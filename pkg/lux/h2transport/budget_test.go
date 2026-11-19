@@ -38,7 +38,7 @@ func TestSharedReceiveBudget(t *testing.T) {
 	a.budget, c.budget = b, b
 	ra, rc := &receivedRequest{}, &receivedRequest{}
 	a.streams[1], c.streams[1] = ra, rc
-	if !a.appendBody(ra, make([]byte, 2048)) || c.appendBody(rc, []byte("x")) {
+	if !a.appendBody(ra, make([]byte, 2048), false) || c.appendBody(rc, []byte("x"), false) {
 		t.Fatal("global limit bypassed")
 	}
 	a.release(1)
@@ -46,7 +46,7 @@ func TestSharedReceiveBudget(t *testing.T) {
 		t.Fatal("idle capacity uncharged")
 	}
 	a.close()
-	if !c.appendBody(rc, []byte("x")) {
+	if !c.appendBody(rc, []byte("x"), false) {
 		t.Fatal("close leaked budget")
 	}
 	c.close()

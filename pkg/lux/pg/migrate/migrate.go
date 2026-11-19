@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -185,7 +185,7 @@ func (r *Runner) Status(ctx context.Context) ([]MigrationStatus, error) {
 	if err != nil {
 		return nil, err
 	}
-	sort.Strings(files)
+	slices.SortFunc(files, compareMigrationFiles)
 
 	var result []MigrationStatus
 	for _, f := range files {
@@ -357,13 +357,66 @@ func (r *Runner) appliedMap(ctx context.Context) (map[string]time.Time, error) {
 	return result, nil
 }
 
+// compareMigrationFiles orders numeric runs by value, then breaks equal-value
+// ties by the original name. It never parses integers or allocates sort keys.
+func compareMigrationFiles(left, right string) int {
+	a, b := filepath.Base(left), filepath.Base(right)
+	i, j := 0, 0
+	for i < min(len(a), len(b)) && a[i] == b[i] {
+		i++
+	}
+	// Revisit a shared digit prefix so different run lengths still sort numerically.
+	for i > 0 && migrationNameDigit(a[i-1]) {
+		i--
+	}
+	j = i
+	for i < len(a) && j < len(b) {
+		if migrationNameDigit(a[i]) && migrationNameDigit(b[j]) {
+			endA, endB := migrationNameDigitEnd(a, i), migrationNameDigitEnd(b, j)
+			if order := compareMigrationDigits(a[i:endA], b[j:endB]); order != 0 {
+				return order
+			}
+			i, j = endA, endB
+			continue
+		}
+		if a[i] != b[j] {
+			return int(a[i]) - int(b[j])
+		}
+		i++
+		j++
+	}
+	if remaining := (len(a) - i) - (len(b) - j); remaining != 0 {
+		return remaining
+	}
+	return strings.Compare(a, b)
+}
+
+func compareMigrationDigits(left, right string) int {
+	left, right = strings.TrimLeft(left, "0"), strings.TrimLeft(right, "0")
+	if len(left) != len(right) {
+		return len(left) - len(right)
+	}
+	return strings.Compare(left, right)
+}
+
+func migrationNameDigitEnd(name string, start int) int {
+	for start < len(name) && migrationNameDigit(name[start]) {
+		start++
+	}
+	return start
+}
+
+func migrationNameDigit(value byte) bool {
+	return value >= '0' && value <= '9'
+}
+
 // pendingFiles returns migration files that haven't been applied yet.
 func (r *Runner) pendingFiles(applied map[string]bool) ([]string, error) {
 	files, err := filepath.Glob(filepath.Join(r.dir, "*.sql"))
 	if err != nil {
 		return nil, err
 	}
-	sort.Strings(files)
+	slices.SortFunc(files, compareMigrationFiles)
 
 	var pending []string
 	for _, f := range files {

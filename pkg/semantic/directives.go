@@ -350,7 +350,7 @@ var builtinDirectives = []DirectiveDef{
 	// ===== API/Fn-level directives =====
 	{
 		Name: "auth", Contexts: OnModel | OnApi | OnFn,
-		Params:      []ParamDef{{Name: "permission"}, {Name: "own"}},
+		Params:      []ParamDef{{Name: "permission"}, {Name: "own"}, {Name: "role"}},
 		MaxArgs:     -1,
 		HasBody:     false,
 		Description: "require authentication for an API, service function, or generated model CRUD handlers; supports optional roles, permission lambda, and ownership checks",
@@ -440,6 +440,15 @@ func (a *Analyzer) validateDirective(d *ast.Directive, ctx DirectiveContext, fie
 	}
 	a.checkDirectiveArgs(d, def)
 	a.checkDirectiveType(d, def, fieldTypeName)
+	for _, argument := range d.Args {
+		a.checkNumericLiteralTree(argument.Value)
+	}
+	if d.Name == "auth" {
+		a.checkAuthArguments(d)
+	}
+	if d.Name == "visible" {
+		a.checkVisibleBody(d)
+	}
 	if d.Name == "mask" {
 		a.checkMaskPattern(d)
 	}
@@ -451,6 +460,123 @@ func (a *Analyzer) validateDirective(d *ast.Directive, ctx DirectiveContext, fie
 	}
 	if d.Name == "cache" {
 		a.checkCacheDirective(d)
+	}
+	if d.Name == "by" {
+		a.checkByArguments(d)
+	}
+}
+
+func (a *Analyzer) checkByArguments(d *ast.Directive) {
+	if len(d.Args) == 0 {
+		a.addError(d.Pos, "@by requires a remote field name / @by 必须指定远端字段名")
+	}
+	for _, argument := range d.Args {
+		name, ok := argument.Value.(*ast.Ident)
+		if argument.Name != "" || !ok || name == nil || name.Name == "" {
+			a.addError(d.Pos, "@by expects positional field identifiers: @by(remoteField, localField) / @by 仅接受位置字段标识符：@by(远端字段, 本地字段)")
+		}
+	}
+}
+
+func (a *Analyzer) checkVisibleBody(d *ast.Directive) {
+	if d.SingleExpression() != nil {
+		return
+	}
+	a.addError(d.Pos, "@visible requires exactly one condition expression / @visible 必须包含一个条件表达式")
+}
+
+func (a *Analyzer) checkAuthArguments(d *ast.Directive) {
+	seen := uint8(0)
+	for _, arg := range d.Args {
+		literal, text := arg.Value.(*ast.Literal)
+		text = text && literal.Kind == token.String && literal.Value != ""
+		_, identifier := arg.Value.(*ast.Ident)
+		_, lambda := arg.Value.(*ast.LambdaExpr)
+		valid := false
+		bit := uint8(0)
+		switch arg.Name {
+		case "":
+			valid = identifier
+		case "role":
+			valid = text
+			bit = 1
+		case "own":
+			valid = text || identifier
+			bit = 2
+		case "subject":
+			valid = identifier
+			bit = 8
+		case "permission":
+			valid = lambda
+			bit = 4
+		}
+		if seen&bit != 0 {
+			a.addError(d.Pos, "duplicate @auth argument '%s' / @auth 参数 '%s' 不能重复声明", arg.Name, arg.Name)
+		}
+		seen |= bit
+		if !valid {
+			a.addError(d.Pos, "invalid @auth argument '%s': use role string, own parameter, permission lambda or positional role name / @auth 参数 '%s' 无效：使用角色字符串、归属参数、权限 lambda 或位置角色名", arg.Name, arg.Name)
+		}
+	}
+}
+
+func (a *Analyzer) checkAuthOwnership(directives []*ast.Directive, params []*ast.ParamDecl) {
+	for _, directive := range directives {
+		if directive.Name != "auth" {
+			continue
+		}
+		for _, arg := range directive.Args {
+			if arg.Name != "own" {
+				continue
+			}
+			name := authOwnershipName(arg.Value)
+			if name == "" {
+				continue // Invalid argument forms are reported by checkAuthArguments.
+			}
+			valid := false
+			for _, param := range params {
+				if param.Name == name && param.Type != nil {
+					valid = param.Type.Name == "Int" && !param.Type.IsList
+					break
+				}
+			}
+			if !valid {
+				a.addError(directive.Pos, "@auth own must reference a declared scalar Int parameter: '%s' / @auth own 必须引用已声明的标量 Int 参数：'%s'", name, name)
+			}
+		}
+	}
+}
+
+func authOwnershipName(expr ast.Expr) string {
+	switch value := expr.(type) {
+	case *ast.Ident:
+		return value.Name
+	case *ast.Literal:
+		if value.Kind == token.String {
+			return value.Value
+		}
+	}
+	return ""
+}
+
+func (a *Analyzer) checkModelAuthOwnership(model *ast.ModelDecl) {
+	for _, directive := range model.Directives {
+		if directive.Name != "auth" {
+			continue
+		}
+		for _, arg := range directive.Args {
+			if arg.Name != "own" {
+				continue
+			}
+			name := authOwnershipName(arg.Value)
+			if name == "" {
+				continue // Invalid argument forms are reported by checkAuthArguments.
+			}
+			field := findModelField(model, name)
+			if field == nil || field.Type == nil || field.Computed != nil || field.Type.Name != "Int" || field.Type.IsList {
+				a.addError(directive.Pos, "model @auth own must reference a stored scalar Int field: '%s' / 模型 @auth own 必须引用存储的标量 Int 字段：'%s'", name, name)
+			}
+		}
 	}
 }
 
@@ -597,12 +723,26 @@ func (a *Analyzer) checkDirectiveType(d *ast.Directive, def *DirectiveDef, field
 	}
 }
 
+func (a *Analyzer) checkResolvedTransform(field *ast.FieldDecl) {
+	for _, directive := range field.Directives {
+		if directive.Name == "transform" {
+			a.checkTransformDirective(field, a.resolveTypeRef(field.Type, field.Pos))
+			return
+		}
+	}
+}
+
 func (a *Analyzer) checkTransformDirective(field *ast.FieldDecl, fieldType *ResolvedType) {
+	seen := false
 	for _, directive := range field.Directives {
 		if directive.Name != "transform" {
 			continue
 		}
-		if directive.Body == nil || len(directive.Body.Stmts) != 1 {
+		if seen {
+			a.addError(directive.Pos, "duplicate @transform directive / 不允许重复 @transform 注解")
+		}
+		seen = true
+		if directive.Body == nil || len(directive.Body.Stmts) != 1 || len(directive.Args) != 0 {
 			a.addError(directive.Pos, "@transform requires exactly one expression / @transform 必须且只能包含一个表达式")
 			continue
 		}
@@ -628,21 +768,71 @@ func (a *Analyzer) checkTransformDirective(field *ast.FieldDecl, fieldType *Reso
 	}
 }
 
+// Type resolution returns a non-nil Unknown even for unresolved names on normal analysis paths.
+// Retain the nil-result guard rather than assuming inconsistent metadata is safe.
+func (a *Analyzer) checkBeforeSaveDirective(field *ast.FieldDecl) {
+	for _, directive := range field.Directives {
+		if directive.Name != "beforeSave" {
+			continue
+		}
+		if directive.Body == nil || len(directive.Body.Stmts) == 0 || len(directive.Args) != 0 {
+			a.addError(directive.Pos, "@beforeSave requires a non-empty conversion body / @beforeSave 必须包含非空转换正文")
+			continue
+		}
+		fieldType := a.resolveTypeRef(field.Type, field.Pos)
+		if fieldType == nil {
+			continue
+		}
+		valueType := *fieldType
+		valueType.Nullable = false
+		scope := a.scope.Child()
+		scope.Define(&Symbol{Name: "it", Kind: SymVariable, Type: &valueType, Mutable: true})
+		for _, statement := range directive.Body.Stmts {
+			expression := beforeSaveExpression(statement)
+			if expression == nil {
+				a.addError(directive.Pos, "@beforeSave only accepts conversion expressions or assignments to it / @beforeSave 仅允许转换表达式或对 it 赋值")
+				continue
+			}
+			previous := len(a.errors)
+			result := a.checkExpr(expression, scope)
+			if len(a.errors) != previous || result == nil || result.Nullable || !sameTransformType(&valueType, result) {
+				a.addError(directive.Pos, "@beforeSave result must match the field type / @beforeSave 结果必须匹配字段类型")
+			}
+		}
+	}
+}
+
+func beforeSaveExpression(statement ast.Stmt) ast.Expr {
+	switch value := statement.(type) {
+	case *ast.ExprStmt:
+		return value.Expr
+	case *ast.AssignStmt:
+		target, ok := value.Target.(*ast.Ident)
+		if !ok || target.Name != "it" || value.Value == nil {
+			return nil
+		}
+		switch value.Op {
+		case "=":
+			return value.Value
+		case "+=", "-=", "*=", "/=", "%=":
+			return &ast.BinaryExpr{Pos: value.Pos, Left: value.Target, Op: strings.TrimSuffix(value.Op, "="), Right: value.Value}
+		}
+	}
+	return nil
+}
+
 func sameTransformType(fieldType, resultType *ResolvedType) bool {
 	if fieldType == nil || resultType == nil || resultType.Kind == TypeUnknown {
 		return true
 	}
-	return fieldType.Name == resultType.Name && fieldType.IsList == resultType.IsList
+	return fieldType.Name == resultType.Name && fieldType.IsList == resultType.IsList && fieldType.Nullable == resultType.Nullable
 }
 
 func typeDisplayName(resolved *ResolvedType) string {
 	if resolved == nil {
 		return "unknown"
 	}
-	if resolved.IsList {
-		return "[" + resolved.Name + "]"
-	}
-	return resolved.Name
+	return formatResolvedType(resolved)
 }
 
 // stringInSlice checks if a string exists in a slice.

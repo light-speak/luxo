@@ -2,9 +2,46 @@ package lux
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
+
+var scalarAggregateSQLSink string
+var scalarAggregateArgsSink []any
+
+func BenchmarkScalarAggregateSQL(b *testing.B) {
+	for _, sample := range []struct {
+		name, table, column string
+		conditions          []Condition
+	}{
+		{"plain", "orders", "amount", nil},
+		{"filtered", "orders", "amount", []Condition{NewIntField("owner_id").Eq(42), NewStringField("status").Eq("OPEN")}},
+		{"long_expression", "archive_orders", strings.Repeat("amount + ", 15) + "tax", nil},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				scalarAggregateSQLSink, scalarAggregateArgsSink = BuildAggregateSQL(sample.table, "SUM", sample.column, sample.conditions)
+			}
+		})
+	}
+}
+
+func BenchmarkSelectProjectionSQL(b *testing.B) {
+	for _, count := range []int{0, 1, 16, 128} {
+		fields := make([]string, count)
+		for index := range fields {
+			fields[index] = fmt.Sprintf("value_%d", index)
+		}
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				scalarAggregateSQLSink, scalarAggregateArgsSink = BuildSelectSQL("orders", fields, nil, nil, 0, 0)
+			}
+		})
+	}
+}
 
 func BenchmarkMembershipSQL(b *testing.B) {
 	type state string

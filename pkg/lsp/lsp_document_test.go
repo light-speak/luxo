@@ -695,3 +695,27 @@ func TestExtractIdentBeforePosNonIdentChar(t *testing.T) {
 		t.Errorf("expected empty for non-ident char before brace, got %q", result)
 	}
 }
+
+func TestDocumentStorePreservesPartialForEachReturnDiagnostics(t *testing.T) {
+	const uri = "file:///partial-return.luxo"
+	const source = `fn probe() { [1].forEach { return } } }`
+	store := NewDocumentStore()
+	t.Cleanup(func() { store.Close(uri) })
+	doc := store.Open(uri, 1, source)
+	if doc == nil || doc.File == nil || doc.Result == nil || len(doc.File.Functions) != 1 {
+		t.Fatal("partial parser output must retain its function and complete semantic analysis")
+	}
+	found := false
+	for _, diagnostic := range doc.Diagnostics() {
+		if diagnostic.Source != "luxo/parser" || !strings.Contains(diagnostic.Message, "expected expression") {
+			continue
+		}
+		found = true
+		if diagnostic.Severity != 1 || diagnostic.Range.Start.Line != 0 || diagnostic.Range.Start.Character != 34 {
+			t.Fatalf("partial return lost its original parser diagnostic: %+v", diagnostic)
+		}
+	}
+	if !found {
+		t.Fatalf("semantic analysis discarded the partial return parser diagnostic: %v", doc.Diagnostics())
+	}
+}

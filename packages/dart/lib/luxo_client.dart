@@ -9,5 +9,13 @@ export 'src/error.dart';
 export 'src/types.dart';
 export 'src/codec.dart';
 export 'src/int64.dart';
-export 'src/json.dart' hide JSONRequestEncoder;
+export 'src/json.dart'
+    hide
+        JSONRequestEncoder,
+        JSONSocketDecoder,
+        JSONModelDepthError,
+        LuxoJSONWritable,
+        LuxoSealedJSONWritable,
+        LuxoJSONOutput,
+        normalizeLuxoJSONList;
 export 'src/codegen.dart' show generate;

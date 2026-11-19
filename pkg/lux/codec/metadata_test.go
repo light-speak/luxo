@@ -106,7 +106,10 @@ func TestColumnSkipsRejectMalformedValuesAfterValidHeader(t *testing.T) {
 
 func TestArrayHeaderPreservesValidCounts(t *testing.T) {
 	for _, count := range []int{0, 1, 127, 128, MaxArrayElements} {
-		data := AppendArrayHeader([]byte{42}, count)
+		data, err := AppendArrayHeader([]byte{42}, count)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if got, n := ReadArrayHeader(data, 1); got != count || n != len(data)-1 {
 			t.Errorf("header %d changed: %d, %d", count, got, n)
 		}

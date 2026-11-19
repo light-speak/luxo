@@ -278,7 +278,7 @@ func TestBuildMux(t *testing.T) {
 	gw := New()
 	gw.AddModule("user")
 
-	mux, port := gw.buildMux("test-version")
+	mux, port := buildTestMux(t, gw, "test-version")
 
 	if port != "4000" {
 		t.Errorf("expected default port 4000, got %q", port)
@@ -300,7 +300,7 @@ func TestBuildMuxCustomPort(t *testing.T) {
 	t.Setenv("APP_PORT", "8080")
 
 	gw := New()
-	_, port := gw.buildMux("v1")
+	_, port := buildTestMux(t, gw, "v1")
 
 	if port != "8080" {
 		t.Errorf("expected port 8080, got %q", port)
@@ -313,7 +313,7 @@ func TestBuildMuxWithAuth(t *testing.T) {
 	defer auth.ResetConfig()
 
 	gw := New()
-	mux, _ := gw.buildMux("v1")
+	mux, _ := buildTestMux(t, gw, "v1")
 
 	// Verify /luvia route goes through auth middleware
 	r := httptest.NewRequest("POST", "/luvia", strings.NewReader(`{"api":"test"}`))
@@ -328,7 +328,7 @@ func TestBuildMuxWithAuth(t *testing.T) {
 
 func TestBuildMuxLuviaRoute(t *testing.T) {
 	gw := New()
-	mux, _ := gw.buildMux("v1")
+	mux, _ := buildTestMux(t, gw, "v1")
 
 	// Verify /luvia route is registered (should return non-404)
 	r := httptest.NewRequest("POST", "/luvia", strings.NewReader(`{"api":"test"}`))
@@ -343,7 +343,7 @@ func TestBuildMuxLuviaRoute(t *testing.T) {
 }
 
 func TestCORSPreflightOptions(t *testing.T) {
-	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := testCORSMiddleware(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("OPTIONS should not reach inner handler")
 	}))
 
@@ -366,7 +366,7 @@ func TestCORSCustomOrigin(t *testing.T) {
 	os.Setenv("CORS_ORIGIN", "https://example.com")
 	defer os.Unsetenv("CORS_ORIGIN")
 
-	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	handler := testCORSMiddleware(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 
 	r := httptest.NewRequest(http.MethodPost, "/luvia", nil)
 	w := httptest.NewRecorder()
@@ -378,7 +378,7 @@ func TestCORSCustomOrigin(t *testing.T) {
 }
 
 func TestSecurityHeaders(t *testing.T) {
-	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	handler := testCORSMiddleware(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 
 	r := httptest.NewRequest(http.MethodPost, "/luvia", nil)
 	w := httptest.NewRecorder()
@@ -407,7 +407,7 @@ func TestBuildMuxIntrospectionKey(t *testing.T) {
 	t.Setenv("INTROSPECTION_KEY", "my-secret-key")
 
 	gw := New()
-	gw.buildMux("v1")
+	buildTestMux(t, gw, "v1")
 
 	if gw.Router.IntrospectionKey != "my-secret-key" {
 		t.Errorf("IntrospectionKey = %q, want my-secret-key", gw.Router.IntrospectionKey)
@@ -418,7 +418,7 @@ func TestBuildMuxDevMode(t *testing.T) {
 	t.Setenv("APP_ENV", "development")
 
 	gw := New()
-	gw.buildMux("v1")
+	buildTestMux(t, gw, "v1")
 
 	// In dev mode, router should be in dev mode
 	// We can't easily check this without exposing state, but ensure no crash
@@ -426,26 +426,27 @@ func TestBuildMuxDevMode(t *testing.T) {
 
 func TestBuildMuxUsesCORSOriginForWebSocket(t *testing.T) {
 	t.Setenv("CORS_ORIGIN", "https://studio.example.com:8443")
-
-	gw := New()
-	gw.buildMux("v1")
-
-	if len(gw.Router.WSOrigins) != 1 || gw.Router.WSOrigins[0] != "studio.example.com:8443" {
-		t.Fatalf("WebSocket origins = %v", gw.Router.WSOrigins)
-	}
-	if gw.Router.WSAllowAllOrigins {
-		t.Fatal("specific CORS origin must not allow every WebSocket origin")
+	mux, _ := buildTestMux(t, New(), "v1")
+	for _, origin := range []string{"https://studio.example.com:8443", "http://studio.example.com:8443"} {
+		request := httptest.NewRequest(http.MethodOptions, "/luvia", nil)
+		request.Header.Set("Origin", origin)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if (response.Code == http.StatusNoContent) != (origin == "https://studio.example.com:8443") {
+			t.Fatal(origin, response.Code)
+		}
 	}
 }
 
 func TestBuildMuxUsesWildcardCORSForWebSocket(t *testing.T) {
 	t.Setenv("CORS_ORIGIN", "*")
-
-	gw := New()
-	gw.buildMux("v1")
-
-	if !gw.Router.WSAllowAllOrigins {
-		t.Fatal("wildcard CORS must apply to WebSocket origin checks")
+	mux, _ := buildTestMux(t, New(), "v1")
+	request := httptest.NewRequest(http.MethodOptions, "/luvia", nil)
+	request.Header.Set("Origin", "https://arbitrary.example")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatal(response.Code)
 	}
 }
 
@@ -502,8 +503,8 @@ func TestStartGatewayServerRejectsInvalidAddress(t *testing.T) {
 func TestConfigureWebSocketOriginsRejectsMalformedOrigins(t *testing.T) {
 	for _, origin := range []string{"", "relative/path", "https://", "://bad", "https://user:password@example.com"} {
 		router := api.NewRouter()
-		configureWebSocketOrigins(router, origin)
-		if router.WSAllowAllOrigins || len(router.WSOrigins) != 0 {
+		policy, err := configureWebSocketOrigins(router, origin)
+		if err == nil || policy != nil {
 			t.Fatalf("invalid origin %q enabled cross-origin access", origin)
 		}
 	}
@@ -519,7 +520,7 @@ func TestBuildBannerDatabaseDisplay(t *testing.T) {
 	gw := New()
 	gw.AddModule("user")
 	// buildMux constructs DB display from env
-	_, _ = gw.buildMux("v1")
+	_, _ = buildTestMux(t, gw, "v1")
 }
 
 func TestServe_H2C(t *testing.T) {
@@ -664,7 +665,7 @@ func TestBuildMuxWithI18nDir(t *testing.T) {
 	os.WriteFile(filepath.Join(i18nDir, "en.json"), []byte(`{"hello": "Hello"}`), 0644)
 
 	gw := New()
-	mux, _ := gw.buildMux("v1")
+	mux, _ := buildTestMux(t, gw, "v1")
 	if mux == nil {
 		t.Fatal("mux should not be nil")
 	}
@@ -705,7 +706,7 @@ func TestWaitForShutdown_NilMetricsAndRegistrar(t *testing.T) {
 
 func TestCORSPassThroughNonOptions(t *testing.T) {
 	called := false
-	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := testCORSMiddleware(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		w.WriteHeader(http.StatusOK)
 	}))

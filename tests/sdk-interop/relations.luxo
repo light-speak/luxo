@@ -1,0 +1,24 @@
+model Person @noTime {
+  id: Int @id
+  name: String
+  privateNote: String @hidden
+  articles: [Article] @by(authorId, id)
+}
+model Article @noTime {
+  id: Int @id
+  title: String
+  body: String
+  authorId: Int?
+  author: Person? @by(id, authorId)
+}
+type ArticleBox { rows: [Article] }
+
+api articleRows(): [Article] { return Article.select().orderBy(id.asc).all() }
+api peopleRows(): [Person] { return Person.select().orderBy(id.asc).all() }
+api articlePage(): [Article] @paginate(defaultPageSize: 2) {
+  return Article.select().orderBy(id.asc).all()
+}
+api boxedArticlePage(): [Article] @paginate(defaultPageSize: 2) {
+  val box = ArticleBox { rows: Article.select().orderBy(id.asc).all() }
+  return box.rows
+}

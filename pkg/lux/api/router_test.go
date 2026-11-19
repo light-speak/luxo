@@ -532,6 +532,27 @@ func TestRouterHandlerPanicRecovery(t *testing.T) {
 
 // --- Introspection Tests ---
 
+func TestIntrospectionRejectsInvalidFieldKinds(t *testing.T) {
+	rt := NewRouter()
+	rt.IntrospectionKey = "test-key"
+	rt.Schema.Models["Record"] = &schema.Model{Name: "Record", Fields: []schema.Field{{ID: 1, Name: "id", Type: -1}}}
+	request := func() *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/luvia?$schema", nil)
+		r.Header.Set("X-Introspection-Key", "test-key")
+		w := httptest.NewRecorder()
+		rt.ServeHTTP(w, r)
+		return w
+	}
+	failed := request()
+	if failed.Code != http.StatusInternalServerError || !strings.Contains(failed.Body.String(), "unknown field type") || !json.Valid(failed.Body.Bytes()) {
+		t.Fatalf("invalid kind returned %d: %s", failed.Code, failed.Body.String())
+	}
+	rt.Schema.Models["Record"].Fields[0].Type = schema.FieldInt
+	if corrected := request(); corrected.Code != http.StatusOK || !strings.Contains(corrected.Body.String(), `"type":"Int"`) {
+		t.Fatalf("corrected metadata returned %d: %s", corrected.Code, corrected.Body.String())
+	}
+}
+
 func TestIntrospectionDisabledByDefault(t *testing.T) {
 	rt := NewRouter()
 	r := httptest.NewRequest(http.MethodGet, "/luvia?$schema", nil)
@@ -771,7 +792,7 @@ func TestConvertBinaryToJSONScalarListAndEnum(t *testing.T) {
 	rt.Schema = schema.New()
 	rt.Schema.RegisterEnum(&schema.Enum{Name: "Role", Values: []string{"ADMIN"}})
 	rt.Schema.APIs["roles"] = &schema.API{Name: "roles", ReturnType: "Role", ReturnList: true}
-	data := codec.AppendArrayHeader(nil, 1)
+	data := codec.AppendVarint(nil, uint64(1))
 	data = codec.AppendBytes(data, []byte("ADMIN"))
 	if got := string(checkedJSON(t)(rt.convertBinaryToJSON("roles", data))); got != `["ADMIN"]` {
 		t.Fatalf("enum list = %s", got)
@@ -987,6 +1008,28 @@ func TestIsStreamAPIUsesSchemaAndNativeRegistration(t *testing.T) {
 	}
 	if rt.isStreamAPI("regularAPI") || rt.isStreamAPI("missing") {
 		t.Error("regular and missing APIs must not be accepted as streams")
+	}
+}
+
+func TestIsStreamAPIWithoutSchema(t *testing.T) {
+	rt := NewRouter()
+	rt.Schema = nil
+	rt.HandleStream("event", func([]byte, *StreamParams, any) bool { return true })
+	rt.HandleStreamNative("native", func(context.Context, *StreamParams, any, *Stream) error { return nil })
+	rt.Handle("regular", func(context.Context, *Request) error { return nil })
+	if err := rt.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]bool{"event": true, "native": true, "regular": false, "missing": false} {
+		if got := rt.isStreamAPI(name); got != want {
+			t.Fatalf("%s: stream=%v, want %v", name, got, want)
+		}
+	}
+	for _, name := range []string{"regular", "missing"} {
+		stream, err := rt.OpenInternalStream(t.Context(), &Request{API: name})
+		if stream != nil || err == nil {
+			t.Fatalf("%s opened a stream: %v %v", name, stream, err)
+		}
 	}
 }
 

@@ -78,7 +78,10 @@ func (e *Encoder) WriteFieldDateTimePtr(fieldID int, value *time.Time) error {
 
 // WriteFieldDateTimeArray writes a count-prefixed timestamp array.
 func (e *Encoder) WriteFieldDateTimeArray(fieldID int, values []time.Time) error {
-	dst := AppendArrayHeader(AppendVarint(e.buf, uint64(fieldID)), len(values))
+	if err := validateArrayCount(len(values)); err != nil {
+		return err
+	}
+	dst := AppendVarint(AppendVarint(e.buf, uint64(fieldID)), uint64(len(values)))
 	for _, value := range values {
 		var err error
 		dst, err = AppendDateTime(dst, value)

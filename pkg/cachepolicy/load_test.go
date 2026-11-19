@@ -48,3 +48,14 @@ func TestLoad(t *testing.T) {
 		}
 	}
 }
+
+func TestEditorDemoCacheCatalog(t *testing.T) {
+	catalog, err := Load("../../editors/vscode/examples/" + Filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, ok := catalog.Lookup("popularPosts")
+	if !ok || policy.TTL != 60*time.Second {
+		t.Fatalf("missing demo policy: %+v", policy)
+	}
+}

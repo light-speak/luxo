@@ -218,7 +218,7 @@ func (a *Analyzer) checkGroupProjection(call *ast.CallExpr, model *ResolvedType,
 			a.addError(object.Pos, "missing result field '%s' in group projection / 分组投影缺少结果字段 '%s'", name, name)
 		}
 	}
-	setExprResolvedType(object, result)
+	a.setExprResolvedType(object, result)
 	return result
 }
 
@@ -255,7 +255,7 @@ func (a *Analyzer) checkGroupResultField(entry *ast.NamedArg, parameter string, 
 	column.Field = entry.Name
 	column.Type, column.Nullable = field.Type.Name, field.Type.Nullable
 	plan.Columns = append(plan.Columns, column)
-	setExprResolvedType(entry.Value, actual)
+	a.setExprResolvedType(entry.Value, actual)
 }
 
 func (a *Analyzer) groupColumn(expression ast.Expr, parameter string, model *ResolvedType, keys []string) (ast.GroupColumn, *ResolvedType) {

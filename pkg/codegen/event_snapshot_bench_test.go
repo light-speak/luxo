@@ -39,7 +39,7 @@ func legacySnapshotCall(h event.Handler,payload any)(err error){
     defer func(){if value:=recover();value!=nil{err=fmt.Errorf("event handler panic: %v",value)}}()
     return h(context.Background(),payload)
 }
-func(b *legacySnapshotBus)Close(){b.once.Do(func(){b.mu.Lock();close(b.done);for _,ch:=range b.channels{close(ch)};b.mu.Unlock();b.wg.Wait()})}
+func(b *legacySnapshotBus)Close()error{b.once.Do(func(){b.mu.Lock();close(b.done);for _,ch:=range b.channels{close(ch)};b.mu.Unlock();b.wg.Wait()});return nil}
 
 func BenchmarkEventSnapshotDispatch(b *testing.B){
     for _,count:=range []int{1,128}{for _,listeners:=range []int{1,4}{for _,owned:=range []bool{false,true}{

@@ -281,6 +281,16 @@ func TestBuildAggregateSQLWithConditions(t *testing.T) {
 	}
 }
 
+func TestBuildAggregateSQLKeepsExpressions(t *testing.T) {
+	for _, operation := range []string{"SUM", "AVG", "MIN", "MAX", "COUNT"} {
+		query, args := BuildAggregateSQL(`"orders"`, operation, `"amount" + "tax"`, []Condition{NewIntField(`"owner_id"`).Eq(9007199254740993)})
+		want := `SELECT COALESCE(` + operation + `("amount" + "tax"), 0) FROM "orders" WHERE "owner_id" = $1`
+		if query != want || len(args) != 1 || args[0] != int64(9007199254740993) {
+			t.Fatal("aggregate changed SQL fragments or typed arguments", query, args)
+		}
+	}
+}
+
 func TestBuildGroupBySQL(t *testing.T) {
 	sql, args := BuildGroupBySQL("orders", []string{"status"}, []GroupAgg{
 		{Col: "status"},
@@ -397,21 +407,30 @@ func TestBuildGroupBySQLWithConditions(t *testing.T) {
 }
 
 func TestIntRangeNormal(t *testing.T) {
-	got := IntRange(1, 5)
+	got, err := IntRange(1, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got) != 5 || got[0] != 1 || got[4] != 5 {
 		t.Errorf("IntRange(1,5) = %v", got)
 	}
 }
 
 func TestIntRangeInverted(t *testing.T) {
-	got := IntRange(5, 1)
+	got, err := IntRange(5, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got != nil {
 		t.Errorf("IntRange(5,1) should return nil, got %v", got)
 	}
 }
 
 func TestIntRangeSingle(t *testing.T) {
-	got := IntRange(3, 3)
+	got, err := IntRange(3, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(got) != 1 || got[0] != 3 {
 		t.Errorf("IntRange(3,3) = %v", got)
 	}

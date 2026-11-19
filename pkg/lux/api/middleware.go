@@ -33,24 +33,49 @@ func WithRateLimit(max int, window time.Duration, handler HandlerFunc) HandlerFu
 }
 
 func cacheResponse(ctx context.Context, req *Request, identity string, ttl time.Duration, binding *ResponseCache, prefix string, execute func() error) error {
+	buf := req.Buf
+	if buf == nil {
+		return errHandlerResponseBuffer
+	}
 	key, err := cacheKeyInNamespace(req, identity, prefix)
 	if err != nil {
 		return err
 	}
 	if data, err := binding.backend.Get(ctx, key); err == nil && data != nil {
-		req.Buf.B = append(req.Buf.B, data...)
-		return nil
+		if len(data) != 0 || !cacheResponseRequiresValue(req) {
+			buf.B = append(buf.B, data...)
+			return nil
+		}
 	}
-	startLen := len(req.Buf.B)
+	startLen := len(buf.B)
 	if err := binding.origin.run(ctx, execute); err != nil {
 		return err
 	}
+	if req.Buf != buf {
+		return errHandlerResponseBuffer
+	}
+	if len(buf.B) < startLen {
+		return errCacheResponseTruncated
+	}
+	body := buf.B[startLen:]
+	if len(body) == 0 && cacheResponseRequiresValue(req) {
+		return errHandlerEmptyResponse
+	}
 	// Best-effort: ignore cache set errors.
-	binding.backend.Set(ctx, key, req.Buf.B[startLen:], ttl)
+	binding.backend.Set(ctx, key, body, ttl)
 	return nil
 }
 
-var errUnpreparedCacheRequest = errors.New("cache requires canonical binary request parameters")
+// Only empty bodies need the prepared return contract; normal hits and fills
+// avoid another plan load or runtime Schema lookup.
+func cacheResponseRequiresValue(req *Request) bool {
+	return req.responseCache.plan.Load().returnsValue
+}
+
+var (
+	errUnpreparedCacheRequest = errors.New("cache requires canonical binary request parameters")
+	errCacheResponseTruncated = luxerrors.InternalError.WithCause(errors.New("api: cached handler truncated its response prefix"))
+)
 
 func cacheKey(req *Request, identity string) (string, error) {
 	return cacheKeyInNamespace(req, identity, "")

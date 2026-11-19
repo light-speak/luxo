@@ -1,6 +1,7 @@
 package luvia
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -11,12 +12,306 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 	"nhooyr.io/websocket"
 )
+
+func TestGatewayShutdownOwnsHTTP2UpgradeRequests(t *testing.T) {
+	for _, mode := range []string{"luxo", "standard"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("APP_HTTP_TRANSPORT", mode)
+			server, done, err := startGatewayServer("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, r.Proto)
+			}), "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = server.Close(); <-done })
+			conn, err := net.DialTimeout("tcp", server.Addr, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+			if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			_, err = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABk\r\n\r\n")
+			if err != nil {
+				t.Fatal(err)
+			}
+			reader := bufio.NewReader(conn)
+			response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertUpgradeShutdown(t, server, conn, reader, response)
+		})
+	}
+}
+
+func TestGatewayStandardProtocolDispatch(t *testing.T) {
+	t.Setenv("APP_HTTP_TRANSPORT", "standard")
+	for _, secure := range []bool{false, true} {
+		t.Run(map[bool]string{false: "cleartext", true: "tls"}[secure], func(t *testing.T) {
+			cert, key := "", ""
+			if secure {
+				cert, key = generateTestCert(t)
+			}
+			server, done, err := startGatewayServer("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, r.Proto)
+			}), cert, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = server.Close(); <-done })
+			for _, h2 := range []bool{false, true} {
+				assertStandardProtocol(t, server.Addr, secure, h2)
+			}
+		})
+	}
+}
+
+func TestGatewayHTTP2ShutdownStopsNewStreams(t *testing.T) {
+	for _, mode := range []string{"luxo", "standard"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("APP_HTTP_TRANSPORT", mode)
+			var calls atomic.Int32
+			server, done, err := startGatewayServer("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				_, _ = io.WriteString(w, r.Proto)
+			}), "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = server.Close(); <-done })
+			conn, err := net.DialTimeout("tcp", server.Addr, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+			_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+			transport := &http2.Transport{}
+			peer, err := transport.NewClientConn(conn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = peer.Close() })
+			request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://"+server.Addr, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := peer.RoundTrip(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if err != nil || string(body) != "HTTP/2.0" {
+				t.Fatalf("prior-knowledge HTTP/2 failed: %q, %v", body, err)
+			}
+			assertHTTP2PeerStops(t, server, peer, request)
+			if calls.Load() != 1 {
+				t.Fatal("business handler ran after gateway shutdown")
+			}
+		})
+	}
+}
+
+func assertHTTP2PeerStops(t *testing.T, server *gatewayHTTPServer, peer *http2.ClientConn, request *http.Request) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	response, err := peer.RoundTrip(request.Clone(t.Context()))
+	if err == nil {
+		_ = response.Body.Close()
+		t.Fatal("closed gateway accepted another stream on the same HTTP/2 peer")
+	}
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		t.Fatal("request timed out instead of being rejected by the closed peer")
+	}
+}
+
+func BenchmarkGatewayStandardStartStop(b *testing.B) {
+	b.Setenv("APP_HTTP_TRANSPORT", "standard")
+	handler := http.NotFoundHandler()
+	b.ReportAllocs()
+	for b.Loop() {
+		server, done, err := startGatewayServer("127.0.0.1:0", handler, "", "")
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := server.Close(); err != nil {
+			b.Fatal(err)
+		}
+		if err := <-done; !errors.Is(err, http.ErrServerClosed) {
+			b.Fatalf("standard listener did not stop: %v", err)
+		}
+	}
+}
+
+func assertStandardProtocol(t *testing.T, addr string, secure, h2 bool) {
+	t.Helper()
+	config := &tls.Config{InsecureSkipVerify: true}
+	var transport http.RoundTripper
+	if h2 {
+		h := &http2.Transport{TLSClientConfig: config}
+		if !secure {
+			h.AllowHTTP = true
+			h.DialTLSContext = func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
+			}
+		}
+		transport = h
+		t.Cleanup(h.CloseIdleConnections)
+	} else {
+		h := &http.Transport{TLSClientConfig: config, TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{}}
+		transport = h
+		t.Cleanup(h.CloseIdleConnections)
+	}
+	scheme := "http://"
+	if secure {
+		scheme = "https://"
+	}
+	client := &http.Client{Transport: transport, Timeout: time.Second}
+	response, err := client.Get(scheme + addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	want := "HTTP/1.1"
+	if h2 {
+		want = "HTTP/2.0"
+	}
+	if err != nil || string(data) != want || response.Proto != want {
+		t.Fatalf("standard protocol secure=%t h2=%t: status=%s body=%q err=%v", secure, h2, response.Proto, data, err)
+	}
+}
+
+func assertUpgradeShutdown(t *testing.T, server *gatewayHTTPServer, conn net.Conn, reader *bufio.Reader, response *http.Response) {
+	t.Helper()
+	var framer *http2.Framer
+	if response.StatusCode == http.StatusSwitchingProtocols {
+		framer = completeUpgradeHandshake(t, conn, reader)
+	} else {
+		body, err := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if err != nil || response.StatusCode != http.StatusOK || string(body) != "HTTP/1.1" {
+			t.Fatalf("unsupported Upgrade was not handled as HTTP/1.1: status=%d body=%q err=%v", response.StatusCode, body, err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if framer != nil {
+		assertUpgradedPeerClosed(t, framer)
+		return
+	}
+	if _, err := reader.ReadByte(); !errors.Is(err, io.EOF) {
+		t.Fatalf("shutdown left HTTP/1 peer open: %v", err)
+	}
+}
+
+func completeUpgradeHandshake(t *testing.T, conn net.Conn, reader *bufio.Reader) *http2.Framer {
+	t.Helper()
+	if _, err := io.WriteString(conn, http2.ClientPreface); err != nil {
+		t.Fatal(err)
+	}
+	framer := http2.NewFramer(conn, reader)
+	if err := framer.WriteSettings(); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		frame, err := framer.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch frame := frame.(type) {
+		case *http2.SettingsFrame:
+			if !frame.IsAck() {
+				if err := framer.WriteSettingsAck(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		case *http2.DataFrame:
+			if frame.StreamID == 1 && frame.StreamEnded() {
+				if string(frame.Data()) != "HTTP/2.0" {
+					t.Fatalf("unexpected upgraded response: %q", frame.Data())
+				}
+				return framer
+			}
+		}
+	}
+}
+
+func assertUpgradedPeerClosed(t *testing.T, framer *http2.Framer) {
+	t.Helper()
+	var headers bytes.Buffer
+	encoder := hpack.NewEncoder(&headers)
+	for _, field := range []hpack.HeaderField{{Name: ":method", Value: "GET"}, {Name: ":scheme", Value: "http"}, {Name: ":authority", Value: "localhost"}, {Name: ":path", Value: "/after-shutdown"}} {
+		if err := encoder.WriteField(field); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := framer.WriteHeaders(http2.HeadersFrameParam{StreamID: 3, BlockFragment: headers.Bytes(), EndHeaders: true, EndStream: true}); err != nil {
+		var timeout net.Error
+		if errors.As(err, &timeout) && timeout.Timeout() {
+			t.Fatal("shutdown left upgraded peer blocking writes")
+		}
+		return
+	}
+	for {
+		frame, err := framer.ReadFrame()
+		if err != nil {
+			var timeout net.Error
+			if errors.As(err, &timeout) && timeout.Timeout() {
+				t.Fatal("shutdown left upgraded peer open without closing or GOAWAY")
+			}
+			return
+		}
+		switch frame := frame.(type) {
+		case *http2.GoAwayFrame:
+			return
+		case *http2.HeadersFrame:
+			if frame.StreamID == 3 {
+				t.Fatal("gateway accepted another upgraded HTTP/2 request after Shutdown returned")
+			}
+		}
+	}
+}
+
+func TestGatewayRejectsNilRouteBeforeTransportStartup(t *testing.T) {
+	t.Setenv("APP_PORT", "invalid")
+	t.Setenv("LUXO_STUDIO_URL", "")
+	for _, transport := range []string{"standard", "luxo"} {
+		t.Run(transport, func(t *testing.T) {
+			t.Setenv("APP_HTTP_TRANSPORT", transport)
+			gateway := New()
+			gateway.Router.Handle("missing", nil)
+			quit := make(chan os.Signal, 1)
+			quit <- os.Interrupt
+			err := gateway.serve("nil-route-test", quit)
+			if err == nil || !strings.Contains(err.Error(), `"missing"`) {
+				t.Fatalf("route validation did not precede transport startup: %v", err)
+			}
+			if gateway.server != nil {
+				t.Fatal("invalid route created HTTP server")
+			}
+		})
+	}
+}
 
 func TestGatewayStandardCloseReleasesListener(t *testing.T) {
 	t.Setenv("APP_HTTP_TRANSPORT", "standard")

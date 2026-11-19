@@ -29,6 +29,7 @@ import com.luxo.interop.ScalarArraysInput
 import java.io.File
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
@@ -48,11 +49,26 @@ import kotlin.coroutines.startCoroutine
 private const val selection = "value, duration, optional, values, label"
 
 suspend fun main(args: Array<String>) {
-    verifyNestedBoundaries()
-    verifyNullableRootDecoding()
+    val scenario = System.getenv("LUXO_INTEROP_SCENARIO") ?: "complete"
+    check(scenario in setOf("complete", "renewal", "decimals")) { "invalid interop scenario: $scenario" }
     check(System.getProperty("java.class.path").split(File.pathSeparator).none {
         File(it).name.startsWith("kotlin-compiler-embeddable-")
     }) { "the compiler must not enter the consumer runtime" }
+    if (scenario == "renewal") {
+        verifyGeneratedWSRenewal(args[0])
+        return
+    }
+    if (scenario == "decimals") {
+        for (websocket in listOf(false, true)) {
+            for (mode in TransportMode.entries) {
+                verifyChannel(args[0], websocket, mode, emptyList(), emptyList(), emptyList(), emptyList(), listOf(4))
+                println("generated compact Decimal ${if (websocket) "WebSocket" else "HTTP"} $mode passed")
+            }
+        }
+        return
+    }
+    verifyNestedBoundaries()
+    verifyNullableRootDecoding()
     val corpus = Json.parseToJsonElement(File(args[1]).readText()).jsonObject
     verifyJSONDateTimeBoundaries(corpus.getValue("dateTimeBoundaryCases").jsonArray)
     for (test in corpus.getValue("jsonUnicodeCases").jsonArray) {
@@ -83,6 +99,83 @@ suspend fun main(args: Array<String>) {
     for (mode in TransportMode.entries) {
         verifyTokenRefresh(args[0], mode)
         println("$scope: HTTP $mode access/refresh lifecycle passed")
+    }
+    verifyGeneratedWSRenewal(args[0])
+}
+
+private suspend fun verifyGeneratedWSRenewal(endpoint: String) {
+    for (mode in TransportMode.entries) {
+        val http = OkHttpClient()
+        try {
+            val bootstrap = LuxoClient(OkHttpTransport(endpoint, client = http, mode = mode, timeoutSeconds = 5))
+            verifyGeneratedWSRenewalSession(endpoint, mode, http, bootstrap)
+            println("generated ws renewal $mode passed")
+        } finally {
+            http.dispatcher.executorService.shutdownNow()
+            http.connectionPool.evictAll()
+        }
+    }
+}
+
+private suspend fun verifyGeneratedWSRenewalSession(endpoint: String, mode: TransportMode, http: OkHttpClient, bootstrap: LuxoClient) {
+    val first = CompletableFuture<String>()
+    val ended = CompletableFuture<LuxoError>()
+    val renewed = CompletableFuture<Unit>()
+    val values = AtomicInteger()
+    val errors = AtomicInteger()
+    val completed = AtomicInteger()
+    val attempts = AtomicInteger()
+    val refresh = bootstrap.issueFixtureRefresh()
+    val token = bootstrap.issueExpiringFixtureAccess()
+    val socket = LuxoWebSocket(endpoint.replace("http:", "ws:"), http, token = token, timeoutMillis = 5_000,
+        onTokenExpired = {
+            attempts.incrementAndGet()
+            val access = bootstrap.exchangeFixtureRefresh(token = refresh)
+            renewed.complete(Unit)
+            access
+        })
+    socket.setMode(mode)
+    try {
+        val client = LuxoClient(socket)
+        val before = readFixtureStreamStats(bootstrap)
+        check(before.second == 0L)
+        check(client.fixtureIdentity() == 9007199254740993L)
+        val observer = StreamObserver(onError = { errors.incrementAndGet(); ended.complete(it) },
+            onComplete = { completed.incrementAndGet() })
+        val timestamp = "2020-01-02T03:04:05.123456789Z"
+        val stopOld = client.subscribeWatchFixtureTimestamp(timestamp, observer = observer) { values.incrementAndGet(); first.complete(it) }
+        check(awaitValue(first) == timestamp)
+        waitForFixtureStreams(bootstrap, before.first + 1, 1)
+        check(awaitValue(ended).code == 401)
+        awaitValue(renewed)
+        check(client.fixtureIdentity() == 9007199254740993L)
+        check(attempts.get() == 1 && values.get() == 1 && errors.get() == 1 && completed.get() == 0)
+        waitForFixtureStreams(bootstrap, before.first + 1, 0)
+        val fresh = CompletableFuture<String>()
+        val stopFresh = client.subscribeWatchFixtureTimestamp(timestamp) { fresh.complete(it) }
+        check(awaitValue(fresh) == timestamp)
+        stopOld()
+        check(client.fixtureIdentity() == 9007199254740993L)
+        check(values.get() == 1 && errors.get() == 1 && completed.get() == 0)
+        waitForFixtureStreams(bootstrap, before.first + 2, 1)
+        stopFresh()
+        waitForFixtureStreams(bootstrap, before.first + 2, 0)
+    } finally { socket.close() }
+}
+
+private suspend fun readFixtureStreamStats(client: LuxoClient): Pair<Long, Long> {
+    val value = client.fixtureStreamStats(select = "started, active")
+    return checkNotNull(value.started.value()) to checkNotNull(value.active.value())
+}
+
+private suspend fun waitForFixtureStreams(client: LuxoClient, started: Long, active: Long) {
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+    while (true) {
+        val value = readFixtureStreamStats(client)
+        check(value.first == started) { "unexpected stream starts: ${value.first} != $started" }
+        if (value.second == active) return
+        check(System.nanoTime() < deadline) { "stream cleanup stalled: ${value.second} != $active" }
+        Thread.sleep(10)
     }
 }
 
@@ -210,7 +303,7 @@ private fun <T> startSubscription(block: suspend () -> T): CompletableFuture<T> 
 
 private suspend fun verifyChannel(
     endpoint: String, websocket: Boolean, mode: TransportMode, values: List<Long>, tokens: List<String>, dates: List<Pair<String, String>>,
-    uuidCases: List<JsonElement>,
+    uuidCases: List<JsonElement>, scalarStates: List<Int>? = null,
 ) {
     val http = OkHttpClient()
     val socket = if (websocket) LuxoWebSocket(endpoint.replace("http:", "ws:"), client = http, autoReconnect = false) else null
@@ -219,6 +312,10 @@ private suspend fun verifyChannel(
     val client = LuxoClient(transport)
     try {
         socket?.connect()
+        if (scalarStates != null) {
+            verifyScalarArrays(client, websocket, scalarStates)
+            return
+        }
         if (System.getenv("LUXO_INTEROP_ENUM_UPGRADE") == "true") {
             verifyEnumUpgrade(client, websocket)
             return
@@ -554,6 +651,8 @@ private suspend fun verifyPagination(client: LuxoClient) {
 }
 
 private suspend fun verifyUnary(client: LuxoClient, values: List<Long>) {
+    check(client.echoManyParameters() == 7L)
+    check(client.echoManyParameters(p0 = 1L, p16 = -1L, p64 = Long.MAX_VALUE) == Long.MAX_VALUE)
     verifyConcurrentSelections(client)
     for (value in values) {
         check(client.echoInteger(value) == value)
@@ -769,7 +868,8 @@ private fun scalarArraysInput(state: Int) = ScalarArraysInput(
     durations = scalarArrayState(state, listOf(Long.MIN_VALUE, Long.MAX_VALUE)),
     uuids = scalarArrayState(state, listOf("00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001")),
     bytes = scalarArrayState(state, listOf(byteArrayOf(), byteArrayOf(0, 127, -128, -1))),
-    decimals = scalarArrayState(state, listOf("1234567890.123456789", "-0.000000001")),
+    decimals = scalarArrayState(state, if (state == 4) listOf("1e2147483647", "-1e-2147483648")
+        else listOf("1234567890.123456789", "-0.000000001")),
     jsons = scalarArrayState(state, listOf(buildJsonObject {
         put("value", JsonPrimitive(Long.MAX_VALUE)); put("text", JsonPrimitive("東京"))
     }, JsonPrimitive(false))),
@@ -791,8 +891,8 @@ private fun verifyScalarArrayValues(row: ScalarArrays, input: ScalarArraysInput)
     check(row.tail.value() == input.tail)
 }
 
-private suspend fun verifyScalarArrays(client: LuxoClient, websocket: Boolean) {
-    for (state in 0..3) {
+private suspend fun verifyScalarArrays(client: LuxoClient, websocket: Boolean, states: List<Int> = listOf(0, 1, 2, 3, 4)) {
+    for (state in states) {
         val input = scalarArraysInput(state)
         verifyScalarArrayValues(client.echoScalarArrays(input, select = scalarSelection), input)
         val rows = client.listScalarArrays(input, select = scalarSelection)

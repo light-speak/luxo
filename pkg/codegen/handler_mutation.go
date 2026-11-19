@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux/str"
 )
 
 type mutationInputField struct {
@@ -76,8 +77,11 @@ func writeMutationValueRead(b *strings.Builder, field *ast.FieldDecl, typ *ast.T
 
 // Applying fields never reads the request again; presence and null decisions
 // belong to the completed validation phase.
-func generateMutationInputApply(b *strings.Builder, input mutationInputField, setter, indent string) {
+func generateMutationInputApply(b *strings.Builder, input mutationInputField, setter, indent string, modelNames ...string) {
 	field, outer := input.field, indent
+	if preparedMutationField(field) && strings.HasPrefix(setter, "Set") {
+		setter = "setPrepared" + strings.TrimPrefix(setter, "Set")
+	}
 	if input.optional {
 		fmt.Fprintf(b, "%sif %sPresent {\n", indent, field.Name)
 		indent += "\t"
@@ -88,7 +92,14 @@ func generateMutationInputApply(b *strings.Builder, input mutationInputField, se
 		indent += "\t"
 	}
 	name := field.Name + "Val"
-	generateBeforeSave(b, field, name, indent)
+	if fallibleSave(field) {
+		if len(modelNames) == 0 {
+			panic(&InternalCompilerError{Detail: "missing save model name"})
+		}
+		fmt.Fprintf(b, "%s_prepared, err := %s(%s)\n%sif err != nil { return err }\n%s%s = _prepared\n", indent, saveBodyName(modelNames[0], field), name, indent, indent, name)
+	} else {
+		generateBeforeSave(b, field, name, indent)
+	}
 	generateMutationHash(b, field, name, indent)
 	arg := name
 	if nullable && !field.Type.IsList {
@@ -113,4 +124,176 @@ func generateMutationHash(b *strings.Builder, field *ast.FieldDecl, value, inden
 	fmt.Fprintf(b, "%s{\n%s\t_hashed, err := luxocrypto.HashPassword(%s)\n", indent, indent, value)
 	fmt.Fprintf(b, "%s\tif err != nil { return fmt.Errorf(\"hash %s: %%w\", err) }\n", indent, field.Name)
 	fmt.Fprintf(b, "%s\t%s = _hashed\n%s}\n", indent, value, indent)
+}
+
+// Save preparation owns nullable scalar storage before applying field transforms.
+func generateSavePreparation(b *strings.Builder, model string, field *ast.FieldDecl) {
+	if field.Type == nil || !hasDirective(field.Directives, "beforeSave") {
+		return
+	}
+	if fallibleSave(field) {
+		generateFallibleSavePreparation(b, model, field)
+		return
+	}
+	typ := resolveGoType(field.Type)
+	fmt.Fprintf(b, "func %s(value %s) %s {\n", savePreparationName(model, field.Name), typ, typ)
+	value := "value"
+	if field.Type.Nullable && !field.Type.IsList {
+		b.WriteString("\tif value == nil { return nil }\n\tprepared := *value\n")
+		value = "prepared"
+	}
+	generateBeforeSave(b, field, value, "\t")
+	if value == "prepared" {
+		value = "&prepared"
+	}
+	fmt.Fprintf(b, "\treturn %s\n}\n\n", value)
+}
+
+func savePreparationName(model, field string) string {
+	return fmt.Sprintf("prepareSave%d%s%s", len(model), model, str.Capitalize(field))
+}
+
+// Compiled mutations apply conversion before hashing and preserve nullable storage.
+func (c *compiler) compileMutationValue(model *ast.ModelDecl, argument *ast.NamedArg) (string, bool) {
+	field := modelField(model, argument.Name)
+	if field == nil || !hasDirective(field.Directives, "beforeSave") {
+		if field != nil && field.Type != nil && (field.Type.IsList || field.Type.Nullable && hasDirective(field.Directives, "hash")) {
+			return c.compileAssignedValue(argument.Value, field.Type), false
+		}
+		return c.compileExpr(argument.Value), false
+	}
+	value := c.compileAssignedValue(argument.Value, field.Type)
+	c.resultTmp++
+	name := fmt.Sprintf("_saveValue%d", c.resultTmp)
+	if fallibleSave(field) {
+		c.write("%s, err := %s(%s)", name, savePreparationName(model.Name, field.Name), value)
+		c.writeErrorGuard()
+	} else {
+		c.write("%s := %s(%s)", name, savePreparationName(model.Name, field.Name), value)
+	}
+	return name, true
+}
+
+// Slot zero means absent; all stored indices are one-based.
+func generateMutationSlots(b *strings.Builder, fields []*ast.FieldDecl) {
+	for _, field := range fields {
+		fmt.Fprintf(b, "\t_setSlot%s int\n", str.Capitalize(field.Name))
+	}
+}
+
+func mutationSetterFields(fields []*ast.FieldDecl, primaryKey *ast.FieldDecl, update bool, modelDirectives ...[]*ast.Directive) []*ast.FieldDecl {
+	var result []*ast.FieldDecl
+	for _, field := range fields {
+		if field.Computed != nil || hasDirective(field.Directives, "internal") || isAutoManaged(field, modelDirectives...) {
+			continue
+		}
+		if update && ((primaryKey != nil && field.Name == primaryKey.Name) || hasDirective(field.Directives, "immutable")) {
+			continue
+		}
+		result = append(result, field)
+	}
+	return result
+}
+
+func (g *GeneratorContext) generateMutationSetter(b *strings.Builder, model, kind string, field *ast.FieldDecl, fallible bool) {
+	builder := model + kind + "Builder"
+	name, typ := str.Capitalize(field.Name), resolveGoType(field.Type)
+	fmt.Fprintf(b, "func (b *%s) Set%s(v %s) *%s {\n", builder, name, typ, builder)
+	if fallible {
+		b.WriteString("\tif b._prepareErr != nil { return b }\n")
+	}
+	if preparedMutationField(field) {
+		writeSetterPreparation(b, model, field)
+		fmt.Fprintf(b, "\treturn b.setPrepared%s(v)\n}\n\n", name)
+		fmt.Fprintf(b, "func (b *%s) setPrepared%s(v %s) *%s {\n", builder, name, typ, builder)
+	}
+	slot := "b._setSlot" + name
+	fmt.Fprintf(b, "\tif %s != 0 {\n", slot)
+	if kind == "Create" {
+		fmt.Fprintf(b, "\t\tb.Vals[%s-1] = v\n", slot)
+	} else {
+		fmt.Fprintf(b, "\t\tb.Sets[%s-1] = lux.SetField{Col: %q, Val: v}\n", slot, g.sqlColumn(field.Name))
+	}
+	b.WriteString("\t\treturn b\n\t}\n")
+	fmt.Fprintf(b, "\tb.Set(%q, v)\n", g.sqlColumn(field.Name))
+	if kind == "Create" {
+		fmt.Fprintf(b, "\t%s = len(b.Cols)\n", slot)
+	} else {
+		fmt.Fprintf(b, "\t%s = len(b.Sets)\n", slot)
+	}
+	b.WriteString("\treturn b\n}\n\n")
+}
+
+func generateCreateManyAdd(b *strings.Builder, model string, fields []*ast.FieldDecl) {
+	fmt.Fprintf(b, "// Add prepares and stores one input without changing the caller's scalar values.\nfunc (b *%sCreateManyBuilder) Add(input %sCreateInput) *%sCreateManyBuilder {\n", model, model, model)
+	if hasFallibleSave(fields) {
+		b.WriteString("\tif b._prepareErr != nil { return b }\n")
+	}
+	for _, field := range fields {
+		if fallibleSave(field) {
+			name := str.Capitalize(field.Name)
+			fmt.Fprintf(b, "\t{ prepared, err := %s(input.%s); if err != nil { b._prepareErr = err; return b }; input.%s = prepared }\n", savePreparationName(model, field.Name), name, name)
+		} else if hasDirective(field.Directives, "beforeSave") {
+			name := str.Capitalize(field.Name)
+			fmt.Fprintf(b, "\tinput.%s = %s(input.%s)\n", name, savePreparationName(model, field.Name), name)
+		}
+		if hasDirective(field.Directives, "hash") {
+			name := str.Capitalize(field.Name)
+			fmt.Fprintf(b, "\t{ hashed, err := %s(input.%s); if err != nil { b._prepareErr = err; return b }; input.%s = hashed }\n", hashPreparationName(model, field), name, name)
+		}
+	}
+	b.WriteString("\tb.rows = append(b.rows, input)\n\treturn b\n}\n\n")
+}
+
+// Unique temporaries keep repeated writes valid in the same generated Go scope.
+func (c *compiler) compileMutationHash(model *ast.ModelDecl, field, value string) (string, bool) {
+	if model == nil || !isHashField(model, field) {
+		return value, false
+	}
+	c.resultTmp++
+	name := fmt.Sprintf("hashed%s%d", str.Capitalize(field), c.resultTmp)
+	declaration := modelField(model, field)
+	if declaration != nil && declaration.Type != nil && declaration.Type.Nullable {
+		c.write("%s, err := %s(%s)", name, hashPreparationName(model.Name, declaration), value)
+	} else {
+		c.write("%s, err := luxocrypto.HashPassword(%s)", name, value)
+	}
+	c.writeErrorGuard()
+	return name, true
+}
+
+// Retain ordinary values before later arguments can modify their source storage.
+func (c *compiler) compileMutationArgument(model *ast.ModelDecl, argument *ast.NamedArg, capture bool) (string, bool, bool) {
+	value, prepared := c.compileMutationValue(model, argument)
+	value, hashed := c.compileMutationHash(model, argument.Name, value)
+	if capture && !prepared && !hashed {
+		typ := c.goTypeForExpr(argument.Value)
+		if field := modelField(model, argument.Name); field != nil && field.Type != nil {
+			declared := *field.Type
+			declared.Nullable = argument.Value.IsNullable()
+			typ = resolveGoType(&declared)
+		}
+		value = c.captureExpressionValue(argument.Value, value, typ)
+	}
+	return value, prepared, hashed
+}
+
+func preparedMutationField(field *ast.FieldDecl) bool {
+	return hasDirective(field.Directives, "beforeSave") || hasDirective(field.Directives, "hash")
+}
+
+func writeSetterPreparation(b *strings.Builder, model string, field *ast.FieldDecl) {
+	writeMutationPreparation(b, model, field, "v", "\t", "b._prepareErr = err; return b")
+}
+
+// Reuse static preparation steps while preserving each caller's error boundary.
+func writeMutationPreparation(b *strings.Builder, model string, field *ast.FieldDecl, value, indent, onError string) {
+	if fallibleSave(field) {
+		fmt.Fprintf(b, "%sprepared, err := %s(%s)\n%sif err != nil { %s }\n%s%s = prepared\n", indent, savePreparationName(model, field.Name), value, indent, onError, indent, value)
+	} else if hasDirective(field.Directives, "beforeSave") {
+		fmt.Fprintf(b, "%s%s = %s(%s)\n", indent, value, savePreparationName(model, field.Name), value)
+	}
+	if hasDirective(field.Directives, "hash") {
+		fmt.Fprintf(b, "%shashed, err := %s(%s)\n%sif err != nil { %s }\n%s%s = hashed\n", indent, hashPreparationName(model, field), value, indent, onError, indent, value)
+	}
 }

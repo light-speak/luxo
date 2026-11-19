@@ -119,6 +119,23 @@ serializer；正常 SDK 请求不要求消费者启用序列化编译插件。�
 的 null 标记一致；API 参数的 `LuxoOptional.Absent` 省略规则不变。生成 Float 编码
 拒绝非有限值，不输出非法 JSON。升级后重新生成客户端；Schema 边界校验仍保留。
 
+## Nesting limits / 嵌套层数
+
+Generated model/type readers and input writers allow at most 64 object layers.
+The root object is layer 1; lists and pagination envelopes do not add object
+layers. Typed JSON model parameters use the same limit. Generic JSON fields
+have a separate limit of 128 object/array containers from their own root;
+scalars add no container layer. Oversized values raise an error.
+Regenerate clients with the matching SDK runtime to enable these checks.
+Binary readers also validate discarded repeated-column values and preserve
+valid final values.
+
+生成的 model/type 读取器与输入写入器最多允许 64 层对象，根对象算第 1 层，
+列表和分页封装不增加对象层数；有 Schema 的 JSON 模型参数采用同一规则。
+通用 JSON 字段从自身根单独限制 128 层对象／数组容器，标量不计容器层数；
+超限明确报错。启用这些检查需要匹配当前 SDK 运行时并重新生成客户端。
+Binary 读取器也检查被重复列覆盖的旧值，合法末值保持不变。
+
 ## Named enums / 命名枚举
 
 Generated enums are sealed interfaces, not String aliases. `Role.Known.MEMBER`
@@ -138,13 +155,15 @@ The server continues to reject values absent from its own Schema.
 生成参数和输入写入器只在声明为 Enum 的位置解包 `rawValue`；缺省、null 和未选择
 字段语义不变，通用 JSON 不做隐式枚举转换。服务端仍拒绝自身 Schema 未声明的值。
 
-Missing enum references, unnamed enum returns and empty/duplicate declarations
-fail before snapshots or generated sources are overwritten. Known values reuse
+Missing enum references, unnamed enum returns and duplicate declarations
+fail before snapshots or generated sources are overwritten. An empty enum has no
+known values; all received strings retain their exact text as Unknown values. Known values reuse
 constants; unknown wrappers and list conversions are not allocation-free.
 Performance and Android device validation remain separate acceptance gates.
 
-缺失枚举引用、裸 Enum 返回值、空或重复声明在覆盖快照/代码前报错。已知值复用
-常量，但未知包装及列表转换并非零分配；性能和 Android 真机仍需独立验收。
+缺失枚举引用、裸 Enum 返回值和重复声明在覆盖快照/代码前报错。空枚举没有已知值，
+收到的字符串均作为 Unknown 保留原文。已知值复用常量，但未知包装及列表转换并非
+零分配；性能和 Android 真机仍需独立验收。
 
 Introspection preserves known Go metadata, including descriptions, directives,
 deprecation, primary/foreign keys and relationships. Unknown schema properties
@@ -326,6 +345,17 @@ box values; they are not an unconditional zero-allocation guarantee.
 
 ## WebSocket / 订阅
 
+An authenticated connection closed with code `4001` ends its pending calls and
+subscriptions with an authentication error. Configure `LuxoWebSocket(onTokenExpired =
+{ refreshAccessToken() })` to obtain a new access token before reconnecting. Old calls
+and subscriptions are never replayed. Missing, failed, or timed-out renewal stops
+reconnecting with the expired credential; `setToken` replaces it explicitly.
+
+已认证连接以 `4001` 关闭时，旧调用和订阅以鉴权错误结束。通过
+`LuxoWebSocket` 的 `onTokenExpired` 挂起回调取得新 access token 后重连；不重放旧调用或订阅。
+缺少回调、刷新失败或超时后停止使用过期凭据重连，可显式 `setToken` 替换。
+
+
 ```kotlin
 val ws = LuxoWebSocket("ws://localhost:4000/luvia/ws")
 ws.connect()
@@ -373,11 +403,14 @@ and stale messages or cancellation handles cannot affect a new subscription.
 Observers run after retirement and outside the lifecycle lock. If one throws,
 the others are still notified, then the first exception is rethrown with any
 distinct additional exceptions suppressed. Explicit cancel/close is silent.
-Other SDKs are still migrating to this disconnect contract; it is not frozen yet.
+All four SDKs implement disconnect termination; remaining release gates are independent.
 
 An unparseable JSON message, invalid root or malformed Unicode closes its socket
 and fails all pending calls/setup and established streams with `ParseError`.
 IDs are not guessed from a damaged document; reconnect does not replay streams.
+Invalid Binary frame tags, missing/truncated IDs or UInt64 overflow also close
+the connection with `ParseError`. A successful Binary ACK with trailing bytes and
+a valid ID fails only that subscription; valid late or retired IDs stay ignored.
 A valid envelope with bad business data remains a subscription-local `DecodeError`.
 
 断线先移除全部订阅。已建立订阅通过 onError 收到一次 NetworkError；尚未收到 ACK
@@ -385,10 +418,12 @@ A valid envelope with bad business data remains a subscription-local `DecodeErro
 ConnectionError。连接可以自动重连，但必须由调用方显式建立新编号的订阅，不保留
 请求编码用于重放；旧消息和旧取消句柄不影响新订阅。通知在清理完成后、生命周期锁
 之外执行；某个回调抛异常仍继续通知其余回调，最后重新抛出首个异常，并保留其他
-异常为 suppressed。主动取消/关闭保持静默。其余 SDK 正在同步，不能据此宣布冻结。
+异常为 suppressed。主动取消/关闭保持静默。四SDK已实现断线终止，其余发行门禁独立验收。
 
 JSON 整包解析失败（含非法根类型、非法 Unicode）关闭对应连接，全部在途调用、
 待确认订阅与已建立流收到 ParseError；不从残缺文档猜测编号，重连不重放订阅。
+Binary帧类型非法、编号缺失／截断／溢出也以ParseError关闭连接；编号合法而成功ACK
+带多余正文时，只结束对应Binary订阅，合法迟到帧／已取消编号仍忽略。
 若整包合法、只是业务数据解码失败，仍以 DecodeError 仅终止对应订阅。
 
 ## Features / 功能
@@ -413,6 +448,11 @@ There is at most one retry, retaining the original JSON/Binary mode. A declined
 refresh preserves the server error; a thrown callback error propagates unchanged.
 Body-read failures close the response and complete the caller with `NetworkError`.
 
+Request bodies use OkHttp's one-shot marker, preventing implicit POST replay
+after sending or receiving a 408/503 follow-up. Explicit validated 401 refresh
+starts a new call with the original bytes. Before sending, connection routing
+retains the supplied client's policy. Custom interceptors remain caller-controlled.
+
 HTTP JSON bytes are decoded strictly as UTF-8, ignoring conflicting charset
 headers. One UTF-8 document BOM is accepted; field values keep U+FEFF/U+FFFD.
 Malformed UTF-8, UTF-16/32 documents and invalid JSON return `ParseError` with
@@ -424,6 +464,10 @@ allocation costs; these remain subject to the performance gate.
 一次且保持原 JSON/Binary 模式；非法错误、读响应体失败或状态/code 不一致不刷新。
 回调返回 null 时保留服务端错误，回调抛出的异常原样传播；响应体读取失败会关闭响应，
 以 NetworkError 通知调用方，不让调用方一直等待。
+
+请求体使用 OkHttp 的 one-shot 标记，禁止发送后的隐式重发及 408/503 后续重发；
+显式且已验证的 401 刷新仍用原正文新建一次调用。尚未发送时的连接换路保留原客户端
+策略；自行替换请求或实现重试的自定义拦截器仍由调用方负责。
 
 HTTP JSON 固定使用严格 UTF-8，不受冲突的 charset 响应头影响。接受一个 UTF-8
 文档 BOM，字段内的 U+FEFF/U+FFFD 保留。坏 UTF-8、UTF-16/32 文档和非法 JSON

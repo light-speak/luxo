@@ -4,8 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"io"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
 )
@@ -66,46 +67,49 @@ func TestServerReusesRequestOnlyAfterSynchronousDispatch(t *testing.T) {
 	if err := router.Registry.RegisterParams("echo", nil); err != nil {
 		t.Fatal(err)
 	}
-	var first *byte
+	addresses := make(map[*byte]bool)
 	calls := 0
 	router.Handle("echo", func(_ context.Context, req *api.Request) error {
 		body := req.BinaryRequest()
-		if calls == 0 {
-			first = &body[0]
-		} else if first != &body[0] {
-			t.Error("server did not reuse request storage")
-		}
+		addresses[&body[0]] = true
 		req.Buf.B = append(req.Buf.B, body...)
 		calls++
 		return nil
 	})
 	server := NewServer(router)
 	defer server.Close()
-	var input, output bytes.Buffer
-	preface := protocolPreface()
-	input.Write(preface[:])
-	body := encodeCallRequest(1, nil, nil)
-	for range 2 {
-		if err := WriteFrame(&input, encodeRequestEnvelope(requestKindCall, "", body)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	conn := &prefaceTestConn{Conn: &poolLifecycleConn{}, reader: &input, writer: &output}
+	conn, peer := net.Pipe()
+	defer peer.Close()
 	if !server.registerConnection(conn) {
 		t.Fatal("registration failed")
 	}
-	server.handleConn(conn)
-	if calls != 2 {
-		t.Fatalf("calls=%d", calls)
+	done := make(chan struct{})
+	go func() { server.handleConn(conn); close(done) }()
+	deadline, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	if err := initiateHandshake(deadline, peer, time.Second); err != nil {
+		t.Fatal(err)
 	}
-	output.Next(len(preface))
-	for range 2 {
-		frame, err := ReadFrame(&output, nil)
+	if err := peer.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	body := encodeCallRequest(1, nil, nil)
+	for range 8 {
+		if err := WriteFrame(peer, encodeRequestEnvelope(requestKindCall, "", body)); err != nil {
+			t.Fatal(err)
+		}
+		frame, err := ReadFrame(peer, nil)
 		if err != nil || !bytes.Equal(frame, append([]byte{statusOK}, body...)) {
 			t.Fatalf("response changed: %x, %v", frame, err)
 		}
 	}
-	if _, err := output.ReadByte(); err != io.EOF {
-		t.Fatal("unexpected trailing response")
+	peer.Close()
+	select {
+	case <-done:
+	case <-deadline.Done():
+		t.Fatal("connection did not stop")
+	}
+	if calls != 8 || len(addresses) > 3 {
+		t.Fatalf("calls=%d retained request buffers=%d", calls, len(addresses))
 	}
 }

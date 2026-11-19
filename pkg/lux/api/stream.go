@@ -96,6 +96,9 @@ func (p *StreamParams) LookupFloat(name string) (float64, bool) {
 	}
 	switch v := p.values[name].(type) {
 	case float64:
+		if !codec.IsFiniteFloat(v) {
+			return 0, false
+		}
 		return v, true
 	case int64:
 		return float64(v), true
@@ -230,15 +233,19 @@ type InternalStream struct {
 // Start begins producing after the owning transport acknowledges the subscription.
 // It is idempotent; a subscription closed before Start never invokes its handler.
 func (s *InternalStream) Start() {
+	var canceled error
 	s.startOnce.Do(func() {
 		run := s.run
 		s.run = nil
 		if err := s.ctx.Err(); err != nil {
-			s.hub.finish(s.apiName, s.sub, err)
+			canceled = err
 			return
 		}
 		s.router.startNativeStreamHandler(s.ctx, s.apiName, s.sub.Identity, s.sub, run)
 	})
+	if canceled != nil {
+		s.hub.finish(s.apiName, s.sub, canceled)
+	}
 }
 
 // Messages returns canonical Luxo binary stream payloads.
@@ -254,12 +261,17 @@ func (s *InternalStream) Err() error {
 	return s.sub.result
 }
 
-// Close removes the subscription and cancels its handler context.
+// Close removes the subscription and cancels its handler context. Resource
+// callbacks run outside the lifecycle gate so cleanup can safely reenter Close.
 func (s *InternalStream) Close() {
+	var release func()
 	s.once.Do(func() {
-		s.hub.Unsubscribe(s.apiName, s.sub)
+		release = s.hub.cancelSubscription(s.apiName, s.sub)
 		s.startOnce.Do(func() { s.run = nil })
 	})
+	if release != nil {
+		releaseStreamSource(release)
+	}
 }
 
 // ErrStreamFull is returned when the subscriber channel is full (client too slow).
@@ -407,6 +419,14 @@ func (h *StreamHub) subscribePreparedMode(apiName string, params map[string]any,
 
 // Unsubscribe removes a subscriber.
 func (h *StreamHub) Unsubscribe(apiName string, sub *StreamSub) {
+	if release := h.cancelSubscription(apiName, sub); release != nil {
+		releaseStreamSource(release)
+	}
+}
+
+// Return the removed resource without invoking application code while callers
+// still hold their own lifecycle gates. The hub state is complete on return.
+func (h *StreamHub) cancelSubscription(apiName string, sub *StreamSub) func() {
 	// Stop the writer before closing Ch. Otherwise it can observe the closed
 	// queue while its context is live and emit cancellation as an Internal end.
 	// A completed producer is already absent from the hub, but its writer may
@@ -414,7 +434,9 @@ func (h *StreamHub) Unsubscribe(apiName string, sub *StreamSub) {
 	if sub != nil {
 		sub.stopWriting()
 	}
-	h.finish(apiName, sub, context.Canceled)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.finishLocked(apiName, sub, context.Canceled)
 }
 
 func (s *StreamSub) stopWriting() {
@@ -430,7 +452,7 @@ func (h *StreamHub) finish(apiName string, sub *StreamSub, err error) {
 	release := h.finishLocked(apiName, sub, err)
 	h.mu.Unlock()
 	if release != nil {
-		release()
+		releaseStreamSource(release)
 	}
 }
 
@@ -594,7 +616,7 @@ func (h *StreamHub) removeSlowSubscribers(apiName string, slow []*StreamSub) {
 	defer func() {
 		h.mu.Unlock()
 		for _, release := range releases {
-			release()
+			releaseStreamSource(release)
 		}
 	}()
 
@@ -649,8 +671,7 @@ func (rt *Router) PrepareInternalStream(ctx context.Context, req *Request) (*Int
 	if req == nil || !rt.isStreamAPI(req.API) {
 		return nil, luxerrors.New("BadRequest", 400, fmt.Sprintf("api: %q is not a stream", requestAPIName(req)))
 	}
-	identity := rt.identityFromCtx(ctx)
-	prepared, err := rt.prepareStreamHandler(ctx, req, identity)
+	prepared, identity, err := rt.prepareStreamHandler(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -660,7 +681,7 @@ func (rt *Router) PrepareInternalStream(ctx context.Context, req *Request) (*Int
 	if sub == nil {
 		cancel()
 		if prepared.release != nil {
-			prepared.release()
+			releaseStreamSource(prepared.release)
 		}
 		return nil, luxerrors.New("Unavailable", 503, fmt.Sprintf("api: stream %q reached subscriber limit", req.API))
 	}
@@ -720,8 +741,8 @@ func requestAPIName(req *Request) string {
 func binaryStreamParams(req *Request) map[string]any {
 	params := make(map[string]any, req.paramCount)
 	for i := 0; i < req.paramCount && i < len(req.paramNames); i++ {
-		if req.paramSet&(uint16(1)<<i) != 0 {
-			params[req.paramNames[i]] = req.paramSlots[i]
+		if req.paramPresent(i) {
+			params[req.paramNames[i]] = *req.paramSlot(i)
 		}
 	}
 	return params

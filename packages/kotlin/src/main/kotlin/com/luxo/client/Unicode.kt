@@ -31,7 +31,7 @@ internal fun requireLuxoSurrogatePair(text: String, index: Int) {
     require(text.codePointAt(index) > 0xffff) { "String contains an isolated Unicode surrogate" }
 }
 
-/** Validate Unicode only; kotlinx.serialization still owns JSON syntax and number tokens. */
+/** Validate Unicode only; literal syntax is checked separately before parsing. */
 internal fun requireJSONUnicode(text: String): String {
     requireLuxoUnicode(text)
     var slash = text.indexOf('\\')
@@ -63,10 +63,39 @@ private fun surrogateKind(text: String, offset: Int): Int {
 }
 
 /** Preserve raw numbers and reject bad text before duplicate object keys can discard it. */
-fun decodeLuxoJSON(text: String): JsonElement = Json.parseToJsonElement(requireJSONUnicode(text))
+fun decodeLuxoJSON(text: String): JsonElement {
+    return Json.parseToJsonElement(requireJSONTokens(requireJSONUnicode(text)))
+}
 
-/** Serialize once, then check keys, strings and raw JSON literals without reparsing. */
-fun encodeLuxoJSON(value: JsonElement): String = requireJSONUnicode(value.toString())
+/** Generic JSON starts its own container budget, independent of a model or envelope. */
+fun decodeBoundedLuxoJSON(text: String): JsonElement =
+    Json.parseToJsonElement(requireJSONTokens(requireJSONUnicode(text), 128))
+
+/** Check the tree and raw fragments before serialization can recurse beyond the limit. */
+fun encodeBoundedLuxoJSON(value: JsonElement): String {
+    requireRawJSONValues(value, 128)
+    return requireJSONUnicode(value.toString())
+}
+
+/** Validate raw boundaries before serialization can turn fragments into sibling values. */
+fun encodeLuxoJSON(value: JsonElement): String {
+    requireRawJSONValues(value)
+    return requireJSONUnicode(value.toString())
+}
+
+private fun requireRawJSONValues(value: JsonElement, remaining: Int = Int.MAX_VALUE) {
+    when (value) {
+        is JsonObject -> {
+            requireJSONContainerBudget(remaining)
+            for (item in value.values) requireRawJSONValues(item, remaining - 1)
+        }
+        is JsonArray -> {
+            requireJSONContainerBudget(remaining)
+            for (index in value.indices) requireRawJSONValues(value[index], remaining - 1)
+        }
+        is JsonPrimitive -> if (!value.isString) requireJSONTokens(value.content, remaining)
+    }
+}
 
 /** Protect direct generated decoders and custom transports without copying the JSON tree. */
 fun decodeLuxoJsonValue(value: JsonElement): JsonElement {
@@ -74,14 +103,20 @@ fun decodeLuxoJsonValue(value: JsonElement): JsonElement {
     return value
 }
 
-private fun requireJSONValueUnicode(value: JsonElement, depth: Int) {
-    require(depth <= 128) { "JSON nesting exceeds 128 levels" }
+internal fun requireJSONValueUnicode(value: JsonElement, depth: Int) {
     when (value) {
-        is JsonObject -> for ((key, item) in value) {
-            requireLuxoUnicode(key)
-            requireJSONValueUnicode(item, depth + 1)
+        is JsonObject -> {
+            requireJSONContainerBudget(128 - depth)
+            for ((key, item) in value) {
+                requireLuxoUnicode(key)
+                requireJSONValueUnicode(item, depth + 1)
+            }
         }
-        is JsonArray -> for (item in value) requireJSONValueUnicode(item, depth + 1)
-        is JsonPrimitive -> if (value.isString) requireLuxoUnicode(value.content) else requireJSONUnicode(value.content)
+        is JsonArray -> {
+            requireJSONContainerBudget(128 - depth)
+            for (index in value.indices) requireJSONValueUnicode(value[index], depth + 1)
+        }
+        is JsonPrimitive -> if (value.isString) requireLuxoUnicode(value.content)
+            else requireJSONTokens(requireJSONUnicode(value.content), 128 - depth)
     }
 }

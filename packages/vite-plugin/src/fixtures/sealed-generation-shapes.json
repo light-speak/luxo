@@ -1,0 +1,90 @@
+{
+  "models": {},
+  "types": {
+    "Batch": {
+      "name": "Batch",
+      "usage": "inputOutput",
+      "fields": [
+        {
+          "id": 1,
+          "name": "choices",
+          "type": "Sealed",
+          "typeName": "Outcome",
+          "isList": true,
+          "nullable": true
+        }
+      ]
+    }
+  },
+  "sealeds": {
+    "Outcome": {
+      "name": "Outcome",
+      "usage": "inputOutput",
+      "variants": [
+        {
+          "id": 1,
+          "name": "Ready",
+          "fields": []
+        }
+      ]
+    },
+    "InputOnly": {
+      "name": "InputOnly",
+      "usage": "input",
+      "variants": [
+        {
+          "id": 1,
+          "name": "Write",
+          "fields": [
+            {
+              "id": 1,
+              "name": "value",
+              "type": "String",
+              "hasDefault": true
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "apis": {
+    "watch": {
+      "id": 1,
+      "name": "watch",
+      "module": "test",
+      "stream": true,
+      "returnType": "Outcome",
+      "returnNullable": true,
+      "params": [
+        {
+          "id": 1,
+          "name": "value",
+          "type": "Sealed",
+          "typeName": "Outcome",
+          "nullable": true,
+          "hasDefault": true
+        }
+      ]
+    },
+    "batch": {
+      "id": 2,
+      "name": "batch",
+      "module": "test",
+      "returnType": "Batch",
+      "params": [
+        {
+          "id": 1,
+          "name": "value",
+          "type": "Model",
+          "typeName": "Batch"
+        },
+        {
+          "id": 2,
+          "name": "write",
+          "type": "Sealed",
+          "typeName": "InputOnly"
+        }
+      ]
+    }
+  }
+}

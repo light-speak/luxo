@@ -43,16 +43,19 @@ it('counts received bytes even when Content-Length understates the body', async 
   await expect(transport().call('read')).rejects.toMatchObject({ error: 'ParseError' })
 })
 
-it('accepts exact-limit chunks and empty bodies', async () => {
+it('accepts exact-limit chunks and rejects missing Binary payloads', async () => {
   const body = new ReadableStream<Uint8Array>({ start(controller) {
     controller.enqueue(Uint8Array.of(1, 2))
     controller.enqueue(Uint8Array.of(3, 4))
     controller.close()
   } })
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(body)).mockResolvedValueOnce(new Response(null)))
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(body))
+    .mockResolvedValueOnce(new Response(null)).mockResolvedValueOnce(new Response(Uint8Array.of(0))))
   const client = transport(4)
   expect(await client.call('read')).toEqual(Uint8Array.of(1, 2, 3, 4))
-  expect(await client.call('read')).toEqual(new Uint8Array())
+  await expect(client.call('read')).rejects.toMatchObject({ error: 'ParseError', message: 'missing binary response data' })
+  expect(await client.call('read')).toEqual(Uint8Array.of(0))
+  expect(await readHTTPBody(new Response(null), 4)).toEqual(new Uint8Array())
 })
 
 it('bounds JSON responses before parsing and preserves normal JSON results', async () => {
@@ -96,4 +99,24 @@ it('propagates body read failures and releases the reader', async () => {
   const body = new ReadableStream<Uint8Array>({ start(controller) { controller.error(failure) } })
   await expect(readHTTPBody(new Response(body), 64)).rejects.toBe(failure)
   expect(body.locked).toBe(false)
+})
+
+it.each(['declared', 'streamed'])('does not await failing cancellation of an oversized %s body', async kind => {
+  let rejectCancellation!: (reason: Error) => void
+  const cleanup = new Promise<void>((_, reject) => { rejectCancellation = reject })
+  const cancel = vi.fn(() => cleanup)
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) { if (kind === 'streamed') controller.enqueue(new Uint8Array(65)) },
+    cancel,
+  })
+  const response = new Response(body, { headers: kind === 'declared' ? { 'content-length': '65' } : {} })
+  try {
+    await expect(readHTTPBody(response, 64)).rejects.toMatchObject({ error: 'ParseError' })
+    expect(cancel).toHaveBeenCalledOnce()
+    expect(body.locked).toBe(false)
+    expect(await readHTTPBody(new Response(Uint8Array.of(7)), 64)).toEqual(Uint8Array.of(7))
+  } finally {
+    rejectCancellation(new Error('cleanup failed'))
+    await Promise.resolve()
+  }
 })

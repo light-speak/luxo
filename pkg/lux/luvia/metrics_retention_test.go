@@ -83,8 +83,10 @@ func TestInvalidObservationDoesNotPoisonBatch(t *testing.T) {
 	mc.Record("good", time.Millisecond, false)
 	mc.Record("bad\xff", time.Millisecond, false)
 	mc.traceSampleRate = 1
-	mc.RecordTrace(api.TraceRecord{TraceID: "good"})
-	mc.RecordTrace(api.TraceRecord{TraceID: "bad", Spans: "\xff"})
+	mc.RecordTrace(observationTestTrace("good"))
+	badTrace := observationTestTrace("bad")
+	badTrace.Spans = "\xff"
+	mc.RecordTrace(badTrace)
 	mc.flush()
 	if received["ingestMetrics"] != 1 || received["ingestTraces"] != 1 {
 		t.Fatal(received)
@@ -113,7 +115,7 @@ func TestInvalidObservationsAreNotRetried(t *testing.T) {
 				mc.instanceID = "\xff"
 			}
 			mc.Record("bad\xff", time.Millisecond, false)
-			mc.RecordTrace(api.TraceRecord{TraceID: "\xff"})
+			mc.RecordTrace(observationTestTrace("\xff"))
 			mc.flush()
 			mc.flush()
 			if requests != 0 || len(mc.buckets) != 0 || len(mc.traces) != 0 {
@@ -135,13 +137,13 @@ func TestObservationIsolationKeepsValidRetry(t *testing.T) {
 	mc.Record("good", time.Millisecond, false)
 	mc.Record("bad\xff", time.Millisecond, false)
 	for _, id := range []string{"\xff", "first", "\xff", "last", "\xff"} {
-		mc.RecordTrace(api.TraceRecord{TraceID: id})
+		mc.RecordTrace(observationTestTrace(id))
 	}
 	mc.flush()
 	if len(mc.buckets) != 1 || len(mc.traces) != 2 || mc.traces[0].TraceID != "first" || mc.traces[1].TraceID != "last" {
 		t.Fatal("valid retry changed")
 	}
-	if mc.traceBytes != 9 {
+	if mc.traceBytes != 17 {
 		t.Fatal(mc.traceBytes)
 	}
 	before := mc.DroppedObservations()
@@ -161,12 +163,12 @@ func TestObservationRetentionWithInflightFailure(t *testing.T) {
 	defer server.Close()
 	mc := newTraceCollector(server.URL, server.Client())
 	mc.traceSampleRate = 1
-	mc.RecordTrace(api.TraceRecord{TraceID: "old"})
+	mc.RecordTrace(observationTestTrace("old"))
 	var worker sync.WaitGroup
 	worker.Go(mc.flushTraces)
 	<-entered
 	for range maxPendingTraces {
-		mc.RecordTrace(api.TraceRecord{TraceID: "new"})
+		mc.RecordTrace(observationTestTrace("new"))
 		_ = mc.DroppedObservations()
 	}
 	close(release)
@@ -181,6 +183,73 @@ func TestOversizedMetricNameDoesNotCreateBucket(t *testing.T) {
 	mc.Record(strings.Repeat("x", maxMetricNameBytes+1), time.Second, true)
 	if len(mc.buckets) != 0 || mc.DroppedObservations().Measurements != 1 {
 		t.Fatal("unbounded API name retained")
+	}
+}
+
+func TestTraceRecoveryAfterInvalidRecordAndConcurrentOverflow(t *testing.T) {
+	received := make(chan []api.TraceRecord, maxPendingTraces/maxExportTraceRecords+2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Traces []api.TraceRecord `json:"traces"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		received <- body.Traces
+		if len(body.Traces) == 1 && body.Traces[0].TraceID == "old" {
+			<-release
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer server.Close()
+	defer unblock()
+	mc := newTraceCollector(server.URL, server.Client())
+	mc.traceSampleRate = 1
+	mc.RecordTrace(observationTestTrace("bad\xff"))
+	mc.RecordTrace(observationTestTrace("old"))
+	var worker sync.WaitGroup
+	worker.Go(mc.flushTraces)
+	if batch := <-received; len(batch) != 1 || batch[0].TraceID != "old" {
+		t.Fatal("invalid record escaped isolation", batch)
+	}
+	for i := range maxPendingTraces + 2 {
+		mc.RecordTrace(observationTestTrace(strconv.Itoa(i)))
+	}
+	unblock()
+	worker.Wait()
+	assertRecoveredTraceRetention(t, mc)
+	mc.flushTraces()
+	var batch []api.TraceRecord
+	for len(received) != 0 {
+		batch = append(batch, (<-received)...)
+	}
+	if len(batch) != maxPendingTraces {
+		t.Fatal("recovery exported wrong record count", len(batch))
+	}
+	for i, record := range batch {
+		if record.TraceID != strconv.Itoa(i+2) {
+			t.Fatalf("retry changed order at %d: %q", i, record.TraceID)
+		}
+	}
+	if len(mc.traces) != 0 || mc.traceBytes != 0 || mc.DroppedObservations().Traces != 4 {
+		t.Fatal("successful recovery retained data or recounted losses")
+	}
+}
+
+func assertRecoveredTraceRetention(t *testing.T, mc *MetricsCollector) {
+	t.Helper()
+	var size int
+	for _, record := range mc.traces {
+		size += traceTextBytes(record)
+	}
+	if len(mc.traces) != maxPendingTraces || mc.traceBytes != size || size > maxPendingTraceBytes {
+		t.Fatal("failed export bypassed retention bounds")
+	}
+	if got := mc.DroppedObservations(); got.Traces != 4 || got.InvalidTraces != 1 {
+		t.Fatalf("invalid, in-flight and queued losses miscounted: %+v", got)
 	}
 }
 
@@ -213,7 +282,8 @@ func TestConcurrentObservationRetentionAccounting(t *testing.T) {
 	}
 }
 
-func TestSteadyTraceOverflowDoesNotAllocate(t *testing.T) {
+// Retained trace text is owned: one bounded copy is expected per accepted record.
+func TestSteadyTraceOverflowKeepsTextAllocationsBounded(t *testing.T) {
 	for _, text := range []string{"id", strings.Repeat("x", maxTraceTextBytes)} {
 		mc := &MetricsCollector{traceSampleRate: 1}
 		record := api.TraceRecord{TraceID: text}
@@ -224,8 +294,8 @@ func TestSteadyTraceOverflowDoesNotAllocate(t *testing.T) {
 			for range 20000 {
 				mc.RecordTrace(record)
 			}
-		}); got != 0 {
-			t.Fatalf("steady overflow allocated %v times per batch", got)
+		}); got > 20000 {
+			t.Fatalf("steady overflow exceeded one owned text allocation per record: %v", got)
 		}
 	}
 }
@@ -261,11 +331,11 @@ func TestFlushRotatedTraceQueuePreservesOrder(t *testing.T) {
 	}))
 	defer server.Close()
 	mc := newTraceCollector(server.URL, server.Client())
-	mc.traces = []api.TraceRecord{{TraceID: "a"}, {TraceID: "b"}, {TraceID: "c"}}
-	mc.traceBytes = 3
-	mc.replaceOldestTrace(api.TraceRecord{TraceID: "d"}, 1)
+	mc.traces = []api.TraceRecord{observationTestTrace("a"), observationTestTrace("b"), observationTestTrace("c")}
+	mc.traceBytes = 15
+	mc.replaceOldestTrace(observationTestTrace("d"), 5)
 	mc.flushTraces()
-	if !slices.Equal(received, []string{"b", "c", "d"}) || mc.traceHead != 0 || mc.traceBytes != 0 {
+	if !slices.Equal(received, []string{"b", "c", "d"}) || mc.traceHead != 0 || mc.traceBytes != 0 || mc.DroppedObservations().InvalidTraces != 0 {
 		t.Fatal(received)
 	}
 }
@@ -298,4 +368,9 @@ func TestTraceRingVariableSizeFallback(t *testing.T) {
 	if total != mc.traceBytes || total > maxPendingTraceBytes {
 		t.Fatal("byte accounting changed")
 	}
+}
+
+// Fully populated records are accepted by Studio, independently of the failure under test.
+func observationTestTrace(id string) api.TraceRecord {
+	return api.TraceRecord{TraceID: id, APIName: "read", StatusCode: http.StatusOK, Timestamp: time.Unix(100, 0).UTC()}
 }

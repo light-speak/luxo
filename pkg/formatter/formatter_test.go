@@ -5,8 +5,29 @@ import (
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/lexer"
+	"github.com/light-speak/luxo/pkg/parser"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestFormatAssignmentReceivers(t *testing.T) {
+	for _, target := range []string{"load().value", "(item).value", "(load()).value", "holder.cell.value"} {
+		for _, operator := range []string{"=", "+=", "-=", "*="} {
+			t.Run(target+operator, func(t *testing.T) {
+				source := "fn run(): Int { " + target + " " + operator + " next() return 0 }"
+				assertFormatTokensUnchanged(t, source)
+				formatted, err := Format(source, "assignment.luxo")
+				if err != nil {
+					t.Fatal(err)
+				}
+				tokens, lexErrors := lexer.New(formatted, "assignment.luxo").Tokenize()
+				_, parseErrors := parser.New(tokens).Parse("assignment.luxo")
+				if len(lexErrors)+len(parseErrors) != 0 {
+					t.Fatal(lexErrors, parseErrors)
+				}
+			})
+		}
+	}
+}
 
 func TestFormatRawNestedBodyPreservesTokens(t *testing.T) {
 	for _, body := range []string{

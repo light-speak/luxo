@@ -7,7 +7,6 @@ import (
 	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux/schema"
-	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
@@ -72,7 +71,7 @@ func (g *GeneratorContext) generateSchemaFile(result *semantic.Result, packageNa
 
 	declarationCount := 0
 	for _, file := range result.Files {
-		declarationCount += len(file.Types) + len(file.Enums)
+		declarationCount += len(file.Types) + len(file.Enums) + len(file.Sealeds)
 	}
 	if len(models) == 0 && len(stubs) == 0 && len(apis) == 0 && declarationCount == 0 {
 		return nil
@@ -106,6 +105,9 @@ func (g *GeneratorContext) generateSchemaFile(result *semantic.Result, packageNa
 		}
 		for _, enumDecl := range file.Enums {
 			writeEnumRegistration(&b, enumDecl, moduleName)
+		}
+		for _, declaration := range file.Sealeds {
+			g.writeSealedRegistration(&b, declaration, moduleName, enums)
 		}
 	}
 	b.WriteString("\ts.InferTypeUsage()\n")
@@ -179,7 +181,8 @@ func (g *GeneratorContext) collectSchemaAPIsWithOwnership(result *semantic.Resul
 			if hasDirective(fn.Directives, "service") {
 				apis = append(apis, schemaAPIInfo{
 					name: "svc:" + fn.Name, moduleName: modName, internal: true,
-					params: fn.Params, returnType: fn.ReturnType, description: fn.Doc,
+					params: fn.Params, returnType: unwrapResultType(fn.ReturnType),
+					directives: fn.Directives, description: fn.Doc,
 				})
 			}
 		}
@@ -339,7 +342,7 @@ func (g *GeneratorContext) writeModelRegistration(b *strings.Builder, m *ast.Mod
 
 		// Scalar fields: write type info for Binary↔JSON
 		if !isRelation {
-			fieldType := luxoTypeToSchemaType(f.Type.Name, enums)
+			fieldType := g.schemaFieldKindName(f.Type.Name, enums)
 			fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q, Nullable: %v, IsList: %v, Computed: %v, PrimaryKey: %v",
 				fieldID, f.Name, fieldType, f.Type.Name, f.Type.Nullable, f.Type.IsList, f.Computed != nil, f.Name == primaryKeyFieldName(m))
 			writeInlineFieldMetadata(b, f)
@@ -380,8 +383,8 @@ func (g *GeneratorContext) writeTypeRegistration(b *strings.Builder, t *ast.Type
 		if fieldID == 0 {
 			continue
 		}
-		relation := isRelationField(f, enums)
-		fieldType := luxoTypeToSchemaType(f.Type.Name, enums)
+		relation := isRelationField(f, enums) && g.sealedDeclaration(f.Type.Name) == nil
+		fieldType := g.schemaFieldKindName(f.Type.Name, enums)
 		if relation {
 			// Nested type/model reference — the converter dispatches blob
 			// decoding on Type==FieldModel; FieldString would misread the
@@ -539,7 +542,7 @@ func (g *GeneratorContext) writeAPIParamSchema(b *strings.Builder, name string, 
 	nullable := false
 	if p.Type != nil {
 		typeName = p.Type.Name
-		pType = luxoParamToSchemaType(typeName, enums)
+		pType = g.schemaFieldKindName(typeName, enums)
 		isList = p.Type.IsList
 		nullable = p.Type.Nullable
 	}
@@ -619,31 +622,46 @@ func BuildSchemaJSON(result *semantic.Result, enums map[string]bool, config Gene
 }
 
 func (g *GeneratorContext) BuildSchemaJSON(result *semantic.Result, enums map[string]bool) ([]byte, error) {
+	if err := validateSemanticResult(result); err != nil {
+		return nil, err
+	}
+	var err error
+	g, result, err = g.prepareValueCompilation(result)
+	if err != nil {
+		return nil, err
+	}
 	copy := *result
-	copy.Files = inferred.ExpandedFiles(result.Files)
-	result = &copy
-	declaredEnums := collectEnums(result)
+	copy.Files = mergeModuleExtensions(inferred.ExpandedFiles(result.Files))
+	expandedResult := &copy
+	g = g.withModelReferences(expandedResult)
+	if err := g.prepareSealeds(expandedResult); err != nil {
+		return nil, err
+	}
+	declaredEnums := collectEnums(expandedResult)
 	for name, enabled := range enums {
 		if enabled {
 			declaredEnums[name] = true
 		}
 	}
 	enums = g.allEnums(declaredEnums)
-	if err := g.validateRegisteredParameters(result, enums); err != nil {
+	if err := g.validateRegisteredParameters(expandedResult, enums); err != nil {
 		return nil, err
 	}
-	if err := g.validateFieldIdentifiers(result); err != nil {
+	if err := g.validateFieldIdentifiers(expandedResult, enums); err != nil {
 		return nil, err
 	}
 	s := schema.New()
-	if err := g.buildSchemaModels(s, result, enums); err != nil {
+	if err := g.buildSchemaModels(s, expandedResult, enums); err != nil {
 		return nil, err
 	}
-	if err := g.buildSchemaAPIs(s, result, enums); err != nil {
+	if err := g.buildSchemaAPIs(s, expandedResult, enums); err != nil {
 		return nil, err
 	}
-	buildSchemaEnums(s, result)
-	if err := g.buildSchemaTypes(s, result, enums); err != nil {
+	buildSchemaEnums(s, expandedResult)
+	if err := g.buildSchemaTypes(s, expandedResult, enums); err != nil {
+		return nil, err
+	}
+	if err := g.buildSchemaSealeds(s, expandedResult, enums); err != nil {
 		return nil, err
 	}
 	s.InferTypeUsage()
@@ -717,7 +735,7 @@ func (g *GeneratorContext) schemaFieldFromDecl(modelName string, field *ast.Fiel
 	result := schema.Field{
 		ID:          g.modelFieldID(modelName, field.Name),
 		Name:        field.Name,
-		Type:        luxoTypeToSchemaFieldType(field.Type.Name, enums),
+		Type:        g.schemaFieldKind(field.Type.Name, enums),
 		TypeName:    field.Type.Name,
 		Nullable:    field.Type.Nullable,
 		IsList:      field.Type.IsList,
@@ -780,7 +798,7 @@ func (g *GeneratorContext) relationForeignKeyName(model *ast.ModelDecl) string {
 	if field := primaryKeyField(model); field != nil {
 		keyName = field.Name
 	}
-	return str.LowerFirst(model.Name) + str.Capitalize(keyName)
+	return inferred.ForeignKeyName(model.Name, keyName)
 }
 
 func (g *GeneratorContext) buildSchemaAPIs(s *schema.Schema, result *semantic.Result, enums map[string]bool) error {
@@ -848,7 +866,7 @@ func (g *GeneratorContext) buildSchemaAPIs(s *schema.Schema, result *semantic.Re
 			for _, p := range api.EffectiveParams() {
 				a.Params = append(a.Params, schema.Param{
 					ID: g.apiParamID(api.Name, p.Name), Name: p.Name,
-					Type:        luxoParamToSchemaFieldType(p.Type.Name, enums),
+					Type:        g.schemaFieldKind(p.Type.Name, enums),
 					TypeName:    p.Type.Name,
 					IsList:      p.Type.IsList,
 					Nullable:    p.Type.Nullable,
@@ -884,7 +902,7 @@ func (g *GeneratorContext) schemaParamForModelID(apiName string, model *ast.Mode
 	}
 	return schema.Param{
 		ID: g.apiParamID(apiName, name), Name: name,
-		Type: luxoParamToSchemaFieldType(typeName, enums), TypeName: typeName, IsList: list, Description: description,
+		Type: g.schemaFieldKind(typeName, enums), TypeName: typeName, IsList: list, Description: description,
 	}
 }
 
@@ -896,7 +914,7 @@ func (g *GeneratorContext) schemaCRUDFieldParams(apiName string, model *ast.Mode
 		}
 		params = append(params, schema.Param{
 			ID: g.apiParamID(apiName, field.Name), Name: field.Name,
-			Type: luxoParamToSchemaFieldType(field.Type.Name, enums), TypeName: field.Type.Name,
+			Type: g.schemaFieldKind(field.Type.Name, enums), TypeName: field.Type.Name,
 			IsList: field.Type.IsList, Nullable: field.Type.Nullable, HasDefault: update || field.Type.Nullable || field.Default != nil,
 			Description: field.Doc,
 		})
@@ -907,7 +925,11 @@ func (g *GeneratorContext) schemaCRUDFieldParams(apiName string, model *ast.Mode
 func buildSchemaEnums(s *schema.Schema, result *semantic.Result) {
 	for _, file := range result.Files {
 		for _, e := range file.Enums {
-			s.RegisterEnum(&schema.Enum{Name: e.Name, Module: moduleNameFromFile(file.Name), Values: e.Values, Description: e.Doc})
+			values := e.Values
+			if values == nil {
+				values = []string{}
+			}
+			s.RegisterEnum(&schema.Enum{Name: e.Name, Module: moduleNameFromFile(file.Name), Values: values, Description: e.Doc})
 		}
 	}
 }
@@ -922,7 +944,7 @@ func (g *GeneratorContext) buildSchemaTypes(s *schema.Schema, result *semantic.R
 				}
 				st.Fields = append(st.Fields, schema.Field{
 					ID: g.modelFieldID(t.Name, f.Name), Name: f.Name,
-					Type: luxoTypeToSchemaFieldType(f.Type.Name, enums), TypeName: f.Type.Name,
+					Type: g.schemaFieldKind(f.Type.Name, enums), TypeName: f.Type.Name,
 					Nullable: f.Type.Nullable, IsList: f.Type.IsList,
 					Description: f.Doc, Directives: schemaDirectiveNames(f.Directives),
 				})

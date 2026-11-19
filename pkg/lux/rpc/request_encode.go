@@ -17,7 +17,7 @@ type callRequest struct {
 var errRequestFrameTooLarge = errors.New("rpc: request exceeds maximum frame size")
 
 func (r callRequest) prepare(conn net.Conn) ([]byte, error) {
-	size := 2 + varintSize(uint64(len(r.token))) + len(r.token) + callBodySize(r.apiID, r.mask, r.params)
+	size := callFrameSize(r.token, r.apiID, r.mask, r.params)
 	if size > maxFrameSize || size < 0 {
 		return nil, errRequestFrameTooLarge
 	}
@@ -65,15 +65,14 @@ func appendEnvelopePrefix(dst []byte, kind, flags byte, token string) []byte {
 // Reserve the frame prefix and compose into one owned buffer. The writer
 // fills the prefix after checking the final size; no body is encoded twice.
 func prepareCallFrame(kind byte, token string, apiID int, mask, params []byte) []byte {
-	size := 2 + varintSize(uint64(len(token))) + len(token) + callBodySize(apiID, mask, params)
+	size := callFrameSize(token, apiID, mask, params)
 	dst := make([]byte, 4, size+4)
 	dst = appendEnvelopePrefix(dst, kind, 0, token)
 	return appendCallBody(dst, apiID, mask, params)
 }
 
 func prepareTracedCallFrame(token, traceID, path string, details bool, apiID int, mask, params []byte) []byte {
-	size := 3 + varintSize(uint64(len(token))) + len(token) + callBodySize(apiID, mask, params)
-	size += varintSize(uint64(len(traceID))) + len(traceID) + varintSize(uint64(len(path))) + len(path)
+	size := tracedCallFrameSize(token, traceID, path, apiID, mask, params)
 	dst := make([]byte, 4, size+4)
 	dst = appendEnvelopePrefix(dst, requestKindCall, requestFlagTraced, token)
 	dst = codec.AppendVarint(dst, uint64(len(traceID)))
@@ -86,4 +85,13 @@ func prepareTracedCallFrame(token, traceID, path string, details bool, apiID int
 	}
 	dst = append(dst, flag)
 	return appendCallBody(dst, apiID, mask, params)
+}
+
+func callFrameSize(token string, apiID int, mask, params []byte) int {
+	return 2 + varintSize(uint64(len(token))) + len(token) + callBodySize(apiID, mask, params)
+}
+
+func tracedCallFrameSize(token, traceID, path string, apiID int, mask, params []byte) int {
+	return callFrameSize(token, apiID, mask, params) + 1 +
+		varintSize(uint64(len(traceID))) + len(traceID) + varintSize(uint64(len(path))) + len(path)
 }

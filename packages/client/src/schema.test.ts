@@ -1,8 +1,59 @@
+import { readFileSync } from 'node:fs'
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import type { LuxoComputedSource, LuxoSchema } from './index'
 import { MAX_API_ID, MAX_PARAM_ID, MAX_SELECTION_FIELD_ID, validateSchemaIDs } from './schema'
 
 describe('stable Schema IDs', () => {
+  it('validates the separate sealed tag and payload field namespaces', () => {
+    const fixture = JSON.parse(readFileSync(new URL('../../../pkg/lux/codec/testdata/sealed-v1.json', import.meta.url), 'utf8')) as { schema: LuxoSchema }
+    expect(() => validateSchemaIDs(fixture.schema)).not.toThrow()
+    const zeroTag = structuredClone(fixture.schema)
+    zeroTag.sealeds!.Outcome!.variants[0]!.id = 0
+    expect(() => validateSchemaIDs(zeroTag)).toThrow('ID')
+    const duplicate = structuredClone(fixture.schema)
+    duplicate.sealeds!.Outcome!.variants[1]!.id = 1
+    expect(() => validateSchemaIDs(duplicate)).toThrow('duplicate')
+    const badPayload = structuredClone(fixture.schema)
+    badPayload.sealeds!.Outcome!.variants[0]!.fields[0]!.id = 65536
+    expect(() => validateSchemaIDs(badPayload)).toThrow('ID')
+  })
+  it('accepts a parameterless API and valid pagination without rewriting metadata', () => {
+    const params = [{ id: 7, name: 'page', type: 'Int' }, { id: 9, name: 'pageSize', type: 'Int' }]
+    const schema: LuxoSchema = { models: {}, apis: {
+      read: { id: 1, name: 'read', module: 'test' },
+      browse: { id: 2, name: 'browse', module: 'test', paginated: true, params },
+    } }
+    expect(() => validateSchemaIDs(schema)).not.toThrow()
+    expect(schema.apis.browse.params).toBe(params)
+    expect(schema.apis.read.params).toBeUndefined()
+    expect(() => validateSchemaIDs({ models: {}, apis: {
+      browse: { id: 2, name: 'browse', module: 'test', paginated: true },
+    } })).toThrow('pagination')
+  })
+
+  it.each(['page', 'pageSize'])('rejects a missing numbered pagination parameter %s', missing => {
+    const schema: LuxoSchema = { models: {}, apis: { browse: {
+      id: 1, name: 'browse', module: 'test', paginated: true,
+      params: ['page', 'pageSize'].filter(name => name !== missing).map(name => ({ id: 7, name, type: 'Int' })),
+    } } }
+    expect(() => validateSchemaIDs(schema)).toThrow('pagination')
+  })
+  it.each([
+    { type: 'String' }, { type: 'Int', nullable: true }, { type: 'Int', isList: true },
+  ])('rejects malformed pagination type %j', invalid => {
+    const schema: LuxoSchema = { models: {}, apis: { browse: {
+      id: 1, name: 'browse', module: 'test', paginated: true,
+      params: [{ id: 7, name: 'page', ...invalid }, { id: 9, name: 'pageSize', type: 'Int' }],
+    } } }
+    expect(() => validateSchemaIDs(schema)).toThrow('pagination')
+  })
+  it('rejects duplicate pagination names with distinct IDs', () => {
+    expect(() => validateSchemaIDs({ models: {}, apis: { browse: {
+      id: 1, name: 'browse', module: 'test', paginated: true,
+      params: [{ id: 7, name: 'page', type: 'Int' }, { id: 8, name: 'page', type: 'Int' },
+        { id: 9, name: 'pageSize', type: 'Int' }],
+    } } })).toThrow('pagination')
+  })
   it('keeps classified limits distinct from business integer ranges', () => {
     expect(MAX_SELECTION_FIELD_ID).toBe(65535)
     expect(MAX_API_ID).toBe(2147483647)

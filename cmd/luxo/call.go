@@ -3,13 +3,16 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/schema"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 	"github.com/spf13/cobra"
@@ -51,8 +54,10 @@ func runCall(cmd *cobra.Command, args []string) error {
 	return callBinaryMode(apiName, args[1:])
 }
 
+// The private body contains only strings or independently copied, validated RawMessages.
+// Keep encoder error propagation; arbitrary marshalers, cycles and non-finite floats cannot enter here.
 func callJSONMode(apiName string, params []string) error {
-	body := map[string]any{"$api": apiName}
+	body := map[string]any{}
 	if callSelect != "" {
 		body["$select"] = callSelect
 	}
@@ -60,6 +65,7 @@ func callJSONMode(apiName string, params []string) error {
 		k, v := parseParam(p)
 		body[k] = inferType(v)
 	}
+	body["$api"] = apiName
 
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -71,9 +77,11 @@ func callJSONMode(apiName string, params []string) error {
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
-	fmt.Println(string(respBody))
-	return nil
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	return printCLIHTTPJSON(respBody, resp.StatusCode)
 }
 
 func callBinaryMode(apiName string, params []string) error {
@@ -129,7 +137,10 @@ func callBinaryMode(apiName string, params []string) error {
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
 
 	if resp.Header.Get("X-Luxo-Mode") == "binary" {
 		fmt.Fprintf(os.Stderr, "[binary] %d bytes, status %d\n", len(respBody), resp.StatusCode)
@@ -143,9 +154,25 @@ func callBinaryMode(apiName string, params []string) error {
 		return decodeBinaryResponse(respBody, apiSchema, runtimeSchema)
 	} else {
 		// JSON response (error or fallback)
-		fmt.Println(string(respBody))
+		return printCLIHTTPJSON(respBody, resp.StatusCode)
+	}
+}
+
+func printCLIHTTPJSON(body []byte, status int) error {
+	fmt.Println(string(body))
+	if status < http.StatusOK || status >= http.StatusMultipleChoices {
+		return cliHTTPStatusError(status)
 	}
 	return nil
+}
+
+func cliHTTPStatusError(status int) error {
+	const prefix = "server returned HTTP status "
+	// Every int64 decimal fits, without boxing the status or delaying Error().
+	var message [len(prefix) + 20]byte
+	data := append(message[:0], prefix...)
+	data = strconv.AppendInt(data, int64(status), 10)
+	return errors.New(string(data))
 }
 
 // decodeBinaryResponse prints a hex + field dump of a binary response.
@@ -156,6 +183,17 @@ func decodeBinaryResponse(data []byte, apiSchema *schema.API, runtimeSchema *sch
 	}
 
 	if apiSchema.ReturnType != "" {
+		if apiSchema.ReturnNullable {
+			value, null, err := codec.UnwrapNullableRoot(data)
+			if err != nil {
+				return err
+			}
+			if null {
+				fmt.Println("null")
+				return nil
+			}
+			data = value
+		}
 		if model := runtimeSchema.LookupModel(apiSchema.ReturnType); model != nil {
 			var output []byte
 			var err error

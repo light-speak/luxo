@@ -22,6 +22,20 @@ func TestEvaluateAcceptsNoiseAndImprovements(t *testing.T) {
 	}
 }
 
+func TestEvaluateRequiresMetricsForEachBenchmark(t *testing.T) {
+	complete := benchstatCSV("~", "~", "n=10")
+	for _, unit := range []string{"sec/op", "B/op", "allocs/op"} {
+		partial := strings.ReplaceAll(benchstatTable(unit, "~", "n=10"), "EncodeEvent-2", "Incomplete-2")
+		if _, err := evaluate(strings.NewReader(complete + "\n" + partial)); err == nil {
+			t.Errorf("complete peer hid incomplete %s metrics", unit)
+		}
+	}
+	second := strings.ReplaceAll(complete, "EncodeEvent-2", "CompletePeer-2")
+	if _, err := evaluate(strings.NewReader(complete + "\n" + second)); err != nil {
+		t.Fatal("rejected two complete benchmarks", err)
+	}
+}
+
 func TestEvaluateRejectsSignificantTimeRegression(t *testing.T) {
 	result, err := evaluate(strings.NewReader(benchstatCSV("+5.01%", "~", "n=10")))
 	if err != nil {
@@ -138,7 +152,7 @@ func TestConfirmEvaluationsRejectsRepeatedRegression(t *testing.T) {
 
 func TestConfirmEvaluationsRequiresMatchingComparisons(t *testing.T) {
 	primary := mustEvaluate(t, benchstatCSV("~", "~", "n=10"))
-	confirmation := mustEvaluate(t, strings.Replace(benchstatCSV("~", "~", "n=10"), "EncodeEvent-2", "DecodeEvent-2", 1))
+	confirmation := mustEvaluate(t, strings.ReplaceAll(benchstatCSV("~", "~", "n=10"), "EncodeEvent-2", "DecodeEvent-2"))
 
 	if _, err := confirmEvaluations(primary, confirmation); err == nil || !strings.Contains(err.Error(), "comparison sets differ") {
 		t.Fatalf("error = %v", err)
@@ -285,7 +299,7 @@ func TestRunRejectsInvalidArgumentsAndPaths(t *testing.T) {
 	if err := run([]string{validPath, "missing"}, io.Discard); err == nil {
 		t.Fatal("missing confirmation error = nil")
 	}
-	differentPath := writeRunInput(t, strings.Replace(benchstatCSV("~", "~", "n=10"), "EncodeEvent-2", "DecodeEvent-2", 1))
+	differentPath := writeRunInput(t, strings.ReplaceAll(benchstatCSV("~", "~", "n=10"), "EncodeEvent-2", "DecodeEvent-2"))
 	if err := run([]string{validPath, differentPath}, io.Discard); err == nil || !strings.Contains(err.Error(), "comparison sets differ") {
 		t.Fatalf("comparison mismatch error = %v", err)
 	}

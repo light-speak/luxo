@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -1210,6 +1211,25 @@ func TestStreamParams_Get_Exists(t *testing.T) {
 	}
 }
 
+func TestStreamParamsLookupFloatRejectsNonFinite(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		params := &StreamParams{values: map[string]any{"value": value}}
+		if _, ok := params.LookupFloat("value"); ok {
+			t.Errorf("non-finite Float accepted: %v", value)
+		}
+		if got := params.Float("value"); got != 0 {
+			t.Errorf("invalid Float did not use the missing-value default: %v", got)
+		}
+	}
+	for _, value := range []float64{0, math.Copysign(0, -1), math.SmallestNonzeroFloat64, math.MaxFloat64, -math.MaxFloat64} {
+		params := &StreamParams{values: map[string]any{"value": value}}
+		got, ok := params.LookupFloat("value")
+		if !ok || math.Float64bits(got) != math.Float64bits(value) {
+			t.Errorf("finite Float changed: %v => %v, %v", value, got, ok)
+		}
+	}
+}
+
 func TestStreamParamsNativeTypeVariants(t *testing.T) {
 	id := uuid.MustParse("550e8400-e29b-41d4-a716-446655440000")
 	fixedID := [16]byte(id)
@@ -1361,5 +1381,33 @@ func TestStreamHubSubscribeLimit(t *testing.T) {
 	sub2 := hub.Subscribe("otherAPI", nil, nil, nil, cancel)
 	if sub2 == nil {
 		t.Fatal("subscribe to different API should succeed")
+	}
+}
+
+func TestSlowStreamReleasePanicDoesNotSkipOtherSources(t *testing.T) {
+	hub := NewStreamHub()
+	first, second := 0, 0
+	for _, release := range []func(){
+		func() { first++; panic("private cleanup detail") },
+		func() { second++ },
+	} {
+		sub := hub.subscribePreparedMode("watch", nil, nil, nil, true, nil, nil, preparedStream{release: release})
+		for range cap(sub.Ch) {
+			sub.Ch <- []byte{1}
+		}
+	}
+	func() {
+		defer func() {
+			if recover() != nil {
+				t.Error("source cleanup panic escaped dispatch")
+			}
+		}()
+		hub.DispatchEncoded("watch", []byte{2}, nil)
+	}()
+	if first != 1 || second != 1 {
+		t.Fatalf("source cleanup skipped: first=%d second=%d", first, second)
+	}
+	if hub.SubCount("watch") != 0 {
+		t.Fatal("slow subscribers retained")
 	}
 }

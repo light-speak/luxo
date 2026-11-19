@@ -31,6 +31,9 @@ func (s *Schema) Prepare() error {
 	for _, decl := range s.Types {
 		s.registerType(decl)
 	}
+	for _, declaration := range s.Sealeds {
+		s.registerSealed(declaration)
+	}
 	s.apiNames = ids
 	return nil
 }

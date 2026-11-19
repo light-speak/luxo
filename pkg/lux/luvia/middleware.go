@@ -4,7 +4,9 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/auth"
 )
 
@@ -38,18 +40,28 @@ func BearerToken(ctx context.Context) string {
 func AuthMiddleware(cfg *auth.Config, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := extractBearerToken(r)
-		if token == "" && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		if token == "" && r.Method == http.MethodGet && api.IsWebSocketUpgrade(r) {
 			token = r.URL.Query().Get("token")
 		}
 		if token != "" {
 			// Cached verify — same Bearer token repeats across a session's
 			// requests; the cache removes HMAC + JSON decode from the hot path.
-			data, err := auth.VerifyCached(cfg, token)
+			data, expiry, err := auth.VerifyCachedWithExpiry(cfg, token)
 			if err == nil {
 				ctx := context.WithValue(r.Context(), identityKey, &data)
 				ctx = context.WithValue(ctx, bearerTokenCtxKey{}, token)
-				r = r.WithContext(ctx)
+				if r.Method == http.MethodGet && api.IsWebSocketUpgrade(r) {
+					ctx = api.WithWebSocketTokenExpiry(ctx, time.Unix(expiry, 0))
+				}
+				next.ServeHTTP(w, r.WithContext(ctx))
+				return
 			}
+		}
+		if Identity(r.Context()) != nil || BearerToken(r.Context()) != "" {
+			ctx := context.WithValue(r.Context(), identityKey, (*Claims)(nil))
+			ctx = context.WithValue(ctx, bearerTokenCtxKey{}, "")
+			ctx = api.WithoutWebSocketTokenExpiry(ctx)
+			r = r.WithContext(ctx)
 		}
 		next.ServeHTTP(w, r)
 	})

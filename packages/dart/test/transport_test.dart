@@ -1,4 +1,8 @@
 import 'dart:async';
+
+import 'support/http_refresh_cases.dart';
+import 'support/schema_request_cases.dart';
+
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -44,7 +48,149 @@ class _SelectionRequest extends GeneratedRequest {
 }
 
 void main() {
+  test('nullable JSON keeps canonical null separate from literal values', () {
+    final empty = LuxoEncoder();
+    encodeParam(
+      empty,
+      const ParamSchema(1, 'value', 'JSON', false, true),
+      null,
+    );
+    expect(empty.bytes(), [1, 0]);
+    final text = LuxoEncoder();
+    encodeParam(
+      text,
+      const ParamSchema(1, 'value', 'JSON', false, true),
+      'null',
+    );
+    expect(text.bytes(), [1, 1, 6, 34, 110, 117, 108, 108, 34]);
+    final list = LuxoEncoder();
+    encodeParam(list, const ParamSchema(1, 'value', 'JSON', true, true), [
+      null,
+    ]);
+    expect(list.bytes(), [1, 1, 1, 4, 110, 117, 108, 108]);
+    expect(
+      () => encodeParam(
+        LuxoEncoder(),
+        const ParamSchema(1, 'value', 'JSON'),
+        null,
+      ),
+      throwsA(isA<LuxoError>()),
+    );
+  });
+
+  test(
+    'binary HTTP requires body and preserves null marker',
+    verifyHTTPBinaryPresence,
+  );
   group('HttpTransport', () {
+    test('typed JSON responses preserve independent budgets through refresh and Schema replacement', () async {
+      const response = JSONResponseSchema(
+        modelType: 'Node',
+        types: {
+          'Node': {
+            'child': SelectionFieldSchema(1, 'Node', 'Model'),
+            'metadata': SelectionFieldSchema(2, null, 'JSON'),
+          },
+        },
+      );
+      final json128 = '${'[' * 128}null${']' * 128}';
+      final model65 = '${'{"child":' * 64}{}${'}' * 64}';
+      for (final refresh in [false, true]) {
+        var requests = 0;
+        late HttpTransport transport;
+        final client = http_testing.MockClient((_) async {
+          requests++;
+          transport.setSchema({'read': const APISchemaEntry(1)});
+          if (refresh && requests == 1) {
+            return http.Response(
+              '{"error":"Unauthorized","code":401,"message":"expired","data":$model65}',
+              401,
+            );
+          }
+          return http.Response('{"data":{"metadata":$json128}}', 200);
+        });
+        transport = HttpTransport(
+          'http://localhost',
+          client: client,
+          onTokenExpired: () async => 'new-token',
+        );
+        transport.setSchema({
+          'read': const APISchemaEntry(1, [], {}, {}, response),
+        });
+        try {
+          final value = await transport.call<Map>(
+            'read',
+            decoder: (value) => value as Map,
+          );
+          expect(value['metadata'], isA<List>());
+          expect(requests, refresh ? 2 : 1);
+          transport.setSchema({
+            'read': const APISchemaEntry(1, [], {}, {}, response),
+          });
+          final raw = await transport.call<Map>('read');
+          expect(raw['metadata'], isA<List>());
+        } finally {
+          transport.close();
+          client.close();
+        }
+      }
+      for (final body in ['{"data":$model65}', '{"data":$model65,"data":{}}']) {
+        final client = http_testing.MockClient(
+          (_) async => http.Response(body, 200),
+        );
+        final transport = HttpTransport('http://localhost', client: client);
+        transport.setSchema({
+          'read': const APISchemaEntry(1, [], {}, {}, response),
+        });
+        try {
+          await expectLater(
+            transport.call<Object?>('read', decoder: (value) => value),
+            throwsA(
+              isA<LuxoError>().having(
+                (error) => error.error,
+                'error',
+                'ParseError',
+              ),
+            ),
+          );
+        } finally {
+          transport.close();
+          client.close();
+        }
+      }
+    });
+
+    test('HTTP JSON retains plan during Schema replacement', () async {
+      var sends = 0;
+      final client = http_testing.MockClient((request) async {
+        sends++;
+        return http.Response('{"data":true}', 200);
+      });
+      final transport = HttpTransport('http://localhost/luvia', client: client);
+      transport.setSchema({
+        'echo': const APISchemaEntry(7, [ParamSchema(1, 'value', 'Int')]),
+      });
+      final request = ReplacingSchemaRequest(7, () {
+        transport.setSchema({
+          'echo': const APISchemaEntry(7, [ParamSchema(1, 'value', 'Float')]),
+        });
+      });
+      try {
+        await expectLater(
+          transport.call<Object?>('echo', request: request),
+          throwsA(
+            isA<LuxoError>().having((e) => e.error, 'error', 'ConfigError'),
+          ),
+        );
+        expect(sends, 0);
+        await transport.call<Object?>('echo', params: {'value': 1.5});
+        expect(sends, 1);
+      } finally {
+        transport.close();
+        client.close();
+      }
+    });
+
     test(
       'shared plans keep HTTP Schema and manual selections isolated',
       () async {
@@ -171,8 +317,8 @@ void main() {
           timeout: const Duration(milliseconds: 50),
         );
 
-        expect(
-          () => transport.call('user.get', params: {'id': 1}),
+        await expectLater(
+          transport.call('user.get', params: {'id': 1}),
           throwsA(
             isA<LuxoError>()
                 .having((e) => e.error, 'error', 'TimeoutError')
@@ -199,8 +345,8 @@ void main() {
           'user.get': APISchemaEntry(1, [ParamSchema(1, 'id', 'Int')]),
         });
 
-        expect(
-          () => transport.call('user.get', params: {'id': 1}),
+        await expectLater(
+          transport.call('user.get', params: {'id': 1}),
           throwsA(
             isA<LuxoError>().having((e) => e.error, 'error', 'TimeoutError'),
           ),
@@ -209,6 +355,42 @@ void main() {
         transport.close();
       });
     });
+
+    for (final mode in TransportMode.values) {
+      test(
+        'HTTP refresh identity replacement ${mode.name}',
+        () => verifyHTTPRefreshIdentity(mode),
+      );
+      test('refresh deadline $mode', () => verifyHTTPRefreshDeadline(mode));
+      test(
+        'generated refresh request snapshot $mode',
+        () => verifyHTTPRefreshRequestSnapshot(mode, generated: true),
+      );
+      test(
+        'refresh request snapshot $mode',
+        () => verifyHTTPRefreshRequestSnapshot(mode),
+      );
+      test(
+        'refresh retry deadline $mode',
+        () => verifyHTTPRefreshRetryDeadline(mode),
+      );
+      for (final completion in ['null', 'reject', 'throw']) {
+        test(
+          'HTTP refresh failure ${mode.name} $completion',
+          () => verifyHTTPRefreshFailure(mode, completion),
+        );
+      }
+      test(
+        'close during HTTP refresh settlement ${mode.name}',
+        () => verifyHTTPRefreshCloseSettlement(mode),
+      );
+      for (final failLate in [false, true]) {
+        test(
+          'close ends pending HTTP refresh ${mode.name} late failure=$failLate',
+          () => verifyHTTPRefreshClose(mode, failLate),
+        );
+      }
+    }
 
     group('onTokenExpired (401 auto-refresh)', () {
       test('retries with new token on 401', () async {
@@ -264,8 +446,8 @@ void main() {
           onTokenExpired: () async => 'new-token',
         );
 
-        expect(
-          () => transport.call('user.get'),
+        await expectLater(
+          transport.call('user.get'),
           throwsA(
             isA<LuxoError>()
                 .having((e) => e.error, 'error', 'Unauthorized')
@@ -298,8 +480,8 @@ void main() {
           onTokenExpired: () async => null,
         );
 
-        expect(
-          () => transport.call('user.get'),
+        await expectLater(
+          transport.call('user.get'),
           throwsA(isA<LuxoError>().having((e) => e.code, 'code', 401)),
         );
         await Future.delayed(Duration.zero);
@@ -324,8 +506,8 @@ void main() {
           client: mockClient,
         );
 
-        expect(
-          () => transport.call('user.get'),
+        await expectLater(
+          transport.call('user.get'),
           throwsA(isA<LuxoError>().having((e) => e.code, 'code', 401)),
         );
         transport.close();
@@ -402,8 +584,8 @@ void main() {
           client: mockClient,
         );
 
-        expect(
-          () => transport.call('user.get'),
+        await expectLater(
+          transport.call('user.get'),
           throwsA(isA<LuxoError>().having((e) => e.error, 'error', 'NotFound')),
         );
         transport.close();
@@ -432,7 +614,7 @@ void main() {
         late Uint8List captured;
         final mockClient = http_testing.MockClient((request) async {
           captured = request.bodyBytes;
-          return http.Response.bytes([], 200);
+          return http.Response.bytes([0], 200);
         });
         final transport = HttpTransport(
           'http://localhost:8080',
@@ -453,7 +635,7 @@ void main() {
 
       test('requires selection for structured responses only', () async {
         final mockClient = http_testing.MockClient((request) async {
-          return http.Response.bytes([], 200);
+          return http.Response.bytes([0], 200);
         });
         final transport = HttpTransport(
           'http://localhost:8080',
@@ -485,7 +667,7 @@ void main() {
         late Uint8List captured;
         final mockClient = http_testing.MockClient((request) async {
           captured = request.bodyBytes;
-          return http.Response.bytes([], 200);
+          return http.Response.bytes([0], 200);
         });
         final transport = HttpTransport(
           'http://localhost:8080',
@@ -521,7 +703,7 @@ void main() {
         late Uint8List captured;
         final mockClient = http_testing.MockClient((request) async {
           captured = request.bodyBytes;
-          return http.Response.bytes([], 200);
+          return http.Response.bytes([0], 200);
         });
         final transport = HttpTransport(
           'http://localhost:8080',
@@ -623,8 +805,8 @@ void main() {
         );
         transport.setSchema({'user.get': APISchemaEntry(1)});
 
-        expect(
-          () => transport.call('user.get'),
+        await expectLater(
+          transport.call('user.get'),
           throwsA(
             isA<LuxoError>()
                 .having((e) => e.error, 'error', 'BadRequest')

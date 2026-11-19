@@ -19,6 +19,7 @@ func generateWriteJSONFile(result *semantic.Result, packageName string, enums ma
 }
 
 func (g *GeneratorContext) generateWriteJSONFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
+	result = g.withoutValueAliases(result)
 	var models []*ast.ModelDecl
 	for _, file := range result.Files {
 		models = append(models, file.Models...)
@@ -64,25 +65,41 @@ func (g *GeneratorContext) generateWriteJSONFile(result *semantic.Result, packag
 			importDecls = append(importDecls, &ast.ModelDecl{Name: t.Name, Fields: t.Fields})
 		}
 	}
+	var helpers string
+	g, helpers = g.withTransformFunctions(result, importDecls, enums)
+	depthContext := *g
+	depthContext.singleObjectDepth = g.valueTypes == nil
+	for _, declaration := range importDecls {
+		if g.hasWriteRelation(declaration, enums) {
+			depthContext.singleObjectDepth = false
+			break
+		}
+	}
+	g = depthContext.withCodecDepthNames(result, importDecls)
+	writers := &writeJSONContext{GeneratorContext: *g, enums: enums}
 	var input strings.Builder
+	identityObjects := identityObjectNames(result, importDecls)
 	for _, declaration := range importDecls {
 		g.generateReadJSONInput(&input, declaration, enums)
+		if identityObjects[declaration.Name] {
+			g.generateReadIdentityInput(&input, declaration, enums, modelNames[declaration.Name])
+		}
 	}
-	writeWriteJSONImports(&b, importDecls, generatedPackages(input.String()))
+	writers.writeWriteJSONImports(&b, importDecls, generatedPackages(input.String()), helpers)
 	b.WriteString(input.String())
 
 	for _, m := range models {
-		g.generateWriteLuxo(&b, m, enums, modelNames)
+		writers.generateWriteLuxo(&b, m, enums, modelNames)
 		g.generateReadLuxo(&b, m, enums)
 		g.generateReadColumnar(&b, m, enums)
-		g.generateWriteColumnar(&b, m, enums, modelNames)
+		writers.generateWriteColumnar(&b, m, enums, modelNames)
 	}
 
 	for _, s := range stubs {
-		g.generateWriteLuxo(&b, s, enums, modelNames)
+		writers.generateWriteLuxo(&b, s, enums, modelNames)
 		g.generateReadLuxo(&b, s, enums)
 		g.generateReadColumnar(&b, s, enums)
-		g.generateWriteColumnar(&b, s, enums, modelNames)
+		writers.generateWriteColumnar(&b, s, enums, modelNames)
 	}
 
 	// type declarations — generate WriteLuxo with VALUE receiver (can call on literal)
@@ -90,13 +107,16 @@ func (g *GeneratorContext) generateWriteJSONFile(result *semantic.Result, packag
 	for _, file := range result.Files {
 		for _, t := range file.Types {
 			pseudo := &ast.ModelDecl{Name: t.Name, Fields: t.Fields}
-			g.generateTypeWriteLuxo(&b, pseudo, enums, modelNames)
+			writers.generateTypeWriteLuxo(&b, pseudo, enums, modelNames)
 			g.generateReadLuxo(&b, pseudo, enums)
 			g.generateReadColumnar(&b, pseudo, enums)
-			g.generateTypeWriteColumnar(&b, pseudo, enums, modelNames)
+			writers.generateTypeWriteColumnar(&b, pseudo, enums, modelNames)
 		}
 	}
 
+	if helpers != "" {
+		b.WriteString(helpers)
+	}
 	return []byte(b.String())
 }
 
@@ -133,9 +153,12 @@ type writeJSONImportNeeds struct {
 	decimal bool
 	strings bool
 	str     bool
+	math    bool
+	checked bool
+	inline  generatedImports
 }
 
-func scanWriteJSONImports(m *ast.ModelDecl, needs *writeJSONImportNeeds) {
+func (w *writeJSONContext) scanWriteJSONImports(m *ast.ModelDecl, needs *writeJSONImportNeeds) {
 	for _, f := range m.Fields {
 		if f.Type == nil {
 			continue
@@ -146,9 +169,18 @@ func scanWriteJSONImports(m *ast.ModelDecl, needs *writeJSONImportNeeds) {
 		if hasDirective(f.Directives, "mask") {
 			needs.str = true
 		}
-		if expression := compileTransformDirectiveExpr(f, "value"); expression != "value" {
-			needs.strings = needs.strings || strings.Contains(expression, "strings.")
-			needs.str = needs.str || strings.Contains(expression, "str.")
+		for _, directive := range f.Directives {
+			if directive.Name != "visible" {
+				continue
+			}
+			w.scanVisibleImportNeeds(f, directive, needs)
+		}
+		// Fallible expressions are compiled into helpers, whose imports are scanned separately.
+		transform := findDirective(f.Directives, "transform")
+		if transform == nil || !fieldBodyPropagatesError(transform.Body) {
+			if expression := compileTransformDirectiveExpr(f, "value"); expression != "value" {
+				needs.inline |= generatedPackages(expression)
+			}
 		}
 		switch f.Type.Name {
 		case "DateTime", "Duration":
@@ -163,19 +195,71 @@ func scanWriteJSONImports(m *ast.ModelDecl, needs *writeJSONImportNeeds) {
 	}
 }
 
-func writeWriteJSONImports(b *strings.Builder, declarations []*ast.ModelDecl, inputImports generatedImports) {
+func (w *writeJSONContext) scanVisibleImportNeeds(field *ast.FieldDecl, directive *ast.Directive, needs *writeJSONImportNeeds) {
+	typed, identity := false, false
+	walkExpr(directive.SingleExpression(), func(value ast.Expr) {
+		needs.checked = needs.checked || fieldExpressionMayFail(value)
+		if value.GetTypeTag() == "Duration" {
+			needs.time = true
+		}
+		switch value := value.(type) {
+		case *ast.BinaryExpr:
+			if _, matched := compileFloatRemainder(value, "", ""); matched {
+				needs.math = true
+			}
+			if w.sealed != nil && (value.Op == "==" || value.Op == "!=") {
+				typed = typed || w.sealedDeclaration(value.Left.GetTypeTag()) != nil || w.sealedDeclaration(value.Right.GetTypeTag()) != nil
+			}
+		case *ast.MemberExpr:
+			typed = typed || value.SealedConstructor
+			if name, ok := value.Object.(*ast.Ident); ok && name.Name == "my" {
+				identity = true
+			}
+		case *ast.Literal:
+			if value.Kind == token.Duration {
+				needs.time = true
+			}
+		}
+	})
+	if typed {
+		plan := w.prepareVisibleCondition(field, directive, identity)
+		needs.inline |= generatedPackages(plan.code)
+	}
+}
+
+func writeWriteJSONImports(b *strings.Builder, declarations []*ast.ModelDecl, inputImports generatedImports, helperBodies ...string) {
+	(&writeJSONContext{}).writeWriteJSONImports(b, declarations, inputImports, helperBodies...)
+}
+
+func (w *writeJSONContext) writeWriteJSONImports(b *strings.Builder, declarations []*ast.ModelDecl, inputImports generatedImports, helperBodies ...string) {
 	var needs writeJSONImportNeeds
 	for _, m := range declarations {
-		scanWriteJSONImports(m, &needs)
+		w.scanWriteJSONImports(m, &needs)
 	}
 
+	var helperBody string
+	if len(helperBodies) != 0 {
+		helperBody = helperBodies[0]
+	}
+	helperImports := generatedPackages(helperBody) | needs.inline
+	if needs.math {
+		helperImports |= generatedPackageBit("math")
+	}
+	if needs.decimal {
+		helperImports |= generatedPackageBit("lux")
+	}
+	if needs.checked {
+		helperImports |= generatedPackageBit("lux") | generatedPackageBit("errors")
+	}
+	mergeFieldFunctionImportNeeds(&needs, helperImports)
 	b.WriteString("import (\n")
+	writeFieldFunctionExtraImports(b, helperImports)
 	for _, name := range []string{"bytes", "fmt"} {
-		if inputImports.has(name) {
+		if inputImports.has(name) || helperImports.has(name) {
 			fmt.Fprintf(b, "\t%q\n", name)
 		}
 	}
-	if needs.json || inputImports.has("json") {
+	if needs.json || inputImports.has("json") || helperImports.has("json") {
 		b.WriteString("\t\"encoding/json\"\n")
 	}
 	if needs.strings {
@@ -210,6 +294,7 @@ func writeWriteJSONImports(b *strings.Builder, declarations []*ast.ModelDecl, in
 	}
 	if needs.decimal {
 		suppressions = append(suppressions, `var _ decimal.Decimal`)
+		suppressions = append(suppressions, `var _ = lux.FormatDecimal`)
 	}
 	for _, s := range suppressions {
 		fmt.Fprintf(b, "%s\n", s)
@@ -247,7 +332,7 @@ func isArenaField(f *ast.FieldDecl, enums map[string]bool) bool {
 
 // writeArenaLenCalc generates code to calculate totalStringLen for arena allocation.
 // Emits: var _arenaLen int; _arenaLen += len(...); ...
-// Returns true if any arena fields exist (totalStringLen prefix should be written).
+// Always writes a totalStringLen prefix; returns whether any arena fields exist.
 func writeArenaLenCalc(b *strings.Builder, m *ast.ModelDecl, recv string, enums map[string]bool, masked bool, indent string) bool {
 	return defaultGenerator().writeArenaLenCalc(b, m, recv, enums, masked, indent)
 }
@@ -328,11 +413,20 @@ func generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bo
 }
 
 func (g *GeneratorContext) generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, modelSets ...map[string]bool) {
+	(&writeJSONContext{GeneratorContext: *g, enums: enums}).generateWriteLuxo(b, m, enums, modelSets...)
+}
+
+func (g *writeJSONContext) generateWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, modelSets ...map[string]bool) {
 	name := m.Name
-	recv := strings.ToLower(name[:1])
+	recv := receiverName(name)
 
 	fmt.Fprintf(b, "// WriteLuxo writes %s as Luxo binary directly to buf. Zero intermediate allocation.\n", name)
 	fmt.Fprintf(b, "func (%s *%s) WriteLuxo(buf *api.ResponseBuf, mask []byte) error {\n", recv, name)
+	if !g.singleObjectDepth {
+		fmt.Fprintf(b, "\treturn %s.%s(buf, mask, 1)\n}\n\n", recv, g.valueDepthMethod(name, "writeLuxoDepth"))
+		fmt.Fprintf(b, "func (%s *%s) %s(buf *api.ResponseBuf, mask []byte, depth int) error {\n", recv, name, g.valueDepthMethod(name, "writeLuxoDepth"))
+		writeModelDepthGuard(b, "return codec.ErrModelDepth")
+	}
 
 	// Output directives must also run for SELECT *, so those models use the
 	// directive-aware path even when the field mask is empty.
@@ -371,17 +465,17 @@ func (g *GeneratorContext) generateWriteLuxo(b *strings.Builder, m *ast.ModelDec
 		}
 
 		// @visible: conditional field visibility based on identity
-		hasVisible := writeVisibleDirective(b, f)
+		hasVisible := g.writeVisibleDirectiveWithEnums(b, f, enums)
 
 		goField := recv + "." + str.Capitalize(f.Name)
 		baseType := f.Type.Name
 		fid := fmt.Sprintf("%d", fieldID)
 
 		if isRelationField(f, enums) {
-			writeNestedRowField(b, f, fid, goField, "selectionMask", "\t\t", nestedModelTarget(f.Type.Name, modelSets))
+			g.writeNestedRowField(b, f, fid, goField, "selectionMask", "\t\t", nestedModelTarget(f.Type.Name, modelSets), g.isModelReference(f.Type.Name))
 		} else {
 			// @transform: apply value transformation before writing
-			goField = writeTransformDirective(b, f, goField)
+			goField = g.writeFieldTransform(b, f, goField, "		")
 
 			// @mask: apply masking before writing string fields
 			goField = writeMaskDirective(b, f, goField, baseType)
@@ -400,7 +494,66 @@ func (g *GeneratorContext) generateWriteLuxo(b *strings.Builder, m *ast.ModelDec
 	fmt.Fprintf(b, "}\n\n")
 }
 
-func writeNestedRowField(b *strings.Builder, f *ast.FieldDecl, fid, goField, selectionMask, indent string, targetIsModel bool) {
+func writeModelDepthGuard(b *strings.Builder, failure string) {
+	b.WriteString("\tif depth > codec.MaxModelDepth { ")
+	b.WriteString(failure)
+	b.WriteString(" }\n")
+}
+
+func (g *GeneratorContext) depthColumnarFunction(name string) string {
+	if g.valueTypes != nil && g.valueTypes.columnar[name] != "" {
+		return g.valueTypes.columnar[name]
+	}
+	initial := "r"
+	if name[0] == 'W' {
+		initial = "w"
+	}
+	name = initial + name[1:] + "Depth"
+	for g.codecDepthNames[name] {
+		name += "_"
+	}
+	return name
+}
+
+// Reserve only possible private-codec collisions; ordinary schemas need no map.
+func (g *GeneratorContext) withCodecDepthNames(result *semantic.Result, declarations []*ast.ModelDecl) *GeneratorContext {
+	if g.singleObjectDepth {
+		return g
+	}
+	var names map[string]bool
+	reserve := func(name string) {
+		if strings.HasPrefix(name, "readColumnar") || strings.HasPrefix(name, "writeColumnar") {
+			if names == nil {
+				names = make(map[string]bool)
+			}
+			names[name] = true
+		}
+	}
+	for _, declaration := range declarations {
+		reserve(declaration.Name)
+	}
+	for _, file := range result.Files {
+		for _, declaration := range file.Enums {
+			name := declaration.Name
+			if !strings.HasPrefix(name, "readColumnar") && !strings.HasPrefix("readColumnar", name) &&
+				!strings.HasPrefix(name, "writeColumnar") && !strings.HasPrefix("writeColumnar", name) {
+				continue
+			}
+			reserve(name)
+			for _, value := range declaration.Values {
+				reserve(name + value)
+			}
+		}
+	}
+	if names == nil {
+		return g
+	}
+	copy := *g
+	copy.codecDepthNames = names
+	return &copy
+}
+
+func (g *GeneratorContext) writeNestedRowField(b *strings.Builder, f *ast.FieldDecl, fid, goField, selectionMask, indent string, targetIsModel bool, pointerLists ...bool) {
 	childMask := "nil"
 	if selectionMask != "" {
 		childMask = "_childMask" + fid
@@ -411,20 +564,29 @@ func writeNestedRowField(b *strings.Builder, f *ast.FieldDecl, fid, goField, sel
 		fmt.Fprintf(b, "%sif %s == nil { buf.B = codec.AppendNull(buf.B) } else {\n", indent, goField)
 		fmt.Fprintf(b, "%sbuf.B = codec.AppendPresent(buf.B)\n", indent)
 	}
-	fmt.Fprintf(b, "%s_frame%s := buf.BeginMessage()\n", indent, fid)
-	if f.Type.IsList {
-		writeBinaryCall(b, indent, fmt.Sprintf("%s(buf, %s, %s)", nestedColumnarWriter(f.Type.Name, targetIsModel), goField, childMask), "return err")
-	} else {
-		writeBinaryCall(b, indent, fmt.Sprintf("%s.WriteLuxo(buf, %s)", goField, childMask), "return err")
+	sealed := g.sealedDeclaration(f.Type.Name) != nil
+	if sealed && !f.Type.IsList && !f.Type.Nullable {
+		fmt.Fprintf(b, "%sif %s == nil { return fmt.Errorf(%q) }\n", indent, goField, "missing sealed field "+f.Name)
 	}
-	fmt.Fprintf(b, "%sbuf.EndMessage(_frame%s)\n", indent, fid)
+	framed := !sealed || !f.Type.IsList
+	if framed {
+		fmt.Fprintf(b, "%s_frame%s := buf.BeginMessage()\n", indent, fid)
+	}
+	if f.Type.IsList {
+		writeBinaryCall(b, indent, fmt.Sprintf("%s(buf, %s, %s, depth+1)", g.depthColumnarFunction(nestedColumnarWriter(f.Type.Name, targetIsModel, pointerLists...)), goField, childMask), "return err")
+	} else {
+		writeBinaryCall(b, indent, fmt.Sprintf("%s.%s(buf, %s, depth+1)", goField, g.valueDepthMethod(f.Type.Name, "writeLuxoDepth"), childMask), "return err")
+	}
+	if framed {
+		fmt.Fprintf(b, "%sbuf.EndMessage(_frame%s)\n", indent, fid)
+	}
 	if f.Type.Nullable {
 		fmt.Fprintf(b, "%s}\n", indent)
 	}
 }
 
-func nestedColumnarWriter(name string, targetIsModel bool) string {
-	if targetIsModel {
+func nestedColumnarWriter(name string, targetIsModel bool, pointerLists ...bool) string {
+	if targetIsModel && (len(pointerLists) == 0 || !pointerLists[0]) {
 		return "WriteColumnar" + name + "Values"
 	}
 	return "WriteColumnar" + name
@@ -489,7 +651,7 @@ func writeModelFieldEncoding(b *strings.Builder, f *ast.FieldDecl, fid, goField 
 // writeScalarEncoding writes binary encoding for a scalar type, handling nullable.
 func writeScalarEncoding(b *strings.Builder, typeName string, nullable bool, fid, goField, indent string) {
 	value := goField
-	if nullable && typeName != "Decimal" {
+	if nullable {
 		value = "*" + value
 	}
 	if typeName == "UUID" {
@@ -504,7 +666,11 @@ func writeScalarEncoding(b *strings.Builder, typeName string, nullable bool, fid
 		writeBinaryAppend(b, indent, "buf.B", expression, "return err")
 		return
 	}
-	fmt.Fprintf(b, "%sif %s != nil {\n", indent, goField)
+	condition := goField + " != nil"
+	if typeName == "JSON" {
+		condition = "!(" + nullableNullCondition(&ast.TypeRef{Name: typeName}, goField) + ")"
+	}
+	fmt.Fprintf(b, "%sif %s {\n", indent, condition)
 	fmt.Fprintf(b, "%s\tbuf.B = codec.AppendPresent(buf.B)\n", indent)
 	writeBinaryAppend(b, indent+"\t", "buf.B", expression, "return err")
 	fmt.Fprintf(b, "%s} else {\n", indent)
@@ -550,14 +716,23 @@ func generateTypeWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 }
 
 func (g *GeneratorContext) generateTypeWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, modelSets ...map[string]bool) {
+	(&writeJSONContext{GeneratorContext: *g, enums: enums}).generateTypeWriteLuxo(b, m, enums, modelSets...)
+}
+
+func (g *writeJSONContext) generateTypeWriteLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, modelSets ...map[string]bool) {
 	var modelNames map[string]bool
 	if len(modelSets) > 0 {
 		modelNames = modelSets[0]
 	}
 	name := m.Name
-	recv := strings.ToLower(name[:1])
+	recv := receiverName(name)
 	fmt.Fprintf(b, "// WriteLuxo writes %s as Luxo binary directly to buf.\n", name)
 	fmt.Fprintf(b, "func (%s %s) WriteLuxo(buf *api.ResponseBuf, mask []byte) error {\n", recv, name)
+	if !g.singleObjectDepth {
+		fmt.Fprintf(b, "\treturn %s.%s(buf, mask, 1)\n}\n\n", recv, g.valueDepthMethod(name, "writeLuxoDepth"))
+		fmt.Fprintf(b, "func (%s %s) %s(buf *api.ResponseBuf, mask []byte, depth int) error {\n", recv, name, g.valueDepthMethod(name, "writeLuxoDepth"))
+		writeModelDepthGuard(b, "return codec.ErrModelDepth")
+	}
 
 	if g.hasWriteRelation(m, enums) {
 		b.WriteString("\tselectionMask := mask\n")
@@ -577,16 +752,16 @@ func (g *GeneratorContext) generateTypeWriteLuxo(b *strings.Builder, m *ast.Mode
 		fid := fmt.Sprintf("%d", fieldID)
 		fmt.Fprintf(b, "\tif codec.FieldMaskHas(mask, %d) {\n", fieldID)
 		indent := "\t\t"
-		visibleExpr := compileVisibleDirectiveExpr(f)
+		visibleExpr := g.writeVisibleConditionAt(b, f, enums, indent)
 		if visibleExpr != "" {
 			fmt.Fprintf(b, "%sif %s {\n", indent, visibleExpr)
 			indent = "\t\t\t"
 		}
-		goField = writeTransformDirectiveAt(b, f, goField, indent)
+		goField = g.writeFieldTransform(b, f, goField, indent)
 		goField = writeMaskDirectiveAt(b, f, goField, f.Type.Name, indent)
 
 		if isRelationField(f, enums) {
-			writeNestedRowField(b, f, fid, goField, "selectionMask", indent, modelNames[f.Type.Name])
+			g.writeNestedRowField(b, f, fid, goField, "selectionMask", indent, modelNames[f.Type.Name], g.isModelReference(f.Type.Name))
 		} else {
 			writeModelFieldEncoding(b, f, fid, goField, enums, indent)
 		}
@@ -617,7 +792,7 @@ func writeListScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField str
 }
 
 func writeScalarArrayItems(b *strings.Builder, elemType string, isEnum bool, goField, indent string) {
-	fmt.Fprintf(b, "%sbuf.B = codec.AppendArrayHeader(buf.B, len(%s))\n", indent, goField)
+	writeBinaryAppend(b, indent, "buf.B", fmt.Sprintf("codec.AppendArrayHeader(buf.B, len(%s))", goField), "return err")
 	if expression := scalarArrayItemEncoding(elemType, isEnum, "buf.B"); expression != "" {
 		fmt.Fprintf(b, "%sfor _, v := range %s {\n", indent, goField)
 		writeBinaryAppend(b, indent+"\t", "buf.B", expression, "return err")
@@ -647,7 +822,7 @@ func scalarArrayItemEncoding(elemType string, isEnum bool, buffer string) string
 	case "UUID":
 		method, value = "UUID", "[16]byte(v)"
 	case "Decimal":
-		method, value = "String", "v.String()"
+		method, value = "String", "lux.FormatDecimal(v)"
 	case "Bytes":
 		method, value = "Bytes", "v"
 	case "JSON":
@@ -690,6 +865,10 @@ func generateWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[strin
 }
 
 func (g *GeneratorContext) generateWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, modelSets ...map[string]bool) {
+	(&writeJSONContext{GeneratorContext: *g, enums: enums}).generateWriteColumnar(b, m, enums, modelSets...)
+}
+
+func (g *writeJSONContext) generateWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, modelSets ...map[string]bool) {
 	g.generateModelWriteColumnar(b, m, enums, "WriteColumnar"+m.Name, "[]*"+m.Name, modelSets...)
 	g.generateModelWriteColumnar(b, m, enums, "WriteColumnar"+m.Name+"Values", "[]"+m.Name, modelSets...)
 }
@@ -699,6 +878,10 @@ func generateModelWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[
 }
 
 func (g *GeneratorContext) generateModelWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, functionName, itemsType string, modelSets ...map[string]bool) {
+	(&writeJSONContext{GeneratorContext: *g, enums: enums}).generateModelWriteColumnar(b, m, enums, functionName, itemsType, modelSets...)
+}
+
+func (g *writeJSONContext) generateModelWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, functionName, itemsType string, modelSets ...map[string]bool) {
 	g.generateDirectColumnar(b, m, enums, functionName, itemsType, true, modelSets)
 }
 
@@ -716,6 +899,10 @@ func generateTypeWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[s
 }
 
 func (g *GeneratorContext) generateTypeWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, modelSets ...map[string]bool) {
+	(&writeJSONContext{GeneratorContext: *g, enums: enums}).generateTypeWriteColumnar(b, m, enums, modelSets...)
+}
+
+func (g *writeJSONContext) generateTypeWriteColumnar(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, modelSets ...map[string]bool) {
 	g.generateDirectColumnar(b, m, enums, "WriteColumnar"+m.Name, "[]"+m.Name, false, modelSets)
 }
 
@@ -769,7 +956,11 @@ func compileMaskDirectiveExpr(f *ast.FieldDecl, valueExpr, baseType string) stri
 // writeVisibleDirective generates @visible condition check.
 // @visible { my.role == "admin" } → skip field if identity doesn't match.
 func writeVisibleDirective(b *strings.Builder, f *ast.FieldDecl) bool {
-	cond := compileVisibleDirectiveExpr(f)
+	return writeVisibleDirectiveWithEnums(b, f, nil)
+}
+
+func writeVisibleDirectiveWithEnums(b *strings.Builder, f *ast.FieldDecl, enums map[string]bool) bool {
+	cond := writeVisibleConditionAt(b, f, enums, "\t")
 	if cond == "" {
 		return false
 	}
@@ -777,40 +968,89 @@ func writeVisibleDirective(b *strings.Builder, f *ast.FieldDecl) bool {
 	return true
 }
 
-func compileVisibleDirectiveExpr(f *ast.FieldDecl) string {
-	visibleDir := findDirective(f.Directives, "visible")
-	if visibleDir == nil || visibleDir.Body == nil || len(visibleDir.Body.Stmts) == 0 {
+func (w *writeJSONContext) writeVisibleDirectiveWithEnums(b *strings.Builder, f *ast.FieldDecl, enums map[string]bool) bool {
+	cond := w.writeVisibleConditionAt(b, f, enums, "\t")
+	if cond == "" {
+		return false
+	}
+	fmt.Fprintf(b, "\t if %s {\n", cond)
+	return true
+}
+
+func compileVisibleDirectiveExprWithEnums(f *ast.FieldDecl, enums map[string]bool) string {
+	visible := findDirective(f.Directives, "visible")
+	if visible == nil {
 		return ""
 	}
-	es, ok := visibleDir.Body.Stmts[0].(*ast.ExprStmt)
-	if !ok || es.Expr == nil {
-		return ""
+	expression := visible.SingleExpression()
+	if expression == nil {
+		panic(&InternalCompilerError{Detail: "invalid @visible expression for field " + f.Name})
 	}
-	return compileVisibleExpr(es.Expr)
+	identity, reader := "buf.Identity", ""
+	if conditionUsesIdentity(expression) {
+		identity, reader = "_identity", "api.NewIdentityReader(buf.Identity)"
+		if visible.AuthSubject != "" {
+			reader = fmt.Sprintf("api.NewIdentityReaderForSubject(buf.Identity, %q)", visible.AuthSubject)
+		}
+	}
+	if conditionHasCheckedArithmetic(expression) {
+		return compileCheckedVisibleCondition(expression, enums, reader)
+	}
+	compiled := compileVisibleCondition(expression, enums, identity)
+	if compiled == "" {
+		panic(&InternalCompilerError{Detail: "unsupported @visible expression for field " + f.Name})
+	}
+	if reader != "" {
+		return "func() bool { _identity := " + reader + "; return _identity.Allowed(" + compiled + ") }()"
+	}
+	return compiled
 }
 
 // compileVisibleExpr compiles a @visible body expression to Go.
 // Supports: my.role == "admin", my.id == someField
 func compileVisibleExpr(expr ast.Expr) string {
+	return compileVisibleExprWithEnums(expr, nil)
+}
+
+func compileVisibleExprWithEnums(expr ast.Expr, enums map[string]bool) string {
+	return compileVisibleCondition(expr, enums, "buf.Identity")
+}
+
+func compileVisibleCondition(expr ast.Expr, enums map[string]bool, identityExpr string) string {
 	switch e := expr.(type) {
+	case *ast.UnaryExpr:
+		operand := compileVisibleCondition(e.Value, enums, identityExpr)
+		if operand != "" && (e.Op == "!" || e.Op == "-") {
+			return compileUnaryOperation(e, "("+operand+")")
+		}
 	case *ast.BinaryExpr:
-		left := compileVisibleExpr(e.Left)
-		right := compileVisibleExpr(e.Right)
+		left := compileVisibleCondition(e.Left, enums, identityExpr)
+		right := compileVisibleCondition(e.Right, enums, identityExpr)
 		if left == "" || right == "" {
 			return ""
 		}
-		left = inferMyFieldType(left, e.Left, e.Right, "buf.Identity")
-		right = inferMyFieldType(right, e.Right, e.Left, "buf.Identity")
-		return fmt.Sprintf("%s %s %s", left, e.Op, right)
+		left = inferMyFieldType(left, e.Left, e.Right, identityExpr)
+		right = inferMyFieldType(right, e.Right, e.Left, identityExpr)
+		if expression, ok := compileFloatArithmetic(e, left, right); ok {
+			return expression
+		}
+		return fmt.Sprintf("%s %s %s", groupBinaryOperand(e.Left, left), e.Op, groupBinaryOperand(e.Right, right))
 	case *ast.MemberExpr:
+		if e.EnumConstant {
+			return fmt.Sprintf("%q", e.Field)
+		}
+		if ident, ok := e.Object.(*ast.Ident); ok && enums[ident.Name] {
+			return "string(" + ident.Name + e.Field + ")"
+		}
 		if ident, ok := e.Object.(*ast.Ident); ok && ident.Name == "my" {
-			return compileMyField(e.Field, "buf.Identity")
+			if identityExpr == "_identity" && (e.IsEnumType() || enums[e.GetTypeTag()]) {
+				return compileIdentityEnumCondition(e, e.GetTypeTag())
+			}
+			return compileMyField(e, identityExpr)
 		}
 	case *ast.Literal:
-		if e.Kind == token.String {
-			return fmt.Sprintf("%q", e.Value)
-		}
-		return e.Value
+		value, _ := compileConditionLiteral(e)
+		return value
 	case *ast.Ident:
 		return e.Name
 	}
@@ -854,16 +1094,19 @@ func fieldValueBinding(name, value string, t *ast.TypeRef) string {
 
 func compileTransformDirectiveExpr(f *ast.FieldDecl, valueExpr string) string {
 	transformDir := findDirective(f.Directives, "transform")
-	if transformDir == nil || transformDir.Body == nil || len(transformDir.Body.Stmts) == 0 {
+	if transformDir == nil {
 		return valueExpr
+	}
+	if transformDir.Body == nil || len(transformDir.Body.Stmts) != 1 || len(transformDir.Args) != 0 {
+		panic(&InternalCompilerError{Detail: "invalid @transform expression for field " + f.Name})
 	}
 	es, ok := transformDir.Body.Stmts[0].(*ast.ExprStmt)
 	if !ok || es.Expr == nil {
-		return valueExpr
+		panic(&InternalCompilerError{Detail: "invalid @transform expression for field " + f.Name})
 	}
 	code := compileFieldExpr(es.Expr, valueExpr)
 	if code == "" {
-		return valueExpr
+		panic(&InternalCompilerError{Detail: "unsupported @transform expression for field " + f.Name})
 	}
 	return code
 }

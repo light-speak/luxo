@@ -2,6 +2,7 @@ package auth
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -56,8 +57,15 @@ func verifyShardIndex(token string) int {
 // per-request paths (auth middleware); one-shot verifications (refresh
 // tokens) must use VerifyRefresh. This cache contains access identities only.
 func VerifyCached(cfg *Config, token string) (Claims, error) {
+	claims, _, err := VerifyCachedWithExpiry(cfg, token)
+	return claims, err
+}
+
+// VerifyCachedWithExpiry returns the verified access token deadline in Unix seconds.
+// Failed verification returns no identity and a zero deadline.
+func VerifyCachedWithExpiry(cfg *Config, token string) (Claims, int64, error) {
 	if cfg == nil {
-		return Claims{}, fmt.Errorf("JWT config is required")
+		return Claims{}, 0, fmt.Errorf("JWT config is required")
 	}
 	sh := &verifyCache[verifyShardIndex(token)]
 	now := time.Now().Unix()
@@ -67,21 +75,29 @@ func VerifyCached(cfg *Config, token string) (Claims, error) {
 	sh.mu.RUnlock()
 	if ok && e.secret == cfg.Secret {
 		if now < e.exp {
-			return e.data, nil
+			return e.data, e.exp, nil
 		}
 		sh.mu.Lock()
 		delete(sh.m, token)
 		sh.mu.Unlock()
-		return Claims{}, fmt.Errorf("token expired")
+		return Claims{}, 0, fmt.Errorf("token expired")
 	}
 
+	return verifyAndCache(cfg, token, sh)
+}
+
+// Keep full verification and owned-key publication off the frequent hit path.
+func verifyAndCache(cfg *Config, token string, sh *verifyShard) (Claims, int64, error) {
 	data, exp, err := verifyFull(cfg, token)
 	if err != nil {
 		// Failures are never cached — an attacker spamming garbage tokens
 		// must not be able to fill the cache.
-		return Claims{}, err
+		return Claims{}, 0, err
 	}
 
+	// Query tokens can borrow a much larger request URL. Own retained keys,
+	// outside the shard lock; cache hits do not allocate or copy token text.
+	key := strings.Clone(token)
 	sh.mu.Lock()
 	if len(sh.m) >= verifyCacheMaxEntries/verifyCacheShards {
 		// Evict one arbitrary entry — O(1), keeps the shard bounded under
@@ -91,9 +107,9 @@ func VerifyCached(cfg *Config, token string) (Claims, error) {
 			break
 		}
 	}
-	sh.m[token] = verifyEntry{data: data, exp: exp, secret: cfg.Secret}
+	sh.m[key] = verifyEntry{data: data, exp: exp, secret: cfg.Secret}
 	sh.mu.Unlock()
-	return data, nil
+	return data, exp, nil
 }
 
 // ResetVerifyCache clears all cached verifications (for testing only).

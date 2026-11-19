@@ -98,8 +98,10 @@ func (e *Encoder) WriteUUID(v [16]byte) {
 }
 
 // WriteArrayHeader writes an array count without a field header.
-func (e *Encoder) WriteArrayHeader(count int) {
-	e.buf = AppendArrayHeader(e.buf, count)
+func (e *Encoder) WriteArrayHeader(count int) error {
+	var err error
+	e.buf, err = AppendArrayHeader(e.buf, count)
+	return err
 }
 
 // --- Field writers ---
@@ -202,18 +204,25 @@ func (e *Encoder) WriteFieldBoolPtr(fieldID int, v *bool) {
 // Format: [fieldID varint] [count varint] [item0] [item1] ...
 
 // WriteFieldIntArray writes an int64 array field.
-func (e *Encoder) WriteFieldIntArray(fieldID int, v []int64) {
+func (e *Encoder) WriteFieldIntArray(fieldID int, v []int64) error {
+	if err := validateArrayCount(len(v)); err != nil {
+		return err
+	}
 	e.buf = AppendVarint(e.buf, uint64(fieldID))
-	e.buf = AppendArrayHeader(e.buf, len(v))
+	e.buf = AppendVarint(e.buf, uint64(len(v)))
 	for _, item := range v {
 		e.buf = AppendSvarint(e.buf, item)
 	}
+	return nil
 }
 
 // WriteFieldStringArray writes a string array field.
 func (e *Encoder) WriteFieldStringArray(fieldID int, v []string) error {
+	if err := validateArrayCount(len(v)); err != nil {
+		return err
+	}
 	dst := AppendVarint(e.buf, uint64(fieldID))
-	dst = AppendArrayHeader(dst, len(v))
+	dst = AppendVarint(dst, uint64(len(v)))
 	for _, item := range v {
 		if !utf8.ValidString(item) {
 			return ErrInvalidUTF8
@@ -226,8 +235,11 @@ func (e *Encoder) WriteFieldStringArray(fieldID int, v []string) error {
 
 // WriteFieldFloatArray writes a float64 array field.
 func (e *Encoder) WriteFieldFloatArray(fieldID int, v []float64) error {
+	if err := validateArrayCount(len(v)); err != nil {
+		return err
+	}
 	dst := AppendVarint(e.buf, uint64(fieldID))
-	dst = AppendArrayHeader(dst, len(v))
+	dst = AppendVarint(dst, uint64(len(v)))
 	for _, item := range v {
 		if !IsFiniteFloat(item) {
 			return ErrNonFiniteFloat
@@ -239,23 +251,31 @@ func (e *Encoder) WriteFieldFloatArray(fieldID int, v []float64) error {
 }
 
 // WriteFieldBoolArray writes a bool array field.
-func (e *Encoder) WriteFieldBoolArray(fieldID int, v []bool) {
+func (e *Encoder) WriteFieldBoolArray(fieldID int, v []bool) error {
+	if err := validateArrayCount(len(v)); err != nil {
+		return err
+	}
 	e.buf = AppendVarint(e.buf, uint64(fieldID))
-	e.buf = AppendArrayHeader(e.buf, len(v))
+	e.buf = AppendVarint(e.buf, uint64(len(v)))
 	for _, item := range v {
 		e.buf = AppendBool(e.buf, item)
 	}
+	return nil
 }
 
 // WriteFieldBytesArray writes a [][]byte array field. Each element is a
 // length-prefixed byte blob — used for lists of nested models (each element is
 // a model's Luxo binary) and for [Bytes]/[JSON] lists.
-func (e *Encoder) WriteFieldBytesArray(fieldID int, v [][]byte) {
+func (e *Encoder) WriteFieldBytesArray(fieldID int, v [][]byte) error {
+	if err := validateArrayCount(len(v)); err != nil {
+		return err
+	}
 	e.buf = AppendVarint(e.buf, uint64(fieldID))
-	e.buf = AppendArrayHeader(e.buf, len(v))
+	e.buf = AppendVarint(e.buf, uint64(len(v)))
 	for _, item := range v {
 		e.buf = AppendBytes(e.buf, item)
 	}
+	return nil
 }
 
 // WriteFieldUUID writes a fixed 16-byte UUID field.
@@ -277,12 +297,16 @@ func (e *Encoder) WriteFieldUUIDPtr(fieldID int, v *[16]byte) {
 
 // WriteFieldUUIDArray writes a UUID array field. Each element is a fixed
 // 16-byte value (no per-item length prefix), per the protocol UUID encoding.
-func (e *Encoder) WriteFieldUUIDArray(fieldID int, v [][16]byte) {
+func (e *Encoder) WriteFieldUUIDArray(fieldID int, v [][16]byte) error {
+	if err := validateArrayCount(len(v)); err != nil {
+		return err
+	}
 	e.buf = AppendVarint(e.buf, uint64(fieldID))
-	e.buf = AppendArrayHeader(e.buf, len(v))
+	e.buf = AppendVarint(e.buf, uint64(len(v)))
 	for _, item := range v {
 		e.buf = AppendUUID(e.buf, item)
 	}
+	return nil
 }
 
 // WriteEnd writes the message terminator (fieldID 0).

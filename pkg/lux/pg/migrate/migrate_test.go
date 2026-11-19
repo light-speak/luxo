@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +17,128 @@ import (
 func TestNewPGDBRejectsInvalidConfiguration(t *testing.T) {
 	if db, err := NewPGDB(t.Context(), "postgres://localhost/db?port=invalid"); err == nil || db != nil {
 		t.Fatalf("invalid configuration: db=%v err=%v", db, err)
+	}
+}
+
+func TestPendingMigrationOrdinalsAfterThreeDigits(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", "..", "..", ".tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp(root, "migration-order-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if filepath.Dir(directory) != root {
+			t.Fatal("refusing cleanup outside owned migration fixture")
+		}
+		if err := os.RemoveAll(directory); err != nil {
+			t.Error(err)
+		}
+	})
+	want := []string{"20261113_998_prior.sql", "20261113_999_prior.sql", "20261113_1000_next.sql", "20261114_1001_next_day.sql"}
+	for _, name := range want {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte("-- SQL\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := &Runner{dir: directory}
+	files, err := runner.pendingFiles(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range files {
+		files[index] = filepath.Base(files[index])
+	}
+	if strings.Join(files, "|") != strings.Join(want, "|") {
+		t.Fatalf("migration execution order crossed ordinal999 incorrectly: got=%v want=%v", files, want)
+	}
+}
+
+func TestMigrationFilenameOrdering(t *testing.T) {
+	ordered := []string{
+		"", "0.sql", "00.sql", "000.sql", "000_a.sql", "00_a.sql", "0_a.sql",
+		"1.sql", "01_a.sql", "1_a.sql", "2_a.sql", "009_a.sql", "10_a.sql",
+		"20261113_998_prior.sql", "20261113_999_prior.sql", "20261113_1000_next.sql",
+		"20261114_001_next.sql", "99999999999999999999999999999999999999_a.sql",
+		"a", "a0", "a00_a", "a0_a", "a1", "a9", "a10", "a10z", "b", "迁移2.sql", "迁移10.sql",
+	}
+	for i, left := range ordered {
+		if compareMigrationFiles(left, left) != 0 {
+			t.Fatalf("filename differs from itself: %q", left)
+		}
+		for j := i + 1; j < len(ordered); j++ {
+			right := ordered[j]
+			if compareMigrationFiles(left, right) >= 0 || compareMigrationFiles(right, left) <= 0 {
+				t.Errorf("inconsistent order: %q before %q", left, right)
+			}
+		}
+	}
+	actual := slices.Clone(ordered)
+	slices.Reverse(actual)
+	slices.SortFunc(actual, compareMigrationFiles)
+	if !slices.Equal(actual, ordered) {
+		t.Errorf("sort order: got=%q want=%q", actual, ordered)
+	}
+	if compareMigrationFiles("/left/001_a.sql", "/right/001_a.sql") != 0 {
+		t.Error("parent path affected migration filename order")
+	}
+}
+
+func FuzzMigrationFilenameOrdering(f *testing.F) {
+	for _, sample := range [][3]string{
+		{"001_a.sql", "01_a.sql", "1_a.sql"},
+		{"20261113_999_x.sql", "20261113_1000_x.sql", "20261114_001_x.sql"},
+		{"", "0", "a"}, {"a0", "a00x", "a1"},
+	} {
+		f.Add(sample[0], sample[1], sample[2])
+	}
+	f.Fuzz(func(t *testing.T, a, b, c string) {
+		ab, ba := compareMigrationFiles(a, b), compareMigrationFiles(b, a)
+		if (ab < 0) != (ba > 0) || (ab == 0) != (ba == 0) {
+			t.Fatalf("asymmetric ordering: %q %q: %d %d", a, b, ab, ba)
+		}
+		bc, ac := compareMigrationFiles(b, c), compareMigrationFiles(a, c)
+		if ab <= 0 && bc <= 0 && ac > 0 {
+			t.Fatalf("non-transitive ordering: %q <= %q <= %q", a, b, c)
+		}
+	})
+}
+
+func BenchmarkPendingMigrationFiles(b *testing.B) {
+	for _, count := range []int{3, 1000} {
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			root, err := filepath.Abs(filepath.Join("..", "..", "..", "..", ".tmp"))
+			if err != nil {
+				b.Fatal(err)
+			}
+			dir, err := os.MkdirTemp(root, "migration-sort-bench-")
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() {
+				if filepath.Dir(dir) != root {
+					b.Fatal("unsafe migration benchmark cleanup")
+				}
+				if err := os.RemoveAll(dir); err != nil {
+					b.Error(err)
+				}
+			})
+			for i := 1; i <= count; i++ {
+				if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("20261113_%03d_label.sql", i)), nil, 0600); err != nil {
+					b.Fatal(err)
+				}
+			}
+			runner := &Runner{dir: dir}
+			b.ReportAllocs()
+			for b.Loop() {
+				files, err := runner.pendingFiles(nil)
+				if err != nil || len(files) != count {
+					b.Fatal(len(files), err)
+				}
+			}
+		})
 	}
 }
 

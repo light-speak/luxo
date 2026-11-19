@@ -131,6 +131,30 @@ func TestPerformanceSamplingStopsOnProcessFailure(t *testing.T) {
 	}
 }
 
+func TestPerformanceSamplingStopsOnEvidenceFailure(t *testing.T) {
+	script := performanceStep(t, "performance-samples", "Run adaptive interleaved benchmark samples")
+	for _, group := range []string{"primary", "confirmation"} {
+		t.Run(group, func(t *testing.T) {
+			fixture := samplingFixture(t, true)
+			fixture.tool(t, "go", `case "$*" in
+*--verify*benchmark-"$FAIL_GROUP"-base.txt*) exit 42 ;;
+*--requires-confirmation*) echo true ;;
+esac`, false)
+			prefix := "export FAIL_GROUP=" + shellQualityQuote(group) + " GITHUB_WORKSPACE=" + shellQualityQuote(string(fixture)) + "\n"
+			output, log, err := fixture.run(t, prefix+script)
+			if err == nil {
+				t.Fatalf("continued after %s evidence failure: %s", group, output)
+			}
+			if group == "primary" && strings.Contains(log, "--requires-confirmation") {
+				t.Fatal("incomplete primary evidence reached the confirmation decision")
+			}
+			if !strings.Contains(log, "--verify .tmp/benchmark-expected.json .tmp/benchmark-"+group+"-base.txt") {
+				t.Fatalf("failure did not reach %s evidence verification: %s", group, log)
+			}
+		})
+	}
+}
+
 func TestPerformancePlanArtifactUsesProducingAttempt(t *testing.T) {
 	workflow := readQualityWorkflow(t)
 	for _, step := range workflow.Jobs["performance-samples"].Steps {

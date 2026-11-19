@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/light-speak/luxo/internal/diagnostics"
 	coreevent "github.com/light-speak/luxo/pkg/lux/event"
 	"sync"
 
@@ -17,10 +18,13 @@ var ErrBinaryPayloadRequired = errors.New("event: NATS payload must use Luxo bin
 // Used in multi-service mode for cross-process event delivery.
 // Generated events use Luxo binary; custom payloads must be pre-encoded.
 type NATSBus struct {
-	conn *nats.Conn
-	subs []*nats.Subscription
-	mu   sync.Mutex
-	once sync.Once
+	conn     *nats.Conn
+	subs     []*busSubscription
+	mu       sync.RWMutex
+	once     sync.Once
+	closed   bool
+	closeErr error
+	reports  diagnostics.Events
 }
 
 var _ coreevent.Bus = (*NATSBus)(nil)
@@ -43,6 +47,11 @@ func (b *NATSBus) Emit(ctx context.Context, name string, payload any) error {
 	if err != nil {
 		return err
 	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
+		return coreevent.ErrBusClosed
+	}
 	return b.conn.Publish(name, data)
 }
 
@@ -63,41 +72,92 @@ func natsPayloadBytes(payload any) ([]byte, error) {
 
 // On subscribes to a NATS subject. Handler receives the raw wire bytes.
 func (b *NATSBus) On(name string, handler coreevent.Handler) error {
-	sub, err := b.conn.Subscribe(name, func(msg *nats.Msg) {
-		coreevent.InvokeHandler(handler, bgCtx, msg.Data)
-	})
+	return b.subscribe(name, "", handler)
+}
+
+// OnQueue subscribes with a queue group. Only one member receives each message.
+func (b *NATSBus) OnQueue(name string, group string, handler coreevent.Handler) error {
+	return b.subscribe(name, group, handler)
+}
+
+func (b *NATSBus) subscribe(name, group string, handler coreevent.Handler) error {
+	if handler == nil {
+		return coreevent.ErrHandlerRequired
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return coreevent.ErrBusClosed
+	}
+	var sub *nats.Subscription
+	var err error
+	if group == "" {
+		sub, err = b.conn.SubscribeSync(name)
+	} else {
+		sub, err = b.conn.QueueSubscribeSync(name, group)
+	}
 	if err != nil {
 		return fmt.Errorf("nats subscribe: %w", err)
 	}
-	b.mu.Lock()
-	b.subs = append(b.subs, sub)
-	b.mu.Unlock()
+	subscription := &busSubscription{sub: sub, handler: b.messageHandler(name, handler), done: make(chan struct{}), bus: b}
+	b.subs = append(b.subs, subscription)
+	go subscription.run()
 	return nil
 }
 
-// OnQueue subscribes with a queue group. Only one member of the group
-// receives each message — used for competing consumers across pods.
-func (b *NATSBus) OnQueue(name string, group string, handler coreevent.Handler) error {
-	sub, err := b.conn.QueueSubscribe(name, group, func(msg *nats.Msg) {
-		coreevent.InvokeHandler(handler, bgCtx, msg.Data)
-	})
-	if err != nil {
-		return fmt.Errorf("nats queue subscribe: %w", err)
-	}
-	b.mu.Lock()
-	b.subs = append(b.subs, sub)
-	b.mu.Unlock()
-	return nil
+// Close rejects new work, drains accepted deliveries, then closes the connection.
+func (b *NATSBus) Close() error {
+	b.once.Do(b.close)
+	return b.closeErr
 }
 
-// Close drains all subscriptions and closes the NATS connection.
-func (b *NATSBus) Close() {
-	b.once.Do(func() {
-		b.mu.Lock()
-		for _, sub := range b.subs {
-			sub.Drain()
+func (b *NATSBus) close() {
+	b.mu.Lock()
+	b.closed = true
+	subscriptions := b.subs
+	b.subs = nil
+	b.mu.Unlock()
+
+	for _, subscription := range subscriptions {
+		if err := subscription.sub.Drain(); err != nil {
+			b.closeErr = errors.Join(b.closeErr, fmt.Errorf("nats event drain: %w", err))
+			b.unsubscribe(subscription)
 		}
-		b.mu.Unlock()
-		b.conn.Close()
-	})
+	}
+	// Flush after UNSUB requests: this covers outbound-only buses as well as
+	// the server boundary for draining subscriptions. A failed barrier is not success.
+	if err := b.conn.FlushTimeout(nats.DefaultTimeout); err != nil {
+		b.closeErr = errors.Join(b.closeErr, fmt.Errorf("nats event flush: %w", err))
+		for _, subscription := range subscriptions {
+			b.unsubscribe(subscription)
+		}
+	}
+	for _, subscription := range subscriptions {
+		<-subscription.done
+	}
+	if b.conn.IsClosed() {
+		b.closeErr = errors.Join(b.closeErr, nats.ErrConnectionClosed)
+	}
+	b.conn.Close()
+	if err := b.reports.Drain(nats.DefaultTimeout); err != nil {
+		b.closeErr = errors.Join(b.closeErr, err)
+	}
 }
+
+func (b *NATSBus) unsubscribe(subscription *busSubscription) {
+	if err := subscription.sub.Unsubscribe(); err != nil && !errors.Is(err, nats.ErrBadSubscription) {
+		b.closeErr = errors.Join(b.closeErr, fmt.Errorf("nats event unsubscribe: %w", err))
+	}
+}
+
+// natsMessageHandler preserves failure diagnostics without retrying a delivery.
+func (b *NATSBus) messageHandler(name string, handler coreevent.Handler) nats.MsgHandler {
+	return func(msg *nats.Msg) {
+		if err := coreevent.InvokeHandler(handler, bgCtx, msg.Data); err != nil {
+			b.reports.Submit(name, "handler error", err)
+		}
+	}
+}
+
+// DiagnosticStats counts failed or dropped reports independently of deliveries.
+func (b *NATSBus) DiagnosticStats() (dropped, failures uint64) { return b.reports.Stats() }

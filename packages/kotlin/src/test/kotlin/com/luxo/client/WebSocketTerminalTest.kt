@@ -6,6 +6,30 @@ import kotlin.test.*
 
 class WebSocketTerminalTest {
     @Test
+    fun invalidErrorStatusOnlyEndsItsOwnSubscription() = runBlocking {
+        for (mode in TransportMode.entries) withSocket(mode) { transport, socket ->
+            val errors = mutableListOf<LuxoError>()
+            var completed = 0
+            val cancel = transport.subscribe("watch", { it }, observer = StreamObserver({ completed++ }, { errors += it })) {
+                fail("invalid subscription delivered data")
+            }
+            var peer = 0
+            val cancelPeer = transport.subscribe("watch", { it }) { peer++ }
+            fail(socket, mode, 1u, code = 0)
+            fail(socket, mode, 1u, code = 0)
+            data(socket, mode, 2u, 7)
+            assertEquals("ParseError", errors.single().error)
+            assertEquals(0, completed)
+            assertEquals(1, peer)
+            assertEquals(0, socket.closes)
+            val sent = socket.sent
+            cancel()
+            assertEquals(sent, socket.sent)
+            cancelPeer()
+        }
+    }
+
+    @Test
     fun completionFollowsDataOnceAndOnlyRemovesItsOwnSubscription() = runBlocking {
         for (mode in TransportMode.entries) withSocket(mode) { transport, socket ->
             val events = mutableListOf<Int>()
@@ -106,15 +130,36 @@ class WebSocketTerminalTest {
     }
 
     @Test
-    fun uncorrelatableBinaryTerminalDoesNotRemoveSubscription() = runBlocking {
+    fun malformedBinaryFramesRetireCallsAcknowledgementsAndObservers() = runBlocking {
+        for (mode in TransportMode.entries) for (bytes in listOf(byteArrayOf(), byteArrayOf(0x15),
+            byteArrayOf(0x95.toByte(), 0, 1), byteArrayOf(0x15) + ByteArray(10) { 0xff.toByte() }, frame(0x17, 1u))) {
+            withSocket(mode) { transport, socket ->
+                val errors = mutableListOf<LuxoError>()
+                val stops = (1..2).map {
+                    transport.subscribe("watch", { it }, observer = StreamObserver(onError = { errors += it })) {}
+                }
+                socket.onText = {}; socket.onBinary = {}
+                val call = async(start = CoroutineStart.UNDISPATCHED) { runCatching { transport.call("watch") } }
+                val setup = async(start = CoroutineStart.UNDISPATCHED) { runCatching { transport.subscribe("watch", { it }) {} } }
+                socket.receive(bytes)
+                assertEquals("ParseError", assertIs<LuxoError>(call.await().exceptionOrNull()).error)
+                assertEquals("ParseError", assertIs<LuxoError>(setup.await().exceptionOrNull()).error)
+                assertEquals(listOf("ParseError", "ParseError"), errors.map { it.error })
+                assertEquals(1, socket.closes)
+                socket.receive(bytes)
+                assertEquals(2, errors.size)
+                stops.forEach { it() }
+            }
+        }
+    }
+
+    @Test
+    fun validRetiredBinaryTerminalDoesNotRemoveSubscription() = runBlocking {
         withSocket(TransportMode.BINARY) { transport, socket ->
             var completed = 0
-            var errors = 0
-            transport.subscribe("watch", { it }, observer = StreamObserver({ completed++ }, { errors++ })) {}
-            for (frame in listOf(byteArrayOf(), byteArrayOf(0x15), byteArrayOf(0x95.toByte(), 0, 1),
-                byteArrayOf(0x15) + ByteArray(10) { 0xff.toByte() }, frame(0x15, 2u), frame(0x17, 1u))) socket.receive(frame)
+            transport.subscribe("watch", { it }, observer = StreamObserver(onComplete = { completed++ })) {}
+            socket.receive(frame(0x15, 2u))
             assertEquals(0, completed)
-            assertEquals(0, errors)
             finish(socket, TransportMode.BINARY, 1u)
             assertEquals(1, completed)
         }
@@ -265,13 +310,13 @@ class WebSocketTerminalTest {
 
     private val precisionData = """{"n":123456789012345678901234567890,"f":1.2345678901234567890123456789,"zero":-0}"""
 
-    private fun fail(socket: TestSocket, mode: TransportMode, id: ULong, acknowledgement: Boolean = false) {
+    private fun fail(socket: TestSocket, mode: TransportMode, id: ULong, acknowledgement: Boolean = false, code: Long = 409) {
         if (mode == TransportMode.JSON) {
             val key = if (acknowledgement) "sub" else "end"
-            socket.receive("""{"${'$'}$key":$id,"error":"Rejected","code":409,"message":"no","traceId":"trace","data":$precisionData,"cause":"details"}""")
+            socket.receive("""{"${'$'}$key":$id,"error":"Rejected","code":$code,"message":"no","traceId":"trace","data":$precisionData,"cause":"details"}""")
         } else {
             val encoder = LuxoEncoder()
-            encoder.writeFieldInt(1, 409)
+            encoder.writeFieldInt(1, code)
             encoder.writeFieldString(2, "Rejected")
             encoder.writeFieldString(3, "no")
             encoder.writeFieldString(4, "trace")

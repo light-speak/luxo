@@ -38,11 +38,11 @@ import (
 	})
 	enums := map[string]bool{"State": true}
 	generateEnum(&source, &ast.EnumDecl{Name: "State", Values: []string{"OPEN", "CLOSED"}})
-	generateFilterParser(&source, model, enums)
-	generateSorterParser(&source, model)
-	generateFilterParser(&source, testModel("Empty", nil, nil), nil)
-	generateSorterParser(&source, testModel("Empty", nil, nil))
-	generateHandler(&source, model, "list", enums, nil)
+	defaultGenerator().generateFilterParser(&source, model, enums)
+	defaultGenerator().generateSorterParser(&source, model)
+	defaultGenerator().generateFilterParser(&source, testModel("Empty", nil, nil), nil)
+	defaultGenerator().generateSorterParser(&source, testModel("Empty", nil, nil))
+	defaultGenerator().generateHandler(&source, model, "list", enums, nil)
 	source.WriteString(queryContractFixture)
 	dir := writeProtocolFixture(t, source.String(), queryContractAssertions)
 	for _, args := range [][]string{{"test", "-count=1", "."}, {"vet", "."}} {

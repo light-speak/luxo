@@ -1,6 +1,7 @@
 package math
 
 import (
+	"fmt"
 	gomath "math"
 	"testing"
 )
@@ -63,5 +64,23 @@ func TestRandInt(t *testing.T) {
 	}
 	if RandInt(10, 5) != 10 {
 		t.Error("inverted bounds")
+	}
+}
+
+func TestRandIntBoundaries(t *testing.T) {
+	for _, bounds := range [][2]int64{
+		{0, gomath.MaxInt64}, {gomath.MinInt64, -1},
+		{gomath.MinInt64, gomath.MaxInt64}, {gomath.MinInt64, 0},
+		{-1, gomath.MaxInt64}, {gomath.MinInt64, gomath.MaxInt64 - 1},
+		{gomath.MinInt64, gomath.MinInt64 + 1}, {gomath.MaxInt64 - 1, gomath.MaxInt64},
+	} {
+		t.Run(fmt.Sprintf("%d/%d", bounds[0], bounds[1]), func(t *testing.T) {
+			for range 128 {
+				got := RandInt(bounds[0], bounds[1])
+				if got < bounds[0] || got > bounds[1] {
+					t.Fatalf("RandInt(%d,%d) = %d", bounds[0], bounds[1], got)
+				}
+			}
+		})
 	}
 }

@@ -17,8 +17,8 @@ String rewriteSelections(
   final plans = StringBuffer();
   for (final entry in analyzer.callSelections.entries) {
     final call = entry.key;
-    final method = call.methodName.element;
-    if (method is! MethodElement ||
+    final method = analyzer.apiMethod(call);
+    if (method == null ||
         !method.formalParameters.any((p) => p.isNamed && p.name == 'select')) {
       continue;
     }

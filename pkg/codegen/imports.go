@@ -13,8 +13,16 @@ type generatedImports uint32
 
 func (imports generatedImports) has(name string) bool { return imports&generatedPackageBit(name) != 0 }
 
-func writeStringUtilityImports(b *strings.Builder, packages generatedImports) {
-	for _, name := range []string{"str", "convert"} {
+func writeOptionalStandardImports(b *strings.Builder, packages generatedImports, names ...string) {
+	for _, name := range names {
+		if packages.has(name) {
+			fmt.Fprintf(b, "\t%q\n", name)
+		}
+	}
+}
+
+func writeRuntimeUtilityImports(b *strings.Builder, packages generatedImports) {
+	for _, name := range []string{"str", "convert", "dataloader"} {
 		if packages.has(name) {
 			fmt.Fprintf(b, "\t\"github.com/light-speak/luxo/pkg/lux/%s\"\n", name)
 		}
@@ -122,6 +130,40 @@ func scopedGeneratedPackages(body string, fallback generatedImports) generatedIm
 	return imports
 }
 
+// Stream modules use arbitrary source names, outside the fixed import bitset.
+// Resolve them once; strings and local shadowing do not justify an import.
+func keepReferencedGeneratedModules(body string, modules map[string]bool) {
+	if len(modules) == 0 {
+		return
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), "stream.go", "package generated\n"+body, 0)
+	if err != nil {
+		return
+	} // The formal generation boundary reports invalid Go.
+	for name := range modules {
+		modules[name] = false
+	}
+	goast.Inspect(file, func(node goast.Node) bool {
+		selector, ok := node.(*goast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		root, ok := selector.X.(*goast.Ident)
+		if ok && root.Obj == nil && strings.HasSuffix(root.Name, "_luxo") {
+			name := strings.TrimSuffix(root.Name, "_luxo")
+			if _, candidate := modules[name]; candidate {
+				modules[name] = true
+			}
+		}
+		return true
+	})
+	for name, used := range modules {
+		if !used {
+			delete(modules, name)
+		}
+	}
+}
+
 func generatedIdentifierByte(ch byte) bool {
 	return ch == '_' || ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch >= 128
 }
@@ -177,13 +219,29 @@ func generatedPackageBit(name string) generatedImports {
 		return 1 << 17
 	case "jsonutil":
 		return 1 << 18
+	case "str", "convert", "dataloader":
+		return generatedUtilityPackageBit(name)
+	case "context":
+		return 1 << 21
+	case "slices":
+		return 1 << 22
+	case "math":
+		return 1 << 23
+	case "api":
+		return 1 << 25
+	default:
+		return 0
+	}
+}
+
+func generatedUtilityPackageBit(name string) generatedImports {
+	switch name {
 	case "str":
 		return 1 << 19
 	case "convert":
 		return 1 << 20
-	case "context":
-		return 1 << 21
-	default:
-		return 0
+	case "dataloader":
+		return 1 << 24
 	}
+	return 0
 }

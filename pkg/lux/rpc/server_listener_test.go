@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -33,27 +34,94 @@ func (l *acceptTestListener) Close() error {
 
 type temporaryAcceptError struct{ permanent bool }
 
+type startupValidationListener struct {
+	net.Listener
+	accepts int
+}
+
+func (l *startupValidationListener) Accept() (net.Conn, error) {
+	l.accepts++
+	return nil, errors.New("startup validation reached Accept")
+}
+
+func TestServerRejectsNilRoutesAndReleasesOwnedListener(t *testing.T) {
+	for _, internal := range []bool{false, true} {
+		router := api.NewRouter()
+		if internal {
+			router.HandleInternal("missing", nil)
+		} else {
+			router.Handle("missing", nil)
+		}
+		server := NewServer(router)
+		t.Cleanup(server.Close)
+		if err := server.ListenAndServe("invalid-address"); err == nil || !strings.Contains(err.Error(), `"missing"`) {
+			t.Fatalf("missing route not checked before listen: %v", err)
+		}
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { listener.Close() })
+		owned := &startupValidationListener{Listener: listener}
+		if err := server.Serve(owned); err == nil || !strings.Contains(err.Error(), `"missing"`) {
+			t.Fatalf("missing route not checked before accept: %v", err)
+		}
+		if owned.accepts != 0 {
+			t.Fatal("invalid route started accepting connections")
+		}
+		rebound, err := net.Listen("tcp", listener.Addr().String())
+		if err != nil {
+			t.Fatalf("failed startup retained listener: %v", err)
+		}
+		rebound.Close()
+	}
+}
+
 func (temporaryAcceptError) Error() string     { return "temporary accept failure" }
 func (e temporaryAcceptError) Temporary() bool { return !e.permanent }
 
-func TestServerClosesConnectionWhenMalformedRequestReplyFails(t *testing.T) {
-	preface := protocolPreface()
-	var input bytes.Buffer
-	input.Write(preface[:])
-	if err := WriteFrame(&input, []byte{255}); err != nil {
-		t.Fatal(err)
+type failedReplyConn struct {
+	net.Conn
+	writes atomic.Int32
+	closes atomic.Int32
+}
+
+func (c *failedReplyConn) Write(data []byte) (int, error) {
+	if c.writes.Add(1) > 1 {
+		return 0, io.ErrClosedPipe
 	}
-	owned := &poolLifecycleConn{}
-	writer := &errWriterAfterN{n: 1}
-	conn := &prefaceTestConn{Conn: owned, reader: &input, writer: writer}
+	return c.Conn.Write(data)
+}
+
+func (c *failedReplyConn) Close() error {
+	c.closes.Add(1)
+	return c.Conn.Close()
+}
+
+func TestServerClosesConnectionWhenMalformedRequestReplyFails(t *testing.T) {
+	socket, peer := net.Pipe()
+	defer peer.Close()
+	conn := &failedReplyConn{Conn: socket}
 	server := NewServer(api.NewRouter())
 	defer server.Close()
 	if !server.registerConnection(conn) {
-		t.Fatal("test connection registration failed")
+		t.Fatal("registration failed")
 	}
-	server.handleConn(conn)
-	if owned.closes.Load() != 1 || writer.calls != 2 || len(server.connections) != 0 {
-		t.Fatalf("failed error response leaked connection: closes=%d, writes=%d, registered=%d", owned.closes.Load(), writer.calls, len(server.connections))
+	done := make(chan struct{})
+	go func() { server.handleConn(conn); close(done) }()
+	if err := initiateHandshake(t.Context(), peer, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	peer.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := WriteFrame(peer, []byte{255}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatal("failed reply did not close connection", err)
+	}
+	<-done
+	if conn.closes.Load() != 1 || conn.writes.Load() != 2 || len(server.connections) != 0 {
+		t.Fatalf("failed response lifecycle: closes=%d writes=%d registered=%d", conn.closes.Load(), conn.writes.Load(), len(server.connections))
 	}
 }
 
@@ -403,5 +471,55 @@ func assertRPCConnectionRejected(t *testing.T, addr string) {
 	}
 	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
 		t.Fatal("connection at capacity was left open")
+	}
+}
+
+func TestServerCloseCancelsRunningUnaryHandler(t *testing.T) {
+	router := api.NewRouter()
+	if err := router.Registry.Register("wait", 1); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan context.Context, 1)
+	release := make(chan struct{})
+	defer close(release)
+	router.Handle("wait", func(ctx context.Context, _ *api.Request) error {
+		started <- ctx
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-release:
+			return context.Canceled
+		}
+	})
+	server := NewServer(router)
+	client := NewClient(startTestRPCServer(t, server))
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	callDone := make(chan error, 1)
+	go func() { _, err := client.CallWithMaskContext(ctx, "", 1, nil, nil); callDone <- err }()
+	var business context.Context
+	select {
+	case business = <-started:
+	case <-ctx.Done():
+		t.Fatal("handler did not start")
+	}
+	closeDone := make(chan struct{})
+	go func() { server.Close(); close(closeDone) }()
+	select {
+	case <-closeDone:
+	case <-ctx.Done():
+		t.Fatal("server close did not cancel running handler")
+	}
+	if business.Err() != context.Canceled {
+		t.Fatal("handler context not canceled", business.Err())
+	}
+	select {
+	case err := <-callDone:
+		if err == nil {
+			t.Fatal("closed request returned success")
+		}
+	case <-ctx.Done():
+		t.Fatal("client did not finish")
 	}
 }

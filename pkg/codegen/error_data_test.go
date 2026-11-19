@@ -9,6 +9,147 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
+func TestGeneratedGatewayLocalizedErrorData(t *testing.T) {
+	var proxy strings.Builder
+	writeGatewayProxy(&proxy)
+	runGeneratedFixture(t, `
+error PublicRejected(value: Int, label: String, raw: JSON, amount: Decimal, optional: String?) {
+ code: 422 message: "error.precision" internal: false
+}
+error PrivateRejected(detail: String) { code: 409 message: "error.private" internal: true }
+api publicFailure(asString: Boolean): Int @native
+api privateFailure(): Int @native
+api success(): Int { return 7 }
+`, localizedGatewayErrorAssertions+proxy.String(), StableIDs{
+		APIs:      map[string]int{"publicFailure": 1, "privateFailure": 2, "success": 3},
+		APIParams: map[string]map[string]int{"publicFailure": {"asString": 1}},
+	})
+}
+
+const localizedGatewayErrorAssertions = `package generated
+import("bytes";"context";"encoding/json";"errors";"fmt";"io";"net";"net/http";"net/http/httptest";"os";"path/filepath";"strconv";"strings";"sync";"sync/atomic";"testing";"time"
+ "github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
+ "github.com/light-speak/luxo/pkg/lux/i18n";"github.com/light-speak/luxo/pkg/lux/luvia";"github.com/light-speak/luxo/pkg/lux/rpc";"github.com/light-speak/luxo/pkg/lux/schema"
+ "github.com/shopspring/decimal";"nhooyr.io/websocket")
+const localizedErrorObject="{\"huge\":123456789012345678901234567890,\"fraction\":0.12345678901234567890123456789,\"text\":\"json\"}"
+const localizedErrorLabel="\uFEFFlabel \"quoted\" \\ path"
+type localizedErrorResolver struct{ calls atomic.Int64 }
+func(r *localizedErrorResolver)PublicFailure(_ context.Context,asString bool)(int64,error){r.calls.Add(1);return 0,localizedPublicError(asString)}
+func(r *localizedErrorResolver)PrivateFailure(context.Context)(int64,error){r.calls.Add(1);return 0,NewPrivateRejected("PRIVATE_DATA").WithCause(errors.New("PRIVATE_CAUSE"))}
+func localizedPublicError(asString bool)*luxerrors.AppError{
+ raw:=localizedErrorObject;if asString{raw="\"json-string\""}
+ return NewPublicRejected(9007199254740993,localizedErrorLabel,json.RawMessage(raw),decimal.New(12345,-2),nil)
+}
+type localizedErrorListener struct{net.Listener;accepted atomic.Int64}
+func(l *localizedErrorListener)Accept()(net.Conn,error){conn,err:=l.Listener.Accept();if err==nil{l.accepted.Add(1)};return conn,err}
+type localizedErrorEnvelope struct{Error string;Code int;Message string;Data json.RawMessage}
+
+func localizedErrorRouter(t *testing.T,resolver *localizedErrorResolver)*api.Router{
+ t.Helper();router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+ if err:=RegisterHandlers(router,&App{Resolver:resolver});err!=nil{t.Fatal(err)}
+ if err:=router.Prepare();err!=nil{t.Fatal(err)};return router
+}
+func localizedErrorGateway(t *testing.T,backend *api.Router)(*api.Router,*rpc.Client,*localizedErrorListener){
+ t.Helper();ln,err:=net.Listen("tcp","127.0.0.1:0");if err!=nil{t.Fatal(err)}
+ listener:=&localizedErrorListener{Listener:ln};server:=rpc.NewServer(backend);done:=make(chan error,1)
+ go func(){done<-server.Serve(listener)}();client:=rpc.NewClient(ln.Addr().String())
+ t.Cleanup(func(){client.Close();server.Close();if err:=<-done;err!=nil{t.Error(err)}})
+ router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+ if err:=router.Registry.RegisterSchemaAPIs(router.Schema);err!=nil{t.Fatal(err)}
+ for _,name:=range []string{"publicFailure","privateFailure","success"}{router.Handle(name,proxyHandler(client,router.Schema,name,nil))}
+ if err:=router.Prepare();err!=nil{t.Fatal(err)};return router,client,listener
+}
+func localizedErrorTranslator(t *testing.T)*i18n.Translator{
+ t.Helper();cwd,err:=os.Getwd();if err!=nil{t.Fatal(err)};dir:=filepath.Join(cwd,"localized-error-catalog")
+ if err:=os.Mkdir(dir,0700);err!=nil{t.Fatal(err)}
+ for lang,prefix:=range map[string]string{"en":"Rejected","zh":"拒绝"}{
+  text:="error:\n  precision: \""+prefix+" ${value}: ${label}; json=${raw}; amount=${amount}\"\n  private: \"PRIVATE_TRANSLATED\"\n"
+  if err:=os.WriteFile(filepath.Join(dir,lang+".yaml"),[]byte(text),0600);err!=nil{t.Fatal(err)}
+ }
+ translator:=i18n.New("en");if err:=translator.LoadDir(dir);err!=nil{t.Fatal(err)};return translator
+}
+func localizedErrorRequest(router *api.Router,binary bool,name string,asString bool)[]byte{
+ if !binary{body:="{\"$api\":\""+name+"\"";if name=="publicFailure"{body+=",\"asString\":"+strconv.FormatBool(asString)};return []byte(body+"}")}
+ var encoded codec.Encoder;encoded.WriteVarint(uint64(router.Schema.APIs[name].ID));encoded.WriteVarint(0)
+ if name=="publicFailure"{encoded.WriteFieldBool(1,asString)};encoded.WriteEnd();return encoded.Bytes()
+}
+func localizedErrorDecode(t *testing.T,binary bool,body []byte)localizedErrorEnvelope{
+ t.Helper();if binary{value,err:=api.DecodeBinaryError(body,0);if err!=nil{t.Fatal(err)};return localizedErrorEnvelope{Error:value.Name,Code:value.Code,Message:value.Message,Data:value.Data}}
+ var value localizedErrorEnvelope;if err:=json.Unmarshal(body,&value);err!=nil{t.Fatal(err)};return value
+}
+func requireLocalizedError(t *testing.T,value localizedErrorEnvelope,name,lang string,asString bool){
+ t.Helper();if name=="privateFailure"{
+  if value.Code!=409||value.Error!="PrivateRejected"||value.Message!="error.internal"||len(value.Data)!=0{t.Fatalf("private error leaked: %+v",value)};return
+ }
+ raw:=localizedErrorObject;if asString{raw="\"json-string\""};prefix:="Rejected";if lang=="zh-CN"{prefix="拒绝"}
+ want:=prefix+" 9007199254740993: "+localizedErrorLabel+"; json="+raw+"; amount=123.45"
+ expected,err:=localizedPublicError(asString).Data.AppendJSON(nil);if err!=nil{t.Fatal(err)}
+ if value.Code!=422||value.Error!="PublicRejected"||value.Message!=want||!bytes.Equal(value.Data,expected){t.Fatalf("%s: %+v data=%s want message=%q data=%s",lang,value,value.Data,want,expected)}
+}
+func requireLocalizedBodyPrivacy(t *testing.T,body []byte){
+ t.Helper();if bytes.Contains(body,[]byte("PRIVATE_")){t.Fatalf("private diagnostic escaped: %s",body)}
+}
+func localizedErrorHTTP(t *testing.T,router *api.Router){
+ t.Helper();server:=httptest.NewServer(router);defer server.Close();client:=server.Client();client.Timeout=5*time.Second
+ for _,lang:=range []string{"zh-CN","en-US","fr",""}{for _,binary:=range []bool{false,true}{
+  for _,sample:=range []struct{name string;asString bool}{{"publicFailure",false},{"publicFailure",true},{"privateFailure",false},{"success",false}}{
+   body:=localizedErrorRequest(router,binary,sample.name,sample.asString)
+   request,err:=http.NewRequestWithContext(t.Context(),http.MethodPost,server.URL,bytes.NewReader(body));if err!=nil{t.Fatal(err)}
+   request.Header.Set("Accept-Language",lang);request.Header.Set("Content-Type","application/json")
+   if binary{request.Header.Set("Content-Type","application/x-luxo");request.Header.Set("X-Luxo-Mode","binary")}
+   response,err:=client.Do(request);if err!=nil{t.Fatal(err)};data,err:=io.ReadAll(response.Body);response.Body.Close();if err!=nil{t.Fatal(err)}
+   requireLocalizedBodyPrivacy(t,data)
+   if sample.name=="success"{want:=[]byte("{\"data\":7}");if binary{want=codec.AppendSvarint(nil,7)};if response.StatusCode!=200||!bytes.Equal(data,want){t.Fatalf("HTTP recovery failed: %d %x",response.StatusCode,data)};continue}
+   value:=localizedErrorDecode(t,binary,data);if response.StatusCode!=value.Code{t.Fatal("HTTP status differs from error code",response.StatusCode,value.Code)}
+   requireLocalizedError(t,value,sample.name,lang,sample.asString)
+  }
+ }}
+}
+func localizedErrorWS(t *testing.T,router *api.Router){
+ t.Helper();server:=httptest.NewServer(router);defer server.Close()
+ for _,lang:=range []string{"zh-CN","en-US","fr",""}{
+  ctx,cancel:=context.WithTimeout(t.Context(),5*time.Second)
+  conn,_,err:=websocket.Dial(ctx,"ws"+strings.TrimPrefix(server.URL,"http"),&websocket.DialOptions{HTTPHeader:http.Header{"Accept-Language":{lang}}});if err!=nil{cancel();t.Fatal(err)}
+  localizedErrorWSMessages(t,ctx,conn,router,lang);conn.CloseNow();cancel()
+ }
+}
+func localizedErrorWSMessages(t *testing.T,ctx context.Context,conn *websocket.Conn,router *api.Router,lang string){
+ t.Helper();var id byte
+ for _,binary:=range []bool{false,true}{for _,sample:=range []struct{name string;asString bool}{{"publicFailure",false},{"publicFailure",true},{"privateFailure",false},{"success",false}}{
+  id++;payload:=localizedErrorRequest(router,binary,sample.name,sample.asString);kind:=websocket.MessageText
+  frame:=append([]byte("{\"$id\":"+strconv.Itoa(int(id))+","),payload[1:]...)
+  if binary{kind=websocket.MessageBinary;frame=append([]byte{api.BinaryFrameCallRequest,id},payload...)}
+  if err:=conn.Write(ctx,kind,frame);err!=nil{t.Fatal(err)};got,data,err:=conn.Read(ctx);if err!=nil||got!=kind{t.Fatal(got,err)}
+  requireLocalizedBodyPrivacy(t,data)
+  if binary{want:=byte(api.BinaryFrameCallError);if sample.name=="success"{want=api.BinaryFrameCallSuccess};if len(data)<3||data[0]!=want||data[1]!=id{t.Fatalf("bad Binary WS reply %x",data)};data=data[2:]}
+  if !binary{var envelope map[string]json.RawMessage;if err:=json.Unmarshal(data,&envelope);err!=nil{t.Fatal(err)};var actual byte;if err:=json.Unmarshal(envelope["$id"],&actual);err!=nil||actual!=id{t.Fatal("wrong WS request ID",string(data),err)}}
+  if sample.name=="success"{if binary{if !bytes.Equal(data,codec.AppendSvarint(nil,7)){t.Fatal("WS Binary recovery failed",data)}}else{var value struct{Data int};if err:=json.Unmarshal(data,&value);err!=nil||value.Data!=7{t.Fatal("WS JSON recovery failed",string(data),err)}};continue}
+  requireLocalizedError(t,localizedErrorDecode(t,binary,data),sample.name,lang,sample.asString)
+ }}
+}
+func localizedErrorRPCKeys(t *testing.T,client *rpc.Client){
+ t.Helper();for _,asString:=range []bool{false,true}{var params codec.Encoder;params.WriteFieldBool(1,asString);params.WriteEnd()
+  _,err:=client.CallWithMaskContext(t.Context(),"",1,nil,params.Bytes());var failure *luxerrors.AppError
+  if !errors.As(err,&failure)||failure.Message!="error.precision"||failure.Data==nil{t.Fatalf("LRPC translated too early: %+v",err)}
+  expected,e:=localizedPublicError(asString).Data.AppendJSON(nil);if e!=nil{t.Fatal(e)};actual,e:=failure.Data.AppendJSON(nil);if e!=nil||!bytes.Equal(actual,expected){t.Fatal("LRPC data changed",string(actual),e)}
+ }
+ _,err:=client.CallWithMaskContext(t.Context(),"",2,nil,[]byte{0});var failure *luxerrors.AppError
+ if !errors.As(err,&failure)||!failure.Internal||failure.Message!="error.internal"||failure.Data!=nil{t.Fatal("LRPC private fields escaped",err)}
+}
+func TestLocalizedGeneratedErrorsAcrossGateway(t *testing.T){
+ resolver:=&localizedErrorResolver{};backend:=localizedErrorRouter(t,resolver);gateway,client,listener:=localizedErrorGateway(t,backend)
+ translator:=localizedErrorTranslator(t);backend.SetTranslator(translator);gateway.SetTranslator(translator)
+ second,secondClient,secondListener:=localizedErrorGateway(t,gateway);second.SetTranslator(translator)
+ for _,route:=range []struct{name string;router *api.Router}{{"direct",backend},{"gateway",gateway},{"two-hop",second}}{
+  t.Run(route.name+"/HTTP",func(t *testing.T){localizedErrorHTTP(t,route.router)})
+  t.Run(route.name+"/WS",func(t *testing.T){localizedErrorWS(t,route.router)})
+ }
+ localizedErrorRPCKeys(t,client);localizedErrorRPCKeys(t,secondClient)
+ if resolver.calls.Load()!=150{t.Fatalf("missing native error executions: %d want 150",resolver.calls.Load())}
+ if listener.accepted.Load()!=1||secondListener.accepted.Load()!=1{t.Fatalf("LRPC connection was not reused: %d / %d",listener.accepted.Load(),secondListener.accepted.Load())}
+}
+`
+
 func TestGeneratedErrorDataUsesRemotePrimaryKey(t *testing.T) {
 	for _, keyType := range []string{"String", "UUID"} {
 		t.Run(keyType, func(t *testing.T) {
@@ -49,6 +190,111 @@ func TestRemoteKey(t *testing.T) {
 			runGeneratedProtocolPackage(t, source, assertions)
 		})
 	}
+}
+
+func TestGeneratedErrorModelListParameter(t *testing.T) {
+	runGeneratedFixture(t, `
+model Detail @noTime { id: Int @id level: Int }
+model User @noTime @withAuth(stores: [id, names]) { id: Int @id names: [Int] }
+error Rejected(details: [Detail]) { code: 422 message: "error.rejected" }
+error OptionalRejected(details: [Detail]?) { code: 422 message: "error.optional" }
+fn rejectDetails(values: [Detail]): Int { throw Rejected(details: values) }
+`, `package generated
+import("testing";"bytes";"context";"encoding/json";"net/http/httptest";"net";"sync/atomic";"time";"github.com/light-speak/luxo/pkg/lux/rpc";"github.com/light-speak/luxo/pkg/lux/schema";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/errors")
+func TestErrorModelList(t *testing.T){
+ values:=[]*Detail{{Id:1,Level:42}}
+ _,failure:=(&App{}).rejectDetails(t.Context(),values)
+ rejected,ok:=failure.(*errors.AppError);if !ok{t.Fatalf("generated throw: %T %v",failure,failure)}
+ data:=rejected.Data
+ raw,err:=data.AppendJSON(nil)
+ if err!=nil||!bytes.Contains(raw,[]byte("\"level\":42")){t.Fatalf("%s: %v",raw,err)}
+ values[0]=nil
+ if raw,err=data.AppendJSON([]byte("prefix:"));err==nil||string(raw)!="prefix:"{t.Fatalf("nil element %s: %v",raw,err)}
+ raw,err=NewRejected([]*Detail{}).Data.AppendJSON(nil)
+ if err!=nil||string(raw)!="{\"details\":[]}"{t.Fatalf("empty %s: %v",raw,err)}
+ raw,err=NewRejected(nil).Data.AppendJSON(nil)
+ if err!=nil||string(raw)!="{\"details\":[]}"{t.Fatalf("required nil %s: %v",raw,err)}
+ raw,err=NewOptionalRejected(nil).Data.AppendJSON(nil)
+ if err!=nil||string(raw)!="{\"details\":null}"{t.Fatalf("optional nil %s: %v",raw,err)}
+ raw,err=NewOptionalRejected([]*Detail{}).Data.AppendJSON(nil)
+ if err!=nil||string(raw)!="{\"details\":[]}"{t.Fatalf("optional empty %s: %v",raw,err)}
+ raw,err=(&User{}).AppendClaimsJSON(nil)
+ if err!=nil||string(raw)!="{\"id\":0,\"names\":[]}"{t.Fatalf("required claims list %s: %v",raw,err)}
+
+}
+func TestErrorModelListOverHTTP(t *testing.T){
+ router:=api.NewRouter()
+ if err:=router.Schema.RegisterAPI(&schema.API{ID:1,Name:"fail",ReturnType:"Int"});err!=nil{t.Fatal(err)}
+ if err:=router.Registry.RegisterSchemaAPIs(router.Schema);err!=nil{t.Fatal(err)}
+ var validValue atomic.Bool
+ router.Handle("fail",func(ctx context.Context,_ *api.Request)error{
+  values:=[]*Detail{{Id:123456789,Level:42}}
+  if !validValue.Load(){values=append(values,nil)}
+  _,err:=(&App{}).rejectDetails(ctx,values);return err
+ })
+ if err:=router.Prepare();err!=nil{t.Fatal(err)}
+ listener,err:=net.Listen("tcp","127.0.0.1:0");if err!=nil{t.Fatal(err)}
+ service:=rpc.NewServer(router);done:=make(chan error,1);go func(){done<-service.Serve(listener)}()
+ defer func(){service.Close();select{case err:=<-done:if err!=nil{t.Error(err)};case <-time.After(5*time.Second):t.Error("LRPC did not stop")}}()
+ client:=rpc.NewClient(listener.Addr().String());defer client.Close()
+ gateway:=api.NewRouter();if err:=gateway.Registry.Register("fail",1);err!=nil{t.Fatal(err)}
+ gateway.Handle("fail",func(ctx context.Context,_ *api.Request)error{_,err:=client.CallWithMaskContext(ctx,"",1,nil,nil);return err})
+ for _,endpoint:=range []*api.Router{router,gateway}{
+ for _,binary:=range []bool{false,true}{
+  for _,valid:=range []bool{false,true}{
+   validValue.Store(valid)
+   body:=[]byte("{\"$api\":\"fail\"}")
+   if binary{body=[]byte{1,0,0}}
+   req:=httptest.NewRequest("POST","/luvia",bytes.NewReader(body))
+   req.Header.Set("Content-Type","application/json")
+   if binary{req.Header.Set("X-Luxo-Mode","binary");req.Header.Set("Content-Type","application/x-luxo")}
+   res:=httptest.NewRecorder();endpoint.ServeHTTP(res,req)
+   wantStatus:=500;if valid{wantStatus=422}
+   if res.Code!=wantStatus{t.Fatalf("binary=%v valid=%v status=%d: %s",binary,valid,res.Code,res.Body)}
+   var name,message string;var data json.RawMessage
+   if binary{
+    e,err:=api.DecodeBinaryError(res.Body.Bytes(),res.Code);if err!=nil{t.Fatal(err)}
+    name,message,data=e.Name,e.Message,e.Data
+   }else{
+    var e struct{Error,Message string;Data json.RawMessage}
+    if err:=json.Unmarshal(res.Body.Bytes(),&e);err!=nil{t.Fatal(err)}
+    name,message,data=e.Error,e.Message,e.Data
+   }
+   if valid{if name!="Rejected"||!bytes.Contains(data,[]byte("123456789")){t.Fatalf("valid error lost: %s %s",name,data)}}else{
+    if name!="Internal"||message!="error.internal"||len(data)!=0||bytes.Contains(res.Body.Bytes(),[]byte("123456789"))||bytes.Contains(res.Body.Bytes(),[]byte("model list element")){t.Fatalf("partial error escaped: %s",res.Body)}
+   }
+  }
+ }}
+}
+`, StableIDs{ModelFields: map[string]map[string]int{"Detail": {"id": 1, "level": 2}, "User": {"id": 1, "names": 2}}})
+}
+
+func TestGeneratedErrorAndClaimsBytesNullability(t *testing.T) {
+	runGeneratedFixture(t, `
+model User @noTime @withAuth(stores: [id, data, optional, items]) {
+ id: Int @id
+ data: Bytes
+ optional: Bytes?
+ items: [Bytes]
+}
+error Rejected(data: Bytes, optional: Bytes?, items: [Bytes]) { code: 422 message: "error.rejected" }
+`, `package generated
+import("testing";"strings")
+func TestBytesNullability(t *testing.T){
+ for _,value:=range [][]byte{nil,{}, {0,255}}{
+  for _,present:=range []bool{false,true}{
+   var optional *[]byte;if present{optional=&value}
+   user:=&User{Id:42,Data:value,Optional:optional,Items:[][]byte{nil,{}}}
+   want:= "\"data\":\"\",\"optional\":null,\"items\":[\"\",\"\"]"
+   if len(value)!=0{want=strings.Replace(want,"\"data\":\"\"","\"data\":\"AP8=\"",1)}
+   if present{part:="\"\"";if len(value)!=0{part="\"AP8=\""};want=strings.Replace(want,"\"optional\":null","\"optional\":"+part,1)}
+   for _,appendJSON:=range []func([]byte)([]byte,error){user.AppendClaimsJSON,NewRejected(value,optional,user.Items).Data.AppendJSON}{
+    raw,err:=appendJSON(nil);if err!=nil||!strings.Contains(string(raw),want){t.Errorf("bytes=%v present=%v output=%s want=%s: %v",value,present,raw,want,err)}
+   }
+  }
+ }
+}
+`, StableIDs{ModelFields: map[string]map[string]int{"User": {"id": 1, "data": 2, "optional": 3, "items": 4}}})
 }
 
 func TestGeneratedStaticErrorData(t *testing.T) {
@@ -270,3 +516,41 @@ func TestNilErrorData(t *testing.T) {
  if raw, found := data.AppendText([]byte("prefix:"),"valueInt"); found || string(raw) != "prefix:" { t.Fatal("nil data text") }
 }
 `
+
+func TestGeneratedBuiltinErrors(t *testing.T) {
+	var source strings.Builder
+	for _, name := range []string{"NotFound", "Unauthorized", "Forbidden", "BadRequest", "Conflict", "InternalError", "ValidationFailed", "RateLimited", "ServiceTimeout", "notFound", "not_found"} {
+		fmt.Fprintf(&source, "api fail%s(): Int { throw error.%s }\n", name, name)
+	}
+	runGeneratedFixture(t, source.String(), `package generated
+import("bytes";"encoding/json";"net/http/httptest";"testing"
+"github.com/light-speak/luxo/pkg/lux/api"
+"github.com/light-speak/luxo/pkg/lux/errors")
+
+func TestBuiltinErrors(t *testing.T){
+ router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+ if err:=RegisterHandlers(router,&App{});err!=nil{t.Fatal(err)}
+ for name,want:=range map[string]*errors.AppError{
+ "NotFound":errors.NotFound,"Unauthorized":errors.Unauthorized,"Forbidden":errors.Forbidden,
+ "BadRequest":errors.BadRequest,"Conflict":errors.Conflict,"InternalError":errors.InternalError,
+ "ValidationFailed":errors.ValidationFailed,"RateLimited":errors.RateLimited,"ServiceTimeout":errors.ServiceTimeout,
+ "notFound":errors.NotFound,"not_found":errors.NotFound,
+ } {
+  body,err:=json.Marshal(map[string]string{"$api":"fail"+name});if err!=nil{t.Fatal(err)}
+  request:=httptest.NewRequest("POST","/",bytes.NewReader(body));request.Header.Set("Content-Type","application/json")
+  response:=httptest.NewRecorder();router.ServeHTTP(response,request)
+  if response.Code!=want.Code{t.Fatal(name,response.Code,response.Body.String())}
+ }
+}
+`, StableIDs{})
+}
+
+func TestCompileBuiltinErrorRejectsUnvalidatedName(t *testing.T) {
+	defer func() {
+		failure, ok := recover().(*InternalCompilerError)
+		if !ok || !strings.Contains(failure.Detail, "Missing") {
+			t.Fatal("missing internal generation diagnostic", failure)
+		}
+	}()
+	compileBuiltinError("Missing")
+}

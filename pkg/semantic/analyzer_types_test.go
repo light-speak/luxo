@@ -8,6 +8,71 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
+func TestGenericExpressionMetadata(t *testing.T) {
+	analyzer := newAnalyzer()
+	expr := &ast.Ident{Name: "channel"}
+	typ := &ResolvedType{Kind: TypeGeneric, Name: "Channel", TypeArgs: []*ResolvedType{{Kind: TypeInt, Name: "Int", Nullable: true}}}
+	analyzer.setExprResolvedType(expr, typ)
+	if analyzer.resolvedExprType(expr) != typ {
+		t.Fatal("generic arguments were lost")
+	}
+	analyzer.setExprResolvedType(expr, analyzer.types["Int"])
+	if len(analyzer.genericExprTypes) != 0 || analyzer.resolvedExprType(expr) != analyzer.types["Int"] {
+		t.Fatal("stale generic metadata survived a replacement")
+	}
+}
+
+func TestGenericMetadataExcludesTransientResultABI(t *testing.T) {
+	result := analyze(t, `fn next(value: Int): Result<Int> @native
+api probe(value: Int): Int { return next(value)? }`)
+	expectNoErrors(t, result)
+	if len(result.GenericExprTypes) != 0 {
+		t.Fatal("transient error ABI must not allocate a generic value catalog")
+	}
+}
+
+func TestResolvedTypeRefOwnsNestedMetadata(t *testing.T) {
+	var missing *ResolvedType
+	if missing.TypeRef() != nil {
+		t.Fatal("nil type must remain nil")
+	}
+	typ := &ResolvedType{Name: "Channel", Nullable: true, IsList: true,
+		TypeArgs: []*ResolvedType{{Name: "Int", Nullable: true}}, Tuple: []*ResolvedType{{Name: "String"}}}
+	ref := typ.TypeRef()
+	if ref.Name != "Channel" || !ref.Nullable || !ref.IsList || ref.TypeArgs[0].Name != "Int" || !ref.TypeArgs[0].Nullable || ref.Tuple[0].Name != "String" {
+		t.Fatalf("incomplete type: %+v", ref)
+	}
+	ref.TypeArgs[0].Name, ref.Tuple[0].Name = "Float", "Int"
+	if typ.TypeArgs[0].Name != "Int" || typ.Tuple[0].Name != "String" {
+		t.Fatal("type copy aliases nested metadata")
+	}
+}
+
+func TestErrorConstructorArgumentValidation(t *testing.T) {
+	for _, arguments := range []string{
+		`first: "wrong", second: 2`, `first: 1`, `unknown: 1, second: 2`,
+		`first: 1, first: 2, second: 3`, `1, 2, 3`, `first: null, second: 2`,
+	} {
+		t.Run(arguments, func(t *testing.T) {
+			result := analyze(t, `error Rejected(first: Int, second: Int) { code: 422 message: "rejected" }
+fn run(): Int { throw Rejected(`+arguments+`) }`)
+			if len(result.Errors) == 0 {
+				t.Fatal("invalid error arguments accepted")
+			}
+		})
+	}
+}
+
+func TestBareErrorConstructorRequiresArguments(t *testing.T) {
+	for _, body := range []string{`throw Rejected`, `true ?: throw Rejected return 1`, `return 1 ?: throw Rejected`} {
+		result := analyze(t, `error Rejected(detail: String) { code: 422 message: "rejected" }
+fn run(): Int { `+body+` }`)
+		if len(result.Errors) == 0 {
+			t.Errorf("missing constructor argument accepted: %s", body)
+		}
+	}
+}
+
 func TestFunctionParameterRejectsLambdaValue(t *testing.T) {
 	for _, signature := range []string{
 		`fn take(value: Int): Int { return value }`,
@@ -108,8 +173,8 @@ func TestAnalyzerCollectionExpressionEdgeCases(t *testing.T) {
 	if listType == nil || !listType.IsList || listType.Kind != TypeUnknown {
 		t.Fatalf("unresolved list type = %#v", listType)
 	}
-	setExprResolvedType(nil, analyzer.types["Int"])
-	setExprResolvedType(&ast.Literal{}, nil)
+	analyzer.setExprResolvedType(nil, analyzer.types["Int"])
+	analyzer.setExprResolvedType(&ast.Literal{}, nil)
 
 	untyped := &ast.Literal{Kind: token.Int, Value: "1"}
 	intValue := &ast.Literal{Kind: token.Int, Value: "1"}
@@ -164,6 +229,12 @@ func TestAnalyzerLoadExpressionEdgeCases(t *testing.T) {
 		&ast.NamedArg{Value: &ast.Literal{Kind: token.Int, Value: "2"}},
 	), []*ResolvedType{analyzer.types["Int"], analyzer.types["Int"]})
 	analyzer.checkPrimaryKeyLoadArguments(call(&ast.NamedArg{Value: intValue}), userType, []*ResolvedType{analyzer.types["Int"]})
+	userType.Fields["id"] = &FieldInfo{Name: "id", Type: analyzer.types["Int"]}
+	count := len(analyzer.errors)
+	analyzer.checkPrimaryKeyLoadArguments(call(&ast.NamedArg{Value: intValue}), userType, []*ResolvedType{nil})
+	if len(analyzer.errors) != count {
+		t.Fatal("unknown argument added a duplicate key diagnostic")
+	}
 	analyzer.typeOwners.register("User", "owner")
 	if analyzer.isLoadFieldVisible("User", "email") {
 		t.Fatal("undeclared cross-module load field is visible")
@@ -326,7 +397,8 @@ func TestAnalyzerValidationAndDirectiveEdgeCases(t *testing.T) {
 	}}}, scope, &ast.File{})
 
 	modelType := &ResolvedType{Kind: TypeModel, Name: "User", Fields: map[string]*FieldInfo{}}
-	analyzer.injectWithAuthMethods(modelType, []*ast.Directive{{
+	analyzer.injectWithAuthMethods(modelType)
+	analyzer.injectStoredIdentityFields(modelType, []*ast.Directive{{
 		Name: "withAuth",
 		Args: []*ast.NamedArg{{Name: "stores", Value: &ast.ListExpr{Items: []ast.Expr{
 			&ast.Literal{Kind: token.String, Value: "not-an-identifier"},
@@ -379,6 +451,46 @@ api test(): Boolean {
 }
 `)
 	expectError(t, result, "requires non-null Boolean")
+}
+
+func TestOrderingRejectsNullableOperands(t *testing.T) {
+	for _, expression := range []string{"left < right", "right >= left", "right > null", "null <= right"} {
+		t.Run(expression, func(t *testing.T) {
+			result := analyze(t, `fn compare(left: DateTime?, right: DateTime): Boolean { return `+expression+` }`)
+			expectError(t, result, "non-null")
+		})
+	}
+}
+
+func TestWhenRejectsInvalidConditions(t *testing.T) {
+	for _, expression := range []string{
+		`when { 1 -> 1 else -> 0 }`, `when { "yes" -> 1 else -> 0 }`,
+		`when { null -> 1 else -> 0 }`, `when { [true] -> 1 else -> 0 }`,
+		`when { nullable -> 1 else -> 0 }`, `when number { "wrong" -> 1 else -> 0 }`,
+		`when state { Other.OPEN -> 1 else -> 0 }`, `when state { "OPEN" -> 1 else -> 0 }`,
+		`when number { [1] -> 1 else -> 0 }`, `when true { 1 -> 1 else -> 0 }`,
+	} {
+		t.Run(expression, func(t *testing.T) {
+			result := analyze(t, `enum State { OPEN } enum Other { OPEN }
+fn probe(nullable: Boolean?, number: Int, state: State): Int { return `+expression+` }`)
+			if len(result.Errors) == 0 {
+				t.Fatal("invalid when condition accepted")
+			}
+		})
+	}
+}
+
+func TestComparisonsRejectIncompatibleOperands(t *testing.T) {
+	for _, types := range [][2]string{{"String", "Boolean"}, {"Int", "String"}, {"UUID", "String"}, {"DateTime", "String"}, {"First", "Second"}, {"[Int]", "Int"}, {"Int", "[Int]"}} {
+		for _, operator := range []string{"==", "!=", "<", ">"} {
+			source := "enum First { OPEN } enum Second { OPEN }\nfn compare(left: " + types[0] + ", right: " + types[1] + "): Boolean { return left " + operator + " right }"
+			t.Run(types[0]+operator+types[1], func(t *testing.T) {
+				if result := analyze(t, source); len(result.Errors) == 0 {
+					t.Fatal("incompatible comparison accepted")
+				}
+			})
+		}
+	}
 }
 
 func TestComparisonOp(t *testing.T) {
@@ -455,6 +567,84 @@ api test(): Int {
 	expectNoErrors(t, result)
 }
 
+func TestDecimalRemainderRejectsUnsupportedOperands(t *testing.T) {
+	for _, pair := range [][2]string{{"Decimal", "Decimal"}, {"Decimal", "Int"}, {"Int", "Decimal"}, {"Decimal", "Float"}, {"Float", "Decimal"}} {
+		resultType := "Int"
+		if pair[0] == "Float" || pair[1] == "Float" {
+			resultType = "Float"
+		}
+		for _, compound := range []bool{false, true} {
+			name, body := pair[0]+"%"+pair[1], "return left % right"
+			if compound {
+				name, body, resultType = pair[0]+"%="+pair[1], "left %= right return left", pair[0]
+			}
+			t.Run(name, func(t *testing.T) {
+				source := "fn remainder(left: " + pair[0] + ", right: " + pair[1] + "): " + resultType + " { " + body + " }"
+				result := analyze(t, source)
+				expectError(t, result, "operator '%' does not support")
+				for _, diagnostic := range result.Errors {
+					if strings.Contains(diagnostic.Message, "operator '%' does not support") && (diagnostic.Pos.File != "test.luxo" || diagnostic.Pos.Line == 0 || diagnostic.Pos.Col == 0) {
+						t.Fatalf("missing operator location: %v", diagnostic)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestDecimalArithmeticRejectsUnsupportedOperators(t *testing.T) {
+	for _, pair := range [][2]string{{"Decimal", "Decimal"}, {"Decimal", "Int"}, {"Int", "Decimal"}, {"Decimal", "Float"}, {"Float", "Decimal"}} {
+		for _, op := range []string{"+", "-", "*", "/"} {
+			if pair[0] == "Decimal" && pair[1] == "Decimal" && op != "/" {
+				continue
+			}
+			for _, compound := range []bool{false, true} {
+				resultType := "Int"
+				if pair[0] == "Float" || pair[1] == "Float" {
+					resultType = "Float"
+				}
+				name, body := pair[0]+op+pair[1], "return left "+op+" right"
+				if compound {
+					name, body, resultType = pair[0]+op+"="+pair[1], "left "+op+"= right return left", pair[0]
+				}
+				t.Run(name, func(t *testing.T) {
+					source := "fn arithmetic(left: " + pair[0] + ", right: " + pair[1] + "): " + resultType + " { " + body + " }"
+					expectError(t, analyze(t, source), "operator '"+op+"' does not support Decimal operands")
+				})
+			}
+		}
+	}
+}
+
+func TestDecimalRemainderRejectsSharedExpressionEntrances(t *testing.T) {
+	for name, source := range map[string]string{
+		"query":      `model Item @noTime { id: Int @id amount: Decimal } api probe(divisor: Decimal): Int { return Item.where(amount % divisor == 0).count() }`,
+		"lambda":     `api probe(values: [Decimal]): [Int] { return values.map { it % it } }`,
+		"field":      `type Sample { value: Decimal @transform { it % it } }`,
+		"beforeSave": `model Item @noTime { id: Int @id amount: Decimal @beforeSave { it % it } }`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			expectError(t, analyze(t, source), "operator '%' does not support")
+		})
+	}
+}
+
+func TestRemainderPreservesSupportedArithmetic(t *testing.T) {
+	for _, sample := range []struct{ left, right, result string }{
+		{"Int", "Int", "Int"}, {"Float", "Float", "Float"}, {"Int", "Float", "Float"}, {"Float", "Int", "Float"},
+	} {
+		expectNoErrors(t, analyze(t, "fn remainder(left: "+sample.left+", right: "+sample.right+"): "+sample.result+" { return left % right }"))
+		if sample.left == sample.result {
+			expectNoErrors(t, analyze(t, "fn remainder(left: "+sample.left+", right: "+sample.right+"): "+sample.result+" { left %= right return left }"))
+		}
+	}
+	for _, op := range []string{"+", "-", "*"} {
+		expectNoErrors(t, analyze(t, "fn exact(left: Decimal, right: Decimal): Decimal { return left "+op+" right }"))
+		expectNoErrors(t, analyze(t, "fn exact(left: Decimal, right: Decimal): Decimal { left "+op+"= right return left }"))
+	}
+	expectError(t, analyze(t, "fn duration(left: Duration, right: Duration): Int { return left % right }"), "requires numeric types")
+}
+
 func TestSemanticTypeReferenceHelpers(t *testing.T) {
 	nested := &ast.TypeRef{
 		Name:     "Page",
@@ -486,7 +676,7 @@ func TestSemanticTypeReferenceHelpers(t *testing.T) {
 }
 
 func TestComputedAggregateHelpers(t *testing.T) {
-	idField := &ast.FieldDecl{Name: "key", Directives: []*ast.Directive{{Name: "id"}}}
+	idField := &ast.FieldDecl{Name: "key", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}}
 	if got := computedModelPrimaryKeyName(&ast.ModelDecl{Fields: []*ast.FieldDecl{idField}}); got != "key" {
 		t.Fatalf("primary key = %q", got)
 	}
@@ -652,6 +842,52 @@ api count(): Int {
 	expectError(t, result, "operator '?' requires Result<T>")
 }
 
+func TestPaginateRejectsUnprovenDatabaseTransforms(t *testing.T) {
+	for _, sample := range []struct{ name, body string }{
+		{"filter", `val rows = Node.orderBy(id.asc).all() return rows.filter { it.id > 1 }`},
+		{"sort", `val rows = Node.orderBy(id.asc).all() return rows.sortBy { it.id }`},
+		{"break", `val rows = Node.orderBy(id.asc).all() return for row in rows { if row.id > 1 { break } row }`},
+		{"query_limit", `return Node.limit(2).all()`},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			result := analyze(t, `model Node @noTime { id: Int @id }
+api page(): [Node] @paginate { `+sample.body+` }`)
+			expectError(t, result, "cannot safely push down pagination")
+		})
+	}
+}
+
+func TestPaginateRejectsHiddenDatabaseListTransforms(t *testing.T) {
+	for _, sample := range []struct{ name, declarations, body string }{
+		{"native_list", `fn readNodes(): Result<[Node]> @native`, `return readNodes()?`},
+		{"helper_query", `fn readNodes(): [Node] { return Node.orderBy(id.asc).all() }`, `return readNodes()`},
+		{"helper_argument", `fn retain(rows: [Node]): [Node] { return rows }`, `val rows = Node.all() return retain(rows)`},
+		{"helper_chain", `fn readNodes(): [Node] { return Node.all() } fn retained(): [Node] { return readNodes() }`, `return retained()`},
+		{"captured_list", ``, `val rows = Node.all() return for row in rows { Node { id: rows.size } }`},
+		{"explicit_offset", ``, `return Node.offset(2).all()`},
+		{"transaction_result", ``, `return transaction { Node.all() }`},
+		{"await_source", ``, `val (rows, other) = await { Node.all() Node.all() } return rows`},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			result := analyze(t, `model Node @noTime { id: Int @id } `+sample.declarations+` api page(): [Node] @paginate { `+sample.body+` }`)
+			expectError(t, result, "cannot safely push down pagination")
+		})
+	}
+}
+
+func TestPaginatePreservesManualTransformsAndSafeQueries(t *testing.T) {
+	for _, body := range []string{
+		`return Node.where(id > 1).orderBy(id.asc).all()`,
+		`val rows = Node.orderBy(id.asc).all() return for row in rows { row }`,
+		`val rows = [Node { id: 1 }, Node { id: 2 }] return rows.filter { it.id > 1 }`,
+		`val rows = [Node { id: 2 }, Node { id: 1 }] return rows.sortBy { it.id }`,
+	} {
+		result := analyze(t, `model Node @noTime { id: Int @id }
+api page(): [Node] @paginate { `+body+` }`)
+		expectNoErrors(t, result)
+	}
+}
+
 func TestNativeFunctionRequiresResult(t *testing.T) {
 	result := analyze(t, `fn loadCount(): Int @native`)
 	expectError(t, result, "@native fn return type must be Result<T>")
@@ -685,6 +921,51 @@ fn format(label: String, count: Int = 2): String { label }
 api display(): String { format(count: 3, label: "ready") }
 `)
 	expectNoErrors(t, result)
+}
+
+func TestSameNamedAPIPreservesFunctionArguments(t *testing.T) {
+	for _, native := range []bool{false, true} {
+		declaration, unwrap := `fn shared(input: Int): Int { return input }`, ""
+		if native {
+			declaration, unwrap = `fn shared(input: Int): Result<Int> @native`, "?"
+		}
+		for _, sample := range []struct{ arguments, message string }{
+			{"wrong: 41", "unknown argument 'wrong'"},
+			{"value: 41", "unknown argument 'value'"},
+			{"", "missing required argument 'input'"},
+			{"1, 2", "expects at most 1 argument"},
+			{`"wrong"`, "argument 'input' expects 'Int'"},
+			{"null", "argument 'input' expects 'Int'"},
+			{"input: 1, input: 2", "duplicate argument 'input'"},
+		} {
+			result := analyze(t, declaration+` api shared(value: Int): Int @native api invoke(): Int { return shared(`+sample.arguments+")"+unwrap+" }")
+			expectError(t, result, sample.message)
+		}
+		expectNoErrors(t, analyze(t, declaration+` api shared(value: Int): Int @native api invoke(): Int { return shared(input: 41)`+unwrap+" }"))
+	}
+}
+
+func TestSameNamedAPIReturnDoesNotReplaceFunctionReturn(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		function := parseFileWithName(t, `fn shared(input: Int): Result<String> @native`, "function.luxo")
+		api := parseFileWithName(t, `api shared(): Int { return 42 } api invoke(): String { return shared(input: 41)? }`, "api.luxo")
+		files := []*ast.File{function, api}
+		if reverse {
+			files[0], files[1] = files[1], files[0]
+		}
+		expectNoErrors(t, Analyze(files))
+	}
+}
+
+func TestFunctionCallRespectsLexicalShadowing(t *testing.T) {
+	for _, declaration := range []string{"", `fn shared(value: Int): String { return "function" }`} {
+		for _, body := range []string{
+			`api invoke(shared: String): String { return shared(41) }`,
+			`api invoke(): String { val shared = "value" return shared(41) }`,
+		} {
+			expectError(t, analyze(t, declaration+"\n"+body), "'shared' is not callable")
+		}
+	}
 }
 
 func TestCompiledFunctionCanCallNativeFunction(t *testing.T) {
@@ -766,11 +1047,25 @@ func TestAPICannotDeclareVariadicParameter(t *testing.T) {
 }
 
 func TestFunctionCallCannotBypassServiceBoundary(t *testing.T) {
-	result := analyze(t, `
-fn remoteScore(projectId: Int): Int @service { projectId }
-api score(projectId: Int): Int { remoteScore(projectId) }
-`)
-	expectError(t, result, "@service fn 'remoteScore' cannot be called as a local function")
+	for _, implementation := range []string{`{ projectId }`, `@native`} {
+		for _, alias := range []string{"", `api remoteScore(projectId: Int): Int @native`, `api remoteScore(projectId: Int): Int { remoteScore(projectId) }`} {
+			result := analyze(t, `fn remoteScore(projectId: Int): Int @service `+implementation+"\n"+alias+`
+api score(projectId: Int): Int { remoteScore(projectId) }`)
+			expectError(t, result, "@service fn 'remoteScore' cannot be called as a local function")
+		}
+	}
+}
+
+func TestServiceBoundarySurvivesCrossFileNameReuse(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		service := parseFileWithName(t, `fn shared(value: Int): Int @service @native`, "service.luxo")
+		endpoint := parseFileWithName(t, `api shared(value: Int): Int @native api invoke(value: Int): Int { return shared(value) }`, "api.luxo")
+		files := []*ast.File{service, endpoint}
+		if reverse {
+			files[0], files[1] = files[1], files[0]
+		}
+		expectError(t, Analyze(files), "@service fn 'shared' cannot be called as a local function")
+	}
 }
 
 func TestCallableParametersRejectDuplicateNames(t *testing.T) {
@@ -937,6 +1232,58 @@ api test(): Boolean {
 }
 `)
 	expectNoErrors(t, result)
+}
+
+func TestOrdinaryIsRequiresTypeTarget(t *testing.T) {
+	for _, target := range []string{`1`, `true`, `null`, `"Int"`, `other`, `Missing`, `Role.ON`, `next()`, `[Int]`} {
+		t.Run(target, func(t *testing.T) {
+			result := analyze(t, `enum Role { ON OFF }
+fn next(): Int { return 1 }
+fn test(value: Int, other: Int): Boolean { return value is `+target+` }`)
+			expectError(t, result, "type after 'is'")
+		})
+	}
+}
+
+func TestOrdinaryIsRequiresValueSubject(t *testing.T) {
+	for _, value := range []string{`User`, `Int`, `User.where(id: 1)`} {
+		t.Run(value, func(t *testing.T) {
+			result := analyze(t, `model User @noTime { id: Int @id }
+fn test(): Boolean { return `+value+` is User }`)
+			expectError(t, result, "value before 'is'")
+		})
+	}
+}
+
+func TestOrdinaryIsStaticTypes(t *testing.T) {
+	result := analyze(t, `model User @noTime { id: Int @id }
+type Payload { value: Int }
+enum Role { ON OFF }
+sealed Outcome { Ready() }
+fn user(value: User?): Boolean { return value is User }
+fn date(value: DateTime?): Boolean { return value is DateTime }
+fn number(value: Decimal): Boolean { return value is Decimal }
+fn different(value: Int): Boolean { return value is String }
+fn list(value: [Int]): Boolean { return value is Int }
+fn empty(): Boolean { return null is User }
+fn object(value: Payload): Boolean { return value is Payload }
+fn choice(value: Role): Boolean { return value is Role }
+fn sum(value: Outcome): Boolean { return value is Outcome }
+fn shadow(User: Int, value: User): Boolean { return value is User }
+`)
+	expectNoErrors(t, result)
+}
+
+func TestOrdinaryIsRejectsIncompleteDataTypes(t *testing.T) {
+	for _, target := range []string{"Page", "Cursor", "Channel", "Box", "Identity"} {
+		t.Run(target, func(t *testing.T) {
+			result := analyze(t, `type Box<T> { value: T }
+fn test(value: Int): Boolean { return value is `+target+` }`)
+			if len(result.Errors) == 0 {
+				t.Fatal("incomplete or runtime-only type accepted")
+			}
+		})
+	}
 }
 
 func TestBinaryInOperatorDirect(t *testing.T) {
@@ -1573,6 +1920,8 @@ func TestCallableReturnTypes(t *testing.T) {
 }`,
 			want: "must return 'Int'",
 		},
+		{name: "empty API response", input: `api wrong(): Int {}`, want: "must return 'Int'"},
+		{name: "empty function response", input: `fn wrong(): Int {}`, want: "must return 'Int'"},
 		{
 			name:  "value return for void callable",
 			input: `fn wrong() { return 42 }`,
@@ -1587,7 +1936,7 @@ func TestCallableReturnTypes(t *testing.T) {
 }
 
 func TestVoidCallableDoesNotRequireAResponse(t *testing.T) {
-	result := analyze(t, `api record() { val value = 42 }`)
+	result := analyze(t, `fn record() { val value = 42 }`)
 	for _, issue := range result.Errors {
 		if strings.Contains(issue.Message, "must return") {
 			t.Fatalf("Void callable should not require a response: %v", result.Errors)
@@ -1608,7 +1957,7 @@ func TestValueCallableRejectsEmptyReturnAST(t *testing.T) {
 
 func TestThrowStmt(t *testing.T) {
 	result := analyze(t, `
-error NotFound { message: String }
+error NotFound { code: 404 message: "error.not_found" }
 api test(): String {
   throw NotFound
 }
@@ -1629,7 +1978,7 @@ api test(): Int {
   throw "something went wrong"
 }
 `)
-	expectNoErrors(t, result)
+	expectError(t, result, "throw requires")
 }
 
 func TestEmitStmtCheck(t *testing.T) {
@@ -2374,8 +2723,8 @@ api listUsers(): Cursor<User>
 func TestGenericTypeResolution(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
-type Paginated {
-  items: [User]
+type Paginated<T> {
+  items: [T]
   total: Int
 }
 api listUsers(): Paginated<User>
@@ -2392,6 +2741,9 @@ api listUsers(): Paginated<User>
 	if len(sym.Type.TypeArgs) != 1 {
 		t.Errorf("expected 1 type arg, got %d", len(sym.Type.TypeArgs))
 	}
+	if items := sym.Type.Fields["items"].Type; items.Name != "User" || !items.IsList {
+		t.Fatalf("expected concrete User items, got %#v", items)
+	}
 }
 
 func TestGenericTypeParam(t *testing.T) {
@@ -2404,11 +2756,11 @@ type Paginated<T> {
 `)
 	expectNoErrors(t, result)
 
-	// T should be registered as a generic type
-	tType, ok := result.Types["T"]
-	if !ok {
-		t.Fatal("expected type T to be registered")
+	// T belongs to Paginated, not the global type catalog.
+	if result.Types["T"] != nil {
+		t.Fatal("type parameter T escaped its declaration")
 	}
+	tType := result.Types["Paginated"].Fields["items"].Type
 	if tType.Kind != TypeGeneric {
 		t.Errorf("expected TypeGeneric, got %v", tType.Kind)
 	}
@@ -2700,6 +3052,47 @@ api test(): [Post] {
 	expectNoErrors(t, result)
 }
 
+func TestDebugRejectsDeclarationNamespaces(t *testing.T) {
+	for _, receiver := range []string{"Node", "Value", "Int", "String", "my"} {
+		for _, property := range []string{"d", "i", "w", "e"} {
+			source := `model Node @noTime { id: Int @id } type Value { id: Int }
+api probe(): Int @auth { ` + receiver + `.` + property + ` return 1 }`
+			expectError(t, analyze(t, source), "debug receiver requires a runtime value")
+		}
+	}
+	expectNoErrors(t, analyze(t, `model User @noTime @withAuth(stores: [id, d]) { id: Int @id d: Int }
+api probe(): Int @auth { return my.d }`))
+	// Type-only fragment scopes can omit the global symbol table.
+	analyzer := New()
+	analyzer.types["Fragment"] = &ResolvedType{Kind: TypeCustom, Name: "Fragment"}
+	member := &ast.MemberExpr{Object: &ast.Ident{Name: "Fragment"}, Field: "d"}
+	if result := analyzer.checkExpr(member, NewScope()); result == nil || result.Name != "Fragment" {
+		t.Fatal("fragment receiver lost its diagnostic type", result)
+	}
+}
+
+func TestDebugChainRejectsCalls(t *testing.T) {
+	for _, receiver := range []string{"Int", "String", "[Int]", "[Node]", "Node"} {
+		for _, args := range []string{"", "1", "value: 1"} {
+			for _, member := range []string{"d", "i", "w", "e"} {
+				source := `model Node @noTime { id: Int @id } fn probe(value: ` + receiver + `): Int { value.` + member + `(` + args + `) return 1 }`
+				expectError(t, analyze(t, source), "debug chain is a property")
+			}
+		}
+	}
+}
+
+func TestValuesShadowTypeNames(t *testing.T) {
+	for _, declaration := range []string{
+		`enum Value { ready }`,
+		`type Value { text: String }`,
+		`model Value @noTime { id: Int @id }`,
+	} {
+		expectNoErrors(t, analyze(t, declaration+` fn probe(Value: Int): Int { return Value.d + 1 }`))
+	}
+	expectNoErrors(t, analyze(t, `fn probe(Int: String): String { return Int.d }`))
+}
+
 func TestMyMethodCall(t *testing.T) {
 	result := analyze(t, `
 api test(): String @auth {
@@ -2754,5 +3147,336 @@ func TestTypeKindString(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("TypeKind(%d).String() = %q, want %q", tt.kind, got, tt.want)
 		}
+	}
+}
+
+func TestBuiltinErrorNames(t *testing.T) {
+	for _, name := range []string{"NotFound", "Unauthorized", "Forbidden", "BadRequest", "Conflict", "InternalError", "ValidationFailed", "RateLimited", "ServiceTimeout", "notFound"} {
+		expectNoErrors(t, analyze(t, `fn run(): Int { throw error.`+name+` }`))
+	}
+	for _, name := range []string{"InvalidParam", "NotFount", "Internal", "Missing"} {
+		t.Run(name, func(t *testing.T) {
+			expectError(t, analyze(t, `fn run(): Int { throw error.`+name+` }`), "unknown built-in error")
+		})
+	}
+}
+
+func TestIdentityRequiresAuthenticatedAPIBody(t *testing.T) {
+	for _, source := range []string{
+		`api current(): Int { return my.id }`,
+		`api current(): Int { val id = my.id return id }`,
+		`api current(): [Int] { return [1].map { my.id } }`,
+		`fn current(): Int { return my.id }`,
+		`fn current(): Int @service { return my.id }`,
+	} {
+		t.Run(source, func(t *testing.T) { expectError(t, analyze(t, source), "my") })
+	}
+	expectNoErrors(t, analyze(t, `api current(): Int @auth { return my.id }`))
+	expectNoErrors(t, analyze(t, `fn current(): Int @service @auth { return my.id }`))
+	expectError(t, analyze(t, `fn current(): Int @service @auth { return my.missing }`), "missing")
+}
+
+func TestAssignmentsRequireCompatibleTypes(t *testing.T) {
+	for _, body := range []string{
+		`var value: Int = 1 value = "bad" return value`,
+		`var value: Int = 1 value = null return value`,
+		`var value: [Int] = [1] value = ["bad"] return 1`,
+		`var value: String = "a" value -= "b" return 1`,
+		`var value: Int = 1 value += "b" return value`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			result := analyze(t, `api sample(): Int { `+body+` }`)
+			if len(result.Errors) == 0 {
+				t.Fatal("invalid assignment was accepted")
+			}
+		})
+	}
+	for _, body := range []string{
+		`var value: Int? = 1 value = null return 1`,
+		`var value: Int? = 1 if value != null { value += 2 } return 1`,
+		`var value: [Int] = [1] value = [] return 1`,
+		`var value: String = "a" value += "b" return 1`,
+	} {
+		expectNoErrors(t, analyze(t, `api sample(): Int { `+body+` }`))
+	}
+}
+
+func TestArithmeticRejectsNonScalarOperands(t *testing.T) {
+	for _, source := range []string{
+		`fn sample(): String { return "count=" + 1 }`,
+		`fn sample(): String { return "ok=" + true }`,
+		`fn sample(): String { var text: String = "x" text += 1 return text }`,
+		`fn sample(): Int { return [1] + [2] }`,
+		`fn sample(): Int { return [1] * 2 }`,
+		`fn sample(): [String] { return ["a"] + ["b"] }`,
+		`fn sample(a: [Duration], b: Duration): Duration { return a + b }`,
+	} {
+		t.Run(source, func(t *testing.T) {
+			if result := analyze(t, source); len(result.Errors) == 0 {
+				t.Fatal("invalid arithmetic was accepted")
+			}
+		})
+	}
+}
+
+func TestArithmeticScalarControls(t *testing.T) {
+	for _, source := range []string{
+		`fn sample(a: String, b: String): String { return a + b }`,
+		`fn sample(a: Int, b: Int): Int { return a + b }`,
+		`fn sample(a: Duration, b: Duration): Duration { return a + b }`,
+		`fn sample(a: DateTime, b: Duration): DateTime { return a - b }`,
+		`fn sample(a: Int): String { return "count=${a}" }`,
+	} {
+		t.Run(source, func(t *testing.T) { expectNoErrors(t, analyze(t, source)) })
+	}
+}
+
+func TestAssignmentRejectsReadOnlyTargets(t *testing.T) {
+	for _, source := range []string{
+		`fn sample(text: String): Int { text.length = 2 return 1 }`,
+		`fn sample(text: String): Int { text.trim() = "bad" return 1 }`,
+		`fn sample(value: Int): Int { value.seconds = 1s return 1 }`,
+		`enum Role { ADMIN USER } fn sample(): Int { Role.ADMIN = Role.USER return 1 }`,
+		`model User { id: Int @id } fn sample(): Int { User.id = 1 return 1 }`,
+		`model User { id: Int @id } fn sample(user: User?): Int { user.id = 1 return 1 }`,
+	} {
+		t.Run(source, func(t *testing.T) {
+			if result := analyze(t, source); len(result.Errors) == 0 {
+				t.Fatal("read-only target was accepted")
+			}
+		})
+	}
+}
+
+func TestAssignmentWritableFieldControls(t *testing.T) {
+	for _, source := range []string{
+		`model User { id: Int @id } fn sample(user: User): Int { user.id = 2 user.id += 1 return user.id }`,
+		`type Data { value: Int } fn sample(data: Data): Int { data.value = 2 return data.value }`,
+		`model User { id: Int @id } fn sample(user: User?): Int { if user != null { user.id = 2 } return 1 }`,
+		`fn sample(value: Int): Int { value = 2 return value }`,
+	} {
+		t.Run(source, func(t *testing.T) { expectNoErrors(t, analyze(t, source)) })
+	}
+}
+
+func TestNullableReceiverRequiresGuard(t *testing.T) {
+	for _, source := range []string{
+		`model User { id: Int @id name: String } fn sample(user: User?): String { return user.name }`,
+		`fn sample(value: String?): Int { return value.length }`,
+		`fn sample(value: String?): String { return value.trim() }`,
+		`fn sample(value: Int?): Duration { return value.seconds }`,
+	} {
+		t.Run(source, func(t *testing.T) {
+			if result := analyze(t, source); len(result.Errors) == 0 {
+				t.Fatal("unguarded nullable receiver was accepted")
+			}
+		})
+	}
+}
+
+func TestNullableReceiverGuardControls(t *testing.T) {
+	for _, source := range []string{
+		`model User { id: Int @id name: String } fn sample(user: User?): String { if user != null { return user.name } return "missing" }`,
+		`fn sample(value: String?): String { if value != null { return value.trim() } return "missing" }`,
+		`fn sample(value: String?): Int? { return value?.length }`,
+		`fn sample(value: String?): Int { return (value ?: "").length }`,
+	} {
+		t.Run(source, func(t *testing.T) { expectNoErrors(t, analyze(t, source)) })
+	}
+}
+
+func TestRandomBuiltinsRejectInvalidArguments(t *testing.T) {
+	for _, call := range []string{`crypto.randomHex("4")`, `crypto.randomHex(1.5)`, `crypto.randomHex(null)`, `crypto.randomHex([4])`, `crypto.randomHex(4, 8)`, `crypto.randomHex(wrong: 4)`, `crypto.randomBytes("4")`, `crypto.randomBytes(4,8)`} {
+		t.Run(call, func(t *testing.T) {
+			result := analyze(t, `fn test(): String { val value = `+call+` return "done" }`)
+			if len(result.Errors) == 0 {
+				t.Fatal("invalid random arguments accepted")
+			}
+		})
+	}
+}
+
+func TestRandomBuiltinsHaveStaticResultTypes(t *testing.T) {
+	expectNoErrors(t, analyze(t, `fn length(n: Int): Int { val text = crypto.randomHex(n) return text.length }
+fn defaults(): String { return crypto.randomHex() }
+fn bytes(n: Int): Bytes { return crypto.randomBytes(n: n) }`))
+	result := analyze(t, `fn wrong(): Int { return crypto.randomHex(4) }`)
+	if len(result.Errors) == 0 {
+		t.Fatal("random String accepted as Int")
+	}
+}
+
+func TestNowRejectsArguments(t *testing.T) {
+	for _, call := range []string{`now(1)`, `now(unused: 1)`, `now(missing)`} {
+		result := analyze(t, `fn date(): DateTime { return `+call+` }`)
+		if len(result.Errors) == 0 {
+			t.Fatalf("unexpected argument accepted: %s", call)
+		}
+	}
+	expectNoErrors(t, analyze(t, `fn now(value: Int): Int { return value } fn call(): Int { return now(1) }`))
+}
+
+func TestLookupFieldHandlesInheritanceCycles(t *testing.T) {
+	first := &ResolvedType{Name: "First", Fields: map[string]*FieldInfo{}}
+	second := &ResolvedType{Name: "Second", Fields: map[string]*FieldInfo{}}
+	wanted := &FieldInfo{Name: "value", Type: &ResolvedType{Name: "String"}}
+	fallback := &ResolvedType{Name: "Fallback", Fields: map[string]*FieldInfo{"value": wanted}}
+	first.Parents = []*ResolvedType{nil, second, fallback}
+	second.Parents = []*ResolvedType{first}
+	if got := first.LookupField("value"); got != wanted {
+		t.Fatalf("cycle hid later parent: %v", got)
+	}
+	if got := first.LookupField("missing"); got != nil {
+		t.Fatal(got)
+	}
+	local := &FieldInfo{Name: "value", Type: &ResolvedType{Name: "Int"}}
+	first.Fields["value"] = local
+	if first.LookupField("value") != local {
+		t.Fatal("local field did not take precedence")
+	}
+}
+
+func TestExplicitAPIBodyRequiresReturnType(t *testing.T) {
+	for _, body := range []string{"{}", "{ 42 }", "{ val value = 42 }"} {
+		t.Run(body, func(t *testing.T) {
+			expectError(t, analyze(t, "api ping() "+body), "API with a body must declare a return type")
+		})
+	}
+	for _, source := range []string{
+		"api ping(): Int { 42 }",
+		"fn record() {}",
+		"model User { id: Int @id } api countUsers",
+	} {
+		expectNoErrors(t, analyze(t, source))
+	}
+}
+
+func TestPublicAPIVoidIsNotABusinessType(t *testing.T) {
+	for _, name := range []string{"Void", "Void?", "[Void]", "[Void]?"} {
+		expectError(t, analyze(t, "api ping(): "+name+" {}"), "unknown type 'Void'")
+	}
+}
+
+func TestPlatformTypeNamesRemainBusinessDeclarations(t *testing.T) {
+	for _, name := range []string{"Promise", "Future", "Unit", "Void"} {
+		t.Run(name, func(t *testing.T) {
+			expectNoErrors(t, analyze(t, "type "+name+" { id: Int } api read(): "+name+" @native"))
+		})
+	}
+}
+
+func TestMixedNumericComparisonsRequireSameType(t *testing.T) {
+	for _, pair := range [][2]string{{"Int", "Float"}, {"Float", "Int"}, {"Int", "Decimal"}, {"Decimal", "Int"}, {"Float", "Decimal"}, {"Decimal", "Float"}} {
+		for _, op := range []string{"==", "!=", "<", "<=", ">", ">="} {
+			t.Run(pair[0]+op+pair[1], func(t *testing.T) {
+				source := "fn compare(left: " + pair[0] + ", right: " + pair[1] + "): Boolean { left " + op + " right }"
+				expectError(t, analyze(t, source), "cannot compare incompatible types")
+			})
+		}
+		for _, nullable := range [][2]string{{"?", ""}, {"", "?"}, {"?", "?"}} {
+			for _, op := range []string{"==", "!="} {
+				source := "fn compare(left: " + pair[0] + nullable[0] + ", right: " + pair[1] + nullable[1] + "): Boolean { left " + op + " right }"
+				expectError(t, analyze(t, source), "cannot compare incompatible types")
+			}
+		}
+	}
+	for _, kind := range []string{"Int", "Float", "Decimal"} {
+		for _, op := range []string{"==", "!=", "<", "<=", ">", ">="} {
+			expectNoErrors(t, analyze(t, "fn compare(left: "+kind+", right: "+kind+"): Boolean { left "+op+" right }"))
+		}
+	}
+	expectError(t, analyze(t, "fn compare(value: Float): Boolean { value > 0 }"), "cannot compare incompatible types")
+	expectNoErrors(t, analyze(t, "fn compare(value: Float): Boolean { value > 0.0 }"))
+}
+
+func TestWhenRejectsMixedNumericPatterns(t *testing.T) {
+	for _, pair := range [][2]string{{"Int", "Float"}, {"Int", "Decimal"}, {"Float", "Decimal"}} {
+		source := "fn compare(left: " + pair[0] + ", right: " + pair[1] + "): Boolean { when left { right -> true else -> false } }"
+		expectError(t, analyze(t, source), "cannot compare incompatible types")
+	}
+}
+
+func TestLoadValidatesInheritedPrimaryKeyType(t *testing.T) {
+	for _, keyType := range []string{"String", "UUID"} {
+		source := "model Base @noTime { key: " + keyType + " @id } model Product : Base @noTime { name: String }\n"
+		t.Run(keyType+"/wrong", func(t *testing.T) {
+			expectError(t, analyze(t, source+`api wrong(value: Int): Product { return Product.load(value) }`), "load key expects '"+keyType+"', got 'Int'")
+		})
+		t.Run(keyType+"/valid", func(t *testing.T) {
+			expectNoErrors(t, analyze(t, source+"api valid(value: "+keyType+"): Product? { return Product.load(value) }"))
+		})
+	}
+}
+
+func TestLoadRequiresAnEffectivePrimaryKey(t *testing.T) {
+	expectError(t, analyze(t, `model Product @noTime { name: String } api missing(value: Int): Product { return Product.load(value) }`), "requires a declared primary key")
+}
+
+func TestInheritedModelsRejectMultiplePrimaryKeys(t *testing.T) {
+	for _, source := range []string{
+		`model Base @noTime { key: String @id } model Child : Base @noTime { id: Int @id }`,
+		`model Left @noTime { key: String @id } model Right @noTime { uuid: UUID @id } model Child : Left, Right @noTime { name: String }`,
+	} {
+		expectError(t, analyze(t, source), "multiple @id")
+	}
+	expectNoErrors(t, analyze(t, `model Base @noTime { key: String @id } model Child : Base @noTime { key: UUID @id }`))
+}
+
+func TestInheritedPrimaryKeyPrecedenceAndCycles(t *testing.T) {
+	key := &FieldInfo{Name: "key", Type: &ResolvedType{Kind: TypeString, Name: "String"}, Directives: []string{"id"}}
+	parent := &ResolvedType{Fields: map[string]*FieldInfo{"key": key}}
+	child := &ResolvedType{Fields: map[string]*FieldInfo{"nil": nil}, Parents: []*ResolvedType{nil, parent}}
+	if resolvedPrimaryKeyField(child) != key {
+		t.Fatal("inherited primary key was not found")
+	}
+	middle := &ResolvedType{Parents: []*ResolvedType{parent}}
+	if resolvedPrimaryKeyField(&ResolvedType{Parents: []*ResolvedType{middle}}) != key {
+		t.Fatal("multi-level primary key was lost")
+	}
+	parent.Parents = []*ResolvedType{child}
+	child.Fields["key"] = &FieldInfo{Name: "key", Type: key.Type}
+	if resolvedPrimaryKeyField(child) != nil {
+		t.Fatal("shadowed primary key reappeared through cycle")
+	}
+	id := &FieldInfo{Name: "id", Type: key.Type}
+	child.Fields["id"] = id
+	if resolvedPrimaryKeyField(child) != id {
+		t.Fatal("conventional key was not selected after override")
+	}
+	parent.Parents = nil
+	first := &ResolvedType{Fields: map[string]*FieldInfo{"key": {Name: "key", Type: key.Type}}}
+	child = &ResolvedType{Parents: []*ResolvedType{first, parent}}
+	if resolvedPrimaryKeyField(child) != nil {
+		t.Fatal("later parent's marker overrode earlier field")
+	}
+}
+
+func TestPositionalLoadUsesCallerScope(t *testing.T) {
+	expectError(t, analyze(t, `model Product @noTime { key: String @id } api wrong(key: Int): Product { return Product.load(key) }`), "load key expects 'String', got 'Int'")
+	expectNoErrors(t, analyze(t, `model Product @noTime { id: Int @id } api valid(id: Int): Product? { return Product.load(id) }`))
+}
+
+func TestPrimaryKeyLoadReturnsNullableModel(t *testing.T) {
+	for _, source := range []string{
+		`model User @noTime { id: Int @id name: String } api lookup(id: Int): User? { return User.load(id) }`,
+		`model User @noTime { id: Int @id name: String } api lookup(id: Int): String { val user = User.load(id) ?: throw error.NotFound return user.name }`,
+		`model User @noTime { id: Int @id name: String } api lookup(id: Int): String? { return User.load(id)?.name }`,
+	} {
+		expectNoErrors(t, analyze(t, source))
+	}
+	for _, source := range []string{
+		`model User @noTime { id: Int @id name: String } api lookup(id: Int): String { val user = User.load(id) return user.name }`,
+		`model User @noTime { id: Int @id name: String } api lookup(id: Int): User { return User.load(id) }`,
+	} {
+		result := analyze(t, source)
+		if len(result.Errors) == 0 {
+			t.Fatal("nullable primary load accepted without handling", source)
+		}
+	}
+	result := analyze(t, `model User @noTime { id: Int @id } api lookup(id: Int): User? { return User.load(id) }`)
+	expectNoErrors(t, result)
+	call := result.Files[0].APIs[0].Body.Stmts[0].(*ast.ReturnStmt).Value
+	if !call.IsNullable() || call.IsListType() {
+		t.Fatal("primary load has wrong nullable/list flags")
 	}
 }

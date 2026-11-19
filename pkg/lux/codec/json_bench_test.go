@@ -9,6 +9,55 @@ import (
 
 var jsonWireSink []byte
 
+// Before retains the preceding public nullable JSON layout. Null cases are
+// intentionally non-equivalent; non-null cases measure the normalization guard.
+func BenchmarkPublicNullableJSON(b *testing.B) {
+	for _, sample := range []struct{ name, text string }{
+		{"null", "null"}, {"spaced-null", " \t\r\nnull \t\r\n"},
+		{"object", `{"ok":true}`}, {"number", "123456789012345678901234567890"},
+	} {
+		raw := []byte(sample.text)
+		for _, canonical := range []bool{false, true} {
+			variant := "Before"
+			if canonical {
+				variant = "After"
+			}
+			b.Run(sample.name+"/write/"+variant, func(b *testing.B) {
+				buf := make([]byte, 0, len(raw)+16)
+				b.ReportAllocs()
+				for b.Loop() {
+					buf = buf[:0]
+					if canonical && IsJSONNull(raw) {
+						buf = AppendNull(buf)
+					} else {
+						var err error
+						buf, err = AppendJSON(AppendPresent(buf), raw)
+						if err != nil {
+							b.Fatal(err)
+						}
+					}
+					jsonWireSink = buf
+				}
+			})
+			b.Run(sample.name+"/read/"+variant, func(b *testing.B) {
+				data := AppendBytes([]byte{1}, raw)
+				b.ReportAllocs()
+				for b.Loop() {
+					dec := NewDecoder(data)
+					if canonical {
+						jsonWireSink = dec.ReadNullableJSON()
+					} else if value := dec.ReadJSONPtr(); value != nil {
+						jsonWireSink = *value
+					}
+					if err := dec.Finish(); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
 // Before is the generated JSON field's previous opaque-byte path, not an
 // equivalent JSON validator. Both variants retain their original wire checks.
 func BenchmarkRawJSONBoundary(b *testing.B) {

@@ -37,7 +37,24 @@ func (c *compiler) aggregateMethod(model string, link chainLink, column string) 
 
 func aggregateColumn(link chainLink) string {
 	if len(link.args) == 1 {
-		return extractLambdaField(link.args[0].Value)
+		return aggregateFieldName(link.args[0].Value)
+	}
+	return ""
+}
+
+// Aggregate arguments name schema fields, never generated Go locals.
+func aggregateFieldName(expr ast.Expr) string {
+	parameter := "it"
+	if lambda, ok := expr.(*ast.LambdaExpr); ok {
+		expr, parameter = lambda.SingleExpression()
+	}
+	if field, ok := expr.(*ast.Ident); ok {
+		return field.Name
+	}
+	if field, ok := expr.(*ast.MemberExpr); ok {
+		if owner, ok := field.Object.(*ast.Ident); ok && owner.Name == parameter {
+			return field.Field
+		}
 	}
 	return ""
 }
@@ -57,7 +74,7 @@ func (c *compiler) emitMixedAggregateGroup(group awaitAggregateGroup, base strin
 	for i, task := range group.tasks {
 		kind := c.aggregateType(task.model, task.function, task.column)
 		mixed = mixed || kind != "Int"
-		targets[i] = "{" + kind + ": &" + task.varName + "}"
+		targets[i] = "{" + kind + ": &" + c.bindings.name(task.varName) + "}"
 	}
 	if !mixed {
 		return false

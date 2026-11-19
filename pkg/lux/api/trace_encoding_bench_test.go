@@ -7,6 +7,28 @@ import (
 	"time"
 )
 
+func BenchmarkDebugTraceIDDecoding(b *testing.B) {
+	for _, count := range []int{1, 128} {
+		b.Run(fmt.Sprintf("spans=%d", count), func(b *testing.B) {
+			snapshot := DebugTraceSnapshot{TraceID: "trace", Spans: make([]DebugSpan, count)}
+			for i := range snapshot.Spans {
+				snapshot.Spans[i] = DebugSpan{ID: uint32(i + 1), ParentID: uint32(i), DebugSpanMeta: DebugSpanMeta{Name: "call", Category: "service"}}
+			}
+			data, err := EncodeDebugTrace(snapshot)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				decoded, err := DecodeDebugTrace(data)
+				if err != nil || len(decoded.Spans) != count {
+					b.Fatal("invalid trace", err)
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkDebugTraceTextEncoding(b *testing.B) {
 	for _, count := range []int{1, 16} {
 		for _, size := range []int{0, 1026} {

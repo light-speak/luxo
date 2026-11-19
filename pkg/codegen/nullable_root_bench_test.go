@@ -61,12 +61,12 @@ func rootString(t testing.TB,dst []byte,value string)[]byte{
 }
 func rootCases(t testing.TB)[]rootCase{
  t.Helper();long:=strings.Repeat("发布检查",350);raw:=bytes.Repeat([]byte{0,255,128,1},1024)
- items:=make([]int64,128);wire:=codec.AppendArrayHeader(nil,len(items))
+ items:=make([]int64,128);wire:=codec.AppendVarint(nil, uint64(len(items)))
  for i:=range items{items[i]=int64(i);wire=codec.AppendSvarint(wire,items[i])}
  snapshot:=Snapshot{Id:42,Label:"发布"};single:=codec.AppendVarint(nil,uint64(len(snapshot.Label)))
  single=codec.AppendSvarint(append(single,1),snapshot.Id)
  single=rootString(t,append(single,2),snapshot.Label);single=append(single,0)
- rows:=make([]Snapshot,128);columns:=codec.AppendVarint(codec.AppendArrayHeader(nil,len(rows)),uint64(len(rows)*len(snapshot.Label)))
+ rows:=make([]Snapshot,128);columns:=codec.AppendVarint(codec.AppendVarint(nil, uint64(len(rows))),uint64(len(rows)*len(snapshot.Label)))
  columns=append(columns,1)
  for i:=range rows{rows[i]=Snapshot{Id:int64(i),Label:"发布"};columns=codec.AppendSvarint(columns,rows[i].Id)}
  columns=append(columns,2);for _,row:=range rows{columns=rootString(t,columns,row.Label)};columns=append(columns,0)

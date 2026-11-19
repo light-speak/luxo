@@ -1,16 +1,19 @@
-import { decodeJSONEnvelope, encodeLuxoJSON } from './json'
-import { jsonUint64, readWireUint64, UINT64_MAX } from './uint64'
+import { booleanFromJSON, decodeJSONEnvelope, encodeBoundedLuxoJSON, encodeLuxoJSON } from './json'
+import { readWireUint64, UINT64_MAX } from './uint64'
 import type { UInt64 } from './uint64'
-import { decodeBinaryError, jsonResponseError } from './error-codec'
+import { decodeBinaryError, jsonResponseError, missingBinaryResponse } from './error-codec'
 import { JSONParamValidator } from './json-params'
+import { JSONEnvelopeSource, JSONResourceError, opaqueJSONResource } from './json-resource'
+import type { JSONResourcePlan } from './json-resource'
 import { snapshotAPISchema } from './schema-runtime'
 import { LuxoError } from './error'
 import { Encoder } from './codec'
 import { writeSelectionMask } from './selection'
 import { HTTPHeaders } from './http-headers'
+import { scheduleDeadline } from './deadline'
 import { readHTTPBody, responseLimit } from './http-response'
 import { enumRawValue } from './enum'
-import { GeneratedRequest, requestJSON } from './request'
+import { GeneratedRequest, requestJSON, staticJSONParameters, generatedJSONParameters } from './request'
 import type { RequestEncoder, RequestValues } from './request'
 import type { RequestParameters } from './request'
 import { writeFilters, writeSorters, writeDynamicFilters, writeDynamicSorters } from './query-controls'
@@ -34,12 +37,20 @@ const BinaryFrame = {
 } as const
 
 export type TransportMode = 'json' | 'binary'
+type PreparedRequestBody = Uint8Array<ArrayBuffer> | string
 
 function writeDateTimeParam(enc: Encoder, value: unknown): void {
 	if (typeof value !== 'string') {
 		throw new LuxoError('ConfigError', 0, 'DateTime parameters require an RFC3339 string')
 	}
 	enc.writeDateTime(value)
+}
+
+function writeTextParam(enc: Encoder, value: unknown): void {
+	if (typeof value !== 'string') {
+		throw new LuxoError('ConfigError', 0, 'text parameters require a string')
+	}
+	enc.writeString(value)
 }
 
 /** Encode a single API param (scalar or list) to binary using the schema metadata. */
@@ -62,7 +73,7 @@ export function encodeParam(
   if (pm.isList) {
     const arr = v as unknown[]
 		if (!Array.isArray(v)) throw new LuxoError('ConfigError', 0, `parameter field ${pm.fieldID} must be an array`)
-		enc.writeVarint(arr.length)
+		enc.writeArrayHeader(arr.length)
     switch (pm.type) {
       case 'Int': case 'Duration':
 		for (const value of arr as bigint[]) enc.writeSvarint(value); break
@@ -73,15 +84,15 @@ export function encodeParam(
       case 'Enum':
 		for (const value of arr) enc.writeString(enumRawValue(value, pm.typeName)); break
       case 'String': case 'Decimal':
-		for (const value of arr as string[]) enc.writeString(value); break
+		for (const value of arr) writeTextParam(enc, value); break
       case 'Boolean':
-		for (const value of arr as boolean[]) enc.writeBool(value); break
+		for (const value of arr) enc.writeBool(booleanFromJSON(value)); break
       case 'UUID':
 		for (const value of arr as string[]) enc.writeUUID(value); break
 	  case 'Bytes':
 		for (const value of arr) enc.writeBytes(toUint8Array(value)); break
 	  case 'JSON':
-		for (const value of arr) enc.writeBytes(encodeJSONParam(value)); break
+		for (const value of arr) enc.writeJSON(value); break
 	  case 'Model':
 		for (const value of arr) writeStructuredParam(enc, pm, value, types); break
 	  default:
@@ -97,9 +108,9 @@ export function encodeParam(
     case 'Enum':
 	  enc.writeString(enumRawValue(v, pm.typeName)); break
     case 'String': case 'Decimal':
-	  enc.writeString(v as string); break
+	  writeTextParam(enc, v); break
     case 'Boolean':
-	  enc.writeBool(v as boolean); break
+	  enc.writeBool(booleanFromJSON(v)); break
     case 'UUID':
 	  enc.writeUUID(v as string); break
     case 'DateTime': {
@@ -108,7 +119,7 @@ export function encodeParam(
 	case 'Bytes':
 	  enc.writeBytes(toUint8Array(v)); break
 	case 'JSON':
-	  enc.writeBytes(encodeJSONParam(v)); break
+	  enc.writeJSON(v); break
 	case 'Model':
 	  writeStructuredParam(enc, pm, v, types); break
 	default:
@@ -194,11 +205,15 @@ function writeStructuredField(
 		}
 		enc.writeBool(true)
 	} else if (value === null) {
+		if (field.type === 'JSON' && !field.isList) {
+			enc.writeJSONNull()
+			return
+		}
 		throw new LuxoError('ConfigError', 0, `${name} is not nullable`)
 	}
 	if (field.isList) {
 		if (!Array.isArray(value)) throw new LuxoError('ConfigError', 0, `${name} must be an array`)
-		enc.writeVarint(value.length)
+		enc.writeArrayHeader(value.length)
 		for (const item of value) writeStructuredValue(enc, field, item, types)
 		return
 	}
@@ -215,12 +230,12 @@ function writeStructuredValue(
 		case 'Int': case 'Duration': enc.writeSvarint(value as bigint); return
 		case 'Float': enc.writeFixed64(value as number); return
 		case 'Enum': enc.writeString(enumRawValue(value, field.typeName)); return
-		case 'String': case 'Decimal': enc.writeString(value as string); return
-		case 'Boolean': enc.writeBool(value as boolean); return
+		case 'String': case 'Decimal': writeTextParam(enc, value); return
+		case 'Boolean': enc.writeBool(booleanFromJSON(value)); return
 		case 'UUID': enc.writeUUID(value as string); return
 		case 'DateTime': writeDateTimeParam(enc, value); return
 		case 'Bytes': enc.writeBytes(toUint8Array(value)); return
-		case 'JSON': enc.writeBytes(encodeJSONParam(value)); return
+		case 'JSON': enc.writeJSON(value); return
 		case 'Model': writeNestedStructuredValue(enc, field, value, types); return
 		default: throw new LuxoError('ConfigError', 0, `unsupported structured field type: ${field.type}`)
 	}
@@ -241,10 +256,7 @@ function writeNestedStructuredValue(
 }
 
 export function encodeJSONParam(value: unknown): Uint8Array {
-	const encoded = encodeLuxoJSON(value)
-	if (encoded === undefined) {
-		throw new LuxoError('ConfigError', 0, 'JSON parameter is not serializable')
-	}
+	const encoded = encodeBoundedLuxoJSON(value)
 	return textEncoder.encode(encoded)
 }
 
@@ -260,6 +272,14 @@ export interface APISchema {
 	params?: ParamSchema[]
   fields?: Record<string, SelectionFieldSchema>
   types?: Record<string, Record<string, SelectionFieldSchema>>
+  response?: JSONResponseSchema
+}
+
+export interface JSONResponseSchema {
+  type: string
+  typeName?: string
+  isList?: boolean
+  paginated?: boolean
 }
 
 export interface ParamSchema {
@@ -280,7 +300,7 @@ export interface SelectionFieldSchema {
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 export function writeFieldMask(enc: Encoder, meta: APISchema, params?: Record<string, unknown>): void {
@@ -304,11 +324,11 @@ export function encodeStaticRequestBody<P extends RequestValues>(
 
 function prepareStaticBody<P extends RequestValues>(
   meta: APISchema | undefined, mode: TransportMode, codec: RequestEncoder<P>, params?: P,
-): Uint8Array<ArrayBuffer> | undefined {
+): PreparedRequestBody | undefined {
   if (!meta) throw new LuxoError('ConfigError', 0, 'generated request API has no registered schema')
   if (mode === 'binary') return encodeStaticRequestBody(meta, codec, params)
   if (meta.id !== codec.apiID) throw new LuxoError('ConfigError', 0, 'generated request API ID differs from registered schema')
-  return undefined
+  return staticJSONParameters(codec, params)
 }
 
 function encodeGeneratedBody(meta: APISchema, params: GeneratedRequest): Uint8Array<ArrayBuffer> {
@@ -337,8 +357,10 @@ export function encodeBinaryBody(meta: APISchema, params?: RequestParameters): U
       encodeParam(enc, param, value, meta.types)
     }
   }
-  if (params && '$filters' in params) writeDynamicFilters(enc, params.$filters)
-  if (params && '$sorters' in params) writeDynamicSorters(enc, params.$sorters)
+  const filters = params?.$filters
+  const sorters = params?.$sorters
+  if (filters !== undefined) writeDynamicFilters(enc, filters)
+  if (sorters !== undefined) writeDynamicSorters(enc, sorters)
   enc.writeEnd()
   return enc.bytes()
 }
@@ -377,8 +399,9 @@ export interface TransportOptions {
   headers?: Record<string, string>
   mode?: TransportMode
   /** Request timeout in milliseconds (default: 30000) */
+  // WebSocket bounds connection setup, response/ACK and renewal separately.
   timeout?: number
-  /** Called only for valid HTTP/code 401 errors; a new token retries once in the original mode. */
+  /** HTTP 401 retries once; WS close 4001 refreshes before reconnecting, without replaying old work. */
   onTokenExpired?: () => Promise<string | null>
   /** Optional safe request observer. Parameter values and wire payloads are never exposed. */
   observer?: TransportObserver
@@ -406,6 +429,7 @@ export interface HTTPResponse {
 }
 
 interface ResponseScope {
+  signal: AbortSignal
   response: HTTPResponse
   close: () => void
   abortError: (error: unknown) => LuxoError | undefined
@@ -424,8 +448,9 @@ function notifyObserver(observer: TransportObserver, event: TransportEvent): voi
 /** Fetch-based transport; the host runtime selects the HTTP version.
  *  Use the Node-specific NodeHTTP2Transport for explicit HTTP/2 connections. */
 export class FetchTransport implements Transport {
+  protected refreshAbortSignal?: AbortSignal
   private readonly responseByteLimit: number
-  private readonly jsonParams = new JSONParamValidator()
+  private jsonParams = new JSONParamValidator()
   private readonly headers: HTTPHeaders
   private mode: TransportMode = 'json'
   private schema: Record<string, APISchema> = {}
@@ -444,7 +469,7 @@ export class FetchTransport implements Transport {
 
   setSchema(schema: Record<string, APISchema>): void {
     const snapshot = snapshotAPISchema(schema)
-    this.jsonParams.setSchema(snapshot)
+    this.jsonParams = new JSONParamValidator(snapshot)
     this.schema = snapshot
   }
   setMode(mode: TransportMode): void { this.mode = mode }
@@ -465,10 +490,11 @@ export class FetchTransport implements Transport {
   private dispatchGenerated<P extends RequestValues>(api: string, codec: RequestEncoder<P>, params?: P, options?: CallOptions): Promise<unknown> {
     try {
       if (options?.signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
+      const jsonParams = this.jsonParams
       const body = prepareStaticBody(this.schema[api], this.mode, codec, params)
-      return body !== undefined
-        ? this.binaryCall(api, undefined, options, true, body)
-        : this.jsonCall(api, params, options)
+      return body instanceof Uint8Array
+        ? this.binaryCall(api, undefined, options, body)
+        : this.jsonCall(api, params, options, body, jsonParams)
     } catch (error) {
       return Promise.reject(error)
     }
@@ -521,21 +547,19 @@ export class FetchTransport implements Transport {
     return fetch(endpoint, init)
   }
 
-  private async openRequest(init: RequestInit, signal?: AbortSignal): Promise<ResponseScope> {
+  private async openRequest(init: RequestInit, signal?: AbortSignal, parent?: ResponseScope): Promise<ResponseScope> {
+    if (parent) return this.openRetry(init, parent)
     if (signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
     const controller = new AbortController()
     let timedOut = false
-    let closed = false
     const cancel = () => controller.abort()
     signal?.addEventListener('abort', cancel, { once: true })
-    const timer = setTimeout(() => {
+    const cancelTimeout = scheduleDeadline(this.timeout, () => {
       timedOut = true
       controller.abort()
-    }, this.timeout)
+    })
     const close = () => {
-      if (closed) return
-      closed = true
-      clearTimeout(timer)
+      cancelTimeout()
       signal?.removeEventListener('abort', cancel)
     }
     const abortError = (error: unknown) => {
@@ -545,8 +569,8 @@ export class FetchTransport implements Transport {
       return new LuxoError('CancelledError', 0, 'request cancelled')
     }
     try {
-      const response = await this.executeRequest(this.endpoint, { ...init, signal: controller.signal })
-      return { response, close, abortError }
+      const response = await this.executeRequest(this.endpoint, { ...init, redirect: 'error', signal: controller.signal })
+      return { response, close, abortError, signal: controller.signal }
     } catch (e) {
       const aborted = abortError(e)
       close()
@@ -555,41 +579,72 @@ export class FetchTransport implements Transport {
     }
   }
 
-  private async jsonCall(
-    api: string,
-    params?: RequestParameters,
+  private async openRetry(init: RequestInit, parent: ResponseScope): Promise<ResponseScope> {
+    try {
+      if (parent.signal.aborted) throw new DOMException('request aborted', 'AbortError')
+      const response = await this.executeRequest(this.endpoint, { ...init, redirect: 'error', signal: parent.signal })
+      return { response, signal: parent.signal, abortError: parent.abortError, close: () => {} }
+    } catch (error) {
+      throw parent.abortError(error) ?? new LuxoError('NetworkError', 0, error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  private jsonCall(api: string, params?: RequestParameters, options?: CallOptions, prepared?: string, jsonParams = this.jsonParams): Promise<unknown> {
+    try {
+      const responsePlan = jsonParams.response(api)
+      const fragment = prepared ?? generatedJSONParameters(params)
+      const body = fragment === undefined
+        ? jsonParams.encode(api, { ...jsonParams.prepare(api, requestJSON(params)), $api: api })
+        : jsonParams.validateEncoded(api, '{"$api":' + encodeLuxoJSON(api) + fragment + '}')
+      return this.jsonRequest(body, responsePlan, options)
+    } catch (error) {
+      return Promise.reject(error)
+    }
+  }
+
+  private async jsonRequest(
+    body: string,
+    responsePlan: JSONResourcePlan,
     options?: CallOptions,
     allowRefresh = true,
+    parent?: ResponseScope,
   ): Promise<unknown> {
-    const prepared = this.jsonParams.prepare(api, requestJSON(params))
-    const body = { ...prepared, $api: api }
-
+    const requestHeaders = this.headers.json
     const scope = await this.openRequest({
       method: 'POST',
-      headers: this.headers.json,
-      body: encodeLuxoJSON(body),
-    }, options?.signal)
+      headers: requestHeaders,
+      body,
+    }, options?.signal, parent)
     const resp = scope.response
 
     try {
       let json: Record<string, unknown>
-      try { json = decodeJSONEnvelope(httpTextDecoder.decode(await readHTTPBody(resp, this.responseByteLimit))) } catch (error) {
+      try {
+        const text = httpTextDecoder.decode(await readHTTPBody(resp, this.responseByteLimit))
+        const source = new JSONEnvelopeSource(text)
+        source.validateData(responsePlan, source.error || resp.status !== 200)
+        json = decodeJSONEnvelope(text, true)
+      } catch (error) {
         const aborted = scope.abortError(error)
         if (aborted) throw aborted
-        throw new LuxoError('ParseError', resp.status, `invalid JSON (HTTP ${resp.status})`)
+        throw new LuxoError('ParseError', resp.status, error instanceof JSONResourceError ? error.message : `invalid JSON (HTTP ${resp.status})`)
       }
 
-      if (resp.status === 200 && !('error' in json)) {
+      if (resp.status === 200 && !Object.hasOwn(json, 'error')) {
         if (!Object.hasOwn(json, 'data')) throw new LuxoError('ParseError', resp.status, 'missing JSON response data')
         return json.data
       }
       const error = jsonResponseError(json, resp.status)
-      const refresh = this.refreshAfterUnauthorized(error, scope, allowRefresh)
+      if (this.headers.json !== requestHeaders) throw error
+      const refresh = this.refreshAfterUnauthorized(error, scope, allowRefresh, options?.signal)
       if (refresh) {
         const token = await refresh
+        if (scope.signal.aborted) throw scope.abortError(new DOMException('request aborted', 'AbortError'))
         if (token) {
+          if (options?.signal?.aborted || this.refreshAbortSignal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
+          if (this.headers.json !== requestHeaders) throw error
           this.setToken(token)
-          return this.jsonCall(api, params, options, false)
+          return await this.jsonRequest(body, responsePlan, options, false, scope)
         }
       }
       throw error
@@ -598,18 +653,33 @@ export class FetchTransport implements Transport {
     }
   }
 
-  private async binaryCall(
+  private binaryCall(
     api: string,
     params?: RequestParameters,
     options?: CallOptions,
-    allowRefresh = true,
     preparedBody?: ArrayBuffer | Uint8Array<ArrayBuffer>,
+  ): Promise<unknown> {
+    try {
+      const requestHeaders = this.headers.binary
+      const body = preparedBody ?? this.encodeBinaryRequest(api, params)
+      return this.binaryRequest(body, options, true, undefined, requestHeaders)
+    } catch (error) {
+      return Promise.reject(error)
+    }
+  }
+
+  private async binaryRequest(
+    body: ArrayBuffer | Uint8Array<ArrayBuffer>,
+    options?: CallOptions,
+    allowRefresh = true,
+    parent?: ResponseScope,
+    requestHeaders = this.headers.binary,
   ): Promise<unknown> {
     const scope = await this.openRequest({
       method: 'POST',
-      headers: this.headers.binary,
-      body: preparedBody ?? this.encodeBinaryRequest(api, params),
-    }, options?.signal)
+      headers: requestHeaders,
+      body,
+    }, options?.signal, parent)
     try {
       let data: Uint8Array
       try {
@@ -619,14 +689,21 @@ export class FetchTransport implements Transport {
         if (aborted) throw aborted
         throw new LuxoError('ParseError', scope.response.status, 'invalid binary response body')
       }
-      if (scope.response.status === 200) return data
+      if (scope.response.status === 200) {
+        if (data.length === 0) throw missingBinaryResponse(scope.response.status)
+        return data
+      }
       const error = decodeBinaryError(data, scope.response.status)
-      const refresh = this.refreshAfterUnauthorized(error, scope, allowRefresh)
+      if (this.headers.binary !== requestHeaders) throw error
+      const refresh = this.refreshAfterUnauthorized(error, scope, allowRefresh, options?.signal)
       if (refresh) {
         const token = await refresh
+        if (scope.signal.aborted) throw scope.abortError(new DOMException('request aborted', 'AbortError'))
         if (token) {
+          if (options?.signal?.aborted || this.refreshAbortSignal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
+          if (this.headers.binary !== requestHeaders) throw error
           this.setToken(token)
-          return this.binaryCall(api, params, options, false, preparedBody)
+          return await this.binaryRequest(body, options, false, scope)
         }
       }
       throw error
@@ -636,13 +713,40 @@ export class FetchTransport implements Transport {
   }
 
   private refreshAfterUnauthorized(
-    error: LuxoError, scope: ResponseScope, allowRefresh: boolean,
+    error: LuxoError, scope: ResponseScope, allowRefresh: boolean, signal?: AbortSignal,
   ): Promise<string | null> | undefined {
     // Only a validated 401 envelope may refresh; body failures never reach here.
     if (!allowRefresh || scope.response.status !== 401 ||
       error.code !== 401 || error.error === 'ParseError' || !this.onTokenExpired) return undefined
-    scope.close()
-    return this.onTokenExpired()
+    if (scope.signal.aborted) return Promise.reject(scope.abortError(new DOMException('request aborted', 'AbortError')))
+    if (signal?.aborted || this.refreshAbortSignal?.aborted) return Promise.reject(new LuxoError('CancelledError', 0, 'request cancelled'))
+    const refresh = this.onTokenExpired()
+    return this.waitForRefresh(refresh, scope, this.refreshAbortSignal)
+  }
+
+  private waitForRefresh(refresh: Promise<string | null>, scope: ResponseScope, lifecycle?: AbortSignal): Promise<string | null> {
+    const signal = scope.signal
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        signal?.removeEventListener('abort', cancel)
+        lifecycle?.removeEventListener('abort', cancel)
+      }
+      const cancel = () => {
+        cleanup()
+        reject(scope.abortError(new DOMException('request aborted', 'AbortError')))
+      }
+      signal?.addEventListener('abort', cancel, { once: true })
+      lifecycle?.addEventListener('abort', cancel, { once: true })
+      if (signal?.aborted || lifecycle?.aborted) cancel()
+      // Observe late settlement without changing credentials or retrying a cancelled call.
+      void refresh.then(token => {
+        cleanup()
+        resolve(token)
+      }, error => {
+        cleanup()
+        reject(error)
+      })
+    })
   }
 
   private encodeBinaryRequest(api: string, params?: RequestParameters): ArrayBuffer {
@@ -664,6 +768,7 @@ interface SubscriptionAcknowledgement {
 
 interface WSSubscription {
   mode: TransportMode
+  responsePlan: JSONResourcePlan
   onData: (data: unknown) => void
   observer?: StreamObserver
   acknowledgement?: SubscriptionAcknowledgement
@@ -673,7 +778,7 @@ interface WSSubscription {
  *  Ideal for real-time apps: subscriptions, events, high-frequency calls.
  *  Supports both JSON and binary modes. */
 export class WsTransport implements Transport {
-  private readonly jsonParams = new JSONParamValidator()
+  private jsonParams = new JSONParamValidator()
   private ws: WebSocket | null = null
   private mode: TransportMode = 'json'
   private schema: Record<string, APISchema> = {}
@@ -681,11 +786,17 @@ export class WsTransport implements Transport {
     resolve: (v: unknown) => void
     reject: (e: Error) => void
     cleanup: () => void
+    responsePlan?: JSONResourcePlan
   }>()
   private seq: UInt64 = 0
   private connectPromise: Promise<void> | null = null
   private rejectConnection: ((error: Error) => void) | null = null
   private token: string | undefined
+  private readonly onTokenExpired?: () => Promise<string | null>
+  private credentialRevision = 0
+  private refreshPromise: Promise<void> | null = null
+  private refreshController: AbortController | null = null
+  private authError: LuxoError | null = null
   private closed = false
   private reconnectAttempts = 0
   private maxReconnectAttempts = 10
@@ -698,23 +809,32 @@ export class WsTransport implements Transport {
   constructor(private endpoint: string, options?: TransportOptions) {
     this.mode = options?.mode ?? 'json'
     this.token = options?.token
+    this.onTokenExpired = options?.onTokenExpired
     this.observer = options?.observer
     this.timeout = options?.timeout ?? 30000
   }
 
   setSchema(schema: Record<string, APISchema>): void {
     const snapshot = snapshotAPISchema(schema)
-    this.jsonParams.setSchema(snapshot)
+    this.jsonParams = new JSONParamValidator(snapshot)
     this.schema = snapshot
   }
   setMode(mode: TransportMode): void { this.mode = mode }
-  setToken(token: string | null): void { this.token = token ?? undefined }
+  setToken(token: string | null): void {
+    this.credentialRevision++
+    this.token = token ?? undefined
+    this.authError = null
+    this.refreshController?.abort()
+  }
 
-  private connect(): Promise<void> {
+  private connect(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(new LuxoError('CancelledError', 0, 'request cancelled'))
     if (this.closed) return Promise.reject(new LuxoError('NetworkError', 0, 'WebSocket closed'))
+    if (this.refreshPromise) return this.waitForConnection(this.connectAfterRefresh(this.refreshPromise), signal)
+    if (this.authError) return Promise.reject(this.authError)
     if (this.ws?.readyState === WebSocket.OPEN) return Promise.resolve()
-    if (this.connectPromise) return this.connectPromise
-    if (this.ws) return this.replaceClosingSocket(this.ws)
+    if (this.connectPromise) return this.waitForConnection(this.connectPromise, signal)
+    if (this.ws) return this.waitForConnection(this.replaceClosingSocket(this.ws), signal)
 
     let ws: WebSocket
     try {
@@ -728,12 +848,18 @@ export class WsTransport implements Transport {
     ws.binaryType = 'arraybuffer'
     this.ws = ws
     this.connectPromise = new Promise((resolve, reject) => {
-      this.rejectConnection = reject
+      const cancelTimeout = scheduleDeadline(this.timeout, () => {
+        if (this.ws !== ws || this.rejectConnection === null) return
+        try { this.disconnect(ws, new LuxoError('TimeoutError', 0, `connection timed out after ${this.timeout}ms`), true) }
+        finally { ws.close() }
+      })
+      this.rejectConnection = error => { cancelTimeout(); reject(error) }
       ws.onopen = () => {
         if (this.ws !== ws) { ws.close(); return }
         this.connectPromise = null
         this.rejectConnection = null
         this.reconnectAttempts = 0
+        cancelTimeout()
         resolve()
       }
       ws.onerror = () => {
@@ -744,15 +870,87 @@ export class WsTransport implements Transport {
       ws.onmessage = (event) => {
         if (this.ws !== ws) return
         if (event.data instanceof ArrayBuffer) {
-          this.handleBinaryResponse(new Uint8Array(event.data))
+          this.handleBinaryResponse(new Uint8Array(event.data), ws)
         } else {
           this.handleJSONResponse(typeof event.data === 'string' ? event.data : '', ws)
         }
       }
 
-      ws.onclose = () => this.disconnect(ws, new LuxoError('NetworkError', 0, 'WebSocket closed'), true)
+      ws.onclose = event => this.onSocketClose(ws, event?.code)
     })
-    return this.connectPromise
+    return this.waitForConnection(this.connectPromise, signal)
+  }
+
+  private waitForConnection(connection: Promise<void>, signal?: AbortSignal): Promise<void> {
+    if (!signal) return connection
+    return (async () => {
+      let abort: (() => void) | undefined
+      try {
+        const cancelled = new Promise<never>((_, reject) => {
+          abort = () => reject(new LuxoError('CancelledError', 0, 'request cancelled'))
+          signal.addEventListener('abort', abort, { once: true })
+          if (signal.aborted) abort()
+        })
+        await Promise.race([connection, cancelled])
+      } finally {
+        if (abort) signal.removeEventListener('abort', abort)
+      }
+    })()
+  }
+
+  private onSocketClose(ws: WebSocket, code?: number): void {
+    if (this.ws !== ws) return
+    if (code !== 4001) {
+      this.disconnect(ws, new LuxoError('NetworkError', 0, 'WebSocket closed'), true)
+      return
+    }
+    const error = new LuxoError('Unauthorized', 401, 'access token expired')
+    this.authError = error
+    if (this.onTokenExpired && !this.closed) {
+      const controller = new AbortController()
+      this.refreshController = controller
+      this.refreshPromise = this.renewAccessToken(controller, this.credentialRevision)
+    }
+    this.disconnect(ws, error, true)
+  }
+
+  private async connectAfterRefresh(refresh: Promise<void>): Promise<void> {
+    await refresh
+    return this.connect()
+  }
+
+  private async renewAccessToken(controller: AbortController, revision: number): Promise<void> {
+    // Defer user code until disconnect has detached the old connection and work.
+    await Promise.resolve()
+    let cancelTimeout: (() => void) | undefined
+    let abort: (() => void) | undefined
+    try {
+      if (controller.signal.aborted || this.closed) return
+      const cancelled = new Promise<never>((_, reject) => {
+        abort = () => reject(new LuxoError('Unauthorized', 401, 'token renewal cancelled'))
+        controller.signal.addEventListener('abort', abort, { once: true })
+      })
+      cancelTimeout = scheduleDeadline(this.timeout, () => controller.abort())
+      const renewal = (async () => this.onTokenExpired!())()
+      const token = await Promise.race([renewal, cancelled])
+      if (controller.signal.aborted || this.closed || revision !== this.credentialRevision) return
+      if (!token) throw new LuxoError('Unauthorized', 401, 'token renewal failed')
+      this.token = token
+      this.credentialRevision++
+      this.authError = null
+    } catch {
+      if (!this.closed && revision === this.credentialRevision) {
+        this.authError = new LuxoError('Unauthorized', 401, 'token renewal failed')
+      }
+    } finally {
+      cancelTimeout?.()
+      if (abort) controller.signal.removeEventListener('abort', abort)
+      if (this.refreshController === controller) {
+        this.refreshController = null
+        this.refreshPromise = null
+        if (!this.closed && !this.authError) this.scheduleReconnect()
+      }
+    }
   }
 
   private replaceClosingSocket(ws: WebSocket): Promise<void> {
@@ -765,8 +963,10 @@ export class WsTransport implements Transport {
     if (this.ws !== ws) return
     this.ws = null
     this.connectPromise = null
-    this.rejectConnection?.(error)
+    const reject = this.rejectConnection
     this.rejectConnection = null
+    // Timer cancellation hooks may start a replacement connection.
+    reject?.(error)
     for (const request of this.pending.values()) {
       request.cleanup()
       request.reject(error)
@@ -797,7 +997,7 @@ export class WsTransport implements Transport {
 
   private scheduleReconnect(): void {
     this.cancelReconnect()
-    if (this.closed || this.reconnectAttempts >= this.maxReconnectAttempts) return
+    if (this.closed || this.authError || this.refreshPromise || this.reconnectAttempts >= this.maxReconnectAttempts) return
     const delay = Math.min(this.reconnectDelay * 2 ** this.reconnectAttempts++, 30000)
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = undefined
@@ -859,18 +1059,20 @@ export class WsTransport implements Transport {
 
   private async dispatchCall(api: string, params?: RequestParameters, options?: CallOptions): Promise<unknown> {
     if (options?.signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
-    await this.connect()
+    const mode = this.mode, jsonParams = this.jsonParams, meta = this.schema[api]
+    await this.connect(options?.signal)
     if (options?.signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
     const id = this.nextRequestID()
-    return this.createPendingCall(id, api, params, options?.signal)
+    return this.createPendingCall(id, api, params, options?.signal, mode, jsonParams, meta)
   }
 
   private async dispatchGeneratedCall<P extends RequestValues>(api: string, codec: RequestEncoder<P>, params?: P, options?: CallOptions): Promise<unknown> {
     if (options?.signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
-    await this.connect()
+    const mode = this.mode, jsonParams = this.jsonParams, meta = this.schema[api]
+    await this.connect(options?.signal)
     if (options?.signal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
-    const body = prepareStaticBody(this.schema[api], this.mode, codec, params)
-    return this.createPendingCall(this.nextRequestID(), api, params, options?.signal, body)
+    const body = prepareStaticBody(meta, mode, codec, params)
+    return this.createPendingCall(this.nextRequestID(), api, params, options?.signal, mode, jsonParams, meta, body)
   }
 
   private nextRequestID(): UInt64 {
@@ -885,67 +1087,115 @@ export class WsTransport implements Transport {
     api: string,
     params: RequestParameters | undefined,
     signal: AbortSignal | undefined,
-    preparedBody?: Uint8Array<ArrayBuffer>,
+    mode: TransportMode,
+    jsonParams: JSONParamValidator,
+    meta: APISchema | undefined,
+    preparedBody?: PreparedRequestBody,
   ): Promise<unknown> {
+    const responsePlan = mode === 'json' ? jsonParams.response(api) : undefined
+    const result = this.registerPendingCall(id, signal, responsePlan)
+    if (!this.pending.has(id)) return result
+    try {
+      this.sendCall(id, api, params, mode, jsonParams, meta, preparedBody)
+    } catch (error) {
+      const pending = this.pending.get(id)
+      if (pending) {
+        this.pending.delete(id)
+        pending.cleanup()
+        pending.reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    }
+    return result
+  }
+
+  private registerPendingCall(id: UInt64, signal?: AbortSignal, responsePlan?: JSONResourcePlan): Promise<unknown> {
+    // Timer and cancellation closures retain only the response ledger, not encoded inputs.
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      const cancelTimeout = scheduleDeadline(this.timeout, () => {
         if (!this.pending.delete(id)) return
         cleanup()
         reject(new LuxoError('TimeoutError', 0, `request timed out after ${this.timeout}ms`))
-      }, this.timeout)
+      })
       const cancel = () => {
         if (!this.pending.delete(id)) return
         cleanup()
         reject(new LuxoError('CancelledError', 0, 'request cancelled'))
       }
       const cleanup = () => {
-        clearTimeout(timeout)
+        cancelTimeout()
         signal?.removeEventListener('abort', cancel)
       }
-      signal?.addEventListener('abort', cancel, { once: true })
-      this.pending.set(id, { resolve, reject, cleanup })
-      if (signal?.aborted) { cancel(); return }
       try {
-        this.sendCall(id, api, params, preparedBody)
+        signal?.addEventListener('abort', cancel, { once: true })
+        this.pending.set(id, { resolve, reject, cleanup, responsePlan })
+        if (signal?.aborted) cancel()
       } catch (error) {
         this.pending.delete(id)
         cleanup()
+        reject(error)
+      }
+    })
+  }
+
+  private sendCall(id: UInt64, api: string, params: RequestParameters | undefined, mode: TransportMode, jsonParams: JSONParamValidator, meta: APISchema | undefined, preparedBody?: PreparedRequestBody): void {
+    const ws = this.requireSocket()
+    if (mode === 'json') {
+      const fragment = typeof preparedBody === 'string' ? preparedBody : generatedJSONParameters(params)
+      const message = fragment === undefined
+        ? jsonParams.encode(api, { ...jsonParams.prepare(api, requestJSON(params)), $id: id, $api: api })
+        : jsonParams.validateEncoded(api, '{"$id":' + id + ',"$api":' + encodeLuxoJSON(api) + fragment + '}')
+      if (this.pending.has(id)) ws.send(message)
+      return
+    }
+    const enc = new Encoder()
+	enc.writeRawBytes(new Uint8Array([BinaryFrame.callRequest]))
+    enc.writeUint64(id)
+	enc.writeRawBytes(preparedBody instanceof Uint8Array ? preparedBody : this.encodeCallBody(api, params, meta))
+    if (!preparedBody && !this.pending.has(id)) return
+    ws.send(enc.bytes().buffer)
+  }
+
+  async subscribe<T>(api: string, params: RequestParameters, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): Promise<() => void> {
+    const mode = this.mode, jsonParams = this.jsonParams, meta = this.schema[api]
+    await this.connect()
+    return this.startSubscription(api, params, decode, onData, mode, jsonParams, meta, observer)
+  }
+
+  async subscribeGenerated<P extends RequestValues, T>(api: string, codec: RequestEncoder<P>, params: P | undefined, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): Promise<() => void> {
+    const mode = this.mode, jsonParams = this.jsonParams, meta = this.schema[api]
+    await this.connect()
+    const body = prepareStaticBody(meta, mode, codec, params)
+    return this.startSubscription(api, params, decode, onData, mode, jsonParams, meta, observer, body)
+  }
+
+  private startSubscription<T>(api: string, params: RequestParameters | undefined, decode: (data: unknown) => T, onData: (data: T) => void, mode: TransportMode, jsonParams: JSONParamValidator, meta: APISchema | undefined, observer?: StreamObserver, preparedBody?: PreparedRequestBody): Promise<() => void> {
+    const id = this.nextRequestID()
+    const plan = mode === 'json' ? jsonParams.response(api) : opaqueJSONResource
+    const subscription = this.createSubscription(id, mode, plan, decode, onData, observer)
+    return new Promise<() => void>((resolve, reject) => {
+      const cancelTimeout = scheduleDeadline(this.timeout, () => {
+        if (!subscription.acknowledgement || this.subscriptions.get(id) !== subscription) return
+        try { this.unsubscribe(id) }
+        catch { /* A failed cancellation cannot leave the timed-out promise pending. */ }
+        subscription.acknowledgement = undefined
+        reject(new LuxoError('TimeoutError', 0, `subscription timed out after ${this.timeout}ms`))
+      })
+      subscription.acknowledgement = { resolve, reject, cleanup: cancelTimeout }
+      this.subscriptions.set(id, subscription)
+      try {
+        this.sendSubscription(id, api, params, subscription.mode, jsonParams, meta, preparedBody)
+      } catch (error) {
+        this.subscriptions.delete(id)
+        subscription.acknowledgement.cleanup()
         reject(error instanceof Error ? error : new Error(String(error)))
       }
     })
   }
 
-  private sendCall(id: UInt64, api: string, params?: RequestParameters, preparedBody?: Uint8Array<ArrayBuffer>): void {
-    const ws = this.requireSocket()
-    if (this.mode !== 'binary') {
-      const prepared = this.jsonParams.prepare(api, requestJSON(params))
-      ws.send(encodeLuxoJSON({ ...prepared, $id: id, $api: api }))
-      return
-    }
-    const meta = this.schema[api]
-    if (!meta) throw new LuxoError('ConfigError', 0, `no schema for "${api}"`)
-    const enc = new Encoder()
-	enc.writeRawBytes(new Uint8Array([BinaryFrame.callRequest]))
-    enc.writeUint64(id)
-	enc.writeRawBytes(preparedBody ?? encodeBinaryBody(meta, params))
-    ws.send(enc.bytes().buffer)
-  }
-
-  async subscribe<T>(api: string, params: RequestParameters, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): Promise<() => void> {
-    await this.connect()
-    return this.startSubscription(api, params, decode, onData, observer)
-  }
-
-  async subscribeGenerated<P extends RequestValues, T>(api: string, codec: RequestEncoder<P>, params: P | undefined, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): Promise<() => void> {
-    await this.connect()
-    const body = prepareStaticBody(this.schema[api], this.mode, codec, params)
-    return this.startSubscription(api, params, decode, onData, observer, body)
-  }
-
-  private startSubscription<T>(api: string, params: RequestParameters | undefined, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver, preparedBody?: Uint8Array<ArrayBuffer>): Promise<() => void> {
-    const id = this.nextRequestID()
+  private createSubscription<T>(id: UInt64, mode: TransportMode, responsePlan: JSONResourcePlan, decode: (data: unknown) => T, onData: (data: T) => void, observer?: StreamObserver): WSSubscription {
+    // Keep callback contexts separate from request preparation metadata.
     const subscription: WSSubscription = {
-      observer, mode: this.mode,
+      observer, mode, responsePlan,
       onData: data => {
         let value: T
         try { value = decode(data) }
@@ -954,23 +1204,7 @@ export class WsTransport implements Transport {
         onData(value)
       },
     }
-    return new Promise<() => void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        if (!subscription.acknowledgement || this.subscriptions.get(id) !== subscription) return
-        this.unsubscribe(id)
-        subscription.acknowledgement = undefined
-        reject(new LuxoError('TimeoutError', 0, `subscription timed out after ${this.timeout}ms`))
-      }, this.timeout)
-      subscription.acknowledgement = { resolve, reject, cleanup: () => clearTimeout(timeout) }
-      this.subscriptions.set(id, subscription)
-      try {
-        this.sendSubscription(id, api, params, subscription.mode, preparedBody)
-      } catch (error) {
-        this.subscriptions.delete(id)
-        subscription.acknowledgement.cleanup()
-        reject(error instanceof Error ? error : new Error(String(error)))
-      }
-    })
+    return subscription
   }
 
   private unsubscribe(id: UInt64): void {
@@ -989,47 +1223,42 @@ export class WsTransport implements Transport {
     this.ws.send(encodeLuxoJSON({ $unsub: id }))
   }
 
-  private sendSubscription(id: UInt64, api: string, params: RequestParameters | undefined, mode: TransportMode, preparedBody?: Uint8Array<ArrayBuffer>): void {
+  private sendSubscription(id: UInt64, api: string, params: RequestParameters | undefined, mode: TransportMode, jsonParams: JSONParamValidator, meta: APISchema | undefined, preparedBody?: PreparedRequestBody): void {
     const ws = this.requireSocket()
     if (mode === 'binary') {
-      const meta = this.schema[api]
-      if (!meta) throw new LuxoError('ConfigError', 0, `no schema for "${api}"`)
       const enc = new Encoder()
 	  enc.writeRawBytes(new Uint8Array([BinaryFrame.subscribe]))
 	  enc.writeUint64(id)
-	  enc.writeRawBytes(preparedBody ?? encodeBinaryBody(meta, params))
-      ws.send(enc.bytes().buffer)
+	  enc.writeRawBytes(preparedBody instanceof Uint8Array ? preparedBody : this.encodeCallBody(api, params, meta))
+      if (preparedBody || this.subscriptions.has(id)) ws.send(enc.bytes().buffer)
       return
     }
-    const prepared = this.jsonParams.prepare(api, requestJSON(params))
-    ws.send(encodeLuxoJSON({ ...prepared, $id: id, $sub: api }))
+    const fragment = typeof preparedBody === 'string' ? preparedBody : generatedJSONParameters(params)
+    const message = fragment === undefined
+      ? jsonParams.encode(api, { ...jsonParams.prepare(api, requestJSON(params)), $id: id, $sub: api })
+      : jsonParams.validateEncoded(api, '{"$id":' + id + ',"$sub":' + encodeLuxoJSON(api) + fragment + '}')
+    if (this.subscriptions.has(id)) ws.send(message)
   }
 
-  private handleJSONResponse(data: string, ws: WebSocket) {
-    let json: Record<string, unknown>
-    try { json = decodeJSONEnvelope(data) }
-    catch {
-      try { this.disconnect(ws, new LuxoError('ParseError', 0, 'invalid WebSocket JSON message'), true) }
-      finally { ws.close() }
+  private encodeCallBody(api: string, params: RequestParameters | undefined, meta: APISchema | undefined): Uint8Array<ArrayBuffer> {
+    if (!meta) throw new LuxoError('ConfigError', 0, `no schema for "${api}"`)
+    return encodeBinaryBody(meta, params)
+  }
+
+  private dispatchJSONResponse(json: Record<string, unknown>, id: UInt64, kind: NonNullable<JSONEnvelopeSource['kind']>): void {
+    if (kind === '$end') {
+      this.handleJSONStreamEnd(id, json)
       return
     }
-    if ('$end' in json) {
-      if ('$sub' in json || '$stream' in json || '$id' in json) return
-      this.handleJSONStreamEnd(json)
-      return
-    }
-    if ('$sub' in json) {
-      const id = jsonUint64(json.$sub)
-      if (id === undefined || this.subscriptions.get(id)?.mode !== 'json') return
-      if (!('error' in json) && json.ok !== true) return
-      this.handleSubscriptionAcknowledgement(id, 'error' in json
+    if (kind === '$sub') {
+      const failure = Object.hasOwn(json, 'error')
+      if (!failure && !(Object.hasOwn(json, 'ok') && json.ok === true)) return
+      this.handleSubscriptionAcknowledgement(id, failure
         ? jsonResponseError(json)
         : undefined)
       return
     }
-    if ('$stream' in json) {
-      const id = jsonUint64(json.$stream)
-      if (id === undefined) return
+    if (kind === '$stream') {
       if (!Object.hasOwn(json, 'data')) {
         const subscription = this.subscriptions.get(id)
         if (subscription?.mode === 'json' && !subscription.acknowledgement) {
@@ -1040,42 +1269,80 @@ export class WsTransport implements Transport {
       this.deliverSubscription(id, 'json', json.data)
       return
     }
-    const id = jsonUint64(json.$id)
-    if (id === undefined) return
     const p = this.pending.get(id)
     if (!p) return
     this.pending.delete(id)
     p.cleanup()
-    if ('error' in json) p.reject(jsonResponseError(json))
+    if (Object.hasOwn(json, 'error')) p.reject(jsonResponseError(json))
     else if (Object.hasOwn(json, 'data')) p.resolve(json.data)
     else p.reject(new LuxoError('ParseError', 0, 'missing JSON response data'))
   }
 
-  private handleJSONStreamEnd(json: Record<string, unknown>): void {
-    const id = jsonUint64(json.$end)
-    if (id === undefined) return
-    const failure = 'error' in json
-    const error = failure && !('ok' in json) ? jsonResponseError(json)
-      : !failure && json.ok === true && !('data' in json) ? undefined
+  private handleJSONResponse(data: string, ws: WebSocket): void {
+    let source: JSONEnvelopeSource
+    try { source = new JSONEnvelopeSource(data) }
+    catch { this.invalidJSONMessage(ws); return }
+    const { id, kind } = source
+    if (id === undefined || kind === undefined) return
+    const pending = kind === '$id' ? this.pending.get(id) : undefined
+    const subscription = kind === '$id' ? undefined : this.subscriptions.get(id)
+    if (kind === '$id' ? !pending?.responsePlan : subscription?.mode !== 'json') return
+    if (kind === '$stream' && subscription?.acknowledgement) return
+    const plan = pending?.responsePlan ?? subscription!.responsePlan
+    try { source.validateData(plan, kind !== '$stream' && source.error) }
+    catch (cause) {
+      const error = new LuxoError('ParseError', 0, cause instanceof Error ? cause.message : 'invalid JSON response resources')
+      if (pending) {
+        this.pending.delete(id)
+        pending.cleanup()
+        pending.reject(error)
+      } else if (kind === '$sub') this.handleSubscriptionAcknowledgement(id, error)
+      else if (kind === '$end') this.finishSubscription(id, 'json', error)
+      else this.failSubscription(id, subscription!, error)
+      return
+    }
+    let json: Record<string, unknown>
+    try { json = decodeJSONEnvelope(data, true) }
+    catch { this.invalidJSONMessage(ws); return }
+    this.dispatchJSONResponse(json, id, kind)
+  }
+
+  private invalidJSONMessage(ws: WebSocket): void {
+    try { this.disconnect(ws, new LuxoError('ParseError', 0, 'invalid WebSocket JSON message'), true) }
+    finally { ws.close() }
+  }
+
+  private handleJSONStreamEnd(id: UInt64, json: Record<string, unknown>): void {
+    const failure = Object.hasOwn(json, 'error'), acknowledged = Object.hasOwn(json, 'ok')
+    const error = failure && !acknowledged ? jsonResponseError(json)
+      : !failure && acknowledged && json.ok === true && !Object.hasOwn(json, 'data') ? undefined
       : new LuxoError('ParseError', 0, 'invalid stream completion')
     this.finishSubscription(id, 'json', error)
   }
 
-  private handleBinaryResponse(data: Uint8Array) {
+  private handleBinaryResponse(data: Uint8Array, ws: WebSocket) {
 	const header = readWireUint64(data, 1)
-	if (!header) return
+	if (!header) { this.invalidBinaryMessage(ws); return }
 	if (data[0] === BinaryFrame.subscribeSuccess || data[0] === BinaryFrame.subscribeError) {
 	  const { value: id, offset } = header
-      if (data[0] === BinaryFrame.subscribeSuccess && offset !== data.length) return
       if (this.subscriptions.get(id)?.mode !== 'binary') return
       this.handleSubscriptionAcknowledgement(
         id,
-        data[0] === BinaryFrame.subscribeError ? decodeBinaryError(data.subarray(offset), 0) : undefined,
+        data[0] === BinaryFrame.subscribeError ? decodeBinaryError(data.subarray(offset), 0)
+          : offset === data.length ? undefined
+          : new LuxoError('ParseError', 0, 'trailing subscription acknowledgement bytes'),
       )
       return
     }
 	if (data[0] === BinaryFrame.stream) {
 	  const { value: id, offset } = header
+      if (offset === data.length) {
+        const subscription = this.subscriptions.get(id)
+        if (subscription?.mode === 'binary' && !subscription.acknowledgement) {
+          this.failSubscription(id, subscription, missingBinaryResponse())
+        }
+        return
+      }
       this.deliverSubscription(id, 'binary', data.subarray(offset))
       return
     }
@@ -1087,18 +1354,27 @@ export class WsTransport implements Transport {
       this.finishSubscription(id, 'binary', error)
       return
     }
-	if (data[0] !== BinaryFrame.callSuccess && data[0] !== BinaryFrame.callError) return
+	if (data[0] !== BinaryFrame.callSuccess && data[0] !== BinaryFrame.callError) {
+      this.invalidBinaryMessage(ws)
+      return
+    }
 	const { value: id, offset: off } = header
 
     const p = this.pending.get(id)
-    if (!p) return
+    if (!p || p.responsePlan !== undefined) return
     this.pending.delete(id)
     p.cleanup()
 	if (data[0] === BinaryFrame.callError) {
 	  p.reject(decodeBinaryError(data.subarray(off), 0))
 	  return
 	}
-	p.resolve(data.subarray(off))
+    if (off === data.length) p.reject(missingBinaryResponse())
+    else p.resolve(data.subarray(off))
+  }
+
+  private invalidBinaryMessage(ws: WebSocket): void {
+    try { this.disconnect(ws, new LuxoError('ParseError', 0, 'invalid WebSocket Binary message'), true) }
+    finally { ws.close() }
   }
 
   private deliverSubscription(id: UInt64, mode: TransportMode, data: unknown): void {
@@ -1107,7 +1383,12 @@ export class WsTransport implements Transport {
   }
 
   private failSubscriptionDecoding(id: UInt64, subscription: WSSubscription, cause: unknown): void {
-    const error = new LuxoError('DecodeError', 0, cause instanceof Error ? cause.message : 'invalid subscription response')
+    let message = 'invalid subscription response'
+    try {
+      const detail = cause instanceof Error ? cause.message : undefined
+      if (typeof detail === 'string') message = detail
+    } catch { /* Diagnostic accessors must not prevent local retirement. */ }
+    const error = new LuxoError('DecodeError', 0, message)
     this.failSubscription(id, subscription, error)
   }
 
@@ -1151,6 +1432,8 @@ export class WsTransport implements Transport {
 
   close(): void {
     this.closed = true
+    this.credentialRevision++
+    this.refreshController?.abort()
     this.cancelReconnect()
     const ws = this.ws
     if (!ws) return

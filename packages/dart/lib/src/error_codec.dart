@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:typed_data';
 
 import 'codec.dart';
@@ -28,6 +27,7 @@ LuxoError decodeJSONError(Map<String, Object?> json, int statusCode) {
     final code = value is int
         ? requireSafeInteger(value)
         : luxoInt64FromJSON(value).toInt();
+    if (code < 400 || code > 599) throw FormatException('invalid error status');
     return LuxoError(
       name,
       code,
@@ -90,7 +90,7 @@ LuxoError _readBinaryError(Uint8List data) {
       case 4:
         traceId = dec.readString();
       case 5:
-        errorData = decodeLuxoJSON(utf8.decode(dec.readBytes()));
+        errorData = decodeLuxoJSONBytes(dec.readBytes());
       case 6:
         cause = dec.readString();
     }
@@ -99,6 +99,7 @@ LuxoError _readBinaryError(Uint8List data) {
   if (!ended) throw FormatException('missing end marker');
   if (dec.offset != data.length) throw FormatException('trailing bytes');
   if ((seen & 14) != 14) throw FormatException('missing required fields');
+  if (code < 400 || code > 599) throw FormatException('invalid error status');
   return LuxoError(name, code, message, traceId, errorData, cause);
 }
 

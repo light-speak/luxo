@@ -1,6 +1,10 @@
 package codegen
 
-import "testing"
+import (
+	"github.com/light-speak/luxo/pkg/ast"
+	"strings"
+	"testing"
+)
 
 func TestGroupScanScalarMappings(t *testing.T) {
 	for _, test := range []struct {
@@ -8,7 +12,7 @@ func TestGroupScanScalarMappings(t *testing.T) {
 		checked                   bool
 	}{
 		{"Int", "Int64Value", "value.Int64", false},
-		{"Float", "Float64Value", "value.Float64", false},
+		{"Float", "Float64Value", "pg.FloatFromValue(value)", true},
 		{"String", "TextValue", "value.String", false},
 		{"Boolean", "BoolValue", "value.Bool", false},
 		{"UUID", "UUIDValue", "uuid.UUID(value.Bytes)", false},
@@ -102,9 +106,10 @@ api bareNamedFlag(): [FlagSummary] {
 const booleanQueryAssertions = `package generated
 import("bytes";"encoding/json";"fmt";"net/http/httptest";"testing"
 "github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/pg"
-"github.com/testcontainers/testcontainers-go";"github.com/testcontainers/testcontainers-go/modules/postgres")
+"github.com/testcontainers/testcontainers-go";"github.com/testcontainers/testcontainers-go/modules/postgres"
+ "github.com/light-speak/luxo/internal/testutil")
 func TestBooleanQueryHTTP(t *testing.T){
- container,err:=postgres.Run(t.Context(),"postgres:17-alpine",postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+ container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
  testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
  connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
  db,err:=pg.NewDB(t.Context(),connection);if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
@@ -229,10 +234,11 @@ import("bytes";"encoding/json";"fmt";"net/http/httptest";"testing"
 "github.com/light-speak/luxo/pkg/lux/codec"
 "github.com/light-speak/luxo/pkg/lux/pg"
 "github.com/testcontainers/testcontainers-go"
-"github.com/testcontainers/testcontainers-go/modules/postgres")
+"github.com/testcontainers/testcontainers-go/modules/postgres"
+ "github.com/light-speak/luxo/internal/testutil")
 func newTypedGroupFixture(t testing.TB)(*api.Router,*pg.DB){
  t.Helper()
- container,err:=postgres.Run(t.Context(),"postgres:17-alpine",postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+ container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
  testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
  connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
  db,err:=pg.NewDB(t.Context(),connection);if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
@@ -420,11 +426,12 @@ api metricHavingFunction(minimum: Int): [MetricCount] {
 const typedGroupScalarAssertions = `package generated
 import("bytes";"context";"encoding/json";"errors";"fmt";"net/http/httptest";"testing";"time"
 "github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/pg"
-"github.com/testcontainers/testcontainers-go";"github.com/testcontainers/testcontainers-go/modules/postgres")
+"github.com/testcontainers/testcontainers-go";"github.com/testcontainers/testcontainers-go/modules/postgres"
+ "github.com/light-speak/luxo/internal/testutil")
 type groupHavingResolver struct{calls int;fail bool}
 func(r *groupHavingResolver)CheckedBound(_ context.Context,value int64)(int64,error){r.calls++;if r.fail{return 0,errors.New("bound failed")};return value,nil}
 func TestGroupedScalarHTTP(t *testing.T){
- container,err:=postgres.Run(t.Context(),"postgres:17-alpine",postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+ container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
  testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
  connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
  db,err:=pg.NewDB(t.Context(),connection);if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
@@ -490,3 +497,45 @@ func checkMetricCount(t *testing.T,response *httptest.ResponseRecorder,binary bo
  for _,value:=range values{if value.Count!=1{t.Fatal("incorrect count",value)}}
 }
 `
+
+func TestGeneratedGroupScannerRejectsInvalidValuesBeforeBusinessUse(t *testing.T) {
+	plan := &ast.GroupProjection{Result: "Reading", Columns: []ast.GroupColumn{
+		{Field: "amount", Type: "Float"}, {Field: "optionalAmount", Type: "Float", Nullable: true},
+		{Field: "at", Type: "DateTime"}, {Field: "optionalAt", Type: "DateTime", Nullable: true},
+	}}
+	var b strings.Builder
+	b.WriteString("package generated\nimport(\"fmt\";\"time\";\"github.com/light-speak/luxo/pkg/lux/pg\")\ntype Reading struct {Amount float64;OptionalAmount *float64;At time.Time;OptionalAt *time.Time}\nvar readGroup = ")
+	c := &compiler{}
+	c.writeGroupScanner(&b, plan)
+	runGeneratedProtocolPackage(t, b.String(), `package generated
+import("errors";"fmt";"math";"testing";"time";"github.com/light-speak/luxo/pkg/lux/pg";"github.com/jackc/pgx/v5/pgtype")
+type groupRows struct{pg.Rows;mapping *pgtype.Map;format int16;values []any;failure error}
+func(r *groupRows)Scan(dest ...any)error{
+ if r.failure!=nil{return r.failure}
+ for i,oid:=range []uint32{pgtype.Float8OID,pgtype.Float8OID,pgtype.TimestamptzOID,pgtype.TimestamptzOID}{
+  raw,err:=r.mapping.Encode(oid,r.format,r.values[i],nil);if err!=nil{return err}
+  if err:=r.mapping.Scan(oid,r.format,raw,dest[i]);err!=nil{return err}
+ };return nil
+}
+func TestGroupBoundary(t *testing.T){
+ at:=time.Date(2026,1,1,0,0,0,123456000,time.UTC)
+ for _,format:=range []int16{pgtype.TextFormatCode,pgtype.BinaryFormatCode}{
+  rows:=&groupRows{mapping:pgtype.NewMap(),format:format,values:[]any{1.25,nil,at,nil}}
+  value,err:=readGroup(rows);if err!=nil||value.Amount!=1.25||value.OptionalAmount!=nil||!value.At.Equal(at)||value.OptionalAt!=nil{t.Fatalf("valid: %+v %v",value,err)}
+  for _,sample:=range []struct{index int;value any;valid bool}{
+   {0,math.NaN(),false},{0,math.Inf(1),false},{1,math.Inf(-1),false},{0,nil,false},
+   {0,math.MaxFloat64,true},{0,math.Copysign(0,-1),true},{1,math.SmallestNonzeroFloat64,true},
+   {2,time.Date(10000,1,1,0,0,0,0,time.UTC),false},{3,time.Date(-1,1,1,0,0,0,0,time.UTC),false},
+   {2,nil,false},{2,time.Date(0,1,1,0,0,0,0,time.UTC),true},{3,at,true},
+  }{t.Run(fmt.Sprintf("%d/%d/%v",format,sample.index,sample.value),func(t *testing.T){
+   rows.values=[]any{1.25,nil,at,nil};rows.values[sample.index]=sample.value
+   value,err:=readGroup(rows)
+   if (err==nil)!=sample.valid{t.Fatalf("group leaked invalid input or rejected valid input: %+v %v",value,err)}
+   if sample.valid&&sample.index==0&&math.Float64bits(value.Amount)!=math.Float64bits(sample.value.(float64)){t.Fatal("Float bits changed")}
+  })}
+  failure:=errors.New("driver failure");rows.failure=failure
+  if _,err:=readGroup(rows);!errors.Is(err,failure){t.Fatalf("driver error lost: %v",err)}
+ }
+}
+`)
+}

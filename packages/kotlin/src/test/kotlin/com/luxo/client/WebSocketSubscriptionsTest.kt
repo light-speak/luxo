@@ -7,6 +7,129 @@ import kotlin.test.*
 
 class WebSocketSubscriptionsTest {
     @Test
+    fun `sealed call and stream raw validation retain their request schema`() = runBlocking {
+        for (stream in listOf(false, true)) withSocket { transport, socket ->
+            val cases = mapOf("Pending" to SelectionFieldSchema(3, "Outcome.Pending", type = "Model"))
+            val meta = APISchemaEntry(77, fields = cases,
+                types = mapOf("Outcome" to cases, "@sealed:Outcome" to cases, "Outcome.Pending" to emptyMap()),
+                responseType = SelectionFieldSchema(0, "Outcome", type = "Sealed"))
+            transport.setSchema(mapOf("watch" to meta))
+            if (stream) {
+                autoAcknowledge(socket, TransportMode.JSON)
+                val errors = mutableListOf<LuxoError>()
+                var delivered = false
+                val cancel = transport.subscribe("watch", { it }, observer = StreamObserver(onError = { errors += it })) { delivered = true }
+                transport.setSchema(emptyMap())
+                socket.receive("""{"${'$'}stream":1,"data":{"Pending":{},"Pending":{}}}""")
+                assertFalse(delivered)
+                assertEquals(listOf("ParseError"), errors.map { it.error })
+                cancel()
+            } else {
+                socket.onText = {
+                    transport.setSchema(emptyMap())
+                    socket.receive("""{"${'$'}id":1,"data":{"Pending":{},"Pending":{}}}""")
+                }
+                val failure = assertFailsWith<LuxoError> { transport.call("watch") }
+                assertEquals("ParseError", failure.error)
+            }
+            assertEquals(1007, socket.lastCloseCode)
+        }
+    }
+
+    @Test
+    fun generatedWSJSONRetainsPlanDuringSchemaReplacement() = runBlocking {
+        for (subscription in listOf(false, true)) withSocket { transport, socket ->
+            transport.setSchema(mapOf("watch" to APISchemaEntry(77, listOf(ParamSchema(1, "value", "Int")))))
+            replyToOperations(socket)
+            val request = object : GeneratedRequest {
+                override val apiID = 77
+                override fun writeParameters(encoder: LuxoEncoder) {}
+                override fun toJSONParameters(): Map<String, Any?> {
+                    transport.setSchema(mapOf("watch" to APISchemaEntry(77, listOf(ParamSchema(1, "value", "Float")))))
+                    return mapOf("value" to 1.5)
+                }
+            }
+            val failure = assertFailsWith<LuxoError> {
+                if (subscription) transport.subscribe("watch", { it }, request) {}
+                else transport.call("watch", request)
+            }
+            assertEquals("ConfigError", failure.error)
+            assertEquals(0, socket.sent)
+            transport.call("watch", mapOf("value" to 1.5))
+            transport.subscribe("watch", { it }, mapOf("value" to 1.5)) {}.invoke()
+        }
+    }
+
+    @Test
+    fun encodingReconnectCannotMoveWorkOntoAnotherConnection() = runBlocking {
+        for (mode in TransportMode.entries) for (subscription in listOf(false, true)) withClient { transport, client ->
+            transport.setMode(mode)
+            val original = client.socket
+            val request = object : GeneratedRequest {
+                override val apiID = 77
+                private fun reconnect() {
+                    original.failed()
+                    transport.connect()
+                    client.socket.open()
+                    replyToOperations(client.socket)
+                }
+                override fun writeParameters(encoder: LuxoEncoder) { reconnect() }
+                override fun toJSONParameters(): Map<String, Any?> { reconnect(); return emptyMap() }
+            }
+            val failure = assertFailsWith<LuxoError>("$mode subscription=$subscription") {
+                if (subscription) transport.subscribe("watch", { it }, request) {}
+                else transport.call("watch", request)
+            }
+            assertEquals("ConnectionError", failure.error)
+            assertNotSame(original, client.socket)
+            assertEquals(0, original.sent)
+            assertEquals(0, client.socket.sent, "old operation reached new connection")
+            assertCallValue(mode, transport.call("watch"), 7)
+            transport.subscribe("watch", { it }) {}.invoke()
+        }
+    }
+
+    @Test
+    fun `peer close retires subscriptions and replies before closed callback`() = runBlocking {
+        for (mode in TransportMode.entries) for (code in listOf(1000, 1005)) withSocket { transport, socket ->
+            transport.setMode(mode)
+            autoAcknowledge(socket, mode)
+            val failures = mutableListOf<LuxoError>()
+            val cancel = transport.subscribe("watch", { it }, observer = StreamObserver(onError = { failures += it })) {}
+            socket.closing(code)
+            assertEquals(1, socket.closes, "peer close requires a close reply")
+            assertEquals(1000, socket.lastCloseCode)
+            assertEquals(listOf("NetworkError"), failures.map { it.error })
+            socket.disconnected()
+            assertEquals(1, failures.size, "closed callback must not report twice")
+            cancel()
+        }
+    }
+
+    @Test
+    fun `peer close replies even when observer throws and leaves new connection intact`() = runBlocking {
+        withClient { transport, client ->
+            val old = client.socket
+            autoAcknowledge(old, TransportMode.JSON)
+            val failure = IllegalStateException("observer failure")
+            transport.subscribe("watch", { it }, observer = StreamObserver(onError = { throw failure })) {}
+            assertSame(failure, assertFailsWith<IllegalStateException> { old.closing() })
+            assertEquals(1, old.closes)
+            transport.connect()
+            val fresh = client.socket
+            fresh.open()
+            autoAcknowledge(fresh, TransportMode.JSON)
+            var failures = 0
+            val cancel = transport.subscribe("watch", { it }, observer = StreamObserver(onError = { failures++ })) {}
+            old.closing()
+            old.disconnected()
+            assertEquals(0, failures)
+            assertEquals(0, fresh.closes)
+            cancel()
+        }
+    }
+
+    @Test
     fun registrationOwnsMetadataAndInvalidReplacementKeepsSubscriptionsUsable() = runBlocking {
         for (mode in TransportMode.entries) withSocket { transport, socket ->
             transport.setMode(mode)
@@ -151,6 +274,39 @@ class WebSocketSubscriptionsTest {
     }
 
     @Test
+    fun `cancellation write failure cannot replace subscription timeout`() = runBlocking {
+        for (mode in TransportMode.entries) withSocket(timeoutMillis = 25) { transport, socket ->
+            transport.setMode(mode)
+            failCancellationWrite(socket)
+            assertEquals("TimeoutError", assertFailsWith<LuxoError> { transport.subscribe("watch", { it }) {} }.error)
+            autoAcknowledge(socket, mode)
+            transport.subscribe("watch", { it }) {}.invoke()
+        }
+    }
+
+    @Test
+    fun `cancellation write failure cannot replace caller cancellation`() = runBlocking {
+        for (mode in TransportMode.entries) withSocket { transport, socket ->
+            transport.setMode(mode)
+            failCancellationWrite(socket)
+            supervisorScope {
+                val waiting = async(start = CoroutineStart.UNDISPATCHED) { transport.subscribe("watch", { it }) {} }
+                waiting.cancel(CancellationException("caller cancelled"))
+                assertEquals("caller cancelled", assertFailsWith<CancellationException> { waiting.await() }.message)
+            }
+        }
+    }
+
+    private fun failCancellationWrite(socket: TestSocket) {
+        socket.onText = { text ->
+            if (Json.parseToJsonElement(text).jsonObject.containsKey("\$unsub")) error("cancel write failed")
+        }
+        socket.onBinary = { bytes ->
+            if (LuxoDecoder(bytes.toByteArray()).readVarint() == 0x11L) error("cancel write failed")
+        }
+    }
+
+    @Test
     fun `retired frames and malformed identifiers cannot acknowledge or deliver`() = runBlocking {
         for (mode in TransportMode.entries) withSocket { transport, socket ->
             transport.setMode(mode)
@@ -160,8 +316,10 @@ class WebSocketSubscriptionsTest {
                 socket.receive("""{"${'$'}sub":$id,"ok":true}""")
                 socket.receive("""{"${'$'}stream":$id,"data":1}""")
             }
-            for (bytes in listOf(byteArrayOf(7, 77), byteArrayOf(6, 77, 1), frame(0x13, 1u, byteArrayOf(0)), byteArrayOf(0x93.toByte(), 0, 1))) {
-                socket.receive(bytes)
+            for (retired in listOf(0uL, 77uL, ULong.MAX_VALUE)) {
+                socket.receive(frame(0x13, retired))
+                socket.receive(frame(0x12, retired, byteArrayOf(1)))
+                socket.receive(frame(0x15, retired))
             }
             ack(socket, transportModeOpposite(mode), 1u)
             yield()
@@ -247,6 +405,10 @@ class WebSocketSubscriptionsTest {
                 oldSocket.failed()
                 oldSocket.disconnected()
                 data(oldSocket, mode, start + 1u, 9)
+                data(oldSocket, mode, start + 3u, 9)
+                oldSocket.receive("{")
+                oldSocket.receive("""{"${'$'}end":${start + 3u}}""")
+                assertEquals(0, newSocket.closes)
                 assertEquals(0, received)
                 data(newSocket, mode, start + 1u, 2)
                 assertEquals(0, received)
@@ -560,6 +722,92 @@ class WebSocketSubscriptionsTest {
                 assertTrue(outcomes.awaitAll().all { it == "success" || it == "ConnectionError" })
             }
         }
+    }
+
+    @Test
+    fun `JSON call send exception removes its pending entry`() = runBlocking {
+        checkCallSendException(TransportMode.JSON)
+    }
+
+    @Test
+    fun `Binary call send exception removes its pending entry`() = runBlocking {
+        checkCallSendException(TransportMode.BINARY)
+    }
+
+    private suspend fun checkCallSendException(mode: TransportMode) = withSocket { transport, socket ->
+        transport.setMode(mode)
+        val expected = IllegalStateException("send failed")
+        socket.onText = { throw expected }
+        socket.onBinary = { throw expected }
+        assertSame(expected, assertFailsWith<IllegalStateException> { transport.call("watch") })
+        // Test-only inspection detects retained waiters without adding a runtime diagnostics API.
+        val pendingField = LuxoWebSocket::class.java.getDeclaredField("pendingCalls")
+        pendingField.isAccessible = true
+        assertTrue((pendingField.get(transport) as Map<*, *>).isEmpty(), "failed send retained a pending call")
+        socket.onText = { socket.receive("""{"${'$'}id":2,"data":42}""") }
+        socket.onBinary = { socket.receive(frame(0x02, 2u, byteArrayOf(42))) }
+        val result = transport.call("watch")
+        if (mode == TransportMode.JSON) assertEquals(JsonPrimitive(42), result)
+        else assertContentEquals(byteArrayOf(42), result as ByteArray)
+        assertTrue((pendingField.get(transport) as Map<*, *>).isEmpty())
+        assertEquals(0, socket.closes)
+    }
+
+    @Test
+    fun `cancelled calls ignore late responses without retiring sibling calls`() = runBlocking {
+        for (mode in TransportMode.entries) withSocket { transport, socket ->
+            transport.setMode(mode)
+            supervisorScope {
+                val first = async(start = CoroutineStart.UNDISPATCHED) { transport.call("watch") }
+                val second = async(start = CoroutineStart.UNDISPATCHED) { transport.call("watch") }
+                first.cancelAndJoin()
+                assertFailsWith<CancellationException> { first.await() }
+                if (mode == TransportMode.JSON) {
+                    socket.receive("""{"${'$'}id":1,"data":999}""")
+                    socket.receive("""{"${'$'}id":1,"error":"Gone","code":400,"message":"late"}""")
+                } else {
+                    socket.receive(frame(0x02, 1u, byteArrayOf(99)))
+                    socket.receive(frame(0x03, 1u, byteArrayOf(255.toByte())))
+                }
+                assertFalse(second.isCompleted)
+                replyToCall(socket, mode, 2u, 42)
+                assertCallValue(mode, second.await(), 42)
+                val third = async(start = CoroutineStart.UNDISPATCHED) { transport.call("watch") }
+                replyToCall(socket, mode, 3u, 84)
+                assertCallValue(mode, third.await(), 84)
+                assertEquals(0, socket.closes)
+            }
+        }
+    }
+
+    private fun replyToCall(socket: TestSocket, mode: TransportMode, id: ULong, value: Int) {
+        if (mode == TransportMode.JSON) socket.receive("""{"${'$'}id":$id,"data":$value}""")
+        else socket.receive(frame(0x02, id, byteArrayOf(value.toByte())))
+    }
+
+    private fun replyToOperations(socket: TestSocket) {
+        socket.onText = { text ->
+            val message = Json.parseToJsonElement(text).jsonObject
+            message["\$id"]?.toString()?.toULong()?.let { id ->
+                if (message.containsKey("\$sub")) ack(socket, TransportMode.JSON, id)
+                else replyToCall(socket, TransportMode.JSON, id, 7)
+            }
+        }
+        socket.onBinary = { bytes ->
+            val decoder = LuxoDecoder(bytes.toByteArray())
+            when (val type = decoder.readVarint()) {
+                1L, 0x10L -> {
+                    val id = decoder.readVarint().toULong()
+                    if (type == 1L) replyToCall(socket, TransportMode.BINARY, id, 7)
+                    else ack(socket, TransportMode.BINARY, id)
+                }
+            }
+        }
+    }
+
+    private fun assertCallValue(mode: TransportMode, actual: Any, expected: Int) {
+        if (mode == TransportMode.JSON) assertEquals(JsonPrimitive(expected), actual)
+        else assertContentEquals(byteArrayOf(expected.toByte()), actual as ByteArray)
     }
 
     private suspend fun withSocket(

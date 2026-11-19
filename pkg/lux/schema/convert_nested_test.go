@@ -102,7 +102,7 @@ func TestNestedModelJSONWarmPathAllocs(t *testing.T) {
 	s, parent, child := nestedBoundaryFixture(t, false, false)
 	dst := make([]byte, 0, 64)
 	allocs := testing.AllocsPerRun(1000, func() {
-		result, err := appendNestedColumnBlobJSON(dst[:0], child, &parent.Fields[1], s)
+		result, err := appendNestedColumnBlobJSON(dst[:0], child, &parent.Fields[1], 1, s)
 		if err != nil || string(result) != `{"value":7}` {
 			t.Fatalf("invalid nested result: %s / %v", result, err)
 		}

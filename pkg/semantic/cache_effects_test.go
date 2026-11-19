@@ -118,7 +118,7 @@ api cached(): Int @cache(policy: "preview") {
   result += 1
   return result
 }
-api writeUncached() { User.where(id: 1).delete() }
+api writeUncached(): Int { User.where(id: 1).delete() return 1 }
 `))
 }
 

@@ -3,8 +3,12 @@ import type { LuxoSchema } from '@luxojs/client'
 const comparisons = ['eq', 'ne', 'gt', 'gte', 'lt', 'lte']
 const patterns = ['eq', 'ne', 'contains', 'startswith', 'endswith', 'match']
 
+export function isDSLIdentifier(name: string): boolean {
+  return /^[_\p{L}][_\p{L}0-9]*$/u.test(name)
+}
+
 function identifier(name: string): void {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`invalid query identifier: ${name}`)
+  if (!isDSLIdentifier(name)) throw new Error(`invalid query identifier: ${name}`)
 }
 
 function fieldType(type: string, schema: LuxoSchema): { name: string; value: string; operators: string[] } {

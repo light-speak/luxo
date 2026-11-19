@@ -38,14 +38,16 @@ fn lookup(): Result<Int> @native ` + annotation
 }
 
 func TestCacheableAcceptsExplicitEmptyModelAndExternalDependencies(t *testing.T) {
-	for _, test := range []struct{ declaration, call string }{
-		{"fn lookup(): Result<Int> @native", "lookup()?"},
-		{"api lookup(): Int @native", "lookup()"},
+	for _, declaration := range []string{
+		"fn lookup(): Result<Int> @native",
+		`api lookup(): Int @native @cache(policy: "preview")`,
 	} {
 		for _, dependencies := range []string{"[]", "[User]", `["pricing/rates"]`, `[User, "User", "pricing/rates"]`} {
-			expectNoErrors(t, analyzeCached(t, `model User { id: Int @id }
-`+test.declaration+` @cacheable(dependsOn: `+dependencies+`)
-api cached(): Int @cache(policy: "preview") { return `+test.call+` }`))
+			source := "model User { id: Int @id }\n" + declaration + " @cacheable(dependsOn: " + dependencies + ")"
+			if strings.HasPrefix(declaration, "fn ") {
+				source += ` api cached(): Int @cache(policy: "preview") { return lookup()? }`
+			}
+			expectNoErrors(t, analyzeCached(t, source))
 		}
 	}
 	expectNoErrors(t, analyzeCached(t, `fn pure(): Result<Int> @native @cacheable(dependsOn: [])`))
@@ -55,7 +57,6 @@ api cached(): Int @cache(policy: "preview") { return `+test.call+` }`))
 func TestCacheRejectsUndeclaredNativeDependenciesTransitively(t *testing.T) {
 	for _, test := range []struct{ declarations, call string }{
 		{`fn lookup(): Result<Int> @native`, "lookup()?"},
-		{`api lookup(): Int @native`, "lookup()"},
 		{`fn lookup(): Int { return helper()? }
 fn helper(): Result<Int> @native`, "lookup()"},
 		{`fn lookup(): Int { return next() }

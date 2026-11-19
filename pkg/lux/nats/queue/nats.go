@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 	corequeue "github.com/light-speak/luxo/pkg/lux/queue"
-	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -15,10 +16,11 @@ import (
 // jsClient abstracts the JetStream operations used by NATSQueue,
 // enabling mock-based testing without a real NATS server.
 type jsClient interface {
-	// CreateOrUpdateStream creates or updates a stream.
-	CreateOrUpdateStream(ctx context.Context, cfg jetstream.StreamConfig) (jsStream, error)
+	// CreateStream creates a stream or reopens an identical configuration.
+	CreateStream(ctx context.Context, cfg jetstream.StreamConfig) (jsStream, error)
 	// Publish publishes a message to a subject.
 	Publish(ctx context.Context, subject string, payload []byte) error
+	Flush(time.Duration) error
 }
 
 // jsStream abstracts the stream-level operations needed for Subscribe.
@@ -30,12 +32,14 @@ type jsStream interface {
 // jsConsumer abstracts the consumer-level operations.
 type jsConsumer interface {
 	// Consume starts consuming messages with the given callback.
-	Consume(handler jetstream.MessageHandler, opts ...jetstream.PullConsumeOpt) (consumeContext, error)
+	Consume(handler jetstream.MessageHandler, renewal *deliveryRenewal) (consumeContext, error)
 }
 
-// consumeContext abstracts the Stop method of jetstream.ConsumeContext.
+// consumeContext separates iterator creation from registered delivery.
 type consumeContext interface {
+	Start(int)
 	Stop()
+	Done() <-chan struct{}
 }
 
 // realJSClient wraps jetstream.JetStream to satisfy jsClient.
@@ -43,8 +47,8 @@ type realJSClient struct {
 	js jetstream.JetStream
 }
 
-func (r *realJSClient) CreateOrUpdateStream(ctx context.Context, cfg jetstream.StreamConfig) (jsStream, error) {
-	s, err := r.js.CreateOrUpdateStream(ctx, cfg)
+func (r *realJSClient) CreateStream(ctx context.Context, cfg jetstream.StreamConfig) (jsStream, error) {
+	s, err := r.js.CreateStream(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -54,6 +58,10 @@ func (r *realJSClient) CreateOrUpdateStream(ctx context.Context, cfg jetstream.S
 func (r *realJSClient) Publish(ctx context.Context, subject string, payload []byte) error {
 	_, err := r.js.Publish(ctx, subject, payload)
 	return err
+}
+
+func (r *realJSClient) Flush(timeout time.Duration) error {
+	return r.js.Conn().FlushTimeout(timeout)
 }
 
 // realJSStream wraps jetstream.Stream to satisfy jsStream.
@@ -74,8 +82,8 @@ type realJSConsumer struct {
 	c jetstream.Consumer
 }
 
-func (r *realJSConsumer) Consume(handler jetstream.MessageHandler, opts ...jetstream.PullConsumeOpt) (consumeContext, error) {
-	return r.c.Consume(handler, opts...)
+func (r *realJSConsumer) Consume(handler jetstream.MessageHandler, renewal *deliveryRenewal) (consumeContext, error) {
+	return newBatchConsumer(r.c, renewal, handler), nil
 }
 
 // NATSQueue implements Queue using NATS JetStream.
@@ -85,14 +93,18 @@ func (r *realJSConsumer) Consume(handler jetstream.MessageHandler, opts ...jetst
 // original remains unacknowledged until JetStream confirms that publication.
 // Transfer is at-least-once: an uncertain publish/ack may duplicate a DLQ entry.
 type NATSQueue struct {
-	conn      *nats.Conn // nil if we don't own the connection
-	js        jsClient
-	cfg       Config
-	mu        sync.Mutex
-	consumers []consumeContext
-	once      sync.Once
-	closed    bool
-	streams   map[string]bool // cache of known streams to avoid ensureStream on every Publish
+	conn            *nats.Conn // nil if we don't own the connection
+	js              jsClient
+	cfg             Config
+	mu              sync.Mutex
+	consumers       []consumeContext
+	subscriptions   map[string]struct{}
+	once            sync.Once
+	closed          bool
+	reports         *renewalReports
+	reportsRejected atomic.Uint64
+	closeErr        error           // Published to all Close callers by once.
+	streams         map[string]bool // cache of known streams to avoid ensureStream on every Publish
 }
 
 var _ Queue = (*NATSQueue)(nil)
@@ -101,6 +113,9 @@ var _ Queue = (*NATSQueue)(nil)
 // The returned NATSQueue owns the connection and will close it on Close().
 func NewNATSQueue(url string, cfg Config) (*NATSQueue, error) {
 	cfg.SetDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	conn, err := nats.Connect(url)
 	if err != nil {
 		return nil, fmt.Errorf("queue nats connect: %w", err)
@@ -122,10 +137,13 @@ func NewNATSQueue(url string, cfg Config) (*NATSQueue, error) {
 // NewNATSQueueFromConn creates a NATSQueue from an existing NATS connection.
 // The caller retains ownership of the connection; Close will NOT close it.
 func NewNATSQueueFromConn(conn *nats.Conn, cfg Config) (*NATSQueue, error) {
+	cfg.SetDefaults()
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	if conn == nil {
 		return nil, fmt.Errorf("queue: NATS connection is required")
 	}
-	cfg.SetDefaults()
 	js, err := jetstream.New(conn)
 	if err != nil {
 		// nats.go v1.53.1 only returns option errors; none are passed here. Keep propagation for upgrades.
@@ -139,21 +157,32 @@ func NewNATSQueueFromConn(conn *nats.Conn, cfg Config) (*NATSQueue, error) {
 	}, nil
 }
 
-// streamName converts a queue name to a valid JetStream stream name.
-// Dots are replaced with underscores since dots are subject separators in NATS.
+// streamName uses an injective escape so subject separators never alias underscores.
 func streamName(queue string) string {
-	buf := make([]byte, len(queue))
+	extra := strings.Count(queue, ".") + strings.Count(queue, "_")
+	if extra == 0 {
+		return "luxo_q_" + queue
+	}
+	buf := make([]byte, len("luxo_q_")+len(queue)+extra)
+	offset := copy(buf, "luxo_q_")
 	for i := range len(queue) {
-		if queue[i] == '.' {
-			buf[i] = '_'
-		} else {
-			buf[i] = queue[i]
+		switch queue[i] {
+		case '.':
+			buf[offset], buf[offset+1] = '_', 'd'
+			offset += 2
+		case '_':
+			buf[offset], buf[offset+1] = '_', '_'
+			offset += 2
+		default:
+			buf[offset] = queue[i]
+			offset++
 		}
 	}
-	return "luxo_q_" + string(buf)
+	return string(buf)
 }
 
-// ensureStream creates or updates the stream for the given queue name.
+// ensureStream creates or reopens an identically configured stream.
+// Conflicting persisted configurations are never silently overwritten.
 // Results are cached so subsequent calls for the same queue skip the RPC.
 func (n *NATSQueue) ensureStream(ctx context.Context, queue string) (jsStream, error) {
 	n.mu.Lock()
@@ -165,7 +194,7 @@ func (n *NATSQueue) ensureStream(ctx context.Context, queue string) (jsStream, e
 	n.mu.Unlock()
 
 	name := streamName(queue)
-	stream, err := n.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+	stream, err := n.js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:     name,
 		Subjects: []string{queue},
 		// Retain tasks until explicitly acknowledged.
@@ -187,7 +216,7 @@ func (n *NATSQueue) ensureStream(ctx context.Context, queue string) (jsStream, e
 // Unlike ensureStream, this always returns a usable stream (needed for Subscribe).
 func (n *NATSQueue) getOrCreateStream(ctx context.Context, queue string) (jsStream, error) {
 	name := streamName(queue)
-	stream, err := n.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+	stream, err := n.js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:      name,
 		Subjects:  []string{queue},
 		Retention: jetstream.WorkQueuePolicy,
@@ -231,52 +260,86 @@ func (n *NATSQueue) Publish(ctx context.Context, queue string, payload []byte) e
 // The handler is called within the business delivery budget; failures use a
 // delayed nak. Exhausted tasks only retry DLQ transfer, including after restart.
 func (n *NATSQueue) Subscribe(queue string, handler Handler) error {
+	if handler == nil {
+		return fmt.Errorf("queue: handler is required")
+	}
+	if err := n.reserveSubscription(queue); err != nil {
+		return err
+	}
+	registered := false
+	defer func() {
+		if !registered {
+			n.mu.Lock()
+			delete(n.subscriptions, queue)
+			n.mu.Unlock()
+		}
+	}()
+	consumeCtx, err := n.createSubscription(queue, handler)
+	if err != nil {
+		return err
+	}
 	n.mu.Lock()
 	if n.closed {
 		n.mu.Unlock()
+		consumeCtx.Stop()
+		consumeCtx.Start(1)
 		return fmt.Errorf("queue: closed")
 	}
+	n.consumers = append(n.consumers, consumeCtx)
+	consumeCtx.Start(n.cfg.Concurrency)
+	registered = true
 	n.mu.Unlock()
+	return nil
+}
 
+func (n *NATSQueue) reserveSubscription(queue string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return fmt.Errorf("queue: closed")
+	}
+	if _, exists := n.subscriptions[queue]; exists {
+		return fmt.Errorf("queue: %q already subscribed", queue)
+	}
+	if n.subscriptions == nil {
+		n.subscriptions = make(map[string]struct{})
+	}
+	n.subscriptions[queue] = struct{}{}
+	return nil
+}
+
+func (n *NATSQueue) createSubscription(queue string, handler Handler) (consumeContext, error) {
 	ctx := context.Background()
-
 	stream, err := n.getOrCreateStream(ctx, queue)
 	if err != nil {
-		return fmt.Errorf("queue subscribe ensure stream: %w", err)
+		return nil, fmt.Errorf("queue subscribe ensure stream: %w", err)
 	}
-
-	name := streamName(queue)
-
 	consumer, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Durable:   name + "_worker",
+		Durable:   streamName(queue) + "_worker",
 		AckPolicy: jetstream.AckExplicitPolicy,
-		// Business attempts are bounded in handleDelivery. Broker redelivery
-		// must remain available until the DLQ transfer is confirmed.
+		// Business attempts are bounded; broker redelivery remains available for DLQ transfer.
 		MaxDeliver: -1,
 		BackOff:    n.retrySchedule(),
 	})
 	if err != nil {
-		return fmt.Errorf("queue subscribe consumer: %w", err)
+		return nil, fmt.Errorf("queue subscribe consumer: %w", err)
 	}
-
+	renewal := newDeliveryRenewal(n.retryDelay(1), n.reportRenewal)
 	consumeCtx, err := consumer.Consume(func(msg jetstream.Msg) {
-		n.handleDelivery(queue, handler, msg)
-	})
+		renewal.handle(msg, func(ctx context.Context, held jetstream.Msg) {
+			n.handleDelivery(ctx, queue, handler, held)
+		})
+	}, renewal)
 	if err != nil {
-		return fmt.Errorf("queue subscribe consume: %w", err)
+		return nil, fmt.Errorf("queue subscribe consume: %w", err)
 	}
-
-	n.mu.Lock()
-	n.consumers = append(n.consumers, consumeCtx)
-	n.mu.Unlock()
-
-	return nil
+	return &renewingConsumer{consumeContext: consumeCtx, renewal: renewal, done: make(chan struct{})}, nil
 }
 
 // publishDLQ publishes a failed task to the dead-letter queue.
-func (n *NATSQueue) publishDLQ(queue string, payload []byte) error {
+func (n *NATSQueue) publishDLQ(parent context.Context, queue string, payload []byte) error {
 	dlq := queue + dlqSuffix
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
 
 	// Ensure DLQ stream exists.
@@ -292,25 +355,52 @@ func (n *NATSQueue) publishDLQ(queue string, payload []byte) error {
 // handleDelivery uses broker metadata so an exhausted task remains exhausted
 // after reconnect or worker restart. A lost publish/ack response may duplicate
 // the DLQ entry; no local flag is treated as proof of durable transfer.
-func (n *NATSQueue) handleDelivery(queue string, handler Handler, msg jetstream.Msg) {
+func (n *NATSQueue) handleDelivery(ctx context.Context, queue string, handler Handler, msg jetstream.Msg) {
+	if ctx.Err() != nil {
+		return
+	}
 	delivered, err := natsDeliveryCount(msg.Reply())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "queue %s: invalid delivery metadata: %v\n", queue, err)
+		n.reportRenewal(queueDiagnostic{queue: queue, operation: "invalid delivery metadata", cause: err})
 		n.retryDelivery(queue, msg, 1)
 		return
 	}
 	if delivered <= uint64(n.cfg.MaxRetries) {
-		if err := corequeue.InvokeHandler(handler, context.Background(), msg.Data()); err == nil {
-			n.ackDelivery(queue, msg)
-			return
-		}
-		if delivered < uint64(n.cfg.MaxRetries) {
-			n.retryDelivery(queue, msg, delivered)
-			return
-		}
+		n.invokeDelivery(ctx, queue, handler, msg, delivered)
+		return
 	}
-	if err := n.publishDLQ(queue, msg.Data()); err != nil {
-		fmt.Fprintf(os.Stderr, "queue %s: retaining task after failed transfer: %v\n", queue, err)
+	n.failedDelivery(ctx, queue, msg, delivered)
+}
+
+func (n *NATSQueue) invokeDelivery(ctx context.Context, queue string, handler Handler, msg jetstream.Msg, delivered uint64) {
+	returned := false
+	defer func() {
+		if !returned {
+			n.failedDelivery(ctx, queue, msg, delivered)
+		}
+	}()
+	err := corequeue.InvokeHandler(handler, ctx, msg.Data())
+	returned = true
+	if ctx.Err() != nil {
+		return
+	}
+	if err == nil {
+		n.ackDelivery(queue, msg)
+		return
+	}
+	n.failedDelivery(ctx, queue, msg, delivered)
+}
+
+func (n *NATSQueue) failedDelivery(ctx context.Context, queue string, msg jetstream.Msg, delivered uint64) {
+	if ctx.Err() != nil {
+		return
+	}
+	if delivered < uint64(n.cfg.MaxRetries) {
+		n.retryDelivery(queue, msg, delivered)
+		return
+	}
+	if err := n.publishDLQ(ctx, queue, msg.Data()); err != nil {
+		n.reportRenewal(queueDiagnostic{queue: queue, operation: "retaining task after failed transfer", cause: err})
 		n.retryDelivery(queue, msg, delivered)
 		return
 	}
@@ -319,14 +409,14 @@ func (n *NATSQueue) handleDelivery(queue string, handler Handler, msg jetstream.
 
 func (n *NATSQueue) ackDelivery(queue string, msg jetstream.Msg) {
 	if err := msg.Ack(); err != nil {
-		fmt.Fprintf(os.Stderr, "queue %s: ack failed; task may be redelivered: %v\n", queue, err)
+		n.reportRenewal(queueDiagnostic{queue: queue, operation: "ack failed; task may be redelivered", cause: err})
 	}
 }
 
 func (n *NATSQueue) retryDelivery(queue string, msg jetstream.Msg, delivery uint64) {
 	// BackOff only controls ack timeouts, not an explicit Nak.
 	if err := msg.NakWithDelay(n.retryDelay(delivery)); err != nil {
-		fmt.Fprintf(os.Stderr, "queue %s: delayed nak failed; awaiting ack timeout: %v\n", queue, err)
+		n.reportRenewal(queueDiagnostic{queue: queue, operation: "delayed nak failed; awaiting ack timeout", cause: err})
 	}
 }
 
@@ -351,28 +441,63 @@ func (n *NATSQueue) retrySchedule() []time.Duration {
 	return schedule
 }
 
-// Close stops all consumers and closes the NATS connection (if owned).
+// Close stops delivery, waits for handlers, and flushes acknowledgements before
+// closing an owned connection. A timeout reports incomplete shutdown explicitly.
 func (n *NATSQueue) Close() error {
-	var closeErr error
-	n.once.Do(func() {
-		n.mu.Lock()
-		n.closed = true
-		consumers := n.consumers
-		n.consumers = nil
-		conn := n.conn
-		n.mu.Unlock()
+	n.once.Do(n.close)
+	return n.closeErr
+}
 
-		// Stop all consumers.
-		for _, c := range consumers {
-			c.Stop()
-		}
+func (n *NATSQueue) close() {
+	deadline := time.Now().Add(10 * time.Second)
+	defer n.closeReports(deadline)
+	n.mu.Lock()
+	n.closed = true
+	consumers := n.consumers
+	n.consumers = nil
+	n.mu.Unlock()
+	if n.conn != nil {
+		defer n.conn.Close()
+	}
+	for _, c := range consumers {
+		c.Stop()
+	}
+	if err := waitConsumers(consumers, deadline); err != nil {
+		n.closeErr = err
+		return
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		n.closeErr = fmt.Errorf("queue: shutdown timed out before acknowledgement flush")
+		return
+	}
+	if err := n.js.Flush(min(remaining, nats.DefaultTimeout)); err != nil {
+		n.closeErr = fmt.Errorf("queue nats acknowledgement flush: %w", err)
+	}
+}
 
-		// Close NATS connection if we own it.
-		if conn != nil {
-			if err := conn.Drain(); err != nil {
-				closeErr = fmt.Errorf("queue nats drain: %w", err)
-			}
+// Already stopped consumers need no shutdown timer allocation.
+func waitConsumers(consumers []consumeContext, deadline time.Time) error {
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
 		}
-	})
-	return closeErr
+	}()
+	for _, consumer := range consumers {
+		select {
+		case <-consumer.Done():
+			continue
+		default:
+		}
+		if timer == nil {
+			timer = time.NewTimer(time.Until(deadline))
+		}
+		select {
+		case <-consumer.Done():
+		case <-timer.C:
+			return fmt.Errorf("queue: shutdown timed out waiting for handlers")
+		}
+	}
+	return nil
 }

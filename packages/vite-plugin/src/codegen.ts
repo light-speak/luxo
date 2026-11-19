@@ -2,29 +2,105 @@ import { writeFileSync, mkdirSync, existsSync } from 'fs'
 import { join } from 'path'
 import type { LuxoSchema, LuxoAPI, LuxoModel, LuxoField, TypeUsage } from '@luxojs/client'
 import { validateSchemaIDs } from '@luxojs/client'
+import { genSealeds, sealedFields } from './codegen-sealed'
 import { genRequests, requestClass } from './codegen-request'
-import { genQueryBuilders } from './codegen-query'
-import { genCompleteCheck, genResponseBody, genScalarJSONRead, hasStructuredReturn, isScalar, luxoTypeToTS } from './codegen-response'
+import { genQueryBuilders, isDSLIdentifier } from './codegen-query'
+import { genCompleteCheck, genResponseBody, genScalarJSONRead, hasStructuredReturn, isScalar, luxoTypeToTS, schemaEntry } from './codegen-response'
 
 /** Generate TypeScript types + client from Luxo schema */
 export async function generateTypes(schema: LuxoSchema, outDir: string, candidate?: { staticRequests: boolean }): Promise<void> {
   validateSchemaIDs(schema)
+  validateTypeReferences(schema)
   const queries = genQueryBuilders(schema)
+  const usages = inferTypeUsages(schema)
+  const staticRequests = candidate?.staticRequests ?? true
+  const files = [
+    ['types.ts', genTypes(schema)],
+    ['schema.ts', genSchema(schema)],
+    ['requests.ts', genRequests(schema, name => inputTypeName(name, usages), staticRequests)],
+    ['client.ts', genClient(schema, staticRequests)],
+    ['queries.ts', queries],
+  ]
   if (!existsSync(outDir)) {
     mkdirSync(outDir, { recursive: true })
   }
-
-  writeFileSync(join(outDir, 'types.ts'), genTypes(schema))
-  writeFileSync(join(outDir, 'schema.ts'), genSchema(schema))
-  const usages = inferTypeUsages(schema)
-  const staticRequests = candidate?.staticRequests ?? true
-  writeFileSync(join(outDir, 'requests.ts'), genRequests(schema, name => inputTypeName(name, usages), staticRequests))
-  writeFileSync(join(outDir, 'client.ts'), genClient(schema, staticRequests))
-  writeFileSync(join(outDir, 'queries.ts'), queries)
+  for (const [name, contents] of files) writeFileSync(join(outDir, name), contents)
   console.log(`[luxo] Generated types → ${outDir}/`)
 }
 
 // --- types.ts ---
+
+function validateTypeReferences(schema: LuxoSchema): void {
+  const validateName = (key: string, name: string, kind = 'declaration', internal = false): void => {
+    if (typeof name !== 'string') throw new TypeError(`${kind} name must be a string`)
+    if (name.length === 0) throw new Error(`${kind} name must not be empty`)
+    if (!internal && !isDSLIdentifier(name)) throw new Error(`invalid ${kind} identifier: ${name}`)
+    if (key !== name) throw new Error(`${kind} name ${name} does not match key ${key}`)
+  }
+  for (const [key, declaration] of Object.entries(schema.enums ?? {})) {
+    validateName(key, declaration.name, 'enum declaration')
+    const values = declaration.values
+    if (!Array.isArray(values) ||
+      new Set(values).size !== values.length) {
+      throw new Error(`enum ${key} has an invalid declaration`)
+    }
+    for (let index = 0; index < values.length; index++) {
+      if (typeof values[index] !== 'string') throw new Error(`enum ${key} has an invalid declaration`)
+    }
+  }
+  for (const [key, model] of Object.entries(schema.models)) {
+    validateName(key, model.name)
+    if (schemaEntry(schema.types, key) || schemaEntry(schema.enums, key)) throw new Error(`duplicate type ${key}`)
+    validateFieldReferences(schema, model.fields, 'model')
+  }
+  for (const [key, type] of Object.entries(schema.types ?? {})) {
+    validateName(key, type.name)
+    if (schemaEntry(schema.enums, key)) throw new Error(`duplicate type ${key}`)
+    validateFieldReferences(schema, type.fields, 'model')
+  }
+  for (const [key, owner] of Object.entries(schema.sealeds ?? {})) {
+    validateName(key, owner.name)
+    if (schemaEntry(schema.models, key) || schemaEntry(schema.types, key) || schemaEntry(schema.enums, key)) throw new Error(`duplicate type ${key}`)
+    const cases = new Set<string>()
+    for (const variant of owner.variants) {
+      validateName(variant.name, variant.name, 'case')
+      if (cases.has(variant.name)) throw new Error(`duplicate ${key} case ${variant.name}`)
+      cases.add(variant.name)
+      validateFieldReferences(schema, variant.fields, 'sealed payload')
+    }
+  }
+  for (const [key, api] of Object.entries(schema.apis)) {
+    validateName(key, api.name, 'declaration', api.internal)
+    const type = api.returnType
+    if (type === undefined || type === 'Enum' || (!isScalar(type) &&
+      !schemaEntry(schema.models, type) && !schemaEntry(schema.types, type) && !schemaEntry(schema.enums, type) && !schemaEntry(schema.sealeds, type))) {
+      throw new Error(`API ${api.name} has an undeclared return type ${type}`)
+    }
+    validateFieldReferences(schema, api.params ?? [], 'input')
+  }
+}
+
+function validateFieldReferences(schema: LuxoSchema, fields: readonly Pick<LuxoField, 'name' | 'type' | 'typeName'>[], context: string): void {
+  const names = new Set<string>()
+  for (const field of fields) {
+    if (field.name.length === 0) throw new Error(`${context}: member name must not be empty`)
+    if (!isDSLIdentifier(field.name)) throw new Error(`invalid ${context} identifier: ${field.name}`)
+    if (names.has(field.name)) throw new Error(`${context}: duplicate name ${field.name}`)
+    names.add(field.name)
+    const { type, typeName: name } = field
+    if (type === 'Model' && (!name || (!schemaEntry(schema.models, name) && !schemaEntry(schema.types, name)))) {
+      throw new Error(`missing ${context} type ${name ?? '<unnamed>'}`)
+    }
+    if (type === 'Sealed' && (!name || !schemaEntry(schema.sealeds, name))) throw new Error(`missing sealed type ${name ?? '<unnamed>'}`)
+    if (type === 'Enum' && (!name || !schemaEntry(schema.enums, name))) {
+      throw new Error(`missing enum type ${name ?? '<unnamed>'}`)
+    }
+    if (type !== 'Model' && type !== 'Enum' && type !== 'Sealed' && !isScalar(type) && !schemaEntry(schema.models, type) &&
+      !schemaEntry(schema.types, type) && !schemaEntry(schema.enums, type) && !schemaEntry(schema.sealeds, type)) {
+      throw new Error(`${context}: undeclared type ${type}`)
+    }
+  }
+}
 
 /** Resolve field type to TypeScript, using typeName for model/enum references */
 type FieldDirection = 'input' | 'output'
@@ -32,7 +108,7 @@ type FieldDirection = 'input' | 'output'
 function resolveFieldType(
   field: { type: string; typeName?: string; isList?: boolean; list?: boolean },
   schema: LuxoSchema,
-  usages: Map<string, TypeUsage>,
+  usages: TypeUsages,
   direction: FieldDirection = 'output',
   selectionType?: string,
 ): string {
@@ -41,11 +117,11 @@ function resolveFieldType(
   let ts: string
 
   // Check if it's an enum
-  if (schema.enums?.[typeName]) {
+  if (schemaEntry(schema.enums, typeName)) {
     ts = typeName
-  } else if (schema.models[typeName]) {
+  } else if (schemaEntry(schema.models, typeName)) {
     ts = direction === 'input' ? inputTypeName(typeName, usages) : outputTypeName(typeName, selectionType)
-  } else if (schema.types?.[typeName]) {
+  } else if (schemaEntry(schema.types, typeName) || schemaEntry(schema.sealeds, typeName)) {
     ts = direction === 'input' ? inputTypeName(typeName, usages) : outputTypeName(typeName, selectionType)
   } else {
     ts = luxoTypeToTS(field.type)
@@ -66,8 +142,42 @@ function hasOutputUsage(usage: TypeUsage): boolean {
   return usage === 'output' || usage === 'inputOutput'
 }
 
-function inputTypeName(name: string, usages: Map<string, TypeUsage>): string {
-  return usages.get(name) === 'inputOutput' ? `${name}Input` : name
+// This catalog belongs to generation, never to a generated request.
+class TypeUsages extends Map<string, TypeUsage> {
+  inputAliases?: ReadonlyMap<string, string>
+}
+
+function planInputAliases(schema: LuxoSchema, usages: TypeUsages): ReadonlyMap<string, string> | undefined {
+  let collisions: string[] | undefined
+  for (const [name, usage] of usages) {
+    if (usage !== 'inputOutput') continue
+    const preferred = `${name}Input`
+    if ((usages.get(preferred) ?? 'unused') !== 'unused' || schemaEntry(schema.enums, preferred)) {
+      (collisions ??= []).push(name)
+    }
+  }
+  if (!collisions) return undefined
+  const reserved = new Set(Object.keys(schema.enums ?? {}))
+  for (const [name, usage] of usages) {
+    if (usage !== 'unused') reserved.add(name)
+    if (usage === 'inputOutput') reserved.add(`${name}Input`)
+  }
+  const aliases = new Map<string, string>()
+  for (const name of collisions.sort()) {
+    const fields = schemaEntry(schema.models, name)?.fields ?? schemaEntry(schema.types, name)?.fields ?? []
+    const members = new Set(fields.map(field => field.name))
+    const base = `Luxo${name}Input`
+    let candidate = base
+    let ordinal = 2
+    while (reserved.has(candidate) || members.has(candidate)) candidate = `${base}${ordinal++}`
+    reserved.add(candidate)
+    aliases.set(name, candidate)
+  }
+  return aliases
+}
+
+function inputTypeName(name: string, usages: TypeUsages): string {
+  return usages.inputAliases?.get(name) ?? (usages.get(name) === 'inputOutput' ? `${name}Input` : name)
 }
 
 function mergeUsage(current: TypeUsage, next: TypeUsage): TypeUsage {
@@ -77,12 +187,13 @@ function mergeUsage(current: TypeUsage, next: TypeUsage): TypeUsage {
 }
 
 /** Infer usage for schemas produced before the core exposed the usage field. */
-function inferTypeUsages(schema: LuxoSchema): Map<string, TypeUsage> {
+function inferTypeUsages(schema: LuxoSchema): TypeUsages {
   const declarations = new Map<string, LuxoModel>()
   for (const model of Object.values(schema.models)) declarations.set(model.name, model)
   for (const type of Object.values(schema.types ?? {})) declarations.set(type.name, type)
+  for (const owner of Object.values(schema.sealeds ?? {})) declarations.set(owner.name, { name:owner.name, usage:owner.usage, fields:sealedFields(owner) })
 
-  const usages = new Map<string, TypeUsage>()
+  const usages = new TypeUsages()
   for (const name of declarations.keys()) usages.set(name, 'unused')
   const visited = new Set<string>()
   const mark = (name: string | undefined, usage: 'input' | 'output'): void => {
@@ -105,6 +216,7 @@ function inferTypeUsages(schema: LuxoSchema): Map<string, TypeUsage> {
     if (declaration.usage === 'output' || declaration.usage === 'inputOutput') mark(declaration.name, 'output')
     if (!declaration.usage && usages.get(declaration.name) === 'unused') mark(declaration.name, 'output')
   }
+  usages.inputAliases = planInputAliases(schema, usages)
   return usages
 }
 
@@ -117,16 +229,21 @@ function genTypes(schema: LuxoSchema): string {
   const fields = [
     ...Object.values(schema.models).filter(model => hasOutputUsage(usages.get(model.name) ?? 'unused')).flatMap(model => model.fields),
     ...Object.values(schema.types ?? {}).filter(type => hasOutputUsage(usages.get(type.name) ?? 'unused')).flatMap(type => type.fields),
+    ...Object.values(schema.sealeds ?? {}).filter(type => hasOutputUsage(usages.get(type.name) ?? 'unused')).flatMap(sealedFields),
   ]
+  // Without any structured edge, every response/list item has one object layer.
+  const trackDepth = fields.some(field => isNestedField(field, schema))
   if (fields.some(field => field.type === 'Int' || field.type === 'Duration')) runtimeImports.push('int64FromJSON')
   if (fields.some(field => field.type === 'Float')) runtimeImports.push('floatFromJSON')
   if (fields.some(field => field.type === 'Boolean')) runtimeImports.push('booleanFromJSON')
   if (fields.some(field => field.type === 'DateTime')) runtimeImports.push('dateTimeFromJSON')
   if (fields.some(field => ['String', 'DateTime', 'UUID', 'Decimal', 'Enum', 'Bytes'].includes(field.type)
-    || schema.enums?.[field.typeName || field.type])) runtimeImports.push('stringFromJSON')
+    || schemaEntry(schema.enums, field.typeName || field.type))) runtimeImports.push('stringFromJSON')
   if (fields.some(field => field.type === 'JSON')) runtimeImports.push('normalizeLuxoJSON')
   if (fields.some(field => field.type === 'Bytes')) runtimeImports.push('decodeBase64')
   if (fields.some(field => field.type === 'JSON')) runtimeImports.push('decodeJSONValue')
+  if (fields.some(field => field.type === 'JSON' && !field.isList && !field.list)) runtimeImports.push('validateJSONValue as $validateJSONValue')
+  if (fields.some(field => field.type === 'JSON' && (field.isList || field.list))) runtimeImports.push('validateJSONArray as $validateJSONArray')
   if (fields.some(field => (field.isList || field.list) && !isNestedField(field, schema))) runtimeImports.push('decodeScalarArray')
   out += `import { ${runtimeImports.join(', ')} } from '@luxojs/client'\n\n`
 
@@ -143,13 +260,13 @@ function genTypes(schema: LuxoSchema): string {
       const usage = usages.get(t.name) ?? 'unused'
       if (hasOutputUsage(usage)) {
         out += genInterface(t.name, t.fields, schema, usages, 'output', false)
-        out += genJSONDecode(t as unknown as LuxoModel, schema)
+        out += genJSONDecode(t as unknown as LuxoModel, schema, trackDepth)
 
         // Binary decoder for type declarations (same logic as models)
-        out += genBinaryDecode(t as unknown as LuxoModel, schema)
+        out += genBinaryDecode(t as unknown as LuxoModel, schema, trackDepth)
 
         // Columnar + paginated decoder for type declarations
-        out += genColumnarDecode(t as unknown as LuxoModel, schema, true, usages)
+        out += genColumnarDecode(t as unknown as LuxoModel, schema, true, usages, trackDepth)
         out += genPaginatedDecode(t as unknown as LuxoModel, schema, true, usages)
       }
       if (hasInputUsage(usage)) {
@@ -163,9 +280,9 @@ function genTypes(schema: LuxoSchema): string {
     const usage = usages.get(model.name) ?? 'unused'
     if (hasOutputUsage(usage)) {
       out += genInterface(model.name, model.fields, schema, usages, 'output', true)
-      out += genJSONDecode(model, schema)
-      out += genBinaryDecode(model, schema)
-      out += genColumnarDecode(model, schema, true, usages)
+      out += genJSONDecode(model, schema, trackDepth)
+      out += genBinaryDecode(model, schema, trackDepth)
+      out += genColumnarDecode(model, schema, true, usages, trackDepth)
       out += genPaginatedDecode(model, schema, true, usages)
     }
     if (hasInputUsage(usage)) {
@@ -173,6 +290,10 @@ function genTypes(schema: LuxoSchema): string {
     }
   }
 
+  out += genSealeds(schema, { usage:name => usages.get(name) ?? 'unused', inputName:name => inputTypeName(name, usages),
+    fieldType:(field, input) => resolveFieldType(field, schema, usages, input ? 'input' : 'output', input ? undefined : 'Selection'),
+    binary:field => genFieldRead(field, schema), json:(field, value) => jsonValueDecode(field, schema, value),
+  })
   out += 'export type { Page }\n'
   return out
 }
@@ -192,7 +313,7 @@ function genInterface(
   name: string,
   fields: LuxoField[],
   schema: LuxoSchema,
-  usages: Map<string, TypeUsage>,
+  usages: TypeUsages,
   direction: FieldDirection,
   model: boolean = false,
 ): string {
@@ -214,9 +335,31 @@ function genInterface(
   return out + '}\n\n'
 }
 
-function genBinaryDecode(model: LuxoModel, schema: LuxoSchema): string {
+const inheritedObjectFields = new Set([
+  '__proto__', 'constructor', 'toString', 'toLocaleString', 'valueOf',
+  'hasOwnProperty', 'isPrototypeOf', 'propertyIsEnumerable',
+  '__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__',
+])
+
+function decodedObjectLiteral(model: LuxoModel): string {
+  const fields = model.fields.filter(field => inheritedObjectFields.has(field.name))
+  if (fields.length === 0) return '{}'
+  // Own slots preserve Selected<T> and bypass the inherited __proto__ setter.
+  return `{ ${fields.map(field => `[${JSON.stringify(field.name)}]: undefined`).join(', ')} }`
+}
+
+function literalPropertyName(name: string, quoted = false): string {
+  return name === '__proto__' ? "['__proto__']" : quoted ? `'${name}'` : name
+}
+
+function genBinaryDecode(model: LuxoModel, schema: LuxoSchema, trackDepth: boolean): string {
   let out = `export function decode${model.name}(dec: Decoder): ${model.name}<true> {\n`
-  out += `  const obj: { [key: string]: unknown } = {}\n`
+  if (trackDepth) {
+    out += `  return decode${model.name}$value(dec, 1)\n}\n\n`
+    out += `function decode${model.name}$value(dec: Decoder, depth: number): ${model.name}<true> {\n`
+    out += `  if (depth > 64) throw new RangeError('model nesting exceeds 64 levels')\n`
+  }
+  out += `  const obj: { [key: string]: unknown } = ${decodedObjectLiteral(model)}\n`
   out += `  dec.skipArenaHeader()\n`
   out += `  while (dec.nextField()) {\n`
   out += `    switch (dec.fieldID) {\n`
@@ -233,13 +376,14 @@ function genBinaryDecode(model: LuxoModel, schema: LuxoSchema): string {
 
 // Keep unary decoders usable as one-argument map callbacks. List items share the
 // field pass; '$' helper names cannot collide with a DSL model identifier.
-function genJSONDecode(model: LuxoModel, schema: LuxoSchema): string {
+function genJSONDecode(model: LuxoModel, schema: LuxoSchema, trackDepth: boolean): string {
   let out = `export function decodeJSON${model.name}(data: { [key: string]: unknown }): ${model.name}<true> {\n`
-  out += `  return decodeJSON${model.name}$value(data, false)\n}\n\n`
-  out += genJSONListDecode(model.name)
-  out += `function decodeJSON${model.name}$value(data: { [key: string]: unknown }, requireField: boolean): ${model.name}<true> {\n`
+  out += `  return decodeJSON${model.name}$value(data, false${trackDepth ? ', 1' : ''})\n}\n\n`
+  out += genJSONListDecode(model.name, trackDepth)
+  out += `function decodeJSON${model.name}$value(data: { [key: string]: unknown }, requireField: boolean${trackDepth ? ', depth: number' : ''}): ${model.name}<true> {\n`
+  if (trackDepth) out += `  if (depth > 64) throw new RangeError('model nesting exceeds 64 levels')\n`
   out += `  if (requireField && (data === null || typeof data !== 'object' || Array.isArray(data))) throw new TypeError('${model.name} list item must be an object')\n`
-  out += `  const obj = {} as ${model.name}<true>\n`
+  out += `  const obj = ${decodedObjectLiteral(model)} as ${model.name}<true>\n`
   out += `  let hasField = false\n`
   for (const field of model.fields) {
     const raw = `data['${field.name}']`
@@ -249,7 +393,8 @@ function genJSONDecode(model: LuxoModel, schema: LuxoSchema): string {
     if (field.nullable) {
       out += `    obj.${field.name} = ${raw} == null ? null : ${decoded}\n`
     } else {
-      out += `    if (${raw} == null) throw new TypeError('${model.name}.${field.name} cannot be null')\n`
+      const jsonScalar = field.type === 'JSON' && !field.isList && !field.list
+      out += `    if (${raw} ${jsonScalar ? '=== undefined' : '== null'}) throw new TypeError('${model.name}.${field.name} cannot be ${jsonScalar ? 'undefined' : 'null'}')\n`
       out += `    obj.${field.name} = ${decoded}\n`
     }
     out += `  }\n`
@@ -260,12 +405,16 @@ function genJSONDecode(model: LuxoModel, schema: LuxoSchema): string {
   return out
 }
 
-function genJSONListDecode(name: string): string {
+function genJSONListDecode(name: string, trackDepth: boolean): string {
   let out = `export function decodeJSON${name}$list(data: unknown): ${name}<true>[] {\n`
+  if (trackDepth) {
+    out += `  return decodeJSON${name}$items(data, 1)\n}\n\n`
+    out += `function decodeJSON${name}$items(data: unknown, depth: number): ${name}<true>[] {\n`
+  }
   out += `  if (!Array.isArray(data)) throw new TypeError('${name} list must be an array')\n`
   out += `  const items = new Array<${name}<true>>(data.length)\n`
   out += `  for (let i = 0; i < items.length; i++) {\n`
-  out += `    items[i] = decodeJSON${name}$value(data[i] as { [key: string]: unknown }, true)\n`
+  out += `    items[i] = decodeJSON${name}$value(data[i] as { [key: string]: unknown }, true${trackDepth ? ', depth' : ''})\n`
   out += `  }\n  return items\n}\n\n`
   return out
 }
@@ -274,9 +423,12 @@ function jsonValueDecode(field: LuxoField, schema: LuxoSchema, value: string): s
   const typeName = field.typeName || field.type
   const list = field.isList || field.list
   const raw = list ? 'item' : value
-  const enumField = Boolean(schema.enums?.[typeName])
+  const enumField = Boolean(schemaEntry(schema.enums, typeName))
+  if (schemaEntry(schema.sealeds, typeName)) {
+    return list ? `decodeJSON${typeName}$items(${value}, depth + 1)` : `decodeJSON${typeName}$value(${raw} as Record<string, unknown>, depth + 1)`
+  }
   if (isNestedField(field, schema)) {
-    return list ? `decodeJSON${typeName}$list(${value})` : `decodeJSON${typeName}(${raw} as { [key: string]: unknown })`
+    return list ? `decodeJSON${typeName}$items(${value}, depth + 1)` : `decodeJSON${typeName}$value(${raw} as { [key: string]: unknown }, false, depth + 1)`
   }
   const decoded = enumField ? `decodeEnum$${typeName}(stringFromJSON(${raw}))` : genScalarJSONRead(field.type, raw)
   return list ? `(${value} as unknown[]).map(item => ${decoded})` : decoded
@@ -285,7 +437,7 @@ function jsonValueDecode(field: LuxoField, schema: LuxoSchema, value: string): s
 /** TypeScript array type for a column variable */
 function isNestedField(field: LuxoField, schema: LuxoSchema): boolean {
   const typeName = field.typeName || field.type
-  return Boolean(field.relation || schema.models[typeName] || schema.types?.[typeName])
+  return Boolean(field.relation || schemaEntry(schema.models, typeName) || schemaEntry(schema.types, typeName) || schemaEntry(schema.sealeds, typeName))
 }
 
 function columnTSType(field: LuxoField, schema: LuxoSchema): string {
@@ -330,15 +482,18 @@ function genColumnRead(field: LuxoField, schema: LuxoSchema): string {
   }
 }
 
-function columnValue(field: LuxoField, schema: LuxoSchema, usages: Map<string, TypeUsage>): string {
+function columnValue(field: LuxoField, schema: LuxoSchema, usages: TypeUsages, depth = '1'): string {
   const column = `_${field.name}`
   const typeName = field.typeName || field.type
   if (isNestedField(field, schema)) {
     if (field.isList || field.list) {
       const item = field.nullable ? `${column}[i]!` : `${column}[i]`
-      return selectedColumnValue(column, `decodeColumnar${typeName}(${item})`, field.nullable)
+      const decoded = schemaEntry(schema.sealeds, typeName)
+        ? `decodeSealedList${typeName}$value(new Decoder(${item}), ${depth} + 1, true)`
+        : `decodeColumnar${typeName}$value(${item}, ${depth} + 1)`
+      return selectedColumnValue(column, decoded, field.nullable)
     }
-    const decoded = `decode${typeName}(new Decoder(${column}[i]!))`
+    const decoded = `decode${typeName}$value(new Decoder(${column}[i]!), ${depth} + 1)`
     if (field.nullable) {
       return `${column} ? (${column}[i] ? ${decoded} : null) : undefined`
     }
@@ -347,12 +502,12 @@ function columnValue(field: LuxoField, schema: LuxoSchema, usages: Map<string, T
   if (field.isList || field.list) {
     const ts = resolveFieldType({ ...field, isList: false, list: false }, schema, usages)
     const item = field.nullable ? `${column}[i]!` : `${column}[i]`
-    const decoded = schema.enums?.[typeName]
+    const decoded = schemaEntry(schema.enums, typeName)
       ? `(decodeScalarArray(${item}, 'Enum') as string[]).map(decodeEnum$${typeName})`
       : `decodeScalarArray(${item}, '${field.type}') as ${ts}[]`
     return selectedColumnValue(column, decoded, field.nullable)
   }
-  if (schema.enums?.[typeName]) return selectedColumnValue(column, `decodeEnum$${typeName}(${column}[i]!)`, field.nullable)
+  if (schemaEntry(schema.enums, typeName)) return selectedColumnValue(column, `decodeEnum$${typeName}(${column}[i]!)`, field.nullable)
   if (field.type === 'JSON') {
     const decoded = `decodeJSONValue(${column}![i]!)`
     return field.nullable
@@ -367,14 +522,39 @@ function selectedColumnValue(column: string, decoded: string, nullable?: boolean
   return `${column} ? ${value} : undefined`
 }
 
+function genColumnCase(field: LuxoField, schema: LuxoSchema, usages: TypeUsages, depth = '1'): string {
+  let out = `      case ${field.id}:`
+  if (isNestedField(field, schema) || field.isList || field.list || field.type === 'JSON') {
+    // Raw cells are decoded after reading columns; validate every retired value.
+    // Only duplicates need checking; generic JSON never needs a discarded tree.
+    out += `\n        if (_${field.name} !== undefined) {\n`
+    out += `          for (let i = 0; i < _${field.name}.length; i++) {\n`
+    out += `            ${columnResourceCheck(field, schema, usages, depth)}\n`
+    out += `          }\n        }\n       `
+  }
+  return out + ` _${field.name} = ${genColumnRead(field, schema)}; break\n`
+}
+
+function columnResourceCheck(field: LuxoField, schema: LuxoSchema, usages: TypeUsages, depth: string): string {
+  if (field.type !== 'JSON' || isNestedField(field, schema)) return `void (${columnValue(field, schema, usages, depth)})`
+  const value = `_${field.name}[i]!`
+  const check = `${field.isList || field.list ? '$validateJSONArray' : '$validateJSONValue'}(${value})`
+  return field.nullable ? `if (_${field.name}[i] !== null) ${check}` : check
+}
+
 function columnarFields(model: LuxoModel, includeNested: boolean): LuxoField[] {
   return includeNested ? model.fields : model.fields.filter(f => !f.relation)
 }
 
-function genColumnarDecode(model: LuxoModel, schema: LuxoSchema, includeNested: boolean, usages: Map<string, TypeUsage>): string {
+function genColumnarDecode(model: LuxoModel, schema: LuxoSchema, includeNested: boolean, usages: TypeUsages, trackDepth: boolean): string {
   const fields = columnarFields(model, includeNested)
   let out = `export function decodeColumnar${model.name}(data: Uint8Array): ${model.name}<true>[] {\n`
+  if (trackDepth) {
+    out += `  return decodeColumnar${model.name}$value(data, 1)\n}\n\n`
+    out += `function decodeColumnar${model.name}$value(data: Uint8Array, depth: number): ${model.name}<true>[] {\n`
+  }
   out += `  const r = new ColumnarDecoder(data)\n`
+  if (trackDepth) out += `  if (r.count !== 0 && depth > 64) throw new RangeError('model nesting exceeds 64 levels')\n`
   // Typed column variables — zero Record overhead, zero type assertion
   for (const f of fields) {
     out += `  let _${f.name}: ${columnTSType(f, schema)} | undefined\n`
@@ -382,7 +562,7 @@ function genColumnarDecode(model: LuxoModel, schema: LuxoSchema, includeNested: 
   out += `  while (r.nextColumn()) {\n`
   out += `    switch (r.fieldID) {\n`
   for (const f of fields) {
-    out += `      case ${f.id}: _${f.name} = ${genColumnRead(f, schema)}; break\n`
+    out += genColumnCase(f, schema, usages, 'depth')
   }
   out += `      default: throw new Error(\`unknown ${model.name} column ID \${r.fieldID}\`)\n`
   out += `    }\n`
@@ -392,7 +572,7 @@ function genColumnarDecode(model: LuxoModel, schema: LuxoSchema, includeNested: 
   out += `  for (let i = 0; i < r.count; i++) {\n`
   out += `    items[i] = {\n`
   for (const f of fields) {
-    out += `      ${f.name}: ${columnValue(f, schema, usages)},\n`
+    out += `      ${literalPropertyName(f.name)}: ${columnValue(f, schema, usages, 'depth')},\n`
   }
   out += `    } as unknown as ${model.name}<true>\n`
   out += `  }\n`
@@ -401,7 +581,7 @@ function genColumnarDecode(model: LuxoModel, schema: LuxoSchema, includeNested: 
   return out
 }
 
-function genPaginatedDecode(model: LuxoModel, schema: LuxoSchema, includeNested: boolean, usages: Map<string, TypeUsage>): string {
+function genPaginatedDecode(model: LuxoModel, schema: LuxoSchema, includeNested: boolean, usages: TypeUsages): string {
   const fields = columnarFields(model, includeNested)
   let out = `export function decodePaginated${model.name}(data: Uint8Array): Page<${model.name}<true>> {\n`
   out += `  const r = new ColumnarDecoder(data)\n`
@@ -411,7 +591,7 @@ function genPaginatedDecode(model: LuxoModel, schema: LuxoSchema, includeNested:
   out += `  while (r.nextColumn()) {\n`
   out += `    switch (r.fieldID) {\n`
   for (const f of fields) {
-    out += `      case ${f.id}: _${f.name} = ${genColumnRead(f, schema)}; break\n`
+    out += genColumnCase(f, schema, usages)
   }
   out += `      default: throw new Error(\`unknown ${model.name} column ID \${r.fieldID}\`)\n`
   out += `    }\n`
@@ -421,7 +601,7 @@ function genPaginatedDecode(model: LuxoModel, schema: LuxoSchema, includeNested:
   out += `  for (let i = 0; i < r.count; i++) {\n`
   out += `    items[i] = {\n`
   for (const f of fields) {
-    out += `      ${f.name}: ${columnValue(f, schema, usages)},\n`
+    out += `      ${literalPropertyName(f.name)}: ${columnValue(f, schema, usages)},\n`
   }
   out += `    } as unknown as ${model.name}<true>\n`
   out += `  }\n`
@@ -443,16 +623,20 @@ function genFieldRead(field: { type: string; typeName?: string; nullable?: boole
 
   // Check for nested model/type reference first (relation fields or typeName pointing to a model/type)
   const tn = field.typeName || field.type
-  if (schema.enums?.[tn]) {
+  if (schemaEntry(schema.sealeds, tn)) {
+    const read = field.isList ? `decodeSealedList${tn}$value(dec, depth + 1)` : `decode${tn}$value(new Decoder(dec.readBytes()), depth + 1)`
+    return n ? `dec.readNullable(() => ${read})` : read
+  }
+  if (schemaEntry(schema.enums, tn)) {
     if (field.isList) return `dec.readStringArray().map(decodeEnum$${tn})`
     const decoded = `decodeEnum$${tn}(dec.readString())`
     return n ? `dec.readNullable(() => ${decoded})` : decoded
   }
-  if (field.relation || (tn && (schema.models[tn] || schema.types?.[tn]))) {
+  if (field.relation || (tn && (schemaEntry(schema.models, tn) || schemaEntry(schema.types, tn)))) {
     if (field.isList) {
-      return `decodeColumnar${tn}(dec.readBytes())`
+      return `decodeColumnar${tn}$value(dec.readBytes(), depth + 1)`
     }
-    const decoded = `decode${tn}(new Decoder(dec.readBytes()))`
+    const decoded = `decode${tn}$value(new Decoder(dec.readBytes()), depth + 1)`
     return n ? `dec.readNullable(() => ${decoded})` : decoded
   }
 
@@ -494,29 +678,38 @@ function genSchema(schema: LuxoSchema): string {
   out += "import type { APISchema } from '@luxojs/client'\n\n"
 
   out += 'const LUXO_SELECTION_TYPES = {\n'
-  const selectionTypes = { ...(schema.types ?? {}), ...schema.models }
+  const selectionTypes: Record<string, { name: string; fields: LuxoField[] }> = { ...(schema.types ?? {}), ...schema.models }
+  for (const owner of Object.values(schema.sealeds ?? {})) {
+    const fields = owner.variants.map(variant => ({ id: variant.id, name: variant.name, type: 'Model', typeName: `${owner.name}.${variant.name}` }))
+    selectionTypes[owner.name] = { name: owner.name, fields }
+    selectionTypes[`@sealed:${owner.name}`] = { name: `@sealed:${owner.name}`, fields }
+    for (const variant of owner.variants) selectionTypes[`${owner.name}.${variant.name}`] = { name: `${owner.name}.${variant.name}`, fields: variant.fields }
+  }
   for (const type of Object.values(selectionTypes)) {
     const fields = type.fields.map(field => {
       const typeName = field.typeName || field.type
 	  const declaredType = field.typeName ? `, typeName: '${typeName}'` : ''
-	  return `'${field.name}': { fieldID: ${field.id}, type: '${field.type}'${declaredType}${field.isList || field.list ? ', isList: true' : ''}${field.nullable ? ', nullable: true' : ''} }`
+	  return `${literalPropertyName(field.name, true)}: { fieldID: ${field.id}, type: '${field.type}'${declaredType}${field.isList || field.list ? ', isList: true' : ''}${field.nullable ? ', nullable: true' : ''} }`
     }).join(', ')
-    out += `  '${type.name}': { ${fields} },\n`
+    out += `  ${literalPropertyName(type.name, true)}: { ${fields} },\n`
   }
   out += '}\n\n'
 
-  out += '/** API schema map — binary encoding and schema-aware JSON integer validation. */\n'
+  out += '/** API schema map — binary encoding and declared JSON resource validation. */\n'
   out += 'export const LUXO_SCHEMA: { [key: string]: APISchema } = {\n'
   for (const api of Object.values(schema.apis)) {
     if (api.internal) continue
-    out += `  '${api.name}': { id: ${api.id}`
+    out += `  ${literalPropertyName(api.name, true)}: { id: ${api.id}`
     const returnFields = api.returnType
-      ? schema.models[api.returnType]?.fields ?? schema.types?.[api.returnType]?.fields
+      ? schemaEntry(selectionTypes, api.returnType)?.fields
       : undefined
+    const returnEnum = api.returnType && schemaEntry(schema.enums, api.returnType)
+    const responseType = schemaEntry(schema.sealeds, api.returnType ?? '') ? 'Sealed' : returnFields ? 'Model' : returnEnum ? 'Enum' : api.returnType || 'Int'
+    out += `, response: { type: '${responseType}'${returnFields || returnEnum ? `, typeName: '${api.returnType}'` : ''}${api.returnList && !api.paginated ? ', isList: true' : ''}${api.paginated ? ', paginated: true' : ''} }`
     if (returnFields && returnFields.length > 0) {
 	  out += `, fields: LUXO_SELECTION_TYPES['${api.returnType}']`
 	}
-	if ((returnFields && returnFields.length > 0) || api.params?.some(param => param.type === 'Model')) {
+	if (returnFields || api.params?.some(param => param.type === 'Model' || param.type === 'Sealed')) {
 	  out += ', types: LUXO_SELECTION_TYPES'
     }
     if (api.params && api.params.length > 0) {
@@ -534,10 +727,10 @@ function genSchema(schema: LuxoSchema): string {
 
 // --- client.ts ---
 
-function genClientImports(schema: LuxoSchema, usages: Map<string, TypeUsage>, staticRequests: boolean): string {
+function genClientImports(schema: LuxoSchema, usages: TypeUsages, staticRequests: boolean): string {
   let out = '// Auto-generated by @luxo/vite-plugin. DO NOT EDIT.\n\n'
   const streamImport = Object.values(schema.apis).some(api => api.stream) ? ', StreamObserver' : ''
-  out += `import type { ${staticRequests ? 'GeneratedTransport as Transport' : 'Transport'}, TransportOptions, CallOptions, Page, Filter, Sorter${streamImport} } from '@luxojs/client'\n`
+  out += `import type { ${staticRequests ? 'GeneratedTransport as Transport' : 'Transport'}, TransportOptions, CallOptions, Page, Filter, Sorter, PreparedSelection${streamImport} } from '@luxojs/client'\n`
   const runtimeImports = ['FetchTransport', 'WsTransport']
   const decodeExpressions = Object.values(schema.apis).map(api => genResponseBody(api, schema, getReturnType(api, schema), '  ')).join('\n')
   for (const helper of ['Decoder', 'decodeBase64', 'decodeJSONValue', 'unixSecondsToISO', 'int64FromJSON', 'floatFromJSON', 'booleanFromJSON', 'stringFromJSON', 'dateTimeFromJSON', 'normalizeLuxoJSON']) {
@@ -555,12 +748,12 @@ function genClientImports(schema: LuxoSchema, usages: Map<string, TypeUsage>, st
     if (api.returnType && !isScalar(api.returnType)) {
       typeImports.add(api.returnType)
     }
-    if (api.returnType && schema.enums?.[api.returnType]) decoderImports.add(`decodeEnum$${api.returnType}`)
+    if (api.returnType && schemaEntry(schema.enums, api.returnType)) decoderImports.add(`decodeEnum$${api.returnType}`)
     if (hasStructuredReturn(api, schema)) {
       if (api.paginated) {
         decoderImports.add(`decodePaginated${api.returnType}`)
       } else if (api.returnList) {
-        decoderImports.add(`decodeColumnar${api.returnType}`)
+        decoderImports.add(`${schemaEntry(schema.sealeds, api.returnType!) ? 'decodeSealedList' : 'decodeColumnar'}${api.returnType}`)
       } else {
         decoderImports.add(`decode${api.returnType}`)
       }
@@ -568,7 +761,7 @@ function genClientImports(schema: LuxoSchema, usages: Map<string, TypeUsage>, st
     }
 		for (const param of api.params ?? []) {
 			const typeName = param.typeName || param.type
-			if (schema.enums?.[typeName] || schema.models[typeName] || schema.types?.[typeName]) {
+			if (schemaEntry(schema.enums, typeName) || schemaEntry(schema.models, typeName) || schemaEntry(schema.types, typeName) || schemaEntry(schema.sealeds, typeName)) {
 				typeImports.add(inputTypeName(typeName, usages))
 			}
 		}
@@ -615,33 +808,43 @@ function genClient(schema: LuxoSchema, staticRequests: boolean): string {
   }
 
   out += '}\n'
+  for (const api of Object.values(schema.apis)) {
+    if (api.internal || api.stream) continue
+    out += genResponseDecoder(api, schema)
+  }
   return out
 }
 
 function resolveParamType(
   p: { type: string; typeName?: string; name: string; isList?: boolean },
   schema: LuxoSchema,
-  usages: Map<string, TypeUsage>,
+  usages: TypeUsages,
 ): string {
   let type: string
   const typeName = p.typeName || p.type
-  if (schema.enums?.[typeName]) type = typeName
-  else if (schema.models[typeName]) type = inputTypeName(typeName, usages)
-  else if (schema.types?.[typeName]) type = inputTypeName(typeName, usages)
+  if (schemaEntry(schema.enums, typeName)) type = typeName
+  else if (schemaEntry(schema.models, typeName)) type = inputTypeName(typeName, usages)
+  else if (schemaEntry(schema.types, typeName) || schemaEntry(schema.sealeds, typeName)) type = inputTypeName(typeName, usages)
   else type = luxoTypeToTS(p.type)
   return p.isList ? `${type}[]` : type
 }
 
-function genMethod(api: LuxoAPI, schema: LuxoSchema, usages: Map<string, TypeUsage>, staticRequests: boolean): string {
-  const structuredReturn = hasStructuredReturn(api, schema)
-  const selectionFlag = structuredReturn ? 'Select extends string ? true : false' : undefined
+function hasSelectableReturn(api: LuxoAPI, schema: LuxoSchema): boolean {
+  const owner = schemaEntry(schema.sealeds, api.returnType ?? '')
+  return owner ? owner.variants.length !== 0 : hasStructuredReturn(api, schema)
+}
+
+function genMethod(api: LuxoAPI, schema: LuxoSchema, usages: TypeUsages, staticRequests: boolean): string {
+  const structuredReturn = hasSelectableReturn(api, schema)
+  const selectionFlag = structuredReturn ? 'Select extends string | PreparedSelection ? true : false' : undefined
   const retTS = getReturnType(api, schema, selectionFlag)
   if (api.stream) return genStreamMethod(api, schema, usages, retTS, staticRequests)
   const paginationNames = new Set(['page', 'pageSize'])
-  const typeParams = structuredReturn ? '<Select extends string | undefined = undefined>' : ''
+  const typeParams = structuredReturn ? '<Select extends string | PreparedSelection | undefined = undefined>' : ''
   const call = (params: string) =>
-    `    ${api.returnNullable ? 'let' : 'const'} d = await this.transport.${staticRequests ? 'callGenerated' : 'call'}('${api.name}', ${staticRequests ? `${requestClass(api)}, ${params || 'undefined'}` : `new ${requestClass(api)}(${params})`}, options)\n` +
-    genResponseBody(api, schema, retTS, '    ')
+    `    try {\n` +
+    `      return decodeResponse$${api.name}${structuredReturn ? '<Select>' : ''}(this.transport.${staticRequests ? 'callGenerated' : 'call'}('${api.name}', ${staticRequests ? `${requestClass(api)}, ${params || 'undefined'}` : `new ${requestClass(api)}(${params})`}, options))\n` +
+    `    } catch (error) { return globalThis.Promise.reject(error) }\n`
 
   // If API has explicit params, always use them for the signature (no guessing by name prefix)
   if (api.params && api.params.length > 0) {
@@ -653,34 +856,36 @@ function genMethod(api: LuxoAPI, schema: LuxoSchema, usages: Map<string, TypeUsa
     })
     if (structuredReturn) paramFields.push('$select?: Select')
     if (api.paginated) {
-      if (!api.params.some(p => p.name === 'page')) paramFields.push('page?: bigint')
-      if (!api.params.some(p => p.name === 'pageSize')) paramFields.push('pageSize?: bigint')
       paramFields.push('$filters?: Filter[]', '$sorters?: Sorter[]')
     }
     const hasRequiredParam = api.params.some(p => !p.hasDefault && !(api.paginated && paginationNames.has(p.name)))
     const optional = hasRequiredParam ? '' : '?'
-    return `  async ${api.name}${typeParams}(params${optional}: { ${paramFields.join('; ')} }, options?: CallOptions): Promise<${retTS}> {\n` +
+    return `  ${api.name}${typeParams}(params${optional}: { ${paramFields.join('; ')} }, options?: CallOptions): globalThis.Promise<${retTS}> {\n` +
            call('params') + `  }\n\n`
   }
 
-  if (api.paginated) {
-    const selection = structuredReturn ? '$select?: Select; ' : ''
-    return `  async ${api.name}${typeParams}(params?: { page?: bigint; pageSize?: bigint; ${selection}$filters?: Filter[]; $sorters?: Sorter[] }, options?: CallOptions): Promise<${retTS}> {\n` +
-           call('params') + `  }\n\n`
-  }
 
   if (structuredReturn) {
-    return `  async ${api.name}${typeParams}(params?: { $select?: Select }, options?: CallOptions): Promise<${retTS}> {\n` +
+    return `  ${api.name}${typeParams}(params?: { $select?: Select }, options?: CallOptions): globalThis.Promise<${retTS}> {\n` +
            call('params') + `  }\n\n`
   }
 
-  return `  async ${api.name}(options?: CallOptions): Promise<${retTS}> {\n` +
+  return `  ${api.name}(options?: CallOptions): globalThis.Promise<${retTS}> {\n` +
          call('') + `  }\n\n`
 }
 
-function genStreamMethod(api: LuxoAPI, schema: LuxoSchema, usages: Map<string, TypeUsage>, retTS: string, staticRequests: boolean): string {
+function genResponseDecoder(api: LuxoAPI, schema: LuxoSchema): string {
+  const structuredReturn = hasSelectableReturn(api, schema)
+  const typeParams = structuredReturn ? '<Select extends string | PreparedSelection | undefined = undefined>' : ''
+  const retTS = getReturnType(api, schema, structuredReturn ? 'Select extends string | PreparedSelection ? true : false' : undefined)
+  return `\nasync function decodeResponse$${api.name}${typeParams}(pending: globalThis.Promise<unknown>): globalThis.Promise<${retTS}> {\n` +
+    `  ${api.returnNullable ? 'let' : 'const'} d = await pending\n` +
+    genResponseBody(api, schema, retTS, '  ') + '}\n'
+}
+
+function genStreamMethod(api: LuxoAPI, schema: LuxoSchema, usages: TypeUsages, retTS: string, staticRequests: boolean): string {
   const methodName = `subscribe${api.name.charAt(0).toUpperCase()}${api.name.slice(1)}`
-  const structuredReturn = hasStructuredReturn(api, schema)
+  const structuredReturn = hasSelectableReturn(api, schema)
   const paramFields = api.params?.map(param => {
     const optional = param.hasDefault ? '?' : ''
     const nullable = param.nullable ? ' | null' : ''
@@ -690,8 +895,8 @@ function genStreamMethod(api: LuxoAPI, schema: LuxoSchema, usages: Map<string, T
   const fields = paramFields.join('; ')
   const params = fields ? `params: { ${fields} }, ` : ''
   const values = staticRequests ? `${requestClass(api)}, ${fields ? 'params' : 'undefined'}` : `new ${requestClass(api)}(${fields ? 'params' : ''})`
-  const typeParams = structuredReturn ? '<Select extends string | undefined = undefined>' : ''
-  return `  ${methodName}${typeParams}(${params}onData: (data: ${retTS}) => void, observer?: StreamObserver): Promise<() => void> {\n` +
+  const typeParams = structuredReturn ? '<Select extends string | PreparedSelection | undefined = undefined>' : ''
+  return `  ${methodName}${typeParams}(${params}onData: (data: ${retTS}) => void, observer?: StreamObserver): globalThis.Promise<() => void> {\n` +
     `    return this.transport.${staticRequests ? 'subscribeGenerated' : 'subscribe'}('${api.name}', ${values}, d => {\n` +
     genResponseBody(api, schema, retTS, '      ') + `    }, onData, observer)\n` +
     `  }\n\n`

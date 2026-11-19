@@ -58,6 +58,19 @@ var staticClaimsSink Claims
 var legacyClaimsSink map[string]any
 var staticIDSink int64
 
+func BenchmarkVerifyAlternateHeader(b *testing.B) {
+	cfg := testConfig()
+	payload := base64Encode([]byte(`{"data":{"id":42,"role":"ADMIN"},"exp":4102444800,"token_use":"access"}`))
+	unsigned := base64Encode([]byte(`{"typ":"JWT","alg":"HS256"}`)) + "." + payload
+	token := unsigned + "." + hmacSign(unsigned, cfg.Secret)
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := Verify(cfg, token); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkStaticJWT(b *testing.B) {
 	cfg := testConfig()
 	data := map[string]any{"id": int64(42), "role": "ADMIN"}
@@ -152,5 +165,102 @@ func TestStaticJWTBenchmarkReference(t *testing.T) {
 	old, err := legacyVerifyReference(cfg, token)
 	if err != nil || old["id"] != float64(42) || old["role"] != "ADMIN" {
 		t.Fatal("reference rejected candidate fixture", err)
+	}
+}
+
+var permissionPredicateResult bool
+
+// The old predicate incorrectly accepts absent or invalid text; this compares
+// local predicate costs, not equivalent authorization or full request latency.
+func BenchmarkPermissionTextValidity(b *testing.B) {
+	for name, raw := range map[string]string{
+		"member": `{"role":"member"}`, "empty": `{"role":""}`,
+		"blocked": `{"role":"blocked"}`, "missing": `{}`,
+	} {
+		cfg := &Config{Secret: "predicate-benchmark", Expires: time.Hour}
+		token, err := Sign(cfg, func(dst []byte) ([]byte, error) { return append(dst, raw...), nil })
+		if err != nil {
+			b.Fatal(err)
+		}
+		claims, err := Verify(cfg, token)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Run(name+"/before", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				permissionPredicateResult = claims.String("role") != "blocked"
+			}
+		})
+		b.Run(name+"/strict", func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				permissionPredicateResult = func() bool {
+					value, valid := claims.Get("role").String()
+					return valid && value != "blocked"
+				}()
+			}
+		})
+	}
+}
+
+// Compare subject-bearing credentials with otherwise identical unbound tokens.
+// Unbound credentials are not an equivalent authentication contract.
+func BenchmarkJWTSubjectBoundary(b *testing.B) {
+	cfg := testConfig()
+	writer := testClaims(9007199254740993, "MEMBER")
+	for _, bound := range []bool{false, true} {
+		name := "unbound"
+		sign := func() (string, error) { return Sign(cfg, writer) }
+		if bound {
+			name = "bound"
+			sign = func() (string, error) { return SignForSubject(cfg, "User", writer) }
+		}
+		token, err := sign()
+		if err != nil {
+			b.Fatal(err)
+		}
+		verified, err := Verify(cfg, token)
+		if err != nil || verified.ID() != 9007199254740993 {
+			b.Fatal("invalid benchmark identity", err)
+		}
+		if bound && verified.Subject() != "User" {
+			b.Fatal("subject missing")
+		}
+		b.Run("sign/"+name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				value, err := sign()
+				if err != nil {
+					b.Fatal(err)
+				}
+				staticTokenSink = value
+			}
+		})
+		b.Run("verify/"+name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				value, err := Verify(cfg, token)
+				if err != nil {
+					b.Fatal(err)
+				}
+				staticClaimsSink = value
+			}
+		})
+		b.Run("cached/"+name, func(b *testing.B) {
+			ResetVerifyCache()
+			b.Cleanup(ResetVerifyCache)
+			if _, err := VerifyCached(cfg, token); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				value, err := VerifyCached(cfg, token)
+				if err != nil {
+					b.Fatal(err)
+				}
+				staticClaimsSink = value
+			}
+		})
 	}
 }

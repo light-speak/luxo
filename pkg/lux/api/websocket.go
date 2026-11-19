@@ -16,6 +16,7 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/jsonutil"
+	"golang.org/x/net/http/httpguts"
 	"nhooyr.io/websocket"
 )
 
@@ -31,6 +32,7 @@ type wsConn struct {
 	totalWriteBytes *atomic.Int64
 	conn            *websocket.Conn
 	ctx             context.Context // connection lifetime, never a subscription's context
+	operationCtx    context.Context // optional authenticated lifetime, separate from transport I/O
 	acceptLanguage  string
 	mu              sync.Mutex // serialize writes
 }
@@ -45,6 +47,9 @@ func (c *wsConn) writeBinary(ctx context.Context, data []byte) error {
 
 func (c *wsConn) write(ctx context.Context, kind websocket.MessageType, data []byte) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.operationError(); err != nil {
 		return err
 	}
 	if c.responseLimit > 0 && len(data) > c.responseLimit {
@@ -65,6 +70,9 @@ func (c *wsConn) write(ctx context.Context, kind websocket.MessageType, data []b
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
+		if err := c.operationError(); err != nil {
+			return err
+		}
 		if time.Until(deadline) <= 0 {
 			c.conn.CloseNow()
 			return context.DeadlineExceeded
@@ -73,6 +81,21 @@ func (c *wsConn) write(ctx context.Context, kind websocket.MessageType, data []b
 		defer c.writeDeadline.disarm()
 		return c.conn.Write(writeCtx, kind, data)
 	}
+}
+
+// IsWebSocketUpgrade checks the HTTP upgrade tokens using ASCII case folding.
+// The WebSocket handshake still validates the method, key, version, and origin.
+func IsWebSocketUpgrade(r *http.Request) bool {
+	upgrade := r.Header["Upgrade"]
+	if len(upgrade) == 0 {
+		return false
+	}
+	if (len(upgrade) != 1 || upgrade[0] != "websocket") && !httpguts.HeaderValuesContainsToken(upgrade, "websocket") {
+		return false
+	}
+	connection := r.Header["Connection"]
+	return len(connection) == 1 && connection[0] == "Upgrade" ||
+		httpguts.HeaderValuesContainsToken(connection, "upgrade")
 }
 
 // handleWebSocket upgrades the HTTP connection to WebSocket and runs the message loop.
@@ -94,20 +117,23 @@ func (c *wsConn) write(ctx context.Context, kind websocket.MessageType, data []b
 //	  Sub OK:    [0x13][subscription UInt64]
 //	  Sub Error: [0x14][subscription UInt64][Binary Error Envelope]
 func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	policy, err := rt.configuredOriginPolicy()
+	if err != nil {
+		http.Error(w, "invalid origin configuration", http.StatusInternalServerError)
+		return
+	}
+	if _, allowed := policy.Match(r); !allowed {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
 	if !reserveWS(&rt.wsConnections, 1, rt.wsLimits.ConnectionsTotal) {
 		http.Error(w, "WebSocket connection capacity reached", http.StatusServiceUnavailable)
 		return
 	}
 	defer rt.wsConnections.Add(-1)
-	opts := &websocket.AcceptOptions{}
-	if rt.WSAllowAllOrigins {
-		opts.InsecureSkipVerify = true
-	} else if len(rt.WSOrigins) > 0 {
-		opts.OriginPatterns = rt.WSOrigins
-	} else if rt.devMode {
-		opts.InsecureSkipVerify = true
-	}
-	conn, err := websocket.Accept(w, r, opts)
+	// The shared policy above validates full origins, including missing/null.
+	// Disable the library's host-only check and implicit same-host exemption.
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		return
 	}
@@ -116,7 +142,12 @@ func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	authCtx, releaseAuth := webSocketAuthContext(ctx, conn)
+	defer releaseAuth()
 	ws := &wsConn{conn: conn, ctx: ctx, acceptLanguage: r.Header.Get("Accept-Language"), limits: rt.wsLimits, totalWriteBytes: &rt.wsWriteBytes, responseLimit: rt.bodyLimits.ResponseBytes}
+	if authCtx != ctx {
+		ws.operationCtx = authCtx
+	}
 	defer ws.writeDeadline.close()
 
 	// Track this connection's stream subscriptions for cleanup on disconnect
@@ -142,7 +173,11 @@ func (rt *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		if !rt.handleWSMessage(ctx, ws, msgType, data, &connSubs, lease) {
+		if authCtx.Err() != nil {
+			lease.release()
+			return
+		}
+		if !rt.handleWSMessage(authCtx, ws, msgType, data, &connSubs, lease) {
 			return
 		}
 	}
@@ -346,8 +381,7 @@ func (rt *Router) handleWSStreamBinary(ctx context.Context, ws *wsConn, data []b
 
 func (rt *Router) startWSSubscription(ctx context.Context, ws *wsConn, connSubs *connectionSubscriptions, id uint64, req *Request, params map[string]any, binary bool) {
 	apiName := req.API
-	identity := rt.identityFromCtx(ctx)
-	prepared, err := rt.prepareStreamHandler(ctx, req, identity)
+	prepared, identity, err := rt.prepareStreamHandler(ctx, req)
 	if err != nil {
 		if binary {
 			rt.writeWSBinarySubscriptionError(ctx, ws, id, err)
@@ -359,7 +393,7 @@ func (rt *Router) startWSSubscription(ctx context.Context, ws *wsConn, connSubs 
 	sub, subCtx, writerCtx := rt.Streams.subscribePreparedWS(ctx, apiName, params, identity, preparedStreamFieldMask(req, prepared), binary, prepared)
 	if sub == nil {
 		if prepared.release != nil {
-			prepared.release()
+			releaseStreamSource(prepared.release)
 		}
 		err := errors.New("Unavailable", http.StatusServiceUnavailable, apiName+" subscriber limit reached")
 		if binary {
@@ -447,56 +481,14 @@ func (rt *Router) identityFromCtx(ctx context.Context) any {
 
 // handleWSJSON processes a JSON WebSocket message.
 func (rt *Router) handleWSJSON(ctx context.Context, ws *wsConn, raw map[string]json.RawMessage) {
-	seqID, valid := parseWSJSONSequence(raw["$id"])
+	id, valid := parseWSJSONSequence(raw["$id"])
 	if !valid {
-		return // No trustworthy correlation ID; drop just like an invalid binary sequence.
-	}
-
-	req, err := parseRawRequest(raw)
-	if err != nil {
-		rt.writeWSJSONError(ctx, ws, seqID, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
 		return
 	}
-	// Find handler
-	fn, ok := rt.handlers[req.API]
-	if !ok {
-		rt.writeWSJSONError(ctx, ws, seqID, errors.New("NotFound", http.StatusNotFound, req.API+" not found"))
-		return
-	}
-
-	if err := rt.prepareCallRequest(req, false, fn.localJSON); err != nil {
-		rt.writeWSJSONError(ctx, ws, seqID, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
-		return
-	}
-
-	// Execute handler
-	buf := GetBuf()
-	req.Buf = buf
-
-	herr := rt.callHandler(fn.call, ctx, req)
-	if herr != nil {
-		PutBuf(buf)
-		rt.writeWSJSONError(ctx, ws, seqID, herr)
-		return
-	}
-
-	// Write JSON response: {"$id": N, "data": ...}
-	jsonBody, err := rt.convertBinaryToJSON(req.API, buf.B)
-	if err != nil {
-		PutBuf(buf)
-		rt.writeWSJSONError(ctx, ws, seqID, err)
-		return
-	}
-	resp := GetBuf()
-	resp.AppendString(`{"$id":`)
-	resp.B = strconv.AppendUint(resp.B, seqID, 10)
-	resp.AppendString(`,"data":`)
-	resp.B = append(resp.B, jsonBody...)
-	resp.AppendByte('}')
-
-	ws.writeText(ctx, resp.B)
-	PutBuf(resp)
-	PutBuf(buf)
+	call := wsUnaryCall{router: rt, ws: ws, ctx: ctx, id: id}
+	defer call.finish()
+	call.handleJSON(raw)
+	call.returned = true
 }
 
 // parseWSJSONSequence preserves the binary uint64 domain without a float or signed intermediate.
@@ -516,51 +508,14 @@ func (rt *Router) handleWSBinary(ctx context.Context, ws *wsConn, data []byte) {
 	if len(data) < 3 || data[0] != BinaryFrameCallRequest {
 		return
 	}
-
-	seq, n := codec.ReadVarint(data, 1)
+	id, n := codec.ReadVarint(data, 1)
 	if n <= 0 {
 		return
 	}
-
-	reqBody := data[1+n:]
-	req := GetRequest()
-	defer PutRequest(req)
-	if err := rt.Registry.ParseBinaryRequestInto(reqBody, req); err != nil {
-		rt.writeWSBinaryError(ctx, ws, seq, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
-		return
-	}
-
-	// Find handler
-	fn, ok := rt.handlers[req.API]
-	if !ok {
-		rt.writeWSBinaryError(ctx, ws, seq, errors.NotFound.WithData(errors.ResourceError{Resource: req.API}))
-		return
-	}
-	if err := rt.validatePublicSelection(req, true); err != nil {
-		rt.writeWSBinaryError(ctx, ws, seq, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
-		return
-	}
-
-	// Execute handler
-	buf := GetBuf()
-	req.Buf = buf
-
-	herr := rt.callHandler(fn.call, ctx, req)
-	if herr != nil {
-		PutBuf(buf)
-		rt.writeWSBinaryError(ctx, ws, seq, herr)
-		return
-	}
-
-	// Write binary response: [0x02=success][seq varint][payload]
-	resp := GetBuf()
-	resp.B = append(resp.B, BinaryFrameCallSuccess)
-	resp.B = codec.AppendVarint(resp.B, seq)
-	resp.B = append(resp.B, buf.B...)
-
-	ws.writeBinary(ctx, resp.B)
-	PutBuf(resp)
-	PutBuf(buf)
+	call := wsUnaryCall{router: rt, ws: ws, ctx: ctx, id: id, binary: true}
+	defer call.finish()
+	call.handleBinary(data[1+n:])
+	call.returned = true
 }
 
 // writeWSJSONError sends a JSON error frame.
@@ -582,9 +537,7 @@ func appendWSJSONError(buf *ResponseBuf, seqID uint64, err wireError) {
 // writeWSBinaryError sends [0x03][seq varint][canonical binary error envelope].
 func (rt *Router) writeWSBinaryError(ctx context.Context, ws *wsConn, seq uint64, err error) {
 	buf := GetBuf()
-	buf.B = append(buf.B, BinaryFrameCallError)
-	buf.B = codec.AppendVarint(buf.B, seq)
-	appendWireErrorFields(buf, rt.buildWireError(ctx, ws.acceptLanguage, err), true)
+	appendWSBinaryCallError(buf, seq, rt.buildWireError(ctx, ws.acceptLanguage, err))
 	ws.writeBinary(ctx, buf.B)
 	PutBuf(buf)
 }

@@ -25,7 +25,7 @@ func receiveHead(t *testing.T, id uint32, length string, end bool) *http2.MetaHe
 	return h
 }
 
-func receiveData(t *testing.T, id uint32, end bool, data, pad []byte) *http2.DataFrame {
+func receiveData(t testing.TB, id uint32, end bool, data, pad []byte) *http2.DataFrame {
 	t.Helper()
 	var wire bytes.Buffer
 	if err := http2.NewFramer(&wire, nil).WriteDataPadded(id, end, data, pad); err != nil {
@@ -64,6 +64,96 @@ func TestReceiveLargeBodyAndOwnership(t *testing.T) {
 	r.release(1)
 	if r.buffered != 0 || len(r.streams) != 0 {
 		t.Fatal("body retained")
+	}
+}
+
+func TestReceiveTerminalBodyCapacity(t *testing.T) {
+	const initial = 64 << 10
+	for _, tc := range []struct {
+		name       string
+		terminal   bool
+		budget     int64
+		capacity   int
+		wantReject bool
+	}{
+		{name: "finished", terminal: true, budget: 1 << 20, capacity: initial + 1},
+		{name: "still uploading", budget: 1 << 20, capacity: 2 * initial},
+		{name: "exact peak charge", terminal: true, budget: 2*initial + 1, capacity: initial + 1},
+		{name: "peak charge exceeds budget", terminal: true, budget: 2 * initial, wantReject: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := newRequestReceiver(1, 1<<18, 1<<20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.initialWindow = 1 << 18
+			r.budget = &byteBudget{limit: tc.budget}
+			if _, err = r.open(receiveHead(t, 1, "", false)); err != nil {
+				t.Fatal(err)
+			}
+			chunk := bytes.Repeat([]byte{'a'}, 16<<10)
+			for range initial / len(chunk) {
+				if _, _, err = r.data(receiveData(t, 1, false, chunk, nil)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			verifyTerminalCapacity(t, r, tc.terminal, tc.capacity, tc.wantReject)
+		})
+	}
+}
+
+func verifyTerminalCapacity(t *testing.T, r *requestReceiver, terminal bool, wantCapacity int, wantReject bool) {
+	t.Helper()
+	ready, credit, err := r.data(receiveData(t, 1, terminal, []byte{'z'}, nil))
+	if wantReject {
+		var streamErr http2.StreamError
+		if !errors.As(err, &streamErr) || streamErr.Code != http2.ErrCodeEnhanceYourCalm ||
+			ready != nil || credit.connection != 1 || r.streams[1] != nil {
+			t.Fatalf("reply=%v credit=%+v error=%v", ready, credit, err)
+		}
+	} else {
+		if err != nil || (ready != nil) != terminal {
+			t.Fatalf("ready=%t terminal=%t error=%v", ready != nil, terminal, err)
+		}
+		body := r.streams[1].body
+		if len(body) != 65537 || body[0] != 'a' || body[65536] != 'z' {
+			t.Fatalf("invalid assembled body length: %d", len(body))
+		}
+		if cap(body) != wantCapacity || r.budget.used.Load() != int64(wantCapacity) {
+			t.Fatalf("capacity=%d charged=%d want=%d", cap(body), r.budget.used.Load(), wantCapacity)
+		}
+		r.release(1)
+	}
+	r.close()
+	if r.budget.used.Load() != 0 {
+		t.Fatalf("request capacity leaked: %d", r.budget.used.Load())
+	}
+}
+
+func BenchmarkReceiveTerminalBody(b *testing.B) {
+	head := &http2.MetaHeadersFrame{
+		HeadersFrame: &http2.HeadersFrame{FrameHeader: http2.FrameHeader{StreamID: 1}},
+		Fields:       requestFields(),
+	}
+	chunk := receiveData(b, 1, false, make([]byte, 16<<10), nil)
+	tail := receiveData(b, 1, true, []byte{'z'}, nil)
+	b.ReportAllocs()
+	for b.Loop() {
+		r, _ := newRequestReceiver(1, 1<<18, 1<<20)
+		r.initialWindow = 1 << 18
+		if _, err := r.open(head); err != nil {
+			b.Fatal(err)
+		}
+		for range 4 {
+			if _, _, err := r.data(chunk); err != nil {
+				b.Fatal(err)
+			}
+		}
+		ready, _, err := r.data(tail)
+		if err != nil || ready == nil || len(ready.body) != 65537 {
+			b.Fatal("incomplete request", err)
+		}
+		r.close()
 	}
 }
 

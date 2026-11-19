@@ -11,11 +11,13 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/auth"
+	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/luvia"
 	"github.com/shopspring/decimal"
 )
@@ -74,6 +76,23 @@ func serveHTTP(router *api.Router) error {
 }
 
 type streamResolver struct{}
+
+var fixtureStreamStarted, fixtureStreamActive atomic.Int64
+
+func (streamResolver) FixtureStreamStats(context.Context) (FixtureStreamStats, error) {
+	return FixtureStreamStats{Started: fixtureStreamStarted.Load(), Active: fixtureStreamActive.Load()}, nil
+}
+
+func (streamResolver) HandleWatchFixtureTimestamp(ctx context.Context, params *WatchFixtureTimestampStreamParams, identity any, stream *api.TypedStream[time.Time]) error {
+	claims := luvia.Identity(ctx)
+	if claims == nil || claims.ID() != 9007199254740993 {
+		return luxerrors.Unauthorized
+	}
+	fixtureStreamStarted.Add(1)
+	fixtureStreamActive.Add(1)
+	defer fixtureStreamActive.Add(-1)
+	return (streamResolver{}).HandleWatchTimestamp(ctx, &WatchTimestampStreamParams{Value: params.Value}, identity, stream)
+}
 
 func (streamResolver) HandleWatchOptionalInteger(_ context.Context, _ *WatchOptionalIntegerStreamParams, _ any, stream *api.TypedStream[*int64]) error {
 	if err := stream.Send(nil); err != nil {
@@ -251,6 +270,9 @@ func scalarArrays(state int64) ScalarArrays {
 	}
 	if state == 3 {
 		value.Floats = []float64{-1.5, 1.25, math.Copysign(0, -1), math.SmallestNonzeroFloat64, -math.SmallestNonzeroFloat64, math.MaxFloat64}
+	}
+	if state == 4 {
+		value.Decimals = []decimal.Decimal{decimal.New(1, math.MaxInt32), decimal.New(-1, math.MinInt32)}
 	}
 	return value
 }

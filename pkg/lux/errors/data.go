@@ -69,9 +69,12 @@ func (w *DataWriter) JSON(value json.RawMessage) {
 	}
 	w.dst = append(w.dst, value...)
 }
+
+// Bytes writes a non-null byte string. Generated nullable writers handle null
+// before calling this method; nil and empty slices both encode as empty Base64.
 func (w *DataWriter) Bytes(value []byte) {
 	if value == nil {
-		w.Token("null")
+		w.Token(`""`)
 		return
 	}
 	w.dst = append(w.dst, '"')

@@ -1,0 +1,55 @@
+package com.luxo.client
+
+import com.luxo.client.depthbaseline.decodeLuxoJSON as beforeDecode
+import com.luxo.client.depthbaseline.encodeLuxoJSON as beforeEncode
+import com.luxo.client.depthbaseline.decodeLuxoJsonValue as beforeValue
+import java.lang.management.ManagementFactory
+import kotlinx.serialization.json.*
+
+/** Compile the pre-change Unicode/JsonSyntax sources in depthbaseline before running. */
+object JSONDepthBenchmark {
+    @Volatile private var sink: Any? = null
+    private val bean = ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
+    private val thread = Thread.currentThread().threadId()
+
+    @JvmStatic
+    fun main(args: Array<String>) {
+        check(bean.isThreadAllocatedMemorySupported)
+        bean.isThreadAllocatedMemoryEnabled = true
+        val samples = linkedMapOf("scalar" to "1e400", "small" to "{\"v\":1}",
+            "objects128" to List(128) { "{\"v\":$it}" }.joinToString(",", "[", "]"),
+            "unicode72k" to JsonPrimitive("文".repeat(24000)).toString(),
+            "depth128" to "[".repeat(128) + "0" + "]".repeat(128),
+            "empty128" to "[".repeat(128) + "]".repeat(128))
+        for ((name, text) in samples) {
+            val value = beforeDecode(text)
+            val iterations = if (name == "unicode72k") 300 else 2000
+            compare("decode/$name", iterations, { beforeDecode(text) }, { decodeBoundedLuxoJSON(text) })
+            compare("encode/$name", iterations, { beforeEncode(value) }, { encodeBoundedLuxoJSON(value) })
+            compare("value/$name", iterations, { beforeValue(value) }, { decodeLuxoJsonValue(value) })
+            compare("documentControl/$name", iterations, { beforeDecode(text) }, { decodeLuxoJSON(text) })
+        }
+        check(sink != null)
+    }
+
+    private fun compare(name: String, iterations: Int, before: () -> Any, after: () -> Any) {
+        check(before() == after())
+        repeat(12) { measure(iterations, before); measure(iterations, after) }
+        repeat(12) { batch ->
+            val first = measure(iterations, if (batch % 2 == 0) before else after)
+            val second = measure(iterations, if (batch % 2 == 0) after else before)
+            val old = if (batch % 2 == 0) first else second
+            val new = if (batch % 2 == 0) second else first
+            println("$name\t$batch\t${old.first}\t${new.first}\t${old.second}\t${new.second}")
+        }
+    }
+
+    private fun measure(iterations: Int, operation: () -> Any): Pair<Double, Double> {
+        val allocated = bean.getThreadAllocatedBytes(thread)
+        val start = System.nanoTime()
+        repeat(iterations) { sink = operation() }
+        val elapsed = System.nanoTime() - start
+        val bytes = bean.getThreadAllocatedBytes(thread) - allocated
+        return elapsed.toDouble() / iterations to bytes.toDouble() / iterations
+    }
+}

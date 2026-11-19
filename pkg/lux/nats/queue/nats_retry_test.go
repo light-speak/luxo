@@ -2,12 +2,37 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
+
+func TestNATSGoexitDeliveryUsesFailurePath(t *testing.T) {
+	client := newMockJSClient()
+	q := newTestNATSQueue(client, testConfig())
+	defer q.Close()
+	if err := q.Subscribe("tasks", func(context.Context, []byte) error {
+		runtime.Goexit()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	message := &mockMsg{data: []byte("accepted"), meta: &jetstream.MsgMetadata{NumDelivered: 1}}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		client.streams["luxo_q_tasks"].consumer.handler(message)
+	}()
+	<-done
+	if message.acked.Load() || !message.naked.Load() || message.nakDelay <= 0 {
+		t.Fatalf("abnormal exit skipped retry: ack=%v nak=%v delay=%v", message.acked.Load(), message.naked.Load(), message.nakDelay)
+	}
+}
 
 func TestNATSExhaustedTaskRetriesOnlyTransfer(t *testing.T) {
 	for _, failure := range []string{"create", "publish"} {
@@ -130,5 +155,99 @@ func TestNATSAcknowledgementFailureDoesNotDropTask(t *testing.T) {
 		if msg.acked.Load() != success || msg.naked.Load() == success {
 			t.Fatal("failed broker acknowledgement used the wrong termination path")
 		}
+	}
+}
+
+func TestNATSGoexitRestoresRealConsumer(t *testing.T) {
+	for _, exhaust := range []bool{false, true} {
+		t.Run(fmt.Sprint(exhaust), func(t *testing.T) {
+			q, js, parent, name := queueNamingFixture(t)
+			q.cfg = testConfig()
+			cleanupQueueStream(t, js, streamName(name))
+			cleanupQueueStream(t, js, streamName(name+dlqSuffix))
+			ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+			defer cancel()
+			var attempts, following atomic.Int32
+			if err := q.Subscribe(name, func(_ context.Context, payload []byte) error {
+				if string(payload) == "next" {
+					following.Add(1)
+					return nil
+				}
+				attempt := attempts.Add(1)
+				if exhaust || attempt == 1 {
+					runtime.Goexit()
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, payload := range []string{"exit", "next"} {
+				if err := q.Publish(ctx, name, []byte(payload)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			wantAttempts := int32(2)
+			if exhaust {
+				wantAttempts = int32(q.cfg.MaxRetries)
+			}
+			waitNATSState(t, ctx, func() bool { return attempts.Load() == wantAttempts && following.Load() == 1 })
+			stream, err := js.Stream(ctx, streamName(name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitNATSState(t, ctx, func() bool { info, err := stream.Info(ctx); return err == nil && info.State.Msgs == 0 })
+			if exhaust {
+				dead, err := js.Stream(ctx, streamName(name+dlqSuffix))
+				if err != nil {
+					t.Fatal(err)
+				}
+				msg, err := dead.GetMsg(ctx, 1)
+				if err != nil || string(msg.Data) != "exit" {
+					t.Fatalf("missing exhausted task: %v %v", msg, err)
+				}
+			}
+		})
+	}
+}
+
+func TestNATSGoexitExhaustionRetainsFailedDeadLetter(t *testing.T) {
+	client := newMockJSClient()
+	q := newTestNATSQueue(client, Config{MaxRetries: 1, RetryDelay: time.Millisecond})
+	defer q.Close()
+	var calls atomic.Int32
+	if err := q.Subscribe("tasks", func(context.Context, []byte) error { calls.Add(1); runtime.Goexit(); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	client.publishErr = errAlwaysFail
+	message := &mockMsg{data: []byte("keep"), meta: &jetstream.MsgMetadata{NumDelivered: 1}}
+	done := make(chan struct{})
+	go func() { defer close(done); client.streams["luxo_q_tasks"].consumer.handler(message) }()
+	<-done
+	if message.acked.Load() || !message.naked.Load() {
+		t.Fatal("failed Goexit dead-letter transfer lost original")
+	}
+	client.publishErr = nil
+	redelivery := &mockMsg{data: []byte("keep"), meta: &jetstream.MsgMetadata{NumDelivered: 2}}
+	client.streams["luxo_q_tasks"].consumer.handler(redelivery)
+	if calls.Load() != 1 || !redelivery.acked.Load() || redelivery.naked.Load() {
+		t.Fatal("exhausted task replayed business or failed to acknowledge transfer")
+	}
+	if len(client.published) != 1 || client.published[0].subject != "tasks.dlq" || string(client.published[0].payload) != "keep" {
+		t.Fatal("wrong retained dead letter")
+	}
+}
+
+func TestNATSCanceledDeliveryLeavesMessageForRedelivery(t *testing.T) {
+	q := newTestNATSQueue(newMockJSClient(), testConfig())
+	defer q.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	msg := &mockMsg{}
+	q.handleDelivery(ctx, "tasks", func(context.Context, []byte) error { t.Error("cancelled delivery invoked the handler"); return nil }, msg)
+	if msg.acked.Load() || msg.naked.Load() {
+		t.Fatal("cancelled delivery was acknowledged or retried locally")
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatal("fixture did not cancel")
 	}
 }

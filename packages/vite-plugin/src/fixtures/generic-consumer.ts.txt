@@ -1,0 +1,28 @@
+import { FetchTransport } from '@luxojs/client'
+import { LuxoClient } from './client.js'
+
+function check(value: boolean, message: string): void {
+  if (!value) throw new Error(message)
+}
+
+async function verifyClosedGenerics(): Promise<void> {
+  for (const mode of genericModes) {
+    const client = new LuxoClient(new FetchTransport('http://generic.fixture.invalid', { mode }))
+    try {
+      const page = await client.readPage()
+      check(page.items?.[0]?.value?.value === 42n, 'Page<Box<Counter>> value')
+      check(page.total === 1n && page.page === 1n && page.pageSize === 20n, 'page metadata')
+      const cursor = await client.readCursor()
+      check(cursor.items?.[0]?.value?.value === 43n, 'Cursor<Box<Counter>> value')
+      check(cursor.nextCursor === 'next' && cursor.hasMore === true, 'cursor metadata')
+      const nested = await client.echoNested({ value: { value: {
+        items: [{ value: 44n }], total: 1n, page: 1n, pageSize: 20n,
+      } } })
+      check(nested.value?.items?.[0]?.value === 44n, 'Box<Page<Counter>> echo')
+      const values = await client.echoLists({ value: [{ value: null }, { value: 45n }] })
+      check(values[0]?.value === null && values[1]?.value === 45n, 'list of nullable closed generic fields')
+    } finally { client.close() }
+    console.log(`closed generics ${mode} passed`)
+  }
+}
+void verifyClosedGenerics().catch(error => { throw error })

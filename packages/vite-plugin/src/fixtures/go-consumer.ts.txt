@@ -9,6 +9,57 @@ import type { Filter } from '@luxojs/client'
 const integers = integerCases.map(value => BigInt(value))
 const selection = 'value, duration, optional, values, label'
 
+async function rejectRuntimeInput(run: () => Promise<unknown>): Promise<void> {
+  try {
+    const value = await run()
+    throw new Error('invalid runtime input reached service: ' + (value instanceof Uint8Array ? [...value].join(',') : String(value)))
+  } catch (error) {
+    if (error instanceof TypeError || (error instanceof LuxoError && error.error === 'ConfigError' && error.code === 0)) return
+    throw error
+  }
+}
+
+async function verifyDynamicInputTypes(): Promise<void> {
+  for (const websocket of [false, true]) {
+    const transport = websocket ? new WsTransport(endpoint.replace('http:', 'ws:'), { mode: 'binary', timeout: 5000 })
+      : new FetchTransport(endpoint, { mode: 'binary', timeout: 5000 })
+    const client = new LuxoClient(transport)
+    try {
+      for (const value of ['false', 0, 1, {}, [], new Boolean(false)]) {
+        await rejectRuntimeInput(() => transport.call('echoBoolean', { value }))
+      }
+      const spoof = { isWellFormed: () => true, toString: () => '\ud800' }
+      for (const value of [new String('text'), spoof]) {
+        await rejectRuntimeInput(() => transport.call('echoString', { value }))
+        await rejectRuntimeInput(() => transport.call('echoStrings', { values: [value] }))
+      }
+      for (const input of [[], Object.assign([], { bools: null })]) {
+        await rejectRuntimeInput(() => transport.call('echoScalarArrays', { input, $select: 'bools' }))
+        await rejectRuntimeInput(() => client.echoScalarArrays({ input: input as unknown as ScalarArraysInput, $select: 'bools' }))
+      }
+      for (const value of [false, true]) {
+        equal(await client.echoBoolean({ value }), value)
+        const bytes = await transport.call('echoBoolean', { value })
+        if (!(bytes instanceof Uint8Array)) throw new Error('missing binary Boolean body')
+        equal(bytes.length, 1)
+        equal(bytes[0], value ? 1 : 0)
+      }
+      console.info('input types binary ' + (websocket ? 'ws' : 'http') + ' passed')
+    } finally { client.close() }
+  }
+}
+
+async function verifyJSONFields(client: LuxoClient): Promise<void> {
+  const inputs = [{ payload: null }, { payload: { count: 9007199254740993n, text: '東京' } }, { payload: null }]
+  for (const input of inputs) {
+    const row = await client.zEchoJSONSnapshot({ input, $select: 'payload' })
+    equal(encodeLuxoJSON(row.payload), encodeLuxoJSON(input.payload))
+  }
+  const rows = await client.zListJSONSnapshots({ inputs, $select: 'payload' })
+  equal(rows.length, inputs.length)
+  equal(encodeLuxoJSON(rows.map(row => row.payload)), encodeLuxoJSON(inputs.map(row => row.payload)))
+}
+
 function equal(actual: unknown, expected: unknown): void {
   if (actual !== expected) throw new Error(String(actual) + ' != ' + String(expected))
 }
@@ -28,6 +79,8 @@ function verify(row: Precision<true>, input: PrecisionInput): void {
 }
 
 async function verifyUnary(client: LuxoClient): Promise<void> {
+  equal(await client.echoManyParameters({}), 7n)
+  equal(await client.echoManyParameters({ p0: 1n, p16: -1n, p64: 9223372036854775807n }), 9223372036854775807n)
   await verifyConcurrentSelections(client)
   await verifyNullableRoots(client)
   await verifyTimestamps(client)
@@ -591,7 +644,7 @@ async function verifySubscriptionIDs(mode: 'json' | 'binary'): Promise<void> {
   }
 }
 
-async function runInterop(verifyClient: (client: LuxoClient, websocket: boolean) => Promise<void>): Promise<void> {
+async function runInterop(verifyClient: (client: LuxoClient, websocket: boolean) => Promise<void>, lifecycleControls = true): Promise<void> {
   verifyNestedBoundaries()
   verifyTextBoundaries()
   for (const channel of ['http:', 'ws:']) {
@@ -599,13 +652,14 @@ async function runInterop(verifyClient: (client: LuxoClient, websocket: boolean)
       const client = LuxoClient.create(endpoint.replace('http:', channel), { mode, timeout: 5000 })
       try {
         await verifyClient(client, channel === 'ws:')
-        if (channel === 'ws:') await verifySubscriptionIDs(mode)
+        if (lifecycleControls && channel === 'ws:') await verifySubscriptionIDs(mode)
         console.log(channel + ' ' + mode + ' passed')
       } finally {
         client.close()
       }
     }
   }
+  if (!lifecycleControls) return
   for (const mode of ['json', 'binary'] as const) {
     await verifyTokenRefresh(mode)
     console.log('refresh ' + mode + ' passed')
@@ -644,6 +698,90 @@ async function verifyTokenRefresh(mode: 'json' | 'binary'): Promise<void> {
       equal(attempts, next === 'decline' ? 2 : 3)
     }
   } finally { client.close(); bootstrap.close() }
+}
+
+async function verifyGeneratedWSRenewal(): Promise<void> {
+  for (const mode of ['json', 'binary'] as const) {
+    await verifyGeneratedWSRenewalMode(mode)
+    console.log(`generated ws renewal ${mode} passed`)
+  }
+}
+
+async function verifyGeneratedWSRenewalMode(mode: 'json' | 'binary'): Promise<void> {
+  const bootstrap = LuxoClient.create(endpoint, { mode, timeout: 5000 })
+  try { await verifyGeneratedWSRenewalSession(bootstrap, mode) }
+  finally { bootstrap.close() }
+}
+
+async function verifyGeneratedWSRenewalSession(bootstrap: LuxoClient, mode: 'json' | 'binary'): Promise<void> {
+  const first = Promise.withResolvers<string>(), ended = Promise.withResolvers<unknown>()
+  const renewed = Promise.withResolvers<void>()
+  let values = 0, errors = 0, completed = 0, attempts = 0
+  const refresh = await bootstrap.issueFixtureRefresh()
+  const token = await bootstrap.issueExpiringFixtureAccess()
+  const transport = new WsTransport(endpoint.replace('http:', 'ws:'), {
+    mode, token, timeout: 5000, onTokenExpired: async () => {
+      attempts++
+      const access = await bootstrap.exchangeFixtureRefresh({ token: refresh })
+      renewed.resolve()
+      return access
+    },
+  })
+  const client = new LuxoClient(transport)
+  const timestamp = '2020-01-02T03:04:05.123456789Z'
+  try {
+    const before = await readFixtureStreamStats(bootstrap)
+    equal(before.active, 0n)
+    equal(await client.fixtureIdentity(), 9007199254740993n)
+    const stopOld = await client.subscribeWatchFixtureTimestamp({ value: timestamp }, value => {
+      values++; first.resolve(value)
+    }, { onError: error => { errors++; ended.resolve(error) }, onComplete: () => { completed++ } })
+    equal(await renewalDeadline(first.promise), timestamp)
+    await waitForFixtureStreams(bootstrap, before.started + 1n, 1n)
+    const reason = await renewalDeadline(ended.promise)
+    if (!(reason instanceof LuxoError)) throw new Error(`Missing typed expiry error: ${String(reason)}`)
+    if (reason.code !== 401) throw new Error(`Unexpected ${mode} WS expiry: ${reason.error} ${reason.code}: ${reason.message}`)
+    await renewalDeadline(renewed.promise)
+    equal(await client.fixtureIdentity(), 9007199254740993n)
+    equal(attempts, 1)
+    equal(values, 1); equal(errors, 1); equal(completed, 0)
+    await waitForFixtureStreams(bootstrap, before.started + 1n, 0n)
+    const fresh = Promise.withResolvers<string>()
+    const stopFresh = await client.subscribeWatchFixtureTimestamp({ value: timestamp }, fresh.resolve)
+    equal(await renewalDeadline(fresh.promise), timestamp)
+    stopOld()
+    equal(await client.fixtureIdentity(), 9007199254740993n)
+    equal(values, 1); equal(errors, 1); equal(completed, 0)
+    await waitForFixtureStreams(bootstrap, before.started + 2n, 1n)
+    stopFresh()
+    await waitForFixtureStreams(bootstrap, before.started + 2n, 0n)
+  } finally { client.close() }
+}
+
+async function readFixtureStreamStats(client: LuxoClient): Promise<{ started: bigint; active: bigint }> {
+  const result = await client.fixtureStreamStats({ $select: 'started, active' })
+  if (result.started === undefined || result.active === undefined) throw new Error('Missing stream counters')
+  return { started: result.started, active: result.active }
+}
+
+async function waitForFixtureStreams(client: LuxoClient, started: bigint, active: bigint): Promise<void> {
+  const deadline = performance.now() + 5000
+  for (;;) {
+    const result = await readFixtureStreamStats(client)
+    equal(result.started, started)
+    if (result.active === active) return
+    if (performance.now() >= deadline) throw new Error(`Stream cleanup stalled: ${result.active} != ${active}`)
+    await new Promise<void>(resolve => { setTimeout(resolve, 10) })
+  }
+}
+
+async function renewalDeadline<T>(pending: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([pending, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Missing generated WS renewal lifecycle result')), 8000)
+    })])
+  } finally { clearTimeout(timer) }
 }
 
 async function verifyDisconnect(mode: 'json' | 'binary'): Promise<void> {
@@ -739,7 +877,8 @@ function scalarArraysInput(state: number): ScalarArraysInput {
     durations: state === 0 ? null : state === 1 ? [] : [-(1n << 63n), (1n << 63n) - 1n],
     uuids: state === 0 ? null : state === 1 ? [] : ['00000000-0000-0000-0000-000000000000', '00000000-0000-0000-0000-000000000001'],
     bytes: state === 0 ? null : state === 1 ? [] : [new Uint8Array(), Uint8Array.from([0, 127, 128, 255])],
-    decimals: state === 0 ? null : state === 1 ? [] : ['1234567890.123456789', '-0.000000001'],
+    decimals: state === 0 ? null : state === 1 ? [] : state === 4
+      ? ['1e2147483647', '-1e-2147483648'] : ['1234567890.123456789', '-0.000000001'],
     jsons: state === 0 ? null : state === 1 ? [] : [{ value: (1n << 63n) - 1n, text: '東京' }, false],
     enums: state === 0 ? null : state === 1 ? [] : ['OPEN', 'CLOSED'], tail: 42n,
   }
@@ -756,8 +895,8 @@ function verifyScalarArrayValues(row: ScalarArrays<true>, input: ScalarArraysInp
   }
 }
 
-async function verifyScalarArrays(client: LuxoClient, websocket: boolean): Promise<void> {
-  for (const state of [0, 1, 2, 3]) {
+async function verifyScalarArrays(client: LuxoClient, websocket: boolean, states: readonly number[] = [0, 1, 2, 3, 4]): Promise<void> {
+  for (const state of states) {
     const input = scalarArraysInput(state)
     verifyScalarArrayValues(await client.echoScalarArrays({ input, $select: scalarSelection }), input)
     const rows = await client.listScalarArrays({ input, $select: scalarSelection })

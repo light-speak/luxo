@@ -18,7 +18,7 @@ func InferAPI(name string, models map[string]*ast.ModelDecl) *InferredAPI {
 	return inferred.Parse(name, models)
 }
 
-func generateInferredHandler(b *strings.Builder, api *ast.ApiDecl, inf *InferredAPI, enums map[string]bool, m *ast.ModelDecl) {
+func (g *GeneratorContext) generateInferredHandler(b *strings.Builder, api *ast.ApiDecl, inf *InferredAPI, enums map[string]bool, m *ast.ModelDecl) {
 	name := api.Name
 	modelName := inf.ModelName
 
@@ -33,42 +33,67 @@ func generateInferredHandler(b *strings.Builder, api *ast.ApiDecl, inf *Inferred
 	if directive := findDirective(api.Directives, "auth"); directive != nil {
 		writeAuthCheck(b, "\t\t", directive)
 	} else if directive := findDirective(m.Directives, "auth"); directive != nil || hasDirective(m.Directives, "withAuth") {
-		writeCRUDAuthCheck(b, "\t\t", directive)
+		writeModelAuthorization(b, "\t\t", m, true)
 	}
 
-	// Parse params
-	for _, p := range params {
-		if p.Type != nil && enums[p.Type.Name] {
-			writeInferredEnumParamExtraction(b, p, enums, "\t\t")
-		} else {
-			writeCallableParamExtraction(b, p, enums, "\t\t")
-		}
-	}
+	params = g.writeInferredParamBindings(b, params, enums)
 	cached := writeCachedBodyStart(b, api.Directives)
+	g.
 
-	// Build conditions
-	writeInferredConditions(b, inf, m, params)
+		// Build conditions
+		writeInferredConditions(b, inf, m, params)
+	if findDirective(api.Directives, "auth") == nil && modelOwnershipField(m) != nil {
+		b.WriteString("\t\tconds = append(conds, _ownConditions...)\n")
+	}
 
 	rels := analyzeRelations(m, enums)
-	writeInferredAction(b, inf, modelName, isSoftDelete(m), rels, m)
+	g.writeInferredAction(b, inf, modelName, isSoftDelete(m), rels, m)
 	writeCachedBodyEnd(b, cached)
 	fmt.Fprintf(b, "\t}\n}\n\n")
 }
 
+// Keep request keys stable while isolating query locals from generated variables.
+func writeInferredParamBindings(b *strings.Builder, params []*ast.ParamDecl, enums map[string]bool) []*ast.ParamDecl {
+	return defaultGenerator().writeInferredParamBindings(b, params, enums)
+}
+
+func (g *GeneratorContext) writeInferredParamBindings(b *strings.Builder, params []*ast.ParamDecl, enums map[string]bool) []*ast.ParamDecl {
+	names := g.parameterBindings(params, nil, nil, enums, "conds", "orParts", "orArgs", "argIdx", "parts", "count", "exists", "q", "cols", "results", "total", "n", "ph")
+	locals := params
+	if len(names) != 0 {
+		locals = make([]*ast.ParamDecl, len(params))
+	}
+	for index, param := range params {
+		local := param
+		if len(names) != 0 {
+			copy := *param
+			copy.Name = names.name(param.Name)
+			local = &copy
+			locals[index] = local
+		}
+		if param.Type != nil && enums[param.Type.Name] {
+			writeInferredEnumParamExtraction(b, local, enums, "\t\t", param.Name)
+		} else {
+			writeCallableParamBinding(b, param, local.Name, enums, "\t\t")
+		}
+	}
+	return locals
+}
+
 // writeInferredConditions generates the WHERE conditions for an inferred handler.
-func writeInferredConditions(b *strings.Builder, inf *InferredAPI, m *ast.ModelDecl, params []*ast.ParamDecl) {
+func (g *GeneratorContext) writeInferredConditions(b *strings.Builder, inf *InferredAPI, m *ast.ModelDecl, params []*ast.ParamDecl) {
 	hasOr := len(inf.Groups) > 1
 	paramIdx := 0
 
 	if hasOr {
-		fmt.Fprintf(b, "\t\tvar orParts []string\n")
+		fmt.Fprintf(b, "\t\torParts := make([]string, 0, %d)\n", len(inf.Groups))
 		fmt.Fprintf(b, "\t\tvar orArgs []any\n")
 		fmt.Fprintf(b, "\t\targIdx := 1\n")
 		for _, group := range inf.Groups {
 			fmt.Fprintf(b, "\t\t{\n")
-			fmt.Fprintf(b, "\t\t\tvar parts []string\n")
+			fmt.Fprintf(b, "\t\t\tparts := make([]string, 0, %d)\n", len(group.Clauses))
 			for _, clause := range group.Clauses {
-				paramIdx = writeClauseSQL(b, clause, m, params, paramIdx)
+				paramIdx = g.writeClauseSQL(b, clause, m, params, paramIdx)
 			}
 			fmt.Fprintf(b, "\t\t\torParts = append(orParts, \"(\"+strings.Join(parts, \" AND \")+\")\")\n")
 			fmt.Fprintf(b, "\t\t}\n")
@@ -78,7 +103,7 @@ func writeInferredConditions(b *strings.Builder, inf *InferredAPI, m *ast.ModelD
 		fmt.Fprintf(b, "\t\tconds := []lux.Condition{\n")
 		if len(inf.Groups) > 0 {
 			for _, clause := range inf.Groups[0].Clauses {
-				paramIdx = writeAndClause(b, clause, m, params, paramIdx)
+				paramIdx = g.writeAndClause(b, clause, m, params, paramIdx)
 			}
 		}
 		fmt.Fprintf(b, "\t\t}\n")
@@ -88,8 +113,8 @@ func writeInferredConditions(b *strings.Builder, inf *InferredAPI, m *ast.ModelD
 }
 
 // writeAndClause writes a single AND clause condition.
-func writeAndClause(b *strings.Builder, clause InferClause, m *ast.ModelDecl, params []*ast.ParamDecl, paramIdx int) int {
-	col := str.ToSnakeCase(clause.Field)
+func (g *GeneratorContext) writeAndClause(b *strings.Builder, clause InferClause, m *ast.ModelDecl, params []*ast.ParamDecl, paramIdx int) int {
+	col := g.sqlColumn(clause.Field)
 	condType := fieldConditionType(getFieldTypeRefRaw(m, clause.Field))
 	paramExpr := ""
 	if paramIdx < len(params) {
@@ -125,7 +150,7 @@ func writeAndClause(b *strings.Builder, clause InferClause, m *ast.ModelDecl, pa
 }
 
 // writeInferredAction generates the query execution + response writing for an inferred handler.
-func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string, soft bool, rels []Relation, models ...*ast.ModelDecl) {
+func (g *GeneratorContext) writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string, soft bool, rels []Relation, models ...*ast.ModelDecl) {
 	hasRels := len(rels) > 0
 	var model *ast.ModelDecl
 	if len(models) > 0 {
@@ -156,7 +181,7 @@ func writeInferredAction(b *strings.Builder, inf *InferredAPI, modelName string,
 		fmt.Fprintf(b, "\t\tcols := select%sSQLColumns(req.Select)\n", modelName)
 		fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(cols...)\n", modelName)
 		if inf.OrderBy != "" {
-			order := str.ToSnakeCase(inf.OrderBy)
+			order := g.sqlColumn(inf.OrderBy)
 			if inf.OrderDesc {
 				fmt.Fprintf(b, "\t\tq = q.OrderBy(%q)\n", order+" DESC")
 			} else {
@@ -266,8 +291,8 @@ func opToMethod(op string) string {
 }
 
 // writeClauseSQL writes a clause as raw SQL parts for OR group building.
-func writeClauseSQL(b *strings.Builder, clause InferClause, m *ast.ModelDecl, params []*ast.ParamDecl, paramIdx int) int {
-	col := str.ToSnakeCase(clause.Field)
+func (g *GeneratorContext) writeClauseSQL(b *strings.Builder, clause InferClause, m *ast.ModelDecl, params []*ast.ParamDecl, paramIdx int) int {
+	col := g.sqlColumn(clause.Field)
 
 	if zp := writeClauseSQLZeroParam(b, clause.Op, col); zp {
 		return paramIdx
@@ -288,7 +313,7 @@ func writeClauseSQL(b *strings.Builder, clause InferClause, m *ast.ModelDecl, pa
 		if paramIdx+1 < len(params) {
 			param2 = params[paramIdx+1].Name
 		}
-		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s BETWEEN $\" + strconv.Itoa(argIdx) + \" AND $\" + strconv.Itoa(argIdx+1))\n", col)
+		fmt.Fprintf(b, "\t\t\tparts = append(parts, %q + strconv.Itoa(argIdx) + \" AND $\" + strconv.Itoa(argIdx+1))\n", col+" BETWEEN $")
 		fmt.Fprintf(b, "\t\t\torArgs = append(orArgs, %s, %s)\n", paramExpr, param2)
 		fmt.Fprintf(b, "\t\t\targIdx += 2\n")
 		return paramIdx + 2
@@ -301,7 +326,7 @@ func writeClauseSQL(b *strings.Builder, clause InferClause, m *ast.ModelDecl, pa
 	}
 
 	sqlOp := clauseOpToSQL(clause.Op)
-	fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s %s $\" + strconv.Itoa(argIdx))\n", col, sqlOp)
+	fmt.Fprintf(b, "\t\t\tparts = append(parts, %q + strconv.Itoa(argIdx))\n", col+" "+sqlOp+" $")
 	fmt.Fprintf(b, "\t\t\torArgs = append(orArgs, %s)\n", paramExpr)
 	fmt.Fprintf(b, "\t\t\targIdx++\n")
 	return paramIdx + 1
@@ -311,13 +336,13 @@ func writeClauseSQL(b *strings.Builder, clause InferClause, m *ast.ModelDecl, pa
 func writeClauseSQLZeroParam(b *strings.Builder, op, col string) bool {
 	switch op {
 	case "true":
-		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s = true\")\n", col)
+		fmt.Fprintf(b, "\t\t\tparts = append(parts, %q)\n", col+" = true")
 	case "false":
-		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s = false\")\n", col)
+		fmt.Fprintf(b, "\t\t\tparts = append(parts, %q)\n", col+" = false")
 	case "isNull":
-		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s IS NULL\")\n", col)
+		fmt.Fprintf(b, "\t\t\tparts = append(parts, %q)\n", col+" IS NULL")
 	case "isNotNull":
-		fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s IS NOT NULL\")\n", col)
+		fmt.Fprintf(b, "\t\t\tparts = append(parts, %q)\n", col+" IS NOT NULL")
 	default:
 		return false
 	}
@@ -349,25 +374,30 @@ func writeClauseSQLStringMatch(b *strings.Builder, op, col, paramExpr string) bo
 
 // writeClauseSQLLike writes a LIKE/NOT LIKE/ILIKE clause for OR groups.
 func writeClauseSQLLike(b *strings.Builder, col, op, valExpr string) {
-	fmt.Fprintf(b, "\t\t\tparts = append(parts, \"%s %s $\" + strconv.Itoa(argIdx))\n", col, op)
+	fmt.Fprintf(b, "\t\t\tparts = append(parts, %q + strconv.Itoa(argIdx))\n", col+" "+op+" $")
 	fmt.Fprintf(b, "\t\t\torArgs = append(orArgs, %s)\n", valExpr)
 	fmt.Fprintf(b, "\t\t\targIdx++\n")
 }
 
 // writeClauseSQLSet writes an IN/NOT IN clause for OR groups.
-// For simplicity, expands the slice with a loop.
+// Placeholder order matches arguments; empty sets use boolean identities.
 func writeClauseSQLSet(b *strings.Builder, col, op, paramExpr string) {
+	empty := "FALSE"
+	if op == "NOT IN" {
+		empty = "TRUE"
+	}
 	fmt.Fprintf(b, "\t\t\t{\n")
-	fmt.Fprintf(b, "\t\t\t\tph := make([]string, len(%s))\n", paramExpr)
-	fmt.Fprintf(b, "\t\t\t\tfor i := range %s {\n", paramExpr)
-	fmt.Fprintf(b, "\t\t\t\t\tph[i] = \"$\" + strconv.Itoa(argIdx+i)\n")
-	fmt.Fprintf(b, "\t\t\t\t}\n")
-	fmt.Fprintf(b, "\t\t\t\tparts = append(parts, \"%s %s (\" + strings.Join(ph, \", \") + \")\")\n", col, op)
-	fmt.Fprintf(b, "\t\t\t\tfor _, v := range %s {\n", paramExpr)
-	fmt.Fprintf(b, "\t\t\t\t\torArgs = append(orArgs, v)\n")
-	fmt.Fprintf(b, "\t\t\t\t}\n")
-	fmt.Fprintf(b, "\t\t\t\targIdx += len(%s)\n", paramExpr)
-	fmt.Fprintf(b, "\t\t\t}\n")
+	fmt.Fprintf(b, "\t\t\t\tif len(%s) == 0 {\n\t\t\t\t\tparts = append(parts, %q)\n\t\t\t\t} else {\n", paramExpr, empty)
+	fmt.Fprintf(b, "\t\t\t\t\tph := make([]string, len(%s))\n", paramExpr)
+	fmt.Fprintf(b, "\t\t\t\t\tfor i := range %s {\n", paramExpr)
+	fmt.Fprintf(b, "\t\t\t\t\t\tph[i] = \"$\" + strconv.Itoa(argIdx+i)\n")
+	fmt.Fprintf(b, "\t\t\t\t\t}\n")
+	fmt.Fprintf(b, "\t\t\t\t\tparts = append(parts, %q + strings.Join(ph, \", \") + \")\")\n", col+" "+op+" (")
+	fmt.Fprintf(b, "\t\t\t\t\tfor _, v := range %s {\n", paramExpr)
+	fmt.Fprintf(b, "\t\t\t\t\t\torArgs = append(orArgs, v)\n")
+	fmt.Fprintf(b, "\t\t\t\t\t}\n")
+	fmt.Fprintf(b, "\t\t\t\t\targIdx += len(%s)\n", paramExpr)
+	fmt.Fprintf(b, "\t\t\t\t}\n\t\t\t}\n")
 }
 
 // clauseOpToSQL converts clause operator to SQL operator.

@@ -50,9 +50,10 @@ class WireReader extends ValueReader {
     return this.wireBytes.subarray(start, this.offset)
   }
 
-  readBool(label: string): void {
+  readBool(label: string): boolean {
     const value = this.readBytes(1, label)[0]
     if (value !== 0 && value !== 1) throw new Error(`invalid ${label}`)
+    return value === 1
   }
 
   get done(): boolean {
@@ -94,8 +95,11 @@ function skipScalar(reader: WireReader, type: string): void {
   switch (type) {
     case 'Int':
     case 'Duration':
-    case 'DateTime':
       reader.skipInt64(`${type} value`)
+      return
+    case 'DateTime':
+      reader.readDateTime()
+      if (reader.error !== null) throw new Error(`DateTime: ${reader.error}`)
       return
     case 'Boolean':
       reader.readBool(`${type} value`)
@@ -110,6 +114,7 @@ function skipScalar(reader: WireReader, type: string): void {
     case 'Enum':
     case 'Decimal':
     case 'Bytes':
+    case 'JSON':
     case 'Model': {
       const length = reader.readVarint(`${type} length`)
       reader.skip(length, `${type} value`)
@@ -179,7 +184,10 @@ export function inspectBinaryRequest(
     if (!param) throw new Error(`unknown field ID ${fieldID} for API ${api}`)
     const valueStart = reader.offset
     let itemCount: number | undefined
-    if (param.isList) {
+    const present = !param.nullable || reader.readBool(`${param.name} presence`)
+    if (!present) {
+      // Null has no payload, including for nullable lists.
+    } else if (param.isList) {
       itemCount = reader.readVarint(`${param.name} item count`)
       for (let index = 0; index < itemCount; index++) skipScalar(reader, param.type)
     } else {

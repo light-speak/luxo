@@ -1,13 +1,15 @@
 package semantic
 
 import (
+	"strings"
+
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
 // ========== Pass 4: Check Bodies ==========
 
-func (a *Analyzer) checkBodies(file *ast.File) {
+func (a *Analyzer) checkGlobalDeclarations(file *ast.File) {
 	// global val/var declarations — var is forbidden at global scope
 	for _, g := range file.Globals {
 		if g.Mutable {
@@ -15,8 +17,12 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 		}
 		a.checkValStmt(g, a.scope)
 	}
+}
 
+func (a *Analyzer) checkBodies(file *ast.File) {
+	a.checkScopeOrders(file)
 	for _, api := range file.APIs {
+		a.checkAuthPermissionConditions(api.Directives)
 		if api.Body != nil {
 			scope := a.scope.Child()
 			// add params to scope
@@ -29,17 +35,12 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 					Pos:  api.Pos,
 				})
 			}
-			// add my (current authenticated user) to scope
-			scope.Define(&Symbol{
-				Name: "my",
-				Kind: SymVariable,
-				Type: a.types["Identity"],
-			})
+			a.injectAuthenticatedIdentity(scope, api.Directives)
 			// @stream(EventName): inject `it` with event's field types
 			a.injectStreamIt(api, scope, file)
 			var expected *ResolvedType
 			if !hasNamedDirective(api.Directives, "stream") {
-				expected = a.symbolReturnType(api.Name)
+				expected = a.apiBodyReturnType(api)
 			}
 			a.checkCallableBody(api.Body, scope, expected)
 			a.validateStreamMatcherResult(api)
@@ -48,6 +49,7 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 	}
 
 	for _, fn := range file.Functions {
+		a.checkAuthPermissionConditions(fn.Directives)
 		if fn.Body != nil {
 			scope := a.scope.Child()
 			for _, p := range fn.Params {
@@ -58,6 +60,9 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 					Type: pType,
 					Pos:  fn.Pos,
 				})
+			}
+			if hasNamedDirective(fn.Directives, "service") {
+				a.injectAuthenticatedIdentity(scope, fn.Directives)
 			}
 			expected := a.symbolReturnType(fn.Name)
 			if expected == nil {
@@ -73,47 +78,52 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 	}
 
 	for _, on := range file.Listeners {
-		if on.Body != nil {
-			scope := a.scope.Child()
-			// Build event type from event declaration
-			var eventType *ResolvedType
-			for _, f := range a.files {
-				for _, ev := range f.Events {
-					if ev.Name == on.EventName {
-						evType := &ResolvedType{Kind: TypeModel, Name: ev.Name, Fields: make(map[string]*FieldInfo)}
-						for _, p := range ev.Params {
-							pType := a.resolveTypeRef(p.Type, on.Pos)
-							evType.Fields[p.Name] = &FieldInfo{Name: p.Name, Type: pType}
-						}
-						eventType = evType
-						break
-					}
-				}
-				if eventType != nil {
-					break
-				}
-			}
-			// add lambda-style params to scope with event type
-			if len(on.Params) > 0 {
-				for _, p := range on.Params {
-					scope.Define(&Symbol{
-						Name: p,
-						Kind: SymParam,
-						Type: eventType,
-					})
-				}
-			} else if eventType != nil {
-				// No named params — inject `it` with event type
-				scope.Define(&Symbol{
-					Name: "it",
-					Kind: SymVariable,
-					Type: eventType,
-					Used: true,
-				})
-			}
-			a.checkBlock(on.Body, scope)
+		a.checkListener(on)
+	}
+}
+
+func (a *Analyzer) checkListener(listener *ast.OnDecl) {
+	if len(listener.Params) > 1 {
+		a.addError(listener.Pos, "listener accepts at most one payload binding")
+	}
+	if listener.Native && listener.Body != nil {
+		a.addError(listener.Pos, "native listener must not declare a body / native 监听器不能声明函数体")
+	}
+	if !listener.Native && listener.Body == nil {
+		a.addError(listener.Pos, "listener requires a body or @native / 监听器必须提供函数体或 @native")
+	}
+	declaration := a.findEvent(listener.EventName)
+	if declaration == nil {
+		a.addError(listener.Pos, "unknown event '%s' / 未知事件 '%s'", listener.EventName, listener.EventName)
+		return
+	}
+	if listener.Body == nil {
+		return
+	}
+	eventType := &ResolvedType{Kind: TypeCustom, Name: declaration.Name, Fields: make(map[string]*FieldInfo, len(declaration.Params))}
+	for _, parameter := range declaration.Params {
+		fieldType := a.resolveTypeRef(parameter.Type, listener.Pos)
+		eventType.Fields[parameter.Name] = &FieldInfo{Name: parameter.Name, Type: fieldType}
+	}
+	scope := a.scope.Child()
+	names := listener.Params
+	if len(names) == 0 {
+		names = []string{"it"}
+	}
+	for _, name := range names {
+		if !scope.Define(&Symbol{Name: name, Kind: SymParam, Type: eventType, Used: true}) {
+			a.addError(listener.Pos, "duplicate listener binding '%s' / 监听器绑定 '%s' 重复", name, name)
 		}
 	}
+	a.checkCallableBody(listener.Body, scope, &ResolvedType{Kind: TypeVoid, Name: "Void"})
+}
+
+// Only same-named fn/API bodies need a second return-type slot.
+func (a *Analyzer) apiBodyReturnType(api *ast.ApiDecl) *ResolvedType {
+	if typ, exists := a.apiBodyReturns[api]; exists {
+		return typ
+	}
+	return a.symbolReturnType(api.Name)
 }
 
 func (a *Analyzer) symbolReturnType(name string) *ResolvedType {
@@ -232,25 +242,25 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 		a.validateReturnValue(s.GetPos(), a.expectedReturn, a.checkExpr(s.Value, scope))
 
 	case *ast.ThrowStmt:
-		a.checkExpr(s.Error, scope)
+		s.Error = a.checkThrownValue(s.Error, scope, s.Pos)
 
 	case *ast.EmitStmt:
-		for _, arg := range s.Args {
-			a.checkExpr(arg.Value, scope)
-		}
+		a.checkEmitArguments(s, scope)
 
 	case *ast.AssignStmt:
 		a.checkAssignStmt(s, scope)
 
-	case *ast.BreakStmt:
-		// valid in any loop context, no check needed at semantic level
-
-	case *ast.ContinueStmt:
-		// valid in any loop context, no check needed at semantic level
+	case *ast.BreakStmt, *ast.ContinueStmt:
+		if a.loopDepth == 0 {
+			a.addError(stmt.GetPos(), "loop control requires a local loop scope / 循环跳转必须位于当前执行作用域的 for 内部")
+		}
 
 	case *ast.ExprStmt:
 		if branch, ok := s.Expr.(*ast.WhenExpr); ok {
-			setExprResolvedType(branch, a.checkWhen(branch, scope, false))
+			a.setExprResolvedType(branch, a.checkWhen(branch, scope, false))
+		} else if guard, ok := s.Expr.(*ast.BangElvisExpr); ok {
+			a.checkBangElvisGuard(guard, scope)
+			a.setExprResolvedType(guard, &ResolvedType{Kind: TypeVoid, Name: "Void"})
 		} else if s.Expr != nil {
 			a.checkExpr(s.Expr, scope)
 		}
@@ -264,6 +274,10 @@ func (a *Analyzer) checkValStmt(s *ast.ValStmt, scope *Scope) {
 	} else {
 		exprType = a.checkExpr(s.Value, scope)
 	}
+	if exprType != nil && exprType.Kind == TypeVoid {
+		a.addError(s.Pos, "void operation cannot initialize a variable / 无返回值操作不能初始化变量")
+		return
+	}
 	if s.Type != nil {
 		declaredType := a.resolveTypeRef(s.Type, s.Pos)
 		if exprType != nil && !isEmptyListExpr(s.Value) && !isTypeAssignable(declaredType, exprType) {
@@ -272,7 +286,9 @@ func (a *Analyzer) checkValStmt(s *ast.ValStmt, scope *Scope) {
 				s.Name, formatResolvedType(declaredType), formatResolvedType(exprType))
 		}
 		exprType = declaredType
-		setExprResolvedType(s.Value, declaredType)
+		if isEmptyListExpr(s.Value) {
+			a.setExprResolvedType(s.Value, declaredType)
+		}
 	}
 	if len(s.Names) > 0 {
 		a.defineDestructured(s, exprType, scope)
@@ -281,13 +297,17 @@ func (a *Analyzer) checkValStmt(s *ast.ValStmt, scope *Scope) {
 		if pos.Line == 0 {
 			pos = s.Pos // fallback for older AST without NamePos
 		}
-		scope.Define(&Symbol{
-			Name:    s.Name,
-			Kind:    SymVariable,
-			Type:    exprType,
-			Pos:     pos,
-			Mutable: s.Mutable,
-		})
+		a.defineVariable(scope, s.Name, exprType, pos, s.Mutable)
+	}
+}
+
+// Failed declarations preserve the earlier binding; discards bind no name.
+func (a *Analyzer) defineVariable(scope *Scope, name string, typ *ResolvedType, pos token.Position, mutable bool) {
+	if name == "_" {
+		return
+	}
+	if !scope.Define(&Symbol{Name: name, Kind: SymVariable, Type: typ, Pos: pos, Mutable: mutable}) {
+		a.addError(pos, "duplicate variable binding '%s' in the same scope / 同一作用域重复声明变量 '%s'", name, name)
 	}
 }
 
@@ -303,13 +323,7 @@ func (a *Analyzer) defineDestructured(s *ast.ValStmt, exprType *ResolvedType, sc
 			// non-tuple assigned to destructuring — all get same type
 			varType = exprType
 		}
-		scope.Define(&Symbol{
-			Name:    name,
-			Kind:    SymVariable,
-			Type:    varType,
-			Pos:     s.Pos,
-			Mutable: s.Mutable,
-		})
+		a.defineVariable(scope, name, varType, s.Pos, s.Mutable)
 	}
 	// warn if count mismatch
 	if exprType != nil && exprType.Kind == TypeTuple && len(s.Names) != len(exprType.Tuple) {
@@ -320,25 +334,73 @@ func (a *Analyzer) defineDestructured(s *ast.ValStmt, exprType *ResolvedType, sc
 }
 
 func (a *Analyzer) checkAssignStmt(s *ast.AssignStmt, scope *Scope) {
-	a.checkExpr(s.Target, scope)
-	a.checkExpr(s.Value, scope)
+	targetType := a.checkExpr(s.Target, scope)
+	operandType := targetType
+	valueType := a.checkExpr(s.Value, scope)
+	if !a.isWritableTarget(s.Target, scope) {
+		a.addError(s.Pos, "assignment target is not writable / 赋值目标不可写")
+	}
 	if ident, ok := s.Target.(*ast.Ident); ok {
-		ident.NarrowedTag = false
+		if s.Op == "=" {
+			ident.NarrowedTag = false
+		}
 		scope.invalidateNarrowing(ident.Name)
 		if declared := scope.ResolvedTypeOf(ident.Name); declared != nil {
-			setExprResolvedType(s.Target, declared)
+			if s.Op == "=" {
+				a.setExprResolvedType(s.Target, declared)
+			}
+			targetType = declared
 		}
 		if sym := scope.Lookup(ident.Name); sym != nil && sym.Kind == SymVariable && !sym.Mutable {
 			a.addError(s.Pos, "cannot assign to immutable variable '%s' (declared with val) / 不能给不可变变量 '%s' 赋值（使用 val 声明）", ident.Name, ident.Name)
 		}
 	}
+	if s.Op != "=" {
+		valueType = a.checkBinaryOp(strings.TrimSuffix(s.Op, "="), operandType, valueType, s.Pos)
+	}
+	emptyList := s.Op == "=" && isEmptyListExpr(s.Value) && targetType != nil && targetType.IsList
+	if !emptyList && !isTypeAssignable(targetType, valueType) {
+		a.addError(s.Pos, "assignment expects '%s', got '%s' / 赋值需要 '%s'，得到 '%s'",
+			formatResolvedType(targetType), formatResolvedType(valueType),
+			formatResolvedType(targetType), formatResolvedType(valueType))
+	}
 	// 1.4: mark compound assignment on model member as atomic
 	if s.Op == "+=" || s.Op == "-=" {
 		if member, ok := s.Target.(*ast.MemberExpr); ok {
-			if objType := a.checkExpr(member.Object, scope); objType != nil && objType.Kind == TypeModel {
+			if objType := a.resolvedExprType(member.Object); objType != nil && objType.Kind == TypeModel {
 				s.Atomic = true
 			}
 		}
+	}
+}
+
+// Assignment requires a storage location, not a computed property or declaration.
+func (a *Analyzer) isWritableTarget(target ast.Expr, scope *Scope) bool {
+	switch value := target.(type) {
+	case *ast.Ident:
+		symbol := scope.Lookup(value.Name)
+		return symbol != nil && (symbol.Kind == SymVariable || symbol.Kind == SymParam)
+	case *ast.MemberExpr:
+		if value.SafeCall {
+			return false
+		}
+		if receiver, ok := value.Object.(*ast.Ident); ok {
+			symbol := scope.Lookup(receiver.Name)
+			if symbol == nil || (symbol.Kind != SymVariable && symbol.Kind != SymParam) {
+				return false
+			}
+		}
+		receiver := a.resolvedExprType(value.Object)
+		if receiver == nil || receiver.IsList || receiver.Nullable {
+			return false
+		}
+		if receiver.Kind != TypeModel && receiver.Kind != TypeCustom && receiver.Kind != TypeInterface {
+			return false
+		}
+		field := receiver.LookupField(value.Field)
+		return field != nil && !field.IsMethod
+	default:
+		return false
 	}
 }
 
@@ -350,6 +412,9 @@ func (a *Analyzer) checkForBody(s *ast.ForStmt, scope *Scope, required bool) *Re
 	childScope := scope.Child()
 	if s.Collection != nil {
 		collType := a.checkExpr(s.Collection, childScope)
+		if s.VarName == "" && collType != nil && !collType.IsNonNullBoolean() {
+			a.addError(s.Pos, "for condition requires non-null Boolean / for 条件必须是非空 Boolean")
+		}
 		if s.VarName != "" {
 			itemType := collectionElementType(collType)
 			childScope.Define(&Symbol{
@@ -360,7 +425,9 @@ func (a *Analyzer) checkForBody(s *ast.ForStmt, scope *Scope, required bool) *Re
 			})
 		}
 	}
+	a.loopDepth++
 	a.checkResultBlock(s.Body, childScope, required)
+	a.loopDepth--
 	return a.inferForExprType(s.Body)
 }
 
@@ -373,8 +440,10 @@ func (a *Analyzer) checkAwaitExpr(e *ast.AwaitExpr, scope *Scope) *ResolvedType 
 		return nil
 	}
 	prevAwait := a.inAwait
+	previousDepth := a.loopDepth
 	a.inAwait = true
-	defer func() { a.inAwait = prevAwait }()
+	a.loopDepth = 0
+	defer func() { a.inAwait, a.loopDepth = prevAwait, previousDepth }()
 	childScope := scope.Child()
 	var elements []*ResolvedType
 	if e.Body != nil {
@@ -399,4 +468,121 @@ func (a *Analyzer) checkAwaitExpr(e *ast.AwaitExpr, scope *Scope) *ResolvedType 
 		}
 	}
 	return nil
+}
+
+// Only authenticated handlers provide a validated identity.
+func (a *Analyzer) injectAuthenticatedIdentity(scope *Scope, directives []*ast.Directive) {
+	if hasNamedDirective(directives, "auth") {
+		scope.Define(&Symbol{Name: "my", Kind: SymVariable, Type: a.authIdentity(directives)})
+	}
+}
+
+// Identity store types are complete before field conditions are checked.
+func (a *Analyzer) checkFieldConditions(file *ast.File) {
+	for _, model := range file.Models {
+		a.checkAuthPermissionConditions(model.Directives)
+		a.checkFieldConditionsForFields(model.Fields)
+	}
+	for _, declaration := range file.Types {
+		previousParameters := a.typeParameters
+		a.typeParameters = declaration.TypeParams
+		a.checkFieldConditionsForFields(declaration.Fields)
+		a.typeParameters = previousParameters
+	}
+	for _, declaration := range file.Interfaces {
+		a.checkFieldConditionsForFields(declaration.Fields)
+	}
+	for _, declaration := range file.Extends {
+		a.checkFieldConditionsForFields(declaration.Fields)
+	}
+}
+
+func (a *Analyzer) checkAuthPermissionConditions(directives []*ast.Directive) {
+	for _, directive := range directives {
+		if directive.Name != "auth" {
+			continue
+		}
+		for _, argument := range directive.Args {
+			if argument.Name != "permission" {
+				continue
+			}
+			lambda, ok := argument.Value.(*ast.LambdaExpr)
+			if !ok {
+				continue // The declaration pass reports an invalid argument type.
+			}
+			condition := (&ast.Directive{Body: lambda.Body}).SingleExpression()
+			if condition == nil {
+				a.addError(directive.Pos, "@auth permission requires one condition expression / @auth permission 必须包含一个条件表达式")
+				continue
+			}
+			scope := a.scope.Child()
+			scope.Define(&Symbol{Name: "my", Kind: SymVariable, Type: a.authIdentity(directives)})
+			resolved := a.checkExpr(condition, scope)
+			if resolved == nil || resolved.Name != "Boolean" || resolved.IsList || resolved.Nullable {
+				a.addError(directive.Pos, "@auth permission must be a non-null Boolean / @auth permission 必须为非空 Boolean")
+			}
+		}
+	}
+}
+
+func (a *Analyzer) checkFieldConditionsForFields(fields []*ast.FieldDecl) {
+	for _, field := range fields {
+		a.checkResolvedTransform(field)
+		a.checkBeforeSaveDirective(field)
+		for _, directive := range field.Directives {
+			if directive.Name != "visible" {
+				continue
+			}
+			expression := directive.SingleExpression()
+			if expression == nil {
+				continue // The declaration pass reports malformed directive bodies.
+			}
+			a.bindVisibleSubject(directive, expression)
+			scope := a.scope.Child()
+			scope.Define(&Symbol{Name: "my", Kind: SymVariable, Type: a.types["Identity"]})
+			condition := a.checkExpr(expression, scope)
+			if condition == nil || condition.Name != "Boolean" || condition.IsList || condition.Nullable {
+				a.addError(directive.Pos, "@visible condition must be a non-null Boolean / @visible 条件必须为非空 Boolean")
+			}
+		}
+	}
+}
+
+// Parsed and defaulted event arguments always carry values; retain the guard for incomplete metadata.
+func (a *Analyzer) checkEmitArguments(statement *ast.EmitStmt, scope *Scope) {
+	event := a.findEvent(statement.EventName)
+	if event == nil {
+		a.addError(statement.Pos, "unknown event '%s' / 未知事件 '%s'", statement.EventName, statement.EventName)
+		a.checkObjectExprValues(statement.Args, scope)
+		return
+	}
+	positions := functionParameterPositions(event.Params)
+	assigned := make([]bool, len(event.Params))
+	for _, argument := range statement.Args {
+		if argument == nil || argument.Value == nil {
+			a.addError(statement.Pos, "event argument requires a name and value / 事件参数需要名称和值")
+			continue
+		}
+		actual := a.checkExpr(argument.Value, scope)
+		position, exists := positions[argument.Name]
+		if !exists {
+			a.addError(argument.Value.GetPos(), "unknown argument '%s' in event '%s' / 事件 '%s' 中存在未知参数 '%s'", argument.Name, event.Name, event.Name, argument.Name)
+			continue
+		}
+		if _, valid := a.rejectDuplicateFunctionArgument(argument, position, assigned); !valid {
+			continue
+		}
+		assigned[position] = true
+		parameter := event.Params[position]
+		argument.ExpectedType = parameter.Type
+		a.checkFunctionArgumentType(argument, actual, parameter)
+	}
+	a.checkMissingFunctionArguments(&ast.CallExpr{Pos: statement.Pos}, &ast.FnDecl{Name: event.Name, Params: event.Params}, assigned)
+	for index, parameter := range event.Params {
+		if !assigned[index] && parameter.Default != nil {
+			statement.Args = append(statement.Args, &ast.NamedArg{
+				Name: parameter.Name, Value: parameter.Default, ExpectedType: parameter.Type,
+			})
+		}
+	}
 }

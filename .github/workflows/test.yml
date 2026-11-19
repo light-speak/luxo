@@ -122,13 +122,26 @@ jobs:
           go vet ./cmd/luxo/... ./pkg/lux/pg/... ./pkg/lux/storage/s3/... ./pkg/lux/cache/redis/... ./pkg/lux/nats/...
 
       - name: Coverage summary
-        run: go tool cover -func=coverage.out | tail -1
+        run: |
+          set -euo pipefail
+          go tool cover -func=coverage.out | tail -1
 
       - name: Coverage floor (minimum 95.0%)
         run: |
-          TOTAL=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | sed 's/%//')
+          set -euo pipefail
+          TOTAL=$(go tool cover -func=coverage.out | awk '
+            $1 == "total:" {
+              count++
+              if (NF != 3 || $2 != "(statements)" || $3 !~ /^[0-9]+([.][0-9]+)?%$/) invalid = 1
+              sub(/%$/, "", $3)
+              total = $3 + 0
+            }
+            END {
+              if (count != 1 || invalid || total < 0 || total > 100) exit 1
+              print total
+            }')
           echo "Total coverage: ${TOTAL}%"
-          if (( $(echo "$TOTAL < 95.0" | bc -l) )); then
+          if ! awk -v total="$TOTAL" 'BEGIN { exit !(total >= 95.0) }'; then
             echo "::error::Coverage ${TOTAL}% is below 95.0% floor"
             exit 1
           fi
@@ -562,6 +575,7 @@ jobs:
 
       - name: Prepare fuzz diagnostics
         run: |
+          set -euo pipefail
           mkdir -p .tmp/fuzz
           go version | tee .tmp/fuzz/toolchain.txt
           go env GOOS GOARCH >> .tmp/fuzz/toolchain.txt

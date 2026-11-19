@@ -175,8 +175,24 @@ func evaluate(input io.Reader) (evaluation, error) {
 	if evaluator.result.AllocationComparisons == 0 {
 		return evaluation{}, errors.New("benchstat output contains no allocation comparisons")
 	}
+	if err := validateComparisonMetrics(evaluator.result.Comparisons); err != nil {
+		return evaluation{}, err
+	}
 	sortRegressions(evaluator.result.Regressions)
 	return evaluator.result, nil
+}
+
+func validateComparisonMetrics(comparisons map[comparisonKey]struct{}) error {
+	for key := range comparisons {
+		for _, unit := range [...]string{"sec/op", "B/op", "allocs/op"} {
+			required := key
+			required.Unit = unit
+			if _, exists := comparisons[required]; !exists {
+				return fmt.Errorf("%s/%s: missing paired %s comparison", key.Package, key.Benchmark, unit)
+			}
+		}
+	}
+	return nil
 }
 
 func (evaluator *comparisonEvaluator) consume(row []string) error {

@@ -2,25 +2,34 @@ package rpc
 
 import (
 	"context"
+	"encoding/binary"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
 	"time"
 
-	stderrors "errors"
+	"github.com/light-speak/luxo/internal/panicerror"
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/codec"
-
 	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 )
 
 // MaxRPCConnections limits concurrent RPC connections to prevent goroutine exhaustion.
 const MaxRPCConnections = 10000
 
+// This private sentinel is replaced by the frame length before network I/O.
+const handlerResponsePrefix = 0x4c525043
+
+var errHandlerResponsePrefix = stderrors.New("rpc: handler overwrote the response buffer or its transport prefix")
+var errHandlerEmptyResponse = luxerrors.InternalError.WithCause(stderrors.New("rpc: handler did not write its declared response value"))
+
 // Server handles internal RPC connections using Luxo binary protocol.
 // Dispatches both public API and RPC-only handlers from a startup snapshot.
 type Server struct {
+	ctx                    context.Context
+	cancel                 context.CancelFunc
 	router                 *api.Router
 	handlers               map[string]api.HandlerFunc
 	registry               *api.APIRegistry
@@ -37,7 +46,10 @@ type Server struct {
 
 // NewServer exports public and internal handlers after registration is complete.
 func NewServer(router *api.Router) *Server {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
+		ctx:                    ctx,
+		cancel:                 cancel,
 		router:                 router,
 		handlers:               router.ExportHandlers(),
 		registry:               router.Registry,
@@ -154,6 +166,7 @@ func (s *Server) retryAccept(err error, delay *time.Duration) (bool, error) {
 // Close stops accepting new connections and waits for active ones to finish.
 func (s *Server) Close() {
 	s.closeOnce.Do(func() {
+		s.cancel()
 		close(s.done)
 		s.connMu.Lock()
 		s.closing = true
@@ -171,38 +184,13 @@ func (s *Server) Close() {
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
 	defer s.unregisterConnection(conn)
-	defer conn.Close()
 	if err := acceptHandshake(conn); err != nil {
+		conn.Close()
 		return
 	}
 
-	var readBuf []byte
-	for {
-		// Read request frame
-		payload, err := ReadFrame(conn, readBuf)
-		if err != nil {
-			if err != io.EOF {
-				// Connection error — close
-			}
-			return
-		}
-		readBuf = retainReadFrame(payload)
-		envelope, envelopeErr := decodeRequestEnvelope(payload)
-		if envelopeErr != nil {
-			if WriteFrame(conn, encodeError(400, "BadRequest", envelopeErr.Error())) != nil {
-				return
-			}
-			continue
-		}
-		if envelope.kind == requestKindStream {
-			s.processStream(conn, envelope)
-			return
-		}
+	s.serveConnection(conn)
 
-		if err := s.processCall(conn, envelope); err != nil {
-			return
-		}
-	}
 }
 
 func (s *Server) registerConnection(conn net.Conn) bool {
@@ -235,7 +223,10 @@ func (s *Server) processRequest(conn io.Writer, payload []byte) error {
 }
 
 func (s *Server) processCall(conn io.Writer, envelope requestEnvelope) error {
-	var ctx context.Context = context.Background()
+	return s.processCallContext(s.ctx, conn, envelope)
+}
+
+func (s *Server) processCallContext(ctx context.Context, conn io.Writer, envelope requestEnvelope) error {
 	var trace *api.DebugTraceSession
 	if envelope.traceID != "" {
 		requestCtx, cancel := context.WithCancel(ctx)
@@ -247,7 +238,7 @@ func (s *Server) processCall(conn io.Writer, envelope requestEnvelope) error {
 	ctx, err := s.requestContext(ctx, envelope.token)
 	trace.Finish(authStarted, api.DebugSpanMeta{Name: "service.authenticate", Category: "service"})
 	if err != nil {
-		return writeCallError(conn, 401, "Unauthorized", err.Error(), trace)
+		return writeEncodedError(conn, encodeAuthenticationError(err), trace)
 	}
 	req := api.GetRequest()
 	defer api.PutRequest(req)
@@ -266,27 +257,41 @@ func (s *Server) processCall(conn io.Writer, envelope requestEnvelope) error {
 	}
 
 	buf := api.GetBuf()
+	defer api.PutBuf(buf)
 	// Reserve the frame header and status; the handler appends its body once.
-	buf.B = append(buf.B, 0, 0, 0, 0, statusOK)
+	buf.B = append(buf.B, 'L', 'R', 'P', 'C', statusOK)
 	req.Buf = buf
 
 	metrics := s.router.RequestMetricsRecorder()
 	var handlerStarted time.Time
+	recorded := false
 	if metrics != nil {
 		handlerStarted = time.Now()
+		defer func() {
+			if !recorded {
+				metrics.Record(req.API, time.Since(handlerStarted), true)
+			}
+		}()
 	}
-	handlerCtx, handlerSpan := trace.StartSpan(ctx, api.DebugSpanMeta{Name: "service.handler", Category: "service", Operation: req.API})
-	herr := s.callHandler(handlerCtx, fn, req)
-	trace.FinishSpan(handlerSpan)
+	var herr error
+	if trace == nil {
+		herr = s.callHandler(ctx, fn, req)
+	} else {
+		herr = s.callTracedHandler(ctx, fn, req, trace)
+	}
+	if herr == nil {
+		if req.Buf != buf || len(buf.B) < 5 || binary.BigEndian.Uint32(buf.B[:4]) != handlerResponsePrefix || buf.B[4] != statusOK {
+			herr = errHandlerResponsePrefix
+		} else if s.missingResponseValue(req, buf) {
+			herr = errHandlerEmptyResponse
+		}
+	}
 	if metrics != nil {
+		recorded = true
 		metrics.Record(req.API, time.Since(handlerStarted), herr != nil)
 	}
 	if herr != nil {
-		api.PutBuf(buf)
-		if appErr, ok := stderrors.AsType[*luxerrors.AppError](herr); ok {
-			return writeApplicationError(conn, appErr, trace)
-		}
-		return writeCallError(conn, 500, "Internal", herr.Error(), trace)
+		return writeApplicationError(conn, normalizeHandlerError(herr, false), trace)
 	}
 
 	// Zero-copy: write [frame header][statusOK + handler payload] directly from pooled buf
@@ -295,14 +300,27 @@ func (s *Server) processCall(conn io.Writer, envelope requestEnvelope) error {
 	} else {
 		err = writeTracedFrame(conn, statusTraceOK, buf.B[5:], trace)
 	}
-	api.PutBuf(buf)
 	return err
 }
 
-func (s *Server) processStream(conn net.Conn, envelope requestEnvelope) {
-	ctx, err := s.requestContext(context.Background(), envelope.token)
+func (s *Server) callTracedHandler(ctx context.Context, fn api.HandlerFunc, req *api.Request, trace *api.DebugTraceSession) error {
+	ctx, span := trace.StartSpan(ctx, api.DebugSpanMeta{Name: "service.handler", Category: "service", Operation: req.API})
+	defer trace.FinishSpan(span)
+	return s.callHandler(ctx, fn, req)
+}
+
+func (s *Server) missingResponseValue(req *api.Request, buf *api.ResponseBuf) bool {
+	if len(buf.B) != 5 || s.router.Schema == nil {
+		return false
+	}
+	definition := s.router.Schema.APIs[req.API]
+	return definition != nil && definition.ReturnType != ""
+}
+
+func (s *Server) processStream(parent context.Context, conn net.Conn, envelope requestEnvelope) {
+	ctx, err := s.requestContext(parent, envelope.token)
 	if err != nil {
-		WriteFrame(conn, encodeError(401, "Unauthorized", err.Error()))
+		WriteFrame(conn, encodeAuthenticationError(err))
 		return
 	}
 	req := api.GetRequest()
@@ -316,11 +334,7 @@ func (s *Server) processStream(conn net.Conn, envelope requestEnvelope) {
 	defer cancel()
 	stream, err := s.router.PrepareInternalStream(streamCtx, req)
 	if err != nil {
-		if appErr, ok := stderrors.AsType[*luxerrors.AppError](err); ok {
-			writeApplicationError(conn, appErr, nil)
-			return
-		}
-		writeApplicationError(conn, luxerrors.Wrap(err), nil)
+		writeApplicationError(conn, normalizeHandlerError(err, false), nil)
 		return
 	}
 	defer stream.Close()
@@ -328,16 +342,10 @@ func (s *Server) processStream(conn net.Conn, envelope requestEnvelope) {
 		return
 	}
 	stream.Start()
-	s.pumpInternalStream(conn, stream)
+	s.pumpInternalStream(streamCtx, conn, stream)
 }
 
-func (s *Server) pumpInternalStream(conn net.Conn, stream *api.InternalStream) {
-	disconnected := make(chan struct{})
-	go func() {
-		var probe [1]byte
-		conn.Read(probe[:])
-		close(disconnected)
-	}()
+func (s *Server) pumpInternalStream(ctx context.Context, conn net.Conn, stream *api.InternalStream) {
 	for {
 		select {
 		case data, ok := <-stream.Messages():
@@ -348,7 +356,7 @@ func (s *Server) pumpInternalStream(conn net.Conn, stream *api.InternalStream) {
 			if writeStatusFrame(conn, statusStream, data) != nil {
 				return
 			}
-		case <-disconnected:
+		case <-ctx.Done():
 			return
 		case <-s.done:
 			return
@@ -360,13 +368,7 @@ func writeStreamResult(w io.Writer, err error) error {
 	if err == nil {
 		return writeStatusFrame(w, statusStreamComplete, nil)
 	}
-	if appErr, ok := stderrors.AsType[*luxerrors.AppError](err); ok {
-		return writeApplicationError(w, appErr, nil)
-	}
-	if stderrors.Is(err, api.ErrStreamFull) {
-		return writeCallError(w, 429, "SlowConsumer", "stream subscriber is too slow", nil)
-	}
-	return writeApplicationError(w, luxerrors.InternalError, nil)
+	return writeApplicationError(w, normalizeHandlerError(err, true), nil)
 }
 
 func (s *Server) requestContext(ctx context.Context, token string) (context.Context, error) {
@@ -376,7 +378,20 @@ func (s *Server) requestContext(ctx context.Context, token string) (context.Cont
 	if s.internalRequestContext == nil {
 		return nil, fmt.Errorf("RPC bearer verification is not configured")
 	}
-	return s.internalRequestContext(ctx, token)
+	return s.verifyRequestContext(ctx, token)
+}
+
+func (s *Server) verifyRequestContext(ctx context.Context, token string) (verified context.Context, err error) {
+	defer func() {
+		if recover() != nil {
+			verified, err = nil, errAuthenticationPanic
+		}
+	}()
+	verified, err = s.internalRequestContext(ctx, token)
+	if err == nil && verified == nil {
+		return nil, fmt.Errorf("RPC bearer verifier returned no context")
+	}
+	return verified, err
 }
 
 // callHandler calls the handler with panic recovery so a panicking handler
@@ -384,7 +399,7 @@ func (s *Server) requestContext(ctx context.Context, token string) (context.Cont
 func (s *Server) callHandler(ctx context.Context, fn api.HandlerFunc, req *api.Request) (herr error) {
 	defer func() {
 		if p := recover(); p != nil {
-			herr = fmt.Errorf("panic: %v", p)
+			herr = panicerror.New("panic: ", p)
 		}
 	}()
 	return fn(ctx, req)

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -7,6 +8,255 @@ import 'package:luxo_client/luxo_client.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test(
+    'response envelope does not consume the JSON payload depth budget',
+    () async {
+      for (final leaf in ['0', '[]', '{}']) {
+        for (final depth in [127, 128, 129]) {
+          final payload = '${'[' * depth}$leaf${']' * depth}';
+          var accepted = true;
+          try {
+            decodeLuxoJSONBytes(utf8.encode(payload));
+          } on FormatException {
+            accepted = false;
+          }
+          for (final status in [200, 400]) {
+            final prefix = status == 200
+                ? ''
+                : '"error":"Custom","code":400,"message":"failed",';
+            final transport = HttpTransport(
+              'http://localhost/api',
+              options: const TransportOptions(mode: TransportMode.json),
+              client: MockClient(
+                (_) async => http.Response('{$prefix"data":$payload}', status),
+              ),
+            );
+            try {
+              if (!accepted) {
+                await expectLater(
+                  transport.call<Object?>('echo'),
+                  _error('ParseError', status),
+                );
+              } else if (status == 200) {
+                expect(
+                  encodeLuxoJSON(await transport.call<Object?>('echo')),
+                  payload,
+                );
+              } else {
+                await expectLater(
+                  transport.call<Object?>('echo'),
+                  throwsA(
+                    isA<LuxoError>()
+                        .having((e) => e.error, 'error', 'Custom')
+                        .having((e) => encodeLuxoJSON(e.data), 'data', payload),
+                  ),
+                );
+              }
+            } finally {
+              transport.close();
+            }
+          }
+        }
+      }
+    },
+  );
+  test(
+    'closed transport does not refresh a late unauthorized response',
+    () async {
+      for (final mode in TransportMode.values) {
+        var refreshes = 0;
+        late HttpTransport transport;
+        final client = MockClient((request) async {
+          transport.close();
+          return _errorResponse(mode);
+        });
+        transport = HttpTransport(
+          'https://example.test/api',
+          client: client,
+          options: TransportOptions(mode: mode),
+          onTokenExpired: () async {
+            refreshes++;
+            return 'late-token';
+          },
+        )..setSchema({'echo': APISchemaEntry(1, [])});
+        addTearDown(transport.close);
+        await expectLater(
+          transport.call<Object?>('echo'),
+          _error('CancelledError', 0),
+        );
+        expect(refreshes, 0, reason: 'closed call must not start user refresh');
+      }
+    },
+  );
+  test(
+    'non-object envelopes never refresh and do not poison later calls',
+    () async {
+      for (final status in [200, 401, 500]) {
+        for (final body in [
+          '[]',
+          '[{"data":true}]',
+          'null',
+          'true',
+          '42',
+          '9223372036854775807',
+          '1.234567890123456789',
+          '"data"',
+          '{}',
+        ]) {
+          var calls = 0, refreshes = 0;
+          final transport = HttpTransport(
+            'http://localhost/api',
+            options: const TransportOptions(mode: TransportMode.json),
+            client: MockClient((_) async {
+              calls++;
+              return calls == 1
+                  ? http.Response(body, status)
+                  : http.Response('{"data":null}', 200);
+            }),
+            onTokenExpired: () async {
+              refreshes++;
+              return 'must-not-refresh';
+            },
+          );
+          try {
+            await expectLater(
+              transport.call<Object?>('echo'),
+              _error('ParseError', status),
+            );
+            expect(refreshes, 0);
+            expect(calls, 1);
+            expect(await transport.call<Object?>('echo'), isNull);
+            expect(calls, 2);
+          } finally {
+            transport.close();
+          }
+        }
+      }
+    },
+  );
+  for (final mode in [TransportMode.json, TransportMode.binary]) {
+    test('$mode stale 401 cannot refresh a replacement identity', () async {
+      final entered = Completer<void>();
+      final response = Completer<http.Response>();
+      var refreshes = 0;
+      final transport = HttpTransport(
+        'http://localhost/api',
+        options: TransportOptions(mode: mode, token: 'original-token'),
+        client: MockClient((_) {
+          entered.complete();
+          return response.future;
+        }),
+        onTokenExpired: () async {
+          refreshes++;
+          return 'old-user-refreshed';
+        },
+      );
+      try {
+        transport.setSchema({'echo': const APISchemaEntry(7)});
+        final failure = expectLater(
+          transport.call<Object?>('echo'),
+          _error('Unauthorized', 401),
+        );
+        await entered.future;
+        transport.setToken('different-user');
+        response.complete(_errorResponse(mode));
+        await failure;
+        expect(refreshes, 0);
+      } finally {
+        transport.close();
+      }
+    });
+    for (final replacement in ['different-user', 'original-token']) {
+      test('$mode late refresh cannot overwrite $replacement', () async {
+        final entered = Completer<void>();
+        final refresh = Completer<String?>();
+        final requests = <http.Request>[];
+        final transport = HttpTransport(
+          'http://localhost/api',
+          options: TransportOptions(mode: mode, token: 'original-token'),
+          client: MockClient((request) async {
+            requests.add(request);
+            return requests.length == 1 ? _errorResponse(mode) : _success(mode);
+          }),
+          onTokenExpired: () {
+            entered.complete();
+            return refresh.future;
+          },
+        );
+        try {
+          transport.setSchema({'echo': const APISchemaEntry(7)});
+          final result = transport
+              .call<Object?>('echo')
+              .then<Object?>(
+                (value) => value,
+                onError: (Object error) => error,
+              );
+          await entered.future;
+          transport.setToken(replacement);
+          refresh.complete('old-user-refreshed');
+          final outcome = await result;
+          final callsBefore = requests.length;
+          await transport.call<Object?>('echo');
+          expect(requests.last.headers['authorization'], 'Bearer $replacement');
+          expect(callsBefore, 1);
+          expect(outcome, isA<LuxoError>().having((e) => e.code, 'code', 401));
+        } finally {
+          transport.close();
+        }
+      });
+    }
+  }
+
+  test('HTTP status and error presence override JSON data', () async {
+    for (final (status, body, name) in [
+      (
+        200,
+        '{"data":true,"error":null,"code":401,"message":"bad"}',
+        'ParseError',
+      ),
+      (
+        200,
+        '{"data":true,"error":false,"code":401,"message":"bad"}',
+        'ParseError',
+      ),
+      (
+        200,
+        '{"data":true,"error":"Unauthorized","code":401,"message":"bad"}',
+        'Unauthorized',
+      ),
+      (201, '{"data":true}', 'ParseError'),
+      (403, '{"data":true}', 'ParseError'),
+      (500, '{"data":true}', 'ParseError'),
+    ]) {
+      var calls = 0, refreshes = 0;
+      final transport = HttpTransport(
+        'http://localhost/api',
+        client: MockClient((_) async {
+          calls++;
+          return calls == 1
+              ? http.Response(body, status)
+              : http.Response('{"data":true}', 200);
+        }),
+        onTokenExpired: () async {
+          refreshes++;
+          return 'unused';
+        },
+      );
+      try {
+        await expectLater(
+          transport.call<Object?>('echo'),
+          _error(name, name == 'Unauthorized' ? 401 : status),
+        );
+        expect(calls, 1);
+        expect(refreshes, 0);
+        expect(await transport.call<Object?>('echo'), true);
+        expect(calls, 2);
+      } finally {
+        transport.close();
+      }
+    }
+  });
+
   test('success requires data while explicit null remains valid', () async {
     var body = '{}', refreshes = 0, calls = 0;
     final transport = HttpTransport(
@@ -318,7 +568,10 @@ void main() {
           transport.setSchema({'echo': const APISchemaEntry(7)});
           await expectLater(
             transport.call<Object?>('echo'),
-            _error('Unauthorized', code),
+            _error(
+              code == 0 ? 'ParseError' : 'Unauthorized',
+              code == 0 ? status : code,
+            ),
           );
           expect(refreshes, 0);
           expect(calls, 1);

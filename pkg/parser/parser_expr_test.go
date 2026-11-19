@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
@@ -1280,16 +1281,16 @@ func TestParseExprStmtStuckRecoveryDirect(t *testing.T) {
 	}
 }
 
-// Test parseExprStmt stuck recovery by directly calling parseExprStmt
+// Test statement expression recovery by directly calling parseExprOrAssignStmt
 // when the parser is positioned beyond all tokens (pos >= len(tokens)).
 // In this state, advance() is a no-op, so parsePrefixExpr returns nil
 // without advancing, triggering the stuck guard.
 func TestParseExprStmtStuckAtEOF(t *testing.T) {
 	p := New([]token.Token{}) // empty tokens
 	p.pos = 0                 // at/beyond len(tokens)=0
-	result := p.parseExprStmt()
+	result := p.parseExprOrAssignStmt()
 	if result != nil {
-		t.Error("expected nil from parseExprStmt stuck guard")
+		t.Error("expected nil from statement expression stuck guard")
 	}
 	if len(p.errors) == 0 {
 		t.Error("expected error from stuck guard")
@@ -1465,8 +1466,9 @@ func TestParseCallArgsEmptyExpression(t *testing.T) {
   0
 }`
 	_, errs := parseWithErrors(t, input)
-	// should parse without panic, may have errors
-	_ = errs
+	if len(errs) != 1 || errs[0].Message != `expected expression for named argument "where"` {
+		t.Fatalf("expected a missing-value diagnostic, got %v", errs)
+	}
 }
 
 func TestParseObjectConstructionWithColon(t *testing.T) {
@@ -1493,5 +1495,120 @@ api test(): AuthResult {
 	}
 	if obj.Fields[0].Name != "token" {
 		t.Errorf("expected 'token', got %q", obj.Fields[0].Name)
+	}
+}
+
+func TestParseGenericConstructorCalls(t *testing.T) {
+	for _, test := range []struct {
+		expression, name string
+		arguments        int
+	}{
+		{`Box<Int>(value: 1)`, "Box", 1},
+		{`box<Int>(value: 1)`, "box", 1},
+		{`Page<User>(items: [], total: 0, page: 1, pageSize: 20)`, "Page", 1},
+		{`Outer<Box<[User]>>(value: Box<[User]>(value: []))`, "Outer", 1},
+		{`Pair<Int, String>(first: 1, second: "ok")`, "Pair", 2},
+		{`Box<>()`, "Box", 0},
+	} {
+		t.Run(test.expression, func(t *testing.T) {
+			file := parse(t, `api probe(): Int { return `+test.expression+` }`)
+			value := file.APIs[0].Body.Stmts[0].(*ast.ReturnStmt).Value
+			call, ok := value.(*ast.CallExpr)
+			if !ok {
+				t.Fatalf("expected typed constructor call, got %T", value)
+			}
+			if call.ConstructorType != nil {
+				t.Fatal("parser set a semantic constructor marker")
+			}
+			if call.Func.(*ast.Ident).Name != test.name || call.TypeArgs == nil || len(call.TypeArgs) != test.arguments {
+				t.Fatal("constructor type arguments lost", call)
+			}
+		})
+	}
+}
+
+func TestParseNestedGenericConstructorTypeArguments(t *testing.T) {
+	file := parse(t, `api probe(): Int { return Box<Pair<Int?, [User]>>(value: input) }`)
+	call := file.APIs[0].Body.Stmts[0].(*ast.ReturnStmt).Value.(*ast.CallExpr)
+	pair := call.TypeArgs[0]
+	if pair.Name != "Pair" || len(pair.TypeArgs) != 2 || !pair.TypeArgs[0].Nullable || !pair.TypeArgs[1].IsList || pair.TypeArgs[1].Name != "User" {
+		t.Fatal("nested type syntax changed", pair)
+	}
+	if call.Pos.Line != 1 || call.TypeArgs[0].Pos.Line != 1 {
+		t.Fatal("constructor source positions lost")
+	}
+}
+
+func TestParseGenericCallComparisonDisambiguation(t *testing.T) {
+	for _, test := range []struct{ expression, op string }{
+		{`a < b`, "<"}, {`a > b`, ">"}, {`(a < b)`, "<"}, {`a < (b)`, "<"}, {`(a) > (b)`, ">"},
+		{`a < b && c > (d)`, "&&"}, {`(a < b) == (c > d)`, "=="},
+	} {
+		file := parse(t, `api probe(): Boolean { return `+test.expression+` }`)
+		value := file.APIs[0].Body.Stmts[0].(*ast.ReturnStmt).Value
+		binary, ok := value.(*ast.BinaryExpr)
+		if !ok || binary.Op != test.op {
+			t.Fatalf("comparison swallowed: %s => %T", test.expression, value)
+		}
+	}
+	file := parse(t, `api probe(): Int { return a<b>(c) }`)
+	call, ok := file.APIs[0].Body.Stmts[0].(*ast.ReturnStmt).Value.(*ast.CallExpr)
+	if !ok || len(call.TypeArgs) != 1 || call.TypeArgs[0].Name != "b" {
+		t.Fatal("type-argument-call ambiguity must resolve to a call")
+	}
+}
+
+func TestGenericConstructorLookaheadKeepsParserState(t *testing.T) {
+	for _, test := range []struct {
+		source   string
+		expected bool
+	}{
+		{`Box<Pair<Int, String>>(value: input)`, true}, {`Box<(Int, String)>(value: input)`, true},
+		{`Box<[Int]?>(value: input)`, true}, {`Box<error>(value: input)`, true}, {`Box<>()`, true},
+		{`a < b`, false}, {`a < b && c > (d)`, false}, {`a < (b > c)`, false},
+		{`Box<Int`, false}, {`Box<Int>`, false}, {`Box<Inner<>>()`, false}, {`Box<Int,>()`, false},
+		{`Box<[Int>()`, false}, {`Box<[]>()`, false}, {`Box<()>()`, false},
+	} {
+		tokens, errors := lexer.New(test.source, "lookahead.luxo").Tokenize()
+		if len(errors) != 0 {
+			t.Fatal(errors)
+		}
+		p := New(tokens)
+		p.advance()
+		position := p.pos
+		if got := p.constructorTypeCallAhead(); got != test.expected {
+			t.Fatalf("%s: got %v", test.source, got)
+		}
+		if p.pos != position || len(p.errors) != 0 {
+			t.Fatal("lookahead changed live parser state")
+		}
+	}
+}
+
+func FuzzGenericConstructorLookahead(f *testing.F) {
+	for _, seed := range []string{`Int>(value: 1)`, `Box<[Int]>>(value: input)`, `(Int, String)>(value: input)`, `b && c > (d)`, `>()`, `[Int`, `Box<>>()`} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, suffix string) {
+		if len(suffix) > 4096 {
+			return
+		}
+		tokens, _ := lexer.New("a<"+suffix, "fuzz.luxo").Tokenize()
+		p := New(tokens)
+		p.advance()
+		position := p.pos
+		p.constructorTypeCallAhead()
+		if p.pos != position || len(p.errors) != 0 {
+			t.Fatal("lookahead modified parser state")
+		}
+	})
+}
+
+func TestGenericConstructorLookaheadExhaustedTokens(t *testing.T) {
+	for _, tokens := range [][]token.Token{nil, {}, {{Type: token.Lt}}} {
+		p := New(tokens)
+		if p.constructorTypeCallAhead() || len(p.errors) != 0 {
+			t.Fatal("exhausted lookahead must fail without diagnostics")
+		}
 	}
 }

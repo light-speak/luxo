@@ -134,7 +134,7 @@ func TestGenerateTypeWriteLuxo_NestedModel(t *testing.T) {
 	code := b.String()
 
 	// Nested model should use inline WriteLuxo
-	if !strings.Contains(code, "a.Member.WriteLuxo(buf, _childMask2)") {
+	if !strings.Contains(code, "a.Member.writeLuxoDepth(buf, _childMask2, depth+1)") {
 		t.Errorf("nested model should call WriteLuxo inline:\n%s", code)
 	}
 }
@@ -161,7 +161,7 @@ func TestGenerateTypeWriteLuxo_ListRelation(t *testing.T) {
 	if !strings.Contains(code, "buf.BeginMessage()") || !strings.Contains(code, "buf.EndMessage(_frame1)") {
 		t.Errorf("list relation should be framed:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteColumnarUser(buf, r.Items, _childMask1)") {
+	if !strings.Contains(code, "writeColumnarUserDepth(buf, r.Items, _childMask1, depth+1)") {
 		t.Errorf("list relation should use its columnar writer:\n%s", code)
 	}
 }
@@ -187,7 +187,7 @@ func TestGenerateTypeWriteLuxo_NullableRelation(t *testing.T) {
 	if !strings.Contains(code, "w.Nested == nil") {
 		t.Errorf("nullable relation should have nil check:\n%s", code)
 	}
-	if !strings.Contains(code, "w.Nested.WriteLuxo(buf, _childMask1)") {
+	if !strings.Contains(code, "w.Nested.writeLuxoDepth(buf, _childMask1, depth+1)") {
 		t.Errorf("nullable relation should call WriteLuxo when present:\n%s", code)
 	}
 	if !strings.Contains(code, "AppendNull") {

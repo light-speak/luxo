@@ -206,16 +206,16 @@ func TestDecodeBinaryErrorOwnsData(t *testing.T) {
 }
 
 func TestDecodeBinaryErrorCodeRepresentability(t *testing.T) {
-	for _, code := range []int64{math.MinInt64, math.MinInt32, 0, math.MaxInt32, math.MaxInt64} {
+	for _, code := range []int64{math.MinInt64, math.MinInt32, 0, 399, 400, 599, 600, math.MaxInt32, math.MaxInt64} {
 		var enc codec.Encoder
 		enc.WriteFieldInt(1, code)
 		enc.WriteFieldString(2, "")
 		enc.WriteFieldString(3, "")
 		enc.WriteEnd()
 		got, err := DecodeBinaryError(enc.Bytes(), 500)
-		if int64(int(code)) != code {
+		if code < 400 || code > 599 {
 			if err == nil || got != nil {
-				t.Fatalf("code narrowed to host int: %+v, %v", got, err)
+				t.Fatalf("invalid error status accepted: %+v, %v", got, err)
 			}
 		} else if err != nil || int64(got.Code) != code || got.Name != "" || got.Message != "" {
 			t.Fatalf("present fields replaced with defaults: %+v, %v", got, err)

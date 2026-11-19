@@ -201,7 +201,15 @@ func TestJSONToBinaryRejectsInvalidValues(t *testing.T) {
 				typeName = "Single"
 				tt.field.ID = 1
 				tt.field.Name = "value"
-				s.RegisterModel(&Model{Name: typeName, Fields: []Field{tt.field}})
+				field := tt.field
+				if tt.name == "unsupported" {
+					// Corrupt only after registration to retain the encoder's defensive-path coverage.
+					field.Type = FieldInt
+				}
+				if err := s.RegisterModel(&Model{Name: typeName, Fields: []Field{field}}); err != nil {
+					t.Fatal(err)
+				}
+				s.Models[typeName].Fields[0].Type = tt.field.Type
 				tt.value = `{"value":` + tt.value + `}`
 			}
 			if _, err := s.JSONToBinary(typeName, json.RawMessage(tt.value)); err == nil || !strings.Contains(err.Error(), tt.wantError) {
@@ -258,6 +266,8 @@ func TestJSONToBinaryRejectsUnknownFields(t *testing.T) {
 		wantError string
 	}{
 		{name: "root", value: `{"count":1,"typo":2}`, wantError: `Input: unknown field "typo"`},
+		{name: "empty", value: `{"":0}`, wantError: `Input: unknown field ""`},
+		{name: "empty minimum", value: `{"z":0,"":1,"a":2}`, wantError: `Input: unknown field ""`},
 		{name: "nested", value: `{"address":{"city":"Tokyo","zip":"100-0001"}}`, wantError: `Input.address: Address: unknown field "zip"`},
 	}
 	for _, tt := range tests {

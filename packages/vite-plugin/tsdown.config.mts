@@ -9,5 +9,5 @@ export default defineConfig({
   outputOptions: { exports: 'named' },
   dts: false,
   clean: true,
-  deps: { neverBundle: ['vite', '@luxojs/client', '@babel/parser', '@babel/traverse', '@babel/types'] },
+  deps: { neverBundle: ['vite', '@luxojs/client', '@babel/parser', '@babel/traverse', '@babel/types', 'magic-string'] },
 })

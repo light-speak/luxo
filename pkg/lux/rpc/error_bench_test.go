@@ -34,10 +34,16 @@ func BenchmarkRPCErrorDecode(b *testing.B) {
 				{"after", decodeError},
 			} {
 				b.Run(version.name, func(b *testing.B) {
+					input := body
+					// The former contract inferred privacy from 5xx; the current decoder
+					// requires the explicit flag. This private fixture adds two wire bytes.
+					if fixture.code >= 500 && version.name == "after" {
+						input = append(append([]byte(nil), body[:len(body)-1]...), 6, 1, 0)
+					}
 					var got error
 					b.ReportAllocs()
 					for b.Loop() {
-						got = version.decode(body)
+						got = version.decode(input)
 					}
 					checkRPCErrorBenchmark(b, got, want)
 				})

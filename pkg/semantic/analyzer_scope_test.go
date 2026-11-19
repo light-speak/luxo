@@ -10,6 +10,132 @@ import (
 
 // ========== Scope & Lookup Tests ==========
 
+func TestBareBuiltinValuesAreRejected(t *testing.T) {
+	for _, name := range []string{
+		"task", "cache", "storage", "mail", "services", "error", "request",
+		"http", "json", "time", "math", "crypto", "convert", "regex", "base64", "url", "uuid", "env",
+		"print", "now", "today", "verifyHash", "generateToken", "find", "save",
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := analyze(t, "fn read(): Int { return "+name+" }")
+			expectError(t, result, "cannot be used as a value")
+		})
+	}
+	t.Run("await_builtin_name", func(t *testing.T) {
+		result := analyze(t, `fn read(): Int { await { val task = 1 } return task }`)
+		expectError(t, result, "cannot be used as a value")
+	})
+	t.Run("await_ordinary_name", func(t *testing.T) {
+		result := analyze(t, `fn read(): Int { await { val ordinary = 1 } return ordinary }`)
+		expectError(t, result, "undefined: 'ordinary'")
+	})
+}
+
+func TestBuiltinValueChecksPreserveBindingsAndOperations(t *testing.T) {
+	for _, source := range []string{
+		`fn read(task: Int): Int { return task }`,
+		`fn read(): Int { val task = 1 return task }`,
+		`fn read(): Int { val task = 1 await { val task = task + 1 val copy = task } return task }`,
+		`model Task @noTime { id: Int @id } fn read(task: Task): Int { return task.id }`,
+		`fn read(crypto: Int): Int { return crypto }`,
+		`fn now(value: Int): Int { return value } fn read(): Int { return now(1) }`,
+		`fn read(): DateTime { return now() }`,
+		`fn read(): String { return crypto.randomHex(4) }`,
+		`fn read(): Int { val values: Channel<Int> = Channel(1) values.close() return 1 }`,
+		`api current(): Int @auth { return my.id }`,
+		`api current(): Int @auth { val identity = my return identity.id }`,
+		`fn read(): Int { throw error.NotFound }`,
+		"fn read(): Int { val (task, entries) = await {\n1\n[2]\n} return task }",
+	} {
+		t.Run(source, func(t *testing.T) { expectNoErrors(t, analyze(t, source)) })
+	}
+}
+
+func TestDuplicateVariableBindingsAreRejected(t *testing.T) {
+	for _, sample := range []struct{ name, source string }{
+		{"immutable", `fn read(): Int { val value = 1 val value = 2 return value }`},
+		{"mutable", `fn read(): Int { var value = 1 var value = 2 return value }`},
+		{"mixed", `fn read(): Int { val value = 1 var value = 2 return value }`},
+		{"parameter", `fn read(value: Int): Int { val value = 2 return value }`},
+		{"global", `val value = 1 val value = 2`},
+		{"loop", `fn read(): Int { for value in [1] { val value = 2 } return 1 }`},
+		{"lambda", `fn read(): [Int] { return [1].map { value -> val value = 2 value } }`},
+		{"listener", `event Changed(value: Int) on Changed { value -> val value = 2 }`},
+		{"destructured", "fn read(): Int { val (value, value) = await {\n1\n2\n} return value }"},
+		{"existing-before-tuple", "fn read(): Int { val value = 1 val (other, value) = await {\n1\n2\n} return value }"},
+		{"existing-after-tuple", "fn read(): Int { val (value, other) = await {\n1\n2\n} val value = 3 return value }"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			result := analyze(t, sample.source)
+			for _, diagnostic := range result.Errors {
+				if strings.Contains(diagnostic.Message, "duplicate variable binding 'value'") {
+					if diagnostic.Pos.Line == 0 || diagnostic.Pos.Col == 0 {
+						t.Fatal("binding diagnostic has no source position", diagnostic)
+					}
+					return
+				}
+			}
+			t.Fatal("duplicate binding was accepted", result.Errors)
+		})
+	}
+}
+
+func TestNestedVariableBindingsAndDiscardsRemainValid(t *testing.T) {
+	for _, source := range []string{
+		`fn read(value: Int): Int { if true { val value = "inner" val copy = value } return value }`,
+		`fn read(): Int { val value = 1 when { true -> { val value = "left" } else -> { val value = false } } return value }`,
+		`fn read(): Int { val value = 1 [1].forEach { value -> val copy = value } return value }`,
+		`fn read(value: Int): Int { val _ = value val _ = value return value }`,
+		"fn read(): Int { val (_, _) = await {\n1\n2\n} return 1 }",
+	} {
+		expectNoErrors(t, analyze(t, source))
+	}
+	result := analyze(t, `fn read(): Int { val _ = 1 return _ }`)
+	expectError(t, result, "discard binding '_' cannot be read")
+}
+
+func TestVariableBindingFailurePreservesEarlierSymbol(t *testing.T) {
+	a := New()
+	scope := NewScope()
+	first := &Symbol{Name: "value", Kind: SymVariable, Type: a.types["Int"], Mutable: false}
+	scope.Define(first)
+	a.checkValStmt(&ast.ValStmt{
+		Name: "value", NamePos: token.Position{Line: 3, Col: 7}, Mutable: true,
+		Value: &ast.Literal{Kind: token.String, Value: "different"},
+	}, scope)
+	if scope.LookupLocal("value") != first || first.Type != a.types["Int"] || first.Mutable {
+		t.Fatal("duplicate declaration changed the earlier binding")
+	}
+	if len(a.errors) != 1 || a.errors[0].Pos.Line != 3 || a.errors[0].Pos.Col != 7 {
+		t.Fatal("duplicate declaration did not retain its binding location", a.errors)
+	}
+	a.checkValStmt(&ast.ValStmt{Name: "_", Value: &ast.Literal{Kind: token.Int, Value: "1"}}, scope)
+	if scope.LookupLocal("_") != nil || len(a.errors) != 1 {
+		t.Fatal("discard introduced a named binding or another diagnostic")
+	}
+}
+
+func TestEnumConstantMetadataTracksDeclarationScope(t *testing.T) {
+	analyzer := New()
+	enum := &ResolvedType{Kind: TypeEnum, Name: "Role", EnumValues: []string{"ADMIN"}}
+	scope := NewScope()
+	scope.Define(&Symbol{Name: "Role", Kind: SymEnum, Type: enum})
+	expression := &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "ADMIN"}
+	if analyzer.checkExpr(expression, scope) != enum || !expression.EnumConstant {
+		t.Fatal("enum declaration member was not identified")
+	}
+	shadow := scope.Child()
+	shadow.Define(&Symbol{Name: "Role", Kind: SymVariable, Type: enum})
+	if analyzer.checkExpr(expression, shadow) != enum || expression.EnumConstant {
+		t.Fatal("variable inherited enum declaration metadata")
+	}
+	expression.EnumConstant = true
+	expression.Field = "UNKNOWN"
+	if analyzer.checkExpr(expression, scope) != nil || expression.EnumConstant {
+		t.Fatal("invalid member retained enum declaration metadata")
+	}
+}
+
 func TestIdentifierNarrowingMetadataIsScopedAndRecomputed(t *testing.T) {
 	analyzer := New()
 	parent := NewScope()
@@ -44,6 +170,55 @@ func TestScopeLookup(t *testing.T) {
 	// parent can't see child's symbols
 	if scope.Lookup("y") != nil {
 		t.Error("expected not to find 'y' in parent scope")
+	}
+}
+
+func TestScopeLookupReadOnlyPreservesUsage(t *testing.T) {
+	for _, used := range []bool{false, true} {
+		parent := NewScope()
+		outer := &Symbol{Name: "outer", Kind: SymVariable, Used: used}
+		shadowed := &Symbol{Name: "shadow", Kind: SymVariable, Used: used}
+		parent.Define(outer)
+		parent.Define(shadowed)
+		child := parent.Child()
+		local := &Symbol{Name: "shadow", Kind: SymVariable, Used: used}
+		child.Define(local)
+		for _, sample := range []struct {
+			scope *Scope
+			name  string
+			want  *Symbol
+		}{
+			{parent, "outer", outer}, {child, "outer", outer},
+			{parent, "shadow", shadowed}, {child, "shadow", local},
+			{child, "missing", nil}, {NewScope(), "missing", nil},
+		} {
+			if got := sample.scope.LookupReadOnly(sample.name); got != sample.want {
+				t.Fatalf("read-only lookup %q resolved %p, want %p", sample.name, got, sample.want)
+			}
+		}
+		if outer.Used != used || shadowed.Used != used || local.Used != used {
+			t.Fatal("read-only lookup changed symbol usage")
+		}
+	}
+}
+
+func TestScopeLookupMarksOnlyResolvedSymbol(t *testing.T) {
+	parent := NewScope()
+	outer := &Symbol{Name: "outer", Kind: SymVariable}
+	shadowed := &Symbol{Name: "shadow", Kind: SymVariable}
+	parent.Define(outer)
+	parent.Define(shadowed)
+	child := parent.Child()
+	local := &Symbol{Name: "shadow", Kind: SymVariable}
+	child.Define(local)
+	if got := child.Lookup("outer"); got != outer || !outer.Used {
+		t.Fatal("ordinary lookup did not mark the parent symbol")
+	}
+	if got := child.Lookup("shadow"); got != local || !local.Used || shadowed.Used {
+		t.Fatal("ordinary lookup changed the shadowed parent")
+	}
+	if got := child.Lookup("missing"); got != nil || shadowed.Used {
+		t.Fatal("missing lookup changed an unrelated symbol")
 	}
 }
 
@@ -129,6 +304,30 @@ func TestEditDistanceEmptyStrings(t *testing.T) {
 	}
 	if d := editDistance("", ""); d != 0 {
 		t.Errorf("editDistance('', '') = %d, want 0", d)
+	}
+}
+
+func TestFindClosestStringMatchesDistanceReference(t *testing.T) {
+	names := []string{"", "a", "b", "ab", "aa", "abc", "abcd", "abcde", "abcdef",
+		"User", "Usar", "Usor", "é", "É", "用户", "用戶", strings.Repeat("x", 128)}
+	for _, target := range names {
+		for shift := range names {
+			candidates := append([]string{}, names[shift:]...)
+			candidates = append(candidates, names[:shift]...)
+			want, distance := "", 3
+			// Prefixes also exercise missing exact matches, ties and the threshold.
+			for count := 0; count <= len(candidates); count++ {
+				if count > 0 {
+					candidate := candidates[count-1]
+					if d := editDistance(target, candidate); d < distance {
+						want, distance = candidate, d
+					}
+				}
+				if got := findClosestString(target, candidates[:count]); got != want {
+					t.Fatalf("target %q, shift %d, count %d: closest = %q, want %q", target, shift, count, got, want)
+				}
+			}
+		}
 	}
 }
 

@@ -5,6 +5,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -17,10 +18,12 @@ type Queue interface {
 	// Subscribe registers a handler for tasks on the named queue.
 	// Handler receives task payload; returning nil acknowledges the task,
 	// returning an error triggers retry (up to MaxRetries).
+	// A nil handler is rejected before reserving local or broker resources.
 	Subscribe(queue string, handler Handler) error
 
 	// Close gracefully shuts down the queue, draining in-flight tasks
-	// with a reasonable timeout.
+	// with a reasonable timeout. Concurrent and repeated calls return the
+	// first shutdown result; failure is not converted to success on retry.
 	Close() error
 }
 
@@ -48,13 +51,23 @@ func DefaultConfig() Config {
 
 // SetDefaults fills zero-value fields with defaults.
 func (c *Config) SetDefaults() {
-	if c.MaxRetries <= 0 {
+	if c.MaxRetries == 0 {
 		c.MaxRetries = 3
 	}
-	if c.RetryDelay <= 0 {
+	if c.RetryDelay == 0 {
 		c.RetryDelay = 5 * time.Second
 	}
-	if c.Concurrency <= 0 {
+	if c.Concurrency == 0 {
 		c.Concurrency = 4
 	}
 }
+
+// Validate rejects invalid settings; zero values select defaults at construction.
+func (c Config) Validate() error {
+	if c.MaxRetries < 0 || c.RetryDelay < 0 || c.Concurrency < 0 {
+		return errNegativeConfig
+	}
+	return nil
+}
+
+var errNegativeConfig = errors.New("queue: configuration values must not be negative")

@@ -33,6 +33,7 @@ func TestColumnTypeBaseTypes(t *testing.T) {
 		{"UUID", "UUID"},
 		{"Decimal", "DECIMAL"},
 		{"Bytes", "BYTEA"},
+		{"JSON", "JSONB"},
 		{"UnknownEnum", "TEXT"}, // enum or unknown → TEXT
 	}
 	for _, tt := range tests {
@@ -48,6 +49,7 @@ func TestColumnTypeBaseTypes(t *testing.T) {
 func TestArrayColumnTypes(t *testing.T) {
 	for _, tc := range []struct{ name, want string }{
 		{"Int", "BIGINT[]"}, {"String", "TEXT[]"}, {"UUID", "UUID[]"},
+		{"JSON", "JSONB[]"},
 		{"DateTime", "TIMESTAMPTZ[]"}, {"Boolean", "BOOLEAN[]"}, {"UnknownEnum", "TEXT[]"},
 	} {
 		if got := d().ArrayColumnType(tc.name); got != tc.want {
@@ -163,7 +165,7 @@ func TestColumnTypeTime(t *testing.T) {
 
 func TestColumnDefSimple(t *testing.T) {
 	got := d().ColumnDef("name", lux.ColumnInfo{Type: "TEXT"})
-	if got != "name TEXT NOT NULL" {
+	if got != "\"name\" TEXT NOT NULL" {
 		t.Errorf("got %q", got)
 	}
 }
@@ -171,7 +173,7 @@ func TestColumnDefSimple(t *testing.T) {
 func TestColumnDefNullable(t *testing.T) {
 	got := d().ColumnDef("bio", lux.ColumnInfo{Type: "TEXT", Nullable: true})
 	// Nullable → no NOT NULL
-	if got != "bio TEXT" {
+	if got != "\"bio\" TEXT" {
 		t.Errorf("got %q", got)
 	}
 }
@@ -229,11 +231,11 @@ func TestCreateTable(t *testing.T) {
 	got := d().CreateTable("users", columns, indexes)
 
 	checks := []string{
-		"CREATE TABLE users (",
-		"id SERIAL PRIMARY KEY",
-		"name TEXT NOT NULL",
-		"email TEXT NOT NULL UNIQUE",
-		"CREATE INDEX idx_users_name ON users (name)",
+		"CREATE TABLE \"users\" (",
+		"\"id\" SERIAL PRIMARY KEY",
+		"\"name\" TEXT NOT NULL",
+		"\"email\" TEXT NOT NULL CONSTRAINT \"users_email_key\" UNIQUE",
+		"CREATE INDEX \"idx_users_name\" ON \"users\" (\"name\")",
 	}
 	for _, c := range checks {
 		if !strings.Contains(got, c) {
@@ -247,7 +249,7 @@ func TestCreateTableNoIndexes(t *testing.T) {
 		{Name: "id", Info: lux.ColumnInfo{Type: "SERIAL", PK: true, Serial: true}},
 	}
 	got := d().CreateTable("configs", columns, nil)
-	if !strings.Contains(got, "CREATE TABLE configs") {
+	if !strings.Contains(got, "CREATE TABLE \"configs\"") {
 		t.Errorf("missing CREATE TABLE:\n%s", got)
 	}
 	if strings.Contains(got, "CREATE INDEX") {
@@ -260,7 +262,7 @@ func TestCreateTableNoIndexes(t *testing.T) {
 func TestCreateIndexBTree(t *testing.T) {
 	idx := lux.IndexInfo{Name: "idx_users_name", Kind: lux.BTreeIndex, Columns: []string{"name"}}
 	got := d().CreateIndexSQL(idx, "users")
-	if got != "CREATE INDEX idx_users_name ON users (name);\n" {
+	if got != "CREATE INDEX \"idx_users_name\" ON \"users\" (\"name\");\n" {
 		t.Errorf("BTree index: %q", got)
 	}
 }
@@ -269,7 +271,7 @@ func TestCreateIndexSearch(t *testing.T) {
 	idx := lux.IndexInfo{Name: "idx_posts_title_search", Kind: lux.SearchIndex, Columns: []string{"title"}}
 	got := d().CreateIndexSQL(idx, "posts")
 	// Default lang is "simple"
-	if !strings.Contains(got, "USING gin(to_tsvector('simple', title))") {
+	if !strings.Contains(got, "USING gin(to_tsvector('simple', \"title\"))") {
 		t.Errorf("Search index default lang: %q", got)
 	}
 }
@@ -277,7 +279,7 @@ func TestCreateIndexSearch(t *testing.T) {
 func TestCreateIndexSearchWithLang(t *testing.T) {
 	idx := lux.IndexInfo{Name: "idx_posts_title_search", Kind: lux.SearchIndex, Columns: []string{"title"}, Lang: "english"}
 	got := d().CreateIndexSQL(idx, "posts")
-	if !strings.Contains(got, "USING gin(to_tsvector('english', title))") {
+	if !strings.Contains(got, "USING gin(to_tsvector('english', \"title\"))") {
 		t.Errorf("Search index with lang: %q", got)
 	}
 }
@@ -285,7 +287,7 @@ func TestCreateIndexSearchWithLang(t *testing.T) {
 func TestCreateIndexBRIN(t *testing.T) {
 	idx := lux.IndexInfo{Name: "idx_logs_created_at_brin", Kind: lux.BrinIndex, Columns: []string{"created_at"}}
 	got := d().CreateIndexSQL(idx, "logs")
-	if !strings.Contains(got, "USING brin(created_at)") {
+	if !strings.Contains(got, "USING brin(\"created_at\")") {
 		t.Errorf("BRIN index: %q", got)
 	}
 }
@@ -293,7 +295,7 @@ func TestCreateIndexBRIN(t *testing.T) {
 func TestCreateIndexUnique(t *testing.T) {
 	idx := lux.IndexInfo{Name: "idx_users_email_unique", Kind: lux.UniqueIndex, Columns: []string{"email"}}
 	got := d().CreateIndexSQL(idx, "users")
-	if got != "CREATE UNIQUE INDEX idx_users_email_unique ON users (email);\n" {
+	if got != "CREATE UNIQUE INDEX \"idx_users_email_unique\" ON \"users\" (\"email\");\n" {
 		t.Errorf("Unique index: %q", got)
 	}
 }
@@ -301,7 +303,7 @@ func TestCreateIndexUnique(t *testing.T) {
 func TestCreateIndexComposite(t *testing.T) {
 	idx := lux.IndexInfo{Name: "idx_users_name_email", Kind: lux.CompositeIndex, Columns: []string{"name", "email"}}
 	got := d().CreateIndexSQL(idx, "users")
-	if got != "CREATE INDEX idx_users_name_email ON users (name, email);\n" {
+	if got != "CREATE INDEX \"idx_users_name_email\" ON \"users\" (\"name\", \"email\");\n" {
 		t.Errorf("Composite index: %q", got)
 	}
 }
@@ -310,56 +312,66 @@ func TestCreateIndexComposite(t *testing.T) {
 
 func TestAlterColumnTypeBigint(t *testing.T) {
 	got := d().AlterColumnType("users", "age", "BIGINT")
-	if !strings.Contains(got, "USING age::BIGINT") {
+	if !strings.Contains(got, "USING \"age\"::BIGINT") {
 		t.Errorf("BIGINT should have USING clause: %q", got)
 	}
 }
 
 func TestAlterColumnTypeBoolean(t *testing.T) {
 	got := d().AlterColumnType("users", "active", "BOOLEAN")
-	if !strings.Contains(got, "USING active::BOOLEAN") {
+	if !strings.Contains(got, "USING \"active\"::BOOLEAN") {
 		t.Errorf("BOOLEAN should have USING clause: %q", got)
 	}
 }
 
 func TestAlterColumnTypeUUID(t *testing.T) {
 	got := d().AlterColumnType("users", "token", "UUID")
-	if !strings.Contains(got, "USING token::UUID") {
+	if !strings.Contains(got, "USING \"token\"::UUID") {
 		t.Errorf("UUID should have USING clause: %q", got)
+	}
+}
+
+func TestAlterColumnTypeJSON(t *testing.T) {
+	for _, name := range []string{"JSONB", "JSONB[]"} {
+		got := d().AlterColumnType("documents", "data", name)
+		want := "ALTER TABLE \"documents\" ALTER COLUMN \"data\" TYPE " + name + " USING \"data\"::" + name + ";\n"
+		if got != want {
+			t.Fatalf("migration=%q; want %q", got, want)
+		}
 	}
 }
 
 func TestAlterColumnTypeTimestamptz(t *testing.T) {
 	got := d().AlterColumnType("events", "ts", "TIMESTAMPTZ")
-	if !strings.Contains(got, "USING ts::TIMESTAMPTZ") {
+	if !strings.Contains(got, "USING \"ts\"::TIMESTAMPTZ") {
 		t.Errorf("TIMESTAMPTZ should have USING clause: %q", got)
 	}
 }
 
 func TestAlterColumnTypeDoublePrecision(t *testing.T) {
 	got := d().AlterColumnType("users", "score", "DOUBLE PRECISION")
-	if !strings.Contains(got, "USING score::DOUBLE PRECISION") {
+	if !strings.Contains(got, "USING \"score\"::DOUBLE PRECISION") {
 		t.Errorf("DOUBLE PRECISION should have USING clause: %q", got)
 	}
 }
 
 func TestAlterColumnTypeSmallint(t *testing.T) {
 	got := d().AlterColumnType("users", "level", "SMALLINT")
-	if !strings.Contains(got, "USING level::BIGINT") {
+	if !strings.Contains(got, "USING \"level\"::BIGINT") {
 		t.Errorf("SMALLINT should have USING clause: %q", got)
 	}
 }
 
 func TestAlterColumnTypeSerial(t *testing.T) {
 	got := d().AlterColumnType("users", "seq", "SERIAL")
-	if !strings.Contains(got, "USING seq::BIGINT") {
+	if !strings.Contains(got, "USING \"seq\"::BIGINT") {
 		t.Errorf("SERIAL should have USING clause: %q", got)
 	}
 }
 
 func TestAlterColumnTypeDecimal(t *testing.T) {
 	got := d().AlterColumnType("products", "price", "DECIMAL(10,2)")
-	if !strings.Contains(got, "USING price::DECIMAL") {
+	if !strings.Contains(got, "USING \"price\"::DECIMAL") {
 		t.Errorf("DECIMAL should have USING clause: %q", got)
 	}
 }
@@ -370,7 +382,7 @@ func TestAlterColumnTypeText(t *testing.T) {
 	if strings.Contains(got, "USING") {
 		t.Errorf("TEXT should not have USING clause: %q", got)
 	}
-	want := "ALTER TABLE users ALTER COLUMN name TYPE TEXT;\n"
+	want := "ALTER TABLE \"users\" ALTER COLUMN \"name\" TYPE TEXT;\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -388,7 +400,7 @@ func TestAlterColumnTypeVarchar(t *testing.T) {
 
 func TestAddColumn(t *testing.T) {
 	got := d().AddColumn("users", "bio TEXT")
-	want := "ALTER TABLE users ADD COLUMN bio TEXT;\n"
+	want := "ALTER TABLE \"users\" ADD COLUMN bio TEXT;\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -407,7 +419,7 @@ func TestDropColumn(t *testing.T) {
 
 func TestSetNotNull(t *testing.T) {
 	got := d().SetNotNull("users", "name")
-	want := "ALTER TABLE users ALTER COLUMN name SET NOT NULL;\n"
+	want := "ALTER TABLE \"users\" ALTER COLUMN \"name\" SET NOT NULL;\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -415,7 +427,7 @@ func TestSetNotNull(t *testing.T) {
 
 func TestDropNotNull(t *testing.T) {
 	got := d().DropNotNull("users", "bio")
-	want := "ALTER TABLE users ALTER COLUMN bio DROP NOT NULL;\n"
+	want := "ALTER TABLE \"users\" ALTER COLUMN \"bio\" DROP NOT NULL;\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -423,14 +435,14 @@ func TestDropNotNull(t *testing.T) {
 
 func TestAddUnique(t *testing.T) {
 	got := d().AddUnique("users", "email")
-	if !strings.Contains(got, "ADD CONSTRAINT users_email_key UNIQUE (email)") {
+	if !strings.Contains(got, "ADD CONSTRAINT \"users_email_key\" UNIQUE (\"email\")") {
 		t.Errorf("got %q", got)
 	}
 }
 
 func TestDropUnique(t *testing.T) {
 	got := d().DropUnique("users", "email")
-	if !strings.Contains(got, "DROP CONSTRAINT users_email_key") {
+	if !strings.Contains(got, "DROP CONSTRAINT \"users_email_key\"") {
 		t.Errorf("got %q", got)
 	}
 }
@@ -448,7 +460,7 @@ func TestDropTable(t *testing.T) {
 
 func TestDropIndex(t *testing.T) {
 	got := d().DropIndex("idx_users_name")
-	want := "DROP INDEX IF EXISTS idx_users_name;\n"
+	want := "DROP INDEX IF EXISTS \"idx_users_name\";\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}

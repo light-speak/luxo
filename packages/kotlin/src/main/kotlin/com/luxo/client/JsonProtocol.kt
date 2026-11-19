@@ -2,8 +2,10 @@ package com.luxo.client
 
 import kotlinx.serialization.json.*
 
-internal fun decodeHTTPJSON(bytes: ByteArray): JsonObject =
-    decodeLuxoJSON(decodeJSONDocumentText(bytes)).jsonObject
+internal fun decodeHTTPJSON(bytes: ByteArray, schema: APISchemaEntry? = null): JsonObject {
+    val text = decodeJSONDocumentText(bytes)
+    return if (schema?.responseType == null) decodeLuxoJSON(text).jsonObject else decodeResponseJSON(text, schema)
+}
 
 /** JSON documents use UTF-8; accept one document BOM, never remove U+FEFF from field values. */
 internal fun decodeJSONDocumentText(bytes: ByteArray): String {
@@ -64,14 +66,16 @@ internal fun JsonObjectBuilder.putLuxoParams(params: Map<String, Any?>, meta: AP
 
 private fun typedJsonValue(
     value: Any?, type: String?, isList: Boolean, nullable: Boolean, typeName: String?,
-    types: Map<String, Map<String, SelectionFieldSchema>>,
+    types: Map<String, Map<String, SelectionFieldSchema>>, depth: Int = 1,
 ): JsonElement {
+    if (type == "JSON") return if (isList && value != null && value !== JsonNull)
+        typedJsonList(value, type, typeName, types, depth) else luxoGenericJSONValue(value)
     if (type != "Int" && type != "Duration" && type != "Model" && type != "DateTime") return luxoJsonValue(value)
     if (value == null || value === JsonNull) {
         if (!nullable) throw LuxoError("ConfigError", 0, "parameter is not nullable")
         return JsonNull
     }
-    if (isList) return typedJsonList(value, type, typeName, types)
+    if (isList) return typedJsonList(value, type, typeName, types, depth)
     return when (type) {
         "DateTime" -> {
             val text = if (value is String) value else if (value is JsonPrimitive && value.isString) value.content else throw LuxoError("ConfigError", 0, "DateTime must be a string")
@@ -81,35 +85,36 @@ private fun typedJsonValue(
             requireLuxoInt64(value)
             luxoJsonValue(value)
         }
-        "Model" -> typedJsonObject(value, typeName, types)
+        "Model" -> typedJsonObject(value, typeName, types, depth)
         else -> luxoJsonValue(value)
     }
 }
 
 private fun typedJsonList(
-    value: Any, type: String?, typeName: String?, types: Map<String, Map<String, SelectionFieldSchema>>,
+    value: Any, type: String?, typeName: String?, types: Map<String, Map<String, SelectionFieldSchema>>, depth: Int,
 ): JsonArray {
     if (value is JsonArray) {
-        for (item in value) typedJsonValue(item, type, false, false, typeName, types)
+        for (item in value) typedJsonValue(item, type, false, false, typeName, types, depth)
         return value
     }
     return buildJsonArray {
         when (value) {
-            is Iterable<*> -> for (item in value) add(typedJsonValue(item, type, false, false, typeName, types))
-            is Array<*> -> for (item in value) add(typedJsonValue(item, type, false, false, typeName, types))
+            is Iterable<*> -> for (item in value) add(typedJsonValue(item, type, false, false, typeName, types, depth))
+            is Array<*> -> for (item in value) add(typedJsonValue(item, type, false, false, typeName, types, depth))
             else -> throw LuxoError("ConfigError", 0, "parameter must be a list")
         }
     }
 }
 
 private fun typedJsonObject(
-    value: Any, typeName: String?, types: Map<String, Map<String, SelectionFieldSchema>>,
+    value: Any, typeName: String?, types: Map<String, Map<String, SelectionFieldSchema>>, depth: Int,
 ): JsonObject {
+    require(depth in 1..64) { "model nesting exceeds 64 levels" }
     val fields = types[typeName]
         ?: throw LuxoError("ConfigError", 0, "no input schema for $typeName")
     val source = if (value is LuxoBinaryEncodable) value.toLuxoJson() else value
     if (source is JsonObject) {
-        for ((name, item) in source) typedJsonMember(name, item, fields, types)
+        for ((name, item) in source) typedJsonMember(name, item, fields, types, depth + 1)
         return source
     }
     val members = source as? Map<*, *>
@@ -117,17 +122,17 @@ private fun typedJsonObject(
     return buildJsonObject {
         for ((name, item) in members) {
             if (name !is String) throw LuxoError("ConfigError", 0, "JSON object keys must be strings")
-            put(name, typedJsonMember(name, item, fields, types))
+            put(name, typedJsonMember(name, item, fields, types, depth + 1))
         }
     }
 }
 
 private fun typedJsonMember(
     name: String, item: Any?, fields: Map<String, SelectionFieldSchema>,
-    types: Map<String, Map<String, SelectionFieldSchema>>,
+    types: Map<String, Map<String, SelectionFieldSchema>>, depth: Int,
 ): JsonElement {
     val field = fields[name] ?: return luxoJsonValue(item)
-    return typedJsonValue(item, field.type, field.isList, field.nullable, field.typeName, types)
+    return typedJsonValue(item, field.type, field.isList, field.nullable, field.typeName, types, depth)
 }
 
 /** Error decoding is shared by HTTP responses and correlated WebSocket frames. */
@@ -137,7 +142,7 @@ internal fun decodeLuxoJsonError(json: JsonObject, statusCode: Int): LuxoError? 
         val code = json["code"] as? JsonPrimitive
         require(code != null && !code.isString) { "error code must be an integer" }
         val parsed = parseLuxoIntToken(code.content) ?: throw IllegalArgumentException("error code must be an integer")
-        require(parsed in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) { "error code exceeds signed 32-bit range" }
+        require(parsed in 400L..599L) { "invalid error status" }
         val exactCode = parsed.toInt()
         LuxoError(
             json.requiredString("error"), exactCode, json.requiredString("message"),

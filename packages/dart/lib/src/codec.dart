@@ -13,6 +13,13 @@ import 'schema.dart' show maxSelectionFieldID;
 
 Uint8List _encodeString(String value) => utf8.encode(requireUnicode(value));
 
+int _checkedArrayCount(int count) {
+  if (count < 0 || count > maxArrayElements) {
+    throw RangeError.range(count, 0, maxArrayElements, 'array count');
+  }
+  return count;
+}
+
 /// Luxo binary wire format encoder.
 ///
 /// Wire format matches the Go implementation exactly:
@@ -160,6 +167,10 @@ class LuxoEncoder {
     _buf[_pos++] = 0x01;
   }
 
+  void writeArrayHeader(int count) {
+    writeVarint(_checkedArrayCount(count));
+  }
+
   // --- Field writers ---
 
   /// Writes field header (fieldID) + signed int value.
@@ -204,8 +215,9 @@ class LuxoEncoder {
 
   /// Writes field header + count-prefixed int64 array (zigzag items).
   void writeFieldIntArray(int fieldID, List<LuxoInt64> v) {
+    final count = _checkedArrayCount(v.length);
     writeVarint(fieldID);
-    writeVarint(v.length);
+    writeVarint(count);
     for (final e in v) {
       writeSvarint(e);
     }
@@ -213,8 +225,9 @@ class LuxoEncoder {
 
   /// Writes field header + count-prefixed float64 array (fixed64 items).
   void writeFieldFloatArray(int fieldID, List<double> v) {
+    final count = _checkedArrayCount(v.length);
     writeVarint(fieldID);
-    writeVarint(v.length);
+    writeVarint(count);
     for (final e in v) {
       writeFixed64(e);
     }
@@ -222,10 +235,11 @@ class LuxoEncoder {
 
   /// Writes field header + count-prefixed string array (length-prefixed items).
   void writeFieldStringArray(int fieldID, List<String> v) {
+    final count = _checkedArrayCount(v.length);
     final start = _pos;
     try {
       writeVarint(fieldID);
-      writeVarint(v.length);
+      writeVarint(count);
       for (final e in v) {
         writeString(e);
       }
@@ -237,8 +251,9 @@ class LuxoEncoder {
 
   /// Writes field header + count-prefixed bool array (1 byte per item).
   void writeFieldBoolArray(int fieldID, List<bool> v) {
+    final count = _checkedArrayCount(v.length);
     writeVarint(fieldID);
-    writeVarint(v.length);
+    writeVarint(count);
     for (final e in v) {
       writeBool(e);
     }
@@ -246,8 +261,9 @@ class LuxoEncoder {
 
   /// Writes field header + count-prefixed UUID array (16-byte items).
   void writeFieldUuidArray(int fieldID, List<String> v) {
+    final count = _checkedArrayCount(v.length);
     writeVarint(fieldID);
-    writeVarint(v.length);
+    writeVarint(count);
     for (final e in v) {
       writeUuid(e);
     }
@@ -255,8 +271,9 @@ class LuxoEncoder {
 
   /// Writes field header + count-prefixed byte arrays.
   void writeFieldBytesArray(int fieldID, List<Uint8List> v) {
+    final count = _checkedArrayCount(v.length);
     writeVarint(fieldID);
-    writeVarint(v.length);
+    writeVarint(count);
     for (final e in v) {
       writeBytes(e);
     }

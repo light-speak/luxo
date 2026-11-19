@@ -1,7 +1,6 @@
 package luvia
 
 import (
-	"bytes"
 	"fmt"
 	"math"
 	"net/http"
@@ -9,6 +8,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -126,7 +126,8 @@ func (mc *MetricsCollector) Record(apiName string, duration time.Duration, isErr
 
 	b, ok := mc.buckets[key]
 	if !ok {
-		b = &metricBucket{apiName: apiName, timestamp: time.Unix(key.bucketUnix, 0).UTC()}
+		key.apiName = strings.Clone(apiName)
+		b = &metricBucket{apiName: key.apiName, timestamp: time.Unix(key.bucketUnix, 0).UTC()}
 		mc.buckets[key] = b
 	}
 	ms := float64(duration.Microseconds()) / 1000.0
@@ -161,6 +162,14 @@ func (mc *MetricsCollector) RecordTrace(record api.TraceRecord) {
 		mc.dropped.Traces++
 		return
 	}
+	if size != 0 {
+		record = ownedTraceText(record, size)
+	} else {
+		record.TraceID, record.APIName = "", ""
+		record.ClientName, record.ClientVersion = "", ""
+		record.Spans, record.Selection = "", ""
+	}
+	record.Timestamp = record.Timestamp.UTC()
 	if len(mc.traces) == maxPendingTraces || mc.traceBytes+size > maxPendingTraceBytes {
 		if mc.replaceOldestTrace(record, size) {
 			return
@@ -243,34 +252,7 @@ func (mc *MetricsCollector) flushMetrics() {
 	mc.buckets = make(map[metricBucketKey]*metricBucket)
 	mc.mu.Unlock()
 
-	body, err := mc.encodePendingMetrics(old)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[metrics] encode failed: %v\n", err)
-		return
-	}
-	if len(old) == 0 {
-		return
-	}
-
-	req, err := http.NewRequest("POST", mc.studioURL+"/luvia", bytes.NewReader(body))
-	if err != nil {
-		mc.reenqueue(old)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+mc.apiKey)
-
-	resp, err := mc.client.Do(req)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[metrics] flush failed: %v\n", err)
-		mc.reenqueue(old)
-		return
-	}
-	resp.Body.Close()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		fmt.Fprintf(os.Stderr, "[metrics] flush failed: HTTP %d\n", resp.StatusCode)
-		mc.reenqueue(old)
-	}
+	mc.exportMetricBuckets(old)
 }
 
 func (mc *MetricsCollector) flushTraces() {
@@ -285,34 +267,7 @@ func (mc *MetricsCollector) flushTraces() {
 	mc.traceBytes = 0
 	mc.mu.Unlock()
 
-	body, valid, err := mc.encodePendingTraces(old)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[traces] encode failed: %v\n", err)
-		return
-	}
-	old = valid
-	if len(old) == 0 {
-		return
-	}
-
-	req, err := http.NewRequest("POST", mc.studioURL+"/luvia", bytes.NewReader(body))
-	if err != nil {
-		mc.reenqueueTraces(old)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+mc.apiKey)
-	resp, err := mc.client.Do(req)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[traces] flush failed: %v\n", err)
-		mc.reenqueueTraces(old)
-		return
-	}
-	resp.Body.Close()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		fmt.Fprintf(os.Stderr, "[traces] flush failed: HTTP %d\n", resp.StatusCode)
-		mc.reenqueueTraces(old)
-	}
+	mc.exportTraceRecords(old)
 }
 
 func (mc *MetricsCollector) reenqueueTraces(records []api.TraceRecord) {

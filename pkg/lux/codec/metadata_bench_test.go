@@ -8,6 +8,48 @@ import (
 var metadataCount, metadataOffset int
 var metadataError error
 
+func BenchmarkWireReadOffsetBounds(b *testing.B) {
+	b.Run("varint-short", func(b *testing.B) {
+		data := AppendVarint(nil, 42)
+		b.ReportAllocs()
+		for b.Loop() {
+			if value, n := ReadVarint(data, 0); value != 42 || n != 1 {
+				b.Fatal("invalid result")
+			}
+		}
+	})
+	b.Run("varint-long", func(b *testing.B) {
+		data := AppendVarint(nil, ^uint64(0))
+		b.ReportAllocs()
+		for b.Loop() {
+			if value, n := ReadVarint(data, 0); value != ^uint64(0) || n != 10 {
+				b.Fatal("invalid result")
+			}
+		}
+	})
+	b.Run("float", func(b *testing.B) {
+		data, err := AppendFixed64(nil, 1.25)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		for b.Loop() {
+			if value, n := ReadFixed64(data, 0); value != 1.25 || n != 8 {
+				b.Fatal("invalid result")
+			}
+		}
+	})
+	b.Run("nullable", func(b *testing.B) {
+		data := []byte{1}
+		b.ReportAllocs()
+		for b.Loop() {
+			if value, n := ReadNullable(data, 0); !value || n != 1 {
+				b.Fatal("invalid result")
+			}
+		}
+	})
+}
+
 func BenchmarkMetadataBounds(b *testing.B) {
 	for _, kind := range []string{"array-header", "array-length", "skip-array", "row-field", "column-field", "skip-arena"} {
 		values := []int{1, 128}

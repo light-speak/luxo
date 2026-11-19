@@ -161,3 +161,34 @@ func TestPurposeEnvelopeRejectsMalformedValues(t *testing.T) {
 		}
 	}
 }
+
+func TestVerifyCachedWithExpiryPreservesSignedDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ResetVerifyCache()
+		t.Cleanup(ResetVerifyCache)
+		cfg := testConfig()
+		cfg.Expires = time.Second
+		token, err := Sign(cfg, testClaims(42, "ADMIN"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := time.Now().Add(time.Second).Unix()
+		for range 2 {
+			claims, expiry, err := VerifyCachedWithExpiry(cfg, token)
+			if err != nil || claims.ID() != 42 || expiry != expected {
+				t.Fatalf("claims=%s expiry=%d err=%v", claims.Raw(), expiry, err)
+			}
+		}
+		time.Sleep(time.Second)
+		claims, expiry, err := VerifyCachedWithExpiry(cfg, token)
+		if err == nil || claims.Raw() != "" || expiry != 0 {
+			t.Fatalf("expired identity retained: %s %d %v", claims.Raw(), expiry, err)
+		}
+		for _, config := range []*Config{nil, {Secret: "different"}} {
+			claims, expiry, err := VerifyCachedWithExpiry(config, token)
+			if err == nil || claims.Raw() != "" || expiry != 0 {
+				t.Fatal("invalid verifier retained deadline")
+			}
+		}
+	})
+}

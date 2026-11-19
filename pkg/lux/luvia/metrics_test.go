@@ -621,7 +621,7 @@ func TestMetricsCollectorFlushTraceErrorPayload(t *testing.T) {
 func TestMetricsCollectorFlushTraceFailuresReenqueue(t *testing.T) {
 	t.Run("invalid URL", func(t *testing.T) {
 		mc := newTraceCollector("://invalid", http.DefaultClient)
-		mc.traces = append(mc.traces, api.TraceRecord{TraceID: "invalid-url"})
+		mc.traces = append(mc.traces, observationTestTrace("invalid-url"))
 		mc.flushTraces()
 		assertTraceRequeued(t, mc, "invalid-url")
 	})
@@ -629,7 +629,7 @@ func TestMetricsCollectorFlushTraceFailuresReenqueue(t *testing.T) {
 	t.Run("transport error", func(t *testing.T) {
 		client := &http.Client{Timeout: 100 * time.Millisecond}
 		mc := newTraceCollector("http://127.0.0.1:1", client)
-		mc.traces = append(mc.traces, api.TraceRecord{TraceID: "transport-error"})
+		mc.traces = append(mc.traces, observationTestTrace("transport-error"))
 		mc.flushTraces()
 		assertTraceRequeued(t, mc, "transport-error")
 	})
@@ -640,7 +640,7 @@ func TestMetricsCollectorFlushTraceFailuresReenqueue(t *testing.T) {
 		}))
 		defer srv.Close()
 		mc := newTraceCollector(srv.URL, srv.Client())
-		mc.traces = append(mc.traces, api.TraceRecord{TraceID: "http-error"})
+		mc.traces = append(mc.traces, observationTestTrace("http-error"))
 		mc.flushTraces()
 		assertTraceRequeued(t, mc, "http-error")
 	})

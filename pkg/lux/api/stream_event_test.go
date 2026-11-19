@@ -14,6 +14,215 @@ import (
 
 type eventTestParams struct{ limit int64 }
 
+func TestEventMatcherErrorIsolatesSubscriber(t *testing.T) {
+	for _, kind := range []string{"shared", "identity", "selection"} {
+		t.Run(kind, func(t *testing.T) {
+			router, topic := typedEventTestRouter(t)
+			first, second := openTypedTestStream(t, router), openTypedTestStream(t, router)
+			first.sub.Ch <- []byte("accepted")
+			topic.subs[0].params.limit = -1
+			failure := luxerrors.BadRequest.WithData(&luxerrors.ParamError{Param: "condition", Error: "overflow"})
+			matcher := func(params *eventTestParams, _ any) (bool, error) {
+				if params.limit == -1 {
+					return false, failure
+				}
+				return true, nil
+			}
+			encode := func([]byte, bool) ([]byte, error) { return []byte("good"), nil }
+			private := func(mask []byte, binary bool, _ any) ([]byte, error) { return encode(mask, binary) }
+			var err error
+			switch kind {
+			case "shared":
+				err = topic.Dispatch(matcher, encode)
+			case "identity":
+				err = topic.DispatchIdentity(matcher, private)
+			case "selection":
+				err = topic.DispatchIdentitySelection(matcher, private, func([]byte) bool { return true })
+			}
+			if err != nil || first.Err() != failure || second.Err() != nil || router.Streams.SubCount("watch") != 1 || len(topic.subs) != 1 {
+				t.Fatal("failure isolation", err, first.Err(), second.Err())
+			}
+			if string(<-first.Messages()) != "accepted" {
+				t.Fatal("accepted data lost")
+			}
+			if _, open := <-first.Messages(); open || string(<-second.Messages()) != "good" {
+				t.Fatal("failed subscription open or healthy data lost")
+			}
+			if err := topic.Dispatch(nil, encode); err != nil || string(<-second.Messages()) != "good" {
+				t.Fatal("remaining subscription unusable", err)
+			}
+		})
+	}
+}
+
+func TestEventIdentitySelectionCacheBoundaries(t *testing.T) {
+	router, topic := typedEventTestRouter(t)
+	var subs []*StreamSub
+	for range 2 {
+		for _, binary := range []bool{false, true} {
+			for _, mask := range [][]byte{{1}, {2}, {1, 2}} {
+				sub := router.Streams.subscribePreparedMode("watch", nil, []int{len(subs)}, mask, binary, nil, nil, preparedStream{bind: func(sub *StreamSub) { topic.attach(sub, eventTestParams{}) }})
+				subs = append(subs, sub)
+				defer router.Streams.Unsubscribe("watch", sub)
+			}
+		}
+	}
+	for event := byte(1); event <= 2; event++ {
+		calls := 0
+		err := topic.DispatchIdentitySelection(nil, func(mask []byte, binary bool, identity any) ([]byte, error) {
+			calls++
+			if identity != nil {
+				t.Fatal("shared output retained identity")
+			}
+			mode := byte(0)
+			if binary {
+				mode = 1
+			}
+			return append([]byte{event, mode}, mask...), nil
+		}, func([]byte) bool { return true })
+		if err != nil || calls != 6 {
+			t.Fatalf("event %d: calls=%d err=%v", event, calls, err)
+		}
+		for _, sub := range subs {
+			body := <-sub.Ch
+			if body[0] != event || (body[1] == 1) != sub.Binary || string(body[2:]) != string(sub.FieldMask) {
+				t.Fatalf("cached output crossed event/mode/selection boundary: %v", body)
+			}
+		}
+	}
+}
+
+func TestEventIdentityIndependentSelectionReusesEncoding(t *testing.T) {
+	router, topic := typedEventTestRouter(t)
+	var subs []*StreamSub
+	for _, mask := range [][]byte{{1}, {1}, {3}, {3}} {
+		sub := router.Streams.subscribePreparedMode("watch", nil, len(subs), mask, true, nil, nil, preparedStream{bind: func(sub *StreamSub) { topic.attach(sub, eventTestParams{}) }})
+		subs = append(subs, sub)
+		defer router.Streams.Unsubscribe("watch", sub)
+	}
+	calls := 0
+	err := topic.DispatchIdentitySelection(nil, func(mask []byte, _ bool, identity any) ([]byte, error) {
+		calls++
+		if mask[0] == 1 {
+			if identity != nil {
+				t.Fatal("shared encoding retained identity")
+			}
+			return []byte{42}, nil
+		}
+		return []byte{byte(identity.(int))}, nil
+	}, func(mask []byte) bool { return mask[0] == 1 })
+	if err != nil || calls != 3 {
+		t.Fatal("wrong encoding count", calls, err)
+	}
+	first, second := <-subs[0].Ch, <-subs[1].Ch
+	if &first[0] != &second[0] {
+		t.Fatal("independent selection not reused")
+	}
+	for index := 2; index < len(subs); index++ {
+		if data := <-subs[index].Ch; data[0] != byte(index) {
+			t.Fatal("private projection shared", index, data)
+		}
+	}
+}
+
+func TestEventDispatchIdentityIsolation(t *testing.T) {
+	router, topic := typedEventTestRouter(t)
+	var subscribers []*StreamSub
+	for index := range 3 {
+		sub := router.Streams.subscribePreparedMode("watch", nil, []int{index}, nil, true, nil, nil, preparedStream{bind: func(sub *StreamSub) { topic.attach(sub, eventTestParams{}) }})
+		subscribers = append(subscribers, sub)
+		defer router.Streams.Unsubscribe("watch", sub)
+	}
+	encode := func(_ []byte, binary bool, identity any) ([]byte, error) {
+		if !binary {
+			t.Fatal("mode lost")
+		}
+		return []byte{byte(identity.([]int)[0])}, nil
+	}
+	if err := topic.DispatchIdentity(nil, encode); err != nil {
+		t.Fatal(err)
+	}
+	for index, sub := range subscribers {
+		if body := <-sub.Ch; len(body) != 1 || body[0] != byte(index) {
+			t.Fatal("identity encoding reused", index, body)
+		}
+	}
+	match := func(_ *eventTestParams, identity any) (bool, error) { return identity.([]int)[0] == 1, nil }
+	if err := topic.DispatchIdentity(match, encode); err != nil {
+		t.Fatal(err)
+	}
+	for index, sub := range subscribers {
+		want := 0
+		if index == 1 {
+			want = 1
+		}
+		if len(sub.Ch) != want {
+			t.Fatal("matcher ignored", index)
+		}
+		if want != 0 {
+			<-sub.Ch
+		}
+	}
+	failure := errors.New("encode failure")
+	if err := topic.DispatchIdentity(nil, func([]byte, bool, any) ([]byte, error) { return nil, failure }); err != failure {
+		t.Fatal("encoding error lost", err)
+	}
+	for _, sub := range subscribers {
+		if len(sub.Ch) != 0 {
+			t.Fatal("failed encoding sent")
+		}
+	}
+	for len(subscribers[0].Ch) < cap(subscribers[0].Ch) {
+		subscribers[0].Ch <- nil
+	}
+	if err := topic.DispatchIdentity(nil, encode); err != nil {
+		t.Fatal(err)
+	}
+	if router.Streams.SubCount("watch") != 2 {
+		t.Fatal("slow subscriber retained")
+	}
+}
+
+func TestEventDispatchIdentityConcurrentCancellation(t *testing.T) {
+	router, topic := typedEventTestRouter(t)
+	var subscribers []*StreamSub
+	for index := range 16 {
+		sub := router.Streams.subscribePreparedMode("watch", nil, []int{index}, nil, true, nil, nil, preparedStream{bind: func(sub *StreamSub) { topic.attach(sub, eventTestParams{}) }})
+		subscribers = append(subscribers, sub)
+	}
+	start := make(chan struct{})
+	var work sync.WaitGroup
+	work.Go(func() {
+		<-start
+		for range 128 {
+			if err := topic.DispatchIdentity(nil, func(_ []byte, _ bool, identity any) ([]byte, error) {
+				return []byte{byte(identity.([]int)[0])}, nil
+			}); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	})
+	work.Go(func() {
+		<-start
+		for _, sub := range subscribers {
+			router.Streams.Unsubscribe("watch", sub)
+		}
+	})
+	close(start)
+	work.Wait()
+	if router.Streams.SubCount("watch") != 0 || len(topic.subs) != 0 {
+		t.Fatal("cancelled subscriptions retained")
+	}
+	for index, sub := range subscribers {
+		for data := range sub.Ch {
+			if len(data) != 1 || data[0] != byte(index) {
+				t.Fatal("cross-subscriber encoding", index, data)
+			}
+		}
+	}
+}
+
 func typedEventTestRouter(t *testing.T) (*Router, *EventStream[eventTestParams]) {
 	t.Helper()
 	router := NewRouter()
@@ -70,7 +279,7 @@ func TestTypedEventStreamWebSocketPreparation(t *testing.T) {
 						ack, data = []byte{BinaryFrameSubscribeSuccess, 1}, []byte{BinaryFrameStream, 1, 14}
 					}
 					requireWSFrame(t, ctx, conn, mode, ack)
-					if err := topic.Dispatch(func(params *eventTestParams, _ any) bool { return params.limit == 7 }, func(_ []byte, mode bool) ([]byte, error) {
+					if err := topic.Dispatch(func(params *eventTestParams, _ any) (bool, error) { return params.limit == 7, nil }, func(_ []byte, mode bool) ([]byte, error) {
 						if mode {
 							return []byte{14}, nil
 						}
@@ -114,7 +323,7 @@ func TestTypedEventStreamRemovalAndEncoding(t *testing.T) {
 	}
 	calls := 0
 	encode := func([]byte, bool) ([]byte, error) { calls++; return []byte{14}, nil }
-	if err := topic.Dispatch(func(*eventTestParams, any) bool { return false }, encode); err != nil || calls != 0 {
+	if err := topic.Dispatch(func(*eventTestParams, any) (bool, error) { return false, nil }, encode); err != nil || calls != 0 {
 		t.Fatal("unmatched event encoded")
 	}
 	for range cap(second.sub.Ch) + 1 {
@@ -223,7 +432,7 @@ func TestTypedEventStreamProjectionAndCleanup(t *testing.T) {
 }
 
 func TestEventDispatchPanicReleasesHub(t *testing.T) {
-	for _, kind := range []string{"typed-match", "typed-encode", "prepared-match", "prepared-encode", "encoded-match"} {
+	for _, kind := range []string{"typed-match", "typed-encode", "identity-match", "identity-encode", "selection-predicate", "selection-encode", "prepared-match", "prepared-encode", "encoded-match"} {
 		t.Run(kind, func(t *testing.T) {
 			router, topic := typedEventTestRouter(t)
 			sub := router.Streams.subscribePreparedMode("watch", nil, nil, nil, true, nil, nil, preparedStream{bind: func(sub *StreamSub) { topic.attach(sub, eventTestParams{}) }})
@@ -236,12 +445,28 @@ func TestEventDispatchPanicReleasesHub(t *testing.T) {
 			panicked := func() (panicked bool) {
 				defer func() { panicked = recover() != nil }()
 				switch kind {
+				case "selection-predicate", "selection-encode":
+					_ = topic.DispatchIdentitySelection(nil, func([]byte, bool, any) ([]byte, error) {
+						panic("native encoder")
+					}, func([]byte) bool {
+						if kind == "selection-predicate" {
+							panic("projection predicate")
+						}
+						return true
+					})
+				case "identity-match", "identity-encode":
+					_ = topic.DispatchIdentity(func(*eventTestParams, any) (bool, error) {
+						if kind == "identity-match" {
+							panic("native matcher")
+						}
+						return true, nil
+					}, func([]byte, bool, any) ([]byte, error) { panic("native encoder") })
 				case "typed-match", "typed-encode":
-					_ = topic.Dispatch(func(*eventTestParams, any) bool {
+					_ = topic.Dispatch(func(*eventTestParams, any) (bool, error) {
 						if kind == "typed-match" {
 							panic("native matcher")
 						}
-						return true
+						return true, nil
 					}, encode)
 				case "prepared-match", "prepared-encode":
 					_ = router.Streams.DispatchPreparedEvent("watch", func(*StreamParams, any) bool {

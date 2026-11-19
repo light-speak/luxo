@@ -35,7 +35,7 @@ func (e *Encoder) writeStringPtrBeforeUTF8(id int, value *string) {
 
 func writeStringArrayBeforeUTF8(e *Encoder, _ string, values []string) error {
 	e.buf = AppendVarint(e.buf, 256)
-	e.buf = AppendArrayHeader(e.buf, len(values))
+	e.buf = AppendVarint(e.buf, uint64(len(values)))
 	for _, value := range values {
 		e.buf = appendStringBeforeUTF8(e.buf, value)
 	}

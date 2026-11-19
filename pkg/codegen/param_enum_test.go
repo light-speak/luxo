@@ -83,7 +83,7 @@ func writeInferredEnumFixture(source *strings.Builder, list bool) {
 		op, name = "in", "countRecordsByStateIn"
 	}
 	inf := &InferredAPI{Action: "count", ModelName: "Record", Groups: []ClauseGroup{{Clauses: []InferClause{{Field: "state", Op: op}}}}}
-	generateInferredHandler(source, &ast.ApiDecl{Name: name, Params: []*ast.ParamDecl{param}}, inf, map[string]bool{"State": true}, model)
+	defaultGenerator().generateInferredHandler(source, &ast.ApiDecl{Name: name, Params: []*ast.ParamDecl{param}}, inf, map[string]bool{"State": true}, model)
 }
 
 const enumParamAssertions = `package generated

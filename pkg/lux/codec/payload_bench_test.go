@@ -18,7 +18,7 @@ func BenchmarkElementPayload(b *testing.B) {
 				}
 				data := make([]byte, count*tc.width)
 				if !column {
-					data = append(AppendArrayHeader(nil, count), data...)
+					data = append(AppendVarint(nil, uint64(count)), data...)
 				}
 				for version, reader := range []payloadReaderCase{before[index], tc} {
 					b.Run(fmt.Sprintf("%s/column=%v/count=%d/version=%d", tc.name, column, count, version), func(b *testing.B) {
@@ -39,7 +39,7 @@ func BenchmarkMissingElementPayload(b *testing.B) {
 			}
 			var data []byte
 			if !column {
-				data = AppendArrayHeader(nil, 16384)
+				data = AppendVarint(nil, uint64(16384))
 			}
 			for version, reader := range []payloadReaderCase{before[index], tc} {
 				b.Run(fmt.Sprintf("%s/column=%v/version=%d", tc.name, column, version), func(b *testing.B) {

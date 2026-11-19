@@ -8,21 +8,18 @@ internal object KotlinRequestCodegen {
         p.nullable || optional(api, p) -> "$base?"
         else -> base
     }
-    private fun missingPages(api: LuxoAPI) = if (api.paginated) pagination.filter { name -> api.params.none { it.name == name } } else emptyList()
 
     fun declarations(api: LuxoAPI, types: (LuxoParam) -> String, selection: Boolean): List<String> = buildList {
         for (p in api.params) {
             val default = if (p.nullable && p.hasDefault) " = LuxoOptional.Absent" else if (optional(api, p)) " = null" else ""
             add("${p.name}: ${type(api, p, types(p))}$default")
         }
-        for (name in missingPages(api)) add("$name: Long? = null")
         if (selection) addAll(listOf("select: String? = null", "`\$selectionPlan`: PreparedSelection? = null"))
         if (api.paginated) addAll(listOf("filters: List<LuxoFilter>? = null", "sorters: List<LuxoSorter>? = null"))
     }
 
     fun invocation(api: LuxoAPI, selection: Boolean, select: String): String {
         val args = api.params.map { it.name }.toMutableList()
-        args += missingPages(api)
         if (selection) args += listOf(select, "`\$selectionPlan`")
         if (api.paginated) args += listOf("filters", "sorters")
         return "_${api.name}Request(${args.joinToString(", ")})"
@@ -31,7 +28,6 @@ internal object KotlinRequestCodegen {
     fun generate(api: LuxoAPI, selection: Boolean, types: (LuxoParam) -> String,
         scalar: (StringBuilder, LuxoField, String) -> Unit): String = buildString {
         val fields = api.params.mapIndexed { i, p -> "private val p$i: ${type(api, p, types(p))}" }.toMutableList()
-        for (name in missingPages(api)) fields += "private val $name: Long?"
         if (selection) fields += listOf("override val selection: String?", "override val selectionPlan: PreparedSelection?")
         if (api.paginated) fields += listOf("override val filters: List<LuxoFilter>?", "override val sorters: List<LuxoSorter>?")
         appendLine("\nprivate class _${api.name}Request(${fields.joinToString(", ")}) : GeneratedRequest {")
@@ -41,7 +37,6 @@ internal object KotlinRequestCodegen {
         appendLine("    }")
         appendLine("    override fun toJSONParameters(): Map<String, Any?> = buildMap {")
         for ((i, p) in api.params.withIndex()) writeJSON(this, api, p, i)
-        for (name in missingPages(api)) appendLine("        if ($name != null) put(\"$name\", $name)")
         if (selection) appendLine("        if (selection != null) put(\"\${'$'}select\", selection)")
         if (api.paginated) {
             appendLine("        if (filters != null) put(\"\${'$'}filters\", filters.map { mapOf(\"field\" to it.field, \"op\" to it.op, \"value\" to it.value) })")
@@ -58,12 +53,12 @@ internal object KotlinRequestCodegen {
         out.appendLine("        val value = p$i${if (tri) ".value" else ""}")
         if (optional(api, p) && !tri) out.appendLine("        if (value != null) {")
         out.appendLine("        encoder.writeVarint(${p.id}L)")
-        if (p.nullable) out.appendLine("        if (value == null) { encoder.writeBool(false) } else {\n        encoder.writeBool(true)")
-        val field = LuxoField(p.id, p.name, p.type, typeName = p.typeName)
+        val field = LuxoField(p.id, p.name, p.type, typeName = p.typeName, isList = p.isList)
+        if (p.nullable) out.appendLine("        if (${LuxoCodegen.kotlinNullCondition(field, "value")}) { encoder.writeBool(false) } else {\n        encoder.writeBool(true)")
         if (p.isList && p.type in listOf("Int", "Duration")) {
             out.appendLine("        encoder.writeIntList(value)")
         } else if (p.isList) {
-            out.appendLine("        encoder.writeVarint(value.size.toLong())\n        for (item in value) {")
+            out.appendLine("        encoder.writeArrayHeader(value.size)\n        for (item in value) {")
             writeScalar(out, field, "item", scalar)
             out.appendLine("        }")
         } else writeScalar(out, field, "value", scalar)

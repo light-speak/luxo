@@ -44,6 +44,12 @@ func (c *compiler) restoreBinding(binding lexicalBinding) {
 	}
 }
 
+func (c *compiler) restoreBindings(bindings []lexicalBinding) {
+	for index := len(bindings) - 1; index >= 0; index-- {
+		c.restoreBinding(bindings[index])
+	}
+}
+
 func (c *compiler) saveStatementBindings(bindings []lexicalBinding, statement ast.Stmt) []lexicalBinding {
 	declaration, ok := statement.(*ast.ValStmt)
 	if !ok {
@@ -68,7 +74,7 @@ func (c *compiler) compileLogicalBinary(expr *ast.BinaryExpr, left string) strin
 	var statements strings.Builder
 	parent, indent := c.b, c.indent
 	c.b, c.indent = &statements, indent+"\t"
-	right := c.compileExpr(expr.Right)
+	right := c.compileBooleanValue(expr.Right)
 	c.b, c.indent = parent, indent
 	if statements.Len() == 0 {
 		return logicalExpression(left, expr.Op, right)
@@ -77,6 +83,32 @@ func (c *compiler) compileLogicalBinary(expr *ast.BinaryExpr, left string) strin
 	result := fmt.Sprintf("_logical%d", c.resultTmp)
 	writeLogicalBranch(parent, indent, result, left, right, statements.String(), expr.Op == "||")
 	return result
+}
+
+// A database Boolean still has an error channel before it can enter an expression.
+func (c *compiler) compileBooleanValue(expr ast.Expr) string {
+	query := c.isModelQuery(expr)
+	if query && !isErrorReturningBool(expr) {
+		return c.compileMaterializedValue(expr, nil)
+	}
+	value := c.compileExpr(expr)
+	if c.models[expr.GetTypeTag()] != nil && !expr.IsListType() {
+		value = c.modelReference(expr, value)
+		if _, literal := expr.(*ast.ObjectExpr); literal {
+			// Composite literals need grouping in switch and if headers.
+			value = "(" + value + ")"
+		}
+	}
+	if !isErrorReturningBool(expr) || !query {
+		return value
+	}
+	c.resultTmp++
+	name := fmt.Sprintf("_boolean%d", c.resultTmp)
+	c.write("%s, err := %s", name, value)
+	c.write("if err != nil {")
+	c.writeErrorReturn("\t", "err")
+	c.write("}")
+	return name
 }
 
 func logicalExpression(left, op, right string) string {
@@ -132,6 +164,17 @@ func (c *compiler) valueCompiler() *compiler {
 	return sub
 }
 
+// Branches share the resolved result ABI, including nullable scalar/object values.
+func (c *compiler) branchValueCompiler(expr ast.Expr) *compiler {
+	sub := c.valueCompiler()
+	if expr.IsNullable() {
+		sub.valueResult = &ast.TypeRef{Name: expr.GetTypeTag(), IsList: expr.IsListType(), Nullable: true}
+	} else {
+		sub.valueModel = c.models[expr.GetTypeTag()] != nil
+	}
+	return sub
+}
+
 // finishValueClosure keeps infallible expressions allocation-free. Fallible
 // expressions use a local error slot checked immediately after the inline call;
 // no panic/recover, reflection or transport serialization crosses this boundary.
@@ -175,21 +218,48 @@ func (c *compiler) errorCompiler() *compiler {
 }
 
 func (c *compiler) compileValueBranch(expr ast.Expr) {
-	if lambda, ok := expr.(*ast.LambdaExpr); ok {
-		for index, statement := range lambda.Body.Stmts {
-			if last, ok := statement.(*ast.ExprStmt); ok && index == len(lambda.Body.Stmts)-1 {
-				c.compileReturn(&ast.ReturnStmt{Value: last.Expr})
-			} else {
-				c.compileStmt(statement)
-			}
-			switch statement.(type) {
-			case *ast.ReturnStmt, *ast.ThrowStmt:
-				return
-			}
-		}
+	switch value := expr.(type) {
+	case *ast.LambdaExpr:
+		c.compileBranchStatements(value.Body)
 		return
+	case *ast.UnaryExpr:
+		if value.Op == "throw" {
+			c.writeErrorReturn("", c.compileThrowExpr(value.Value))
+			return
+		}
 	}
-	c.compileReturn(&ast.ReturnStmt{Value: expr})
+	if c.whenScope != nil {
+		c.compileExprStmt(&ast.ExprStmt{Expr: expr})
+	} else {
+		c.compileReturn(&ast.ReturnStmt{Value: expr})
+	}
+}
+
+func (c *compiler) compileBranchStatements(block *ast.Block) {
+	var local [8]lexicalBinding
+	bindings := local[:0]
+	for index, statement := range block.Stmts {
+		bindings = c.saveStatementBindings(bindings, statement)
+		if last, ok := statement.(*ast.ExprStmt); ok && index == len(block.Stmts)-1 && c.whenScope == nil {
+			c.compileReturn(&ast.ReturnStmt{Value: last.Expr})
+		} else {
+			c.compileStmt(statement)
+		}
+		switch statement.(type) {
+		case *ast.ReturnStmt, *ast.ThrowStmt:
+			c.restoreBindings(bindings)
+			return
+		}
+	}
+	c.restoreBindings(bindings)
+}
+
+func (c *compiler) finishWhenClosure(sub *compiler, expr *ast.WhenExpr, fallback bool) string {
+	goType := c.inferWhenReturnType(expr)
+	if fallback {
+		sub.write("return %s", zeroValueForType(goType))
+	}
+	return c.finishValueClosure(sub, goType, sub.b.String())
 }
 
 // Nested else scopes preserve lazy condition evaluation, including statements
@@ -197,9 +267,9 @@ func (c *compiler) compileValueBranch(expr ast.Expr) {
 func (c *compiler) compileWhenConditions(expr *ast.WhenExpr, subject string) {
 	indent := c.indent
 	for _, branch := range expr.Branches {
-		condition := c.compileExpr(branch.Condition)
+		condition := c.compileBooleanValue(branch.Condition)
 		if subject != "" {
-			condition = subject + " == " + condition
+			condition = c.compileWhenEquality(expr.Subject, branch.Condition, subject, condition)
 		}
 		c.write("if %s {", condition)
 		c.indent += "\t"
@@ -216,6 +286,29 @@ func (c *compiler) compileWhenConditions(expr *ast.WhenExpr, subject string) {
 		c.write("}")
 	}
 	c.indent = indent
+}
+
+func whenNeedsValueEquality(expr *ast.WhenExpr) bool {
+	if expr.Subject == nil || expr.Subject.IsListType() {
+		return false
+	}
+	if expr.Subject.GetTypeTag() == "DateTime" || expr.Subject.GetTypeTag() == "Decimal" || expr.Subject.IsNullable() {
+		return true
+	}
+	for _, branch := range expr.Branches {
+		if branch.Condition != nil && branch.Condition.IsNullable() {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *compiler) compileWhenEquality(subject, pattern ast.Expr, left, right string) string {
+	comparison := &ast.BinaryExpr{Left: subject, Right: pattern, Op: "=="}
+	if expression, ok := c.compileScalarComparison(comparison, left, right); ok {
+		return expression
+	}
+	return left + " == " + right
 }
 
 func whenConditionsCall(expr *ast.WhenExpr) bool {
@@ -248,15 +341,15 @@ func (c *compiler) compileYieldWhenBranches(expr *ast.WhenExpr, result string, e
 	indent := c.indent
 	subject := ""
 	if expr.Subject != nil {
-		value := c.compileExpr(expr.Subject)
+		value := c.compileBooleanValue(expr.Subject)
 		c.resultTmp++
 		subject = fmt.Sprintf("_yieldSubject%d", c.resultTmp)
 		c.write("%s := %s", subject, value)
 	}
 	for _, branch := range expr.Branches {
-		condition := c.compileExpr(branch.Condition)
+		condition := c.compileBooleanValue(branch.Condition)
 		if subject != "" {
-			condition = subject + " == " + condition
+			condition = c.compileWhenEquality(expr.Subject, branch.Condition, subject, condition)
 		}
 		c.write("if %s {", condition)
 		c.indent += "\t"
@@ -307,9 +400,7 @@ func (c *compiler) compileYieldValueBlock(block *ast.Block, result string, expec
 			c.compileStmt(statement)
 		}
 	}
-	for i := len(bindings) - 1; i >= 0; i-- {
-		c.restoreBinding(bindings[i])
-	}
+	c.restoreBindings(bindings)
 }
 
 func (c *compiler) compileForValue(s *ast.ForStmt, yield bool) string {
@@ -328,13 +419,24 @@ func (c *compiler) compileForValue(s *ast.ForStmt, yield bool) string {
 	if !yield {
 		sub.write("var _result %s", goType)
 	}
-	if bounds, ok := s.Collection.(*ast.RangeExpr); ok {
-		start, end := c.compileExpr(bounds.Start), c.compileExpr(bounds.End)
-		sub.write("for %s := int64(%s); %s <= %s; %s++ {", s.VarName, start, s.VarName, end, s.VarName)
+	sub.withLoopScope(func() { sub.compileForValueLoop(s, yield) })
+	if yield {
+		sub.write("return nil")
 	} else {
-		sub.write("for _, %s := range %s {", s.VarName, c.compileExpr(s.Collection))
+		sub.write("return _result")
 	}
-	sub.indent += "\t"
+	return c.finishValueClosure(sub, goType, sub.b.String())
+}
+
+func (c *compiler) compileForValueLoop(s *ast.ForStmt, yield bool) {
+	c.compileLoopHeader(s)
+	if s.VarName != "" {
+		c.vars[s.VarName] = c.loopElementType(s.Collection)
+	}
+	c.indent += "\t"
+	if s.VarName != "" {
+		c.write("_ = %s", c.bindings.name(s.VarName))
+	}
 	for index, statement := range s.Body.Stmts {
 		if !yield && index == len(s.Body.Stmts)-1 {
 			var expression ast.Expr
@@ -344,17 +446,15 @@ func (c *compiler) compileForValue(s *ast.ForStmt, yield bool) string {
 			case *ast.ReturnStmt:
 				expression = last.Value
 			}
-			sub.write("_result = append(_result, %s)", sub.compileExpr(expression))
+			value := c.compileMaterializedValue(expression, nil)
+			if c.models[s.GetTypeTag()] != nil {
+				value = c.modelReference(expression, value)
+			}
+			c.write("_result = append(_result, %s)", value)
 		} else {
-			sub.compileStmt(statement)
+			c.compileStmt(statement)
 		}
 	}
-	sub.indent = strings.TrimSuffix(sub.indent, "\t")
-	sub.write("}")
-	if yield {
-		sub.write("return nil")
-	} else {
-		sub.write("return _result")
-	}
-	return c.finishValueClosure(sub, goType, sub.b.String())
+	c.indent = strings.TrimSuffix(c.indent, "\t")
+	c.write("}")
 }

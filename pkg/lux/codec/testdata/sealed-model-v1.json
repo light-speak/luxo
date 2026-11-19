@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "dsl": "model Person @noTime { id: Int @id name: String }\nsealed ModelResult { Owner(person: Person, people: [Person]) }\napi echo(value: ModelResult): ModelResult { return value }\n",
+  "input": {"Owner": {"person": {"id": 7, "name": "first"}, "people": [{"id": 8, "name": "second"}]}},
+  "selection": "Owner{person{id},people{name}}",
+  "selected": {"Owner": {"person": {"id": 7}, "people": [{"name": "second"}]}}
+}

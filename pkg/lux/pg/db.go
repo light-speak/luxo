@@ -5,6 +5,7 @@ package pg
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -46,6 +47,12 @@ func NewDBWithConfig(ctx context.Context, connString string, cfg lux.DBConfig) (
 	if err != nil {
 		return nil, fmt.Errorf("pg: parse config: %w", err)
 	}
+	if cfg.Pool < 0 || cfg.Pool > math.MaxInt32 {
+		return nil, fmt.Errorf("pg: pool size out of range: %d", cfg.Pool)
+	}
+	if cfg.Idle < 0 || cfg.Idle > math.MaxInt32 {
+		return nil, fmt.Errorf("pg: idle connections out of range: %d", cfg.Idle)
+	}
 	poolCfg.MaxConns = int32(cfg.Pool)
 	poolCfg.MinConns = int32(cfg.Idle)
 	if cfg.Timeout > 0 {
@@ -76,7 +83,7 @@ func (db *DB) Pool() *pgxpool.Pool {
 
 // Tx runs fn inside a database transaction. The *DB passed to fn uses the
 // transaction for all queries. If fn returns nil, the transaction commits;
-// otherwise it rolls back. Panics inside fn are recovered and cause a rollback.
+// otherwise it rolls back. Panic and Goexit also roll back; panics propagate.
 // A nested call uses a savepoint on the current connection, not a new pool
 // transaction, so releasing it never commits independently of its parent.
 func (db *DB) Tx(ctx context.Context, fn func(tx *DB) error) (err error) {
@@ -86,13 +93,9 @@ func (db *DB) Tx(ctx context.Context, fn func(tx *DB) error) (err error) {
 	}
 
 	txDB := &DB{pool: db.pool, conn: pgxTx}
-
+	returned := false
 	defer func() {
-		if p := recover(); p != nil {
-			_ = pgxTx.Rollback(ctx)
-			panic(p) // re-panic after rollback
-		}
-		if err != nil {
+		if !returned || err != nil {
 			_ = pgxTx.Rollback(ctx)
 			return
 		}
@@ -100,6 +103,7 @@ func (db *DB) Tx(ctx context.Context, fn func(tx *DB) error) (err error) {
 	}()
 
 	err = fn(txDB)
+	returned = true
 	return
 }
 
@@ -111,7 +115,7 @@ func QueryRows[T any](ctx context.Context, db *DB, scan ScanFunc[T], query strin
 // queryValues supports both model pointers and plain projection values without
 // a dynamic row map or an intermediate result conversion.
 func queryValues[T any](ctx context.Context, db *DB, scan func(Rows) (T, error), query string, args ...any) ([]T, error) {
-	rows, err := db.conn.Query(ctx, query, args...)
+	rows, err := db.queryBound(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -133,9 +137,10 @@ func (db *DB) QueryRows[T any](ctx context.Context, scan ScanFunc[T], query stri
 	return QueryRows(ctx, db, scan, query, args...)
 }
 
-// QueryRow executes a SELECT and scans the first row, or returns nil.
+// QueryRow scans the first row, or returns nil, and checks command completion.
+// A successful scanner alone does not prove that the statement succeeded.
 func QueryRow[T any](ctx context.Context, db *DB, scan ScanFunc[T], query string, args ...any) (*T, error) {
-	rows, err := db.conn.Query(ctx, query, args...)
+	rows, err := db.queryBound(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -147,25 +152,6 @@ func QueryRow[T any](ctx context.Context, db *DB, scan ScanFunc[T], query string
 		}
 		return nil, nil
 	}
-	return scan(rows)
-}
-
-// QueryRow scans the first row on this pool or transaction, or returns nil.
-func (db *DB) QueryRow[T any](ctx context.Context, scan ScanFunc[T], query string, args ...any) (*T, error) {
-	return QueryRow(ctx, db, scan, query, args...)
-}
-
-// writeRow drains the command completion before returning a mutation result.
-// A successful row scanner alone does not prove that the statement committed.
-func writeRow[T any](ctx context.Context, db *DB, scan ScanFunc[T], query string, args ...any) (*T, error) {
-	rows, err := db.conn.Query(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	if !rows.Next() {
-		return nil, rows.Err()
-	}
 	row, err := scan(rows)
 	rows.Close()
 	if err == nil {
@@ -174,10 +160,15 @@ func writeRow[T any](ctx context.Context, db *DB, scan ScanFunc[T], query string
 	return row, err
 }
 
+// QueryRow scans the first row on this pool or transaction, or returns nil.
+func (db *DB) QueryRow[T any](ctx context.Context, scan ScanFunc[T], query string, args ...any) (*T, error) {
+	return QueryRow(ctx, db, scan, query, args...)
+}
+
 // QueryScalar executes a SELECT and scans a single scalar value.
 func QueryScalar[T any](ctx context.Context, db *DB, query string, args ...any) (T, error) {
 	var result T
-	err := db.conn.QueryRow(ctx, query, args...).Scan(&result)
+	err := db.queryRowBound(ctx, query, args...).Scan(&result)
 	return result, err
 }
 
@@ -189,12 +180,12 @@ func (db *DB) QueryScalar[T any](ctx context.Context, query string, args ...any)
 // QueryRaw executes a row query through the active pool or transaction.
 // Generated batch resolvers use it when each row contains several aggregate values.
 func QueryRaw(ctx context.Context, db *DB, query string, args ...any) (Rows, error) {
-	return db.conn.Query(ctx, query, args...)
+	return db.queryBound(ctx, query, args...)
 }
 
 // Exec executes a statement and returns rows affected.
 func Exec(ctx context.Context, db *DB, query string, args ...any) (int64, error) {
-	tag, err := db.conn.Exec(ctx, query, args...)
+	tag, err := db.execBound(ctx, query, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -203,6 +194,12 @@ func Exec(ctx context.Context, db *DB, query string, args ...any) (int64, error)
 
 // InsertReturning inserts a row and scans the RETURNING * result.
 func InsertReturning[T any](ctx context.Context, db *DB, scan ScanFunc[T], table string, cols []string, vals []any) (*T, error) {
+	if len(vals) != len(cols) {
+		return nil, fmt.Errorf("pg: insert has %d values for %d columns", len(vals), len(cols))
+	}
+	if len(cols) == 0 {
+		return QueryRow(ctx, db, scan, "INSERT INTO "+table+" DEFAULT VALUES RETURNING *", vals...)
+	}
 	var b strings.Builder
 	var tmp [20]byte
 	b.WriteString("INSERT INTO ")
@@ -218,13 +215,23 @@ func InsertReturning[T any](ctx context.Context, db *DB, scan ScanFunc[T], table
 		b.Write(strconv.AppendInt(tmp[:0], int64(i+1), 10))
 	}
 	b.WriteString(") RETURNING *")
-	return writeRow(ctx, db, scan, b.String(), vals...)
+	return QueryRow(ctx, db, scan, b.String(), vals...)
 }
 
 // InsertManyReturning inserts multiple rows and scans all RETURNING * results.
 func InsertManyReturning[T any](ctx context.Context, db *DB, scan ScanFunc[T], table string, cols []string, rows [][]any) ([]*T, error) {
 	if len(rows) == 0 {
 		return nil, nil
+	}
+	for i, row := range rows {
+		if len(row) != len(cols) {
+			return nil, fmt.Errorf("pg: insert row %d has %d values for %d columns", i, len(row), len(cols))
+		}
+	}
+	if len(cols) == 0 {
+		// An empty target list lets PostgreSQL apply every column default to
+		// each source row, preserving one atomic statement for the batch.
+		return QueryRows(ctx, db, scan, "INSERT INTO "+table+" SELECT FROM generate_series(1, $1::bigint) RETURNING *", int64(len(rows)))
 	}
 
 	var b strings.Builder
@@ -301,5 +308,5 @@ func UpdateReturningBy[T any, ID comparable](ctx context.Context, db *DB, scan S
 	b.WriteString(" RETURNING *")
 	args = append(args, id)
 
-	return writeRow(ctx, db, scan, b.String(), args...)
+	return QueryRow(ctx, db, scan, b.String(), args...)
 }

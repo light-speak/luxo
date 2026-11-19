@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,27 @@ import (
 
 	"github.com/light-speak/luxo/pkg/lux/schema"
 )
+
+var streamClassificationSink bool
+
+func BenchmarkStreamAPIClassification(b *testing.B) {
+	router := NewRouter()
+	for index, name := range []string{"schema-stream", "schema-regular"} {
+		if err := router.Schema.RegisterAPI(&schema.API{ID: index + 1, Name: name, Stream: index == 0}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	router.HandleStream("matcher", func([]byte, *StreamParams, any) bool { return true })
+	router.HandleStreamNative("native", func(context.Context, *StreamParams, any, *Stream) error { return nil })
+	for _, name := range []string{"schema-stream", "schema-regular", "missing", "matcher", "native"} {
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				streamClassificationSink = router.isStreamAPI(name)
+			}
+		})
+	}
+}
 
 func BenchmarkWSJSONSubscriptionMetadata(b *testing.B) {
 	for _, apiName := range []string{`"watchIdentity"`, `"\u0077atchIdentity"`} {

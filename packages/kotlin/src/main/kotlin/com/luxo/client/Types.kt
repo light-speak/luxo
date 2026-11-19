@@ -59,6 +59,33 @@ data class LuxoSchema(
     val apis: Map<String, LuxoAPI> = emptyMap(),
     val enums: Map<String, LuxoEnum> = emptyMap(),
     val types: Map<String, LuxoTypeDecl> = emptyMap(),
+    val sealeds: Map<String, LuxoSealed> = emptyMap(),
+) {
+    /** Preserve generated tools compiled before the sealed directory was introduced. */
+    internal constructor(models: Map<String, LuxoModel> = emptyMap(), apis: Map<String, LuxoAPI> = emptyMap(),
+        enums: Map<String, LuxoEnum> = emptyMap(), types: Map<String, LuxoTypeDecl> = emptyMap()) :
+        this(models, apis, enums, types, emptyMap())
+
+    @JvmName("copy")
+    internal fun legacyCopy(models: Map<String, LuxoModel> = this.models, apis: Map<String, LuxoAPI> = this.apis,
+        enums: Map<String, LuxoEnum> = this.enums, types: Map<String, LuxoTypeDecl> = this.types): LuxoSchema =
+        LuxoSchema(models, apis, enums, types, sealeds)
+}
+
+@Serializable
+data class LuxoSealed(
+    val name: String,
+    val variants: List<LuxoSealedVariant> = emptyList(),
+    val module: String = "",
+    val usage: TypeUsage? = null,
+    val description: String = "",
+)
+
+@Serializable
+data class LuxoSealedVariant(
+    val id: Int,
+    val name: String,
+    val fields: List<LuxoParam> = emptyList(),
 )
 
 @Serializable
@@ -109,11 +136,11 @@ data class LuxoField(
     val name: String,
     val type: String,
     val typeName: String? = null,
-    val nullable: Boolean = false,
-    val isList: Boolean = false,
-    val relation: Boolean = false,
-    val computed: Boolean = false,
-    val primaryKey: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val nullable: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val isList: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val relation: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val computed: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val primaryKey: Boolean = false,
     val description: String = "",
     val directives: List<String> = emptyList(),
     val relationKind: RelationKind? = null,
@@ -130,17 +157,18 @@ data class LuxoAPI(
     val name: String,
     val module: String,
     val returnType: String? = null,
-    val returnList: Boolean = false,
-    val paginated: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val returnList: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val paginated: Boolean = false,
     val defaultPageSize: Int? = null,
-    val stream: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val stream: Boolean = false,
     val params: List<LuxoParam> = emptyList(),
-    val deprecated: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val deprecated: Boolean = false,
     val deprecatedReason: String = "",
     val description: String = "",
     val directives: List<String> = emptyList(),
+    @Serializable(with = SchemaBooleanSerializer::class)
     @SerialName("internal") val isInternal: Boolean = false,
-    val returnNullable: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val returnNullable: Boolean = false,
     val query: LuxoQueryCapabilities? = null,
 )
 
@@ -160,8 +188,8 @@ data class LuxoParam(
     val type: String,
     val typeName: String? = null,
     /** True when the param is an array ([T]). */
-    val isList: Boolean = false,
-    val nullable: Boolean = false,
-    val hasDefault: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val isList: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val nullable: Boolean = false,
+    @Serializable(with = SchemaBooleanSerializer::class) val hasDefault: Boolean = false,
     val description: String = "",
 )

@@ -39,7 +39,15 @@ void main() {
   });
   test('generates only advertised query capabilities', () async {
     final document = <String, dynamic>{
-      'models': <String, Object>{},
+      'models': {
+        'User': {
+          'name': 'User',
+          'fields': [
+            {'id': 1, 'name': 'id', 'type': 'Int'},
+            {'id': 2, 'name': 'state', 'type': 'Enum', 'typeName': 'State'},
+          ],
+        },
+      },
       'enums': {
         'State': {
           'name': 'State',
@@ -51,7 +59,12 @@ void main() {
           'id': 1,
           'name': 'listUsers',
           'module': 'user',
+          'returnType': 'User',
           'paginated': true,
+          'params': [
+            {'id': 7, 'name': 'page', 'type': 'Int', 'hasDefault': true},
+            {'id': 9, 'name': 'pageSize', 'type': 'Int', 'hasDefault': true},
+          ],
           'query': {
             'filters': [
               {
@@ -72,6 +85,7 @@ void main() {
           'id': 2,
           'name': 'custom',
           'module': 'user',
+          'returnType': 'Int',
           'returnList': true,
         },
       },

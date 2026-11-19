@@ -1,6 +1,11 @@
 package api
 
-import "github.com/light-speak/luxo/pkg/lux/schema"
+import (
+	"cmp"
+	"slices"
+
+	"github.com/light-speak/luxo/pkg/lux/schema"
+)
 
 // Plans are replaced during registration and remain read-only while serving.
 type binaryAPIPlan struct {
@@ -16,11 +21,20 @@ type binaryParamLookup struct {
 	base  int
 	slots [32]uint8
 	ids   []int
+	wide  []binaryParamIndex
 }
 
 func newBinaryParamLookup(params []ParamMeta) binaryParamLookup {
 	var p binaryParamLookup
-	if len(params) == 0 || len(params) > 16 {
+	if len(params) > 16 {
+		p.wide = make([]binaryParamIndex, len(params))
+		for i, param := range params {
+			p.wide[i] = binaryParamIndex{id: param.FieldID, index: i}
+		}
+		slices.SortFunc(p.wide, func(a, b binaryParamIndex) int { return cmp.Compare(a.id, b.id) })
+		return p
+	}
+	if len(params) == 0 {
 		return p
 	}
 	p.base = params[0].FieldID
@@ -47,7 +61,16 @@ func newBinaryParamLookup(params []ParamMeta) binaryParamLookup {
 	return p
 }
 
+type binaryParamIndex struct{ id, index int }
+
 func (p *binaryParamLookup) find(id int) int {
+	if p.wide != nil {
+		index, found := slices.BinarySearchFunc(p.wide, id, func(entry binaryParamIndex, id int) int { return cmp.Compare(entry.id, id) })
+		if !found {
+			return -1
+		}
+		return p.wide[index].index
+	}
 	if p.ids == nil {
 		offset := uint(id) - uint(p.base)
 		if offset < uint(len(p.slots)) {

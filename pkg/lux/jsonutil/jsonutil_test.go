@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -18,6 +19,36 @@ func TestValidUTF8JSON(t *testing.T) {
 	for _, raw := range [][]byte{nil, []byte(""), []byte("{"), []byte("NaN"), []byte("true false"), {'"', 0xff, '"'}} {
 		if ValidUTF8JSON(raw) {
 			t.Errorf("accepted invalid raw JSON %q", raw)
+		}
+	}
+}
+
+func TestCloneJSONValueDepthAndOwnership(t *testing.T) {
+	for _, depth := range []int{0, 127, 128, 129} {
+		raw := []byte(strings.Repeat("[", depth) + "0" + strings.Repeat("]", depth))
+		got, err := CloneJSONValue(raw)
+		if depth > 128 {
+			if err == nil || got != nil {
+				t.Fatalf("deep value returned: %q / %v", got, err)
+			}
+			continue
+		}
+		if err != nil || string(got) != string(raw) {
+			t.Fatalf("depth %d: %q / %v", depth, got, err)
+		}
+		raw[depth] = '1'
+		if got[depth] != '0' {
+			t.Fatal("JSON input retained borrowed source")
+		}
+	}
+}
+
+func TestJSONDepthAfterWidePrefix(t *testing.T) {
+	prefix := strings.Repeat("{},", 128)
+	for _, depth := range []int{0, 127, 128, 129} {
+		raw := "[" + prefix + strings.Repeat("[", depth) + "0" + strings.Repeat("]", depth) + "]"
+		if got := ValidUTF8JSON([]byte(raw)); got != (depth <= 127) {
+			t.Fatalf("depth %d after wide prefix: %t", depth, got)
 		}
 	}
 }
@@ -278,4 +309,53 @@ func TestPrettyPrint(t *testing.T) {
 			t.Errorf("PrettyPrint() expected error for channel")
 		}
 	})
+}
+
+func TestGenericJSONContainerDepth(t *testing.T) {
+	for _, shape := range [][2]string{{"[", "]"}, {"{\"x\":", "}"}, {"[{\"x\":", "}]"}} {
+		for _, containers := range []int{0, 1, 63, 64, 127, 128, 129, 130} {
+			for _, leaf := range []string{"0", "null", "[]", "{}", "\"[{}]\""} {
+				text := strings.Repeat(shape[0], containers) + leaf + strings.Repeat(shape[1], containers)
+				count := containers
+				if shape[0] == "[{\"x\":" {
+					count *= 2
+				}
+				if leaf == "[]" || leaf == "{}" {
+					count++
+				}
+				if got := ValidUTF8JSON([]byte(text)); got != (count <= 128) {
+					t.Errorf("containers=%d leaf=%s got=%v", count, leaf, got)
+				}
+			}
+		}
+	}
+	// Brackets in strings, escaped quotes and duplicated keys cannot hide excess nesting.
+	deep := strings.Repeat("[", 129) + "0" + strings.Repeat("]", 129)
+	for _, text := range []string{"{\"x\":" + deep + ",\"x\":0}", "[" + deep + ",0]"} {
+		if ValidUTF8JSON([]byte(text)) {
+			t.Fatal("hidden depth accepted")
+		}
+	}
+}
+
+func TestGenericJSONDepthQuotedText(t *testing.T) {
+	for _, text := range []string{
+		strings.Repeat("[{}]", 512), strings.Repeat(`\"[`, 256), strings.Repeat(`\\`, 256),
+	} {
+		raw, err := json.Marshal(text)
+		if err != nil || !ValidUTF8JSON(raw) {
+			t.Fatal("quoted containers changed depth", err)
+		}
+		if !ValidUTF8JSON(append(append([]byte{'['}, raw...), ']')) {
+			t.Fatal("nested quoted containers changed depth")
+		}
+		for _, invalid := range [][]byte{raw[:len(raw)-1], append(raw[:len(raw)-1:len(raw)-1], '\\', '"')} {
+			if ValidUTF8JSON(invalid) {
+				t.Fatal("unterminated long string accepted")
+			}
+			if ValidUTF8JSON(append([]byte{'['}, invalid...)) {
+				t.Fatal("nested unterminated long string accepted")
+			}
+		}
+	}
 }

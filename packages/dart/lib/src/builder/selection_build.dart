@@ -231,12 +231,30 @@ const _excludedDirectories = {
   'node_modules',
 };
 
+bool _isFlutterGenerated(String relative) {
+  final path = relative.endsWith('/')
+      ? relative.substring(0, relative.length - 1)
+      : relative;
+  return const {
+    'ios/.symlinks',
+    'ios/Pods',
+    'ios/Flutter/ephemeral',
+    'macos/.symlinks',
+    'macos/Pods',
+    'macos/Flutter/ephemeral',
+    'linux/flutter/ephemeral',
+    'windows/flutter/ephemeral',
+  }.contains(path);
+}
+
 Future<List<File>> _sourceFiles(Directory root) async {
   final files = <File>[];
   Future<void> scan(Directory directory) async {
     await for (final entry in directory.list(followLinks: false)) {
       final name = entry.uri.pathSegments.where((p) => p.isNotEmpty).last;
-      if (_excludedDirectories.contains(name)) continue;
+      if (_excludedDirectories.contains(name) ||
+          _isFlutterGenerated(root.uri.relativize(entry.uri)))
+        continue;
       if (entry is Link)
         throw StateError(
           'Source symlinks require explicit build configuration: ${entry.path}',

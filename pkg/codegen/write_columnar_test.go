@@ -355,16 +355,21 @@ import (
     "bytes"
     "strings"
     "testing"
+    "time"
+    "github.com/light-speak/luxo/pkg/lux/auth"
     "github.com/light-speak/luxo/pkg/lux/api"
     "github.com/light-speak/luxo/pkg/lux/codec"
     "github.com/light-speak/luxo/pkg/lux/str"
 )
 var transformCalls int
 func transformName(value string) string { transformCalls++; return strings.ToUpper(value) }
-type identity struct { role string }
-func (i identity) ID() int64 { return 1 }
-func (i identity) Int(string) int64 { return 0 }
-func (i identity) String(key string) string { if key == "role" { return i.role }; return "" }
+func columnarClaims(t *testing.T,role string) auth.Claims {
+    t.Helper();cfg:=&auth.Config{Secret:"columnar-directive-test",Expires:time.Hour}
+    token,err:=auth.Sign(cfg,func(dst []byte)([]byte,error){
+        dst=append(dst,` + "`" + `{"role":"` + "`" + `...);dst=append(dst,role...);return append(dst,` + "`" + `"}` + "`" + `...),nil
+    });if err!=nil{t.Fatal(err)}
+    claims,err:=auth.Verify(cfg,token);if err!=nil{t.Fatal(err)};return claims
+}
 func TestNestedColumnDirectives(t *testing.T) {
     secret := "confidentiallongvalue"
     children := []PrivateChild{{Name:"firstlongvalue", Secret:&secret}, {Name:"secondlongvalue"}}
@@ -372,7 +377,7 @@ func TestNestedColumnDirectives(t *testing.T) {
     for _, role := range []string{"admin","guest"} {
         for _, fields := range []byte{1,3} {
             mask := testutil.Bytes(t)(codec.AppendSelectionMask(nil, []byte{1}, []codec.SelectionMaskChild{{FieldID:1, Mask:[]byte{1,fields}}}))
-            buf := api.ResponseBuf{Identity:identity{role:role}}
+            buf := api.ResponseBuf{Identity:columnarClaims(t,role)}
             transformCalls = 0
             writeFixture(&buf, items, mask)
             expectedCalls := 2

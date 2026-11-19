@@ -16,9 +16,18 @@ type Claims struct {
 	data *claimData
 }
 
+// Subject identifies the signed authentication model, independently of business fields.
+func (c Claims) Subject() string {
+	if c.data == nil {
+		return ""
+	}
+	return c.data.subject
+}
+
 type claimData struct {
-	fields map[string]ClaimValue
-	raw    string
+	subject string
+	fields  map[string]ClaimValue
+	raw     string
 }
 
 // ClaimValue retains the original JSON number rather than a float64 surrogate.

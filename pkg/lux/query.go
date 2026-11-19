@@ -1,7 +1,6 @@
 package lux
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 )
@@ -34,9 +33,15 @@ func BuildSelectSQL(table string, fields []string, conds []Condition, orderBy []
 	var args []any
 	argIdx := 1
 
+	b.Grow(selectPrefixSize(table, fields))
 	b.WriteString("SELECT ")
 	if len(fields) > 0 {
-		b.WriteString(strings.Join(fields, ", "))
+		for index, field := range fields {
+			if index > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(field)
+		}
 	} else {
 		b.WriteByte('*')
 	}
@@ -47,6 +52,18 @@ func BuildSelectSQL(table string, fields []string, conds []Condition, orderBy []
 	appendLimitOffset(&b, &argIdx, &args, limit, offset)
 
 	return b.String(), args
+}
+
+func selectPrefixSize(table string, fields []string) int {
+	size := len("SELECT  FROM ") + len(table)
+	if len(fields) == 0 {
+		return size + 1
+	}
+	size += (len(fields) - 1) * len(", ")
+	for _, field := range fields {
+		size += len(field)
+	}
+	return size
 }
 
 // BuildExistsSQL builds a SELECT EXISTS(SELECT 1 FROM ... WHERE ... LIMIT 1) query.
@@ -79,7 +96,13 @@ func BuildAggregateSQL(table, fn, col string, conds []Condition) (string, []any)
 	var b strings.Builder
 	var args []any
 	argIdx := 1
-	fmt.Fprintf(&b, "SELECT COALESCE(%s(%s), 0) FROM %s", fn, col, table)
+	b.Grow(len("SELECT COALESCE((), 0) FROM ") + len(fn) + len(col) + len(table))
+	b.WriteString("SELECT COALESCE(")
+	b.WriteString(fn)
+	b.WriteByte('(')
+	b.WriteString(col)
+	b.WriteString("), 0) FROM ")
+	b.WriteString(table)
 	argIdx, args = appendWhere(&b, argIdx, args, conds)
 	_ = argIdx
 	return b.String(), args

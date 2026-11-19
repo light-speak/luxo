@@ -24,12 +24,24 @@ func (c *compiler) authMethod(call *ast.CallExpr) *ast.MemberExpr {
 	return member
 }
 
+// Address model literals before selecting their generated pointer methods.
+func (c *compiler) compileLiteralModelReceiver(expr ast.Expr) (string, bool) {
+	object, literal := expr.(*ast.ObjectExpr)
+	if !literal || c.models[object.TypeName] == nil {
+		return "", false
+	}
+	return fmt.Sprintf("(&%s)", c.compileMaterializedValue(object, nil)), true
+}
+
 func (c *compiler) compileAuthMethod(call *ast.CallExpr) (string, bool) {
 	member := c.authMethod(call)
 	if member == nil {
 		return "", false
 	}
-	object := c.compileExpr(member.Object)
+	object, literal := c.compileLiteralModelReceiver(member.Object)
+	if !literal {
+		object = c.compileExpr(member.Object)
+	}
 	args := make([]string, 0, len(call.Args))
 	for _, arg := range call.Args {
 		args = append(args, c.compileExpr(arg.Value))

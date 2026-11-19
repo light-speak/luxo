@@ -24,6 +24,18 @@ func TestNormalizePreservesMeasurementsAcrossStartupLogs(t *testing.T) {
 	}
 }
 
+func TestNormalizePreservesBareNamesAndBlankStartupLines(t *testing.T) {
+	raw := "pkg: example\n\nBenchmarkRPC_Echo-2\n2026/11/06 00:50:00 server starting\n\n10 12 ns/op 0 B/op 0 allocs/op\n\nPASS\n"
+	var output bytes.Buffer
+	if err := normalize(strings.NewReader(raw), &output); err != nil {
+		t.Fatal(err)
+	}
+	want := "pkg: example\nBenchmarkRPC_Echo-2\t10 12 ns/op 0 B/op 0 allocs/op\nPASS\n"
+	if output.String() != want {
+		t.Fatalf("lost bare name or misclassified startup log: %q", output.String())
+	}
+}
+
 func TestNormalizeNeverInventsMissingMeasurements(t *testing.T) {
 	for _, raw := range []string{
 		"BenchmarkRPC_Echo-2 log\nPASS\n", "BenchmarkRPC_Echo-2 log\n",
@@ -33,6 +45,37 @@ func TestNormalizeNeverInventsMissingMeasurements(t *testing.T) {
 	} {
 		if err := normalize(strings.NewReader(raw), &bytes.Buffer{}); err == nil {
 			t.Errorf("accepted missing or ambiguous measurement %q", raw)
+		}
+	}
+}
+
+func TestNormalizeRejectsMalformedMetricsBeforeAValidRow(t *testing.T) {
+	const header = "pkg: github.com/light-speak/luxo/pkg/a\n"
+	const tail = "10 12 ns/op 0 B/op 0 allocs/op\n"
+	for _, malformed := range []string{
+		"10 NaN ns/op 0 B/op 0 allocs/op", "10 +Inf ns/op 0 B/op 0 allocs/op",
+		"10 -1 ns/op 0 B/op 0 allocs/op", "0 12 ns/op 0 B/op 0 allocs/op",
+		"18446744073709551616 12 ns/op 0 B/op 0 allocs/op",
+		"10 broken ns/op 0 B/op 0 allocs/op", "10 12 ns/op 0 B/op 0",
+		"10", "10 12", "10 broken", "1.5", "NaN", "1e9999",
+	} {
+		for _, prefix := range []string{"BenchmarkRead-2 ", "BenchmarkRead-2 startup\n"} {
+			raw := header + strings.Repeat("BenchmarkRead-2 "+tail, 9) + prefix + malformed + "\n" + tail + "PASS\n"
+			var output bytes.Buffer
+			if err := normalize(strings.NewReader(raw), &output); err == nil {
+				verified := verifySamples(strings.NewReader(output.String()), []sampleKey{{Package: "pkg/a", Name: "BenchmarkRead-2"}}) == nil
+				t.Errorf("concealed malformed metrics %q; verification accepted=%v", malformed, verified)
+			}
+		}
+	}
+}
+
+func TestNormalizeRejectsMeasurementsWithoutBenchmarkIdentity(t *testing.T) {
+	const row = "10 12 ns/op 0 B/op 0 allocs/op\n"
+	for _, extra := range []string{row, "10 NaN ns/op 0 B/op 0 allocs/op\n", "10 12\n"} {
+		raw := "pkg: github.com/light-speak/luxo/pkg/a\n" + strings.Repeat("BenchmarkRead-2 "+row, 10) + extra + "PASS\n"
+		if err := normalize(strings.NewReader(raw), &bytes.Buffer{}); err == nil {
+			t.Errorf("discarded an unidentified measurement: %q", extra)
 		}
 	}
 }

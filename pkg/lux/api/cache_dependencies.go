@@ -11,9 +11,10 @@ import (
 
 // Built only by startup validation, never mutated while serving requests.
 type cacheDependencyPlan struct {
-	models    []schema.ComputedSource
-	selection *schema.SelectionDependencies
-	policy    *compiledCachePolicy
+	models       []schema.ComputedSource
+	selection    *schema.SelectionDependencies
+	policy       *compiledCachePolicy
+	returnsValue bool
 }
 
 func (rt *Router) prepareCacheRequirements() (map[string]*cacheDependencyPlan, error) {
@@ -62,7 +63,7 @@ func (rt *Router) prepareCachePlan(name string, selections map[string]*schema.Se
 	if err != nil {
 		return nil, fmt.Errorf("api: cached API %q: %w", name, err)
 	}
-	return &cacheDependencyPlan{models: models, selection: selected, policy: policy}, nil
+	return &cacheDependencyPlan{models: models, selection: selected, policy: policy, returnsValue: definition.ReturnType != ""}, nil
 }
 
 func (rt *Router) prepareCacheModels(models []schema.ComputedSource) ([]schema.ComputedSource, error) {
@@ -86,7 +87,7 @@ func (rt *Router) prepareCacheSelection(name string, prepared map[string]*schema
 	if plan := prepared[name]; plan != nil {
 		return plan, nil
 	}
-	if rt.Schema.LookupModel(name) != nil {
+	if rt.Schema.SelectionModel(name) != nil {
 		plan, err := rt.Schema.PrepareSelectionDependencies(name)
 		if err == nil {
 			prepared[name] = plan

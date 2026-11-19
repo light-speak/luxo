@@ -5368,6 +5368,20 @@ func testModelForCompletion() *ast.ModelDecl {
 	}
 }
 
+func TestInferredAPICompletionUnicodeFields(t *testing.T) {
+	for field, suffix := range map[string]string{"école": "École", "用户": "用户", "𐐨value": "𐐀value"} {
+		t.Run(field, func(t *testing.T) {
+			model := &ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{{Name: field, Type: &ast.TypeRef{Name: "String"}}}}
+			for _, item := range buildModelAPICompletions(model, map[string]bool{}, "get") {
+				if item.Label == "getUserBy"+suffix {
+					return
+				}
+			}
+			t.Fatal("missing intact Unicode inferred field completion")
+		})
+	}
+}
+
 func TestInferredAPICompletionFieldLevel(t *testing.T) {
 	m := testModelForCompletion()
 	items := buildModelAPICompletions(m, map[string]bool{}, "get")
@@ -6881,5 +6895,32 @@ func TestDidChangeWatchedFilesMarksSiblingsDirty(t *testing.T) {
 	server.docs.mu.RUnlock()
 	if !dirtyAfter {
 		t.Error("expected siblingDirty=true after watched file change")
+	}
+}
+
+func TestAuthDefinitionUsesDefaultSubjectAcrossFiles(t *testing.T) {
+	store := NewDocumentStore()
+	store.Open("file:///luxo-auth-review/base.luxo", 1, `model Base { label: String }`)
+	store.Open("file:///luxo-auth-review/user.luxo", 1, `model Admin @withAuth(stores: [id]) { id: Int @id label: Int }
+model User : Base @withAuth(stores: [id], default: true) { id: Int @id }`)
+	store.Open("file:///luxo-auth-review/query.luxo", 1, `api current(): Int @auth { return my.id }`)
+	for _, uri := range []string{"file:///luxo-auth-review/user.luxo", "file:///luxo-auth-review/query.luxo"} {
+		doc := store.Get(uri)
+		if got := findWithAuthModelName(doc); got != "User" {
+			t.Errorf("%s: subject=%q want User", uri, got)
+		}
+		pos := findMyLoadFieldDefinition(doc, "label")
+		if pos == nil || !strings.HasSuffix(pos.File, "base.luxo") {
+			t.Errorf("%s: inherited definition=%v", uri, pos)
+		}
+	}
+	store.Open("file:///luxo-auth-review/user.luxo", 2, `model Admin @withAuth(stores: [id], default: true) { id: Int @id label: Int }
+model User : Base @withAuth(stores: [id], default: false) { id: Int @id }`)
+	doc := store.Get("file:///luxo-auth-review/query.luxo")
+	if findWithAuthModelName(doc) != "Admin" {
+		t.Fatal("definition retained the previous default subject")
+	}
+	if pos := findMyLoadFieldDefinition(doc, "label"); pos == nil || !strings.HasSuffix(pos.File, "user.luxo") {
+		t.Fatalf("definition retained the previous inherited field: %v", pos)
 	}
 }

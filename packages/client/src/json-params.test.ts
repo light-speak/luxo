@@ -9,6 +9,67 @@ function validator(meta: APISchema): JSONParamValidator {
 }
 
 describe('compiled JSON integer paths', () => {
+  it('validates raw sealed cases before duplicate folding and keeps JSON depth independent', () => {
+    const check = validator({ id: 1, params: [{ name: 'value', fieldID: 1, type: 'Sealed', typeName: 'Outcome' }], types: {
+      '@sealed:Outcome': { Pending: { fieldID: 1, type: 'Model', typeName: 'Outcome.Pending' }, Next: { fieldID: 2, type: 'Model', typeName: 'Outcome.Next' } },
+      'Outcome.Pending': {}, 'Outcome.Next': {
+        child: { fieldID: 1, type: 'Sealed', typeName: 'Outcome', nullable: true }, note: { fieldID: 2, type: 'JSON' },
+      },
+    } })
+    expect(check.validateEncoded('echo', '{"value":{"Pending":{}}}')).toBe('{"value":{"Pending":{}}}')
+    for (const value of ['{}', '{"Future":{}}', '{"Pending":null}', '{"Pending":{},"Pending":{}}', '{"Pending":{},"Next":{}}', '{"Pending":{"extra":0}}']) {
+      expect(() => check.validateEncoded('echo', '{"value":' + value + '}')).toThrow()
+    }
+    const nested = (count: number): unknown => {
+      let value: unknown = { Pending: {} }
+      for (let i = 1; i < count; i++) value = { Next: { child: value } }
+      return value
+    }
+    expect(() => check.validateEncoded('echo', JSON.stringify({ value: nested(32) }))).not.toThrow()
+    expect(() => check.validateEncoded('echo', JSON.stringify({ value: nested(33) }))).toThrow(/64/)
+    const json = '['.repeat(128) + '0' + ']'.repeat(128)
+    expect(() => check.validateEncoded('echo', '{"value":{"Next":{"note":' + json + '}}}')).not.toThrow()
+    expect(() => check.validateEncoded('echo', '{"value":{"Next":{"note":[' + json + '],"note":0}}}')).toThrow(/128/)
+    expect(() => check.validateEncoded('echo', '{"value":{"Next":{"note":1,"note":2}}}')).not.toThrow()
+  })
+  it('rejects a model getter that changes shape before Bytes projection', () => {
+    const check = validator({ id: 1, params: [{ fieldID: 1, name: 'node', type: 'Model', typeName: 'Node' }],
+      types: { Node: { bytes: { fieldID: 1, type: 'Bytes' } } } })
+    let reads = 0
+    const input = { get node(): unknown { return ++reads === 1 ? {} : 42 } }
+    expect(() => check.prepare('echo', input)).toThrow('node must be an object')
+    expect(reads).toBe(2)
+  })
+
+  it('projects plain Enum strings when legacy metadata omits the enum name', () => {
+    const check = validator({ id: 1, params: [{ fieldID: 1, name: 'state', type: 'Enum' }] })
+    expect(check.prepare('echo', { state: 'READY' })).toEqual({ state: 'READY' })
+  })
+
+  it.each([false, true])('counts only model objects toward the 64-layer limit (list=%s)', list => {
+    const check = validator({ id: 1, params: [{ name: 'node', fieldID: 1, type: 'Model', typeName: 'Node' }], types: { Node: {
+      next: { fieldID: 1, type: 'Model', typeName: 'Node', isList: list, nullable: true },
+      json: { fieldID: 2, type: 'JSON' }, bytes: { fieldID: 3, type: 'Bytes' },
+    } } })
+    let json: unknown = {}
+    for (let i = 1; i < 128; i++) json = { child: json }
+    const input = (layers: number): Record<string, unknown> => {
+      let node: Record<string, unknown> = { next: list ? [] : null, json }
+      for (let i = 1; i < layers; i++) node = { next: list ? [node] : node }
+      return { node }
+    }
+    const valid = input(64)
+    expect(() => check.validate('echo', valid)).not.toThrow()
+    expect(check.prepare('echo', valid)).toBe(valid)
+    for (const operation of ['validate', 'prepare'] as const) {
+      expect(() => check[operation]('echo', input(65))).toThrow(/model nesting exceeds 64 levels/)
+      const cyclic: Record<string, unknown> = {}
+      cyclic.next = list ? [cyclic] : cyclic
+      expect(() => check[operation]('echo', { node: cyclic })).toThrow(/model nesting exceeds 64 levels/)
+    }
+    expect(check.prepare('echo', { node: { bytes: new Uint8Array([255]) } })).toEqual({ node: { bytes: '/w==' } })
+  })
+
   it('projects scalar and model-list Bytes with safe property names', () => {
     const check = validator({ id: 1, params: [
       { name: 'data', fieldID: 1, type: 'Bytes', nullable: true },
@@ -36,6 +97,18 @@ describe('compiled JSON integer paths', () => {
     } finally {
       Object.defineProperty(Uint8Array.prototype, 'toBase64', original)
     }
+  })
+
+  it('bounds model projection when a getter changes its value after validation', () => {
+    const check = validator({ id: 1, params: [{ name: 'node', fieldID: 1, type: 'Model', typeName: 'Node' }], types: { Node: {
+      next: { fieldID: 1, type: 'Model', typeName: 'Node' }, bytes: { fieldID: 2, type: 'Bytes' },
+    } } })
+    const cyclic: Record<string, unknown> = {}
+    cyclic.next = cyclic
+    let reads = 0
+    const params = { get node(): Record<string, unknown> { return ++reads === 1 ? {} : cyclic } }
+    expect(() => check.prepare('echo', params)).toThrow(/model nesting exceeds 64 levels/)
+    expect(reads).toBe(2)
   })
 
   it('projects only declared Bytes paths without mutating caller-owned data', () => {
@@ -125,12 +198,12 @@ describe('compiled JSON integer paths', () => {
       types: { Node: { next: { fieldID: 1, type: 'Model', typeName: 'Node' } } },
     })
     let node: Record<string, unknown> = {}
-    for (let depth = 1; depth < 128; depth++) node = { next: node }
+    for (let depth = 1; depth < 64; depth++) node = { next: node }
     check.validate('echo', { node })
-    expect(() => check.validate('echo', { node: { next: node } })).toThrow('128')
+    expect(() => check.validate('echo', { node: { next: node } })).toThrow('64')
     const cycle: Record<string, unknown> = {}
     cycle.next = cycle
-    expect(() => check.validate('echo', { node: cycle })).toThrow('128')
+    expect(() => check.validate('echo', { node: cycle })).toThrow('64')
   })
 
   it('does not confuse API names with Object prototype members', () => {

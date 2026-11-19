@@ -11,9 +11,10 @@ import (
 // SelectionDependencies is an immutable snapshot of selection-triggered reads.
 // It does not replace execution, authentication or native resource dependencies.
 type SelectionDependencies struct {
-	root    *dependencyNode
-	sources []ComputedSource
-	index   map[ComputedSource]int
+	root     *dependencyNode
+	sources  []ComputedSource
+	index    map[ComputedSource]int
+	implicit bool
 }
 
 type dependencyNode struct {
@@ -26,6 +27,9 @@ type dependencyField struct {
 	sourceID int
 	child    *dependencyNode
 }
+
+// A case leaf selects only the tag; negative values never identify a source.
+const sealedCaseDependency = -1
 
 type dependencyBuilder struct {
 	schema  *Schema
@@ -50,7 +54,7 @@ func (s *Schema) PrepareSelectionDependencies(root string) (*SelectionDependenci
 		}
 	}
 	b.closeDependencies()
-	return &SelectionDependencies{root: node, sources: b.sources, index: b.index}, nil
+	return &SelectionDependencies{root: node, sources: b.sources, index: b.index, implicit: s.Sealeds[root] != nil}, nil
 }
 
 func (b *dependencyBuilder) node(name string) *dependencyNode {
@@ -64,7 +68,7 @@ func (b *dependencyBuilder) node(name string) *dependencyNode {
 }
 
 func (b *dependencyBuilder) prepareNode(node *dependencyNode) error {
-	model := b.schema.LookupModel(node.name)
+	model := b.schema.SelectionModel(node.name)
 	if model == nil {
 		return fmt.Errorf("cache dependency type %q is not registered", node.name)
 	}
@@ -77,7 +81,7 @@ func (b *dependencyBuilder) prepareNode(node *dependencyNode) error {
 			return err
 		}
 		node.fields[field.Name] = prepared
-		if prepared.sourceID != 0 && !slices.Contains(node.all, prepared.sourceID) {
+		if prepared.sourceID > 0 && !slices.Contains(node.all, prepared.sourceID) {
 			node.all = append(node.all, prepared.sourceID)
 		}
 		if prepared.child != nil {
@@ -95,8 +99,11 @@ func (b *dependencyBuilder) prepareNode(node *dependencyNode) error {
 
 func (b *dependencyBuilder) prepareField(model *Model, field Field) (dependencyField, error) {
 	var prepared dependencyField
+	if b.schema.Sealeds[model.Name] != nil {
+		prepared.sourceID = sealedCaseDependency
+	}
 	if field.Computed {
-		if field.Type == FieldModel {
+		if field.Type == FieldModel || field.Type == FieldSealed {
 			return prepared, fmt.Errorf("unsupported structured computed cache source %s.%s", model.Name, field.Name)
 		}
 		source, ok := model.ComputedSources[field.Name]
@@ -108,10 +115,10 @@ func (b *dependencyBuilder) prepareField(model *Model, field Field) (dependencyF
 		}
 		prepared.sourceID = b.sourceID(source)
 	}
-	if field.Type != FieldModel {
+	if field.Type != FieldModel && field.Type != FieldSealed {
 		return prepared, nil
 	}
-	target := b.schema.LookupModel(field.TypeName)
+	target := b.schema.SelectionModel(field.TypeName)
 	if target == nil {
 		return prepared, fmt.Errorf("cache dependency type %q for %s.%s is not registered", field.TypeName, model.Name, field.Name)
 	}
@@ -127,7 +134,7 @@ func (b *dependencyBuilder) prepareField(model *Model, field Field) (dependencyF
 }
 
 func (b *dependencyBuilder) sourceID(source ComputedSource) int {
-	if id := b.index[source]; id != 0 {
+	if id := b.index[source]; id > 0 {
 		return id
 	}
 	b.sources = append(b.sources, source)
@@ -191,7 +198,7 @@ func (b *dependencyBuilder) closeDependencies() {
 // nested selections conservatively include the prebuilt reachable closure, not
 // an implicit change to the response selection. The plan is safe to share.
 func (p *SelectionDependencies) AppendSources(dst []ComputedSource, fields []*selection.Field) ([]ComputedSource, error) {
-	if len(fields) == 0 {
+	if len(fields) == 0 && !p.implicit {
 		return dst, fmt.Errorf("cache dependencies require an explicit root selection")
 	}
 	collector := dependencyCollector{dst: dst, sources: p.sources}
@@ -199,9 +206,15 @@ func (p *SelectionDependencies) AppendSources(dst []ComputedSource, fields []*se
 		collector.overflow = make([]uint64, (len(p.sources)+63)/64)
 	}
 	for _, source := range dst {
-		if id := p.index[source]; id != 0 {
+		if id := p.index[source]; id > 0 {
 			collector.mark(id)
 		}
+	}
+	if len(fields) == 0 {
+		for _, source := range p.root.all {
+			collector.add(source)
+		}
+		return collector.dst, nil
 	}
 	if err := p.root.appendSelected(&collector, fields, 0); err != nil {
 		return dst, err
@@ -221,7 +234,7 @@ func (n *dependencyNode) appendSelected(collector *dependencyCollector, fields [
 		if !ok {
 			return fmt.Errorf("unknown cache dependency selection %s.%s", n.name, field.Name)
 		}
-		if prepared.sourceID != 0 {
+		if prepared.sourceID > 0 {
 			collector.add(prepared.sourceID)
 		}
 		if err := prepared.appendChildren(collector, field, depth); err != nil {
@@ -238,7 +251,7 @@ func (f dependencyField) appendChildren(collector *dependencyCollector, selected
 		}
 		return f.child.appendSelected(collector, selected.Children, depth+1)
 	}
-	if f.child != nil {
+	if f.child != nil && f.sourceID != sealedCaseDependency {
 		for _, source := range f.child.all {
 			collector.add(source)
 		}
@@ -254,7 +267,7 @@ type dependencyCollector struct {
 }
 
 func (c *dependencyCollector) add(id int) {
-	if c.mark(id) {
+	if id > 0 && c.mark(id) {
 		c.dst = append(c.dst, c.sources[id-1])
 	}
 }

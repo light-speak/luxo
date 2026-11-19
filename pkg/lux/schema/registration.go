@@ -40,6 +40,9 @@ func validateFields(name string, fields []Field) error {
 		if err := set.add(field.Name, field.ID); err != nil {
 			return err
 		}
+		if !field.Type.valid() {
+			return fmt.Errorf("schema: %s.%s has unknown field type %d", name, field.Name, field.Type)
+		}
 	}
 	return nil
 }
@@ -55,6 +58,9 @@ func validateAPIDefinition(a *API) error {
 	for _, param := range a.Params {
 		if err := set.add(param.Name, param.ID); err != nil {
 			return err
+		}
+		if !param.Type.valid() {
+			return fmt.Errorf("schema: API %s parameter %s has unknown field type %d", a.Name, param.Name, param.Type)
 		}
 	}
 	return nil
@@ -97,5 +103,5 @@ func (s *Schema) validateDeclarations() error {
 			return err
 		}
 	}
-	return nil
+	return s.validateSealedDeclarations()
 }

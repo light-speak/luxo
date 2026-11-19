@@ -92,3 +92,57 @@ type benchmarkAcklessMessage struct{ jetstream.Msg }
 func (*benchmarkAcklessMessage) Ack() error                       { return nil }
 func (*benchmarkAcklessMessage) Nak() error                       { return nil }
 func (*benchmarkAcklessMessage) NakWithDelay(time.Duration) error { return nil }
+
+func BenchmarkNATSRepeatedClose(b *testing.B) {
+	q := &NATSQueue{}
+	if err := q.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := q.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+var closeResultQueueSink *NATSQueue
+
+// Excludes broker connection and JetStream setup; isolates object allocation.
+func BenchmarkNATSCloseResultConstruction(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		closeResultQueueSink = &NATSQueue{}
+	}
+}
+
+func BenchmarkQueueStreamName(b *testing.B) {
+	for _, name := range []string{"tasks", "email.send", "email_send"} {
+		for _, impl := range []struct {
+			name   string
+			encode func(string) string
+		}{{"before", legacyStreamNameForBenchmark}, {"after", streamName}} {
+			b.Run(name+"/"+impl.name, func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					if impl.encode(name) == "" {
+						b.Fatal("empty stream name")
+					}
+				}
+			})
+		}
+	}
+}
+
+// The previous mapping is not injective; it is only a cold-name cost baseline.
+func legacyStreamNameForBenchmark(queue string) string {
+	buf := make([]byte, len(queue))
+	for i := range len(queue) {
+		if queue[i] == '.' {
+			buf[i] = '_'
+		} else {
+			buf[i] = queue[i]
+		}
+	}
+	return "luxo_q_" + string(buf)
+}

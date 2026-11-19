@@ -1,10 +1,78 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"testing"
+
+	"github.com/light-speak/luxo/pkg/lux/codec"
 )
+
+// The shared reference cannot implement identity-specific fields. These cases
+// measure fan-out plus ownership copies, not generated model encoding or I/O.
+func BenchmarkEventIdentityDispatch(b *testing.B) {
+	for _, count := range []int{1, 16, 128} {
+		for _, size := range []int{8, 4096} {
+			for _, variant := range []string{"false", "true", "selection-public", "selection-private"} {
+				b.Run(fmt.Sprintf("subscribers=%d/bytes=%d/identity=%s", count, size, variant), func(b *testing.B) {
+					personalized := variant == "true" || variant == "selection-private"
+					router := NewRouter()
+					topic := RegisterEventStream(router, "watch", func(context.Context, *Request, any) (int, error) { return 0, nil })
+					bits := byte(1)
+					if personalized {
+						bits = 3
+					}
+					mask, err := codec.AppendSelectionMask(nil, []byte{bits}, nil)
+					if err != nil {
+						b.Fatal(err)
+					}
+					subs := make([]*StreamSub, 0, count)
+					for index := range count {
+						sub := router.Streams.subscribePreparedMode("watch", nil, index, mask, true, nil, nil, preparedStream{bind: func(sub *StreamSub) { topic.attach(sub, 0) }})
+						subs = append(subs, sub)
+					}
+					payload := bytes.Repeat([]byte{7}, size)
+					encode := func([]byte, bool) ([]byte, error) { return bytes.Clone(payload), nil }
+					encodeIdentity := func(_ []byte, _ bool, identity any) ([]byte, error) {
+						data := bytes.Clone(payload)
+						if identity != nil {
+							data[0] = byte(identity.(int))
+						}
+						return data, nil
+					}
+					dispatch := func() error { return topic.Dispatch(nil, encode) }
+					if personalized {
+						dispatch = func() error { return topic.DispatchIdentity(nil, encodeIdentity) }
+					}
+					if variant == "selection-public" || variant == "selection-private" {
+						independent := func(mask []byte) bool { return !codec.FieldMaskHas(codec.SelectionMaskFields(mask), 2) }
+						dispatch = func() error { return topic.DispatchIdentitySelection(nil, encodeIdentity, independent) }
+					}
+					b.ReportAllocs()
+					for b.Loop() {
+						if err := dispatch(); err != nil {
+							b.Fatal(err)
+						}
+						for index, sub := range subs {
+							data := <-sub.Ch
+							want := byte(7)
+							if personalized {
+								want = byte(index)
+							}
+							if len(data) != size || data[0] != want {
+								b.Fatal("wrong identity output")
+							}
+						}
+					}
+					for _, sub := range subs {
+						router.Streams.Unsubscribe("watch", sub)
+					}
+				})
+			}
+		}
+	}
+}
 
 // Compare dispatch only: subscriptions and their owned input values already
 // exist. No network, event decoding, registration or shutdown is timed here.
@@ -38,7 +106,9 @@ func BenchmarkEventSnapshotDispatch(b *testing.B) {
 					}
 				}
 				if typed {
-					dispatch = func() error { return topic.Dispatch(func(value *int64, _ any) bool { return *value == 42 }, encode) }
+					dispatch = func() error {
+						return topic.Dispatch(func(value *int64, _ any) (bool, error) { return *value == 42, nil }, encode)
+					}
 				}
 				b.ReportAllocs()
 				for b.Loop() {

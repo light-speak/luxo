@@ -4,8 +4,71 @@ import 'dart:typed_data';
 import 'package:test/test.dart';
 import 'package:luxo_client/src/codec.dart';
 import 'package:luxo_client/src/int64.dart';
+import 'package:luxo_client/src/json.dart';
 
 void main() {
+  test('preserves compact Decimal text from Go without numeric conversion', () {
+    for (final text in ['1e2147483647', '-1e-2147483648', '1.23']) {
+      final payload = Uint8List.fromList([text.length, ...utf8.encode(text)]);
+      final decoder = LuxoDecoder(payload);
+      expect(decoder.readStringChecked(), text);
+      decoder.checkComplete();
+      final list = LuxoDecoder(Uint8List.fromList([1, ...payload]));
+      expect(list.readStringArrayChecked(), [text]);
+      list.checkComplete();
+      expect(luxoStringFromJSON(decodeLuxoJSON('"$text"')), text);
+    }
+  });
+
+  group('decoder byte view boundaries', () {
+    test('reads fixed values relative to the view', () {
+      final bytes = Uint8List(24)..fillRange(0, 24, 255);
+      ByteData.sublistView(bytes).setFloat64(8, 1.25, Endian.little);
+      final decoder = LuxoDecoder(Uint8List.sublistView(bytes, 8, 16));
+      expect(decoder.readFloat(), 1.25);
+      expect(decoder.error, isNull);
+    });
+
+    test('rejects truncation despite complete backing bytes', () {
+      final samples = <(List<int>, void Function(LuxoDecoder))>[
+        (
+          [128, 1],
+          (decoder) {
+            decoder.readInt();
+          },
+        ),
+        (
+          [2, 65, 66],
+          (decoder) {
+            decoder.readString();
+          },
+        ),
+        (
+          [2, 65, 66],
+          (decoder) {
+            decoder.readBytes();
+          },
+        ),
+        (
+          [0, 0, 0, 0, 0, 0, 244, 63],
+          (decoder) {
+            decoder.readFloat();
+          },
+        ),
+      ];
+      for (final (bytes, read) in samples) {
+        final backing = Uint8List.fromList([255, ...bytes, 255]);
+        for (var length = 0; length < bytes.length; length++) {
+          final decoder = LuxoDecoder(
+            Uint8List.sublistView(backing, 1, 1 + length),
+          );
+          expect(() => read(decoder), returnsNormally);
+          expect(decoder.error, isNotNull);
+        }
+      }
+    });
+  });
+
   test('row and column decoders require the end marker', () {
     final row = LuxoDecoder(Uint8List.fromList([0, 1, 84]));
     row.skipArenaHeader();

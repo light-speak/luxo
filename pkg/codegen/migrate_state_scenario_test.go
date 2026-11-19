@@ -29,18 +29,24 @@ func TestScenarioFirstMigration(t *testing.T) {
 	}
 
 	d := pgDialect()
-	desired := ComputeState(result, nil, d)
+	desired, err := ComputeState(result, nil, d)
+	if err != nil {
+		t.Fatal(err)
+	}
 	current := &SchemaState{Models: map[string]*ModelState{}}
 
-	ops := Diff(current, desired, nil)
+	ops := mustMigrationDiff(t, current, desired, nil)
 	if len(ops) != 1 || ops[0].Kind != CreateTable {
 		t.Fatalf("expected 1 CreateTable, got %d ops", len(ops))
 	}
 
-	up, down := GenerateMigrationSQL(ops, desired, d)
+	up, down, migrationSQLFailure1 := GenerateMigrationSQL(ops, desired, d)
+	if migrationSQLFailure1 != nil {
+		t.Fatal(migrationSQLFailure1)
+	}
 
 	// UP checks
-	checks := []string{"CREATE TABLE users", "SERIAL", "PRIMARY KEY", "VARCHAR(100)", "UNIQUE", "created_at", "updated_at"}
+	checks := []string{"CREATE TABLE \"users\"", "SERIAL", "PRIMARY KEY", "VARCHAR(100)", "UNIQUE", "created_at", "updated_at"}
 	for _, c := range checks {
 		if !strings.Contains(up, c) {
 			t.Errorf("UP missing %q:\n%s", c, up)
@@ -48,7 +54,7 @@ func TestScenarioFirstMigration(t *testing.T) {
 	}
 
 	// DOWN checks
-	if !strings.Contains(down, "DROP TABLE IF EXISTS users") {
+	if !strings.Contains(down, "DROP TABLE IF EXISTS \"users\"") {
 		t.Errorf("DOWN missing DROP TABLE:\n%s", down)
 	}
 
@@ -77,17 +83,20 @@ func TestScenarioAddColumn(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
-	up, down := GenerateMigrationSQL(ops, desired, d)
+	ops := mustMigrationDiff(t, current, desired, nil)
+	up, down, migrationSQLFailure2 := GenerateMigrationSQL(ops, desired, d)
+	if migrationSQLFailure2 != nil {
+		t.Fatal(migrationSQLFailure2)
+	}
 
-	if !strings.Contains(up, "ADD COLUMN avatar TEXT") {
+	if !strings.Contains(up, "ADD COLUMN \"avatar\" TEXT") {
 		t.Errorf("UP missing ADD COLUMN:\n%s", up)
 	}
 	// Nullable → no NOT NULL
-	if strings.Contains(up, "avatar TEXT NOT NULL") {
+	if strings.Contains(up, "\"avatar\" TEXT NOT NULL") {
 		t.Error("nullable column should not have NOT NULL")
 	}
-	if !strings.Contains(down, "DROP COLUMN avatar") {
+	if !strings.Contains(down, "DROP COLUMN \"avatar\"") {
 		t.Errorf("DOWN missing DROP COLUMN:\n%s", down)
 	}
 
@@ -113,11 +122,14 @@ func TestScenarioDropColumn(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
-	up, _ := GenerateMigrationSQL(ops, desired, d)
+	ops := mustMigrationDiff(t, current, desired, nil)
+	up, _, migrationSQLFailure3 := GenerateMigrationSQL(ops, desired, d)
+	if migrationSQLFailure3 != nil {
+		t.Fatal(migrationSQLFailure3)
+	}
 
 	// Should be commented out
-	if !strings.Contains(up, "-- ALTER TABLE users DROP COLUMN old_field") {
+	if !strings.Contains(up, "-- ALTER TABLE \"users\" DROP COLUMN \"old_field\"") {
 		t.Errorf("DROP COLUMN should be commented out:\n%s", up)
 	}
 }
@@ -137,13 +149,16 @@ func TestScenarioAlterColumnType(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
-	up, down := GenerateMigrationSQL(ops, desired, d)
+	ops := mustMigrationDiff(t, current, desired, nil)
+	up, down, migrationSQLFailure4 := GenerateMigrationSQL(ops, desired, d)
+	if migrationSQLFailure4 != nil {
+		t.Fatal(migrationSQLFailure4)
+	}
 
-	if !strings.Contains(up, "ALTER COLUMN name TYPE TEXT") {
+	if !strings.Contains(up, "ALTER COLUMN \"name\" TYPE TEXT") {
 		t.Errorf("UP missing type change:\n%s", up)
 	}
-	if !strings.Contains(down, "ALTER COLUMN name TYPE VARCHAR(50)") {
+	if !strings.Contains(down, "ALTER COLUMN \"name\" TYPE VARCHAR(50)") {
 		t.Errorf("DOWN missing reverse type change:\n%s", down)
 	}
 }
@@ -163,8 +178,11 @@ func TestScenarioChangeNullable(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
-	up, down := GenerateMigrationSQL(ops, desired, d)
+	ops := mustMigrationDiff(t, current, desired, nil)
+	up, down, migrationSQLFailure5 := GenerateMigrationSQL(ops, desired, d)
+	if migrationSQLFailure5 != nil {
+		t.Fatal(migrationSQLFailure5)
+	}
 
 	if !strings.Contains(up, "DROP NOT NULL") {
 		t.Errorf("UP should drop NOT NULL:\n%s", up)
@@ -189,13 +207,16 @@ func TestScenarioAddUnique(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
-	up, down := GenerateMigrationSQL(ops, desired, d)
+	ops := mustMigrationDiff(t, current, desired, nil)
+	up, down, migrationSQLFailure6 := GenerateMigrationSQL(ops, desired, d)
+	if migrationSQLFailure6 != nil {
+		t.Fatal(migrationSQLFailure6)
+	}
 
-	if !strings.Contains(up, "ADD CONSTRAINT users_email_key UNIQUE") {
+	if !strings.Contains(up, "ADD CONSTRAINT \"users_email_key\" UNIQUE") {
 		t.Errorf("UP should add unique:\n%s", up)
 	}
-	if !strings.Contains(down, "DROP CONSTRAINT users_email_key") {
+	if !strings.Contains(down, "DROP CONSTRAINT \"users_email_key\"") {
 		t.Errorf("DOWN should drop unique:\n%s", down)
 	}
 }
@@ -215,13 +236,16 @@ func TestScenarioRemoveUnique(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
-	up, down := GenerateMigrationSQL(ops, desired, d)
+	ops := mustMigrationDiff(t, current, desired, nil)
+	up, down, migrationSQLFailure7 := GenerateMigrationSQL(ops, desired, d)
+	if migrationSQLFailure7 != nil {
+		t.Fatal(migrationSQLFailure7)
+	}
 
-	if !strings.Contains(up, "DROP CONSTRAINT users_email_key") {
+	if !strings.Contains(up, "DROP CONSTRAINT \"users_email_key\"") {
 		t.Errorf("UP should drop unique:\n%s", up)
 	}
-	if !strings.Contains(down, "ADD CONSTRAINT users_email_key UNIQUE") {
+	if !strings.Contains(down, "ADD CONSTRAINT \"users_email_key\" UNIQUE") {
 		t.Errorf("DOWN should add unique:\n%s", down)
 	}
 }
@@ -237,19 +261,22 @@ func TestScenarioIndexChanges(t *testing.T) {
 		"User": {Table: "users", Columns: map[string]*ColumnState{}, Indexes: []lux.IndexInfo{{Name: "idx_users_email", Kind: lux.BTreeIndex, Columns: []string{"email"}}}},
 	}}
 
-	ops := Diff(current, desired, nil)
-	up, down := GenerateMigrationSQL(ops, desired, d)
+	ops := mustMigrationDiff(t, current, desired, nil)
+	up, down, migrationSQLFailure8 := GenerateMigrationSQL(ops, desired, d)
+	if migrationSQLFailure8 != nil {
+		t.Fatal(migrationSQLFailure8)
+	}
 
-	if !strings.Contains(up, "CREATE INDEX idx_users_email ON users (email)") {
+	if !strings.Contains(up, "CREATE INDEX \"idx_users_email\" ON \"users\" (\"email\")") {
 		t.Errorf("UP should create index:\n%s", up)
 	}
-	if !strings.Contains(up, "DROP INDEX IF EXISTS idx_users_name") {
+	if !strings.Contains(up, "DROP INDEX IF EXISTS \"idx_users_name\"") {
 		t.Errorf("UP should drop old index:\n%s", up)
 	}
-	if !strings.Contains(down, "DROP INDEX IF EXISTS idx_users_email") {
+	if !strings.Contains(down, "DROP INDEX IF EXISTS \"idx_users_email\"") {
 		t.Errorf("DOWN should drop new index:\n%s", down)
 	}
-	if !strings.Contains(down, "CREATE INDEX idx_users_name ON users (name)") {
+	if !strings.Contains(down, "CREATE INDEX \"idx_users_name\" ON \"users\" (\"name\")") {
 		t.Errorf("DOWN should recreate old index:\n%s", down)
 	}
 }
@@ -263,10 +290,13 @@ func TestScenarioDropTable(t *testing.T) {
 	}}
 	desired := &SchemaState{Models: map[string]*ModelState{}}
 
-	ops := Diff(current, desired, nil)
-	up, _ := GenerateMigrationSQL(ops, desired, d)
+	ops := mustMigrationDiff(t, current, desired, nil)
+	up, _, migrationSQLFailure9 := GenerateMigrationSQL(ops, desired, d)
+	if migrationSQLFailure9 != nil {
+		t.Fatal(migrationSQLFailure9)
+	}
 
-	if !strings.Contains(up, "-- DROP TABLE IF EXISTS old_models") {
+	if !strings.Contains(up, "-- DROP TABLE IF EXISTS \"old_models\"") {
 		t.Errorf("DROP TABLE should be commented out:\n%s", up)
 	}
 }
@@ -293,7 +323,7 @@ func TestScenarioMultipleChanges(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
+	ops := mustMigrationDiff(t, current, desired, nil)
 
 	// Should have: CreateTable(Post) + AddColumn(avatar) + AlterColumn(name) + AddIndex
 	kinds := map[DiffKind]int{}
@@ -313,14 +343,17 @@ func TestScenarioMultipleChanges(t *testing.T) {
 		t.Errorf("expected 1 AddIndex, got %d", kinds[AddIndex])
 	}
 
-	up, _ := GenerateMigrationSQL(ops, desired, d)
-	if !strings.Contains(up, "CREATE TABLE posts") {
+	up, _, migrationSQLFailure10 := GenerateMigrationSQL(ops, desired, d)
+	if migrationSQLFailure10 != nil {
+		t.Fatal(migrationSQLFailure10)
+	}
+	if !strings.Contains(up, "CREATE TABLE \"posts\"") {
 		t.Error("UP should create posts table")
 	}
-	if !strings.Contains(up, "ADD COLUMN avatar") {
+	if !strings.Contains(up, "ADD COLUMN \"avatar\"") {
 		t.Error("UP should add avatar column")
 	}
-	if !strings.Contains(up, "ALTER COLUMN name TYPE TEXT") {
+	if !strings.Contains(up, "ALTER COLUMN \"name\" TYPE TEXT") {
 		t.Error("UP should alter name type")
 	}
 }
@@ -344,7 +377,11 @@ func TestScenarioSoftDeleteModel(t *testing.T) {
 		}},
 	}
 
-	desired := ComputeState(result, nil, d)
+	desired, err := ComputeState(result, nil, d)
+
+	if err != nil {
+		t.Fatal(err)
+	}
 	ms := desired.Models["Post"]
 
 	if _, ok := ms.Columns["deleted_at"]; !ok {
@@ -374,7 +411,11 @@ func TestScenarioNoTimeModel(t *testing.T) {
 		}},
 	}
 
-	desired := ComputeState(result, nil, d)
+	desired, err := ComputeState(result, nil, d)
+
+	if err != nil {
+		t.Fatal(err)
+	}
 	ms := desired.Models["Config"]
 
 	if _, ok := ms.Columns["created_at"]; ok {
@@ -403,8 +444,12 @@ func TestScenarioIdempotent(t *testing.T) {
 		}},
 	}
 
-	state := ComputeState(result, nil, d)
-	ops := Diff(state, state, nil)
+	state, err := ComputeState(result, nil, d)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := mustMigrationDiff(t, state, state, nil)
 
 	if len(ops) != 0 {
 		t.Errorf("diff of same state should be empty, got %d ops", len(ops))
@@ -434,7 +479,7 @@ func TestScenarioRenameColumn(t *testing.T) {
 		},
 	}
 
-	ops := Diff(current, desired, fieldIDs)
+	ops := mustMigrationDiff(t, current, desired, fieldIDs)
 
 	foundRename := false
 	for _, op := range ops {
@@ -456,8 +501,11 @@ func TestScenarioRenameColumn(t *testing.T) {
 		}
 	}
 
-	up, _ := GenerateMigrationSQL(ops, desired, d)
-	if !strings.Contains(up, "RENAME COLUMN name TO display_name") {
+	up, _, migrationSQLFailure11 := GenerateMigrationSQL(ops, desired, d)
+	if migrationSQLFailure11 != nil {
+		t.Fatal(migrationSQLFailure11)
+	}
+	if !strings.Contains(up, "RENAME COLUMN \"name\" TO \"display_name\"") {
 		t.Errorf("UP should have RENAME COLUMN:\n%s", up)
 	}
 }
@@ -484,7 +532,7 @@ func TestScenarioRenameAndTypeChange(t *testing.T) {
 		},
 	}
 
-	ops := Diff(current, desired, fieldIDs)
+	ops := mustMigrationDiff(t, current, desired, fieldIDs)
 
 	hasRename, hasAlter := false, false
 	for _, op := range ops {
@@ -502,8 +550,11 @@ func TestScenarioRenameAndTypeChange(t *testing.T) {
 		t.Error("should detect type change after rename")
 	}
 
-	up, _ := GenerateMigrationSQL(ops, desired, d)
-	if !strings.Contains(up, "RENAME COLUMN status TO state") {
+	up, _, migrationSQLFailure12 := GenerateMigrationSQL(ops, desired, d)
+	if migrationSQLFailure12 != nil {
+		t.Fatal(migrationSQLFailure12)
+	}
+	if !strings.Contains(up, "RENAME COLUMN \"status\" TO \"state\"") {
 		t.Errorf("UP missing RENAME:\n%s", up)
 	}
 	if !strings.Contains(up, "TYPE BIGINT") {
@@ -526,7 +577,7 @@ func TestScenarioSafetyWarnings(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
+	ops := mustMigrationDiff(t, current, desired, nil)
 
 	// Should have warnings
 	for _, op := range ops {
@@ -553,7 +604,7 @@ func TestScenarioNotNullWithoutDefault(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
+	ops := mustMigrationDiff(t, current, desired, nil)
 
 	for _, op := range ops {
 		if op.Kind == AlterColumn && op.Warning == "" {

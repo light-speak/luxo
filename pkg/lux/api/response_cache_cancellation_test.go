@@ -81,7 +81,7 @@ func TestResponseCacheLiveMissStillRunsOrigin(t *testing.T) {
 			}}
 			req := &Request{API: "cached", Buf: &ResponseBuf{}, responseCache: testCacheRoute(t, backend, "test", "cached")}
 			called := false
-			err := CacheResponsePolicy(t.Context(), req, "", func() error { called = true; return nil })
+			err := CacheResponsePolicy(t.Context(), req, "", func() error { called = true; return writeCacheTestZero(req) })
 			if err != nil || !called || backend.sets != 1 {
 				t.Fatalf("live fallback changed: %v called=%t sets=%d", err, called, backend.sets)
 			}

@@ -1,5 +1,14 @@
 import assert from 'node:assert/strict'
 const format = process.argv[2]
+if (process.env.LUXO_SQL_INFERRED === '1') {
+ const { createClient, verifyInferred } = await import(`./${format}/out/inferred.${format === 'cjs' ? 'cjs' : 'mjs'}`)
+ const client = createClient(process.argv[3])
+ try {
+  await verifyInferred(client)
+  const inferredCalls = process.env.LUXO_SQL_RELATIONS === '1' ? 18 : 32
+  console.log(JSON.stringify({ format, inferredCalls, modes: ['json', 'binary'], passed: true }))
+ } finally { client.close() }
+} else {
 const { LuxoClient } = await import(`./${format}/out/client.js`)
 const { prepareSelection } = await import(`./${format}/node_modules/@luxojs/client/dist/index.${format === 'esm' ? 'mjs' : 'js'}`)
 const metrics = []
@@ -37,3 +46,4 @@ try {
  narrow([...page.items, ...second.items])
  console.log(JSON.stringify({ format, metrics, passed: true }))
 } finally { client.close() }
+}

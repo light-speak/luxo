@@ -114,19 +114,19 @@ func BenchmarkObservationMetricOverflow(b *testing.B) {
 }
 
 func BenchmarkObservationPoisonIsolation(b *testing.B) {
-	mc := &MetricsCollector{}
-	good := api.TraceRecord{TraceID: "good", Spans: "[]"}
-	bad := api.TraceRecord{TraceID: "bad", Spans: "\xff"}
-	var records [2]api.TraceRecord
+	transport := &observationBenchmarkTransport{}
+	mc := newTraceCollector("http://studio.invalid", &http.Client{Transport: transport, Timeout: 10 * time.Second})
+	good, bad := observationTestTrace("good"), observationTestTrace("bad")
+	bad.Spans = "\xff"
 	b.ReportAllocs()
 	for b.Loop() {
-		records[0], records[1] = bad, good
-		_, valid, err := mc.encodePendingTraces(records[:])
-		if err != nil || len(valid) != 1 || valid[0].TraceID != "good" {
+		mc.traces = append(mc.traces[:0], bad, good)
+		mc.flushTraces()
+		if len(mc.traces) != 0 {
 			b.Fatal("isolation failed")
 		}
 	}
-	if mc.DroppedObservations().InvalidTraces != uint64(b.N) {
-		b.Fatal("loss accounting changed")
+	if mc.DroppedObservations().InvalidTraces != uint64(b.N) || transport.bytes == 0 || transport.requests != int64(b.N) {
+		b.Fatal("loss or successful export accounting changed")
 	}
 }

@@ -200,15 +200,36 @@ type TypeRef struct {
 	IsList   bool       // [xxx]
 	TypeArgs []*TypeRef // generic args: Page<User>
 	Tuple    []*TypeRef // polymorphic: (Post, Video, Product)
-	FKField  string     // custom foreign key: User(key: authorId)
 }
 
 // Directive: @cache(policy: "preview"), @hidden, @transform { ... }
 type Directive struct {
-	Pos  token.Position
-	Name string
-	Args []*NamedArg
-	Body *Block // @transform { ... }, @beforeSave { ... }
+	// AuthSubject is resolved by semantic analysis, never inferred from JWT fields.
+	AuthSubject string
+	Pos         token.Position
+	Name        string
+	Args        []*NamedArg
+	Body        *Block // @transform { ... }, @beforeSave { ... }
+}
+
+// SingleExpression returns an unambiguous positional or expression-body value.
+func (d *Directive) SingleExpression() Expr {
+	if d == nil {
+		return nil
+	}
+	if d.Body == nil {
+		if len(d.Args) == 1 && d.Args[0] != nil && d.Args[0].Name == "" {
+			return d.Args[0].Value
+		}
+		return nil
+	}
+	if len(d.Args) != 0 || len(d.Body.Stmts) != 1 {
+		return nil
+	}
+	if statement, ok := d.Body.Stmts[0].(*ExprStmt); ok {
+		return statement.Expr
+	}
+	return nil
 }
 
 // ========== Expressions ==========
@@ -224,16 +245,20 @@ type Expr interface {
 	SetListType(bool)
 	IsModelType() bool
 	SetModelType(bool)
+	IsEnumType() bool
+	SetEnumType(bool)
 }
 
 // TypeTagged provides type tag storage for all Expr nodes via embedding.
 // Semantic analyzer writes the tag; codegen reads it. O(1) access, zero allocation.
 type TypeTagged struct {
-	TypeTag      string
-	NullableTag  bool
-	ListTypeTag  bool
-	ModelTypeTag bool
-	NarrowedTag  bool // Identifier read narrowed from a nullable lexical binding.
+	TypeTag             string
+	NullableTag         bool
+	ListTypeTag         bool
+	ModelTypeTag        bool
+	EnumTypeTag         bool
+	NarrowedTag         bool // Identifier read narrowed from a nullable lexical binding.
+	ResultValueNullable bool // Result<T> payload nullability before '?' lifts a nullable call.
 }
 
 func (t *TypeTagged) GetTypeTag() string  { return t.TypeTag }
@@ -244,6 +269,8 @@ func (t *TypeTagged) IsListType() bool    { return t.ListTypeTag }
 func (t *TypeTagged) SetListType(v bool)  { t.ListTypeTag = v }
 func (t *TypeTagged) IsModelType() bool   { return t.ModelTypeTag }
 func (t *TypeTagged) SetModelType(v bool) { t.ModelTypeTag = v }
+func (t *TypeTagged) IsEnumType() bool    { return t.EnumTypeTag }
+func (t *TypeTagged) SetEnumType(v bool)  { t.EnumTypeTag = v }
 
 // Literal: 42, 3.14, "hello", true, false, null, 7d
 type Literal struct {
@@ -263,19 +290,26 @@ type Ident struct {
 // MemberExpr: user.name, user?.address?.city
 type MemberExpr struct {
 	TypeTagged
-	Pos      token.Position
-	Object   Expr
-	Field    string
-	SafeCall bool // ?.
+	Pos               token.Position
+	Object            Expr
+	Field             string
+	SafeCall          bool // ?.
+	ValueNullable     bool // Declared result before safe access lifts it to nullable.
+	EnumConstant      bool // Semantic analysis resolved an enum declaration member.
+	SealedConstructor bool // Semantic analysis resolved a sealed declaration variant constructor.
+	DeclaredField     bool // An instance field takes precedence over a builtin property.
 }
 
 // CallExpr: find(User, id: 1), encrypt(password)
 type CallExpr struct {
 	TypeTagged
-	Pos   token.Position
-	Func  Expr
-	Args  []*NamedArg
-	Group *GroupProjection // Set only after semantic validation of a grouped query.
+	Pos              token.Position
+	Func             Expr
+	TypeArgs         []*TypeRef // Explicit constructor arguments; nil means none were written.
+	ConstructorType  *TypeRef   // Semantically checked concrete constructor; never set by the parser.
+	Args             []*NamedArg
+	Group            *GroupProjection // Set only after semantic validation of a grouped query.
+	ErrorConstructor *ErrorDecl       // Declaration used to validate and lower typed error arguments.
 }
 
 // GroupProjection is a backend-independent, statically checked query result.
@@ -309,8 +343,9 @@ type GroupColumn struct {
 
 // NamedArg: name: value or positional value
 type NamedArg struct {
-	Name  string // empty = positional
-	Value Expr
+	Name         string // empty = positional
+	Value        Expr
+	ExpectedType *TypeRef // analyzed destination type, distinct from the value type
 }
 
 // BinaryExpr: a + b, a == b, a && b, a in 1..10

@@ -1,22 +1,10 @@
 import com.luxo.client.*
 import probe.LuxoClient
 import kotlinx.coroutines.*
-import okhttp3.OkHttpClient
 import java.io.File
-import java.security.KeyStore
-import java.security.cert.CertificateFactory
-import javax.net.ssl.*
 
 fun main(args: Array<String>) = runBlocking {
-    val certificate = File(args[1]).inputStream().use { CertificateFactory.getInstance("X.509").generateCertificate(it) }
-    val store = KeyStore.getInstance(KeyStore.getDefaultType()).apply {
-        load(null, null)
-        setCertificateEntry("fixture", certificate)
-    }
-    val factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply { init(store) }
-    val manager = factory.trustManagers.filterIsInstance<X509TrustManager>().single()
-    val tls = SSLContext.getInstance("TLS").apply { init(null, arrayOf(manager), null) }
-    val http = OkHttpClient.Builder().sslSocketFactory(tls.socketFactory, manager).build()
+    val http = sqlHTTPClient(args[1])
     val client = LuxoClient(OkHttpTransport(args[0], client=http, mode=TransportMode.BINARY))
     val plan = PreparedSelection("name")
     try {

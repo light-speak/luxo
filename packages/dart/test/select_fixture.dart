@@ -11,6 +11,52 @@ import 'package:build/build.dart';
 import 'package:luxo_client/src/codegen.dart';
 import 'package:test/test.dart';
 
+const erasedFutureModels = '''
+import 'package:luxo_client/luxo_client.dart';
+abstract interface class Marker {}
+class Child(final Selected<String> city, final Selected<String> secret) implements Marker;
+class Envelope(final Selected<Child?> child);
+class LuxoClient {
+  Future<Child> getChild({String? select}) async => throw UnimplementedError();
+  Future<Envelope> getEnvelope({String? select}) async => throw UnimplementedError();
+}
+void consume(Object? value) { print((value as Child?)?.secret.value); }
+void consumeEnvelope(Object? value) { print((value as Envelope).child.value?.secret.value); }
+''';
+
+const erasedFutureBodies = {
+  'cast object': '''
+  final future = client.getChild();
+  await future.then((row) { print(row.city.value); });
+  final Object? erased = await (future as Future<Object?>);
+  consume(erased);
+''',
+  'declared object': '''
+  final Future<Object?> future = client.getChild();
+  await future.then((row) { print((row as Child).city.value); });
+  final erased = await future;
+  consume(erased);
+''',
+  'declared dynamic': '''
+  final Future<dynamic> future = client.getChild();
+  await future.then((row) { print((row as Child).city.value); });
+  final erased = await future;
+  consume(erased);
+''',
+  'unmarked interface': '''
+  final Future<Marker> future = client.getChild();
+  await future.then((row) { print((row as Child).city.value); });
+  final erased = await future;
+  consume(erased);
+''',
+  'envelope object': '''
+  final future = client.getEnvelope();
+  await future.then((row) { print(row.child.value?.city.value); });
+  final Object? erased = await (future as Future<Object?>);
+  consumeEnvelope(erased);
+''',
+};
+
 /// Uses real resolved Dart libraries without starting a build daemon.
 class SelectFixture implements Resolver {
   final Directory root;
@@ -156,31 +202,37 @@ class SelectFixture implements Resolver {
   );
 }
 
-Future<void> generateSelectionClient(Directory root) async {
+Future<void> generateSelectionClient(
+  Directory root, {
+  Map<String, Object?>? schema,
+}) async {
   final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
   final response = server.first.then((request) async {
     request.response.headers.contentType = ContentType.json;
     request.response.write(
-      jsonEncode({
-        'models': {
-          'User': {
-            'name': 'User',
-            'usage': 'output',
-            'fields': [
-              {'id': 1, 'name': 'id', 'type': 'Int'},
-              {'id': 2, 'name': 'name', 'type': 'String'},
-            ],
-          },
-        },
-        'apis': {
-          'getUser': {
-            'id': 1,
-            'name': 'getUser',
-            'module': 'user',
-            'returnType': 'User',
-          },
-        },
-      }),
+      jsonEncode(
+        schema ??
+            {
+              'models': {
+                'User': {
+                  'name': 'User',
+                  'usage': 'output',
+                  'fields': [
+                    {'id': 1, 'name': 'id', 'type': 'Int'},
+                    {'id': 2, 'name': 'name', 'type': 'String'},
+                  ],
+                },
+              },
+              'apis': {
+                'getUser': {
+                  'id': 1,
+                  'name': 'getUser',
+                  'module': 'user',
+                  'returnType': 'User',
+                },
+              },
+            },
+      ),
     );
     await request.response.close();
   });

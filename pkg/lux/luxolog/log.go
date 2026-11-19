@@ -2,11 +2,9 @@ package luxolog
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"strings"
 	"sync/atomic"
-	"time"
 )
 
 // ANSI colors
@@ -72,36 +70,29 @@ func parseLevel(s string) int {
 
 // Debug prints a debug message (blue).
 func Debug(msg string) string {
-	if GetLevel() <= LevelDebug {
-		ts := time.Now().Format("15:04:05")
-		fmt.Fprintf(os.Stderr, "%s%s%s %sDEBUG%s %s\n", dim, ts, reset, blue, reset, msg)
-	}
-	return msg
+	return message(LevelDebug, msg)
 }
 
 // Info prints an info message (cyan).
 func Info(msg string) string {
-	if GetLevel() <= LevelInfo {
-		ts := time.Now().Format("15:04:05")
-		fmt.Fprintf(os.Stderr, "%s%s%s %sINFO%s  %s\n", dim, ts, reset, cyan, reset, msg)
-	}
-	return msg
+	return message(LevelInfo, msg)
 }
 
 // Warn prints a warning message (yellow).
 func Warn(msg string) string {
-	if GetLevel() <= LevelWarn {
-		ts := time.Now().Format("15:04:05")
-		fmt.Fprintf(os.Stderr, "%s%s%s %sWARN%s  %s\n", dim, ts, reset, yellow, reset, msg)
-	}
-	return msg
+	return message(LevelWarn, msg)
 }
 
 // Error prints an error message (red).
 func Error(msg string) string {
-	if GetLevel() <= LevelError {
-		ts := time.Now().Format("15:04:05")
-		fmt.Fprintf(os.Stderr, "%s%s%s %sERROR%s %s\n", dim, ts, reset, red, reset, msg)
+	return message(LevelError, msg)
+}
+
+func message(level int, msg string) string {
+	if GetLevel() <= level {
+		r := NewRecord()
+		r.Text(msg)
+		r.write(level)
 	}
 	return msg
 }

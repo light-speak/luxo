@@ -1,5 +1,10 @@
 import type { LuxoAPI, LuxoSchema } from '@luxojs/client'
 
+/** Schema directories contain declarations only in their own entries. */
+export function schemaEntry<T>(directory: Record<string, T> | undefined, name: string): T | undefined {
+  return directory && Object.hasOwn(directory, name) ? directory[name] : undefined
+}
+
 const scalarTypes: Record<string, string> = {
   Int: 'bigint', Duration: 'bigint', Float: 'number', Boolean: 'boolean',
   String: 'string', DateTime: 'string', UUID: 'string', Decimal: 'string',
@@ -15,7 +20,7 @@ export function luxoTypeToTS(type: string): string {
 }
 
 export function hasStructuredReturn(api: LuxoAPI, schema: LuxoSchema): boolean {
-  return Boolean(api.returnType && !isScalar(api.returnType) && !schema.enums?.[api.returnType])
+  return Boolean(api.returnType && !isScalar(api.returnType) && !schemaEntry(schema.enums, api.returnType))
 }
 
 export function genCompleteCheck(decoder: string, trailing: string, context: string, indent = '  '): string {
@@ -38,8 +43,8 @@ function genNullableRoot(indent: string): string {
 
 function genPresentResponseBody(api: LuxoAPI, schema: LuxoSchema, returnType: string, indent: string): string {
   const emit = (value: string, prefix = indent) => `${prefix}return ${value}\n`
-  if (hasStructuredReturn(api, schema)) return emit(`(${modelDecode(api)}) as unknown as ${returnType}`)
-  const enumReturn = Boolean(api.returnType && schema.enums?.[api.returnType])
+  if (hasStructuredReturn(api, schema)) return emit(`(${modelDecode(api, schema)}) as unknown as ${returnType}`)
+  const enumReturn = Boolean(api.returnType && schemaEntry(schema.enums, api.returnType))
   const type = enumReturn ? 'Enum' : api.returnType || 'Int'
 
   const inner = indent + '  '
@@ -81,14 +86,14 @@ export function genScalarJSONRead(type: string, value: string): string {
   }
 }
 
-function modelDecode(api: LuxoAPI): string {
+function modelDecode(api: LuxoAPI, schema: LuxoSchema): string {
   const type = api.returnType
   if (api.paginated) {
     const page = `(d as { [key: string]: unknown })`
     return `d instanceof Uint8Array ? decodePaginated${type}(d) : { items: decodeJSON${type}$list(${page}['items']), total: int64FromJSON(${page}['total']), page: int64FromJSON(${page}['page']), pageSize: int64FromJSON(${page}['pageSize']) }`
   }
   if (api.returnList) {
-    return `d instanceof Uint8Array ? decodeColumnar${type}(d) : decodeJSON${type}$list(d)`
+    return `d instanceof Uint8Array ? ${schemaEntry(schema.sealeds, type!) ? 'decodeSealedList' : 'decodeColumnar'}${type}(d) : decodeJSON${type}$list(d)`
   }
   return `d instanceof Uint8Array ? decode${type}(new Decoder(d)) : decodeJSON${type}(d as { [key: string]: unknown })`
 }

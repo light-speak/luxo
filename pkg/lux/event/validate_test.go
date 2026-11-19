@@ -3,6 +3,7 @@ package event
 import (
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,5 +37,15 @@ func TestSnapshotScalarDomains(t *testing.T) {
 				t.Fatalf("got %v want %v", err, test.want)
 			}
 		})
+	}
+}
+
+func TestSnapshotJSONContainerDepth(t *testing.T) {
+	for _, depth := range []int{127, 128, 129} {
+		raw := []byte(strings.Repeat("[", depth) + "0" + strings.Repeat("]", depth))
+		err := CheckJSON(raw)
+		if depth <= 128 && err != nil || depth > 128 && !errors.Is(err, codec.ErrInvalidJSON) {
+			t.Fatalf("depth %d: %v", depth, err)
+		}
 	}
 }

@@ -100,7 +100,7 @@ func sameRegisteredParam(a, b ParamMeta) bool {
 	}
 	// Scalar names can be explicit in schema metadata and omitted in generated
 	// handlers. Named enums and structured types must still match exactly.
-	if a.Type != "Enum" && a.Type != "Model" {
+	if a.Type != "Enum" && a.Type != "Model" && a.Type != "Sealed" {
 		if a.TypeName == a.Type {
 			a.TypeName = ""
 		}

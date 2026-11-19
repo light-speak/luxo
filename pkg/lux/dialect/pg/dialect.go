@@ -1,8 +1,11 @@
 package pg
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/light-speak/luxo/pkg/lux"
 )
@@ -11,6 +14,39 @@ import (
 type Dialect struct{}
 
 var _ lux.Dialect = Dialect{}
+
+// ValidateIdentifier uses the standard PostgreSQL 63-byte identifier boundary.
+func (Dialect) ValidateIdentifier(name string) error {
+	if name == "" || len(name) > 63 || !utf8.ValidString(name) || strings.IndexByte(name, 0) >= 0 {
+		return fmt.Errorf("PostgreSQL identifier %q must be valid UTF-8 without NUL and contain 1..63 bytes", name)
+	}
+	return nil
+}
+
+// GeneratedIdentifier retains short names and uses a stable hash of the full long name.
+func (Dialect) GeneratedIdentifier(name string) string {
+	if len(name) <= 63 {
+		return name
+	}
+	hash := sha256.Sum256([]byte(name))
+	var suffix [16]byte
+	hex.Encode(suffix[:], hash[:8])
+	prefix := 63 - 1 - len(suffix)
+	for !utf8.RuneStart(name[prefix]) {
+		prefix--
+	}
+	return name[:prefix] + "_" + string(suffix[:])
+}
+
+// UniqueConstraintName matches the name used by create/add/drop migrations.
+func (d Dialect) UniqueConstraintName(table, column string) string {
+	return d.GeneratedIdentifier(table + "_" + column + "_key")
+}
+
+// QuoteIdentifier preserves an atomic identifier, including embedded quotes.
+func (Dialect) QuoteIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
 
 func (Dialect) Name() string { return "pg" }
 
@@ -51,6 +87,8 @@ func pgBaseType(name string) string {
 		return "DECIMAL"
 	case "Bytes":
 		return "BYTEA"
+	case "JSON":
+		return "JSONB"
 	default:
 		return "TEXT" // enum → TEXT
 	}
@@ -95,9 +133,9 @@ func pgApplyDirective(base, luxoType string, directives []lux.DirectiveInfo) str
 	return base
 }
 
-func (Dialect) ColumnDef(name string, col lux.ColumnInfo) string {
+func (d Dialect) ColumnDef(name string, col lux.ColumnInfo) string {
 	var parts []string
-	parts = append(parts, name+" "+col.Type)
+	parts = append(parts, d.QuoteIdentifier(name)+" "+col.Type)
 	if !col.Nullable && !col.Serial {
 		parts = append(parts, "NOT NULL")
 	}
@@ -115,11 +153,17 @@ func (Dialect) ColumnDef(name string, col lux.ColumnInfo) string {
 
 func (d Dialect) CreateTable(table string, columns []lux.ColumnEntry, indexes []lux.IndexInfo) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "CREATE TABLE %s (\n", table)
+	fmt.Fprintf(&b, "CREATE TABLE %s (\n", d.QuoteIdentifier(table))
 
 	var cols []string
 	for _, c := range columns {
-		cols = append(cols, "  "+d.ColumnDef(c.Name, c.Info))
+		info := c.Info
+		info.Unique = false
+		definition := d.ColumnDef(c.Name, info)
+		if c.Info.Unique {
+			definition += " CONSTRAINT " + d.QuoteIdentifier(d.UniqueConstraintName(table, c.Name)) + " UNIQUE"
+		}
+		cols = append(cols, "  "+definition)
 	}
 	b.WriteString(strings.Join(cols, ",\n"))
 	b.WriteString("\n);\n")
@@ -130,15 +174,16 @@ func (d Dialect) CreateTable(table string, columns []lux.ColumnEntry, indexes []
 	return b.String()
 }
 
-func (Dialect) AddColumn(table, colDef string) string {
-	return fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s;\n", table, colDef)
+func (d Dialect) AddColumn(table, colDef string) string {
+	return fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s;\n", d.QuoteIdentifier(table), colDef)
 }
 
-func (Dialect) DropColumn(table, column string) string {
-	return fmt.Sprintf("-- ALTER TABLE %s DROP COLUMN %s; -- DANGEROUS: uncomment to apply\n", table, column)
+func (d Dialect) DropColumn(table, column string) string {
+	return fmt.Sprintf("-- ALTER TABLE %s DROP COLUMN %s; -- DANGEROUS: uncomment to apply\n", d.QuoteIdentifier(table), d.QuoteIdentifier(column))
 }
 
-func (Dialect) AlterColumnType(table, column, newType string) string {
+func (d Dialect) AlterColumnType(table, column, newType string) string {
+	table, column = d.QuoteIdentifier(table), d.QuoteIdentifier(column)
 	using := pgUsingClause(column, newType)
 	if using != "" {
 		return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s;\n", table, column, newType, using)
@@ -159,6 +204,8 @@ func pgUsingClause(column, newType string) string {
 		return column + "::TIMESTAMPTZ"
 	case "UUID":
 		return column + "::UUID"
+	case "JSONB", "JSONB[]":
+		return column + "::" + newType
 	}
 	if strings.HasPrefix(newType, "DECIMAL") {
 		return column + "::DECIMAL"
@@ -166,46 +213,57 @@ func pgUsingClause(column, newType string) string {
 	return "" // TEXT, VARCHAR — implicit cast
 }
 
-func (Dialect) SetNotNull(table, column string) string {
-	return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;\n", table, column)
+func (d Dialect) SetNotNull(table, column string) string {
+	return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;\n", d.QuoteIdentifier(table), d.QuoteIdentifier(column))
 }
 
-func (Dialect) DropNotNull(table, column string) string {
-	return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP NOT NULL;\n", table, column)
+func (d Dialect) DropNotNull(table, column string) string {
+	return fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s DROP NOT NULL;\n", d.QuoteIdentifier(table), d.QuoteIdentifier(column))
 }
 
-func (Dialect) AddUnique(table, column string) string {
-	return fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s_%s_key UNIQUE (%s);\n", table, table, column, column)
+func (d Dialect) AddUnique(table, column string) string {
+	return fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s UNIQUE (%s);\n", d.QuoteIdentifier(table), d.QuoteIdentifier(d.UniqueConstraintName(table, column)), d.QuoteIdentifier(column))
 }
 
-func (Dialect) DropUnique(table, column string) string {
-	return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s_%s_key;\n", table, table, column)
+func (d Dialect) DropUnique(table, column string) string {
+	return fmt.Sprintf("ALTER TABLE %s DROP CONSTRAINT %s;\n", d.QuoteIdentifier(table), d.QuoteIdentifier(d.UniqueConstraintName(table, column)))
 }
 
-func (Dialect) CreateIndexSQL(idx lux.IndexInfo, table string) string {
-	cols := strings.Join(idx.Columns, ", ")
+// RenameUnique keeps generated constraint and backing-index identity in sync.
+func (d Dialect) RenameUnique(table, oldColumn, newColumn string) string {
+	return fmt.Sprintf("ALTER TABLE %s RENAME CONSTRAINT %s TO %s;\n", d.QuoteIdentifier(table),
+		d.QuoteIdentifier(d.UniqueConstraintName(table, oldColumn)), d.QuoteIdentifier(d.UniqueConstraintName(table, newColumn)))
+}
+
+func (d Dialect) CreateIndexSQL(idx lux.IndexInfo, table string) string {
+	columns := make([]string, len(idx.Columns))
+	for i, column := range idx.Columns {
+		columns[i] = d.QuoteIdentifier(column)
+	}
+	cols := strings.Join(columns, ", ")
+	table, index := d.QuoteIdentifier(table), d.QuoteIdentifier(idx.Name)
 	switch idx.Kind {
 	case lux.SearchIndex:
 		lang := idx.Lang
 		if lang == "" {
 			lang = "simple"
 		}
-		return fmt.Sprintf("CREATE INDEX %s ON %s USING gin(to_tsvector('%s', %s));\n", idx.Name, table, lang, cols)
+		return fmt.Sprintf("CREATE INDEX %s ON %s USING gin(to_tsvector(%s, %s));\n", index, table, quoteDefaultString(lang), cols)
 	case lux.BrinIndex:
-		return fmt.Sprintf("CREATE INDEX %s ON %s USING brin(%s);\n", idx.Name, table, cols)
+		return fmt.Sprintf("CREATE INDEX %s ON %s USING brin(%s);\n", index, table, cols)
 	case lux.UniqueIndex:
-		return fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s (%s);\n", idx.Name, table, cols)
+		return fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s (%s);\n", index, table, cols)
 	default: // BTreeIndex, CompositeIndex
-		return fmt.Sprintf("CREATE INDEX %s ON %s (%s);\n", idx.Name, table, cols)
+		return fmt.Sprintf("CREATE INDEX %s ON %s (%s);\n", index, table, cols)
 	}
 }
 
-func (Dialect) DropIndex(index string) string {
-	return fmt.Sprintf("DROP INDEX IF EXISTS %s;\n", index)
+func (d Dialect) DropIndex(index string) string {
+	return fmt.Sprintf("DROP INDEX IF EXISTS %s;\n", d.QuoteIdentifier(index))
 }
 
-func (Dialect) DropTable(table string) string {
-	return fmt.Sprintf("-- DROP TABLE IF EXISTS %s; -- DANGEROUS: uncomment to apply\n", table)
+func (d Dialect) DropTable(table string) string {
+	return fmt.Sprintf("-- DROP TABLE IF EXISTS %s; -- DANGEROUS: uncomment to apply\n", d.QuoteIdentifier(table))
 }
 
 func hasDir(directives []lux.DirectiveInfo, name string) bool {

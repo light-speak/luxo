@@ -36,7 +36,7 @@ func typeModelBeforePrebuild(s *Schema, name string) *Model {
 }
 
 // Keep strict nested validation identical on both sides; only lookup differs.
-func appendNestedJSONBeforePrebuild(dst, blob []byte, f *Field, schemas ...*Schema) ([]byte, error) {
+func appendNestedJSONBeforePrebuild(dst, blob []byte, f *Field, depth int, schemas ...*Schema) ([]byte, error) {
 	if len(schemas) == 0 || schemas[0] == nil {
 		return dst, fmt.Errorf("schema: nested type %q for field %q requires schema", f.TypeName, f.Name)
 	}
@@ -45,7 +45,7 @@ func appendNestedJSONBeforePrebuild(dst, blob []byte, f *Field, schemas ...*Sche
 		return dst, fmt.Errorf("schema: nested type %q for field %q is not registered", f.TypeName, f.Name)
 	}
 	if f.IsList {
-		return BinaryListToJSON(dst, blob, nested, schemas[0])
+		return columnarToJSON(dst, blob, nested, depth+1, schemas[0])
 	}
-	return BinaryToJSON(dst, blob, nested, schemas[0])
+	return binaryToJSON(dst, blob, nested, depth+1, schemas[0])
 }

@@ -21,6 +21,7 @@ type Schema struct {
 	APIs       map[string]*API      `json:"apis"`
 	Enums      map[string]*Enum     `json:"enums,omitempty"`
 	Types      map[string]*TypeDecl `json:"types,omitempty"`
+	Sealeds    map[string]*Sealed   `json:"sealeds,omitempty"`
 	typeModels map[string]*Model
 	apiNames   map[int]string
 }
@@ -124,6 +125,7 @@ const (
 	FieldUUID    // 16-byte fixed value
 	FieldDecimal // decimal string
 	FieldJSON    // length-prefixed raw JSON
+	FieldSealed  // stable variant tag followed by one framed payload row
 )
 
 // API describes an API's params and return type.
@@ -200,22 +202,27 @@ var fieldTypeNames = [...]string{
 	FieldUUID:     "UUID",
 	FieldDecimal:  "Decimal",
 	FieldJSON:     "JSON",
+	FieldSealed:   "Sealed",
 }
 
 // String returns the Luxo type name for the field type.
 func (t FieldType) String() string {
-	if t >= 0 && int(t) < len(fieldTypeNames) {
+	if t.valid() {
 		return fieldTypeNames[t]
 	}
 	return "Unknown"
 }
 
+func (t FieldType) valid() bool {
+	return t >= 0 && int(t) < len(fieldTypeNames)
+}
+
 // MarshalJSON outputs FieldType as a string.
 func (t FieldType) MarshalJSON() ([]byte, error) {
-	if t >= 0 && int(t) < len(fieldTypeNames) {
+	if t.valid() {
 		return json.Marshal(fieldTypeNames[t])
 	}
-	return json.Marshal("Unknown")
+	return nil, fmt.Errorf("schema: unknown field type %d", t)
 }
 
 // UnmarshalJSON decodes the stable string form used by luxo.schema.json.
@@ -402,8 +409,11 @@ func (s *Schema) InferTypeUsage() {
 	for _, decl := range s.Types {
 		decl.Usage = TypeUsageUnused
 	}
+	for _, declaration := range s.Sealeds {
+		declaration.Usage = TypeUsageUnused
+	}
 
-	visited := make(map[typeUsageVisit]bool, len(s.Models)+len(s.Types))
+	visited := make(map[typeUsageVisit]bool, len(s.Models)+len(s.Types)+len(s.Sealeds))
 	for _, api := range s.APIs {
 		s.markTypeUsage(api.ReturnType, TypeUsageOutput, visited)
 		for _, param := range api.Params {
@@ -440,6 +450,15 @@ func (s *Schema) markTypeUsage(name string, usage TypeUsage, visited map[typeUsa
 	if decl := s.Types[name]; decl != nil {
 		decl.Usage = mergeTypeUsage(decl.Usage, usage)
 		s.markFieldUsage(decl.Fields, usage, visited)
+		return
+	}
+	if declaration := s.Sealeds[name]; declaration != nil {
+		declaration.Usage = mergeTypeUsage(declaration.Usage, usage)
+		for _, variant := range declaration.Variants {
+			for _, field := range variant.Fields {
+				s.markTypeUsage(field.TypeName, usage, visited)
+			}
+		}
 	}
 }
 
@@ -503,7 +522,7 @@ func selectToFieldMask(fields []*selection.Field, model *Model, schema *Schema, 
 	if model == nil {
 		return nil, fmt.Errorf("selection has no return model")
 	}
-	if depth >= 32 {
+	if depth >= codec.MaxSelectionDepth {
 		return nil, fmt.Errorf("selection depth exceeds 32")
 	}
 	var fieldMask []byte
@@ -526,10 +545,10 @@ func selectToFieldMask(fields []*selection.Field, model *Model, schema *Schema, 
 		if f.Children == nil {
 			continue
 		}
-		if !mf.Relation || schema == nil {
+		if (!mf.Relation && mf.Type != FieldSealed) || schema == nil {
 			return nil, fmt.Errorf("field %s.%s does not support nested selection", model.Name, f.Name)
 		}
-		nested := schema.LookupModel(mf.TypeName)
+		nested := schema.SelectionModel(mf.TypeName)
 		if nested == nil {
 			return nil, fmt.Errorf("nested type %q for %s.%s is not registered", mf.TypeName, model.Name, f.Name)
 		}

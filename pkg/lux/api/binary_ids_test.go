@@ -2,12 +2,98 @@ package api
 
 import (
 	"bytes"
+	"context"
+	"fmt"
+	"io"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 )
+
+func TestBinarySelectionDepthWithoutSchema(t *testing.T) {
+	registry := NewAPIRegistry()
+	if err := registry.Register("read", 1); err != nil {
+		t.Fatal(err)
+	}
+	for _, depth := range []int{1, 31, 32, 33, 1024} {
+		t.Run(fmt.Sprint(depth), func(t *testing.T) {
+			mask, wire := binarySelectionDepthFixture(depth)
+			req, parseErr := registry.ParseBinaryRequest(wire)
+			encoded, encodeErr := EncodeBinaryRequest(1, mask, nil, nil)
+			if depth > 32 {
+				if parseErr == nil || req != nil {
+					t.Error("inbound over-depth selection accepted without schema")
+				}
+				if encodeErr == nil || encoded != nil {
+					t.Error("outbound over-depth selection encoded")
+				}
+			} else if parseErr != nil || encodeErr != nil || req == nil || req.API != "read" || !bytes.Equal(encoded, wire) {
+				t.Fatalf("valid depth %d changed: parse=%v encode=%v", depth, parseErr, encodeErr)
+			}
+		})
+	}
+}
+
+func TestBinaryHTTPSelectionDepthWithoutSchema(t *testing.T) {
+	router := NewRouter()
+	if err := router.Registry.Register("read", 1); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	router.Handle("read", func(_ context.Context, req *Request) error {
+		calls.Add(1)
+		req.Buf.B = append(req.Buf.B, 1)
+		return nil
+	})
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+	client := server.Client()
+	client.Timeout = 2 * time.Second
+	t.Cleanup(client.CloseIdleConnections)
+	for _, depth := range []int{32, 33, 1024, 32} {
+		_, wire := binarySelectionDepthFixture(depth)
+		before := calls.Load()
+		request, err := http.NewRequest(http.MethodPost, server.URL+"/luvia", bytes.NewReader(wire))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("X-Luxo-Mode", "binary")
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		closeErr := response.Body.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("read=%v close=%v", readErr, closeErr)
+		}
+		if depth > 32 {
+			if response.StatusCode != http.StatusBadRequest || calls.Load() != before {
+				t.Fatalf("depth %d reached handler: status=%d calls=%d", depth, response.StatusCode, calls.Load()-before)
+			}
+		} else if response.StatusCode != http.StatusOK || calls.Load() != before+1 || !bytes.Equal(body, []byte{1}) {
+			t.Fatalf("depth %d failed: status=%d calls=%d body=%x", depth, response.StatusCode, calls.Load()-before, body)
+		}
+	}
+}
+
+// Keep inbound bad-wire fixtures independent of EncodeBinaryRequest.
+func binarySelectionDepthFixture(depth int) (mask, wire []byte) {
+	mask = []byte{1, 1}
+	for level := 1; level < depth; level++ {
+		node := codec.AppendVarint([]byte{1, 1, 1}, uint64(len(mask)))
+		mask = append(node, mask...)
+	}
+	wire = codec.AppendVarint([]byte{1}, uint64(len(mask)))
+	wire = append(append(wire, mask...), 0)
+	return mask, wire
+}
 
 func TestBinaryRequestRejectsIncompleteIdentifierHeaders(t *testing.T) {
 	registry := NewAPIRegistry()

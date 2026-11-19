@@ -49,6 +49,11 @@ api byBareContains(title: String): [Probe] { return Probe.where(title.contains(t
 api byFindContains(title: String): [Probe] { return Probe.find(where: it.title.contains(title), order: id.asc) }
 api byFindWindow(points: [Int], skip: Int): [Probe] { return Probe.find(where: it.points in points, order: id.desc, limit: 1, offset: skip) }
 api byScopedFind(points: [Int]): [Probe] @scope(eligible) { return Probe.find(where: it.points in points, order: id.asc) }
+api byGroupedLeft(): [Probe] { return Probe.where { (it.id == 1 || it.id == 2) && it.points > 5 }.orderBy(id.asc).all() }
+api byGroupedRight(): [Probe] { return Probe.where { it.points > 5 && (it.id == 1 || it.id == 2) }.orderBy(id.asc).all() }
+api byGroupedNegation(): [Probe] { return Probe.where { !(it.id == 1 || it.id == 2) }.orderBy(id.asc).all() }
+api byComputedBound(low: Int, high: Int): [Probe] { return Probe.where { it.points == (low + high) * 2 }.orderBy(id.asc).all() }
+
 api updateMatching(points: [Int]): Int { return Probe.updateMany(where: it.points in points && it.id > 100, title: "changed") }
 api deleteMatching(points: [Int]): Int { return Probe.deleteMany(where: it.points in points && it.id > 100) }
 `, membershipAssertions+typedGroupRequestHelper, StableIDs{ModelFields: map[string]map[string]int{
@@ -58,10 +63,11 @@ api deleteMatching(points: [Int]): Int { return Probe.deleteMany(where: it.point
 
 const membershipAssertions = `package generated
 import("bytes";"encoding/json";"fmt";"net/http/httptest";"testing"
+"github.com/light-speak/luxo/internal/testutil"
 "github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/pg"
 "github.com/testcontainers/testcontainers-go";"github.com/testcontainers/testcontainers-go/modules/postgres")
 func TestMembershipHTTP(t *testing.T){
- container,err:=postgres.Run(t.Context(),"postgres:17-alpine",postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+ container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
  testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
  connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
  db,err:=pg.NewDB(t.Context(),connection);if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
@@ -101,6 +107,10 @@ func TestMembershipHTTP(t *testing.T){
    {"byFindContains",map[string]any{"title":"the"},[]int64{2,3}},
    {"byFindWindow",map[string]any{"points":[]int64{4,6,9},"skip":int64(1)},[]int64{2}},
    {"byScopedFind",map[string]any{"points":[]int64{4,6}},[]int64{3}},
+   {"byGroupedLeft",nil,[]int64{2}},
+   {"byGroupedRight",nil,[]int64{2}},
+   {"byGroupedNegation",nil,[]int64{3}},
+   {"byComputedBound",map[string]any{"low":int64(1),"high":int64(2)},[]int64{3}},
   }{t.Run(fmt.Sprintf("%s/%v",sample.name,binary),func(t *testing.T){
    checkMembership(t,router,sample.name,binary,sample.params,sample.ids)
   })}

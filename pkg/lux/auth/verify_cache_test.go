@@ -5,10 +5,60 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func cacheTestConfig() *Config {
 	return &Config{Secret: "cache-test-secret", Expires: time.Hour}
+}
+
+func TestVerifyCacheOwnsTokenStorage(t *testing.T) {
+	for _, prefix := range []bool{false, true} {
+		t.Run(strconv.FormatBool(prefix), func(t *testing.T) {
+			ResetVerifyCache()
+			t.Cleanup(ResetVerifyCache)
+			cfg := cacheTestConfig()
+			signed, err := Sign(cfg, testClaims(42, "ADMIN"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			large := strings.Repeat("x", 1<<20)
+			backing, start := signed+large, 0
+			if prefix {
+				backing, start = large+signed, len(large)
+			}
+			token := backing[start : start+len(signed)]
+			claims, expiry, err := VerifyCachedWithExpiry(cfg, token)
+			if err != nil || claims.ID() != 42 || expiry <= time.Now().Unix() {
+				t.Fatalf("verified identity changed: %v", err)
+			}
+			stored := cachedTokenKey(t, token)
+			// Observe storage only in tests; cache retention must not pin a larger input.
+			if unsafe.StringData(stored) == unsafe.StringData(token) {
+				t.Fatal("verification cache retained the token's source allocation")
+			}
+			if _, err := VerifyCached(cfg, token); err != nil {
+				t.Fatal(err)
+			}
+			if unsafe.StringData(cachedTokenKey(t, token)) != unsafe.StringData(stored) {
+				t.Fatal("a cache hit replaced the owned key")
+			}
+		})
+	}
+}
+
+func cachedTokenKey(t testing.TB, token string) string {
+	t.Helper()
+	shard := &verifyCache[verifyShardIndex(token)]
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	for key := range shard.m {
+		if key == token {
+			return key
+		}
+	}
+	t.Fatal("verified token was not cached")
+	return ""
 }
 
 func TestVerifyCachedHit(t *testing.T) {
@@ -207,6 +257,56 @@ func BenchmarkVerifyUncached(b *testing.B) {
 	}
 }
 
+func BenchmarkVerifyCacheOwnedTokenHit(b *testing.B) {
+	for _, size := range []int{0, 4096} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			cfg, token := ownedTokenBenchmark(b, size)
+			if _, err := VerifyCached(cfg, token); err != nil {
+				b.Fatal(err)
+			}
+			// Match repeated network requests with distinct string storage.
+			lookup := strings.Clone(token)
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := VerifyCached(cfg, lookup); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkVerifyCacheOwnedTokenCold(b *testing.B) {
+	for _, size := range []int{0, 4096} {
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			cfg, token := ownedTokenBenchmark(b, size)
+			shard := &verifyCache[verifyShardIndex(token)]
+			b.ReportAllocs()
+			for b.Loop() {
+				// Include identical eviction work in both revisions to force a miss.
+				shard.mu.Lock()
+				delete(shard.m, token)
+				shard.mu.Unlock()
+				if _, _, err := VerifyCachedWithExpiry(cfg, token); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func ownedTokenBenchmark(b *testing.B, size int) (*Config, string) {
+	b.Helper()
+	ResetVerifyCache()
+	b.Cleanup(ResetVerifyCache)
+	cfg := cacheTestConfig()
+	token, err := Sign(cfg, testClaims(42, strings.Repeat("x", size)))
+	if err != nil {
+		b.Fatal(err)
+	}
+	return cfg, token
+}
+
 func BenchmarkVerifyCachedSecretBinding(b *testing.B) {
 	for _, size := range []int{32, 512} {
 		for _, copied := range []bool{false, true} {
@@ -267,4 +367,43 @@ func BenchmarkVerificationEntryStorage(b *testing.B) {
 			}
 		})
 	}
+}
+
+func FuzzVerifyCachedMatchesStrictVerifier(f *testing.F) {
+	for _, sample := range [][2]string{
+		{`{"alg":"HS256","typ":"JWT"}`, `{"id":9007199254740993,"ratio":0.1234567890123456789}`},
+		{`{"alg":"HS256"}`, `{"text":"","enabled":false,"value":null}`},
+		{`{"alg":"HS256"}`, `{"id":1,"\u0069d":2}`},
+		{`{"alg":"none"}`, `{"id":42}`},
+		{`{"alg":"HS256","crit":["custom"]}`, `{"id":42}`},
+		{`{"alg":"HS256"}`, `null`},
+		{`{"alg":"HS256"}`, `{"role":"\uD800"}`},
+	} {
+		f.Add(sample[0], sample[1])
+	}
+	f.Fuzz(func(t *testing.T, header, data string) {
+		if len(header) > 4096 || len(data) > 8192 {
+			t.Skip()
+		}
+		ResetVerifyCache()
+		t.Cleanup(ResetVerifyCache)
+		cfg := cacheTestConfig()
+		payload := `{"token_use":"access","data":` + data + `,"exp":4102444800}`
+		unsigned := base64Encode([]byte(header)) + "." + base64Encode([]byte(payload))
+		token := unsigned + "." + hmacSign(unsigned, cfg.Secret)
+		want, wantErr := Verify(cfg, token)
+		for range 2 {
+			got, err := VerifyCached(cfg, token)
+			if (err == nil) != (wantErr == nil) || got.Raw() != want.Raw() {
+				t.Fatalf("cached/strict mismatch: %q, %v / %q, %v", got.Raw(), err, want.Raw(), wantErr)
+			}
+		}
+		expectedEntries := 0
+		if wantErr == nil {
+			expectedEntries = 1
+		}
+		if n := verifyCacheLen(); n != expectedEntries {
+			t.Fatalf("cache entries=%d, want %d", n, expectedEntries)
+		}
+	})
 }

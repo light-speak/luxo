@@ -2,11 +2,179 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:luxo_client/luxo_client.dart';
 import 'package:test/test.dart';
 
 void main() {
   for (final mode in TransportMode.values) {
+    for (final generated in [false, true]) {
+      for (final headersReceived in [false, true]) {
+        test(
+          'deadline never fails early in $mode generated=$generated headers=$headersReceived',
+          () async {
+            const timeout = Duration(milliseconds: 1);
+            final elapsed = <Duration>[];
+            for (var i = 0; i < 32; i++) {
+              final client = _PendingClient(headersReceived);
+              final transport = HttpTransport(
+                'https://example.test/luvia',
+                client: client,
+                options: TransportOptions(mode: mode),
+                timeout: timeout,
+              )..setSchema({'echo': APISchemaEntry(1, [])});
+              final request = generated ? _ClosingRequest(() {}) : null;
+              final clock = Stopwatch()..start();
+              try {
+                await transport.call<Object?>('echo', request: request);
+                fail('stalled request returned data');
+              } on LuxoError catch (error) {
+                elapsed.add(clock.elapsed);
+                expect(error.error, 'TimeoutError');
+                if (client.calls > 0) await client.aborted.future;
+                expect(client.abortCount, client.calls);
+                expect(client.active, 0);
+              } finally {
+                transport.close();
+              }
+            }
+            expect(
+              elapsed.where((value) => value < timeout),
+              isEmpty,
+              reason:
+                  'a pending call must receive its entire configured budget',
+            );
+          },
+        );
+      }
+    }
+    test('refresh cannot fail before the shared deadline in $mode', () async {
+      const timeout = Duration(milliseconds: 1);
+      final encoder = LuxoEncoder()
+        ..writeFieldInt(1, LuxoInt64.fromInt(401))
+        ..writeFieldString(2, 'Unauthorized')
+        ..writeFieldString(3, 'expired')
+        ..writeEnd();
+      final body = mode == TransportMode.json
+          ? utf8.encode(
+              '{"error":"Unauthorized","code":401,"message":"expired"}',
+            )
+          : encoder.bytes();
+      var refreshes = 0;
+      final elapsed = <Duration>[];
+      for (var i = 0; i < 32; i++) {
+        final transport = HttpTransport(
+          'https://example.test/luvia',
+          client: MockClient((_) async => http.Response.bytes(body, 401)),
+          options: TransportOptions(mode: mode),
+          timeout: timeout,
+          onTokenExpired: () {
+            refreshes++;
+            return Completer<String?>().future;
+          },
+        )..setSchema({'echo': APISchemaEntry(1, [])});
+        final clock = Stopwatch()..start();
+        try {
+          await transport.call<Object?>('echo');
+          fail('stalled refresh returned data');
+        } on LuxoError catch (error) {
+          elapsed.add(clock.elapsed);
+          expect(error.error, 'TimeoutError');
+        } finally {
+          transport.close();
+        }
+      }
+      expect(refreshes, greaterThan(0));
+      expect(elapsed.where((value) => value < timeout), isEmpty);
+    });
+
+    test('nonpositive deadlines never send or overflow in $mode', () async {
+      for (final timeout in [
+        Duration.zero,
+        const Duration(microseconds: -1),
+        const Duration(microseconds: -0x8000000000000000),
+      ]) {
+        var calls = 0;
+        final transport = HttpTransport(
+          'https://example.test/luvia',
+          client: MockClient((_) async {
+            calls++;
+            return http.Response('{"data":1}', 200);
+          }),
+          options: TransportOptions(mode: mode),
+          timeout: timeout,
+        )..setSchema({'echo': APISchemaEntry(1, [])});
+        try {
+          await expectLater(
+            transport.call<Object?>('echo'),
+            throwsA(
+              isA<LuxoError>().having(
+                (error) => error.error,
+                'error',
+                'TimeoutError',
+              ),
+            ),
+          );
+          expect(calls, 0);
+        } finally {
+          transport.close();
+        }
+      }
+    });
+
+    test(
+      'encoding failures remain asynchronous and unchanged in $mode',
+      () async {
+        final failure = StateError('encoding failed');
+        final client = MockClient((_) async {
+          fail('invalid encoding reached the backend');
+        });
+        final transport = HttpTransport(
+          'https://example.test/luvia',
+          client: client,
+          options: TransportOptions(mode: mode),
+        )..setSchema({'echo': APISchemaEntry(1, [])});
+        addTearDown(transport.close);
+        late Future<Object?> pending;
+        expect(
+          () => pending = transport.call<Object?>(
+            'echo',
+            request: _ClosingRequest(() => throw failure),
+          ),
+          returnsNormally,
+        );
+        await expectLater(pending, throwsA(same(failure)));
+      },
+    );
+
+    test('close during generated encoding prevents sending in $mode', () async {
+      var calls = 0;
+      final client = MockClient((request) async {
+        calls++;
+        return http.Response('{"data":true}', 200);
+      });
+      final transport = HttpTransport(
+        'https://example.test/luvia',
+        client: client,
+        options: TransportOptions(mode: mode),
+      )..setSchema({'echo': APISchemaEntry(1, [])});
+      addTearDown(transport.close);
+      await expectLater(
+        transport.call<Object?>(
+          'echo',
+          request: _ClosingRequest(transport.close),
+        ),
+        throwsA(
+          isA<LuxoError>().having(
+            (error) => error.error,
+            'error',
+            'NetworkError',
+          ),
+        ),
+      );
+      expect(calls, 0);
+    });
+
     test(
       'timeout leaves sibling calls and the client usable in $mode',
       () async {
@@ -132,9 +300,23 @@ class _PendingClient extends http.BaseClient {
     if (closed) return;
     closed = true;
     active = 0;
-    if (!headersReceived && !_headers.isCompleted) {
+    if (calls > 0 && !headersReceived && !_headers.isCompleted) {
       _headers.completeError(http.ClientException('closed'));
     }
     unawaited(_body.close());
+  }
+}
+
+class _ClosingRequest extends GeneratedRequest {
+  final void Function() close;
+  _ClosingRequest(this.close);
+  @override
+  int get apiID => 1;
+  @override
+  void writeParameters(LuxoEncoder encoder) => close();
+  @override
+  Map<String, dynamic> toJSONParameters() {
+    close();
+    return {};
   }
 }

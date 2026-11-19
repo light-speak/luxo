@@ -303,22 +303,46 @@ func TestBoolToString(t *testing.T) {
 }
 
 func TestStringToInt(t *testing.T) {
-	if got := StringToInt("42"); got != 42 {
-		t.Errorf("got %d", got)
-	}
-	if got := StringToInt("invalid"); got != 0 {
-		t.Errorf("invalid should return 0, got %d", got)
-	}
-	if got := StringToInt(""); got != 0 {
-		t.Errorf("empty should return 0, got %d", got)
+	for _, sample := range []struct {
+		input   string
+		want    int64
+		invalid bool
+	}{
+		{"42", 42, false}, {"-9223372036854775808", -9223372036854775808, false},
+		{"invalid", 0, true}, {"", 0, true}, {"9223372036854775808", 0, true}, {"-9223372036854775809", 0, true},
+	} {
+		got, err := StringToInt(sample.input)
+		if (err != nil) != sample.invalid || got != sample.want {
+			t.Errorf("%q: %d, %v", sample.input, got, err)
+		}
 	}
 }
 
 func TestStringToFloat(t *testing.T) {
-	if got := StringToFloat("3.14"); got != 3.14 {
-		t.Errorf("got %f", got)
+	for _, sample := range []struct {
+		input   string
+		want    float64
+		invalid bool
+	}{
+		{"3.14", 3.14, false}, {"5e-324", 5e-324, false}, {"invalid", 0, true}, {"", 0, true},
+		{"1e999", 0, true}, {"NaN", 0, true}, {"+Inf", 0, true}, {"-Inf", 0, true},
+	} {
+		got, err := StringToFloat(sample.input)
+		if (err != nil) != sample.invalid || got != sample.want {
+			t.Errorf("%q: %g, %v", sample.input, got, err)
+		}
 	}
-	if got := StringToFloat("invalid"); got != 0 {
-		t.Errorf("invalid should return 0, got %f", got)
+}
+
+func TestToFloatRejectsNonFinite(t *testing.T) {
+	for _, input := range []any{gomath.NaN(), gomath.Inf(1), gomath.Inf(-1), float32(gomath.NaN()), float32(gomath.Inf(1)), "NaN", "+Inf", "-Inf", "1e999"} {
+		if value, err := ToFloat(input); err == nil || value != 0 {
+			t.Errorf("%v: %g, %v", input, value, err)
+		}
+	}
+	for _, input := range []any{gomath.Copysign(0, -1), float32(gomath.Copysign(0, -1)), "-0"} {
+		if value, err := ToFloat(input); err != nil || !gomath.Signbit(value) {
+			t.Errorf("negative zero: %g, %v", value, err)
+		}
 	}
 }

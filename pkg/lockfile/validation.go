@@ -42,6 +42,9 @@ func validateModelIDs(kind string, models map[string]*ModelLock, limit int) erro
 		if name == "" || model == nil {
 			return fmt.Errorf("luxo.lock %s has an empty name or null declaration", kind)
 		}
+		if err := validateSealedLockKind(kind, name, model, models); err != nil {
+			return err
+		}
 		scope := kind + "." + name
 		maximum, err := ValidateAssignments(scope, model.Fields, model.Reserved, limit)
 		if err != nil {

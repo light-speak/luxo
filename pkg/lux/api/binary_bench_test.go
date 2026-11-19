@@ -471,3 +471,23 @@ func BenchmarkParseBinaryRequestIntoPaginatedDefaults(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkExtendedParameterDecode(b *testing.B) {
+	for _, count := range []int{17, 65, 256} {
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			registry := NewAPIRegistry()
+			if err := registry.Register("read", 1); err != nil {
+				b.Fatal(err)
+			}
+			meta, values := binaryIDParameters(count, false)
+			if err := registry.RegisterParams("read", meta); err != nil {
+				b.Fatal(err)
+			}
+			body, err := EncodeBinaryRequest(1, nil, values, meta)
+			if err != nil {
+				b.Fatal(err)
+			}
+			benchmarkIDDecode(b, registry, body, count)
+		})
+	}
+}

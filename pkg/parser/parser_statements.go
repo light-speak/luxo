@@ -75,7 +75,7 @@ func (p *Parser) parseStmt() ast.Stmt {
 		p.advance()
 		return nil
 	default:
-		return p.parseExprStmt()
+		return p.parseExprOrAssignStmt()
 	}
 }
 
@@ -106,7 +106,14 @@ func (p *Parser) parseAssignStmt() *ast.AssignStmt {
 func (p *Parser) parseExprOrAssignStmt() ast.Stmt {
 	pos := p.current().Pos
 	// parse the left side as an expression (handles member access chains)
+	startPos := p.pos
 	expr := p.parseExpr(precNone)
+	// prevent infinite loop if no tokens consumed
+	if p.pos == startPos {
+		p.error("unexpected token in statement: %s", p.current().Val)
+		p.advance()
+		return nil
+	}
 
 	// check if followed by assign op
 	if p.isAssignOp(p.current().Type) {
@@ -185,10 +192,10 @@ func (p *Parser) parseForStmt() *ast.ForStmt {
 	if p.check(token.Ident) && p.peekType() == token.In {
 		stmt.VarName = p.expectIdent()
 		p.expect(token.In)
-		stmt.Collection = p.parseForCondition()
+		stmt.Collection = p.parseConditionExpr()
 	} else {
 		// conditional loop: for condition { ... }
-		stmt.Collection = p.parseForCondition()
+		stmt.Collection = p.parseConditionExpr()
 	}
 
 	stmt.Body = p.parseBlock()
@@ -211,17 +218,4 @@ func (p *Parser) parseThrowStmt() *ast.ThrowStmt {
 		Pos:   pos,
 		Error: p.parseExpr(precNone),
 	}
-}
-
-func (p *Parser) parseExprStmt() *ast.ExprStmt {
-	pos := p.current().Pos
-	startPos := p.pos
-	expr := p.parseExpr(precNone)
-	// prevent infinite loop if no tokens consumed
-	if p.pos == startPos {
-		p.error("unexpected token in statement: %s", p.current().Val)
-		p.advance()
-		return nil
-	}
-	return &ast.ExprStmt{Pos: pos, Expr: expr}
 }

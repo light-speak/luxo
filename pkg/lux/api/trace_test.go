@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -512,6 +513,33 @@ func TestDebugTraceDecodeCompatibilityAndValidation(t *testing.T) {
 	}
 }
 
+func TestDebugTraceRejectsUnrepresentableSpanIDs(t *testing.T) {
+	for _, field := range []int{8, 9} {
+		for _, id := range []int64{-1, -4294967295, 1 << 32, 1<<32 + 1, math.MaxInt64} {
+			span := encodeSpanForTest("span", "service", 0, 0, func(enc *codec.Encoder) { enc.WriteFieldInt(field, id) })
+			data := encodeTraceForTest("trace", 0, [][]byte{span}, nil)
+			got, err := DecodeDebugTrace(data)
+			if err == nil || got.TraceID != "" || got.Spans != nil {
+				t.Errorf("field %d value %d was narrowed or returned partial trace: %+v, %v", field, id, got, err)
+			}
+		}
+		for _, id := range []int64{0, 1, math.MaxUint32} {
+			span := encodeSpanForTest("span", "service", 0, 0, func(enc *codec.Encoder) { enc.WriteFieldInt(field, id) })
+			got, err := DecodeDebugTrace(encodeTraceForTest("trace", 0, [][]byte{span}, nil))
+			if err != nil || len(got.Spans) != 1 {
+				t.Fatalf("valid ID rejected: %v", err)
+			}
+			actual := got.Spans[0].ID
+			if field == 9 {
+				actual = got.Spans[0].ParentID
+			}
+			if actual != uint32(id) {
+				t.Fatalf("ID changed: %d != %d", actual, id)
+			}
+		}
+	}
+}
+
 func TestDebugTraceDecodeRejectsBrokenTerminators(t *testing.T) {
 	validSpan := encodeSpanForTest("span", "service", 0, 0, nil)
 	for name, span := range map[string][]byte{
@@ -670,6 +698,23 @@ func TestDebugResponseWriterImplicitHeadersAndWriteFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	traceFailure.flush(trace)
+}
+
+func TestDebugResponseWriterStopsAfterBusinessWriteFailure(t *testing.T) {
+	_, trace := WithDebugTrace(context.Background(), "trace-body-write-error")
+	target := &failingResponseWriter{header: make(http.Header), failAt: 2}
+	writer := newDebugResponseWriter(target)
+	_, firstErr := writer.Write([]byte("body"))
+	if firstErr == nil {
+		t.Fatal("expected business body write failure")
+	}
+	if n, err := writer.Write([]byte("later")); n != 0 || err != firstErr {
+		t.Fatalf("later write = %d, %v; want original failure", n, err)
+	}
+	writer.flush(trace)
+	if target.writes != 2 {
+		t.Fatalf("continued writing after body failure: %d writes", target.writes)
+	}
 }
 
 func TestRouterReturnsDetailedTraceInDebugResponseEnvelope(t *testing.T) {

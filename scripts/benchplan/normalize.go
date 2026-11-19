@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/light-speak/luxo/internal/benchlayout"
@@ -57,7 +58,7 @@ func normalizeLine(line string, pending *string) (string, error) {
 	if strings.HasPrefix(line, prefix) {
 		line = prefix + benchlayout.Canonical(strings.TrimPrefix(line, prefix))
 	}
-	if line == "FAIL" || strings.HasPrefix(line, "--- FAIL:") {
+	if isBenchmarkFailure(line) {
 		return "", errors.New("benchmark process failed")
 	}
 	if *pending != "" && (line == "PASS" || strings.HasPrefix(line, "pkg: ") || strings.HasPrefix(line, "Benchmark")) {
@@ -68,19 +69,51 @@ func normalizeLine(line string, pending *string) (string, error) {
 		if err := addMeasurement(make(inventory), []string{fields[0], "1", "0", "ns/op"}); err != nil {
 			return "", err
 		}
-		if measurementTail(fields[1:]) {
+		measured, err := normalizedMeasurement(fields[1:])
+		if err != nil {
+			return "", err
+		}
+		if measured {
 			return line, nil
 		}
 		*pending = fields[0]
 		return "", nil
 	}
+	measured, err := normalizedMeasurement(fields)
+	if err != nil {
+		return "", err
+	}
 	if *pending != "" {
-		if measurementTail(fields) {
+		if measured {
 			completed := *pending + "\t" + line
 			*pending = ""
 			return completed, nil
 		}
 		return "", nil
 	}
+	if measured {
+		return "", fmt.Errorf("benchmark measurement has no benchmark name: %q", fields)
+	}
 	return line, nil
+}
+
+func normalizedMeasurement(fields []string) (bool, error) {
+	if measurementTail(fields) {
+		return true, nil
+	}
+	if len(fields) == 0 {
+		return false, nil
+	}
+	_, err := strconv.ParseFloat(fields[0], 64)
+	malformed := err == nil || errors.Is(err, strconv.ErrRange)
+	for _, field := range fields {
+		switch field {
+		case "ns/op", "B/op", "allocs/op":
+			malformed = true
+		}
+	}
+	if malformed {
+		return false, fmt.Errorf("invalid benchmark measurement: %q", fields)
+	}
+	return false, nil
 }

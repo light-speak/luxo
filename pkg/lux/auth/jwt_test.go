@@ -211,8 +211,12 @@ func TestLoadConfigRejectsInvalidSecuritySettings(t *testing.T) {
 	}{
 		{name: "empty secret", key: "JWT_SECRET", value: ""},
 		{name: "non-positive expiry", key: "JWT_EXPIRES", value: "0s"},
+		{name: "overflow expiry", key: "JWT_EXPIRES", value: "100000d100000d100000d"},
+		{name: "malformed expiry", key: "JWT_EXPIRES", value: "1..2d"},
 		{name: "invalid refresh flag", key: "JWT_REFRESH", value: "yes"},
 		{name: "non-positive refresh expiry", key: "JWT_REFRESH_EXPIRES", value: "-1s"},
+		{name: "overflow refresh expiry", key: "JWT_REFRESH_EXPIRES", value: "106752d"},
+		{name: "malformed refresh expiry", key: "JWT_REFRESH_EXPIRES", value: "1.2.3w"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

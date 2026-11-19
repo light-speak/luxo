@@ -4,6 +4,104 @@ import 'dart:typed_data';
 import 'package:luxo_client/luxo_client.dart';
 import 'package:luxo_client/src/transport.dart' show wsTransportWithSequence;
 
+class EmptyBinaryRequest extends GeneratedRequest {
+  @override
+  final int apiID;
+  EmptyBinaryRequest(this.apiID);
+  @override
+  void writeParameters(LuxoEncoder encoder) {}
+  @override
+  Map<String, dynamic> toJSONParameters() =>
+      throw StateError('Binary request used JSON parameters');
+}
+
+List<Uint8List> binaryPresenceReplies(Object? message) {
+  final decoder = LuxoDecoder(Uint8List.fromList(message as List<int>));
+  final tag = decoder.readBoundedUnsigned(127, 'fixture tag');
+  final id = decoder.readBoundedUnsigned(127, 'fixture id');
+  Uint8List frame(int tag, [bool present = false]) =>
+      Uint8List.fromList([tag, id, if (present) 0]);
+  if (tag == BinaryFrameType.unsubscribe) return [];
+  if (tag == BinaryFrameType.callRequest) return [frame(2, id != 3)];
+  return [
+    frame(0x13),
+    frame(0x12, true),
+    if (id == 1) ...[frame(0x12), frame(0x12), frame(0x15)],
+  ];
+}
+
+Future<void> verifyWebSocketBinaryPresence(String endpoint) async {
+  for (final generated in [false, true]) {
+    final transport = WsTransport(
+      endpoint,
+      options: const TransportOptions(mode: TransportMode.binary),
+      autoReconnect: false,
+      timeout: const Duration(seconds: 2),
+    );
+    transport.setSchema({'echo': const APISchemaEntry(7)});
+    final request = generated ? EmptyBinaryRequest(7) : null;
+    final failed = Completer<LuxoError>(), peer = Completer<Object?>();
+    final values = <Object?>[];
+    var errors = 0, completed = 0, decoded = 0;
+    Object? decode(Object? value) {
+      decoded++;
+      return value is Uint8List && value.length == 1 && value[0] == 0
+          ? null
+          : value;
+    }
+
+    try {
+      final stop = await transport.subscribe<Object?>(
+        'echo',
+        {},
+        values.add,
+        request: request,
+        decoder: decode,
+        onDone: () {
+          completed++;
+        },
+        onError: (error) {
+          errors++;
+          if (!failed.isCompleted) failed.complete(error);
+        },
+      );
+      final stopPeer = await transport.subscribe<Object?>(
+        'echo',
+        {},
+        peer.complete,
+        request: request,
+        decoder: decode,
+      );
+      final error = await failed.future.timeout(const Duration(seconds: 3));
+      if (error.error != 'ParseError' ||
+          await peer.future != null ||
+          values.length != 1 ||
+          values.single != null ||
+          errors != 1 ||
+          completed != 0 ||
+          decoded != 2) {
+        throw StateError(
+          'missing Binary stream reached decoder or peer: $error/$values/$errors/$completed/$decoded',
+        );
+      }
+      try {
+        await transport.call('echo', request: request);
+        throw StateError('missing Binary call body accepted');
+      } on LuxoError catch (error) {
+        if (error.error != 'ParseError') rethrow;
+      }
+      final value = await transport.call('echo', request: request);
+      if (value is! Uint8List || value.length != 1 || value[0] != 0) {
+        throw StateError('Binary null marker was lost: $value');
+      }
+      stop();
+      stopPeer();
+    } finally {
+      transport.close();
+    }
+  }
+}
+
 /// Runs unchanged on VM, dart2js and dart2wasm against a real loopback socket.
 Future<void> verifyWebSocketIDs(String endpoint) async {
   await _verifyJSONParameters(endpoint);

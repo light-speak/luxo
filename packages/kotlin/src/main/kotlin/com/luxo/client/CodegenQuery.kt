@@ -1,16 +1,16 @@
 package com.luxo.client
 
 internal object KotlinQueryCodegen {
-    private val identifier = Regex("[A-Za-z_][A-Za-z0-9_]*")
+    private val identifier = Regex("[_\\p{L}][_\\p{L}0-9]*")
     private fun checkName(name: String) = require(identifier.matches(name)) { "invalid query identifier: $name" }
 
-    private fun type(name: String, isEnum: Boolean): String = when {
-        isEnum -> name
-        name == "Int" -> "Long"
-        name == "Float" -> "Double"
-        name == "Boolean" -> "Boolean"
-        name in listOf("String", "UUID", "DateTime", "Decimal") -> "String"
-        else -> error("unsupported query type: $name")
+    private fun type(name: String, isEnum: Boolean, schema: LuxoSchema): String {
+        if (isEnum) return name
+        return when (name) {
+            "Int", "Float", "Boolean", "String", "UUID", "DateTime", "Decimal" ->
+                LuxoCodegen.luxoTypeToKt(name, schema)
+            else -> error("unsupported query type: $name")
+        }
     }
 
     private fun operators(name: String, isEnum: Boolean): List<String> = when {
@@ -38,7 +38,7 @@ internal object KotlinQueryCodegen {
                 checkName(field.type)
                 require(fields.add(field.field)) { "duplicate query field: ${field.field}" }
                 val isEnum = schema.enums.containsKey(field.type)
-                val type = type(field.type, isEnum)
+                val type = type(field.type, isEnum, schema)
                 val value = if (isEnum) "value.rawValue" else "value"
                 val allowed = operators(field.type, isEnum)
                 require(field.operators.isNotEmpty()) { "empty query operators: ${field.field}" }

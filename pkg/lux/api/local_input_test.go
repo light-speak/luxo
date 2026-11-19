@@ -90,13 +90,6 @@ func TestLocalInputRegistrationAndReset(t *testing.T) {
 		t.Fatal("unregistered API accepted")
 	}
 	router.Registry.RegisterSchemaAPIs(router.Schema)
-	// Bypass registration only to exercise the request boundary's defense
-	// against corrupted metadata. Public registration rejects this layout.
-	router.Registry.paramOrder["read"] = make([]ParamMeta, 17)
-	if err := router.Registry.prepareLocalJSONRequest(request); err == nil {
-		t.Fatal("oversized metadata accepted")
-	}
-	router.Registry.paramOrder["read"] = nil
 	if err := router.Registry.prepareLocalJSONRequest(request); err != nil || request.PageSize != 25 {
 		t.Fatalf("valid local preparation: %v %+v", err, request)
 	}

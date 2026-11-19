@@ -46,6 +46,9 @@ class _ProbeSocket implements LuxoSocket {
   Stream<Object> get messages => _messages.stream;
 
   @override
+  int? get closeCode => null;
+
+  @override
   void add(Object data) {
     if (data is String) {
       final request = decodeLuxoJSON(data) as Map<String, dynamic>;

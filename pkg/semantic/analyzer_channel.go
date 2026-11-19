@@ -41,7 +41,7 @@ func (a *Analyzer) checkChannelInitializer(s *ast.ValStmt, scope *Scope) *Resolv
 			}
 		}
 	}
-	setExprResolvedType(call, typ)
+	a.setExprResolvedType(call, typ)
 	return typ
 }
 

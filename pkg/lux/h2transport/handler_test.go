@@ -6,12 +6,163 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"runtime"
 	"testing"
 	"time"
 
+	"github.com/light-speak/luxo/pkg/lux/api"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
+
+func TestWorkerGoexitReleasesResponseAndAbortsStream(t *testing.T) {
+	for _, transfer := range []bool{false, true} {
+		t.Run(map[bool]string{false: "copied", true: "transferred"}[transfer], func(t *testing.T) {
+			handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if transfer {
+					buf := &api.ResponseBuf{B: make([]byte, 4, 16)}
+					copy(buf.B, "data")
+					if !w.(*response).TakeBinaryResponse(buf) {
+						t.Error("response transfer failed")
+					}
+				} else if _, err := w.Write([]byte("data")); err != nil {
+					t.Error(err)
+				}
+				runtime.Goexit()
+			})
+			c, task, _ := workerFixture(t, handler)
+			c.budget = &byteBudget{limit: 64}
+			finished := make(chan struct{})
+			go func() { defer close(finished); c.work() }()
+			select {
+			case <-finished:
+			case <-time.After(time.Second):
+				t.Fatal("Goexit did not finish worker")
+			}
+			if !task.done || c.budget.used.Load() != 0 || task.response != nil {
+				t.Errorf("Goexit retained task or response: done=%t bytes=%d", task.done, c.budget.used.Load())
+			}
+			command, ok, err := c.inbox.poll()
+			if err != nil || !ok || command.kind != abortStreamCommand || command.streamID != task.id || command.code != http2.ErrCodeInternal {
+				t.Errorf("Goexit did not abort only its stream: %+v %v", command, err)
+			}
+			c.outputFinished(task.id)
+			if len(c.tasks) != 0 || task.ctx.Err() == nil {
+				t.Error("aborted task remained registered")
+			}
+		})
+	}
+}
+
+func TestHandlerGoexitKeepsPeerAndWorkersUsable(t *testing.T) {
+	entered := make(chan struct{})
+	hold, release := context.WithCancel(t.Context())
+	defer release()
+	server, peer := goexitTestPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/hold":
+			close(entered)
+			select {
+			case <-hold.Done():
+			case <-r.Context().Done():
+				return
+			}
+		case "/exit":
+			_, _ = w.Write([]byte("private partial response"))
+			runtime.Goexit()
+		}
+		_, _ = io.WriteString(w, "healthy")
+	}))
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	held := make(chan error, 1)
+	go func() { held <- readHealthyGoexitPeer(ctx, peer, "/hold") }()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatal("unrelated stream did not start")
+	}
+	assertGoexitStreamResets(t, ctx, peer)
+	if err := readHealthyGoexitPeer(ctx, peer, "/healthy"); err != nil {
+		t.Fatal("Goexit exhausted workers or closed the peer", err)
+	}
+	release()
+	if err := <-held; err != nil {
+		t.Fatal("Goexit canceled an unrelated active stream", err)
+	}
+	_ = peer.Close()
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if server.budget.used.Load() != 0 || server.streams.used.Load() != 0 {
+		t.Fatal("Goexit leaked capacity", server.budget.used.Load(), server.streams.used.Load())
+	}
+}
+
+func goexitTestPeer(t *testing.T, handler http.Handler) (*Server, *http2.ClientConn) {
+	t.Helper()
+	server, err := NewServer(handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewUnstartedServer(nil)
+	if err := server.ConfigureHTTPServer(httpServer.Config); err != nil {
+		t.Fatal(err)
+	}
+	httpServer.Start()
+	t.Cleanup(func() { _ = server.Close(); httpServer.Close() })
+	conn, err := net.DialTimeout("tcp", httpServer.Listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &http2.Transport{}
+	peer, err := transport.NewClientConn(conn)
+	if err != nil {
+		_ = conn.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	return server, peer
+}
+
+func assertGoexitStreamResets(t *testing.T, ctx context.Context, peer *http2.ClientConn) {
+	t.Helper()
+	for range 16 {
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://example.test/exit", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := peer.RoundTrip(request)
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		var streamError http2.StreamError
+		if !errors.As(err, &streamError) || streamError.Code != http2.ErrCodeInternal {
+			t.Fatal("Goexit did not reset its stream with Internal", err)
+		}
+	}
+}
+
+func readHealthyGoexitPeer(ctx context.Context, peer *http2.ClientConn, path string) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://example.test"+path, nil)
+	if err != nil {
+		return err
+	}
+	response, err := peer.RoundTrip(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK || string(body) != "healthy" {
+		return errors.New("unexpected healthy response")
+	}
+	return nil
+}
 
 func TestHandlerBridgeMetadataAndErrors(t *testing.T) {
 	server, client := net.Pipe()

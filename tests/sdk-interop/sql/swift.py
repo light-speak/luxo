@@ -1,5 +1,6 @@
 """Build the macOS SQL consumer and runtime from current Swift sources."""
 import os
+import json
 from pathlib import Path
 import subprocess
 from evidence import save_evidence
@@ -7,6 +8,25 @@ from evidence import save_evidence
 
 def run(args):
     subprocess.run(args, check=True, timeout=180)
+
+
+def build_inferred(sdk, core, work, arguments):
+    build = ['swift', 'build', '--package-path', str(sdk), '--disable-automatic-resolution']
+    run([*build, '--product', 'LuxoAnalyze'])
+    binary_directory = subprocess.check_output([*build, '--show-bin-path'], text=True).strip()
+    analyzer = Path(binary_directory) / 'LuxoAnalyze'
+    # Swift 6 already enables complete concurrency checking. Diagnostic flags
+    # remain on the downstream compiler, alongside the prepared VFS overlay.
+    semantic = [arg for arg in arguments if arg not in ('-strict-concurrency=complete', '-warnings-as-errors')]
+    prepare = [str(analyzer), 'prepare-build', '--workspace', str(core),
+               '--manifest', str(work / 'generated/LuxoSelection.json'),
+               '--scratch', str(work / 'overlay'), '--', '-module-name', 'LuxoGenerated', *semantic]
+    overlay = subprocess.check_output(prepare, text=True).strip().splitlines()[-1]
+    Path(overlay).resolve().relative_to(work.resolve())
+    compiler = ['swiftc', '-module-name', 'LuxoGenerated', *arguments, '-vfsoverlay', overlay]
+    (work / 'compiler-arguments.json').write_text(json.dumps({'prepare': prepare, 'compile': compiler}, indent=2))
+    run(compiler)
+    return analyzer
 
 
 def main():
@@ -21,6 +41,13 @@ def main():
     work = evidence / 'swift'
     work.mkdir()
     consumer = source / ('Projection.swift' if os.environ.get('LUXO_SQL_PROJECTION') == '1' else 'Consumer.swift')
+    if os.environ.get('LUXO_SQL_PRECISION') == '1':
+        consumer = source / 'Precision.swift'
+    inferred = os.environ.get('LUXO_SQL_INFERRED') == '1'
+    if inferred:
+        consumer = source / 'Inferred.swift'
+    if os.environ.get('LUXO_SQL_RELATIONS') == '1':
+        consumer = source / 'Relations.swift'
     runtime = work / 'runtime'
     runtime.mkdir()
     flags = ['-O', '-swift-version', '6', '-strict-concurrency=complete',
@@ -28,15 +55,23 @@ def main():
     run(['swiftc', *flags, '-enable-testing', '-emit-library', '-emit-module',
          '-module-name', 'LuxoClient', '-emit-module-path', str(runtime / 'LuxoClient.swiftmodule'),
          *map(str, sources), '-o', str(runtime / 'libLuxoClient.dylib')])
-    flags += ['-I', str(runtime), '-L', str(runtime), '-lLuxoClient',
+    flags += ['-I', str(runtime), '-L', str(runtime), '-l', 'LuxoClient',
               '-Xlinker', '-rpath', '-Xlinker', str(runtime)]
     generator = work / 'generator'
     run(['swiftc', *flags, str(source / 'Generate.swift'), '-o', str(generator)])
     run([str(generator), os.environ['LUXO_SQL_SCHEMA_ENDPOINT'], str(work / 'generated')])
-    run(['swiftc', *flags, str(consumer),
-         *map(str, sorted((work / 'generated').glob('*.swift'))), '-o', str(work / 'consumer')])
+    arguments = [*flags, str(consumer), str(source / 'Trust.swift'),
+                 *map(str, sorted((work / 'generated').glob('*.swift'))), '-o', str(work / 'consumer')]
+    analyzer = None
+    if inferred:
+        analyzer = build_inferred(sdk, core, work, arguments)
+    else:
+        run(['swiftc', *arguments])
     run([str(work / 'consumer'), os.environ['LUXO_SQL_ENDPOINT'], os.environ['LUXO_SQL_CERTIFICATE']])
-    files = [*sources, consumer, source / 'Generate.swift', *work.rglob('*')]
+    files = [*sources, consumer, source / 'Trust.swift', source / 'Generate.swift', *work.rglob('*')]
+    if analyzer:
+        files.extend([analyzer, source / 'swift.py', *sdk.glob('Sources/LuxoCompiler/*.swift'),
+                      sdk / 'Sources/LuxoAnalyze/main.swift'])
     save_evidence(files, evidence, 'swift', core.parent)
 
 

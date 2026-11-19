@@ -7,6 +7,96 @@ import kotlin.test.*
 
 class WebSocketDecodeTest {
     @Test
+    fun generatedUnaryEncodingCancellationDoesNotSend() = runBlocking {
+        for (mode in TransportMode.entries) withSocket(mode) { transport, socket ->
+            verifyEncodingCancellation(transport, socket, subscription = false)
+        }
+    }
+
+    @Test
+    fun generatedSubscriptionEncodingCancellationDoesNotSend() = runBlocking {
+        for (mode in TransportMode.entries) withSocket(mode) { transport, socket ->
+            verifyEncodingCancellation(transport, socket, subscription = true)
+        }
+    }
+
+    private suspend fun verifyEncodingCancellation(transport: LuxoWebSocket, socket: TestSocket, subscription: Boolean) = coroutineScope {
+        val sent = socket.sent
+        val pending = async(start = CoroutineStart.UNDISPATCHED) {
+            val context = currentCoroutineContext()
+            val request = object : GeneratedRequest {
+                override val apiID = 77
+                override fun writeParameters(encoder: LuxoEncoder) { context.cancel() }
+                override fun toJSONParameters(): Map<String, Any?> { context.cancel(); return emptyMap() }
+            }
+            if (subscription) transport.subscribe("watch", { it }, request) { fail("cancelled handler ran") }
+            else transport.call("watch", request)
+        }
+        assertFailsWith<CancellationException> { pending.await() }
+        assertEquals(sent, socket.sent, "request cancelled during encoding reached socket")
+        assertEquals(7L, integer(transport.call("watch")))
+        assertEquals(sent + 1, socket.sent, "cancelled encoding broke the next call")
+        assertEquals(0, socket.closes)
+    }
+
+    @Test
+    fun missingBinaryDataRetiresOnlyItsOperation() = runBlocking {
+        withSocket(TransportMode.BINARY) { transport, socket ->
+            val errors = mutableListOf<LuxoError>()
+            val values = mutableListOf<Any>()
+            val peers = mutableListOf<Any>()
+            var done = 0
+            var decoded = 0
+            val decoder: (Any) -> Any = { decoded++; it }
+            val stop = transport.subscribe("watch", decoder, observer = StreamObserver({ done++ }, { errors += it })) { values += it }
+            val stopPeer = transport.subscribe("watch", decoder) { peers += it }
+            socket.receive(frame(0x12, 1, byteArrayOf(0)))
+            repeat(2) { socket.receive(frame(0x12, 1)) }
+            finish(socket, TransportMode.BINARY, 1)
+            socket.receive(frame(0x12, 2, byteArrayOf(0)))
+            assertEquals(listOf(listOf<Byte>(0)), values.map { (it as ByteArray).toList() })
+            assertEquals(listOf(listOf<Byte>(0)), peers.map { (it as ByteArray).toList() })
+            assertEquals("ParseError", errors.single().error)
+            assertEquals(0, done)
+            assertEquals(2, decoded)
+            val normal = socket.onBinary
+            socket.onBinary = { bytes ->
+                val dec = LuxoDecoder(bytes.toByteArray())
+                if (dec.readVarint() == 1L) socket.receive(frame(2, dec.readVarint()))
+            }
+            assertEquals("ParseError", assertFailsWith<LuxoError> { transport.call("watch") }.error)
+            socket.onBinary = normal
+            assertEquals(7L, integer(transport.call("watch")))
+            assertEquals(0, socket.closes)
+            stop(); stopPeer()
+        }
+    }
+
+    @Test
+    fun invalidJSONTokensTerminateConnectionWithoutDeliveringOverwrittenData() = runBlocking {
+        for (token in listOf("NaN", "01", "1e+", "[1,]", "\"\\q\"")) withSocket(TransportMode.JSON) { transport, socket ->
+            val errors = mutableListOf<LuxoError>()
+            var values = 0
+            var completed = 0
+            repeat(2) {
+                transport.subscribe("watch", { it }, observer = StreamObserver({ completed++ }, { errors += it })) { values++ }
+            }
+            socket.onText = {}
+            val pending = async(start = CoroutineStart.UNDISPATCHED) { runCatching { transport.call("watch") } }
+            val message = """{"${'$'}stream":1,"data":$token,"data":7}"""
+            socket.receive(message)
+            val failure = withTimeout(1_000) { pending.await() }.exceptionOrNull()
+            assertEquals("ParseError", assertIs<LuxoError>(failure).error, token)
+            assertEquals(listOf("ParseError", "ParseError"), errors.map { it.error }, token)
+            assertEquals(0, values, token)
+            assertEquals(0, completed, token)
+            assertEquals(1, socket.closes, token)
+            socket.receive(message)
+            assertEquals(2, errors.size, "late message notified twice: $token")
+        }
+    }
+
+    @Test
     fun missingJSONDataRetiresOnlyItsOperation() = runBlocking {
         withSocket(TransportMode.JSON) { transport, socket ->
             val errors = mutableListOf<LuxoError>()
@@ -86,6 +176,34 @@ class WebSocketDecodeTest {
             assertEquals("DecodeError", errors.single().error)
             assertEquals("invalid subscription payload", errors.single().message)
             stop()
+        }
+    }
+
+    @Test
+    fun unreadableDecoderMessageStillRetiresSubscription() = runBlocking {
+        for (mode in TransportMode.entries) withSocket(mode) { transport, socket ->
+            val errors = mutableListOf<LuxoError>()
+            val cause = object : Exception() {
+                override val message: String get() = throw IllegalStateException("message accessor failed")
+            }
+            var decodes = 0
+            var completed = 0
+            val stop = transport.subscribe<Long>("watch", { decodes++; throw cause },
+                observer = StreamObserver({ completed++ }, { errors += it })) { fail("unexpected data") }
+            var peer = 0L
+            val stopPeer = transport.subscribe("watch", ::integer) { peer = it }
+            repeat(2) { data(socket, mode, 1, valid = false) }
+            finish(socket, mode, 1)
+            stop(); stop()
+            data(socket, mode, 2, valid = true)
+            assertEquals(1, decodes)
+            assertEquals("DecodeError", errors.single().error)
+            assertEquals("invalid subscription payload", errors.single().message)
+            assertEquals(0, completed)
+            assertEquals(7L, peer)
+            assertEquals(7L, integer(transport.call("watch")))
+            assertEquals(0, socket.closes)
+            stopPeer()
         }
     }
 

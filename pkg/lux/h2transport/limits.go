@@ -15,7 +15,8 @@ type Limits struct {
 	HandshakeTimeout, BodyTimeout, ResponseTimeout, IdleTimeout, WriteTimeout time.Duration
 }
 
-// DefaultLimits are benchmark candidate settings, not production sizing advice.
+// DefaultLimits supplies finite engine bounds, not deployment sizing advice.
+// Gateway startup separately overrides body limits and configured timeouts.
 func DefaultLimits() Limits {
 	return Limits{MaxRequestBodyBytes: api.MaxRequestBodySize, MaxResponseBodyBytes: api.DefaultResponseBodySize, MaxConnections: 128, MaxInFlight: 256, MaxBufferedBytes: 64 << 20, ControlFramesPerSecond: 1024,
 		HandshakeTimeout: 5 * time.Second, BodyTimeout: 10 * time.Second, ResponseTimeout: 30 * time.Second,

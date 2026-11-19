@@ -14,10 +14,12 @@ type eventSnapshotGenerator struct {
 	enums   map[string]bool
 	queued  map[string]bool
 	queue   []string
+	sealed  *sealedPlan
+	owner   *GeneratorContext
 }
 
 func (generator *GeneratorContext) generateEventSnapshots(b *strings.Builder, result *semantic.Result, events []*ast.EventDecl, enums map[string]bool) {
-	g := eventSnapshotGenerator{objects: make(map[string][]*ast.FieldDecl), enums: enums, queued: make(map[string]bool)}
+	g := eventSnapshotGenerator{objects: make(map[string][]*ast.FieldDecl), enums: enums, queued: make(map[string]bool), sealed: generator.sealed, owner: generator}
 	for _, file := range result.Files {
 		for _, declaration := range file.Types {
 			g.objects[declaration.Name] = declaration.Fields
@@ -29,6 +31,10 @@ func (generator *GeneratorContext) generateEventSnapshots(b *strings.Builder, re
 	objects := collectEventObjectTypes(result)
 	for index := 0; index < len(g.queue); index++ {
 		name := g.queue[index]
+		if g.sealed != nil && g.sealed.declarations[name] != nil {
+			g.writeSealed(b, g.sealed.declarations[name])
+			continue
+		}
 		g.writeObject(b, name)
 		generator.generateEventObjectCodec(b, name, g.objects[name], enums, objects)
 	}
@@ -88,6 +94,7 @@ func (g *eventSnapshotGenerator) writeObject(b *strings.Builder, name string) {
 			}
 			goName := str.Capitalize(field.Name)
 			_, object := g.objects[field.Type.Name]
+			object = object || g.sealed != nil && g.sealed.declarations[field.Type.Name] != nil
 			g.writeValue(b, field.Type, "out."+goName, "value."+goName, object, validate, name+"{}", "\t")
 		}
 		if validate {
@@ -119,12 +126,16 @@ func (g *eventSnapshotGenerator) writeValue(b *strings.Builder, ref *ast.TypeRef
 }
 
 func (g *eventSnapshotGenerator) writeList(b *strings.Builder, ref *ast.TypeRef, target, source string, validate bool, zero, indent string) {
+	if validate {
+		fmt.Fprintf(b, "%sif len(%s) > codec.MaxArrayElements { return %s, codec.ErrInvalidArrayCount }\n", indent, source, zero)
+	}
 	if ref.Nullable {
 		fmt.Fprintf(b, "%sif %s != nil {\n", indent, source)
 		indent += "\t"
 	}
 	fmt.Fprintf(b, "%s%s = make(%s, len(%s))\n", indent, target, resolveGoType(ref), source)
 	_, object := g.objects[ref.Name]
+	object = object || g.sealed != nil && g.sealed.declarations[ref.Name] != nil
 	// Nested snapshots, mutable byte values and normalized timestamps assign
 	// every destination element below; an initial bulk copy would be discarded.
 	assignsElements := object || ref.Name == "Bytes" || ref.Name == "JSON" || (validate && ref.Name == "DateTime")
@@ -142,6 +153,10 @@ func (g *eventSnapshotGenerator) writeList(b *strings.Builder, ref *ast.TypeRef,
 }
 
 func (g *eventSnapshotGenerator) writeScalar(b *strings.Builder, ref *ast.TypeRef, target, source string, validate bool, zero, indent string) {
+	if g.sealed != nil && g.sealed.declarations[ref.Name] != nil {
+		g.writeNested(b, ref.Name, target, source, validate, zero, indent)
+		return
+	}
 	if _, object := g.objects[ref.Name]; object {
 		g.writeNested(b, ref.Name, target, source, validate, zero, indent)
 		return
@@ -166,11 +181,17 @@ func (g *eventSnapshotGenerator) writeNested(b *strings.Builder, name, target, s
 		g.queued[name] = true
 		g.queue = append(g.queue, name)
 	}
+	copy, clone := "copyEvent"+name, "cloneEvent"+name
+	if g.sealed != nil {
+		if names, exists := g.sealed.snapshots[name]; exists {
+			copy, clone = names.copy, names.clone
+		}
+	}
 	if !validate {
-		fmt.Fprintf(b, "%s%s = cloneEvent%s(%s)\n", indent, target, name, source)
+		fmt.Fprintf(b, "%s%s = %s(%s)\n", indent, target, clone, source)
 		return
 	}
-	fmt.Fprintf(b, "%s{\n%s\t_nested, err := copyEvent%s(%s, depth + 1)\n", indent, indent, name, source)
+	fmt.Fprintf(b, "%s{\n%s\t_nested, err := %s(%s, depth + 1)\n", indent, indent, copy, source)
 	fmt.Fprintf(b, "%s\tif err != nil { return %s, err }\n%s\t%s = _nested\n%s}\n", indent, zero, indent, target, indent)
 }
 

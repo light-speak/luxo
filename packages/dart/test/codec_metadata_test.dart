@@ -49,6 +49,34 @@ Uint8List _batch(BigInt count, [List<int> payload = const [], int arena = 0]) =>
     ]);
 
 void main() {
+  test('array headers validate the count before writing', () {
+    for (final count in [
+      -1,
+      -9223372036854775807,
+      1000001,
+      9223372036854775807,
+    ]) {
+      final encoder = LuxoEncoder()..writeBool(true);
+      expect(() => encoder.writeArrayHeader(count), throwsRangeError);
+      expect(encoder.bytes(), [1]);
+    }
+    for (final count in [0, 1, 127, 128, 1000000]) {
+      final encoder = LuxoEncoder()..writeArrayHeader(count);
+      expect(encoder.bytes(), _unsigned(BigInt.from(count)));
+    }
+  });
+
+  test('oversized array fields fail before changing output', () {
+    final encoder = LuxoEncoder()..writeBool(true);
+    final before = encoder.bytes();
+    expect(
+      () => encoder.writeFieldBoolArray(1, List<bool>.filled(1000001, false)),
+      throwsRangeError,
+    );
+    expect(encoder.bytes(), orderedEquals(before));
+  });
+
+  _columnViewTests();
   test(
     'rejects nonempty zero-column and impossible-row lists before allocation',
     () {
@@ -552,4 +580,69 @@ void main() {
       },
     );
   });
+}
+
+void _columnViewTests() {
+  final values = <String, (void Function(LuxoEncoder), Object)>{
+    'Int': ((e) => e.writeSvarint(LuxoInt64.maxValue), LuxoInt64.maxValue),
+    'Float': ((e) => e.writeFixed64(-0.0), -0.0),
+    'String': ((e) => e.writeString('東京𐐀'), '東京𐐀'),
+    'Bool': ((e) => e.writeBool(true), true),
+    'UUID': (
+      (e) => e.writeUuid('531f2d00-20e5-47f2-b874-22b6fc76328b'),
+      '531f2d00-20e5-47f2-b874-22b6fc76328b',
+    ),
+    'Bytes': (
+      (e) => e.writeBytes(Uint8List.fromList([0, 128, 255])),
+      Uint8List.fromList([0, 128, 255]),
+    ),
+    'DateTime': (
+      (e) => e.writeDateTime('1969-12-31T23:59:59.123456789Z'),
+      '1969-12-31T23:59:59.123456789Z',
+    ),
+  };
+  for (final entry in values.entries) {
+    for (final mode in ['value', 'present', 'null']) {
+      test('column view isolation ${entry.key} $mode', () {
+        final encoder = LuxoEncoder()
+          ..writeVarint(1)
+          ..writeVarint(0)
+          ..writeVarint(16384);
+        if (mode != 'value') encoder.writeBool(mode == 'present');
+        if (mode != 'null') entry.value.$1(encoder);
+        encoder.writeEnd();
+        final bytes = encoder.bytes();
+        final read =
+            _columnReaders['${entry.key}${mode == 'value' ? '' : 'Ptr'}']!;
+        for (final start in [0, 1, 8, 33]) {
+          final backing = Uint8List(start + bytes.length + 8)
+            ..fillRange(0, start + bytes.length + 8, 255);
+          backing.setRange(start, start + bytes.length, bytes);
+          final snapshot = Uint8List.fromList(backing);
+          for (var length = 0; length <= bytes.length; length++) {
+            final decoder = ColumnarDecoder(
+              Uint8List.sublistView(backing, start, start + length),
+            );
+            List<Object?> result = [];
+            if (decoder.nextColumn()) {
+              expect(decoder.fieldID, 16384);
+              result = read(decoder);
+              expect(decoder.nextColumn(), isFalse);
+            }
+            expect(decoder.offset, lessThanOrEqualTo(length));
+            if (length < bytes.length) {
+              expect(decoder.error, isNotNull);
+            } else {
+              expect(decoder.error, isNull);
+              expect(result, [mode == 'null' ? null : entry.value.$2]);
+              if (entry.key == 'Float' && mode != 'null') {
+                expect((result.single as double).isNegative, isTrue);
+              }
+            }
+            expect(backing, snapshot);
+          }
+        }
+      });
+    }
+  }
 }

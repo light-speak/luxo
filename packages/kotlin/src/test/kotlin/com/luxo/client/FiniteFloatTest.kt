@@ -32,6 +32,8 @@ class FiniteFloatTest {
             encoder.writeFixed64(value)
             assertContentEquals(wire(value), encoder.bytes())
             assertEquals(value.toRawBits(), LuxoDecoder(encoder.bytes()).readFloat().toRawBits())
+            val document = luxoJsonFloat(value).toString()
+            assertEquals(value.toRawBits(), decodeLuxoJsonFloat(decodeLuxoJSON(document)).toRawBits())
         }
     }
 }

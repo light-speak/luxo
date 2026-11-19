@@ -2,8 +2,10 @@ package codegen
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux/str"
 	"github.com/light-speak/luxo/pkg/semantic"
@@ -20,14 +22,15 @@ const (
 
 // Relation describes a single model relationship.
 type Relation struct {
-	FieldName  string       // field name in the model (e.g., "user", "posts")
-	TargetName string       // target model name (e.g., "User", "Post")
-	Type       RelationType // belongsTo, hasMany, hasOne
-	LocalKey   string       // key on this model (e.g., "userId" for belongsTo, "id" for hasMany)
-	RemoteKey  string       // key on target model (e.g., "id" for belongsTo, "userId" for hasMany)
-	IsList     bool         // [Post] vs Post
-	FKNullable bool         // true if the FK field is nullable (e.g., userId: Int?)
-	KeyGoType  string       // Go type of the local key (e.g., "int64", "uuid.UUID")
+	FieldName         string       // field name in the model (e.g., "user", "posts")
+	TargetName        string       // target model name (e.g., "User", "Post")
+	Type              RelationType // belongsTo, hasMany, hasOne
+	LocalKey          string       // key on this model (e.g., "userId" for belongsTo, "id" for hasMany)
+	RemoteKey         string       // key on target model (e.g., "id" for belongsTo, "userId" for hasMany)
+	IsList            bool         // [Post] vs Post
+	FKNullable        bool         // true if the FK field is nullable (e.g., userId: Int?)
+	RemoteKeyNullable bool         // the target row stores its grouping key as a pointer
+	KeyGoType         string       // Go type of the local key (e.g., "int64", "uuid.UUID")
 }
 
 // analyzeRelations extracts all relations from a model's fields.
@@ -66,23 +69,17 @@ func (g *GeneratorContext) analyzeRelations(m *ast.ModelDecl, enums map[string]b
 				rel.Type = HasOne
 			}
 		} else {
-			// Auto-infer
-			if rel.IsList {
+			var belongsTo bool
+			rel.LocalKey, rel.RemoteKey, belongsTo = inferred.ImplicitRelationKeys(m, f, g.externalModelIDFieldName(rel.TargetName))
+			switch {
+			case rel.IsList:
 				rel.Type = HasMany
-				rel.RemoteKey = g.relationForeignKeyName(m)
-				rel.LocalKey = primaryKeyFieldName(m)
-			} else {
-				fkName := str.LowerFirst(rel.TargetName) + str.Capitalize(g.externalModelIDFieldName(rel.TargetName))
-				if hasFKField(m.Fields, fkName) {
-					rel.Type = BelongsTo
-					rel.LocalKey = fkName
-					rel.RemoteKey = g.externalModelIDFieldName(rel.TargetName)
-				} else {
-					rel.Type = HasOne
-					rel.RemoteKey = g.relationForeignKeyName(m)
-					rel.LocalKey = primaryKeyFieldName(m)
-				}
+			case belongsTo:
+				rel.Type = BelongsTo
+			default:
+				rel.Type = HasOne
 			}
+
 		}
 
 		// Check if the FK field is nullable (e.g., userId: Int?)
@@ -142,7 +139,7 @@ func buildModelFieldIndex(result *semantic.Result) map[string][]*ast.FieldDecl {
 	return idx
 }
 
-// collectLoadCalls scans all API/fn bodies for Model.load(...) calls
+// collectLoadCalls scans executable bodies for Model.load(...) calls
 // and returns unique (model, args) combinations for DataLoader generation.
 func collectLoadCalls(result *semantic.Result) []loadCallInfo {
 	if !hasLoadCallBodies(result) {
@@ -160,24 +157,12 @@ func collectLoadCalls(result *semantic.Result) []loadCallInfo {
 			seenByModule[moduleName] = seen
 		}
 		start := len(calls)
-		// Scan API bodies
-		for _, api := range file.APIs {
-			if api.Body == nil {
-				continue
-			}
-			for _, stmt := range api.Body.Stmts {
-				scanLoadCalls(stmt, seen, &calls, fieldIndex)
-			}
-		}
-		// Scan fn bodies
-		for _, fn := range file.Functions {
-			if fn.Body == nil {
-				continue
-			}
-			for _, stmt := range fn.Body.Stmts {
-				scanLoadCalls(stmt, seen, &calls, fieldIndex)
-			}
-		}
+		visitLoadCallBodies(file, func(body *ast.Block) bool {
+			ast.WalkExprs(body, func(expr ast.Expr) {
+				recordLoadCallExpr(expr, seen, &calls, fieldIndex)
+			})
+			return false
+		})
 		for i := start; i < len(calls); i++ {
 			calls[i].sourceModule = moduleName
 		}
@@ -187,15 +172,27 @@ func collectLoadCalls(result *semantic.Result) []loadCallInfo {
 
 func hasLoadCallBodies(result *semantic.Result) bool {
 	for _, file := range result.Files {
-		for _, api := range file.APIs {
-			if api.Body != nil {
-				return true
-			}
+		if visitLoadCallBodies(file, func(*ast.Block) bool { return true }) {
+			return true
 		}
-		for _, fn := range file.Functions {
-			if fn.Body != nil {
-				return true
-			}
+	}
+	return false
+}
+
+func visitLoadCallBodies(file *ast.File, visit func(*ast.Block) bool) bool {
+	for _, api := range file.APIs {
+		if api.Body != nil && visit(api.Body) {
+			return true
+		}
+	}
+	for _, fn := range file.Functions {
+		if fn.Body != nil && visit(fn.Body) {
+			return true
+		}
+	}
+	for _, listener := range file.Listeners {
+		if listener.Body != nil && visit(listener.Body) {
+			return true
 		}
 	}
 	return false
@@ -319,15 +316,16 @@ type modelRelations struct {
 }
 
 type dataLoaderInputs struct {
-	relations    []modelRelations
-	extendModels []string
-	loadCalls    []loadCallInfo
-	softModels   map[string]bool
-	hasRemote    bool
+	relations      []modelRelations
+	pkModels       []string
+	remotePKModels []string
+	loadCalls      []loadCallInfo
+	softModels     map[string]bool
+	hasRemote      bool
 }
 
 func (inputs dataLoaderInputs) needed() bool {
-	return len(inputs.relations) > 0 || len(inputs.extendModels) > 0 || len(inputs.loadCalls) > 0
+	return len(inputs.relations) > 0 || len(inputs.pkModels) > 0 || len(inputs.loadCalls) > 0
 }
 
 // generateDataLoaderFile produces dataloader.gen.go with loader types and batch function signatures.
@@ -339,11 +337,16 @@ func generateDataLoaderFile(result *semantic.Result, packageName string, enums m
 }
 
 func (g *GeneratorContext) generateDataLoaderFile(result *semantic.Result, packageName string, enums map[string]bool, externalSoftModels map[string]bool) []byte {
-	inputs := g.collectDataLoaderInputs(result, enums, externalSoftModels)
+	var inputs dataLoaderInputs
+	if g.bindingPlan != nil && g.bindingPlan.source == result && g.bindingPlan.loaders != nil {
+		inputs = *g.bindingPlan.loaders
+	} else {
+		inputs = g.collectDataLoaderInputs(result, enums, externalSoftModels)
+	}
 	if !inputs.needed() {
 		return nil
 	}
-	needsUUID := g.dataLoaderNeedsUUID(inputs.relations, inputs.extendModels, inputs.loadCalls)
+	needsUUID := g.dataLoaderNeedsUUID(inputs.relations, inputs.pkModels, inputs.loadCalls)
 
 	var b strings.Builder
 	writeHeader(&b, packageName, "dataloader.gen.go")
@@ -369,11 +372,11 @@ func (g *GeneratorContext) generateDataLoaderFile(result *semantic.Result, packa
 
 	seenTypes := make(map[string]bool)
 	generateRelationLoaderTypes(&b, inputs.relations, seenTypes)
-	g.generateExtendLoaderTypes(&b, inputs.extendModels, seenTypes)
+	g.generateExtendLoaderTypes(&b, inputs.pkModels, seenTypes)
 	generateNamedLoaderTypes(&b, inputs.loadCalls, seenTypes)
-	g.generateLoadersStruct(&b, inputs.relations, seenTypes, inputs.extendModels, inputs.loadCalls)
-	g.generateDefaultLoaders(&b, inputs.relations, inputs.softModels, inputs.extendModels, inputs.loadCalls)
-	g.generateRemoteLoaders(&b, result, inputs.relations, inputs.softModels, inputs.extendModels, inputs.loadCalls)
+	g.generateLoadersStruct(&b, inputs.relations, seenTypes, inputs.pkModels, inputs.loadCalls)
+	g.generateDefaultLoaders(&b, inputs.relations, inputs.softModels, inputs.pkModels, inputs.loadCalls)
+	g.generateRemoteLoaders(&b, result, inputs)
 
 	return []byte(b.String())
 }
@@ -384,18 +387,16 @@ func (g *GeneratorContext) collectDataLoaderInputs(result *semantic.Result, enum
 	for _, file := range result.Files {
 		for _, m := range file.Models {
 			rels := g.analyzeRelations(m, enums)
+			for i := range rels {
+				rels[i].RemoteKeyNullable = relationRemoteKeyNullable(result, rels[i])
+			}
 			if len(rels) > 0 {
 				inputs.relations = append(inputs.relations, modelRelations{m.Name, rels})
 			}
 		}
 	}
 
-	inputs.extendModels = collectExtendModels(result)
-	for _, lc := range collectLoadCalls(result) {
-		if len(lc.argNames) > 0 {
-			inputs.loadCalls = append(inputs.loadCalls, lc)
-		}
-	}
+	inputs.collectLoadCalls(g, result)
 	if len(externalSoftModels) > 0 {
 		inputs.softModels = make(map[string]bool, len(externalSoftModels))
 		for k, v := range externalSoftModels {
@@ -414,14 +415,26 @@ func (g *GeneratorContext) collectDataLoaderInputs(result *semantic.Result, enum
 			}
 		}
 	}
-	inputs.hasRemote = len(inputs.extendModels) > 0
-	for _, call := range inputs.loadCalls {
-		if g.isRemoteLoadCall(call) {
-			inputs.hasRemote = true
-			break
+	inputs.hasRemote = inputs.hasRemote || len(inputs.remotePKModels) > 0
+	return inputs
+}
+
+func (inputs *dataLoaderInputs) collectLoadCalls(g *GeneratorContext, result *semantic.Result) {
+	inputs.remotePKModels = collectExtendModels(result)
+	inputs.pkModels = slices.Clip(inputs.remotePKModels)
+	for _, call := range collectLoadCalls(result) {
+		if len(call.argNames) > 0 {
+			inputs.loadCalls = append(inputs.loadCalls, call)
+			inputs.hasRemote = inputs.hasRemote || g.isRemoteLoadCall(call)
+			continue
+		}
+		if !slices.Contains(inputs.pkModels, call.modelName) {
+			inputs.pkModels = append(inputs.pkModels, call.modelName)
+		}
+		if g.isRemoteLoadCall(call) && !slices.Contains(inputs.remotePKModels, call.modelName) {
+			inputs.remotePKModels = append(inputs.remotePKModels, call.modelName)
 		}
 	}
-	return inputs
 }
 
 func generateRelationLoaderTypes(b *strings.Builder, relations []modelRelations, seenTypes map[string]bool) {
@@ -442,7 +455,7 @@ func (g *GeneratorContext) generateExtendLoaderTypes(b *strings.Builder, extendM
 		typeName := "Extend" + name + "ByIdLoader"
 		if !seenTypes[typeName] {
 			seenTypes[typeName] = true
-			fmt.Fprintf(b, "// %s is the batch function for loading %s by primary key (cross-module).\n", typeName, name)
+			fmt.Fprintf(b, "// %s is the batch function for loading %s by primary key.\n", typeName, name)
 			fmt.Fprintf(b, "type %s = dataloader.BatchFn[%s, *%s]\n\n", typeName, g.externalModelIDGoType(name), name)
 		}
 	}
@@ -483,7 +496,7 @@ func generateLoaderType(b *strings.Builder, modelName string, rel Relation) {
 	localGoType := rel.KeyGoType
 	if rel.IsList {
 		fmt.Fprintf(b, "// %s is the batch function for %s.%s (hasMany).\n", loaderName, modelName, rel.FieldName)
-		fmt.Fprintf(b, "type %s = dataloader.BatchFn[%s, []%s]\n\n", loaderName, localGoType, rel.TargetName)
+		fmt.Fprintf(b, "type %s = dataloader.BatchFn[%s, []*%s]\n\n", loaderName, localGoType, rel.TargetName)
 	} else {
 		fmt.Fprintf(b, "// %s is the batch function for %s.%s (%s).\n", loaderName, modelName, rel.FieldName, relTypeName(rel.Type))
 		fmt.Fprintf(b, "type %s = dataloader.BatchFn[%s, *%s]\n\n", loaderName, localGoType, rel.TargetName)
@@ -556,15 +569,7 @@ func (g *GeneratorContext) generateLoadersStruct(b *strings.Builder, allRelation
 	b.WriteString("\t}\n")
 	b.WriteString("}\n\n")
 
-	// ensureField helper
-	b.WriteString("// ensureField adds a field to the list if not already present.\n")
-	b.WriteString("func ensureField(fields []string, name string) []string {\n")
-	b.WriteString("\tif fields == nil {\n\t\treturn nil\n\t}\n")
-	b.WriteString("\tfor _, f := range fields {\n")
-	b.WriteString("\t\tif f == name {\n\t\t\treturn fields\n\t\t}\n")
-	b.WriteString("\t}\n")
-	b.WriteString("\treturn append(fields, name)\n")
-	b.WriteString("}\n\n")
+	generateEnsureFieldHelper(b)
 
 	b.WriteString("// SetLoaders injects DataLoader instances into the App.\n")
 	b.WriteString("func (a *App) SetLoaders(l Loaders) {\n")
@@ -583,7 +588,7 @@ func (g *GeneratorContext) loaderBindingSlots(entries []loaderEntry, extends []s
 	for _, entry := range entries {
 		value := "*" + entry.rel.TargetName
 		if entry.rel.IsList {
-			value = "[]" + entry.rel.TargetName
+			value = "[]*" + entry.rel.TargetName
 		}
 		slots = append(slots, loaderBindingSlot{entry.fieldName, fmt.Sprintf("*dataloader.Loader[%s, %s]", entry.rel.KeyGoType, value)})
 	}
@@ -649,9 +654,9 @@ func (g *GeneratorContext) generateDefaultLoaders(b *strings.Builder, allRelatio
 		}
 	}
 
-	// Extend model load-by-PK batch functions
+	// Primary-key batch functions for local and extended models
 	for _, name := range extendModels {
-		g.generateExtendByPKBatchFunc(b, name)
+		g.generateExtendByPKBatchFunc(b, name, softModels[name])
 	}
 
 	// FK/multi-condition batch functions from load() calls
@@ -675,7 +680,7 @@ func writeLoaderTransactionFactory(b *strings.Builder, constructor string) {
 
 // generateFKLoadBatchFunc generates a batch function for FK/multi-condition load().
 func (g *GeneratorContext) generateFKLoadBatchFunc(b *strings.Builder, lc loadCallInfo, softTarget bool) {
-	tableName := modelTableName(lc.modelName)
+	tableName := g.sqlTable(lc.modelName)
 	scanFn := "scan" + lc.modelName
 	loaderName := loaderNameFromLoadCall(lc)
 
@@ -683,16 +688,16 @@ func (g *GeneratorContext) generateFKLoadBatchFunc(b *strings.Builder, lc loadCa
 
 	if len(lc.argNames) == 1 {
 		// Single FK: WHERE col IN (keys)
-		col := str.ToSnakeCase(lc.argNames[0])
+		col := g.sqlColumn(lc.argNames[0])
 		goField := str.Capitalize(lc.argNames[0])
 		keyType := lc.argTypes[0]
 		condField := goTypeToCondField(keyType)
 		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []%s, selected []*selection.Field) (map[%s][]*%s, error) {\n", keyType, keyType, lc.modelName)
-		fmt.Fprintf(b, "\t\t\tfields := select%sSQLColumns(selected)\n", lc.modelName)
+		fmt.Fprintf(b, "\t\t\tfields := %s(selected)\n", g.loadSQLColumnSelector(lc.modelName))
 		fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", col)
 		fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", condField, col)
 		if softTarget {
-			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
+			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(%q).IsNull())\n", g.sqlColumn("deletedAt"))
 		}
 		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", tableName)
 		fmt.Fprintf(b, "\t\t\trows, err := app.DB.QueryRows(ctx, %s, query, args...)\n", scanFn)
@@ -707,15 +712,15 @@ func (g *GeneratorContext) generateFKLoadBatchFunc(b *strings.Builder, lc loadCa
 		// Multi-condition: composite key
 		keyType := loaderName + "Key"
 		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []%s, selected []*selection.Field) (map[%s][]*%s, error) {\n", keyType, keyType, lc.modelName)
-		fmt.Fprintf(b, "\t\t\tfields := select%sSQLColumns(selected)\n", lc.modelName)
+		fmt.Fprintf(b, "\t\t\tfields := %s(selected)\n", g.loadSQLColumnSelector(lc.modelName))
 
 		for _, arg := range lc.argNames {
-			col := str.ToSnakeCase(arg)
+			col := g.sqlColumn(arg)
 			fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", col)
 		}
-		generateCompositeLoadConditions(b, "\t\t\t", lc, false)
+		g.generateCompositeLoadConditions(b, "\t\t\t", lc, false)
 		if softTarget {
-			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
+			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(%q).IsNull())\n", g.sqlColumn("deletedAt"))
 		}
 
 		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", tableName)
@@ -740,7 +745,7 @@ func (g *GeneratorContext) generateFKLoadBatchFunc(b *strings.Builder, lc loadCa
 	}
 }
 
-func generateCompositeLoadConditions(b *strings.Builder, indent string, call loadCallInfo, parallelKeys bool) {
+func (g *GeneratorContext) generateCompositeLoadConditions(b *strings.Builder, indent string, call loadCallInfo, parallelKeys bool) {
 	lengthExpr := "keys"
 	loop := "for i, k := range keys {"
 	if parallelKeys {
@@ -756,7 +761,7 @@ func generateCompositeLoadConditions(b *strings.Builder, indent string, call loa
 			valueExpr = argName + "Keys[i]"
 		}
 		fmt.Fprintf(b, "%s\t\tlux.New%s(%q).Eq(%s),\n", indent,
-			goTypeToCondField(call.argTypes[i]), str.ToSnakeCase(argName), valueExpr)
+			goTypeToCondField(call.argTypes[i]), g.sqlColumn(argName), valueExpr)
 	}
 	fmt.Fprintf(b, "%s\t)\n", indent)
 	fmt.Fprintf(b, "%s}\n", indent)
@@ -765,16 +770,9 @@ func generateCompositeLoadConditions(b *strings.Builder, indent string, call loa
 
 // generateRemoteLoaders generates NewRemoteLoaders for cluster mode.
 // Same-module relations use local DB. Cross-module (extend) loaders use RPC.
-func (g *GeneratorContext) generateRemoteLoaders(b *strings.Builder, result *semantic.Result, allRelations []modelRelations, softModels map[string]bool, extendModels []string, fkLoadCalls []loadCallInfo) {
-	hasRemoteLoad := len(extendModels) > 0
-	for _, call := range fkLoadCalls {
-		if g.isRemoteLoadCall(call) {
-			hasRemoteLoad = true
-			break
-		}
-	}
-	if !hasRemoteLoad {
-		return // no cross-module loaders, no need for remote variant
+func (g *GeneratorContext) generateRemoteLoaders(b *strings.Builder, result *semantic.Result, inputs dataLoaderInputs) {
+	if !inputs.hasRemote {
+		return
 	}
 
 	b.WriteString("// NewRemoteLoaders creates Loaders with RPC-backed batch functions for cross-module models.\n")
@@ -786,7 +784,7 @@ func (g *GeneratorContext) generateRemoteLoaders(b *strings.Builder, result *sem
 	// Same-module relations use the local DB. A belongs-to relation whose target
 	// model is owned by another module must use that module's batch-load RPC.
 	seen := make(map[string]bool)
-	for _, mr := range allRelations {
+	for _, mr := range inputs.relations {
 		for _, rel := range mr.relations {
 			name := loaderFieldName(mr.modelName, rel)
 			if seen[name] {
@@ -796,22 +794,26 @@ func (g *GeneratorContext) generateRemoteLoaders(b *strings.Builder, result *sem
 			if g.isRemoteBelongsToRelation(mr.modelName, rel) {
 				g.generateRemoteByPKBatchFunc(b, rel.TargetName, g.externalModelFieldNames(result, rel.TargetName), rel.FieldName)
 			} else {
-				g.generateBatchFunc(b, mr.modelName, rel, softModels[rel.TargetName])
+				g.generateBatchFunc(b, mr.modelName, rel, inputs.softModels[rel.TargetName])
 			}
 		}
 	}
 
-	// Extend models: RPC batch function
-	for _, name := range extendModels {
-		g.generateRemoteByPKBatchFunc(b, name, g.externalModelFieldNames(result, name), "")
+	// Local primary-key loads keep the transaction-bound database path.
+	for _, name := range inputs.pkModels {
+		if slices.Contains(inputs.remotePKModels, name) {
+			g.generateRemoteByPKBatchFunc(b, name, g.externalModelFieldNames(result, name), "")
+		} else {
+			g.generateExtendByPKBatchFunc(b, name, inputs.softModels[name])
+		}
 	}
 
 	// Named loads use RPC only when the target model belongs to another module.
-	for _, lc := range fkLoadCalls {
+	for _, lc := range inputs.loadCalls {
 		if g.isRemoteLoadCall(lc) {
 			g.generateRemoteNamedLoadBatchFunc(b, lc, g.externalModelFieldNames(result, lc.modelName))
 		} else {
-			g.generateFKLoadBatchFunc(b, lc, softModels[lc.modelName])
+			g.generateFKLoadBatchFunc(b, lc, inputs.softModels[lc.modelName])
 		}
 	}
 
@@ -835,22 +837,24 @@ func (g *GeneratorContext) generateRemoteByPKBatchFunc(b *strings.Builder, model
 	g.generateRemoteFieldMask(b, modelName, visibleFields, idField)
 	// Encode keys as one canonical typed list param.
 	fmt.Fprintf(b, "\t\t\tvar enc codec.Encoder\n")
-	generateRemoteKeyEncoding(b, g.externalModelIDTypeName(modelName))
-	fmt.Fprintf(b, "\t\t\tenc.WriteEnd()\n")
 	svcName := "svc:batchLoad:" + modelName
+	generateRemoteKeyEncoding(b, g.externalModelIDTypeName(modelName), g.apiParamID(svcName, "keys"))
+	fmt.Fprintf(b, "\t\t\tenc.WriteEnd()\n")
 	apiID := g.apiID(svcName)
 	fmt.Fprintf(b, "\t\t\tresp, err := client.CallWithMaskTargetContext(ctx, luvia.BearerToken(ctx), %d, selectionMask, enc.Bytes(), rpc.TraceTarget{Operation: %q, Field: %q, Selection: selection.Format(fields), Dependency: api.TraceDependencySequential})\n", apiID, svcName, fieldName)
 	fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
 	// Decode response: [varint count][model1 ReadLuxo][model2 ReadLuxo]...
-	fmt.Fprintf(b, "\t\t\tcount, n := codec.ReadVarint(resp, 0)\n")
-	fmt.Fprintf(b, "\t\t\tif n <= 0 {\n\t\t\t\treturn nil, fmt.Errorf(\"invalid batch response\")\n\t\t\t}\n")
+	fmt.Fprintf(b, "\t\t\tcount, n := codec.ReadArrayHeader(resp, 0)\n")
+	fmt.Fprintf(b, "\t\t\tif n <= 0 || count > len(keys) || !codec.HasElementBytes(resp, n, count, 2) {\n\t\t\t\treturn nil, fmt.Errorf(\"invalid batch response\")\n\t\t\t}\n")
 	fmt.Fprintf(b, "\t\t\tresult := make(map[%s]*%s, count)\n", keyType, modelName)
 	fmt.Fprintf(b, "\t\t\tdec := codec.NewDecoder(resp[n:])\n")
-	fmt.Fprintf(b, "\t\t\tfor i := uint64(0); i < count; i++ {\n")
+	fmt.Fprintf(b, "\t\t\tfor i := 0; i < count; i++ {\n")
 	fmt.Fprintf(b, "\t\t\t\titem := &%s{}\n", modelName)
 	fmt.Fprintf(b, "\t\t\t\titem.ReadLuxo(dec)\n")
+	b.WriteString("\t\t\t\tif err := dec.Err(); err != nil { return nil, err }\n")
 	fmt.Fprintf(b, "\t\t\t\tresult[item.%s] = item\n", idGoName)
 	fmt.Fprintf(b, "\t\t\t}\n")
+	b.WriteString("\t\t\tif err := dec.Finish(); err != nil { return nil, err }\n")
 	fmt.Fprintf(b, "\t\t\treturn result, nil\n")
 	fmt.Fprintf(b, "\t\t},\n")
 }
@@ -903,22 +907,22 @@ func (g *GeneratorContext) generateRemoteNamedLoadBatchFunc(b *strings.Builder, 
 	fmt.Fprintf(b, "\t\t\tresp, err := client.CallWithMaskTargetContext(ctx, luvia.BearerToken(ctx), %d, selectionMask, enc.Bytes(), rpc.TraceTarget{Operation: %q, Selection: selection.Format(fields), Dependency: api.TraceDependencySequential})\n", g.apiID(serviceName), serviceName)
 	b.WriteString("\t\t\tif err != nil { return nil, err }\n")
 	b.WriteString("\t\t\tgroupCount, n := codec.ReadVarint(resp, 0)\n")
-	b.WriteString("\t\t\tif n <= 0 || groupCount != uint64(len(keys)) { return nil, fmt.Errorf(\"invalid grouped load response\") }\n")
+	b.WriteString("\t\t\tif n <= 0 || groupCount != uint64(len(keys)) || !codec.HasElementBytes(resp, n, len(keys), 1) { return nil, fmt.Errorf(\"invalid grouped load response\") }\n")
 	fmt.Fprintf(b, "\t\t\tresult := make(map[%s][]*%s, len(keys))\n", keyType, call.modelName)
 	b.WriteString("\t\t\toff := n\n")
 	b.WriteString("\t\t\tfor i, key := range keys {\n")
-	b.WriteString("\t\t\t\titemCount, consumed := codec.ReadVarint(resp, off)\n")
-	b.WriteString("\t\t\t\tif consumed <= 0 { return nil, fmt.Errorf(\"invalid grouped load response at key %d\", i) }\n")
+	b.WriteString("\t\t\t\titemCount, consumed := codec.ReadArrayHeader(resp, off)\n")
+	b.WriteString("\t\t\t\tif consumed <= 0 || !codec.HasElementBytes(resp, off+consumed, itemCount, 3) { return nil, fmt.Errorf(\"invalid grouped load response at key %d\", i) }\n")
 	b.WriteString("\t\t\t\toff += consumed\n")
 	fmt.Fprintf(b, "\t\t\t\titems := make([]*%s, 0, itemCount)\n", call.modelName)
-	b.WriteString("\t\t\t\tfor j := uint64(0); j < itemCount; j++ {\n")
+	b.WriteString("\t\t\t\tfor j := 0; j < itemCount; j++ {\n")
 	b.WriteString("\t\t\t\t\traw, size := codec.ReadBytes(resp, off)\n")
 	b.WriteString("\t\t\t\t\tif size == 0 { return nil, fmt.Errorf(\"invalid grouped load item at key %d\", i) }\n")
 	b.WriteString("\t\t\t\t\toff += size\n")
 	fmt.Fprintf(b, "\t\t\t\t\titem := &%s{}\n", call.modelName)
 	b.WriteString("\t\t\t\t\tdec := codec.NewDecoder(raw)\n")
 	b.WriteString("\t\t\t\t\titem.ReadLuxo(dec)\n")
-	b.WriteString("\t\t\t\t\tif err := dec.Err(); err != nil { return nil, err }\n")
+	b.WriteString("\t\t\t\t\tif err := dec.Finish(); err != nil { return nil, err }\n")
 	b.WriteString("\t\t\t\t\titems = append(items, item)\n")
 	b.WriteString("\t\t\t\t}\n")
 	b.WriteString("\t\t\t\tresult[key] = items\n")
@@ -930,19 +934,20 @@ func (g *GeneratorContext) generateRemoteNamedLoadBatchFunc(b *strings.Builder, 
 
 // generateExtendByPKBatchFunc generates a load-by-primary-key batch function for a cross-module model.
 // User.load(id) → this batch function queries users WHERE id IN (keys).
-func (g *GeneratorContext) generateExtendByPKBatchFunc(b *strings.Builder, modelName string) {
-	tableName := modelTableName(modelName)
+func (g *GeneratorContext) generateExtendByPKBatchFunc(b *strings.Builder, modelName string, soft bool) {
+	tableName := g.sqlTable(modelName)
 	scanFn := "scan" + modelName
 	keyType := g.externalModelIDGoType(modelName)
 	idField := g.externalModelIDFieldName(modelName)
-	idColumn := str.ToSnakeCase(idField)
+	idColumn := g.sqlColumn(idField)
 	idGoName := str.Capitalize(idField)
 
-	fmt.Fprintf(b, "\t\t// Extend %s: load by primary key (cross-module DataLoader)\n", modelName)
+	fmt.Fprintf(b, "\t\t// %s: load by primary key\n", modelName)
 	fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []%s, selected []*selection.Field) (map[%s]*%s, error) {\n", keyType, keyType, modelName)
-	fmt.Fprintf(b, "\t\t\tfields := select%sSQLColumns(selected)\n", modelName)
+	fmt.Fprintf(b, "\t\t\tfields := %s(selected)\n", g.loadSQLColumnSelector(modelName))
 	fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", idColumn)
 	fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", goTypeToCondField(keyType), idColumn)
+	g.generateSoftDeleteCondition(b, soft, "\t\t\t")
 	fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", tableName)
 	fmt.Fprintf(b, "\t\t\trows, err := app.DB.QueryRows(ctx, %s, query, args...)\n", scanFn)
 	fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
@@ -954,30 +959,24 @@ func (g *GeneratorContext) generateExtendByPKBatchFunc(b *strings.Builder, model
 	fmt.Fprintf(b, "\t\t},\n")
 }
 
-func generateRemoteKeyEncoding(b *strings.Builder, typeName string) {
-	switch typeName {
-	case "String":
-		writeBinaryCall(b, "\t\t\t", "enc.WriteFieldStringArray(1, keys)", "return nil, err")
-	case "UUID":
-		b.WriteString("\t\t\trawKeys := make([][16]byte, len(keys))\n")
-		b.WriteString("\t\t\tfor i, key := range keys { rawKeys[i] = [16]byte(key) }\n")
-		b.WriteString("\t\t\tenc.WriteFieldUUIDArray(1, rawKeys)\n")
-	default:
-		b.WriteString("\t\t\tenc.WriteFieldIntArray(1, keys)\n")
-	}
+func generateRemoteKeyEncoding(b *strings.Builder, typeName string, fieldID int) {
+	writeRemoteArrayEncoding(b, fieldID, typeName, "keys")
 }
 
 func generateRemoteArrayEncoding(b *strings.Builder, fieldID int, typeName, keysName string) {
+	writeRemoteArrayEncoding(b, fieldID, typeName, keysName)
+}
+
+func writeRemoteArrayEncoding(b *strings.Builder, fieldID int, typeName, keysName string) {
 	switch typeName {
 	case "String":
 		writeBinaryCall(b, "\t\t\t", fmt.Sprintf("enc.WriteFieldStringArray(%d, %s)", fieldID, keysName), "return nil, err")
 	case "UUID":
-		rawName := keysName + "Raw"
-		fmt.Fprintf(b, "\t\t\t%s := make([][16]byte, len(%s))\n", rawName, keysName)
-		fmt.Fprintf(b, "\t\t\tfor i, key := range %s { %s[i] = [16]byte(key) }\n", keysName, rawName)
-		fmt.Fprintf(b, "\t\t\tenc.WriteFieldUUIDArray(%d, %s)\n", fieldID, rawName)
+		fmt.Fprintf(b, "\t\t\tenc.WriteFieldHeader(%d)\n", fieldID)
+		writeBinaryCall(b, "\t\t\t", fmt.Sprintf("enc.WriteArrayHeader(len(%s))", keysName), "return nil, err")
+		fmt.Fprintf(b, "\t\t\tfor _, key := range %s { enc.WriteUUID([16]byte(key)) }\n", keysName)
 	default:
-		fmt.Fprintf(b, "\t\t\tenc.WriteFieldIntArray(%d, %s)\n", fieldID, keysName)
+		writeBinaryCall(b, "\t\t\t", fmt.Sprintf("enc.WriteFieldIntArray(%d, %s)", fieldID, keysName), "return nil, err")
 	}
 }
 
@@ -1061,49 +1060,77 @@ func (g *GeneratorContext) remoteModelModule(modelName string) string {
 // generateBatchFunc generates an inline batch function for a relation.
 // Uses DB.QueryRows with the module's scan function — no cross-module Client dependency.
 func (g *GeneratorContext) generateBatchFunc(b *strings.Builder, modelName string, rel Relation, softTarget bool) {
-	targetTable := modelTableName(rel.TargetName)
-	remoteCol := str.ToSnakeCase(rel.RemoteKey)
-	scanFn := "scan" + rel.TargetName
-	goRemoteField := str.Capitalize(rel.RemoteKey) // camelCase → PascalCase (e.g., userId → UserId)
-
+	remoteCol := g.sqlColumn(rel.RemoteKey)
 	keyType := rel.KeyGoType
 	if rel.IsList {
-		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []%s, selected []*selection.Field) (map[%s][]%s, error) {\n", keyType, keyType, rel.TargetName)
-		fmt.Fprintf(b, "\t\t\tfields := select%sSQLColumns(selected)\n", rel.TargetName)
-		fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", remoteCol)
-		condField := goTypeToCondField(keyType)
-		fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", condField, remoteCol)
-		if softTarget {
-			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
-		}
-		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", targetTable)
-		fmt.Fprintf(b, "\t\t\trows, err := app.DB.QueryRows(ctx, %s, query, args...)\n", scanFn)
-		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
-		fmt.Fprintf(b, "\t\t\tresult := make(map[%s][]%s, len(keys))\n", keyType, rel.TargetName)
-		fmt.Fprintf(b, "\t\t\tfor _, row := range rows {\n")
-		fmt.Fprintf(b, "\t\t\t\tresult[row.%s] = append(result[row.%s], *row)\n", goRemoteField, goRemoteField)
-		fmt.Fprintf(b, "\t\t\t}\n")
-		fmt.Fprintf(b, "\t\t\treturn result, nil\n")
-		fmt.Fprintf(b, "\t\t},\n")
+		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []%s, selected []*selection.Field) (map[%s][]*%s, error) {\n", keyType, keyType, rel.TargetName)
 	} else {
 		fmt.Fprintf(b, "\t\tfunc(ctx context.Context, keys []%s, selected []*selection.Field) (map[%s]*%s, error) {\n", keyType, keyType, rel.TargetName)
-		fmt.Fprintf(b, "\t\t\tfields := select%sSQLColumns(selected)\n", rel.TargetName)
-		fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", remoteCol)
-		condField := goTypeToCondField(keyType)
-		fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", condField, remoteCol)
-		if softTarget {
-			fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
-		}
-		fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", targetTable)
-		fmt.Fprintf(b, "\t\t\trows, err := app.DB.QueryRows(ctx, %s, query, args...)\n", scanFn)
-		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
-		fmt.Fprintf(b, "\t\t\tresult := make(map[%s]*%s, len(keys))\n", keyType, rel.TargetName)
-		fmt.Fprintf(b, "\t\t\tfor _, row := range rows {\n")
-		fmt.Fprintf(b, "\t\t\t\tresult[row.%s] = row\n", goRemoteField)
-		fmt.Fprintf(b, "\t\t\t}\n")
-		fmt.Fprintf(b, "\t\t\treturn result, nil\n")
-		fmt.Fprintf(b, "\t\t},\n")
 	}
+	fmt.Fprintf(b, "\t\t\tfields := %s(selected)\n", g.loadSQLColumnSelector(rel.TargetName))
+	fmt.Fprintf(b, "\t\t\tfields = ensureField(fields, %q)\n", remoteCol)
+	fmt.Fprintf(b, "\t\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", goTypeToCondField(keyType), remoteCol)
+	if softTarget {
+		fmt.Fprintf(b, "\t\t\tconds = append(conds, lux.NewTimeField(%q).IsNull())\n", g.sqlColumn("deletedAt"))
+	}
+	fmt.Fprintf(b, "\t\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", g.sqlTable(rel.TargetName))
+	fmt.Fprintf(b, "\t\t\trows, err := app.DB.QueryRows(ctx, scan%s, query, args...)\n", rel.TargetName)
+	b.WriteString("\t\t\tif err != nil {\n\t\t\t\treturn nil, err\n\t\t\t}\n")
+	writeRelationBatchResult(b, rel)
+}
+
+// A private result map cannot escape before the check. A single-object batch
+// must retain one distinct key per non-NULL row, otherwise a row was overwritten.
+func writeRelationBatchResult(b *strings.Builder, rel Relation) {
+	if rel.IsList {
+		fmt.Fprintf(b, "\t\t\tresult := make(map[%s][]*%s, len(keys))\n", rel.KeyGoType, rel.TargetName)
+	} else {
+		fmt.Fprintf(b, "\t\t\tresult := make(map[%s]*%s, len(keys))\n", rel.KeyGoType, rel.TargetName)
+	}
+	if !rel.IsList && rel.RemoteKeyNullable {
+		b.WriteString("\t\t\tnullKeys := 0\n")
+	}
+	b.WriteString("\t\t\tfor _, row := range rows {\n")
+	field, dereference := str.Capitalize(rel.RemoteKey), ""
+	if rel.RemoteKeyNullable {
+		if rel.IsList {
+			fmt.Fprintf(b, "\t\t\t\tif row.%s == nil { continue }\n", field)
+		} else {
+			fmt.Fprintf(b, "\t\t\t\tif row.%s == nil { nullKeys++; continue }\n", field)
+		}
+		dereference = "*"
+	}
+	if rel.IsList {
+		fmt.Fprintf(b, "\t\t\t\tresult[%srow.%s] = append(result[%srow.%s], row)\n", dereference, field, dereference, field)
+	} else {
+		fmt.Fprintf(b, "\t\t\t\tresult[%srow.%s] = row\n", dereference, field)
+	}
+	b.WriteString("\t\t\t}\n")
+	if !rel.IsList {
+		count := "len(rows)"
+		if rel.RemoteKeyNullable {
+			count += " - nullKeys"
+		}
+		fmt.Fprintf(b, "\t\t\tif len(result) != %s { return nil, dataloader.ErrNonUniqueRelation }\n", count)
+	}
+	b.WriteString("\t\t\treturn result, nil\n\t\t},\n")
+}
+
+// NULL cannot match the loader's non-null IN keys. Keep zero-valued keys
+// distinct from NULL and group nullable columns by their scalar value.
+func relationRemoteKeyNullable(result *semantic.Result, rel Relation) bool {
+	if target := result.Types[rel.TargetName]; target != nil {
+		field := target.LookupField(rel.RemoteKey)
+		return field != nil && field.Type != nil && (field.Nullable || field.Type.Nullable)
+	}
+	for _, file := range result.Files {
+		for _, model := range file.Models {
+			if model.Name == rel.TargetName {
+				return isFKNullable(model.Fields, rel.RemoteKey)
+			}
+		}
+	}
+	return false
 }
 
 // loaderTypeName returns the type name for a loader function.
@@ -1222,4 +1249,24 @@ func relTypeName(t RelationType) string {
 		return "hasOne"
 	}
 	return "unknown"
+}
+
+func generateEnsureFieldHelper(b *strings.Builder) {
+	// ensureField helper
+	b.WriteString("// ensureField adds a field to the list if not already present.\n")
+	b.WriteString("func ensureField(fields []string, name string) []string {\n")
+	b.WriteString("\tif fields == nil {\n\t\treturn nil\n\t}\n")
+	b.WriteString("\tfor _, f := range fields {\n")
+	b.WriteString("\t\tif f == name {\n\t\t\treturn fields\n\t\t}\n")
+	b.WriteString("\t}\n")
+	b.WriteString("\treturn append(fields, name)\n")
+	b.WriteString("}\n\n")
+
+}
+
+func (g *GeneratorContext) loadSQLColumnSelector(modelName string) string {
+	if hasPrivateSQLFields(g.modelDeclarations[modelName]) {
+		return "(*" + modelName + ")(nil).loadSQLColumns"
+	}
+	return "select" + modelName + "SQLColumns"
 }

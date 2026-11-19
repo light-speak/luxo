@@ -1,11 +1,14 @@
 import { readFileSync } from 'node:fs'
+import { getEventListeners } from 'node:events'
 import { createSecureServer } from 'node:http2'
 import { createServer } from 'node:net'
+import { createServer as createHTTPServer } from 'node:http'
 import { createServer as createTLSServer } from 'node:tls'
 import type { Socket } from 'node:net'
 import type { Http2SecureServer, ServerHttp2Stream, ServerHttp2Session, IncomingHttpHeaders } from 'node:http2'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { NodeHTTP2Transport } from './node'
+import { Encoder } from './codec'
 
 const cert = readFileSync(new URL('../testdata/node-http2-cert.pem', import.meta.url))
 const key = readFileSync(new URL('../testdata/node-http2-key.pem', import.meta.url))
@@ -47,9 +50,70 @@ function client(options: ConstructorParameters<typeof NodeHTTP2Transport>[1] = {
   return result
 }
 
+it('keeps native H2 registration after non-string parameter names are rejected', async () => {
+  const transport = client()
+  transport.setSchema({ echo: { id: 1, params: [{ fieldID: 1, name: 'value', type: 'Int' }] } })
+  let received: number[] | undefined
+  handle = (stream, body) => {
+    received = Array.from(body)
+    stream.respond({ ':status': 200 })
+    stream.end(Uint8Array.of(42))
+  }
+  for (const name of [undefined, null, false, true, 0, 7, [], {}]) {
+    const invalid = { echo: { id: 2, params: [{ fieldID: 2, name: 'other', type: 'Int' }] } }
+    Object.assign(invalid.echo.params[0], { name })
+    expect(() => transport.setSchema(invalid)).toThrow(/name.*string/)
+  }
+  await expect(transport.call('echo', { value: 7n })).resolves.toEqual(Uint8Array.of(42))
+  expect(received).toEqual([1, 0, 1, 14, 0])
+})
+
 it('reuses verified TLS H2 and preserves response bytes', async () => {
   const transport = client()
   for (let index = 0; index < 3; index++) expect(await transport.call('echo')).toEqual(Uint8Array.of(42))
+  expect(sessions.size).toBe(1)
+})
+
+it('keeps native H2 registration after non-string type metadata is rejected', async () => {
+  const transport = client()
+  transport.setSchema({ echo: { id: 1, params: [{ fieldID: 1, name: 'value', type: 'Int' }] } })
+  let received: number[] | undefined
+  handle = (stream, body) => {
+    received = Array.from(body)
+    stream.respond({ ':status': 200 })
+    stream.end(Uint8Array.of(42))
+  }
+  for (const target of ['param', 'field', 'type']) {
+    for (const member of ['type', 'typeName']) {
+      for (const value of [false, true, 0, 7, [], {}]) {
+        const field = { fieldID: 2, type: 'Int' }
+        const invalid = { echo: { id: 2, params: [{ fieldID: 2, name: 'other', type: 'Int' }],
+          fields: { id: { ...field } }, types: { Input: { id: { ...field } } } } }
+        const metadata = target === 'param' ? invalid.echo.params[0]
+          : target === 'field' ? invalid.echo.fields.id : invalid.echo.types.Input.id
+        Object.assign(metadata, { [member]: value })
+        expect(() => transport.setSchema(invalid)).toThrow(new RegExp(`${member}.*string`))
+      }
+    }
+  }
+  await expect(transport.call('echo', { value: 7n })).resolves.toEqual(Uint8Array.of(42))
+  expect(received).toEqual([1, 0, 1, 14, 0])
+})
+
+it('rejects empty Binary bodies and releases TLS H2 capacity without losing the session', async () => {
+  let requests = 0
+  handle = stream => {
+    stream.respond({ ':status': 200 })
+    stream.end(++requests % 2 === 1 ? undefined : Uint8Array.of(0))
+  }
+  const transport = client({ maxConcurrentRequests: 1 })
+  const codec = { apiID: 1, initialCapacity: () => 8, writeParameters() {} }
+  for (const generated of [false, true]) {
+    const call = () => generated ? transport.callGenerated('echo', codec) : transport.call('echo')
+    await expect(call()).rejects.toMatchObject({ error: 'ParseError', code: 200 })
+    await expect(call()).resolves.toEqual(Uint8Array.of(0))
+  }
+  expect(requests).toBe(4)
   expect(sessions.size).toBe(1)
 })
 
@@ -81,8 +145,8 @@ it('cancels one partial response without closing another request or the session'
 })
 
 it.each([1, 16])('honors local/peer capacity and releases timeout slots (local=%s)', async maximum => {
-  // Keep real socket I/O; advance only the SDK deadline after capacity is occupied.
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  // Keep real socket I/O; advance the SDK timer and monotonic clock together.
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] })
   server.updateSettings({ maxConcurrentStreams: 1 })
   const transport = client({ maxConcurrentRequests: maximum, timeout: 25 })
   expect(await transport.call('echo')).toEqual(Uint8Array.of(42))
@@ -169,6 +233,79 @@ it('rejects oversized requests before opening a connection', async () => {
   expect(sessions.size).toBe(0)
 })
 
+it.each([['json', false], ['json', true], ['binary', false], ['binary', true]] as const)('closing H2 terminates %s refresh with late rejection=%s', async (mode, rejectLate) => {
+  const entered = Promise.withResolvers<void>()
+  const refresh = Promise.withResolvers<string | null>()
+  const encoder = new Encoder()
+  encoder.writeFieldInt(1, 401n)
+  encoder.writeFieldString(2, 'Unauthorized')
+  encoder.writeFieldString(3, 'expired')
+  encoder.writeEnd()
+  handle = stream => {
+    stream.respond({ ':status': 401 })
+    stream.end(mode === 'json' ? '{"error":"Unauthorized","code":401,"message":"expired"}' : encoder.bytes())
+  }
+  const transport = client({ mode, onTokenExpired: () => { entered.resolve(); return refresh.promise } })
+  const setToken = vi.spyOn(transport, 'setToken')
+  let settled = false
+  let failure: unknown
+  const observed = transport.call('echo').then(() => { settled = true }, error => { settled = true; failure = error })
+  await entered.promise
+  transport.close()
+  await new Promise<void>(resolve => setImmediate(resolve))
+  try {
+    expect(settled).toBe(true)
+    expect(failure).toMatchObject({ error: 'CancelledError' })
+  } finally {
+    if (rejectLate) refresh.reject(new Error('late refresh failure'))
+    else refresh.resolve('late-token')
+    await observed
+  }
+  await new Promise<void>(resolve => setImmediate(resolve))
+  expect(setToken).not.toHaveBeenCalled()
+})
+
+it.each(['json', 'binary'] as const)('isolates cancelled %s refresh and removes both abort listeners', async mode => {
+  class ObservableTransport extends NodeHTTP2Transport {
+    get refreshSignal() { return this.refreshAbortSignal! }
+  }
+  const entered = [Promise.withResolvers<void>(), Promise.withResolvers<void>()]
+  const refreshes = [Promise.withResolvers<string | null>(), Promise.withResolvers<string | null>()]
+  let index = 0
+  const transport = new ObservableTransport(endpoint, {
+    mode, token: 'old', tls: { ca: cert },
+    onTokenExpired: () => { const current = index++; entered[current].resolve(); return refreshes[current].promise },
+  })
+  transport.setSchema({ echo: { id: 1, params: [] } })
+  clients.push(transport)
+  const encoder = new Encoder()
+  encoder.writeFieldInt(1, 401n)
+  encoder.writeFieldString(2, 'Unauthorized')
+  encoder.writeFieldString(3, 'expired')
+  encoder.writeEnd()
+  handle = (stream, _body, headers) => {
+    const authorized = headers.authorization === 'Bearer new'
+    stream.respond({ ':status': authorized ? 200 : 401 })
+    stream.end(authorized ? (mode === 'json' ? '{"data":42}' : Uint8Array.of(42))
+      : (mode === 'json' ? '{"error":"Unauthorized","code":401,"message":"expired"}' : encoder.bytes()))
+  }
+  const controller = new AbortController()
+  const first = expect(transport.call('echo', undefined, { signal: controller.signal })).rejects.toMatchObject({ error: 'CancelledError' })
+  await entered[0].promise
+  const second = transport.call('echo')
+  await entered[1].promise
+  expect(getEventListeners(transport.refreshSignal, 'abort')).toHaveLength(2)
+  controller.abort()
+  await first
+  expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
+  expect(getEventListeners(transport.refreshSignal, 'abort')).toHaveLength(1)
+  refreshes[0].reject(new Error('cancelled refresh failed late'))
+  refreshes[1].resolve('new')
+  expect(await second).toEqual(mode === 'json' ? 42 : Uint8Array.of(42))
+  expect(getEventListeners(transport.refreshSignal, 'abort')).toHaveLength(0)
+  expect(sessions.size).toBe(1)
+})
+
 it('preserves JSON and authenticated refresh through the common transport', async () => {
   let calls = 0
   let refreshes = 0
@@ -219,7 +356,7 @@ it('rejects a truncated declared body without replaying the call', async () => {
 })
 
 it.each([false, true])('destroys stalled handshake after timeout (TLS negotiated=%s)', async negotiated => {
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] })
   const connected = Promise.withResolvers<void>()
   const sockets = new Set<Socket>()
   let closed: (() => void) | undefined
@@ -289,4 +426,79 @@ it('keeps concurrent responses independent when the peer finishes out of order',
   const keys = Array.from({ length: 8 }, (_, index) => String(index))
   expect(await Promise.all(keys.map(key => transport.call('echo', { key })))).toEqual(keys)
   expect(sessions.size).toBe(1)
+})
+
+it.each(['json', 'binary'] as const)('preserves %s retry bytes over verified TLS H2', async mode => {
+  const bodies: Buffer[] = []
+  const tokens: (string | string[] | undefined)[] = []
+  handle = (stream, body, headers) => {
+    bodies.push(body)
+    tokens.push(headers.authorization)
+    if (bodies.length === 1) {
+      stream.respond({ ':status': 401 })
+      if (mode === 'json') stream.end('{"error":"Unauthorized","code":401,"message":"expired"}')
+      else {
+        const encoder = new Encoder()
+        encoder.writeFieldInt(1, 401n)
+        encoder.writeFieldString(2, 'Unauthorized')
+        encoder.writeFieldString(3, 'expired')
+        encoder.writeEnd()
+        stream.end(encoder.bytes())
+      }
+    } else {
+      stream.respond({ ':status': 200 })
+      stream.end(mode === 'json' ? '{"data":true}' : Uint8Array.of(42))
+    }
+  }
+  const params = { count: 42n }
+  const transport = client({ mode, token: 'original', onTokenExpired: async () => {
+    params.count = 99n
+    transport.setSchema({ echo: { id: 2, params: [{ fieldID: 3, name: 'count', type: 'Int' }] } })
+    return 'renewed'
+  } })
+  transport.setSchema({ echo: { id: 1, params: [{ fieldID: 1, name: 'count', type: 'Int' }] } })
+  await transport.call('echo', params)
+  expect(bodies).toHaveLength(2)
+  expect(bodies[1]).toEqual(bodies[0])
+  expect(tokens).toEqual(['Bearer original', 'Bearer renewed'])
+  await transport.call('echo', params)
+  expect(bodies[2]).not.toEqual(bodies[0])
+  expect(sessions.size).toBe(1)
+})
+
+it.each(['json', 'binary'] as const)('never follows redirects or replays %s requests on verified H2', async mode => {
+  let targetRequests = 0, sourceRequests = 0
+  const target = createHTTPServer((request, reply) => {
+    targetRequests++
+    request.resume()
+    reply.end('{"data":true}')
+  })
+  await new Promise<void>(resolve => target.listen(0, '127.0.0.1', resolve))
+  const address = target.address()
+  if (!address || typeof address === 'string') throw new Error('missing target port')
+  const refresh = vi.fn(async () => 'unused')
+  const transport = client({ mode, headers: { 'X-Project-Key': 'test-only-key' }, onTokenExpired: refresh })
+  try {
+    for (const status of [301, 302, 303, 307, 308]) {
+      for (const location of ['/capture', `http://127.0.0.1:${address.port}/capture`]) {
+        handle = (stream, _body, headers) => {
+          sourceRequests++
+          if (headers[':path'] !== '/api') targetRequests++
+          stream.respond({ ':status': status, location })
+          stream.end()
+        }
+        const previous = sourceRequests
+        await expect(transport.call('echo')).rejects.toMatchObject({ error: 'ParseError', code: status })
+        expect(sourceRequests).toBe(previous + 1)
+        expect(targetRequests).toBe(0)
+      }
+    }
+    expect(refresh).not.toHaveBeenCalled()
+    handle = stream => { stream.respond({ ':status': 200 }); stream.end(mode === 'json' ? '{"data":true}' : Uint8Array.of(42)) }
+    expect(await transport.call('echo')).toEqual(mode === 'json' ? true : Uint8Array.of(42))
+    expect(sessions.size).toBe(1)
+  } finally {
+    target.closeAllConnections()
+    await new Promise<void>(resolve => target.close(() => resolve()))
+  }
 })

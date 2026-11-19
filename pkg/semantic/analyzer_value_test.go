@@ -2,6 +2,45 @@ package semantic
 
 import "testing"
 
+func TestWhenRejectsIncompatibleGenericBlocks(t *testing.T) {
+	for _, branches := range []string{
+		`return when { flag -> { left } else -> { right } }`,
+		`return when { flag -> { val item = left item } else -> { val item = right item } }`,
+	} {
+		expectError(t, analyze(t, `fn choose(flag: Boolean, left: Channel<Int>, right: Channel<String>): Channel<Int> { `+branches+` }`), "compatible types")
+	}
+}
+
+func TestWhenBlocksPreserveDatabaseContext(t *testing.T) {
+	for _, body := range []string{
+		`when { flag -> { Entry.find(id: 1) } else -> {} } return 0`,
+		`return when { flag -> { Entry.find(id: 1).id } else -> { 0 } }`,
+		`val row = when { flag -> { Entry.find(id: 1) } else -> { Entry.find(id: 2) } } return row.id`,
+		`when { flag -> { when { true -> { Entry.find(id: 1) } else -> {} } } else -> {} } return 0`,
+		`val channel: Channel<Int> = Channel(1) channel <- 1 return when { <-channel -> { key -> Entry.find(id: key).id } else -> 0 }`,
+		`transaction { when { flag -> { Entry.find(id: 1) } else -> {} } } return 0`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			source := "model Entry @noTime { id: Int @id }\napi probe(flag: Boolean): Int { " + body + " }"
+			expectNoErrors(t, analyze(t, source))
+		})
+	}
+}
+
+func TestWhenAndTransactionRetainCollectionQueryRestriction(t *testing.T) {
+	for _, body := range []string{
+		`values.forEach { value -> when { flag -> { Entry.find(id: value) } else -> {} } }`,
+		`values.forEach { value -> transaction { Entry.find(id: value) } }`,
+		`values.forEach { value -> transaction { when { flag -> { Entry.find(id: value) } else -> {} } } }`,
+		`values.forEach { value -> when { flag -> { transaction { Entry.find(id: value) } } else -> {} } }`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			source := "model Entry @noTime { id: Int @id }\napi probe(flag: Boolean, values: [Int]): Int { " + body + " return 0 }"
+			expectError(t, analyze(t, source), "inside collection lambda")
+		})
+	}
+}
+
 func TestValueControlFlowRequiresResult(t *testing.T) {
 	for _, source := range []string{
 		`fn broken(flag: Boolean): Int { return when { flag -> 1 else -> { val x = 2 } } }`,

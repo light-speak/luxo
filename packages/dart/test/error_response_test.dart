@@ -7,6 +7,26 @@ import 'package:luxo_client/luxo_client.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('rejects non-error status codes in both encodings', () async {
+    for (final code in [
+      -9007199254740991,
+      -1,
+      0,
+      200,
+      399,
+      600,
+      1000,
+      9007199254740991,
+    ]) {
+      final error = await _jsonError(
+        '{"error":"Rejected","code":$code,"message":"invalid"}',
+      );
+      expect(error.error, 'ParseError');
+      final binary = _errorHeader(LuxoInt64.fromInt(code))..writeEnd();
+      expect(decodeBinaryError(binary.bytes(), 502).error, 'ParseError');
+    }
+  });
+
   test(
     'JSON and binary errors retain nested numeric tokens verbatim',
     () async {
@@ -86,23 +106,20 @@ void main() {
     },
   );
 
-  test(
-    'JSON error codes retain the existing portable int domain exactly',
-    () async {
-      for (final value in [0, -1, 400, -9007199254740991, 9007199254740991]) {
-        await _expectJSONError(
-          '{"error":"Rejected","code":$value,"message":"invalid"}',
-          'Rejected',
-          value,
-        );
-      }
+  test('JSON error codes retain the HTTP error status range', () async {
+    for (final value in [400, 401, 500, 599]) {
       await _expectJSONError(
-        '{"error":"Rejected","code":-0,"message":"invalid"}',
+        '{"error":"Rejected","code":$value,"message":"invalid"}',
         'Rejected',
-        0,
+        value,
       );
-    },
-  );
+    }
+    await _expectJSONError(
+      '{"error":"Rejected","code":-0,"message":"invalid"}',
+      'ParseError',
+      502,
+    );
+  });
 
   test(
     'JSON error data preserves wide integers and raw fractional tokens',
@@ -166,7 +183,7 @@ void main() {
   });
 
   test('binary errors preserve codes, structured data and optional fields', () {
-    for (final value in [0, -1, 400, -9007199254740991, 9007199254740991]) {
+    for (final value in [400, 401, 500, 599]) {
       final encoder = _errorHeader(LuxoInt64.fromInt(value))
         ..writeFieldString(4, 'trace')
         ..writeVarint(5)

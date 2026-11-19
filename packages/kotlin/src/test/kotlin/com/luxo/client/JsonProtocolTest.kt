@@ -6,6 +6,163 @@ import kotlin.test.*
 
 class JsonProtocolTest {
     @Test
+    fun `typed model parameters count objects independently from lists and JSON`() {
+        val fields = mapOf("child" to SelectionFieldSchema(1, typeName = "Node", type = "Model", nullable = true),
+            "children" to SelectionFieldSchema(2, typeName = "Node", type = "Model", isList = true),
+            "payload" to SelectionFieldSchema(3, type = "JSON"))
+        val meta = APISchemaEntry(1, listOf(ParamSchema(1, "node", "Model", typeName = "Node")), types = mapOf("Node" to fields))
+        val generic = Json.parseToJsonElement("[".repeat(128) + "0" + "]".repeat(128))
+        fun value(depth: Int, list: Boolean): JsonObject = buildJsonObject {
+            put("child", if (depth > 1 && !list) value(depth - 1, list) else JsonNull)
+            put("children", JsonArray(if (depth > 1 && list) listOf(value(depth - 1, list)) else emptyList()))
+            put("payload", generic)
+        }
+        for (list in listOf(false, true)) for (depth in listOf(1, 63, 64, 65)) {
+            val objectValue = value(depth, list)
+            for (source in listOf(objectValue, objectValue.toMap())) {
+                val params = mapOf("node" to source)
+                if (depth <= 64) buildJsonObject { putLuxoParams(params, meta) }
+                else assertContains(assertFailsWith<IllegalArgumentException> {
+                    buildJsonObject { putLuxoParams(params, meta) }
+                }.message.orEmpty(), "64")
+            }
+        }
+    }
+
+    @Test
+    fun `scalar syntax fast path preserves whitespace and control character rules`() {
+        for (value in listOf("0", "-0", "1.25e-3", "true", "false", "null", "\"x\"", "{}", "[]")) {
+            val text = " \t\r\n$value\n\t "
+            assertSame(text, requireJSONTokens(text))
+            for (suffix in listOf("0", "null", "]", "}", ",", ":")) {
+                assertFailsWith<IllegalArgumentException> { requireJSONTokens(text + suffix) }
+            }
+        }
+        for (control in 0..31) {
+            assertFailsWith<IllegalArgumentException> { requireJSONTokens("\"a${control.toChar()}b\"") }
+            val escaped = "\"\\u${control.toString(16).padStart(4, '0')}\""
+            assertSame(escaped, requireJSONTokens(escaped))
+        }
+        for (text in listOf("\"\\", "\"\\u", "\"\\u000", "\"\\\"", "[}", "{]")) {
+            assertFailsWith<IllegalArgumentException> { requireJSONTokens(text) }
+        }
+    }
+
+    @Test
+    fun `syntax stack preserves mixed parents across storage boundaries`() {
+        for (depth in listOf(1, 2, 31, 32, 63, 64, 65, 127, 128, 129, 1000)) {
+            val opens = (0 until depth).joinToString("") { if (it % 2 == 0) "[" else "{\"x\":" }
+            val closes = (depth - 1 downTo 0).joinToString("") { if (it % 2 == 0) "]" else "}" }
+            for (leaf in listOf("0", "[]", "{}", "\"text\"")) {
+                val text = opens + leaf + closes
+                assertSame(text, requireJSONTokens(text))
+                assertFailsWith<IllegalArgumentException> { requireJSONTokens(text.dropLast(1)) }
+                assertFailsWith<IllegalArgumentException> { requireJSONTokens(text + "]") }
+            }
+            val wrongClose = if (closes.first() == ']') '}' else ']'
+            assertFailsWith<IllegalArgumentException> { requireJSONTokens(opens + "0" + wrongClose + closes.drop(1)) }
+            val sibling = "[$opens{}$closes,$opens[]$closes]"
+            assertSame(sibling, requireJSONTokens(sibling))
+        }
+    }
+
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    @Test
+    fun `raw fragments cannot inject siblings into a JSON container`() {
+        val invalid = listOf(
+            JsonArray(listOf(JsonUnquotedLiteral("0,1"))),
+            JsonArray(listOf(JsonUnquotedLiteral(""))),
+            JsonObject(mapOf("value" to JsonUnquotedLiteral("0,\"extra\":true"))),
+            JsonObject(mapOf("value" to JsonUnquotedLiteral("0,\"value\":1"))),
+        )
+        for (value in invalid) {
+            assertFailsWith<IllegalArgumentException>(value.toString()) { encodeLuxoJSON(value) }
+            assertFailsWith<IllegalArgumentException> { decodeLuxoJsonValue(value) }
+        }
+        val literal = JsonUnquotedLiteral("{\"extra\":[1,2]}")
+        assertEquals("[{\"extra\":[1,2]}]", encodeLuxoJSON(JsonArray(listOf(literal))))
+    }
+
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    @Test
+    fun `raw invalid literals cannot enter generated inputs or direct error data`() {
+        for (token in listOf("undefined", "NaN", "+1", "01", "1e+", "\uFEFFnull")) {
+            val raw = JsonUnquotedLiteral(token)
+            for (value in listOf(raw, JsonArray(listOf(raw)), JsonObject(mapOf("value" to raw)))) {
+                assertFails(token) { encodeLuxoJSON(value) }
+                assertFails(token) { decodeLuxoJsonValue(value) }
+            }
+        }
+    }
+
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    @Test
+    fun `raw JSON fragments must contain exactly one complete value`() {
+        val invalid = listOf("", " ", "1 2", "[1,]", "{\"x\":}", "[1", "{", "true false",
+            "[1 2]", "{\"x\" 1}", "{\"x\":1,}", "\"\\q\"", "\"\\u12zz\"", "\"line\nfeed\"")
+        for (text in invalid) {
+            val raw = JsonUnquotedLiteral(text)
+            assertFails(text) { encodeLuxoJSON(raw) }
+            assertFails(text) { decodeLuxoJsonValue(raw) }
+            assertFails(text) { decodeLuxoJSON(text) }
+        }
+        for (text in listOf("{}", "[]", "[1,{\"x\":[true,null]}]", "\"escaped\\\"quote\"", "\"\\u0061\"")) {
+            val raw = JsonUnquotedLiteral(text)
+            assertEquals(text, encodeLuxoJSON(raw))
+            assertSame(raw, decodeLuxoJsonValue(raw))
+            assertEquals(Json.parseToJsonElement(text), decodeLuxoJSON(text))
+        }
+    }
+
+    @Test
+    fun `invalid JSON literals cannot hide in opaque values or overwritten keys`() {
+        val invalid = listOf("undefined", "NaN", "Infinity", "+1", "01", "-01", "1.", ".1", "1e", "1e+", "--1", "TRUE", "nul", "\uFEFFnull")
+        val accepted = invalid.flatMap { listOf(it, "[$it]", "{\"data\":$it,\"data\":0}") }
+            .filter { runCatching { decodeLuxoJSON(it) }.isSuccess }
+        assertEquals(emptyList(), accepted, "invalid tokens must be rejected before duplicate keys discard them")
+        for (valid in listOf("0", "-0", "1.2300", "1e9999", "-1e-9999", "123456789012345678901234567890", "true", "false", "null")) {
+            assertEquals(valid, decodeLuxoJSON(valid).toString())
+        }
+        assertEquals("NaN", decodeLuxoJSON("\"NaN\"").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `Binary JSON rejects document BOM prefixes`() {
+        for (text in listOf("null", "42", "{}", "[]", "\"value\"")) {
+            assertFails { decodeLuxoJSON("\uFEFF$text") }
+            val encoder = LuxoEncoder()
+            encoder.writeFieldInt(1, 400)
+            encoder.writeFieldString(2, "Custom")
+            encoder.writeFieldString(3, "failed")
+            encoder.writeFieldString(5, "\uFEFF$text")
+            encoder.writeEnd()
+            assertEquals("ParseError", LuxoBinaryProtocol.decodeError(encoder.bytes(), 502).error)
+        }
+        assertEquals("\uFEFFvalue", decodeLuxoJSON("\"\uFEFFvalue\"").jsonPrimitive.content)
+        assertTrue(decodeHTTPJSON("\uFEFF{\"data\":null}".encodeToByteArray()).containsKey("data"))
+    }
+
+    @Test
+    fun `prototype named error data keys survive both encodings`() {
+        val text = """{"__proto__":{"marker":"value"},"constructor":{"prototype":{"marker":"value"}},"hasOwnProperty":false,"toJSON":"literal","n":9007199254740993,"precise":1.2300}"""
+        val envelope = decodeHTTPJSON("""{"error":"Custom","code":400,"message":"failed","data":$text}""".encodeToByteArray())
+        val binary = LuxoEncoder()
+        binary.writeFieldInt(1, 400)
+        binary.writeFieldString(2, "Custom")
+        binary.writeFieldString(3, "failed")
+        binary.writeFieldString(5, text)
+        binary.writeEnd()
+        for (error in listOf(decodeLuxoJsonError(envelope, 502), LuxoBinaryProtocol.decodeError(binary.bytes(), 502))) {
+            assertNotNull(error)
+            assertEquals("Custom", error.error)
+            val data = assertIs<JsonObject>(error.data)
+            assertTrue(data.containsKey("__proto__"))
+            assertEquals("literal", data["toJSON"]?.jsonPrimitive?.content)
+            assertEquals(text, data.toString())
+        }
+    }
+
+    @Test
     fun `typed strings and booleans reject other JSON kinds`() {
         for (text in listOf("", "false", "9007199254740993", "发布 café", "\uFEFFtext")) {
             val value = JsonPrimitive(text)
@@ -119,7 +276,7 @@ class JsonProtocolTest {
 
     @Test
     fun `valid error codes preserve optional fields and opaque full width data`() {
-        for (code in listOf(Int.MIN_VALUE, 0, 400, Int.MAX_VALUE)) {
+        for (code in listOf(400, 401, 500, 599)) {
             val json = Json.parseToJsonElement("""{"error":"Custom","code":$code,"message":"failure","data":{"id":9223372036854775807},"traceId":"trace","cause":"reason"}""").jsonObject
             val error = assertNotNull(decodeLuxoJsonError(json, 500))
             assertEquals(code, error.code)

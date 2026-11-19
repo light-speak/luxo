@@ -197,6 +197,55 @@ func TestParseChanSend(t *testing.T) {
 	}
 }
 
+func TestParseChanSendPayloadPrecedence(t *testing.T) {
+	for _, sample := range []struct{ value, operation string }{
+		{"value + 2 * 3", "+"},
+		{"value - 1", "-"},
+		{"value * 2", "*"},
+		{"value / 2", "/"},
+		{"value % 2", "%"},
+		{"value == other", "=="},
+		{"value != other", "!="},
+		{"value < other", "<"},
+		{"value > 0 && value < 10", "&&"},
+		{"first || second", "||"},
+		{"value ?: fallback", "?:"},
+		{"value !: fallback", "!:"},
+		{"1..value + 1", ".."},
+		{"<-source + 1", "+"},
+		{"value.method() + 1", "+"},
+	} {
+		t.Run(sample.value, func(t *testing.T) {
+			file := parse(t, "api send(): Int { ch <- "+sample.value+" return 7 }")
+			statements := file.APIs[0].Body.Stmts
+			if len(statements) != 2 {
+				t.Fatalf("send absorbed the following statement: %d", len(statements))
+			}
+			send, ok := statements[0].(*ast.ExprStmt).Expr.(*ast.BinaryExpr)
+			if !ok || send.Op != "<-" {
+				t.Fatalf("send must contain the complete payload: %#v", statements[0])
+			}
+			if operation := channelPayloadOperation(send.Right); operation != sample.operation {
+				t.Fatalf("payload operation=%q, want %q", operation, sample.operation)
+			}
+		})
+	}
+}
+
+func channelPayloadOperation(expr ast.Expr) string {
+	switch value := expr.(type) {
+	case *ast.BinaryExpr:
+		return value.Op
+	case *ast.ElvisExpr:
+		return "?:"
+	case *ast.BangElvisExpr:
+		return "!:"
+	case *ast.RangeExpr:
+		return ".."
+	}
+	return ""
+}
+
 func TestParseChanReceive(t *testing.T) {
 	input := `api test(): Int {
   val ch = Channel(10)

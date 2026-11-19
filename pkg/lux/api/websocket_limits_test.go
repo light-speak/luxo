@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/errors"
 	"nhooyr.io/websocket"
 )
 
@@ -75,19 +77,7 @@ func TestWSUnaryAdmissionRejectsBeforeDispatch(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if mode == websocket.MessageText {
-					var raw map[string]json.RawMessage
-					if err := json.Unmarshal(data, &raw); err != nil {
-						t.Fatal(err)
-					}
-					if string(raw["code"]) != "503" || string(raw["$id"]) != "2" {
-						t.Fatalf("response %s", data)
-					}
-				} else if id, n := codec.ReadVarint(data, 1); n <= 0 || id != 2 || data[0] != BinaryFrameCallError {
-					t.Fatalf("response %x", data)
-				} else if wireErr, err := DecodeBinaryError(data[1+n:], 0); err != nil || wireErr.Code != 503 {
-					t.Fatalf("binary overload: %+v, %v", wireErr, err)
-				}
+				requireWSCallError(t, mode, data, 2, 503)
 				select {
 				case <-started:
 					t.Fatal("overloaded handler executed")
@@ -257,5 +247,80 @@ func TestWSQueuedWriteDeadline(t *testing.T) {
 		case <-deadline.C:
 			t.Fatal("queued write retained budget")
 		}
+	}
+}
+
+func TestWSFailedHandlerReleasesBudgetForNextCall(t *testing.T) {
+	for _, mode := range []websocket.MessageType{websocket.MessageText, websocket.MessageBinary} {
+		for _, panics := range []bool{false, true} {
+			t.Run(mode.String()+"/panic="+strconv.FormatBool(panics), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					rt := testWSRouter()
+					rt.wsLimits = normalizeWSLimits(WebSocketLimits{CallsPerConnection: 1, CallsTotal: 1})
+					original := rt.handlers["getUser"].call
+					var calls atomic.Int64
+					rt.Handle("getUser", func(ctx context.Context, req *Request) error {
+						if calls.Add(1) == 1 {
+							if panics {
+								panic("injected handler failure")
+							}
+							return errors.NotFound
+						}
+						return original(ctx, req)
+					})
+					ctx, conn := newInMemoryWebSocket(t, rt)
+					writeWSFrame(t, ctx, conn, mode, sequenceRequest(mode, "getUser", 1))
+					_, data, err := conn.Read(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					code := 404
+					if panics {
+						code = 500
+					}
+					requireWSCallError(t, mode, data, 1, code)
+					synctest.Wait()
+					if rt.wsCalls.Load() != 0 || rt.wsWriteBytes.Load() != 0 || rt.receiveBytes.Load() != 0 {
+						t.Fatal("failed handler retained request budget")
+					}
+					writeWSFrame(t, ctx, conn, mode, sequenceRequest(mode, "getUser", 2))
+					_, data, err = conn.Read(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					assertSequenceResponse(t, mode, "getUser", 2, data)
+					if calls.Load() != 2 {
+						t.Fatal("next handler was not admitted")
+					}
+					conn.CloseNow()
+					synctest.Wait()
+					if rt.wsCalls.Load() != 0 || rt.wsWriteBytes.Load() != 0 || rt.receiveBytes.Load() != 0 || rt.wsConnections.Load() != 0 {
+						t.Fatal("disconnect retained request or connection budget")
+					}
+				})
+			})
+		}
+	}
+}
+
+func requireWSCallError(t *testing.T, mode websocket.MessageType, data []byte, id uint64, code int) {
+	t.Helper()
+	if mode == websocket.MessageText {
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(data, &raw); err != nil {
+			t.Fatal(err)
+		}
+		if string(raw["code"]) != strconv.Itoa(code) || string(raw["$id"]) != strconv.FormatUint(id, 10) {
+			t.Fatalf("unexpected error: %s", data)
+		}
+		return
+	}
+	gotID, n := codec.ReadVarint(data, 1)
+	if n <= 0 || gotID != id || data[0] != BinaryFrameCallError {
+		t.Fatalf("unexpected error frame: %x", data)
+	}
+	wireErr, err := DecodeBinaryError(data[1+n:], 0)
+	if err != nil || wireErr.Code != code {
+		t.Fatalf("unexpected binary error: %+v, %v", wireErr, err)
 	}
 }

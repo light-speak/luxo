@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/lux/jsonutil"
@@ -36,6 +37,13 @@ func TestJSONWireConformance(t *testing.T) {
 	for _, raw := range []string{"null", " {} ", "123456789012345678901234567890", "-0.000", "1e-9999", "1e9999"} {
 		checkJSONWire(t, []byte(raw), true)
 	}
+}
+
+func TestJSONWireRejectsDocumentBOM(t *testing.T) {
+	for _, raw := range []string{"null", "42", "{}", "[]", `"value"`} {
+		checkJSONWire(t, []byte("\ufeff"+raw), false)
+	}
+	checkJSONWire(t, []byte("\"\ufeffvalue\""), true)
 }
 
 func checkJSONWire(t *testing.T, raw []byte, valid bool) {
@@ -112,6 +120,48 @@ func TestJSONReadBorrowsInput(t *testing.T) {
 	}
 }
 
+func TestPublicNullableJSON(t *testing.T) {
+	for _, text := range []string{`"null"`, "0", "false", "[null]"} {
+		dec := NewDecoder(AppendBytes([]byte{1}, []byte(text)))
+		if raw := dec.ReadNullableJSON(); string(raw) != text || dec.Finish() != nil {
+			t.Fatalf("non-null JSON was normalized: %q / %v", raw, dec.Err())
+		}
+	}
+	for _, text := range []string{"null", " \t\r\nnull \t\r\n"} {
+		if !IsJSONNull([]byte(text)) {
+			t.Fatalf("JSON null not recognized: %q", text)
+		}
+		dec := NewDecoder(AppendBytes([]byte{1}, []byte(text)))
+		if raw := dec.ReadNullableJSON(); raw != nil || dec.Finish() != nil {
+			t.Fatalf("legacy null not normalized: %q / %v", raw, dec.Err())
+		}
+	}
+	for _, text := range []string{"", "nul", "null true", "null\u00a0", "\ufeffnull", `"null"`, "{}"} {
+		if IsJSONNull([]byte(text)) {
+			t.Fatalf("not JSON null: %q", text)
+		}
+	}
+	for _, wire := range [][]byte{nil, {0}, {2}, {1}, AppendBytes([]byte{1}, []byte("null false")), AppendBytes([]byte{1}, []byte("\ufeffnull"))} {
+		dec := NewDecoder(wire)
+		if raw := dec.ReadNullableJSON(); raw != nil || (dec.Finish() == nil) != bytes.Equal(wire, []byte{0}) {
+			t.Fatalf("invalid null envelope accepted: %x / %v", wire, dec.Err())
+		}
+	}
+	raw := []byte(`{"n":123456789012345678901234567890}`)
+	wire := AppendBytes([]byte{1}, raw)
+	dec := NewDecoder(wire)
+	got := dec.ReadNullableJSON()
+	if !bytes.Equal(got, raw) || dec.Finish() != nil || &got[0] != &wire[len(wire)-len(raw)] {
+		t.Fatal("present JSON changed or copied")
+	}
+	first := errors.New("first")
+	dec = NewDecoder([]byte{1, 4, 'n', 'u', 'l', 'l'})
+	dec.Fail(first)
+	if dec.ReadNullableJSON() != nil || dec.Err() != first || dec.Offset() != 0 {
+		t.Fatal("sticky failure changed")
+	}
+}
+
 func FuzzJSONWire(f *testing.F) {
 	for _, raw := range []string{"null", `"\uD800"`, `"\uD800\uDC00"`, "{}", "1e-9999", `{"n":123456789012345678901234567890}`} {
 		f.Add([]byte(raw))
@@ -119,4 +169,16 @@ func FuzzJSONWire(f *testing.F) {
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		checkJSONWire(t, raw, jsonutil.ValidUTF8JSON(raw))
 	})
+}
+
+func TestJSONWireContainerDepth(t *testing.T) {
+	for _, depth := range []int{127, 128, 129} {
+		for _, leaf := range []string{"0", "[]", "{}"} {
+			count := depth
+			if leaf != "0" {
+				count++
+			}
+			checkJSONWire(t, []byte(strings.Repeat("[", depth)+leaf+strings.Repeat("]", depth)), count <= 128)
+		}
+	}
 }

@@ -207,3 +207,39 @@ func TestValidateRejectsNullInMemoryCatalogs(t *testing.T) {
 		}
 	}
 }
+
+func TestModelLockUnmarshalRejectsInvalidInputAtomically(t *testing.T) {
+	var missing *ModelLock
+	if err := missing.UnmarshalJSON([]byte(`{}`)); err == nil || !strings.Contains(err.Error(), "nil declaration") {
+		t.Fatal("nil public decoder receiver accepted", err)
+	}
+	var declaration ModelLock
+	if err := json.Unmarshal([]byte(`{"kind":"sealedVariant","next_id":2,"fields":{"value":1},"default_fields":[1]}`), &declaration); err != nil {
+		t.Fatal(err)
+	}
+	before, err := json.Marshal(&declaration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []struct {
+		input, message string
+		throughJSON    bool
+	}{
+		{`{"unexpected":1}`, "unknown lock member", true},
+		{`{} {}`, "exactly one object", false},
+		{`{} trailing`, "exactly one object", false},
+	} {
+		if sample.throughJSON {
+			err = json.Unmarshal([]byte(sample.input), &declaration)
+		} else {
+			err = declaration.UnmarshalJSON([]byte(sample.input))
+		}
+		if err == nil || !strings.Contains(err.Error(), sample.message) {
+			t.Fatal("public declaration decoder accepted invalid input", sample.input, err)
+		}
+		after, marshalErr := json.Marshal(&declaration)
+		if marshalErr != nil || string(after) != string(before) {
+			t.Fatal("failed declaration decoding published a partial result", sample.input, string(after), marshalErr)
+		}
+	}
+}

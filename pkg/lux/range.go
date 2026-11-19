@@ -1,14 +1,26 @@
 package lux
 
-// IntRange generates a slice of int64 from start to end (inclusive).
-// Used by generated code for Luxo range expressions: 0..10
-func IntRange(start, end int64) []int64 {
+import "errors"
+
+// MaxRangeElements bounds a materialized Int range to 512 KiB of element data.
+const MaxRangeElements = 65_536
+
+// ErrRangeTooLarge rejects a range before allocating storage beyond its limit.
+var ErrRangeTooLarge = errors.New("lux: integer range is too large (maximum 65536 elements)")
+
+// IntRange materializes the inclusive range without overflowing its size or endpoint.
+func IntRange(start, end int64) ([]int64, error) {
 	if start > end {
-		return nil
+		return nil, nil
 	}
-	result := make([]int64, 0, end-start+1)
-	for i := start; i <= end; i++ {
-		result = append(result, i)
+	span := uint64(end) - uint64(start)
+	// The inclusive count must fit the limit before conversion or allocation.
+	if span >= MaxRangeElements {
+		return nil, ErrRangeTooLarge
 	}
-	return result
+	result := make([]int64, int(span)+1)
+	for index := range result {
+		result[index] = start + int64(index)
+	}
+	return result, nil
 }

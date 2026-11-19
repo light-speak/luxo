@@ -2,6 +2,7 @@
 package convert
 
 import (
+	"errors"
 	"fmt"
 	gomath "math"
 	"strconv"
@@ -82,15 +83,15 @@ func toIntReflect(v any) (int64, error) {
 func ToFloat(v any) (float64, error) {
 	switch val := v.(type) {
 	case float64:
-		return val, nil
+		return finiteFloat(val)
 	case float32:
-		return float64(val), nil
+		return finiteFloat(float64(val))
 	case int:
 		return float64(val), nil
 	case int64:
 		return float64(val), nil
 	case string:
-		return strconv.ParseFloat(val, 64)
+		return StringToFloat(val)
 	case bool:
 		if val {
 			return 1, nil
@@ -99,6 +100,15 @@ func ToFloat(v any) (float64, error) {
 	default:
 		return toFloatReflect(v)
 	}
+}
+
+var errNonFiniteFloat = errors.New("convert: Float must be finite")
+
+func finiteFloat(value float64) (float64, error) {
+	if gomath.IsNaN(value) || gomath.IsInf(value, 0) {
+		return 0, errNonFiniteFloat
+	}
+	return value, nil
 }
 
 // toFloatReflect handles less common numeric types.
@@ -152,14 +162,23 @@ func FloatToString(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64
 // BoolToString converts a bool to "true" or "false".
 func BoolToString(v bool) string { return strconv.FormatBool(v) }
 
-// StringToInt converts a string to int64. Returns 0 on parse error. Zero allocation.
-func StringToInt(s string) int64 {
-	v, _ := strconv.ParseInt(s, 10, 64)
-	return v
+// StringToInt parses a decimal Int64 without substituting a value on failure.
+func StringToInt(s string) (int64, error) {
+	value, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
 }
 
-// StringToFloat converts a string to float64. Returns 0 on parse error. Zero allocation.
-func StringToFloat(s string) float64 {
-	v, _ := strconv.ParseFloat(s, 64)
-	return v
+// StringToFloat accepts only finite double-precision values.
+func StringToFloat(s string) (float64, error) {
+	value, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, err
+	}
+	if gomath.IsNaN(value) || gomath.IsInf(value, 0) {
+		return 0, &strconv.NumError{Func: "ParseFloat", Num: s, Err: strconv.ErrRange}
+	}
+	return value, nil
 }

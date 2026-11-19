@@ -8,9 +8,80 @@ import (
 	"net/http/httptest"
 	"nhooyr.io/websocket"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestChunkedHTTPBodyLimitBeforeDispatch(t *testing.T) {
+	for _, binary := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "binary"}[binary], func(t *testing.T) {
+			body := []byte(`{"$api":"health"}`)
+			if binary {
+				var err error
+				body, err = EncodeBinaryRequest(1, nil, nil, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			rt := NewRouterWithOptions(RouterOptions{BodyLimits: BodyLimits{RequestBytes: len(body)}})
+			if err := rt.Registry.Register("health", 1); err != nil {
+				t.Fatal(err)
+			}
+			var calls atomic.Int32
+			rt.Handle("health", func(_ context.Context, req *Request) error {
+				calls.Add(1)
+				if binary {
+					req.Buf.B = append(req.Buf.B, 84)
+				} else {
+					req.Buf.AppendString("42")
+				}
+				return nil
+			})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.ContentLength != -1 || len(r.TransferEncoding) != 1 || r.TransferEncoding[0] != "chunked" {
+					t.Error("fixture did not send an actual chunked request")
+				}
+				rt.ServeHTTP(w, r)
+			}))
+			defer server.Close()
+			for _, extra := range []bool{false, true, false} {
+				payload := append([]byte(nil), body...)
+				status := http.StatusOK
+				if extra {
+					payload = append(payload, ' ')
+					status = http.StatusRequestEntityTooLarge
+				}
+				checkChunkedBodyStatus(t, server, binary, payload, status)
+			}
+			if calls.Load() != 2 {
+				t.Fatalf("handler calls=%d, want 2", calls.Load())
+			}
+		})
+	}
+}
+
+func checkChunkedBodyStatus(t *testing.T, server *httptest.Server, binary bool, body []byte, status int) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL, io.NopCloser(bytes.NewReader(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binary {
+		req.Header.Set("X-Luxo-Mode", "binary")
+	}
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != status {
+		t.Fatalf("status=%d, want %d", resp.StatusCode, status)
+	}
+}
 
 func TestDefaultRequestBodyLimit(t *testing.T) {
 	if MaxRequestBodySize != 2<<20 || MaxJSONBodySize != 2<<20 {

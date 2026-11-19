@@ -10,9 +10,27 @@ internal object WireIDLimits {
 internal fun LuxoSchema.validateIDs() {
     for (model in models.values) validateFieldIDs(model.fields, "model ${model.name}")
     for (type in types.values) validateFieldIDs(type.fields, "type ${type.name}")
+    for (owner in sealeds.values) {
+        val tags = HashSet<Int>()
+        for (variant in owner.variants) {
+            checkSchemaID(variant.id, WireIDLimits.SELECTION_FIELD, tags, "sealed ${owner.name}", variant.name)
+            val fields = HashSet<Int>()
+            for (field in variant.fields) {
+                checkSchemaID(field.id, WireIDLimits.SELECTION_FIELD, fields, "${owner.name}.${variant.name}", field.name)
+            }
+        }
+    }
     val seen = HashSet<Int>()
     for (api in apis.values) {
         checkSchemaID(api.id, WireIDLimits.API, seen, "API", api.name)
+        if (api.paginated) {
+            for (name in listOf("page", "pageSize")) {
+                val param = api.params.singleOrNull { it.name == name }
+                require(param != null && param.type == "Int" && !param.nullable && !param.isList) {
+                    "API ${api.name} pagination requires a numbered non-null Int parameter $name"
+                }
+            }
+        }
         val params = HashSet<Int>()
         val owner = "API ${api.name}"
         for (param in api.params) {

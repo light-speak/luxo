@@ -22,6 +22,9 @@ Thumbs.db
 
 # Examples (local testing only)
 examples/
+!editors/vscode/examples/
+editors/vscode/examples/*
+!editors/vscode/examples/luxo.cache.json
 /luxo
 cover.out
 .tmp/

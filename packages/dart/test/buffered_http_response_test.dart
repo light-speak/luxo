@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 import 'package:luxo_client/src/buffered_http_response.dart';
+import 'package:luxo_client/src/error.dart';
 import 'package:luxo_client/src/transport.dart';
 import 'package:test/test.dart';
 
@@ -36,6 +37,51 @@ class _FailingListen extends Stream<List<int>> {
 }
 
 void main() {
+  for (final declared in [false, true]) {
+    test(
+      'oversize cancellation may remain pending then fail: $declared',
+      () async {
+        final cleanup = Completer<void>();
+        var cancelled = 0;
+        final source = StreamController<List<int>>(
+          onCancel: () {
+            cancelled++;
+            return cleanup.future;
+          },
+        );
+        final response = http.StreamedResponse(
+          source.stream,
+          200,
+          contentLength: declared ? 65 : null,
+        );
+        final rejected = expectLater(
+          collectHTTPResponse(response, 64),
+          throwsA(
+            isA<LuxoError>().having(
+              (error) => error.error,
+              'error',
+              'ParseError',
+            ),
+          ),
+        );
+        if (!declared) source.add(List<int>.filled(65, 0));
+        try {
+          await rejected;
+          expect(cancelled, 1);
+          final next = await collectHTTPResponse(
+            http.StreamedResponse(Stream.value([7]), 200),
+            64,
+          );
+          expect(next.bodyBytes, [7]);
+        } finally {
+          cleanup.completeError(StateError('cleanup failed'));
+          await Future<void>.delayed(Duration.zero);
+          await source.close();
+        }
+      },
+    );
+  }
+
   test('synchronous stream setup errors remain Future errors', () async {
     final failure = StateError('listen failed');
     late Future<http.Response> result;

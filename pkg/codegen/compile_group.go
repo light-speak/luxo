@@ -24,11 +24,11 @@ func (c *compiler) compileTypedGroup(plan *ast.GroupProjection) string {
 	}
 	b.WriteString(".GroupBy(ctx, []string{")
 	for _, key := range plan.Keys {
-		fmt.Fprintf(&b, "%q,", str.ToSnakeCase(key))
+		fmt.Fprintf(&b, "%q,", c.generator.sqlColumn(key))
 	}
 	b.WriteString("}, []lux.GroupAgg{")
 	for _, column := range plan.Columns {
-		fmt.Fprintf(&b, "{Fn:%q, Col:%q, Alias:%q},", strings.ToUpper(column.Aggregate), str.ToSnakeCase(column.Source), str.ToSnakeCase(column.Field))
+		fmt.Fprintf(&b, "{Fn:%q, Col:%q, Alias:%q},", strings.ToUpper(column.Aggregate), c.generator.sqlAggregateColumn(column.Source), c.generator.sqlColumn(column.Field))
 	}
 	b.WriteString("}, ")
 	c.writeGroupScanner(&b, plan)
@@ -58,7 +58,7 @@ func (c *compiler) groupHavingSQL(condition *ast.GroupCondition, arguments *[]st
 		return "(" + left + operator + right + ")"
 	}
 	column := condition.Column
-	expression := (lux.GroupAgg{Fn: strings.ToUpper(column.Aggregate), Col: str.ToSnakeCase(column.Source)}).SQLExpression()
+	expression := (lux.GroupAgg{Fn: strings.ToUpper(column.Aggregate), Col: c.generator.sqlAggregateColumn(column.Source)}).SQLExpression()
 	operator := condition.Operator
 	if literal, ok := condition.Value.(*ast.Literal); ok && literal.Kind == token.Null {
 		if operator == "==" {
@@ -151,7 +151,7 @@ func groupScanExpression(name, source string, enum bool) (string, bool) {
 	case "Int":
 		return source + ".Int64", false
 	case "Float":
-		return source + ".Float64", false
+		return "pg.FloatFromValue(" + source + ")", true
 	case "String":
 		return source + ".String", false
 	case "Boolean":

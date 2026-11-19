@@ -34,6 +34,7 @@ export interface LuxoSchema {
   apis: Record<string, LuxoAPI>
   enums?: Record<string, LuxoEnum>
   types?: Record<string, LuxoTypeDecl>
+  sealeds?: Record<string, LuxoSealed>
 }
 
 export interface LuxoModel {
@@ -70,6 +71,20 @@ export interface LuxoTypeDecl {
   fields: LuxoField[]
 }
 
+export interface LuxoSealed {
+  name: string
+  module?: string
+  usage?: TypeUsage
+  description?: string
+  variants: LuxoSealedVariant[]
+}
+
+export interface LuxoSealedVariant {
+  id: number
+  name: string
+  fields: LuxoParam[]
+}
+
 export interface LuxoAPI {
   id: number
   name: string
@@ -96,4 +111,5 @@ export interface LuxoParam {
   isList?: boolean // true for array params (in/notIn → [T])
   nullable?: boolean
   hasDefault?: boolean
+  description?: string
 }

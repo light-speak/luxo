@@ -84,6 +84,31 @@ func TestIndependentCLI(t *testing.T) {
 	}
 }
 
+func TestCLIModuleBuildsWithReadOnlyMetadata(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := consumerFixture(t, root, "", "")
+	for _, name := range []string{"go.mod", "go.sum"} {
+		data, err := os.ReadFile(filepath.Join(root, "cmd", "luxo", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runConsumer(t, directory, "mod", "edit", "-replace=github.com/light-speak/luxo="+root,
+		"-replace=github.com/light-speak/luxo/pkg/lux/pg="+filepath.Join(root, "pkg/lux/pg"))
+	command := exec.Command("go", "list", "-mod=readonly", "-modfile="+filepath.Join(directory, "go.mod"), "-deps", ".")
+	command.Dir = filepath.Join(root, "cmd", "luxo")
+	command.Env = append(os.Environ(), "GOWORK=off", "GOPROXY=off")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("CLI metadata needs updates outside the workspace: %v\n%s", err, output)
+	}
+}
+
 func runConsumer(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("go", args...)

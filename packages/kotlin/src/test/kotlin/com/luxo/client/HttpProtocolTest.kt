@@ -5,6 +5,12 @@ import java.net.InetSocketAddress
 import java.util.concurrent.Executors
 import java.util.concurrent.ConcurrentLinkedQueue
 import com.sun.net.httpserver.HttpServer
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -25,6 +31,438 @@ import okio.buffer
 import kotlin.test.*
 
 class HttpProtocolTest {
+    @Test
+    fun `binary HTTP requires body and preserves null marker`() = runBlocking {
+        var body = byteArrayOf()
+        var refreshed = 0
+        withClient({ request, _ -> response(request, 200, body) }) { client, _ ->
+            val transport = transport(client, TransportMode.BINARY) { refreshed++; "unused" }
+            val request = object : GeneratedRequest {
+                override val apiID = 1
+                override fun writeParameters(encoder: LuxoEncoder) {}
+                override fun toJSONParameters(): Map<String, Any?> = error("Binary used JSON parameters")
+            }
+            for (generated in listOf(false, true)) {
+                suspend fun call() = if (generated) transport.call("echo", request) else transport.call("echo")
+                body = byteArrayOf()
+                val failure = assertFailsWith<LuxoError> { call() }
+                assertEquals("ParseError", failure.error)
+                assertEquals(200, failure.code)
+                body = byteArrayOf(0)
+                assertContentEquals(body, assertIs<ByteArray>(call()))
+            }
+            assertEquals(0, refreshed)
+        }
+    }
+
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    @Test
+    fun `raw JSON sibling injection is rejected before any HTTP send`() = runBlocking {
+        for (mode in TransportMode.entries) withClient({ _, _ -> error("invalid input reached HTTP") }) { client, sent ->
+            val transport = OkHttpTransport(endpoint, client = client, mode = mode,
+                schema = mapOf("echo" to APISchemaEntry(1, listOf(ParamSchema(1, "value", "JSON")))))
+            for (token in listOf("0,1", "0,\"extra\":true", "")) {
+                val value = kotlinx.serialization.json.JsonArray(listOf(kotlinx.serialization.json.JsonUnquotedLiteral(token)))
+                assertFails { transport.call("echo", mapOf("value" to value)) }
+                assertTrue(sent.isEmpty(), "$mode accepted $token")
+            }
+        }
+    }
+
+    @Test
+    fun `invalid JSON tokens cannot become success or trigger token renewal`() = runBlocking {
+        for (status in listOf(200, 401)) for (token in listOf("NaN", "01", "1e+", "[1,]", "\"\\q\"")) {
+            var refreshes = 0
+            val body = if (status == 200) """{"data":$token,"data":true}"""
+                else """{"error":"Unauthorized","code":401,"data":$token,"data":null}"""
+            withClient({ request, count -> response(request, if (count == 1) status else 200,
+                (if (count == 1) body else """{"data":true}""").toByteArray()) }) { client, sent ->
+                val transport = transport(client, TransportMode.JSON) { refreshes++; "must-not-refresh" }
+                val error = assertFailsWith<LuxoError> { transport.call("echo") }
+                assertEquals("ParseError", error.error, token)
+                assertEquals(0, refreshes, token)
+                assertEquals(1, sent.size, token)
+                assertEquals(JsonPrimitive(true), transport.call("echo"))
+                assertEquals(2, sent.size)
+            }
+        }
+    }
+
+    @Test
+    fun `late unauthorized response does not refresh a cancelled caller`() = runBlocking {
+        for (mode in TransportMode.entries) {
+            val caller = java.util.concurrent.atomic.AtomicReference<kotlinx.coroutines.Job>()
+            val refreshes = java.util.concurrent.atomic.AtomicInteger()
+            withClient({ request, count ->
+                if (count == 1) {
+                    caller.get().cancel()
+                    response(request, 401, errorBody(mode, 401))
+                } else response(request, 200,
+                    if (mode == TransportMode.JSON) "{\"data\":true}".toByteArray() else byteArrayOf(1))
+            }) { client, sent ->
+                val transport = OkHttpTransport(endpoint, client = client, mode = mode,
+                    schema = mapOf("echo" to APISchemaEntry(1)),
+                    onTokenExpired = { refreshes.incrementAndGet(); "must-not-install" })
+                val pending = async {
+                    caller.set(currentCoroutineContext()[kotlinx.coroutines.Job]!!)
+                    transport.call("echo")
+                }
+                assertFailsWith<CancellationException> { pending.await() }
+                withTimeout(2000) {
+                    while (client.dispatcher.runningCallsCount() != 0) kotlinx.coroutines.delay(1)
+                }
+                assertEquals(0, refreshes.get(), "cancelled response invoked refresh: $mode")
+                assertEquals(1, sent.size)
+                transport.call("echo")
+                assertEquals(2, sent.size)
+            }
+        }
+    }
+
+    @Test
+    fun `cancellation during generated encoding never reaches the HTTP server`() = runBlocking {
+        val received = java.util.concurrent.atomic.AtomicInteger()
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/api") { exchange -> exchange.use {
+            received.incrementAndGet()
+            it.requestBody.use { input -> input.readBytes() }
+            val body = if (it.requestHeaders.getFirst("Content-Type").startsWith("application/json"))
+                "{\"data\":true}".toByteArray() else byteArrayOf(1)
+            it.sendResponseHeaders(200, body.size.toLong())
+            it.responseBody.use { output -> output.write(body) }
+        } }
+        val client = OkHttpClient()
+        server.start()
+        try {
+            for (mode in TransportMode.entries) {
+                received.set(0)
+                val transport = OkHttpTransport("http://127.0.0.1:${server.address.port}/api",
+                    client = client, mode = mode, schema = mapOf("echo" to APISchemaEntry(1)))
+                val pending = async {
+                    val context = currentCoroutineContext()
+                    val request = object : GeneratedRequest {
+                        override val apiID = 1
+                        override fun writeParameters(encoder: LuxoEncoder) { context.cancel() }
+                        override fun toJSONParameters(): Map<String, Any?> { context.cancel(); return emptyMap() }
+                    }
+                    transport.call("echo", request)
+                }
+                assertFailsWith<CancellationException> { pending.await() }
+                withTimeout(2000) {
+                    while (client.dispatcher.runningCallsCount() != 0) kotlinx.coroutines.delay(1)
+                }
+                assertEquals(0, received.get(), "cancelled request reached server: $mode")
+                transport.call("echo")
+                assertEquals(1, received.get(), "cancellation broke following request: $mode")
+            }
+        } finally {
+            server.stop(0)
+            client.dispatcher.executorService.shutdownNow()
+            client.connectionPool.evictAll()
+        }
+    }
+
+    @Test
+    fun `redirect policy preserves injected client resources and configuration`() {
+        val interceptor = okhttp3.Interceptor { chain -> chain.proceed(chain.request()) }
+        val original = OkHttpClient.Builder().addInterceptor(interceptor)
+            .callTimeout(1234, java.util.concurrent.TimeUnit.MILLISECONDS).build()
+        val direct = directHTTPClient(original)
+        assertNotSame(original, direct)
+        assertTrue(original.followRedirects)
+        assertTrue(original.followSslRedirects)
+        assertFalse(direct.followRedirects)
+        assertFalse(direct.followSslRedirects)
+        assertSame(original.connectionPool, direct.connectionPool)
+        assertSame(original.dispatcher, direct.dispatcher)
+        assertSame(interceptor, direct.interceptors.single())
+        assertEquals(original.callTimeoutMillis, direct.callTimeoutMillis)
+        assertSame(direct, directHTTPClient(direct))
+        val defaults = defaultHTTPClient(5, 2)
+        assertFalse(defaults.followRedirects)
+        assertFalse(defaults.followSslRedirects)
+        assertSame(defaults, directHTTPClient(defaults))
+    }
+
+    @Test
+    fun `business redirects never forward credentials or bodies`() = runBlocking {
+        val targets = java.util.concurrent.atomic.AtomicInteger()
+        val status = java.util.concurrent.atomic.AtomicInteger(303)
+        val location = java.util.concurrent.atomic.AtomicReference("")
+        val expireNext = java.util.concurrent.atomic.AtomicBoolean()
+        val sent = ConcurrentLinkedQueue<Pair<String?, ByteArray>>()
+        val source = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val target = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val capture = com.sun.net.httpserver.HttpHandler { exchange -> exchange.use {
+            targets.incrementAndGet()
+            it.requestBody.use { input -> input.readBytes() }
+            val body = "{\"data\":true}".toByteArray()
+            it.sendResponseHeaders(200, body.size.toLong())
+            it.responseBody.use { output -> output.write(body) }
+        } }
+        source.createContext("/capture", capture); target.createContext("/capture", capture)
+        source.createContext("/api") { exchange -> exchange.use {
+            val body = it.requestBody.use { input -> input.readBytes() }
+            sent.add(it.requestHeaders.getFirst("Authorization") to body)
+            if (expireNext.getAndSet(false)) {
+                val mode = if (it.requestHeaders.getFirst("Content-Type").startsWith("application/json")) TransportMode.JSON else TransportMode.BINARY
+                val error = errorBody(mode, 401)
+                it.sendResponseHeaders(401, error.size.toLong())
+                it.responseBody.use { output -> output.write(error) }
+            } else {
+                it.responseHeaders.set("Location", location.get())
+                it.sendResponseHeaders(status.get(), -1)
+            }
+        } }
+        source.start(); target.start()
+        val clients = listOf(OkHttpClient(), defaultHTTPClient(5, 2))
+        try {
+            for (client in clients) for (mode in TransportMode.entries) {
+                var refreshes = 0
+                val transport = OkHttpTransport("http://127.0.0.1:${source.address.port}/api", client = client,
+                    mode = mode, schema = mapOf("echo" to APISchemaEntry(1, listOf(ParamSchema(1, "value", "String")))),
+                    headers = mapOf("X-Project-Key" to "test-only-key"), onTokenExpired = { refreshes++; "unused" })
+                for (refresh in listOf(false, true)) for (code in listOf(303, 301, 302, 307, 308)) {
+                    status.set(code)
+                    for (destination in listOf("/capture", "http://127.0.0.1:${target.address.port}/capture")) {
+                        location.set(destination)
+                        expireNext.set(refresh)
+                        sent.clear()
+                        val previousRefreshes = refreshes
+                        val error = assertFailsWith<LuxoError> { withTimeout(5000) { transport.call("echo", mapOf("value" to "private-input")) } }
+                        assertEquals(code, error.code)
+                        assertEquals(0, targets.get())
+                        assertEquals(previousRefreshes + if (refresh) 1 else 0, refreshes)
+                        assertEquals(if (refresh) 2 else 1, sent.size)
+                        if (refresh) {
+                            val calls = sent.toList()
+                            assertContentEquals(calls[0].second, calls[1].second)
+                            assertEquals("Bearer unused", calls[1].first)
+                        }
+                    }
+                }
+            }
+        } finally {
+            source.stop(0); target.stop(0)
+            for (client in clients) { client.dispatcher.executorService.shutdownNow(); client.connectionPool.evictAll() }
+        }
+    }
+
+    @Test
+    fun `refresh preserves encoded body across parameter and schema changes`() = runBlocking {
+        for (mode in TransportMode.entries) for (generated in listOf(false, true)) {
+            val params = mutableMapOf<String, Any?>("count" to 42L)
+            var encodes = 0
+            val request = object : GeneratedRequest {
+                override val apiID = 1
+                override fun writeParameters(encoder: LuxoEncoder) { encodes++; encoder.writeFieldInt(1, params.getValue("count") as Long) }
+                override fun toJSONParameters(): Map<String, Any?> { encodes++; return params }
+            }
+            val bodies = mutableListOf<String>()
+            withClient({ sent, count ->
+                bodies.add(requestBody(sent))
+                if (count == 1) response(sent, 401, errorBody(mode, 401))
+                else response(sent, 200, if (mode == TransportMode.JSON) "{\"data\":42}".toByteArray() else byteArrayOf(84))
+            }) { client, sent ->
+                lateinit var transport: OkHttpTransport
+                transport = OkHttpTransport(endpoint, client = client, mode = mode, onTokenExpired = {
+                    params["count"] = 99L
+                    transport.setSchema(mapOf("echo" to APISchemaEntry(if (generated) 1 else 2,
+                        listOf(ParamSchema(if (generated) 1 else 3, "count", "Int")))))
+                    "renewed"
+                })
+                transport.setSchema(mapOf("echo" to APISchemaEntry(1, listOf(ParamSchema(1, "count", "Int")))))
+                if (generated) transport.call("echo", request) else transport.call("echo", params)
+                assertEquals(2, bodies.size)
+                assertEquals(bodies[0], bodies[1], "retry changed request: $mode generated=$generated")
+                assertSame(sent.first().body, sent.last().body)
+                if (generated) assertEquals(1, encodes)
+                if (generated) transport.call("echo", request) else transport.call("echo", params)
+                assertNotEquals(bodies[0], bodies[2])
+            }
+        }
+    }
+
+    @Test
+    fun `generated retry shares deadline and cancels its underlying call`() = runBlocking {
+        for (mode in TransportMode.entries) {
+            val retryCancelled = CompletableDeferred<Unit>()
+            var calls = 0
+            val client = OkHttpClient.Builder().addInterceptor { chain ->
+                if (++calls == 1) response(chain.request(), 401, errorBody(mode, 401))
+                else {
+                    while (!chain.call().isCanceled()) Thread.sleep(5)
+                    retryCancelled.complete(Unit)
+                    throw IOException("cancelled retry")
+                }
+            }.build()
+            try {
+                val transport = OkHttpTransport(endpoint, client = client, mode = mode, schema = schema,
+                    timeoutSeconds = 1, onTokenExpired = { kotlinx.coroutines.delay(600); "renewed" })
+                val request = object : GeneratedRequest {
+                    override val apiID = schema.getValue("echo").id
+                    override fun writeParameters(encoder: LuxoEncoder) {}
+                    override fun toJSONParameters(): Map<String, Any?> = emptyMap()
+                }
+                val failure = withTimeout(1400) { runCatching { transport.call("echo", request) }.exceptionOrNull() }
+                assertIs<LuxoError>(failure)
+                assertEquals("TimeoutError", failure.error)
+                withTimeout(1000) { retryCancelled.await() }
+                assertEquals(2, calls)
+            } finally {
+                client.dispatcher.cancelAll()
+                client.dispatcher.executorService.shutdownNow()
+                client.connectionPool.evictAll()
+            }
+        }
+    }
+
+    @Test
+    fun `caller deadline remains coroutine cancellation during refresh`() = runBlocking {
+        withClient({ request, _ -> response(request, 401, errorBody(TransportMode.JSON, 401)) }) { client, _ ->
+            val transport = transport(client, TransportMode.JSON) { awaitCancellation() }
+            assertFailsWith<kotlinx.coroutines.TimeoutCancellationException> {
+                withTimeout(100) { transport.call("echo") }
+            }
+        }
+    }
+
+    @Test
+    fun `request deadline cancels a pending refresh without replacing credentials`() = runBlocking {
+        for (mode in TransportMode.entries) {
+            val cancelled = CompletableDeferred<Unit>()
+            withClient({ request, count ->
+                if (count == 1) response(request, 401, errorBody(mode, 401))
+                else response(request, 200, if (mode == TransportMode.JSON) "{\"data\":42}".toByteArray() else byteArrayOf(84))
+            }) { client, sent ->
+                val transport = OkHttpTransport(endpoint, token = "original", client = client,
+                    mode = mode, schema = schema, timeoutSeconds = 1, onTokenExpired = {
+                        try { awaitCancellation() } finally { cancelled.complete(Unit) }
+                    })
+                val failure = withTimeout(3000) { runCatching { transport.call("echo") }.exceptionOrNull() }
+                assertIs<LuxoError>(failure)
+                assertEquals("TimeoutError", failure.error)
+                assertTrue(cancelled.isCompleted)
+                assertEquals(1, sent.size)
+                transport.call("echo")
+                assertEquals("Bearer original", sent.last().header("authorization"))
+            }
+        }
+    }
+
+    @Test
+    fun `non-object envelopes never refresh and do not poison later calls`() = runBlocking {
+        for (status in listOf(200, 401, 500)) {
+            for (body in listOf("[]", "[{\"data\":true}]", "null", "true", "42", "9223372036854775807", "1.234567890123456789", "\"data\"", "{}")) {
+                var refreshes = 0
+                withClient({ request, count ->
+                    if (count == 1) response(request, status, body.toByteArray())
+                    else response(request, 200, "{\"data\":null}".toByteArray())
+                }) { client, sent ->
+                    val transport = transport(client, TransportMode.JSON) { refreshes++; "must-not-refresh" }
+                    val error = assertFailsWith<LuxoError> { transport.call("echo") }
+                    assertEquals("ParseError", error.error)
+                    assertEquals(status, error.code)
+                    assertEquals(0, refreshes)
+                    assertEquals(1, sent.size)
+                    assertEquals(kotlinx.serialization.json.JsonNull, transport.call("echo"))
+                    assertEquals(2, sent.size)
+                }
+            }
+        }
+    }
+    @Test
+    fun `stale unauthorized response cannot start refresh for a replacement identity`() = runBlocking {
+        for (mode in TransportMode.entries) {
+            val entered = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            var refreshes = 0
+            withClient({ request, _ ->
+                entered.complete(Unit)
+                runBlocking { release.await() }
+                response(request, 401, errorBody(mode, 401))
+            }) { client, sent ->
+                val transport = transport(client, mode) { refreshes++; "old-user-refreshed" }
+                transport.setToken("original-token")
+                val result = async { runCatching { transport.call("echo") } }
+                try {
+                    withTimeout(3000) { entered.await() }
+                    transport.setToken("different-user")
+                } finally {
+                    release.complete(Unit)
+                }
+                assertEquals(401, (result.await().exceptionOrNull() as LuxoError).code)
+                assertEquals(0, refreshes)
+                assertEquals(1, sent.size)
+            }
+        }
+    }
+
+    @Test
+    fun `late refresh cannot overwrite explicitly replaced credentials`() = runBlocking {
+        for (mode in TransportMode.entries) {
+            for (replacement in listOf("different-user", "original-token")) {
+                val entered = CompletableDeferred<Unit>()
+                val refresh = CompletableDeferred<String?>()
+                withClient({ request, attempt ->
+                    if (attempt == 1) response(request, 401, errorBody(mode, 401))
+                    else response(request, 200, if (mode == TransportMode.JSON) """{"data":true}""".toByteArray() else byteArrayOf(1))
+                }) { client, sent ->
+                    val transport = transport(client, mode) { entered.complete(Unit); refresh.await() }
+                    transport.setToken("original-token")
+                    val result = async { runCatching { transport.call("echo") } }
+                    entered.await()
+                    transport.setToken(replacement)
+                    refresh.complete("old-user-refreshed")
+                    val outcome = result.await()
+                    val callsBefore = sent.size
+                    transport.call("echo")
+                    assertEquals("Bearer $replacement", sent.last().header("Authorization"))
+                    assertEquals(1, callsBefore)
+                    assertEquals(401, (outcome.exceptionOrNull() as LuxoError).code)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `HTTP status and error presence override JSON data`() = runBlocking {
+        for ((status, body, name) in listOf(
+            Triple(200, """{"data":true,"error":null,"code":401,"message":"bad"}""", "ParseError"),
+            Triple(200, """{"data":true,"error":false,"code":401,"message":"bad"}""", "ParseError"),
+            Triple(200, """{"data":true,"error":"Unauthorized","code":401,"message":"bad"}""", "Unauthorized"),
+            Triple(201, """{"data":true}""", "ParseError"),
+            Triple(403, """{"data":true}""", "ParseError"),
+            Triple(500, """{"data":true}""", "ParseError"),
+        )) {
+            var refreshed = 0
+            withClient({ request, attempt ->
+                if (attempt == 1) response(request, status, body.toByteArray())
+                else response(request, 200, """{"data":true}""".toByteArray())
+            }) { client, sent ->
+                val transport = transport(client, TransportMode.JSON) { refreshed++; "unused" }
+                val error = assertFailsWith<LuxoError> { transport.call("echo") }
+                assertEquals(name, error.error)
+                assertEquals(if (name == "Unauthorized") 401 else status, error.code)
+                assertEquals(1, sent.size)
+                assertEquals(0, refreshed)
+                assertEquals(JsonPrimitive(true), transport.call("echo"))
+                assertEquals(2, sent.size)
+            }
+        }
+    }
+
+    @Test
+    fun `parameters cannot replace the selected HTTP API`() = runBlocking {
+        withClient({ request, _ -> response(request, 200, "{\"data\":true}".toByteArray()) }) { client, sent ->
+            val transport = OkHttpTransport(endpoint, client = client, schema = schema)
+            transport.call("echo", mapOf("\$api" to "other"))
+            val buffer = Buffer()
+            sent.single().body!!.writeTo(buffer)
+            assertTrue(buffer.readUtf8().contains("\"\$api\":\"echo\""))
+        }
+    }
+
     @Test
     fun `concurrent first calls publish one immutable endpoint`() = runBlocking {
         withClient({ request, _ -> response(request, 200, byteArrayOf(1)) }) { client, sent ->
@@ -86,6 +524,39 @@ class HttpProtocolTest {
 
     private val endpoint = "http://localhost/luvia"
     private val schema = mapOf("echo" to APISchemaEntry(1))
+
+    @Test
+    fun `refresh failure preserves credentials and does not retry`() = runBlocking {
+        for (mode in TransportMode.entries) {
+            for (throws in listOf(false, true)) {
+                val callbackError = IllegalStateException("refresh unavailable")
+                var refreshed = 0
+                withClient({ request, attempt ->
+                    if (attempt == 1) response(request, 401, errorBody(mode, 401))
+                    else response(request, 200, if (mode == TransportMode.JSON) "{\"data\":42}".toByteArray() else byteArrayOf(84))
+                }) { client, sent ->
+                    val transport = OkHttpTransport(endpoint, token = "original", client = client,
+                        mode = mode, schema = schema, onTokenExpired = {
+                            refreshed++
+                            if (throws) throw callbackError
+                            null
+                        })
+                    if (throws) {
+                        assertSame(callbackError, assertFailsWith<IllegalStateException> { transport.call("echo") })
+                    } else {
+                        val error = assertFailsWith<LuxoError> { transport.call("echo") }
+                        assertEquals(401, error.code)
+                        assertEquals("Unauthorized", error.error)
+                    }
+                    assertEquals(1, sent.size)
+                    transport.call("echo")
+                    assertEquals(2, sent.size)
+                    assertEquals("Bearer original", sent.last().header("Authorization"))
+                    assertEquals(1, refreshed)
+                }
+            }
+        }
+    }
 
     @Test
     fun `cache overload preserves identity without automatic retry or token refresh`() = runBlocking {
@@ -259,8 +730,8 @@ class HttpProtocolTest {
                 withClient({ request, _ -> response(request, status, errorBody(mode, code)) }) { client, sent ->
                     val transport = transport(client, mode) { refreshed++; "renewed" }
                     val error = assertFailsWith<LuxoError> { transport.call("echo") }
-                    assertEquals("Unauthorized", error.error)
-                    assertEquals(code, error.code)
+                    assertEquals(if (code == 0) "ParseError" else "Unauthorized", error.error)
+                    assertEquals(if (code == 0) status else code, error.code)
                     val eligible = status == 401 && code == 401
                     assertEquals(if (eligible) 1 else 0, refreshed)
                     assertEquals(if (eligible) 2 else 1, sent.size)
@@ -409,6 +880,43 @@ class HttpProtocolTest {
                 assertEquals(0, refreshed)
                 assertEquals(1, sent.size)
                 assertTrue(closed)
+            }
+        }
+    }
+
+    @Test
+    fun `cancelled refresh cannot replace credentials for later calls`() = runBlocking {
+        for (mode in TransportMode.entries) {
+            val success = if (mode == TransportMode.JSON) """{"data":true}""".toByteArray() else byteArrayOf(1)
+            withClient({ request, count ->
+                response(request, if (count == 1) 401 else 200, if (count == 1) errorBody(mode, 401) else success)
+            }) { client, sent ->
+                val transport = transport(client, mode) {
+                    currentCoroutineContext().cancel()
+                    "late-token"
+                }
+                transport.setToken("original-token")
+                val first = async { transport.call("echo") }
+                assertFailsWith<CancellationException> { first.await() }
+                transport.call("echo")
+                assertEquals("Bearer original-token", sent.last().header("Authorization"))
+            }
+        }
+    }
+
+    @Test
+    fun `cooperative refresh cancellation terminates without retry`() = runBlocking {
+        for (mode in TransportMode.entries) {
+            val entered = CompletableDeferred<Unit>()
+            withClient({ request, _ -> response(request, 401, errorBody(mode, 401)) }) { client, sent ->
+                val transport = transport(client, mode) {
+                    entered.complete(Unit)
+                    awaitCancellation()
+                }
+                val first = async { transport.call("echo") }
+                withTimeout(3000) { entered.await(); first.cancelAndJoin() }
+                assertTrue(first.isCancelled)
+                assertEquals(1, sent.size)
             }
         }
     }

@@ -104,7 +104,7 @@ class WebSocketPrecisionTest {
 
     @Test
     fun `malformed JSON IDs never consume a pending call`() = runBlocking {
-        val invalid = listOf("true", "false", "null", "-1", "-0", "1.0", "1e0", "\"1\"", "[]", "{}", "18446744073709551616", "+1", "01", "0١")
+        val invalid = listOf("true", "false", "null", "-1", "-0", "1.0", "1e0", "\"1\"", "[]", "{}", "18446744073709551616")
         for (id in invalid) withSocket { transport, socket ->
             socket.onText = {
                 socket.receive("""{"${'$'}id":$id,"data":1}""")
@@ -116,7 +116,21 @@ class WebSocketPrecisionTest {
     }
 
     @Test
-    fun `binary frame tags and IDs reject malformed encodings`() = runBlocking {
+    fun malformedJSONIDTokensTerminatePendingCalls() = runBlocking {
+        for (id in listOf("+1", "01", "0١")) withSocket { transport, socket ->
+            socket.onText = {
+                socket.receive("""{"${'$'}id":$id,"data":1}""")
+                socket.receive("""{"${'$'}id":1,"data":2}""")
+            }
+            val failure = assertFailsWith<LuxoError>(id) { transport.call("echo") }
+            assertEquals("ParseError", failure.error)
+            assertEquals(1, socket.closes)
+            assertEquals(1007, socket.lastCloseCode)
+        }
+    }
+
+    @Test
+    fun `malformed Binary headers reject pending calls with ParseError`() = runBlocking {
         val invalid = listOf(
             byteArrayOf(), byteArrayOf(2), byteArrayOf(2, 0x81.toByte()),
             byteArrayOf(0x82.toByte(), 0, 1, 1),
@@ -126,11 +140,9 @@ class WebSocketPrecisionTest {
         for (bytes in invalid) withSocket { transport, socket ->
             transport.setMode(TransportMode.BINARY)
             transport.setSchema(mapOf("echo" to APISchemaEntry(1)))
-            socket.onBinary = {
-                socket.receive(bytes)
-                respond(socket, TransportMode.BINARY, 1u, 2)
-            }
-            assertResult(2, transport.call("echo"))
+            socket.onBinary = { socket.receive(bytes) }
+            assertEquals("ParseError", assertFailsWith<LuxoError> { transport.call("echo") }.error)
+            assertEquals(1, socket.closes)
         }
     }
 
@@ -140,8 +152,8 @@ class WebSocketPrecisionTest {
             transport.setMode(TransportMode.BINARY)
             transport.setSchema(mapOf("echo" to APISchemaEntry(1)))
             val pending = async(start = CoroutineStart.UNDISPATCHED) { transport.call("echo") }
-            for (tag in 0..255) {
-                if (tag == LuxoBinaryProtocol.CALL_SUCCESS || tag == LuxoBinaryProtocol.CALL_ERROR) continue
+            for (tag in listOf(LuxoBinaryProtocol.STREAM, LuxoBinaryProtocol.SUBSCRIBE_SUCCESS,
+                LuxoBinaryProtocol.SUBSCRIBE_ERROR, LuxoBinaryProtocol.STREAM_COMPLETE, LuxoBinaryProtocol.STREAM_ERROR)) {
                 val frame = LuxoEncoder().apply {
                     writeRawBytes(byteArrayOf(tag.toByte()))
                     writeVarint((start + 1u).toLong())
@@ -156,27 +168,41 @@ class WebSocketPrecisionTest {
     }
 
     @Test
-    fun `subscription success requires an exact acknowledgement`() = runBlocking {
-        for (mode in TransportMode.entries) withSocket { transport, socket ->
-            transport.setMode(mode)
-            transport.setSchema(mapOf("watch" to APISchemaEntry(1)))
+    fun `JSON subscription success requires an exact acknowledgement`() = runBlocking {
+        withSocket { transport, socket ->
             coroutineScope {
                 val subscription = async(start = CoroutineStart.UNDISPATCHED) { transport.subscribe("watch", { it }) {} }
-                if (mode == TransportMode.JSON) {
-                    for (ok in listOf("false", "1", "\"true\"", "null", "{}")) {
-                        socket.receive("""{"${'$'}sub":1,"ok":$ok}""")
-                    }
-                    socket.receive("""{"${'$'}sub":1}""")
-                } else {
-                    socket.receive(byteArrayOf(0x13, 1, 0))
-                    socket.receive(byteArrayOf(0x93.toByte(), 0, 1))
+                for (ok in listOf("false", "1", "\"true\"", "null", "{}")) {
+                    socket.receive("""{"${'$'}sub":1,"ok":$ok}""")
                 }
+                socket.receive("""{"${'$'}sub":1}""")
                 yield()
                 assertFalse(subscription.isCompleted)
-                if (mode == TransportMode.JSON) socket.receive("""{"${'$'}sub":1,"ok":true}""")
-                else socket.receive(byteArrayOf(0x13, 1))
+                socket.receive("""{"${'$'}sub":1,"ok":true}""")
                 subscription.await().invoke()
             }
+        }
+    }
+
+    @Test
+    fun `correlated Binary ACK trailing payload only fails its subscription`() = runBlocking {
+        withSocket { transport, socket ->
+            transport.setMode(TransportMode.BINARY)
+            transport.setSchema(mapOf("watch" to APISchemaEntry(1)))
+            var delivered: Any? = null
+            val broken = async(start = CoroutineStart.UNDISPATCHED) { runCatching { transport.subscribe("watch", { it }) {} } }
+            val peer = async(start = CoroutineStart.UNDISPATCHED) { transport.subscribe("watch", { it }) { delivered = it } }
+            socket.receive(byteArrayOf(0x13, 99, 42))
+            socket.receive(byteArrayOf(0x13, 1, 42))
+            socket.receive(byteArrayOf(0x13, 2))
+            assertEquals("ParseError", assertIs<LuxoError>(broken.await().exceptionOrNull()).error)
+            val stop = peer.await()
+            socket.receive(byteArrayOf(0x12, 2, 7))
+            assertResult(7, requireNotNull(delivered))
+            socket.onBinary = { respond(socket, TransportMode.BINARY, 3u, 42) }
+            assertResult(42, transport.call("watch"))
+            assertEquals(0, socket.closes)
+            stop()
         }
     }
 
@@ -265,7 +291,7 @@ class WebSocketPrecisionTest {
                     socket.receive(encoder.bytes())
                 }
             }
-            assertContentEquals(byteArrayOf(2), transport.call("echo") as ByteArray)
+            assertEquals("ParseError", assertFailsWith<LuxoError> { transport.call("echo") }.error)
         }
     }
 
@@ -346,17 +372,19 @@ internal class TestSocket(private val request: Request, private val listener: We
     var sent = 0
     var acceptSend = true
     var closes = 0
+    var lastCloseCode: Int? = null
 
     fun open() = listener.onOpen(this, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("upgrade").build())
     fun receive(text: String) = listener.onMessage(this, text)
     fun receive(bytes: ByteArray) = listener.onMessage(this, ByteString.of(*bytes))
     fun receive(bytes: ByteString) = listener.onMessage(this, bytes)
     fun disconnected() = listener.onClosed(this, 1006, "lost")
+    fun closing(code: Int = 1000) = listener.onClosing(this, code, "peer closed")
     fun failed() = listener.onFailure(this, java.io.IOException("lost"), null)
     override fun request(): Request = request
     override fun queueSize(): Long = 0
     override fun send(text: String): Boolean { sent++; onText(text); return acceptSend }
     override fun send(bytes: ByteString): Boolean { sent++; onBinary(bytes); return acceptSend }
-    override fun close(code: Int, reason: String?): Boolean { closes++; return true }
+    override fun close(code: Int, reason: String?): Boolean { closes++; lastCloseCode = code; return true }
     override fun cancel() {}
 }

@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"encoding/hex"
 	"fmt"
 	"slices"
 	"strings"
@@ -66,27 +67,88 @@ func generateSharedEnumFile(declarations map[string]*ast.EnumDecl) ([]byte, erro
 		names = append(names, name)
 	}
 	slices.Sort(names)
+	var symbols enumSymbols
+	for _, name := range names {
+		if err := symbols.add(declarations[name]); err != nil {
+			return nil, err
+		}
+	}
 	var body strings.Builder
+	exportUnicode := false
 	writeHeader(&body, "luxotypes", "enum.gen.go")
 	body.WriteString("import \"github.com/light-speak/luxo/pkg/lux/codec\"\n\n")
 	for _, name := range names {
+		exportUnicode = exportUnicode || needsUnicodeGoName(name)
 		generateEnum(&body, declarations[name])
+		writeSharedEnumExports(&body, declarations[name], symbols)
 		body.WriteByte('\n')
 	}
-	return formatGeneratedChecked([]byte(body.String()))
+	return formatGeneratedWithIdentifiers([]byte(body.String()), exportUnicode)
 }
 
-func generateEnumAlias(body *strings.Builder, declaration *ast.EnumDecl) {
-	fmt.Fprintf(body, "type %s = luxotypes.%s\n\n", declaration.Name, declaration.Name)
+func generateEnumAlias(body *strings.Builder, declaration *ast.EnumDecl, namespaces ...enumSymbols) {
+	var symbols enumSymbols
+	if len(namespaces) > 0 {
+		symbols = namespaces[0]
+	}
+	fmt.Fprintf(body, "type %s = luxotypes.%s\n\n", declaration.Name, sharedEnumPublicSymbol(declaration.Name, symbols))
 	if len(declaration.Values) == 0 {
 		return
 	}
 	body.WriteString("const (\n")
 	for _, value := range declaration.Values {
 		name := declaration.Name + value
-		fmt.Fprintf(body, "\t%s = luxotypes.%s\n", name, name)
+		fmt.Fprintf(body, "\t%s = luxotypes.%s\n", name, sharedEnumPublicSymbol(name, symbols))
 	}
 	body.WriteString(")\n\n")
+}
+
+func sharedEnumPublicSymbol(name string, symbols enumSymbols) string {
+	if normalizedGoNameIsExported(name) {
+		return name
+	}
+	public := "LuxoPrivateEnum_" + hex.EncodeToString([]byte(name))
+	for symbols[public] != "" {
+		public += "_"
+	}
+	return public
+}
+
+// Private source names retain their local spelling through exported aliases.
+func writeSharedEnumExports(b *strings.Builder, declaration *ast.EnumDecl, symbols enumSymbols) {
+	public := sharedEnumPublicSymbol(declaration.Name, symbols)
+	if public == declaration.Name {
+		return
+	}
+	fmt.Fprintf(b, "type %s = %s\n", public, declaration.Name)
+	for _, value := range declaration.Values {
+		name := declaration.Name + value
+		fmt.Fprintf(b, "const %s = %s\n", sharedEnumPublicSymbol(name, symbols), name)
+	}
+}
+
+func (g *GeneratorContext) sharedEnumAliasSymbols(files []*ast.File) enumSymbols {
+	if !g.usesSharedEnums() {
+		return nil
+	}
+	needed := false
+	for _, file := range files {
+		for _, declaration := range file.Enums {
+			needed = needed || !normalizedGoNameIsExported(declaration.Name)
+		}
+	}
+	if !needed {
+		return nil
+	}
+	// This is a reservation set; formal enum validation owns collision errors.
+	symbols := make(enumSymbols)
+	for _, declaration := range g.events.Enums {
+		symbols[declaration.Name] = declaration.Name
+		for _, value := range declaration.Values {
+			symbols[declaration.Name+value] = declaration.Name
+		}
+	}
+	return symbols
 }
 
 // GenerateSharedEnums emits the project's canonical enum package.
@@ -107,4 +169,37 @@ func (g *GeneratorContext) usesSharedEnums() bool {
 
 func enumAppendExpression(typeName, destination, value string) string {
 	return fmt.Sprintf("%s(%s).AppendLuxo(%s)", typeName, value, destination)
+}
+
+// Enum types and constants share the generated Go package namespace.
+type enumSymbols map[string]string
+
+func (names *enumSymbols) add(declaration *ast.EnumDecl) error {
+	if *names == nil {
+		*names = make(enumSymbols)
+	}
+	if err := names.register(declaration.Name, declaration.Name); err != nil {
+		return err
+	}
+	for _, member := range declaration.Values {
+		if err := names.register(declaration.Name+member, declaration.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (names enumSymbols) register(symbol, source string) error {
+	if previous, exists := names[symbol]; exists {
+		return fmt.Errorf("generated enum symbol %q conflicts between %s and %s", symbol, enumSymbolSource(symbol, previous), enumSymbolSource(symbol, source))
+	}
+	names[symbol] = source
+	return nil
+}
+
+func enumSymbolSource(symbol, owner string) string {
+	if symbol == owner {
+		return owner
+	}
+	return owner + "." + strings.TrimPrefix(symbol, owner)
 }

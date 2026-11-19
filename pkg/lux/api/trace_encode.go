@@ -42,7 +42,9 @@ func EncodeDebugTrace(snapshot DebugTraceSnapshot) ([]byte, error) {
 	}
 	enc.WriteFieldInt(2, int64(snapshot.Duration))
 	enc.WriteFieldHeader(3)
-	enc.WriteArrayHeader(len(snapshot.Spans))
+	if err := enc.WriteArrayHeader(len(snapshot.Spans)); err != nil {
+		return nil, err
+	}
 	for i := range snapshot.Spans {
 		span, err := encodeDebugSpan(&snapshot.Spans[i])
 		if err != nil {

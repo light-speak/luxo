@@ -15,9 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/light-speak/luxo/internal/panicerror"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
+	"github.com/light-speak/luxo/pkg/lux/jsonutil"
 	"github.com/light-speak/luxo/pkg/lux/schema"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
@@ -28,8 +30,13 @@ var (
 	jsonDataSuffix = []byte(`}`)
 )
 
+var errHandlerResponseBuffer = errors.InternalError.WithCause(stderrors.New("api: handler replaced its transport response buffer"))
+var errHandlerEmptyResponse = errors.InternalError.WithCause(stderrors.New("api: handler did not write its declared response value"))
+
 // HandlerFunc is the signature for API handlers.
 // Handlers write their response directly to req.Buf — zero allocation, zero any.
+// req.Buf belongs to the transport. Its B slice may grow or be replaced, but the
+// handler must retain the ResponseBuf pointer for the duration of the call.
 type HandlerFunc func(ctx context.Context, req *Request) error
 
 type handlerRoute struct {
@@ -95,14 +102,15 @@ type Router struct {
 	requiredStreams        map[string]struct{}           // generated @stream APIs that must have an implementation
 	translator             *i18n.Translator
 	devMode                bool
-	Registry               *APIRegistry                                           // binary protocol API ID mapping
-	Schema                 *schema.Schema                                         // model/API metadata for Binary↔JSON conversion
-	Streams                *StreamHub                                             // WebSocket stream subscription manager
-	IntrospectionKey       string                                                 // key for schema introspection (empty = disabled)
-	Version                string                                                 // application version exposed with schema introspection
-	WSOrigins              []string                                               // allowed WebSocket origins (empty = allow all in dev mode)
-	WSAllowAllOrigins      bool                                                   // explicitly allow every WebSocket origin
-	IdentityExtractor      func(context.Context) any                              // extracts authenticated stream identity from request context
+	Registry               *APIRegistry   // binary protocol API ID mapping
+	Schema                 *schema.Schema // model/API metadata for Binary↔JSON conversion
+	Streams                *StreamHub     // WebSocket stream subscription manager
+	IntrospectionKey       string         // key for schema introspection (empty = disabled)
+	Version                string         // application version exposed with schema introspection
+	WSOrigins              []string       // exact HTTP(S) origins or explicit null; empty defaults to *
+	WSAllowAllOrigins      bool           // allow any valid HTTP(S) origin, never implicit null
+	originPolicy           atomic.Pointer[OriginPolicy]
+	IdentityExtractor      func(context.Context) any                              // extracts authenticated response/stream identity from request context
 	InternalRequestContext func(context.Context, string) (context.Context, error) // verifies RPC bearer metadata and enriches context
 	metrics                atomic.Pointer[metricsRecorderState]                   // optional metrics collector
 	debugTraceSecret       string
@@ -236,6 +244,13 @@ func (rt *Router) Prepare() error {
 	if err := rt.Validate(); err != nil {
 		return err
 	}
+	policy, err := rt.configuredOriginPolicy()
+	if err != nil {
+		return err
+	}
+	// A gateway can publish its shared policy while this preparation derives a
+	// fallback. Never replace that newer HTTP/WebSocket startup configuration.
+	rt.originPolicy.CompareAndSwap(nil, policy)
 	for name, binding := range rt.cacheBindings {
 		binding.plan.Store(rt.cachePlans[name])
 	}
@@ -261,12 +276,8 @@ func (rt *Router) Validate() error {
 	if err := rt.validateRouteScopes(); err != nil {
 		return err
 	}
-	for name, route := range rt.handlers {
-		if route.localJSON {
-			if _, err := rt.Registry.localJSONDefinition(name); err != nil {
-				return err
-			}
-		}
+	if err := rt.validateUnaryHandlers(); err != nil {
+		return err
 	}
 	for name, route := range rt.streamHandlers {
 		if route.handler == nil && !route.preparesInputs() && route.forwardPrepare == nil {
@@ -318,12 +329,34 @@ func (rt *Router) validateRouteScopes() error {
 	return nil
 }
 
+func (rt *Router) validateUnaryHandlers() error {
+	for name, route := range rt.handlers {
+		if route.call == nil {
+			return fmt.Errorf("api: route %q has no registered implementation", name)
+		}
+		if route.localJSON {
+			if _, err := rt.Registry.localJSONDefinition(name); err != nil {
+				return err
+			}
+		}
+	}
+	for name, handler := range rt.internalHandlers {
+		if handler == nil {
+			return fmt.Errorf("api: internal route %q has no registered implementation", name)
+		}
+	}
+	return nil
+}
+
 func (rt *Router) isStreamAPI(apiName string) bool {
 	if _, ok := rt.streamMatchers[apiName]; ok {
 		return true
 	}
 	if _, ok := rt.streamHandlers[apiName]; ok {
 		return true
+	}
+	if rt.Schema == nil {
+		return false
 	}
 	definition := rt.Schema.APIs[apiName]
 	return definition != nil && definition.Stream
@@ -332,6 +365,7 @@ func (rt *Router) isStreamAPI(apiName string) bool {
 // Handle registers a public HTTP/WebSocket handler, also available over RPC.
 // Registration replaces any previous route with the same name and must finish
 // before serving requests or exporting the RPC startup snapshot.
+// A nil implementation is rejected by Validate/Prepare before serving.
 func (rt *Router) Handle(name string, fn HandlerFunc) {
 	delete(rt.internalHandlers, name)
 	rt.handlers[name] = handlerRoute{call: rt.bindHandler(name, fn)}
@@ -339,6 +373,7 @@ func (rt *Router) Handle(name string, fn HandlerFunc) {
 
 // HandleInternal registers an RPC-only handler. Public transports never look up
 // this table; names and prefixes have no bearing on route visibility.
+// A nil implementation is rejected by Validate/Prepare before serving.
 func (rt *Router) HandleInternal(name string, fn HandlerFunc) {
 	if rt.internalHandlers == nil {
 		rt.internalHandlers = make(map[string]HandlerFunc)
@@ -348,6 +383,11 @@ func (rt *Router) HandleInternal(name string, fn HandlerFunc) {
 }
 
 func (rt *Router) bindHandler(name string, fn HandlerFunc) HandlerFunc {
+	// Keep absent implementations visible to startup validation; wrapping a nil
+	// function would make it look registered until the first request panics.
+	if fn == nil {
+		return nil
+	}
 	if rt.responseCache != nil {
 		if rt.cacheBindings == nil {
 			rt.cacheBindings = make(map[string]*cacheRouteBinding)
@@ -356,7 +396,12 @@ func (rt *Router) bindHandler(name string, fn HandlerFunc) HandlerFunc {
 		rt.cacheBindings[name] = binding
 		fn = bindResponseCache(binding, fn)
 	}
-	return fn
+	return func(ctx context.Context, req *Request) error {
+		if rt.IdentityExtractor != nil && req.Buf != nil {
+			req.Buf.Identity = rt.IdentityExtractor(ctx)
+		}
+		return fn(ctx, req)
+	}
 }
 
 // HandleLocal registers a statically typed handler that reads and validates all
@@ -401,7 +446,7 @@ func (rt *Router) ExportHandlers() map[string]HandlerFunc {
 // ServeHTTP implements http.Handler for the /luvia endpoint.
 // Supports JSON, Luxo binary, and WebSocket protocols on the same endpoint.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Upgrade") == "websocket" {
+	if IsWebSocketUpgrade(r) {
 		rt.handleWebSocket(w, r)
 		return
 	}
@@ -523,73 +568,39 @@ func (rt *Router) writeParseError(w http.ResponseWriter, r *http.Request, binary
 }
 
 func (rt *Router) executeHTTPHandler(w http.ResponseWriter, r *http.Request, req *Request, fn HandlerFunc, binaryMode bool, metrics MetricsRecorder, trace *DebugTraceSession, logStarted time.Time) {
-	buf := GetBuf()
+	call := httpHandlerCall{router: rt, req: req, metrics: metrics, buf: GetBuf()}
+	defer call.finish(r)
+	buf := call.buf
 	req.Buf = buf
-	startedAt, duration, handlerErr := rt.callObservedHandler(r.Context(), req, fn, metrics != nil || rt.requestLogging, trace)
+	handlerErr := call.invoke(r.Context(), fn, trace)
 	if handlerErr != nil {
-		rt.recordRequestMetrics(r, req, metrics, startedAt, duration, handlerErr)
-		rt.writeHandlerError(w, r, req, buf, binaryMode, trace, handlerErr)
-		rt.logHTTPCompletion(req.API, duration, logStarted, handlerErr)
+		call.fail(w, r, binaryMode, trace, logStarted, handlerErr)
 		return
 	}
 	jsonBody, encodeErr := rt.encodeHTTPResponse(req, buf, binaryMode, trace)
 	if encodeErr == nil && responseBodySize(buf.B, jsonBody, binaryMode) > rt.responseBodyLimit() {
 		encodeErr = errors.New("ResponseTooLarge", http.StatusInternalServerError, "response exceeds configured size limit")
 	}
-	rt.recordRequestMetrics(r, req, metrics, startedAt, duration, encodeErr)
 	if encodeErr != nil {
-		rt.writeHandlerError(w, r, req, buf, binaryMode, trace, encodeErr)
-		rt.logHTTPCompletion(req.API, duration, logStarted, encodeErr)
+		call.fail(w, r, binaryMode, trace, logStarted, encodeErr)
 		return
 	}
+	call.record(r, http.StatusOK)
 	writeDebugTraceHeaders(w.Header(), trace)
-	transferred := rt.writeOwnedResponse(w, buf, jsonBody, binaryMode)
-	rt.logHTTPCompletion(req.API, duration, logStarted, nil)
-	if !transferred {
-		PutBuf(buf)
+	if rt.writeOwnedResponse(w, buf, jsonBody, binaryMode) {
+		call.buf = nil
 	}
+	rt.logHTTPCompletion(req.API, call.duration, logStarted, nil)
 }
 
-func (rt *Router) callObservedHandler(ctx context.Context, req *Request, fn HandlerFunc, observed bool, trace *DebugTraceSession) (time.Time, time.Duration, error) {
-	var start time.Time
-	if observed || trace != nil {
-		start = time.Now()
-	}
-	handlerCtx := ctx
-	var handlerSpan DebugSpanHandle
-	if trace != nil {
-		handlerCtx, handlerSpan = trace.StartSpan(handlerCtx, DebugSpanMeta{
-			Name: "handler.execute", Category: "gateway", Operation: req.API,
-		})
-	}
-	err := rt.callHandler(fn, handlerCtx, req)
-	var duration time.Duration
-	if observed || trace != nil {
-		duration = time.Since(start)
-	}
-	if trace != nil {
-		trace.FinishSpan(handlerSpan)
-	}
-	return start, duration, err
-}
-
-func (rt *Router) recordRequestMetrics(r *http.Request, req *Request, metrics MetricsRecorder, startedAt time.Time, duration time.Duration, err error) {
+func (rt *Router) recordRequestMetrics(r *http.Request, req *Request, metrics MetricsRecorder, startedAt time.Time, duration time.Duration, statusCode int) {
 	if metrics == nil {
 		return
 	}
-	metrics.Record(req.API, duration, err != nil)
+	metrics.Record(req.API, duration, statusCode >= http.StatusBadRequest)
 	if recorder, ok := metrics.(TraceRecorder); ok {
-		recorder.RecordTrace(newTraceRecord(r, req.API, req.Select, startedAt, duration, err))
+		recorder.RecordTrace(newTraceRecord(r, req.API, req.Select, startedAt, duration, statusCode))
 	}
-}
-
-func (rt *Router) writeHandlerError(w http.ResponseWriter, r *http.Request, req *Request, buf *ResponseBuf, binaryMode bool, trace *DebugTraceSession, err error) {
-	if rt.requestLogging && rt.debugParamShape {
-		rt.logParamStructure(req)
-	}
-	PutBuf(buf)
-	writeDebugTraceHeaders(w.Header(), trace)
-	rt.writeAppError(w, r, binaryMode, err)
 }
 
 func (rt *Router) encodeHTTPResponse(req *Request, buf *ResponseBuf, binaryMode bool, trace *DebugTraceSession) ([]byte, error) {
@@ -719,7 +730,7 @@ func (rt *Router) applyJSONSelection(req *Request, binaryMode bool) error {
 	if apiMeta == nil || apiMeta.ReturnType == "" {
 		return nil
 	}
-	model := rt.Schema.LookupModel(apiMeta.ReturnType)
+	model := rt.Schema.SelectionModel(apiMeta.ReturnType)
 	if model == nil {
 		return nil
 	}
@@ -730,15 +741,7 @@ func (rt *Router) applyJSONSelection(req *Request, binaryMode bool) error {
 	return err
 }
 
-func newTraceRecord(r *http.Request, apiName string, selected []*selection.Field, startedAt time.Time, duration time.Duration, err error) TraceRecord {
-	statusCode := http.StatusOK
-	if err != nil {
-		statusCode = http.StatusInternalServerError
-		var appErr *errors.AppError
-		if stderrors.As(err, &appErr) {
-			statusCode = appErr.Code
-		}
-	}
+func newTraceRecord(r *http.Request, apiName string, selected []*selection.Field, startedAt time.Time, duration time.Duration, statusCode int) TraceRecord {
 	record := TraceRecord{
 		TraceID:       TraceID(r.Context()),
 		APIName:       apiName,
@@ -778,7 +781,7 @@ func (rt *Router) handleIntrospection(w http.ResponseWriter, r *http.Request) {
 	}
 	data, err := rt.Schema.ToJSON()
 	if err != nil {
-		// Unreachable with Schema's fixed JSON-safe fields; retain the public encoder's error contract.
+		// Reject malformed manually supplied metadata instead of returning a partial Schema.
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -821,6 +824,12 @@ func (rt *Router) convertBinaryToJSON(apiName string, data []byte) ([]byte, erro
 	}
 
 	// Check if return type is a model, type declaration, or scalar
+	if rt.Schema.Sealeds[apiMeta.ReturnType] != nil {
+		if apiMeta.ReturnList {
+			return rt.Schema.SealedListToJSON(nil, data, apiMeta.ReturnType)
+		}
+		return rt.Schema.SealedToJSON(nil, data, apiMeta.ReturnType)
+	}
 	model := rt.Schema.LookupModel(apiMeta.ReturnType)
 	if model == nil {
 		wireType := apiMeta.ReturnType
@@ -848,15 +857,34 @@ func (rt *Router) StreamPayloadJSON(apiName string, data []byte) ([]byte, error)
 	return rt.convertBinaryToJSON(apiName, data)
 }
 
-// callHandler executes a handler with panic recovery.
+// callHandler executes a handler with panic recovery and buffer ownership checks.
 // If the handler panics, the panic is caught and returned as an InternalServerError.
 func (rt *Router) callHandler(fn HandlerFunc, ctx context.Context, req *Request) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
-			err = errors.InternalError.WithCause(fmt.Errorf("panic: %v", p))
+			err = errors.InternalError.WithCause(panicerror.New("panic: ", p))
 		}
 	}()
-	return fn(ctx, req)
+	buf := req.Buf
+	err = fn(ctx, req)
+	if err != nil {
+		return err
+	}
+	if req.Buf != buf {
+		return errHandlerResponseBuffer
+	}
+	if len(buf.B) == 0 && rt.declaresResponseValue(req.API) {
+		return errHandlerEmptyResponse
+	}
+	return nil
+}
+
+func (rt *Router) declaresResponseValue(name string) bool {
+	if rt.Schema == nil {
+		return false
+	}
+	definition := rt.Schema.APIs[name]
+	return definition != nil && definition.ReturnType != ""
 }
 
 // writeAppError writes a structured error response with i18n translation and traceId.
@@ -864,32 +892,48 @@ func (rt *Router) callHandler(fn HandlerFunc, ctx context.Context, req *Request)
 func (rt *Router) writeAppError(w http.ResponseWriter, r *http.Request, binaryMode bool, err error) {
 	werr := rt.buildWireError(r.Context(), r.Header.Get("Accept-Language"), err)
 	buf := GetBuf()
+	defer PutBuf(buf)
+	werr = appendAppErrorResponse(buf, werr, binaryMode)
+	writeAppErrorResponse(w, buf, werr.Code, binaryMode)
+}
 
+func appendAppErrorResponse(buf *ResponseBuf, werr wireError, binaryMode bool) wireError {
 	if binaryMode {
 		werr = appendWireErrorFields(buf, werr, true)
-		w.Header().Set("Content-Type", "application/x-luxo")
-		w.Header().Set("X-Luxo-Mode", "binary")
 	} else {
 		buf.AppendByte('{')
 		werr = appendWireErrorFields(buf, werr, false)
 		buf.AppendByte('}')
 	}
-
-	w.WriteHeader(werr.Code)
-	w.Write(buf.B)
-	PutBuf(buf)
+	return werr
 }
 
-func (rt *Router) buildWireError(ctx context.Context, acceptLanguage string, err error) wireError {
+func writeAppErrorResponse(w http.ResponseWriter, buf *ResponseBuf, statusCode int, binaryMode bool) {
+	if binaryMode {
+		w.Header().Set("Content-Type", "application/x-luxo")
+		w.Header().Set("X-Luxo-Mode", "binary")
+	}
+	w.WriteHeader(statusCode)
+	_, _ = w.Write(buf.B)
+}
+
+func (rt *Router) buildWireError(ctx context.Context, acceptLanguage string, err error) (result wireError) {
+	defer recoverWireError(&result)
 	appErr, ok := stderrors.AsType[*errors.AppError](err)
 	if !ok {
 		appErr = errors.Wrap(err)
+	}
+	if appErr == nil || appErr.Code < 400 || appErr.Code > 599 {
+		appErr = errors.InternalError
 	}
 
 	var data []byte
 	if appErr.Data != nil && !appErr.Internal {
 		var encodeErr error
 		data, encodeErr = appErr.Data.AppendJSON(nil)
+		if encodeErr == nil && !jsonutil.ValidUTF8JSON(data) {
+			encodeErr = stderrors.New("invalid error data JSON")
+		}
 		if encodeErr != nil {
 			appErr, data = errors.Wrap(encodeErr), nil
 		}
@@ -914,6 +958,14 @@ func (rt *Router) buildWireError(ctx context.Context, acceptLanguage string, err
 		werr.Cause = appErr.Cause.Error()
 	}
 	return werr
+}
+
+// Error data and translation callbacks run after the business handler returns.
+// Never stringify the panic value: it may itself panic or contain secrets.
+func recoverWireError(result *wireError) {
+	if recover() != nil {
+		*result = wireError{Code: 500, Name: "Internal", Message: "error.internal"}
+	}
 }
 
 func appendJSONErrorFields(buf *ResponseBuf, e wireError) error {
@@ -1047,6 +1099,15 @@ func (rt *Router) logHTTPCompletion(name string, duration time.Duration, started
 	}
 }
 
+func (rt *Router) logHTTPFailure(name string, duration time.Duration, started time.Time, failure string) {
+	if !started.IsZero() && rt.requestLogging {
+		if failure == "" {
+			failure = "Error"
+		}
+		rt.logAcceptedRequestResult(name, duration, time.Since(started), failure)
+	}
+}
+
 func (rt *Router) shouldLogRequest(err error) bool {
 	return rt.requestLogging && (err != nil || rt.logSampleEvery <= 1 || rt.logSequence.Add(1)%rt.logSampleEvery == 0)
 }
@@ -1058,6 +1119,14 @@ func (rt *Router) logRequestTiming(apiName string, duration, serverDuration time
 }
 
 func (rt *Router) logAcceptedRequestTiming(apiName string, duration, serverDuration time.Duration, err error) {
+	failure := ""
+	if err != nil {
+		failure = safeLogErrorName(err)
+	}
+	rt.logAcceptedRequestResult(apiName, duration, serverDuration, failure)
+}
+
+func (rt *Router) logAcceptedRequestResult(apiName string, duration, serverDuration time.Duration, failure string) {
 	mod := ""
 	if rt.Schema != nil {
 		if a, ok := rt.Schema.APIs[apiName]; ok {
@@ -1068,10 +1137,6 @@ func (rt *Router) logAcceptedRequestTiming(apiName string, duration, serverDurat
 		mod = "api"
 	}
 
-	failure := ""
-	if err != nil {
-		failure = safeLogErrorName(err)
-	}
 	if !rt.allowLogParts(mod, apiName, failure) {
 		return
 	}
@@ -1086,8 +1151,7 @@ func (rt *Router) logAcceptedRequestTiming(apiName string, duration, serverDurat
 }
 
 func safeLogErrorName(err error) string {
-	var appErr *errors.AppError
-	if stderrors.As(err, &appErr) {
+	if appErr, ok := stderrors.AsType[*errors.AppError](err); ok && appErr != nil && appErr.Code >= 400 && appErr.Code <= 599 && appErr.Name != "" {
 		return appErr.Name
 	}
 	return "Internal"
@@ -1107,7 +1171,7 @@ func (rt *Router) logParamStructure(req *Request) {
 		if i < len(params) {
 			typeName = params[i].Type
 		}
-		rt.writeParamStructure(i, req.paramNames[i], typeName, req.paramSlots[i] != nil)
+		rt.writeParamStructure(i, req.paramNames[i], typeName, req.paramPresent(i))
 	}
 }
 

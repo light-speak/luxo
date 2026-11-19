@@ -27,6 +27,7 @@ func generateErrorFile(result *semantic.Result, packageName string) []byte {
 }
 
 func (generator *GeneratorContext) generateErrorFile(result *semantic.Result, packageName string) []byte {
+	generator = generator.bindingContext(result, nil)
 	var errs []*ast.ErrorDecl
 	for _, file := range result.Files {
 		errs = append(errs, file.Errors...)
@@ -38,7 +39,7 @@ func (generator *GeneratorContext) generateErrorFile(result *semantic.Result, pa
 	var b strings.Builder
 	g := newErrorDataGenerator(result, generator)
 	for _, e := range errs {
-		generateErrorConstructor(&b, e)
+		generator.generateErrorConstructor(&b, e, g.models)
 		g.writeData(&b, e)
 	}
 	g.writeObjects(&b)
@@ -48,6 +49,9 @@ func (generator *GeneratorContext) generateErrorFile(result *semantic.Result, pa
 	writeHeader(&out, packageName, "error.gen.go")
 	out.WriteString("import (\n")
 	writeScalarTypeImports(&out, body)
+	if generatedPackages(body).has("lux") {
+		out.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
+	}
 	out.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
 	out.WriteString(")\n\n")
 	out.WriteString(body)
@@ -55,28 +59,46 @@ func (generator *GeneratorContext) generateErrorFile(result *semantic.Result, pa
 }
 
 // generateErrorConstructor generates a typed constructor for an error declaration.
-func generateErrorConstructor(b *strings.Builder, e *ast.ErrorDecl) {
+func generateErrorConstructor(b *strings.Builder, e *ast.ErrorDecl, models map[string]bool) {
+	defaultGenerator().generateErrorConstructor(b, e, models)
+}
+
+func (g *GeneratorContext) generateErrorConstructor(b *strings.Builder, e *ast.ErrorDecl, models map[string]bool) {
 	name := e.Name
+	var bindings localBindings
+	if g.bindingPlan == nil && len(e.Fields) != 0 {
+		bindings = parameterBindings(e.Fields, nil, e.Name+"ErrorData")
+	} else {
+		bindings = g.parameterBindings(e.Fields, nil, nil, nil)
+	}
 	fmt.Fprintf(b, "// New%s creates a %s error.\n", name, name)
 	fmt.Fprintf(b, "func New%s(", name)
 	for i, p := range e.Fields {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		goType := resolveGoType(p.Type)
-		fmt.Fprintf(b, "%s %s", p.Name, goType)
+		goType := errorDataGoType(p.Type, models)
+		fmt.Fprintf(b, "%s %s", bindings.name(p.Name), goType)
 	}
 	b.WriteString(") *errors.AppError {\n")
 
-	fmt.Fprintf(b, "\treturn errors.New(%q, %d, %q)", name, e.Code, e.Message)
+	if e.Internal {
+		b.WriteString("\terr := ")
+	} else {
+		b.WriteString("\treturn ")
+	}
+	fmt.Fprintf(b, "errors.New(%q, %d, %q)", name, e.Code, e.Message)
 
 	if len(e.Fields) > 0 {
 		fmt.Fprintf(b, ".WithData(&%sErrorData{\n", name)
 		for i, p := range e.Fields {
-			fmt.Fprintf(b, "\t\tfield%d: %s,\n", i, p.Name)
+			fmt.Fprintf(b, "\t\tfield%d: %s,\n", i, bindings.name(p.Name))
 		}
 		b.WriteString("\t})")
 	}
 
+	if e.Internal {
+		b.WriteString("\n\terr.Internal = true\n\treturn err")
+	}
 	b.WriteString("\n}\n\n")
 }

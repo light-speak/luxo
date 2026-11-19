@@ -25,7 +25,9 @@ identity for token lifecycle assertions. No database, mock
 HTTP responses, handwritten payload codec or new dependency is required.
 
 The Dart, TypeScript, Kotlin and Swift suites fetch live introspection and generate/type-check
-their clients. Dart runs HTTP/WebSocket, JSON/Binary assertions on VM, JavaScript
+their clients. The shared 65-parameter API checks omitted defaults and explicit
+values across the inline/overflow boundary, including Int64.max, through each
+generated client. This exercises request capacity, not a performance budget. Dart runs HTTP/WebSocket, JSON/Binary assertions on VM, JavaScript
 and Wasm; TypeScript 7 compiles and executes CJS/ESM consumers on Node. Kotlin
 compiles an independent JVM consumer without the serialization compiler plugin.
 Swift compiles an independent SwiftPM consumer with Swift 6 strict concurrency
@@ -42,6 +44,53 @@ also use real compiled handlers. All four SDKs additionally exercise a generated
 gateway with a separate TCP RPC backend as described below. That four-SDK fixture
 does not exercise extension-response merging, multiple backend modules or device
 consumers; the separate Go gateway fixture below covers the first two.
+
+## Generated Decimal exponent boundary
+
+The `decimals` scenario sends compact Decimal strings through generated inputs,
+model responses, columnar lists and native streams via the generated gateway and
+a separate TCP LRPC service. It checks `1e2147483647` and `-1e-2147483648` over
+HTTP/WebSocket in JSON/Binary modes, including projections that omit the Decimal
+field. The stream builds its values independently in Go. Regular consumers also
+include this fixture state.
+
+Run only these checks from the core checkout with the existing toolchains:
+
+```sh
+pnpm -C packages/vite-plugin exec vitest run src/go-consumer.test.ts -t 'Decimal arrays preserve compact exponents'
+(cd packages/dart && dart test test/go_interop_test.dart --name 'generated Decimal arrays preserve compact exponents')
+LUXO_INTEROP_SCENARIO=decimals go run ./tests/sdk-interop -run -gateway -- ./packages/kotlin/gradlew \
+  -p tests/sdk-interop/kotlin verifyProtocol --offline -Pkotlin.compiler.execution.strategy=in-process --no-daemon --warning-mode fail
+LUXO_INTEROP_SCENARIO=decimals go run ./tests/sdk-interop -run -gateway -- bash tests/sdk-interop/swift/run.sh
+```
+
+This covers TS CJS/ESM, Dart VM and Node-hosted JS/Wasm, Kotlin JVM and Swift
+macOS. It does not measure performance, validate database storage precision or
+cover H2/TLS, actual browsers or devices. The wire and SDK runtime are unchanged.
+
+## Generated WebSocket token renewal
+
+The fixture includes a three-second access issuer and an explicitly authenticated
+timestamp stream. The generated consumers verify expiry reports one 401, refreshes
+through a generated HTTP API, preserves the exact identity, and permits explicit
+resubscription on the new connection. Generated stream counters check the old
+native handler exits, subscriptions are not replayed, and cancellation of an old
+subscription cannot cancel the new one. These issuers and counters are test-only.
+
+Run only this scenario from the core checkout using the existing toolchains:
+
+```sh
+pnpm -C packages/vite-plugin exec vitest run src/go-consumer.test.ts -t 'WS client renews expired identity'
+(cd packages/dart && dart test test/go_interop_test.dart --name 'generated WS renewal through gateway')
+LUXO_INTEROP_SCENARIO=renewal go run ./tests/sdk-interop -run -gateway -- ./packages/kotlin/gradlew \
+  -p tests/sdk-interop/kotlin verifyProtocol --offline -Pkotlin.compiler.execution.strategy=in-process --no-daemon --warning-mode fail
+LUXO_INTEROP_SCENARIO=renewal go run ./tests/sdk-interop -run -gateway -- bash tests/sdk-interop/swift/run.sh
+```
+
+The regular consumers also register these checks. TS covers CJS/ESM; Dart covers
+VM and Node-hosted JS/Wasm; Kotlin covers JVM; Swift covers macOS. The gateway and
+TCP service run in separate owned Go processes. This scenario does not measure
+performance or cover H2/TLS, databases, extension merging, browsers or devices.
 
 ## PostgreSQL selection fixture
 
@@ -107,11 +156,65 @@ Each driver retains source/artifact hashes and generated consumers in the eviden
 directory. Dart removes its owned package scratch after execution. Keep these
 builds separate from timed benchmarks.
 
+For TypeScript automatic selection, add `--inferred --gateway --runs 2` to the
+runner command above. It builds the public CJS/ESM Vite plugin and generated
+clients from current source, type checks the untouched `sql/Inferred.ts`
+consumer, and verifies inferred projections through the generated TCP RPC
+gateway to actual PostgreSQL queries. The fixture includes chained filters,
+callback rest parameters, static containers, destructuring rest/defaults and
+hidden backend dependencies. Kotlin and Swift use `--inferred --gateway` with
+their drivers above: Kotlin loads the current IR plugin JAR; Swift prepares a
+compiler-resolved VFS overlay and compiles it with the full Swift 6 diagnostics.
+Each executes 32 JSON/Binary calls with documented map/alias behavior and
+independent call sites. The original consumers contain no explicit selection.
+Kotlin list indexing is rejected by its current plugin; Swift's indexing cases
+are included. These checks do not cover relation/pagination combinations or
+Android/Apple devices.
+
+Add `--relations --gateway` instead of `--inferred` to run the separate
+`relations.luxo` fixture with any of the four SQL drivers. This mode infers
+selection and runs nine calls per JSON/Binary format: nullable single relations,
+reverse lists, four page windows, a result stored in a model container, and two
+explicit selection controls. It distinguishes null, zero, duplicate and missing
+relation keys, checks empty lists/pages and totals, and rejects hidden or extra
+SQL columns, changed windows and added queries. Each consumer makes 18 H2/RPC
+calls and exactly 42 SQL queries; TypeScript `--runs 2` checks CJS and ESM.
+The runner permits projection column reordering while preserving duplicates and
+the exact query tail. These are local relations using real generated loaders;
+remote federated relations, devices and performance require separate evidence.
+
 The owner terminates the consumer's process group, including descendants left
 behind by an exited parent. It waits up to five seconds for graceful termination
 before killing remaining group members; a regression test covers a child that
 ignores SIGTERM. Processes that deliberately create another session are outside
 this ownership mechanism.
+
+### Persistent scalar precision
+
+`--precision --gateway` uses a separate `precision.luxo` schema and the shared
+owned PostgreSQL runner. The generated client writes and reads six boundary
+records in JSON and Binary through TLS H2 and a generated TCP RPC gateway.
+The runner also checks PostgreSQL values directly, including Float bits, exact
+Decimal values, UTC microseconds, Duration nanoseconds and UUID normalization.
+Non-microsecond Duration writes must fail without adding a row. This is a
+correctness check; it does not measure or approve performance costs.
+
+```sh
+GOFLAGS="${GOFLAGS:+$GOFLAGS }-race" python3 -B tests/sdk-interop/sql/runner.py --image "$PG_TEST_IMAGE" --precision --gateway --runs 2 -- python3 -B tests/sdk-interop/sql/ts.py
+GOFLAGS="${GOFLAGS:+$GOFLAGS }-race" python3 -B tests/sdk-interop/sql/runner.py --image "$PG_TEST_IMAGE" --precision --gateway -- python3 -B tests/sdk-interop/sql/dart.py
+GOFLAGS="${GOFLAGS:+$GOFLAGS }-race" python3 -B tests/sdk-interop/sql/runner.py --image "$PG_TEST_IMAGE" --precision --gateway -- python3 -B tests/sdk-interop/sql/kotlin.py
+GOFLAGS="${GOFLAGS:+$GOFLAGS }-race" python3 -B tests/sdk-interop/sql/runner.py --image "$PG_TEST_IMAGE" --precision --gateway -- python3 -B tests/sdk-interop/sql/swift.py
+```
+
+These consumers cover Node CJS/ESM, Dart native AOT, Kotlin JVM and Swift macOS.
+They do not establish browser, Android or Apple-device persistence coverage.
+DateTime storage uses PostgreSQL microseconds; the protocol's nanosecond
+capability does not imply nanosecond database storage.
+
+Replacing `--precision` with `--nullable` in the same commands checks persistent
+nullable Int and Int-list states: null, zero, empty list and exact Int64 values.
+Each mode also reads a missing record and the runner directly verifies SQL NULL
+and array cardinality. This does not define nullable JSON's two null layers.
 
 ### Same-output SQL projection comparison
 
@@ -528,11 +631,44 @@ each owned process to `127.0.0.1:0`, closes its stdin to shut it down and remove
 generated files in `finally`. It does not leave a service running. The generator
 rejects nonempty output directories and destinations outside the core `.tmp`.
 
+## Generated recursive DTO depth
+
+With the existing Go, JDK and cached Kotlin dependencies, run from the core root:
+
+```sh
+python3 -B tests/sdk-interop/model_depth.py --out .tmp/model-depth-network
+```
+
+The output directory must be new and inside the core repository's `.tmp`.
+The runner generates the real Go service, obtains its Schema through the public
+introspection endpoint, generates and compiles a Kotlin consumer offline, then
+checks HTTP/1.1 TLS, HTTP/2 TLS and WSS in JSON and Binary modes. The client trusts
+only the owned fixture certificate through an in-memory test trust store.
+
+The corpus includes object depths 63/64/65, nullable child/list edges, independent
+JSON128 at the deepest model, input rejection before handler entry, recovery,
+and stream error isolation with remote cancellation. Per-phase handler and
+protocol counts prevent transport fallback or missing requests from passing.
+Logs and generated sources are retained; owned binaries and bytecode are hashed
+before cleanup. This is functional evidence, without a performance budget or
+Android, pagination, required-edge or gateway/LRPC acceptance claim.
+
+Negative responses use the fixture's explicit `-malformed-responses` mode.
+Binary unary and stream negatives inject 16 hostile payloads. A separate bounded
+JSON peer at `/hostile` and `/hostile/ws` sends 12 depth65 unary responses and six
+depth1 recovery responses; both endpoints are disabled without the flag.
+The ordinary generated JSON handlers separately reject all 12 depth65 requests.
+The report distinguishes these rejections from actual hostile-byte delivery and
+checks 320 consumer assertions. Legal service responses still use generated
+handlers and writers. The JSON peer's two shapes are checked against native
+generated-model JSON, including TLS H1/H2, WSS and exact correlation IDs.
+
 ## 中文说明
 
 该 fixture 从真实 `.luxo` 编译服务，不是 SDK 自己编解码后互相验证。实际使用
 生成的处理器、Schema、行式/列式编码器和流编码器；普通 API 的逻辑仍由 Luxo
-编译，只有流的数据源使用 `@native`。无需数据库、预制 HTTP 响应或新依赖。
+编译，只有流的数据源使用 `@native`。常规用例无需数据库或预制 HTTP 响应；
+深度负例使用显式坏端点，不新增依赖。
 
 Dart、TypeScript、Kotlin、Swift 测试从运行中的 Go 服务获取 Schema，生成并检查客户端。
 Dart 覆盖 VM、JS、Wasm，TS 7 编译并运行 CJS/ESM 消费者，Kotlin 编译独立 JVM
@@ -640,3 +776,5 @@ echoInteger增加实际参与计算的`delta: Int = 0`。先由旧AST建立编�
 
 只启动一个随机端口回环服务，结束时关闭并清理本次专用 `.tmp` 目录。不会覆盖
 已有生成目录，也不会保留后台服务。
+
+递归DTO真实网络验证：从核心根目录运行`python3 -B tests/sdk-interop/model_depth.py --out .tmp/model-depth-network`，输出必须是`.tmp`内的新目录。测试从正式Go产物的公开Schema生成并编译Kotlin消费者，核对H1 TLS／H2 TLS／WSS与JSON／Binary、64层对象末层JSON128、发送前拦截、恢复及订阅隔离／远端取消；不代表性能、Android、分页或LRPC验收。显式`-malformed-responses`模式分别核对16次Binary／流坏包、独立JSON坏端点的12次超限响应与6次恢复，以及正式JSON处理器的12次拒绝；报告要求320项消费者断言。坏端点默认关闭，合法服务响应仍走正式生成代码。

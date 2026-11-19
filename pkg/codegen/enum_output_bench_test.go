@@ -57,9 +57,10 @@ func (e *BeforeBASEEvent) UnmarshalLuxo(data []byte) error {
 }
 `
 
+// Both variants use the current checked header ABI; this reference isolates enum checks.
 const enumOutputBaseline = `
 func beforeEnumList(req *api.Request,result []State) error {
-    req.Buf.B=codec.AppendArrayHeader(req.Buf.B,len(result))
+    encoded,err:=codec.AppendArrayHeader(req.Buf.B,len(result));if err!=nil{return err};req.Buf.B=encoded
     for _,item:=range result {
         if encoded,err:=codec.AppendString(req.Buf.B,string(item));err!=nil{return err}else{req.Buf.B=encoded}
     }

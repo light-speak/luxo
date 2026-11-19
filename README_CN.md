@@ -52,6 +52,10 @@ Luxo 是一门 **Schema-first 的编译型后端语言与平台**。它把 `.lux
 
 Luxo 的目标是统一通常分散在 REST、GraphQL、gRPC、ORM 和手写客户端胶水中的工作。当前已实现的数据库后端是 PostgreSQL；MySQL、SQLite、MongoDB 仍是规划目标。
 
+生成器按所选方言在生成阶段转义 SQL 标识符，覆盖迁移和回滚；Schema 字段名、扫描标签保持原名。生成的 Go 字段常量包含 SQL 令牌，可直接传给查询构造器；手写 `lux.Dialect` 实现需补齐 `QuoteIdentifier(name string) string`、`ValidateIdentifier(name string) error`、`GeneratedIdentifier(name string) string`、`UniqueConstraintName(table, column string) string` 和 `RenameUnique(table, oldColumn, newColumn string) string`。显式底层 SQL 表达式仍由调用方负责，不能把表达式整体当作标识符转义。这改变生成的 Go SQL 令牌，不改变 SDK 协议编号。 `codegen.GenerateMigrationSQL` 返回 `(up, down string, err error)`，在输出 SQL 前拒绝非法元数据，调用方必须传播错误。`codegen.Diff` 同样返回 `([]DiffOp, error)`。PG 原始表／列名须在 63 字节以内；自动索引／唯一约束名超限时使用保留完整 UTF-8 字符的确定性前缀和哈希后缀。改名计划按字段身份处理链、环和腾空名称的复用；不支持的表身份或主键／自增属性变更要求显式迁移。
+
+PostgreSQL 将 `Duration` 保存为整微秒 `INTERVAL`。不能精确保留的写入在执行语句前返回 `pg.ErrDurationPrecision`，覆盖可空／列表参数及 SQL 改写后的最终参数，生成的 Create／Update 和事务传播该错误。JSON／Binary 的 `Duration` 仍保留完整 Int64 纳秒范围；不自动迁移已有列或舍入数值。
+
 ```luxo
 model User @crud {
   name:     String @filterable
@@ -83,7 +87,9 @@ model User @crud {
 
 Luxo 是后端编程语言，不只是 Schema DSL。标量类型包括 `Int`、`Float`、`String`、`Boolean`、`DateTime`、`Duration`、`UUID`、`Decimal`、`Bytes`、`JSON`；泛型运行时类型包括 `Result<T>`、`Channel<T>`、`Page<T>`、`Cursor<T>`。Luxo 编译到 Go。
 
-DateTime 在 JSON 和 Binary 中都保留纳秒。JSON 要求带时区的 RFC3339、最多9位小数及 UTC 年份0000～9999；Binary 写入向下取整的 Unix 秒与非负纳秒。超精度或越界直接报错。此发布前变更要求服务与 SDK 配套重新生成，不降级为旧整秒编码；数据库存储精度和性能单独验收。当前内部 RPC 为版本4，另加入显式可空根响应；对应四 SDK 迁移尚未完成，不代表已冻结。
+DateTime 在 JSON 和 Binary 中都保留纳秒。JSON 要求带时区的 RFC3339、最多9位小数及 UTC 年份0000～9999；Binary 写入向下取整的 Unix 秒与非负纳秒。超精度或越界直接报错。此发布前变更要求服务与 SDK 配套重新生成，不降级为旧整秒编码；数据库存储精度和性能单独验收。当前内部 RPC 为版本4，另加入显式可空根响应。核心与四 SDK 生成器已实现该封装；最终候选验收仍未完成，不代表已冻结。
+
+PostgreSQL 使用原生 `timestamptz` 保存 `DateTime`，精度为微秒；亚微秒部分在此存储边界截断。生成的 Create／CreateMany 结果及后续 API 读取返回实际保存值，JSON／Binary 传输仍保留纳秒。参见 [PostgreSQL 时间类型](https://www.postgresql.org/docs/16/datatype-datetime.html)。
 
 ### 空安全
 
@@ -211,6 +217,9 @@ Beta 支持显式 TTL 响应缓存，不提供自动写入失效。TTL 从缓存
 不保证底层数据库快照的年龄；必须读取最新数据的决策查询不启用缓存。
 结果按已验证身份隔离，启动时必须显式配置后端、部署命名空间和有界回源。
 `invalidation` 模式直接报错，不会静默转换为 TTL。
+旧的 `cache.BuildKey`、`BuildKeyRaw` 和 `InvalidatePrefix` 工具已移除。
+生成的响应缓存统一使用已配置策略及其隔离键路径；手写应用缓存通过 `cache.Cache`
+后端接口定义自己的键，不复用旧动态工具。
 
 ```luxo
 // 1. 零代码 — 框架自动生成
@@ -342,7 +351,9 @@ luxo run
 
 JSON 与 Luxo Binary 都是生产传输。HTTP 客户端通过 SDK transport mode 或 `X-Luxo-Mode: json|binary` 选择；WebSocket 支持 JSON 文本帧与 canonical binary 帧，原生 RPC 使用自己的二进制帧。`APP_ENV` 不会静默改变 wire 契约。
 
-两种编码保持相同的数据语义。业务 `Int/Duration` 为有符号 int64；WebSocket 调用编号（JSON `$id`、Binary `sequence`）为无符号 uint64。JSON ID 必须是 `0…18446744073709551615` 范围内不带引号的十进制整数 token，不能用布尔值、字符串、小数或指数。非法、缺失或溢出的 ID 在业务执行前直接丢弃，不能强转为零；成功与失败响应都原样返回合法 ID。SDK 计数器耗尽时须明确失败，不得舍入、窄化或覆盖待响应请求；四 SDK 的完整边界验收仍是 beta 发布门禁。
+两种编码遵守相同的数值与文本边界。可空 JSON 的表达仍有冻结前待决项：数据库读取区分 SQL NULL 与 JSON 字面量 `null`，生成模型的 Binary 输出保留区别，而 JSON 输出均为 `null`。公开表达方式仍待确定，数据库层继续保留两种状态。
+
+业务 `Int/Duration` 为有符号 int64；WebSocket 调用编号（JSON `$id`、Binary `sequence`）为无符号 uint64。JSON ID 必须是 `0…18446744073709551615` 范围内不带引号的十进制整数 token，不能用布尔值、字符串、小数或指数。非法、缺失或溢出的 ID 在业务执行前直接丢弃，不能强转为零；成功与失败响应都原样返回合法 ID。SDK 计数器耗尽时须明确失败，不得舍入、窄化或覆盖待响应请求；四 SDK 的完整边界验收仍是 beta 发布门禁。
 
 ### 网关 HTTP 实现
 
@@ -351,6 +362,8 @@ JSON 与 Luxo Binary 都是生产传输。HTTP 客户端通过 SDK transport mod
 Go 标准 HTTP 路径。显式设置 `APP_HTTP_TRANSPORT=standard` 可让 HTTP/2 也使用
 标准实现；未知配置值在启动时拒绝。此启动配置选择服务端实现，不选择 JSON/Binary
 编码，也不会替客户端改变 HTTP 版本。
+旧式 `Upgrade: h2c` 请求继续按 HTTP/1.1 处理；HTTP/2 使用 TLS ALPN 或明文
+prior knowledge。两种服务端模式都会在关闭时管理自己持有的HTTP/2连接。
 
 ### 请求追踪与 SQL
 
@@ -380,7 +393,7 @@ Luxo 的追踪是请求级、跨网关、服务、DataLoader 与数据库的执�
 
 ### 发布与稳定性规范
 
-Swift 跨仓库 CI 已固定候选提交 `c0fa9cc3334045ce488bd5d97d1a3a8c82ff8071`，并检查其 `VERSION` 与核心一致，不再跟随浮动 `main`。本地固定提交联测不替代推送后的远端 checkout、完整发行门禁或正式发布；每次候选升级都必须重新记录受测提交和兼容矩阵。
+当前 Swift 跨仓库 CI 配置固定 checkout 提交 `9e45d47284827e06d1dfd649ff54876d0116d249`，并检查其 `VERSION` 与核心一致，不再跟随浮动 `main`。该配置修订不代表当前未提交的 Swift 工作树已获验证。本地联测不替代推送后的远端 checkout、完整发行门禁或正式发布；每次候选升级都必须重新记录受测提交和兼容矩阵。
 
 下一发布目标为 **`v1.0.0-beta.1`**，不是已经发布的稳定版。Luxo 遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)：Git tag 使用 `v` 前缀，包版本采用各生态要求的格式。
 
@@ -413,6 +426,8 @@ Go 适配器和 CLI 仍在同一仓库，但各自是独立 module。首轮候�
 | `pkg/lux/storage/s3` | `pkg/lux/storage/s3/v1.0.0-beta.1` |
 
 此表定义发行坐标，不代表已经发布。通过门禁并取得授权后才能发布；发布后还须在外部消费者中关闭 go.work、移除本地 replace，验证真实版本可解析，不能用工作区构建代替发行依赖验收。应用只依赖已选择的适配器。所有 Luxo 模块依赖，包括 CLI 对 PG 的依赖，首轮必须与候选版本一致。
+
+S3适配器未配置端点时默认使用HTTPS。显式HTTPS或`UseSSL=true`同样要求TLS；内网端点仍可显式使用HTTP。构造器及其他bucket的URL生成会明确拒绝非法bucket名称。
 
 Studio 发布时必须将核心 Go module、CLI、前端 SDK 和 CI checkout 固定到记录的版本/提交，不跟随浮动 `main` 或 `latest`；本地源码替换仅用于开发。Studio 保留独立版本；后续 SDK 是否独立发版仍须维护兼容矩阵，不凭版本数字猜兼容。当前已实现数据库后端为 PostgreSQL，未来数据库后端和 Studio 新功能不纳入本次冻结。
 
@@ -473,11 +488,17 @@ AppendJSON 成功必须返回合法 JSON，失败保留原始 dst 前缀并返�
 限制生效时拒绝新写入，不通过删除未确认消息腾空间；存储容量和积压必须
 由部署方监控。不得随意删除 durable consumer 或重置其投递状态来“恢复”任务。
 
+#### Beta 前 Binary 数组写入接口迁移
+
+普通 Binary 数组读写统一限制为 0～1,000,000 项。Go 的 `codec.AppendArrayHeader` 改为返回 `([]byte, error)`，`Encoder.WriteArrayHeader` 和类型化数组字段写入方法返回 `error`；Swift 的 `writeArrayHeader` 增加 `throws`。手写编码器须传播错误，客户端和服务须重新生成。生成参数、标量列表响应、流消息和事件均检查计数；内存事件在复制前拒绝超长列表。列式记录数保持独立限制，合法 wire 字节不变。
+
 #### 有限 Float 写入接口迁移（验收中）
 
 `codec.LuxoMarshaler.MarshalLuxo` 现在返回 `([]byte, error)`；事件重新运行 `luxo gen`，手写实现同步适配。Encoder 的 Float 单值、字段、数组写入和 ColumnarWriter 的 Float 列写入返回 `error`，拒绝 NaN/Infinity，失败不提交部分字段或列。`rpc.EncodeParams` 同样返回 `([]byte, error)`，不支持的值不再静默丢弃。NATS 编码失败时不发布消息，已有 `Emit` 的 error 返回不变。
 
 生成模型/type 的 `WriteLuxo` 和全部 `WriteColumnar` 变体现在返回 `error`；`codec.AppendFixed64` 返回 `([]byte,error)`，`ResponseBuf.AppendFloat` 返回 `error`。嵌套事件、编译/native handler 和内部 RPC 均传递写入失败；直接使用 ResponseBuf 的调用方遇错必须丢弃本次输出。
+
+生成的 Go 行式／列式模型 codec 和直接 JSON／Binary 输入读取按 `codec.MaxModelDepth` 限制对象深度为64层：根对象算1，列表不增加层数，JSON字段保留独立128层预算。直接调用这些Go方法可用 `errors.Is(err, codec.ErrModelDepth)` 检查超限；公开方法签名保持不变，需重新生成并匹配当前核心运行时。无结构字段的声明集可静态证明对象深度最多1层，保留原有直接路径。重复字段旧值、共享Schema转换、四SDK及完整覆盖／性能仍属beta验收范围。
 
 `codec.ColumnarWriter.Bytes()` 现在返回 `([]byte, error)`，在修改输出缓冲前拒绝非空零列、非法行数/arena 大小、非正字段 ID 和列值数量不一致；失败返回 nil 字节，调用方必须检查错误。空列表仍为 `00 00 00`，选中全 null 列仍合法。列长度不一致或字段 ID 非法后需 `Reset()`；生成的直写代码已有 error 返回，不使用此缓冲辅助类型。本项接口迁移不等于未测负载的性能已通过。
 

@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 
+	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/datetime"
 	"github.com/light-speak/luxo/pkg/lux/jsonutil"
@@ -143,15 +144,15 @@ func (r *APIRegistry) ParseBinaryRequestInto(body []byte, req *Request) error {
 	req.FieldMask = fieldMask
 	req.paramNames = plan.names
 	req.paramCount = len(paramMeta)
-	if len(paramMeta) > len(req.paramSlots) {
-		return fmt.Errorf("too many params (max %d) for API %s", len(req.paramSlots), plan.name)
-	}
+	req.allocateParamOverflow(len(paramMeta))
 	decoder := binaryParamDecoder{req: req, buf: body[off:], meta: paramMeta, lookup: &plan.lookup}
 	if err := decoder.decode(); err != nil {
 		return err
 	}
-	req.applyBinaryListParams()
 	definition := plan.definition
+	if definition != nil && definition.Paginated {
+		req.applyBinaryListParams()
+	}
 	applyPaginationDefaults(req, definition)
 	if err := validateRequiredParams(req, definition); err != nil {
 		return err
@@ -169,7 +170,9 @@ func (r *APIRegistry) prepareJSONRequest(req *Request) error {
 		return nil
 	}
 	definition := r.apiDefinition(req.API)
-	applyPaginationDefaults(req, definition)
+	if err := prepareJSONPagination(req, definition); err != nil {
+		return err
+	}
 	params, err := r.encodeJSONRequestParams(req, definition)
 	if err != nil {
 		req.clearPreparedJSON()
@@ -204,11 +207,25 @@ func applyPaginationDefaults(req *Request, definition *schema.API) {
 	req.PageSize = pageSize
 }
 
+func prepareJSONPagination(req *Request, definition *schema.API) error {
+	if definition == nil || !definition.Paginated {
+		return nil
+	}
+	return preparePaginatedJSON(req, definition)
+}
+
+// Keep the schema predicate inlineable for ordinary JSON requests.
+func preparePaginatedJSON(req *Request, definition *schema.API) error {
+	if err := req.parseJSONPagination(); err != nil {
+		return err
+	}
+	applyPaginationDefaults(req, definition)
+	return nil
+}
+
 func (r *APIRegistry) encodeJSONRequestParams(req *Request, definition *schema.API) ([]byte, error) {
 	meta := r.paramOrder[req.API]
-	if len(meta) > len(req.paramSlots) {
-		return nil, fmt.Errorf("too many params (max %d) for API %s", len(req.paramSlots), req.API)
-	}
+
 	if err := validateKnownJSONParams(req, meta); err != nil {
 		return nil, err
 	}
@@ -228,8 +245,9 @@ func (r *APIRegistry) encodeJSONRequestParams(req *Request, definition *schema.A
 			if req.paramNames == nil {
 				req.paramNames = r.paramNames[req.API]
 				req.paramCount = len(meta)
+				req.allocateParamOverflow(len(meta))
 			}
-			req.paramSlots[i] = value
+			*req.paramSlot(i) = value
 			req.markParamPresent(i)
 		}
 	}
@@ -267,12 +285,6 @@ func validateKnownJSONParams(req *Request, meta []ParamMeta) error {
 }
 
 func (r *APIRegistry) jsonParamValue(req *Request, meta ParamMeta) (any, bool, error) {
-	if meta.Name == "page" {
-		return int64(req.Page), true, nil
-	}
-	if meta.Name == "pageSize" {
-		return int64(req.PageSize), true, nil
-	}
 	raw, present := req.Params[meta.Name]
 	if !present {
 		return nil, false, nil
@@ -283,7 +295,7 @@ func (r *APIRegistry) jsonParamValue(req *Request, meta ParamMeta) (any, bool, e
 	if meta.Type == "Bytes" {
 		return decodeJSONBytesParam(raw, meta)
 	}
-	if meta.Type == "Model" {
+	if meta.Type == "Model" || meta.Type == "Sealed" {
 		return r.jsonStructuredParam(raw, meta)
 	}
 	if meta.Type == "Int" || meta.Type == "Duration" {
@@ -498,7 +510,7 @@ func (d *binaryParamDecoder) decodeParam(fieldID uint64) error {
 		return fmt.Errorf("unknown param field ID %d for API %s", fieldID, d.req.API)
 	}
 	meta := &d.meta[paramIndex]
-	if d.req.paramSet&(uint16(1)<<paramIndex) != 0 {
+	if d.req.paramPresent(paramIndex) {
 		return fmt.Errorf("duplicate param field ID %d for API %s", fieldID, d.req.API)
 	}
 	d.req.markParamPresent(paramIndex)
@@ -518,7 +530,11 @@ func (d *binaryParamDecoder) decodeParam(fieldID uint64) error {
 		return err
 	}
 	d.off += consumed
-	d.req.paramSlots[paramIndex] = value
+	if value == nil {
+		d.req.markParamNull(paramIndex)
+		return nil
+	}
+	*d.req.paramSlot(paramIndex) = value
 	return nil
 }
 
@@ -530,7 +546,7 @@ func (r *APIRegistry) decodeFieldMask(apiName string, mask []byte) ([]*selection
 	if apiMeta == nil || apiMeta.ReturnType == "" {
 		return nil, nil
 	}
-	model := r.schema.LookupModel(apiMeta.ReturnType)
+	model := r.schema.SelectionModel(apiMeta.ReturnType)
 	return decodeFieldMask(mask, model, r.schema, 0)
 }
 
@@ -539,7 +555,7 @@ func decodeFieldMask(mask []byte, model *schema.Model, schemas *schema.Schema, d
 	if model == nil {
 		return nil, nil
 	}
-	if depth >= 32 {
+	if depth >= codec.MaxSelectionDepth {
 		return nil, fmt.Errorf("field mask depth exceeds 32")
 	}
 	fieldMask, children, ok := codec.SplitSelectionMask(mask)
@@ -563,10 +579,10 @@ func decodeFieldMask(mask []byte, model *schema.Model, schemas *schema.Schema, d
 		end := off + int(length)
 		field := model.FieldByID(int(fieldID))
 		selected := selectedByID[int(fieldID)]
-		if field == nil || selected == nil || !field.Relation {
+		if field == nil || selected == nil || (!field.Relation && field.Type != schema.FieldSealed) {
 			return nil, fmt.Errorf("field mask child %d is not a selected relation on %s", fieldID, model.Name)
 		}
-		nested := schemas.LookupModel(field.TypeName)
+		nested := schemas.SelectionModel(field.TypeName)
 		if nested == nil {
 			return nil, fmt.Errorf("field mask nested type %q is not registered", field.TypeName)
 		}
@@ -599,7 +615,7 @@ func allocateSelectedFields(mask []byte, model *schema.Model, relations map[int]
 		}
 		selected := &nodes[len(fields)]
 		selected.Name = field.Name
-		if field.Relation {
+		if field.Relation || field.Type == schema.FieldSealed {
 			selected.Children = []*selection.Field{}
 			if relations != nil {
 				relations[field.ID] = selected
@@ -692,7 +708,7 @@ func writeBinaryFilters(enc *codec.Encoder, filters []Filter) error {
 		return fmt.Errorf("$filters exceeds limit: %d > 1000", len(filters))
 	}
 	enc.WriteFieldHeader(BinaryFiltersFieldID)
-	enc.WriteArrayHeader(len(filters))
+	enc.WriteVarint(uint64(len(filters))) // The query-control limit was checked above.
 	for i := range filters {
 		operatorID := filterOperatorID(filters[i].Operator)
 		if filters[i].Field == "" || operatorID == 0 {
@@ -743,7 +759,7 @@ func writeBinarySorters(enc *codec.Encoder, sorters []Sorter) error {
 		return fmt.Errorf("$sorters exceeds limit: %d > 100", len(sorters))
 	}
 	enc.WriteFieldHeader(BinarySortersFieldID)
-	enc.WriteArrayHeader(len(sorters))
+	enc.WriteVarint(uint64(len(sorters))) // The query-control limit was checked above.
 	for i := range sorters {
 		if sorters[i].Field == "" || (sorters[i].Order != "asc" && sorters[i].Order != "desc") {
 			return fmt.Errorf("$sorters[%d]: invalid field or order", i)
@@ -803,6 +819,19 @@ func encodeBinaryParam(enc *codec.Encoder, meta ParamMeta, value any) error {
 			enc.WriteNull()
 			return nil
 		}
+		if meta.Type == "JSON" && !meta.IsList {
+			raw, ok := binaryJSON(value)
+			if !ok {
+				return fmt.Errorf("param %s: expected valid JSON", meta.Name)
+			}
+			if isJSONNull(raw) {
+				enc.WriteNull()
+			} else {
+				enc.WritePresent()
+				enc.WriteBytes(raw)
+			}
+			return nil
+		}
 		enc.WritePresent()
 	}
 	if meta.IsList {
@@ -860,7 +889,7 @@ func encodeBinaryScalarValue(enc *codec.Encoder, meta ParamMeta, value any) bool
 			enc.WriteBytes(raw)
 			return true
 		}
-	case "Model":
+	case "Model", "Sealed":
 		if message, ok := value.(BinaryMessage); ok {
 			enc.WriteBytes(message)
 			return true
@@ -910,7 +939,7 @@ func binaryDuration(value any) (time.Duration, bool) {
 func binaryDecimal(value any) (string, bool) {
 	switch v := value.(type) {
 	case decimal.Decimal:
-		return v.String(), true
+		return lux.FormatDecimal(v), true
 	case string:
 		if _, err := decimal.NewFromString(v); err == nil {
 			return v, true
@@ -925,7 +954,7 @@ func binaryJSON(value any) ([]byte, bool) {
 }
 
 func isJSONNull(raw []byte) bool {
-	return bytes.Equal(bytes.Trim(raw, " \t\r\n"), []byte("null"))
+	return codec.IsJSONNull(raw)
 }
 
 func encodeBinaryListValue(enc *codec.Encoder, meta ParamMeta, value any) error {
@@ -934,12 +963,14 @@ func encodeBinaryListValue(enc *codec.Encoder, meta ParamMeta, value any) error 
 			return encodeJSONDocuments(enc, meta, documents)
 		}
 	}
-	if meta.Type == "Model" {
+	if meta.Type == "Model" || meta.Type == "Sealed" {
 		messages, ok := value.(BinaryMessages)
 		if !ok {
 			return fmt.Errorf("param %s: expected list of %s, got %T", meta.Name, meta.TypeName, value)
 		}
-		enc.WriteArrayHeader(len(messages))
+		if err := enc.WriteArrayHeader(len(messages)); err != nil {
+			return err
+		}
 		for _, message := range messages {
 			enc.WriteBytes(message)
 		}
@@ -952,7 +983,9 @@ func encodeBinaryListValue(enc *codec.Encoder, meta ParamMeta, value any) error 
 		}
 		return fmt.Errorf("param %s: expected list of %s, got %T", meta.Name, meta.Type, value)
 	}
-	enc.WriteArrayHeader(len(values))
+	if err := enc.WriteArrayHeader(len(values)); err != nil {
+		return err
+	}
 	switch meta.Type {
 	case "Int":
 		return encodeBinaryIntList(enc, meta, values, false)
@@ -1263,7 +1296,7 @@ func readBinaryParam(buf []byte, off int, meta ParamMeta) (any, int, error) {
 		return v, n, nil
 	case "JSON":
 		return readBinaryJSONParam(buf, off, meta)
-	case "Model":
+	case "Model", "Sealed":
 		return readBinaryMessageParam(buf, off, meta)
 	default:
 		return nil, 0, fmt.Errorf("param %s: unknown type %s", meta.Name, meta.Type)
@@ -1290,8 +1323,11 @@ func readBinaryJSONParam(buf []byte, off int, meta ParamMeta) (any, int, error) 
 	if !jsonutil.ValidUTF8JSON(value) {
 		return nil, 0, fmt.Errorf("param %s: invalid JSON", meta.Name)
 	}
-	if !meta.Nullable && isJSONNull(value) {
-		return nil, 0, fmt.Errorf("param %s: expected a non-null JSON value", meta.Name)
+	if isJSONNull(value) {
+		if !meta.Nullable {
+			return nil, 0, fmt.Errorf("param %s: expected a non-null JSON value", meta.Name)
+		}
+		return nil, consumed, nil
 	}
 	return json.RawMessage(value), consumed, nil
 }
@@ -1338,7 +1374,7 @@ func readBinaryListParam(buf []byte, off int, meta ParamMeta) (any, int, error) 
 		value, end, err = readBinaryBytesArray(buf, off, count, meta, false)
 	case "JSON":
 		value, end, err = readBinaryBytesArray(buf, off, count, meta, true)
-	case "Model":
+	case "Model", "Sealed":
 		value, end, err = readBinaryMessageArray(buf, off, count, meta)
 	default:
 		return nil, 0, fmt.Errorf("param %s: unknown list type %s", meta.Name, meta.Type)

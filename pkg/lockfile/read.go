@@ -5,7 +5,10 @@ import (
 	"encoding/json/jsontext"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
+
+	"github.com/light-speak/luxo/pkg/lux/codec"
 )
 
 // readLock uses the standard tokenizer for syntax and Unicode. Every object is
@@ -52,8 +55,13 @@ func readLock(data []byte) (*LockFile, error) {
 
 func readModelLock(d *jsontext.Decoder) (*ModelLock, error) {
 	m := new(ModelLock)
-	err := readLockMembers(d, lockNextID|lockFields|lockFieldTypes|lockReserved, func(member lockMember) (err error) {
+	err := readLockMembers(d, lockNextID|lockFields|lockFieldTypes|lockReserved|lockKind|lockDefaultFields, func(member lockMember) (err error) {
 		switch member {
+		case lockKind:
+			m.ensureTypeInfo().kind, err = readLockString(d)
+		case lockDefaultFields:
+			m.ensureTypeInfo().defaultIDs, err = readDefaultFieldIDs(d)
+			slices.Sort(m.typeInfo.defaultIDs)
 		case lockNextID:
 			m.NextID, err = readLockInt(d)
 		case lockFields:
@@ -66,6 +74,24 @@ func readModelLock(d *jsontext.Decoder) (*ModelLock, error) {
 		return err
 	})
 	return m, err
+}
+
+// UnmarshalJSON preserves declaration metadata for standard-library callers.
+// Load already uses the same strict reader without a serialization round trip.
+func (m *ModelLock) UnmarshalJSON(data []byte) error {
+	if m == nil {
+		return fmt.Errorf("luxo.lock cannot decode into a nil declaration")
+	}
+	d := jsontext.NewDecoder(bytes.NewReader(data), jsontext.AllowDuplicateNames(true))
+	decoded, err := readModelLock(d)
+	if err != nil {
+		return err
+	}
+	if _, err := d.ReadToken(); err != io.EOF {
+		return fmt.Errorf("luxo.lock declaration must contain exactly one object: %v", err)
+	}
+	*m = *decoded
+	return nil
 }
 
 func readAPILock(d *jsontext.Decoder) (*APILock, error) {
@@ -88,6 +114,25 @@ func readAPILock(d *jsontext.Decoder) (*APILock, error) {
 		return err
 	})
 	return a, err
+}
+
+func readDefaultFieldIDs(d *jsontext.Decoder) ([]int, error) {
+	if _, err := readLockToken(d, '['); err != nil {
+		return nil, err
+	}
+	ids := []int{}
+	for d.PeekKind() != ']' {
+		if len(ids) >= codec.MaxSelectionFieldID {
+			return nil, fmt.Errorf("too many default field IDs")
+		}
+		id, err := readLockInt(d)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	_, err := readLockToken(d, ']')
+	return ids, err
 }
 
 func readLockMembers(d *jsontext.Decoder, allowed lockMember, visit func(lockMember) error) error {

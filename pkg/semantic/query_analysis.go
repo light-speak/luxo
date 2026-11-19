@@ -63,7 +63,9 @@ func (a *Analyzer) analyzeExpr(expr ast.Expr) {
 	case *ast.CallExpr:
 		a.analyzeCallExpr(e)
 		for _, arg := range e.Args {
-			a.analyzeExpr(arg.Value)
+			if arg != nil {
+				a.analyzeExpr(arg.Value)
+			}
 		}
 	case *ast.BinaryExpr:
 		a.analyzeExpr(e.Left)
@@ -82,6 +84,9 @@ func (a *Analyzer) analyzeExpr(expr ast.Expr) {
 // analyzeCallExpr checks a CRUD call for index coverage.
 // Supports both function-style find(Model, ...) and chain-style Model.find(...).
 func (a *Analyzer) analyzeCallExpr(e *ast.CallExpr) {
+	if isDeclaredFunctionCall(e, a.scope) {
+		return
+	}
 	var opName string
 	var modelType *ResolvedType
 
@@ -278,7 +283,7 @@ func (a *Analyzer) detectN1InExpr(expr ast.Expr, stmtPos token.Position) {
 		return
 	}
 	call, ok := expr.(*ast.CallExpr)
-	if !ok {
+	if !ok || isDeclaredFunctionCall(call, a.scope) {
 		return
 	}
 

@@ -32,6 +32,47 @@ function batch(count: bigint, payload: number[] = [], arena = 0n): Uint8Array {
 }
 
 describe('binary metadata bounds', () => {
+  it('bounds sealed variant tags and framed-list counts through the public readers', () => {
+    for (const tag of [1n, 65535n]) {
+      const decoder = new Decoder(Uint8Array.from(unsigned(tag)))
+      expect(decoder.readVariantTag()).toBe(Number(tag))
+      expect(decoder.error).toBeNull()
+    }
+    for (const bytes of [unsigned(65536n), [128]]) {
+      const decoder = new Decoder(Uint8Array.from(bytes))
+      decoder.readVariantTag()
+      expect(decoder.error).not.toBeNull()
+    }
+    const list = new Decoder(Uint8Array.of(2, 0, 0))
+    expect(list.readListCount()).toBe(2)
+    for (const bytes of [[2, 0], unsigned(1000001n)]) {
+      const decoder = new Decoder(Uint8Array.from(bytes))
+      decoder.readListCount()
+      expect(decoder.error).not.toBeNull()
+    }
+  })
+  it('validates array counts before mutating the output', () => {
+    for (const count of [-1, 0.5, NaN, Infinity, 1_000_001, Number.MAX_SAFE_INTEGER]) {
+      const encoder = new Encoder()
+      encoder.writeBool(true)
+      expect(() => encoder.writeArrayHeader(count)).toThrow(RangeError)
+      expect(encoder.bytes()).toEqual(Uint8Array.of(1))
+    }
+    for (const count of [0, 1, 127, 128, 1_000_000]) {
+      const encoder = new Encoder()
+      encoder.writeArrayHeader(count)
+      expect(encoder.bytes()).toEqual(Uint8Array.from(unsigned(BigInt(count))))
+    }
+  })
+
+  it('rejects oversized array fields before changing output', () => {
+    const encoder = new Encoder()
+    encoder.writeBool(true)
+    const before = encoder.bytes().slice()
+    expect(() => encoder.writeFieldBoolArray(1, Array<boolean>(1_000_001).fill(false))).toThrow()
+    expect(encoder.bytes()).toEqual(before)
+  })
+
   it('rejects nonempty zero-column and impossible-row lists before allocation', () => {
     for (const count of [1n, 128n, 10_000_000n]) {
       for (const payload of [
@@ -296,4 +337,55 @@ describe('column payload bounds', () => {
     expect(decoder.nextColumn()).toBe(false)
     expect(decoder.error).toBeNull()
   })
+})
+
+describe('columnar byte view isolation', () => {
+  const samples: { name: string; write: (encoder: Encoder) => void; value: unknown }[] = [
+    { name: 'Int', write: e => e.writeSvarint(9223372036854775807n), value: 9223372036854775807n },
+    { name: 'Float', write: e => e.writeFixed64(-0), value: -0 },
+    { name: 'String', write: e => e.writeString('東京𐐀'), value: '東京𐐀' },
+    { name: 'Bool', write: e => e.writeBool(true), value: true },
+    { name: 'UUID', write: e => e.writeUUID('531f2d00-20e5-47f2-b874-22b6fc76328b'), value: '531f2d00-20e5-47f2-b874-22b6fc76328b' },
+    { name: 'Bytes', write: e => e.writeBytes(Uint8Array.of(0, 128, 255)), value: Uint8Array.of(0, 128, 255) },
+    { name: 'DateTime', write: e => e.writeDateTime('1969-12-31T23:59:59.123456789Z'), value: '1969-12-31T23:59:59.123456789Z' },
+  ]
+  for (const sample of samples) {
+    for (const mode of ['value', 'present', 'null'] as const) {
+      it(`${sample.name}/${mode} respects the complete view and every truncation`, () => {
+        const encoder = new Encoder()
+        encoder.writeVarint(1)
+        encoder.writeVarint(0)
+        encoder.writeVarint(16384)
+        if (mode !== 'value') encoder.writeBool(mode === 'present')
+        if (mode !== 'null') sample.write(encoder)
+        encoder.writeEnd()
+        const encoded = encoder.bytes()
+        const read = columnReaders[sample.name + (mode === 'value' ? '' : 'Ptr')]
+        for (const prefix of [0, 1, 8, 33]) {
+          const backing = new Uint8Array(prefix + encoded.length + 32).fill(255)
+          backing.set(encoded, prefix)
+          const unchanged = backing.slice()
+          for (let length = 0; length <= encoded.length; length++) {
+            const decoder = new ColumnarDecoder(backing.subarray(prefix, prefix + length))
+            let values: unknown[] = []
+            expect(() => {
+              if (decoder.nextColumn()) {
+                expect(decoder.fieldID).toBe(16384)
+                values = read(decoder)
+                expect(decoder.nextColumn()).toBe(false)
+              }
+            }).not.toThrow()
+            if (length === encoded.length) {
+              expect(decoder.error).toBeNull()
+              expect(values).toEqual([mode === 'null' ? null : sample.value])
+            } else {
+              expect(decoder.error, `prefix=${prefix}, length=${length}`).not.toBeNull()
+            }
+            expect(decoder.offset()).toBeLessThanOrEqual(length)
+          }
+          expect(backing).toEqual(unchanged)
+        }
+      })
+    }
+  }
 })

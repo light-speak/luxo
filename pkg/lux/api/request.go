@@ -136,7 +136,7 @@ func readBodyBufferBudget(r io.Reader, buf []byte, limit int, lease *receiveLeas
 
 // reservedKeys are protocol fields that should not appear in user params.
 var reservedKeys = [...]string{
-	"$id", "$api", "$select", "$filters", "$sorters", "page", "pageSize",
+	"$id", "$api", "$select", "$filters", "$sorters",
 }
 
 // Request represents a parsed Luvia API request.
@@ -159,11 +159,12 @@ type Request struct {
 	// Typed binary params and prepared JSON structured messages share inline storage.
 	// paramSlots stores values by index (position in API param list)
 	// paramNames points to the static name list from Registry (never allocated per request)
-	paramSlots [16]any
-	paramNames []string // shared, not owned
-	paramCount int
-	paramSet   uint16
-	paramNull  uint16
+	paramSlots    [16]any
+	paramOverflow *[]overflowParamSlot
+	paramNames    []string // shared, not owned
+	paramCount    int
+	paramSet      uint16
+	paramNull     uint16
 
 	// Canonical binary request bytes are prepared once at the transport edge.
 	// Gateways forward these slices directly without decoding and re-encoding.
@@ -269,7 +270,7 @@ func parseRawRequest(raw map[string]json.RawMessage) (*Request, error) {
 		req.Select = fields
 	}
 
-	// Extract list params (filters, sorters, pagination)
+	// Extract envelope controls. Pagination names remain ordinary Schema params.
 	if err := req.parseListParams(raw); err != nil {
 		return nil, err
 	}
@@ -283,7 +284,7 @@ func parseRawRequest(raw map[string]json.RawMessage) (*Request, error) {
 	return req, nil
 }
 
-// parseListParams extracts $filters, $sorters, page, pageSize from raw request.
+// parseListParams extracts $filters and $sorters from the request envelope.
 func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 	if filtersRaw, ok := raw["$filters"]; ok {
 		filters, err := parseListObjects(filtersRaw, 1000, "op", filterMetadata)
@@ -311,13 +312,19 @@ func (req *Request) parseListParams(raw map[string]json.RawMessage) error {
 	}
 	req.Page = 1
 	req.PageSize = defaultPageSize
+	return nil
+}
+
+// parseJSONPagination runs only after the API's explicit pagination contract
+// is known. Keep the original values available to typed parameter readers.
+func (req *Request) parseJSONPagination() error {
 	var err error
-	if pageRaw, ok := raw["page"]; ok {
+	if pageRaw, ok := req.Params["page"]; ok {
 		if req.Page, err = parseJSONPageInteger(pageRaw); err != nil {
 			return fmt.Errorf("page must be an integer")
 		}
 	}
-	if psRaw, ok := raw["pageSize"]; ok {
+	if psRaw, ok := req.Params["pageSize"]; ok {
 		req.pageSizeSet = true
 		if req.PageSize, err = parseJSONPageInteger(psRaw); err != nil {
 			return fmt.Errorf("pageSize must be an integer")
@@ -342,28 +349,36 @@ func parseJSONPageInteger(raw []byte) (int, error) {
 	return int(value), nil
 }
 
-// findParam looks up a binary param by name from the inline slot array.
+// findParam looks up a binary param by name from inline or overflow storage.
 // Returns the value and true if found, nil and false otherwise.
 func (r *Request) findParam(name string) (any, bool) {
 	for i := 0; i < r.paramCount; i++ {
 		if r.paramNames[i] == name {
-			if r.paramSet&(1<<i) != 0 {
-				return r.paramSlots[i], true
+			if r.paramPresent(i) {
+				return *r.paramSlot(i), true
 			}
-			if r.paramSlots[i] == nil {
+			if *r.paramSlot(i) == nil {
 				return nil, false
 			}
-			return r.paramSlots[i], true
+			return *r.paramSlot(i), true
 		}
 	}
 	return nil, false
 }
 
 func (r *Request) markParamPresent(index int) {
-	r.paramSet |= 1 << index
+	if index < len(r.paramSlots) {
+		r.paramSet |= 1 << index
+		return
+	}
+	(*r.paramOverflow)[index-len(r.paramSlots)].state = 1
 }
 
 func (r *Request) markParamNull(index int) {
+	if index >= len(r.paramSlots) {
+		(*r.paramOverflow)[index-len(r.paramSlots)] = overflowParamSlot{state: 2}
+		return
+	}
 	r.paramSet |= 1 << index
 	r.paramNull |= 1 << index
 	r.paramSlots[index] = nil
@@ -377,7 +392,7 @@ func (r *Request) ParamIsNull(name string) bool {
 	}
 	for i := 0; i < r.paramCount; i++ {
 		if r.paramNames[i] == name {
-			return r.paramNull&(1<<i) != 0
+			return r.paramIsNull(i)
 		}
 	}
 	return false
@@ -635,18 +650,20 @@ func InvalidParam(name string, cause error) error {
 }
 
 // SetBinaryParams configures binary mode param storage.
-// Called by RPC server to set up paramSlots without allocation.
+// Small parameter lists use inline storage; larger lists allocate overflow slots.
 func (r *Request) SetBinaryParams(names []string, count int) {
+	r.clearPreparedJSON()
 	r.Params = nil
 	r.paramNames = names
 	r.paramCount = count
+	r.allocateParamOverflow(count)
 }
 
 // SetParamSlot sets a param value by index (binary mode).
 // If a slot already has a value, repeated calls accumulate into a slice.
 // This supports array params encoded as repeated field IDs (e.g. batchLoad keys).
 func (r *Request) SetParamSlot(index int, value any) {
-	if index < 0 || index >= 16 {
+	if index < 0 || (index >= len(r.paramSlots) && (r.paramOverflow == nil || index-len(r.paramSlots) >= len(*r.paramOverflow))) {
 		return
 	}
 	if value == nil {
@@ -654,37 +671,40 @@ func (r *Request) SetParamSlot(index int, value any) {
 		return
 	}
 	r.markParamPresent(index)
-	r.paramNull &^= 1 << index
-	existing := r.paramSlots[index]
+	if index < len(r.paramSlots) {
+		r.paramNull &^= 1 << index
+	}
+	slot := r.paramSlot(index)
+	existing := *slot
 	if existing == nil {
-		r.paramSlots[index] = value
+		*slot = value
 		return
 	}
 	// Accumulate into slice
 	switch ev := existing.(type) {
 	case int64:
 		if iv, ok := value.(int64); ok {
-			r.paramSlots[index] = []int64{ev, iv}
+			*slot = []int64{ev, iv}
 			return
 		}
 	case []int64:
 		if iv, ok := value.(int64); ok {
-			r.paramSlots[index] = append(ev, iv)
+			*slot = append(ev, iv)
 			return
 		}
 	case string:
 		if sv, ok := value.(string); ok {
-			r.paramSlots[index] = []string{ev, sv}
+			*slot = []string{ev, sv}
 			return
 		}
 	case []string:
 		if sv, ok := value.(string); ok {
-			r.paramSlots[index] = append(ev, sv)
+			*slot = append(ev, sv)
 			return
 		}
 	}
 	// Type mismatch or unsupported — overwrite
-	r.paramSlots[index] = value
+	*slot = value
 }
 
 // HasParam checks if a parameter exists (supports both JSON and binary mode).
@@ -705,4 +725,38 @@ func (r *Request) BinaryRequest() []byte {
 // BinaryParams returns the canonical parameter fields including the end marker.
 func (r *Request) BinaryParams() []byte {
 	return r.binaryParams
+}
+
+// Small requests retain inline storage. Only larger registered schemas allocate.
+type overflowParamSlot struct {
+	value any
+	state uint8 // 0 missing, 1 value, 2 explicit null
+}
+
+func (r *Request) allocateParamOverflow(count int) {
+	if count > len(r.paramSlots) {
+		slots := make([]overflowParamSlot, count-len(r.paramSlots))
+		r.paramOverflow = &slots
+	}
+}
+
+func (r *Request) paramSlot(index int) *any {
+	if index < len(r.paramSlots) {
+		return &r.paramSlots[index]
+	}
+	return &(*r.paramOverflow)[index-len(r.paramSlots)].value
+}
+
+func (r *Request) paramPresent(index int) bool {
+	if index < len(r.paramSlots) {
+		return r.paramSet&(uint16(1)<<index) != 0
+	}
+	return (*r.paramOverflow)[index-len(r.paramSlots)].state != 0
+}
+
+func (r *Request) paramIsNull(index int) bool {
+	if index < len(r.paramSlots) {
+		return r.paramNull&(uint16(1)<<index) != 0
+	}
+	return (*r.paramOverflow)[index-len(r.paramSlots)].state == 2
 }

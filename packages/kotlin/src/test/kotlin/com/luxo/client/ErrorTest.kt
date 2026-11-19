@@ -8,6 +8,20 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
 class LuxoErrorTest {
+    @Test
+    fun `wire errors reject non-error statuses`() {
+        for (code in listOf(Int.MIN_VALUE, -1, 0, 200, 399, 600, 1000, Int.MAX_VALUE)) {
+            val json = buildJsonObject { put("error", "Rejected"); put("message", "invalid"); put("code", code) }
+            assertEquals("ParseError", decodeLuxoJsonError(json, 502)?.error)
+            val enc = LuxoEncoder()
+            enc.writeFieldInt(1, code.toLong())
+            enc.writeVarint(2); enc.writeString("Rejected")
+            enc.writeVarint(3); enc.writeString("invalid")
+            enc.writeEnd()
+            assertEquals("ParseError", LuxoBinaryProtocol.decodeError(enc.bytes(), 502).error)
+        }
+    }
+
 
     @Test
     fun `constructor sets all properties`() {

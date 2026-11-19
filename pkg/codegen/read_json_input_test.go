@@ -32,7 +32,7 @@ func TestGeneratedJSONInputReader(t *testing.T) {
 	g := generatorWithModelFieldIDs(ids)
 	var source strings.Builder
 	source.WriteString(`package generated
-import ("bytes";"encoding/json";"fmt";"time";"github.com/google/uuid";"github.com/shopspring/decimal";
+import ("encoding/json";"fmt";"time";"github.com/google/uuid";"github.com/shopspring/decimal";
 "github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/jsonutil";"github.com/light-speak/luxo/pkg/lux/schema")
 `)
 	enum := &ast.EnumDecl{Name: "State", Values: []string{"OPEN", "CLOSED"}}
@@ -241,7 +241,7 @@ func(c *probeClient)Delete(context.Context)(int64,error){return 1,nil}
 		if inferred == nil {
 			t.Fatalf("cannot infer %s", name)
 		}
-		generateInferredHandler(&source, declaration, inferred, enums, model)
+		defaultGenerator().generateInferredHandler(&source, declaration, inferred, enums, model)
 	}
 	runGeneratedProtocolPackage(t, source.String(), inferredLocalJSONAssertions)
 }
@@ -331,3 +331,51 @@ func BenchmarkLocalJSONTransportInferred(b *testing.B){
     }
 }
 `
+
+func TestGeneratedStructuredIdentityReader(t *testing.T) {
+	node := &ast.ModelDecl{Name: "IdentityNode", Fields: []*ast.FieldDecl{
+		testField("id", "Int"), {Name: "children", Type: &ast.TypeRef{Name: "IdentityNode", IsList: true}},
+	}}
+	g := generatorWithModelFieldIDs(map[string]map[string]int{"IdentityNode": {"id": 1, "children": 2}})
+	var source strings.Builder
+	source.WriteString(`package generated
+import("fmt";"github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/jsonutil")
+type IdentityNode struct{Id int64;Children []IdentityNode}
+`)
+	g.generateJSONInputDepthCheck(&source, node, g.jsonInputFields(node), nil)
+	g.generateReadIdentityInput(&source, node, nil, false)
+	for _, banned := range []string{"json.Unmarshal", "json.Marshal", "reflect.", "map[string]"} {
+		if strings.Contains(source.String(), banned) {
+			t.Fatalf("dynamic identity reader: %s", banned)
+		}
+	}
+	runGeneratedProtocolPackage(t, source.String(), `package generated
+import("strings";"testing")
+func TestIdentityStructure(t *testing.T){
+ value:=IdentityNode{Id:99}
+ for _,raw:=range []string{"{}","null","{\"id\":1}","{\"id\":1,\"children\":[{}]}","{\"id\":1,\"children\":[null]}","{\"id\":1,\"children\":[{\"id\":\"0\",\"children\":[]}]}","{\"id\":1,\"children\":[],\"unknown\":0}"}{
+  if err:=value.readIdentityInput([]byte(raw),0);err==nil{t.Fatalf("accepted %s",raw)}
+  if value.Id!=99||value.Children!=nil{t.Fatal("partial value exposed",value)}
+ }
+ leaf:="{\"id\":0,\"children\":[]}"
+ raw:=[]byte("{\"id\":9223372036854775807,\"children\":["+leaf+"]}")
+ if err:=value.readIdentityInput(raw,0);err!=nil{t.Fatal(err)}
+ clear(raw)
+ if value.Id!=9223372036854775807||len(value.Children)!=1||value.Children[0].Id!=0{t.Fatal(value)}
+ for _,depth:=range []int{64,65}{
+  raw:=[]byte(strings.Repeat("{\"id\":1,\"children\":[",depth-1)+leaf+strings.Repeat("]}",depth-1))
+  var got IdentityNode
+  if err:=got.readIdentityInput(raw,0);(err==nil)!=(depth==64){t.Fatalf("depth %d: %v",depth,err)}
+ }
+
+ for _,depth:=range []int{63,64}{
+  old:=strings.Repeat("{\"id\":1,\"children\":[",depth-1)+leaf+strings.Repeat("]}",depth-1)
+  raw:=[]byte("{\"id\":1,\"children\":["+old+"],\"children\":[]}");var value IdentityNode
+  if err:=value.readIdentityInput(raw,0);(err==nil)!=(depth==63){t.Fatalf("discarded identity depth %d: %v",depth+1,err)}
+ }
+ for _,raw:=range []string{"{\"id\":\"bad\",\"id\":1,\"children\":[]}","{\"id\":1,\"children\":[{}],\"children\":[]}"}{var value IdentityNode;if err:=value.readIdentityInput([]byte(raw),0);err!=nil{t.Fatal("ignored identity business error",err)}}
+ values,err:=readIdentityIdentityNodeList([]byte("["+leaf+"]"))
+ if err!=nil||len(values)!=1||values[0].Id!=0{t.Fatal(values,err)}
+}
+`)
+}

@@ -38,6 +38,27 @@ class Selected<T> {
 
 enum TypeUsage { input, output, inputOutput, unused }
 
+/// Static provenance read by the compiler from generated sum declarations.
+final class LuxoSealedProjection {
+  final String owner;
+  final List<String> variants;
+  const LuxoSealedProjection(this.owner, this.variants);
+}
+
+/// A generated case retains its wire owner, case name and stable tag.
+final class LuxoSealedCaseProjection {
+  final String owner;
+  final String variant;
+  final int tag;
+  const LuxoSealedCaseProjection(this.owner, this.variant, this.tag);
+}
+
+/// A target-language alias still selects the original wire field.
+final class LuxoSelectionFieldProjection {
+  final String name;
+  const LuxoSelectionFieldProjection(this.name);
+}
+
 TypeUsage? _typeUsageFromJson(Object? value) => switch (value) {
   'input' => TypeUsage.input,
   'output' => TypeUsage.output,
@@ -82,12 +103,14 @@ class LuxoSchema {
   final Map<String, LuxoAPI> apis;
   final Map<String, LuxoEnum> enums;
   final Map<String, LuxoTypeDecl> types;
+  final Map<String, LuxoSealed> sealeds;
 
   const LuxoSchema({
     required this.models,
     required this.apis,
     this.enums = const {},
     this.types = const {},
+    this.sealeds = const {},
   });
 
   /// Validate the complete stable ID directory before generating files.
@@ -98,9 +121,32 @@ class LuxoSchema {
     for (final type in types.values) {
       _validateFieldIDs(type.fields, 'type ${type.name}');
     }
+    for (final sealed in sealeds.values) {
+      final tags = <int>{};
+      for (final variant in sealed.variants) {
+        checkSchemaID(
+          variant.id,
+          maxSelectionFieldID,
+          tags,
+          'sealed ${sealed.name}',
+          variant.name,
+        );
+        final fields = <int>{};
+        for (final field in variant.fields) {
+          checkSchemaID(
+            field.id,
+            maxSelectionFieldID,
+            fields,
+            '${sealed.name}.${variant.name}',
+            field.name,
+          );
+        }
+      }
+    }
     final seen = <int>{};
     for (final api in apis.values) {
       checkSchemaID(api.id, maxAPIID, seen, 'API', api.name);
+      _validatePagination(api);
       final params = <int>{};
       for (final param in api.params) {
         checkSchemaID(
@@ -119,6 +165,7 @@ class LuxoSchema {
     final apis = <String, LuxoAPI>{};
     final enums = <String, LuxoEnum>{};
     final types = <String, LuxoTypeDecl>{};
+    final sealeds = <String, LuxoSealed>{};
     if (json['models'] != null) {
       for (final e in (json['models'] as Map<String, dynamic>).entries) {
         models[e.key] = LuxoModel.fromJson(e.value as Map<String, dynamic>);
@@ -139,7 +186,35 @@ class LuxoSchema {
         types[e.key] = LuxoTypeDecl.fromJson(e.value as Map<String, dynamic>);
       }
     }
-    return LuxoSchema(models: models, apis: apis, enums: enums, types: types);
+    if (json['sealeds'] != null) {
+      for (final entry in (json['sealeds'] as Map<String, dynamic>).entries) {
+        sealeds[entry.key] = LuxoSealed.fromJson(
+          entry.value as Map<String, dynamic>,
+        );
+      }
+    }
+    return LuxoSchema(
+      models: models,
+      apis: apis,
+      enums: enums,
+      types: types,
+      sealeds: sealeds,
+    );
+  }
+}
+
+void _validatePagination(LuxoAPI api) {
+  if (!api.paginated) return;
+  for (final name in const ['page', 'pageSize']) {
+    final matches = api.params.where((param) => param.name == name);
+    if (matches.length != 1 ||
+        matches.single.type != 'Int' ||
+        matches.single.nullable ||
+        matches.single.isList) {
+      throw FormatException(
+        'API ${api.name} pagination requires a numbered non-null Int parameter $name',
+      );
+    }
   }
 }
 
@@ -156,7 +231,7 @@ class LuxoEnum {
   const LuxoEnum({required this.name, required this.values});
   factory LuxoEnum.fromJson(Map<String, dynamic> json) => LuxoEnum(
     name: json['name'] as String,
-    values: (json['values'] as List).cast<String>(),
+    values: List<String>.from(json['values'] as List),
   );
 }
 
@@ -172,6 +247,51 @@ class LuxoTypeDecl {
         .map((e) => LuxoField.fromJson(e as Map<String, dynamic>))
         .toList(),
   );
+}
+
+class LuxoSealed {
+  final String name;
+  final String? module;
+  final TypeUsage? usage;
+  final String? description;
+  final List<LuxoSealedVariant> variants;
+  const LuxoSealed({
+    required this.name,
+    required this.variants,
+    this.module,
+    this.usage,
+    this.description,
+  });
+  factory LuxoSealed.fromJson(Map<String, dynamic> json) => LuxoSealed(
+    name: json['name'] as String,
+    module: json['module'] as String?,
+    usage: _typeUsageFromJson(json['usage']),
+    description: json['description'] as String?,
+    variants: (json['variants'] as List)
+        .map(
+          (value) => LuxoSealedVariant.fromJson(value as Map<String, dynamic>),
+        )
+        .toList(),
+  );
+}
+
+class LuxoSealedVariant {
+  final int id;
+  final String name;
+  final List<LuxoParam> fields;
+  const LuxoSealedVariant({
+    required this.id,
+    required this.name,
+    required this.fields,
+  });
+  factory LuxoSealedVariant.fromJson(Map<String, dynamic> json) =>
+      LuxoSealedVariant(
+        id: json['id'] as int,
+        name: json['name'] as String,
+        fields: (json['fields'] as List)
+            .map((value) => LuxoParam.fromJson(value as Map<String, dynamic>))
+            .toList(),
+      );
 }
 
 class LuxoModel {
@@ -335,6 +455,7 @@ class LuxoParam {
   final bool isList;
   final bool nullable;
   final bool hasDefault;
+  final String? description;
 
   const LuxoParam({
     required this.id,
@@ -344,6 +465,7 @@ class LuxoParam {
     this.isList = false,
     this.nullable = false,
     this.hasDefault = false,
+    this.description,
   });
 
   factory LuxoParam.fromJson(Map<String, dynamic> json) => LuxoParam(
@@ -354,5 +476,6 @@ class LuxoParam {
     isList: json['isList'] as bool? ?? false,
     nullable: json['nullable'] as bool? ?? false,
     hasDefault: json['hasDefault'] as bool? ?? false,
+    description: json['description'] as String?,
   );
 }

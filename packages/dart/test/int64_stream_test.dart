@@ -53,6 +53,75 @@ void main() {
   );
 
   for (final mode in TransportMode.values) {
+    test(
+      '$mode retired call leaves other calls usable on real socket',
+      () async {
+        final peers = <WebSocket>{};
+        final ids = <int>[];
+        await _withRawSocket(
+          mode,
+          (socket, message) {
+            peers.add(socket);
+            final id = mode == TransportMode.json
+                ? ((decodeLuxoJSON(message as String) as Map)[r'$id'] as num)
+                      .toInt()
+                : _readUnsigned(
+                    Uint8List.fromList(message as List<int>),
+                    1,
+                  ).$1.toInt();
+            ids.add(id);
+            if (id != 3) return;
+            if (mode == TransportMode.json) {
+              socket.add(r'{"$id":1,"data":999}');
+              socket.add(
+                r'{"$id":1,"error":"Gone","code":400,"message":"late"}',
+              );
+            } else {
+              socket.add([BinaryFrameType.callSuccess, 1, 99]);
+              socket.add([BinaryFrameType.callError, 1, 255]);
+            }
+            for (final response in [(3, 84), (2, 42)]) {
+              if (mode == TransportMode.json) {
+                socket.add('{"\$id":${response.$1},"data":${response.$2}}');
+              } else {
+                final enc = LuxoEncoder()
+                  ..writeSvarint(LuxoInt64.fromInt(response.$2));
+                socket.add([
+                  BinaryFrameType.callSuccess,
+                  response.$1,
+                  ...enc.bytes(),
+                ]);
+              }
+            }
+          },
+          (transport) async {
+            Future<LuxoInt64> call() => transport.call(
+              'echo',
+              decoder: (value) => value is Uint8List
+                  ? LuxoDecoder(value).readIntChecked()
+                  : luxoInt64FromJSON(value),
+            );
+            await expectLater(
+              call(),
+              throwsA(
+                isA<LuxoError>().having(
+                  (error) => error.error,
+                  'error',
+                  'TimeoutError',
+                ),
+              ),
+            );
+            final results = await Future.wait([call(), call()]);
+            expect(results, [LuxoInt64.fromInt(42), LuxoInt64.fromInt(84)]);
+            expect(ids, [1, 2, 3]);
+            expect(peers, hasLength(1));
+          },
+        );
+      },
+    );
+  }
+
+  for (final mode in TransportMode.values) {
     for (final subscription in [false, true]) {
       test(
         '$mode malformed error completes ${subscription ? 'subscription' : 'call'}',
@@ -246,42 +315,64 @@ void main() {
     );
   });
 
-  test('truncated binary IDs cannot consume a pending request', () async {
-    await _withRawSocket(
-      TransportMode.binary,
-      (socket, message) {
-        socket.add([BinaryFrameType.callSuccess, 0x81]);
-        socket.add([BinaryFrameType.callSuccess, 1, 42]);
-      },
-      (transport) async {
-        expect(await transport.call<Uint8List>('echo'), [42]);
-      },
-    );
-  });
-
   test(
-    'overflowing and malformed binary headers leave pending requests untouched',
+    'truncated binary IDs retire the connection before later replies',
     () async {
       await _withRawSocket(
         TransportMode.binary,
         (socket, message) {
-          for (final bytes in <List<int>>[
-            [],
-            [2],
-            [2, 0x81],
-            [0x82, 0, 1, 1],
-            [255, 1, 1],
-            [2, 0x81, ...List.filled(8, 128), 2, 1],
-            [2, 0x81, ...List.filled(9, 128), 0, 1],
-          ]) {
-            socket.add(bytes);
-          }
-          socket.add([2, 1, 42]);
+          socket.add([BinaryFrameType.callSuccess, 0x81]);
+          socket.add([BinaryFrameType.callSuccess, 1, 42]);
         },
         (transport) async {
-          expect(await transport.call<Uint8List>('echo'), [42]);
+          await expectLater(
+            transport.call<Uint8List>('echo'),
+            throwsA(
+              isA<LuxoError>().having(
+                (error) => error.error,
+                'error',
+                'ParseError',
+              ),
+            ),
+          );
         },
       );
+    },
+  );
+
+  test(
+    'overflowing and malformed binary headers retire pending requests',
+    () async {
+      for (final bytes in <List<int>>[
+        [],
+        [2],
+        [2, 0x81],
+        [0x82, 0, 1, 1],
+        [255, 1, 1],
+        [2, 0x81, ...List.filled(8, 128), 2, 1],
+        [2, 0x81, ...List.filled(9, 128), 0, 1],
+      ]) {
+        await _withRawSocket(
+          TransportMode.binary,
+          (socket, message) {
+            socket.add(bytes);
+            socket.add([2, 1, 42]);
+          },
+          (transport) async {
+            await expectLater(
+              transport.call<Uint8List>('echo'),
+              throwsA(
+                isA<LuxoError>().having(
+                  (error) => error.error,
+                  'error',
+                  'ParseError',
+                ),
+              ),
+              reason: '$bytes',
+            );
+          },
+        );
+      }
     },
   );
 
@@ -316,16 +407,21 @@ void main() {
     await _withRawSocket(
       TransportMode.binary,
       (socket, message) {
-        if ((message as List<int>).first != BinaryFrameType.subscribe) return;
-        socket.add([BinaryFrameType.subscribeSuccess, 1, 0]);
+        final bytes = message as List<int>;
+        socket.add(
+          bytes.first == BinaryFrameType.subscribe
+              ? [BinaryFrameType.subscribeSuccess, bytes[1], 0]
+              : [BinaryFrameType.callSuccess, bytes[1], 42],
+        );
       },
       (transport) async {
         await expectLater(
           transport.subscribe('echo', {}, (_) {}, decoder: (value) => value),
           throwsA(
-            isA<LuxoError>().having((e) => e.error, 'error', 'TimeoutError'),
+            isA<LuxoError>().having((e) => e.error, 'error', 'ParseError'),
           ),
         );
+        expect(await transport.call<Uint8List>('echo'), [42]);
       },
     );
   });
@@ -419,21 +515,32 @@ void main() {
         final directory = temporaryRoot.createTempSync('dart-web-socket-');
         try {
           server.listen((request) async {
+            if (request.uri.path == '/stalled-handshake') return;
             final socket = await WebSocketTransformer.upgrade(request);
             sockets.add(socket);
-            socket.listen(
-              (message) => _respond(
+            socket.listen((message) {
+              if (request.uri.path == '/missing-binary-body') {
+                for (final reply in binaryPresenceReplies(message))
+                  socket.add(reply);
+                return;
+              }
+              _respond(
                 socket,
                 message,
                 message is String ? TransportMode.json : TransportMode.binary,
                 LuxoInt64.maxValue,
-              ),
-            );
+              );
+            });
           });
           final entry = File('${directory.path}/consumer.dart');
           entry.writeAsStringSync(
             File('test/fixtures/socket_consumer.dart.txt')
                 .readAsStringSync()
+                .replaceAll(
+                  '__HTTP_REFRESH_CASES__',
+                  File('test/support/http_refresh_cases.dart').absolute.uri
+                      .toString(),
+                )
                 .replaceAll(
                   '__WEBSOCKET_ID_CASES__',
                   File('test/support/websocket_id_cases.dart').absolute.uri
@@ -515,7 +622,32 @@ String _webRunner(Directory directory, String compiler) {
   const socketFault = '''
 const NativeWebSocket = globalThis.WebSocket;
 globalThis.WebSocket = class extends NativeWebSocket {
+  droppedSubscription = false;
+  failedCancellation = false;
   send(data) {
+    if (this.url.endsWith('/call-send-fault')) {
+      if (!this.failedCall) {
+        this.failedCall = true;
+        throw new Error('injected call send failure');
+      }
+      const json = typeof data === 'string' ? JSON.parse(data) : null;
+      const bytes = json ? null : new Uint8Array(data.buffer ?? data, data.byteOffset ?? 0, data.byteLength);
+      if ((json ? json.\$id : bytes[1]) !== 2) throw new Error('unexpected request identity');
+      const late = json ? '{"\$id":1,"error":"Gone","code":400,"message":"late"}' : new Uint8Array([3, 1, 255]).buffer;
+      this.dispatchEvent(new MessageEvent('message', { data: late }));
+    }
+    if (this.url.endsWith('/timeout-cancel')) {
+      const json = typeof data === 'string' ? JSON.parse(data) : null;
+      const tag = json ? 0 : new Uint8Array(data.buffer ?? data, data.byteOffset ?? 0, data.byteLength)[0];
+      if ((json ? json.\$sub !== undefined : tag === 0x10) && !this.droppedSubscription) {
+        this.droppedSubscription = true;
+        return;
+      }
+      if ((json ? json.\$unsub !== undefined : tag === 0x11) && !this.failedCancellation) {
+        this.failedCancellation = true;
+        throw new Error('cancellation send failed');
+      }
+    }
     if (this.url.endsWith('/adapter-fault')) {
       queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data: 42 })));
     } else {

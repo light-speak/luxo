@@ -17,6 +17,9 @@ type eventStreamSub[P any] struct {
 	index  int
 }
 
+// EventMatcher skips on false and terminates only this subscription on error.
+type EventMatcher[P any] func(params *P, identity any) (bool, error)
+
 // RegisterEventStream validates and owns parameters before a transport ACK.
 // prepare must not retain Request buffers or acquire resources needing cleanup.
 // Register routes at startup; matchers must treat their parameters as read-only.
@@ -55,15 +58,23 @@ func (t *EventStream[P]) attach(sub *StreamSub, params P) {
 // Dispatch matches typed snapshots against an already decoded event. Encodings
 // are shared by mode and projection, just as in the untyped hub dispatcher.
 // Matchers and encoders must not register or cancel subscriptions while called.
-func (t *EventStream[P]) Dispatch(match func(*P, any) bool, encode func([]byte, bool) ([]byte, error)) error {
+func (t *EventStream[P]) Dispatch(match EventMatcher[P], encode func([]byte, bool) ([]byte, error)) error {
 	t.hub.mu.RLock()
 	var encodings streamEncodings
 	var slow []*StreamSub
-	defer t.hub.finishDispatch(t.apiName, &slow)
+	var failed []streamMatchFailure
+	defer t.hub.finishEventDispatch(t.apiName, &slow, &failed)
 	for _, entry := range t.subs {
 		sub := entry.sub
-		if match != nil && !match(&entry.params, sub.Identity) {
-			continue
+		if match != nil {
+			allowed, err := match(&entry.params, sub.Identity)
+			if err != nil {
+				failed = append(failed, streamMatchFailure{sub, err})
+				continue
+			}
+			if !allowed {
+				continue
+			}
 		}
 		data, err := cachedStreamEncoding(&encodings, sub.FieldMask, sub.Binary, encode)
 		if err != nil {
@@ -74,4 +85,69 @@ func (t *EventStream[P]) Dispatch(match func(*P, any) bool, encode func([]byte, 
 		}
 	}
 	return nil
+}
+
+// DispatchIdentity encodes identity-dependent output separately for each
+// subscriber. Identity values are never compared, hashed, or shared as cache keys.
+// Matchers and encoders have the same lifecycle restrictions as Dispatch.
+func (t *EventStream[P]) DispatchIdentity(match EventMatcher[P], encode func([]byte, bool, any) ([]byte, error)) error {
+	return t.dispatchIdentity(match, encode, nil)
+}
+
+// DispatchIdentitySelection shares only projections proven identity-independent
+// by generated field checks. Shared projections are encoded without an identity.
+// A nil predicate retains per-subscriber encoding for every projection.
+func (t *EventStream[P]) DispatchIdentitySelection(match EventMatcher[P], encode func([]byte, bool, any) ([]byte, error), independent func([]byte) bool) error {
+	return t.dispatchIdentity(match, encode, independent)
+}
+
+func (t *EventStream[P]) dispatchIdentity(match EventMatcher[P], encode func([]byte, bool, any) ([]byte, error), independent func([]byte) bool) error {
+	t.hub.mu.RLock()
+	var slow []*StreamSub
+	var failed []streamMatchFailure
+	var encodings streamEncodings
+	shared := func(mask []byte, binary bool) ([]byte, error) { return encode(mask, binary, nil) }
+	defer t.hub.finishEventDispatch(t.apiName, &slow, &failed)
+	for _, entry := range t.subs {
+		sub := entry.sub
+		if match != nil {
+			allowed, err := match(&entry.params, sub.Identity)
+			if err != nil {
+				failed = append(failed, streamMatchFailure{sub, err})
+				continue
+			}
+			if !allowed {
+				continue
+			}
+		}
+		var data []byte
+		var err error
+		if independent != nil && independent(sub.FieldMask) {
+			data, err = cachedStreamEncoding(&encodings, sub.FieldMask, sub.Binary, shared)
+		} else {
+			data, err = encode(sub.FieldMask, sub.Binary, sub.Identity)
+		}
+		if err != nil {
+			return err
+		}
+		if !enqueueStreamData(sub, data) {
+			slow = append(slow, sub)
+		}
+	}
+	return nil
+}
+
+type streamMatchFailure struct {
+	sub *StreamSub
+	err error
+}
+
+// Publish a condition failure only after releasing the dispatch read lock.
+// Finishing one subscriber must not cancel other consumers or event delivery.
+func (h *StreamHub) finishEventDispatch(apiName string, slow *[]*StreamSub, failed *[]streamMatchFailure) {
+	h.mu.RUnlock()
+	for _, failure := range *failed {
+		h.finish(apiName, failure.sub, failure.err)
+	}
+	h.removeSlowSubscribers(apiName, *slow)
 }

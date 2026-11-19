@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/light-speak/luxo/internal/builtin"
 	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux/str"
@@ -118,22 +119,26 @@ func generateHandlerFile(result *semantic.Result, packageName string, enums map[
 }
 
 func (g *GeneratorContext) generateHandlerFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
+	g = g.bindingContext(result, enums)
 	models, allModels := collectHandlerModels(result)
 	modelMap, inferredAPIs := collectInferredAPIs(result)
 	hasCompiledAPIs, hasNativeAPIs, hasServiceFns := handlerDeclarationKinds(result)
 	compiledFunctions := collectCompiledFunctions(result)
 	functionDeclarations := collectFunctionDeclarations(result)
-	selectionFunctions := collectSelectionAwareFunctions(compiledFunctions)
+	selectionFunctions := collectSelectionAwareFunctions(compiledFunctions, modelMap)
 	var callableEnums map[string]bool
 	if hasCompiledAPIs || hasServiceFns {
 		// Only callable bodies need a retained enum index; share it across handlers.
 		callableEnums = CollectEnumsFromResult(result)
 	}
 	remoteLoads := g.remoteLoadCallsForResult(result)
-	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasNativeAPIs && !hasServiceFns && len(remoteLoads) == 0 && !g.needsInternalModelHandlers(result, allModels) {
+	if len(models) == 0 && len(inferredAPIs) == 0 && !hasCompiledAPIs && !hasNativeAPIs && !hasServiceFns && len(remoteLoads) == 0 && !g.needsInternalModelHandlers(result, allModels, enums) {
 		return nil
 	}
 	g = g.withRequestDeclarations(result, enums)
+	g.querySQLSelectors = nil
+	g.scopeFunctions = collectScopeAwareFunctions(compiledFunctions)
+	g.explicitSelections = collectSelectionAwareFunctions(compiledFunctions)
 
 	features := g.detectHandlerFeatures(result, models, inferredAPIs, modelMap)
 
@@ -141,23 +146,22 @@ func (g *GeneratorContext) generateHandlerFile(result *semantic.Result, packageN
 	// derived from what the generated code actually references (e.g. a module
 	// whose native list handlers all became columnar no longer needs codec).
 	var b strings.Builder
-	generateSelectedColumnHelper(&b)
-	for _, model := range g.collectSelectionModels(result, allModels) {
-		generateSQLColumnSelector(&b, model, enums)
-	}
+	selectionModels := g.collectSelectionModels(result, allModels)
+	g.addHandlerBindingSymbols(selectionModels)
+	g.addImportBindingSymbols(features.crossEventImports)
 	g.generateComputedResolvers(&b, allModels, modelMap, enums)
 
 	// Generate defaultCols for models with @hidden fields (excludes hidden from SELECT *)
 	for _, m := range models {
 		if hasHiddenFields(m) {
-			generateDefaultCols(&b, m, enums)
+			g.generateDefaultCols(&b, m, enums)
 		}
 	}
 
 	g.generateCompiledFunctions(&b, result, compiledFunctions, functionDeclarations, selectionFunctions, modelMap, callableEnums)
 	compiledNames := g.generateCompiledHandlers(&b, result, modelMap, callableEnums, functionDeclarations, selectionFunctions)
-	nativeNames := generateNativeAPIHandlers(&b, result)
-	inferredNames := generateInferredHandlers(&b, inferredAPIs, modelMap, enums)
+	nativeNames := g.generateNativeAPIHandlers(&b, result)
+	inferredNames := g.generateInferredHandlers(&b, inferredAPIs, modelMap, enums)
 
 	// Build set of compiled/inferred names to avoid generating duplicate CRUD handlers
 	compiledSet := make(map[string]bool, len(compiledNames)+len(inferredNames)+len(nativeNames))
@@ -191,24 +195,36 @@ func (g *GeneratorContext) generateHandlerFile(result *semantic.Result, packageN
 
 	// Federation resolve endpoints — svc:resolve:{Model}:{FK} for cross-module extends
 	g.generateFederationResolvers(&b, result, models, enums)
+	selectorImports := ""
+	if len(selectionModels) > 0 {
+		// Selector signatures only reference selection; avoid buffering their source.
+		selectorImports = "selection.Field"
+	}
 
 	body := b.String()
 	var out strings.Builder
 	writeHeader(&out, packageName, "handler.gen.go")
-	g.writeHandlerImports(&out, result, allModels, features, strings.Contains(body, "codec."), body)
+	g.writeHandlerImports(&out, result, allModels, features, strings.Contains(body, "codec."), body, selectorImports)
+	generateSelectedColumnHelper(&out)
+	for _, model := range selectionModels {
+		g.generateSQLColumnSelector(&out, model, enums)
+	}
 	out.WriteString(body)
 	return []byte(out.String())
 }
 
-func (g *GeneratorContext) needsInternalModelHandlers(result *semantic.Result, models []*ast.ModelDecl) bool {
+func (g *GeneratorContext) needsInternalModelHandlers(result *semantic.Result, models []*ast.ModelDecl, enums map[string]bool) bool {
 	for _, file := range result.Files {
 		if len(file.Extends) > 0 {
 			return true
 		}
 	}
-	if g.events != nil {
-		for _, model := range models {
-			if g.events.remotePKModels[model.Name] {
+	for _, model := range models {
+		if g.events != nil && g.events.remotePKModels[model.Name] {
+			return true
+		}
+		for _, field := range model.Fields {
+			if field.Type != nil && field.Computed == nil && isRelationField(field, enums) {
 				return true
 			}
 		}
@@ -239,6 +255,9 @@ func handlerDeclarationKinds(result *semantic.Result) (hasCompiled, hasNative, h
 		}
 		for _, fn := range file.Functions {
 			hasCompiled = hasCompiled || fn.Body != nil && !hasDirective(fn.Directives, "native")
+		}
+		for _, listener := range file.Listeners {
+			hasCompiled = hasCompiled || listener.Body != nil
 		}
 		hasService = hasService || functionsHaveDirective(file.Functions, "service")
 	}
@@ -280,6 +299,7 @@ func (g *GeneratorContext) generateCRUDHandlers(b *strings.Builder, models []*as
 	for _, m := range computedUniverse {
 		rels := g.analyzeRelations(m, enums)
 		if len(rels) > 0 {
+			generateRelationSelectionCheck(b, m.Name, rels)
 			modelRels[m.Name] = true
 		}
 	}
@@ -288,8 +308,8 @@ func (g *GeneratorContext) generateCRUDHandlers(b *strings.Builder, models []*as
 		computedModels[model.Name] = modelHasComputedAggregates(model)
 	}
 
-	// Generate MaxRelationDepth constant
-	b.WriteString("// MaxRelationDepth limits recursive relation resolution to prevent infinite loops.\n")
+	// The generated setting is configured once before serving requests.
+	b.WriteString("// MaxRelationDepth bounds relation loading; configure it before serving requests.\n")
 	b.WriteString("var MaxRelationDepth = 5\n\n")
 
 	for _, m := range models {
@@ -300,10 +320,10 @@ func (g *GeneratorContext) generateCRUDHandlers(b *strings.Builder, models []*as
 			if skipNames[ast.CRUDAPIName(m.Name, op)] {
 				continue
 			}
-			generateHandler(b, m, op, enums, rels)
+			g.generateHandler(b, m, op, enums, rels)
 		}
-		generateFilterParser(b, m, enums)
-		generateSorterParser(b, m, enums)
+		g.generateFilterParser(b, m, enums)
+		g.generateSorterParser(b, m, enums)
 	}
 	// Relation resolution is also needed by explicit and inferred APIs without @crud.
 	for _, m := range computedUniverse {
@@ -316,7 +336,7 @@ func (g *GeneratorContext) generateCRUDHandlers(b *strings.Builder, models []*as
 	}
 }
 
-func generateInferredHandlers(b *strings.Builder, apis []*ast.ApiDecl, modelMap map[string]*ast.ModelDecl, enums map[string]bool) []string {
+func (g *GeneratorContext) generateInferredHandlers(b *strings.Builder, apis []*ast.ApiDecl, modelMap map[string]*ast.ModelDecl, enums map[string]bool) []string {
 	var names []string
 	for _, api := range apis {
 		inf := InferAPI(api.Name, modelMap)
@@ -324,7 +344,7 @@ func generateInferredHandlers(b *strings.Builder, apis []*ast.ApiDecl, modelMap 
 			if errMsg := ValidateInferredReturnType(api, inf); errMsg != "" {
 				fmt.Fprintf(os.Stderr, "warning: %s:%d: %s\n", api.Pos.File, api.Pos.Line, errMsg)
 			}
-			generateInferredHandler(b, api, inf, enums, modelMap[inf.ModelName])
+			g.generateInferredHandler(b, api, inf, enums, modelMap[inf.ModelName])
 			names = append(names, api.Name)
 		}
 	}
@@ -333,7 +353,7 @@ func generateInferredHandlers(b *strings.Builder, apis []*ast.ApiDecl, modelMap 
 
 func generateCompiledHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
 	functions := collectFunctionDeclarations(result)
-	return defaultGenerator().generateCompiledHandlers(b, result, modelMap, CollectEnumsFromResult(result), functions, collectSelectionAwareFunctions(collectCompiledFunctions(result)))
+	return defaultGenerator().generateCompiledHandlers(b, result, modelMap, CollectEnumsFromResult(result), functions, collectSelectionAwareFunctions(collectCompiledFunctions(result), modelMap))
 }
 
 func (g *GeneratorContext) generateCompiledHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl, enumSet map[string]bool, functions map[string]*ast.FnDecl, selectionFunctions map[string]bool) []string {
@@ -393,7 +413,21 @@ func (g *GeneratorContext) generateCompiledFunctions(b *strings.Builder, result 
 	}
 }
 
-func collectSelectionAwareFunctions(functions map[string]*ast.FnDecl) map[string]bool {
+func collectSelectionAwareFunctions(functions map[string]*ast.FnDecl, modelSets ...map[string]*ast.ModelDecl) map[string]bool {
+	return collectFunctionRequirements(functions, func(call *ast.CallExpr) bool {
+		member, ok := call.Func.(*ast.MemberExpr)
+		if ok && member.Field == "select" && len(call.Args) == 0 {
+			return true
+		}
+		if len(modelSets) == 0 {
+			return false
+		}
+		_, query := relationQueryModel(call, modelSets[0])
+		return query
+	})
+}
+
+func collectFunctionRequirements(functions map[string]*ast.FnDecl, required func(*ast.CallExpr) bool) map[string]bool {
 	if len(functions) == 0 {
 		return nil
 	}
@@ -405,7 +439,7 @@ func collectSelectionAwareFunctions(functions map[string]*ast.FnDecl) map[string
 			if !ok {
 				return
 			}
-			if member, ok := call.Func.(*ast.MemberExpr); ok && member.Field == "select" && len(call.Args) == 0 {
+			if required(call) {
 				selectionFunctions[name] = true
 			}
 			if ident, ok := call.Func.(*ast.Ident); ok && functions[ident.Name] != nil {
@@ -450,7 +484,7 @@ func collectNativeFunctionNames(result *semantic.Result) map[string]bool {
 // Returns service fn names for RegisterServiceFns generation.
 func generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl) []string {
 	functions := collectFunctionDeclarations(result)
-	return defaultGenerator().generateServiceFnHandlers(b, result, modelMap, CollectEnumsFromResult(result), functions, collectSelectionAwareFunctions(collectCompiledFunctions(result)))
+	return defaultGenerator().withModelReferences(result).generateServiceFnHandlers(b, result, modelMap, CollectEnumsFromResult(result), functions, collectSelectionAwareFunctions(collectCompiledFunctions(result), modelMap))
 }
 
 func (g *GeneratorContext) generateServiceFnHandlers(b *strings.Builder, result *semantic.Result, modelMap map[string]*ast.ModelDecl, enumSet map[string]bool, functions map[string]*ast.FnDecl, selectionFunctions map[string]bool) []string {
@@ -463,7 +497,7 @@ func (g *GeneratorContext) generateServiceFnHandlers(b *strings.Builder, result 
 			}
 			if hasDirective(fn.Directives, "native") {
 				// @native @service — delegate to NativeResolver
-				generateNativeServiceHandler(b, fn, modelMap, enumSet)
+				g.generateNativeServiceHandler(b, fn, modelMap, enumSet)
 			} else if fn.Body != nil {
 				// Compiled fn @service
 				g.compileFnBodyWithFunctions(b, fn, modelMap, enumSet, nativeFunctions, functions, selectionFunctions)
@@ -477,6 +511,10 @@ func (g *GeneratorContext) generateServiceFnHandlers(b *strings.Builder, result 
 // generateNativeAPIHandlers generates handlers for api @native declarations.
 // Returns native API names for registration in RegisterHandlers.
 func generateNativeAPIHandlers(b *strings.Builder, result *semantic.Result) []string {
+	return defaultGenerator().withModelReferences(result).generateNativeAPIHandlers(b, result)
+}
+
+func (g *GeneratorContext) generateNativeAPIHandlers(b *strings.Builder, result *semantic.Result) []string {
 	// Model names — list returns need the []Model → []*Model adapter for
 	// WriteColumnar (types get a value-slice writer, models a pointer-slice one)
 	models := make(map[string]*ast.ModelDecl)
@@ -495,7 +533,7 @@ func generateNativeAPIHandlers(b *strings.Builder, result *semantic.Result) []st
 			if !hasDirective(api.Directives, "native") || hasDirective(api.Directives, "stream") {
 				continue
 			}
-			generateNativeAPIHandler(b, api, models, enums)
+			g.generateNativeAPIHandler(b, api, models, enums)
 			names = append(names, api.Name)
 		}
 	}
@@ -504,6 +542,10 @@ func generateNativeAPIHandlers(b *strings.Builder, result *semantic.Result) []st
 
 // generateNativeAPIHandler generates a single handler for an api @native declaration.
 func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
+	defaultGenerator().generateNativeAPIHandler(b, api, models, enums)
+}
+
+func (g *GeneratorContext) generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	name := api.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
@@ -518,9 +560,10 @@ func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[s
 
 	// Parse params
 	var paramNames []string
+	bindings := g.parameterBindings(api.Params, api.Body, models, enums)
 	for _, p := range api.Params {
-		writeCallableParamExtraction(b, p, enums, "\t\t")
-		paramNames = append(paramNames, p.Name)
+		writeCallableParamBinding(b, p, bindings.name(p.Name), enums, "\t\t", models)
+		paramNames = append(paramNames, bindings.name(p.Name))
 	}
 	cached := writeCachedBodyStart(b, api.Directives)
 
@@ -548,7 +591,7 @@ func generateNativeAPIHandler(b *strings.Builder, api *ast.ApiDecl, models map[s
 // writeNativeReturnEncoding writes the binary encoding for a native API return value.
 func writeNativeReturnEncoding(b *strings.Builder, rt *ast.TypeRef, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	if rt.Nullable {
-		b.WriteString("\t\tif result == nil { req.Buf.B = codec.AppendNull(req.Buf.B); return nil }\n")
+		fmt.Fprintf(b, "\t\tif %s { req.Buf.B = codec.AppendNull(req.Buf.B); return nil }\n", nullableNullCondition(rt, "result"))
 		b.WriteString("\t\treq.Buf.B = codec.AppendPresent(req.Buf.B)\n")
 		if !rt.IsList {
 			b.WriteString("\t\t{\n\t\tresult := *result\n")
@@ -576,21 +619,15 @@ func writeNativePresentEncoding(b *strings.Builder, rt *ast.TypeRef, models map[
 // list responses (Luvia's BinaryListToJSON reads columnar).
 func writeNativeListEncoding(b *strings.Builder, rt *ast.TypeRef, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	if appendExpr, ok := binaryScalarAppend(rt.Name, "req.Buf.B", "v", enums[rt.Name]); ok {
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(result)))\n")
+		writeBinaryAppend(b, "\t\t", "req.Buf.B", "codec.AppendArrayHeader(req.Buf.B, len(result))", "return err")
 		fmt.Fprintf(b, "\t\tfor _, v := range result {\n")
 		writeBinaryAppend(b, "\t\t\t", "req.Buf.B", appendExpr, "return err")
 		fmt.Fprintf(b, "\t\t}\n")
 		return
 	}
 	if model := models[rt.Name]; model != nil {
-		// Model list — resolver returns []Model but WriteColumnarModel
-		// takes []*Model (DB loaders produce pointer slices); adapt.
-		fmt.Fprintf(b, "\t\t_ptrs := make([]*%s, len(result))\n", rt.Name)
-		fmt.Fprintf(b, "\t\tfor i := range result {\n")
-		fmt.Fprintf(b, "\t\t\t_ptrs[i] = &result[i]\n")
-		fmt.Fprintf(b, "\t\t}\n")
-		writeComputedResolve(b, model, "_ptrs", "\t\t")
-		fmt.Fprintf(b, "\t\tif err := WriteColumnar%s(req.Buf, _ptrs, req.FieldMask); err != nil { return err }\n", rt.Name)
+		writeComputedResolve(b, model, "result", "\t\t")
+		fmt.Fprintf(b, "\t\tif err := WriteColumnar%s(req.Buf, result, req.FieldMask); err != nil { return err }\n", rt.Name)
 	} else {
 		// Type declaration list — value-slice columnar writer
 		fmt.Fprintf(b, "\t\tif err := WriteColumnar%s(req.Buf, result, req.FieldMask); err != nil { return err }\n", rt.Name)
@@ -609,15 +646,23 @@ func writeNativeScalarEncoding(b *strings.Builder, rt *ast.TypeRef, varName stri
 
 // generateNativeServiceHandler generates a handler that delegates to NativeResolver.
 func generateNativeServiceHandler(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
+	defaultGenerator().generateNativeServiceHandler(b, fn, models, enums)
+}
+
+func (g *GeneratorContext) generateNativeServiceHandler(b *strings.Builder, fn *ast.FnDecl, models map[string]*ast.ModelDecl, enums map[string]bool) {
 	name := fn.Name
-	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(name))
+	fmt.Fprintf(b, "func %s(app *App) api.HandlerFunc {\n", serviceHandlerGoName(name))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
+	if directive := findDirective(fn.Directives, "auth"); directive != nil {
+		writeAuthCheck(b, "\t\t", directive)
+	}
 
 	// Parse params
 	var paramNames []string
+	bindings := g.parameterBindings(fn.Params, fn.Body, models, enums)
 	for _, p := range fn.Params {
-		writeCallableParamExtraction(b, p, enums, "\t\t")
-		paramNames = append(paramNames, p.Name)
+		writeCallableParamBinding(b, p, bindings.name(p.Name), enums, "\t\t", models)
+		paramNames = append(paramNames, bindings.name(p.Name))
 	}
 
 	// Call NativeResolver
@@ -655,12 +700,15 @@ func (g *GeneratorContext) generateRegisterServiceFns(b *strings.Builder, servic
 
 	for _, name := range serviceNames {
 		svcName := "svc:" + name
-		fmt.Fprintf(b, "\trouter.HandleInternal(%q, handle%s(app))\n", svcName, str.Capitalize(name))
+		fmt.Fprintf(b, "\trouter.HandleInternal(%q, %s(app))\n", svcName, serviceHandlerGoName(name))
 		g.writeAPIRegistration(b, svcName, firstBoolSet(enumSets))
 	}
 
 	b.WriteString("\treturn nil\n}\n\n")
 }
+
+// Public handler names start with handle; service handlers occupy a private namespace.
+func serviceHandlerGoName(name string) string { return "_handleService_" + name }
 
 // writeHandlerImports writes handler.gen.go imports.
 // writeSortedCrossModuleImports writes cross-module event imports in deterministic order.
@@ -702,6 +750,14 @@ func writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*
 	defaultGenerator().writeHandlerImports(b, result, models, feat, needsCodec, generatedBody...)
 }
 
+func handlerImportPackages(bodies []string) generatedImports {
+	var packages generatedImports
+	for _, body := range bodies {
+		packages |= generatedPackages(body)
+	}
+	return packages
+}
+
 func (g *GeneratorContext) writeHandlerImports(b *strings.Builder, result *semantic.Result, models []*ast.ModelDecl, feat handlerFeatures, needsCodec bool, generatedBody ...string) {
 	hasOrGroups := feat.hasOrGroups
 	hasSortable := feat.hasSortable
@@ -723,7 +779,7 @@ func (g *GeneratorContext) writeHandlerImports(b *strings.Builder, result *seman
 	needsContext := true
 	var packages generatedImports
 	if len(generatedBody) > 0 {
-		packages = generatedPackages(generatedBody[0])
+		packages = handlerImportPackages(generatedBody)
 		needsContext = packages.has("context")
 		hasOrGroups = packages.has("strconv")
 		hasSortable = packages.has("strings")
@@ -800,7 +856,8 @@ func (g *GeneratorContext) writeHandlerImports(b *strings.Builder, result *seman
 	if needsDecimal {
 		b.WriteString("\t\"github.com/shopspring/decimal\"\n")
 	}
-	writeStringUtilityImports(b, packages)
+	writeRuntimeUtilityImports(b, packages)
+	writeOptionalStandardImports(b, packages, "slices", "math")
 	g.writeSortedCrossModuleImports(b, feat.crossEventImports)
 	if hasAwait {
 		b.WriteString("\t\"golang.org/x/sync/errgroup\"\n")
@@ -839,7 +896,7 @@ func crudOperations(m *ast.ModelDecl) []string {
 }
 
 // generateHandler generates a single CRUD handler function.
-func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[string]bool, rels []Relation) {
+func (g *GeneratorContext) generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[string]bool, rels []Relation) {
 	name := m.Name
 	idType := idGoType(m)
 	idGoName := primaryKeyGoName(m)
@@ -857,14 +914,19 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		if needAuth {
-			writeCRUDAuthCheck(b, "\t\t", modelAuth)
+			writeModelAuthorization(b, "\t\t", m, true)
 		}
 		writeParamID(b, idType, "\t\t")
+		own := modelOwnershipField(m) != nil
 		fmt.Fprintf(b, "\t\tcols := select%sSQLColumns(req.Select)\n", name)
 		if hidden {
 			fmt.Fprintf(b, "\t\tif cols == nil { cols = default%sCols }\n", name)
 		}
-		fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(%sWhere.%s.Eq(id)).Select(cols...).First(ctx)\n", name, name, idGoName)
+		if own {
+			fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(%sWhere.%s.Eq(id)).Where(_ownConditions...).Select(cols...).First(ctx)\n", name, name, idGoName)
+		} else {
+			fmt.Fprintf(b, "\t\tresult, err := app.%s.Where(%sWhere.%s.Eq(id)).Select(cols...).First(ctx)\n", name, name, idGoName)
+		}
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tif result == nil {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: errors.%s(id)})\n\t\t}\n", name, resourceIDConstructor(idType))
 		if hasRels {
@@ -880,7 +942,7 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		if needAuth {
-			writeCRUDAuthCheck(b, "\t\t", modelAuth)
+			writeModelAuthorization(b, "\t\t", m, true)
 		}
 		fmt.Fprintf(b, "\t\tcols := select%sSQLColumns(req.Select)\n", name)
 		if hidden {
@@ -890,6 +952,9 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		b.WriteString("\t\tif err != nil { return err }\n")
 		fmt.Fprintf(b, "\t\tsorts, err := parse%sSorters(req.Sorters)\n", name)
 		b.WriteString("\t\tif err != nil { return err }\n")
+		if modelOwnershipField(m) != nil {
+			b.WriteString("\t\tconds = append(conds, _ownConditions...)\n")
+		}
 		// Note: @soft deleted_at filter is already in Client.Where(), not added here
 		fmt.Fprintf(b, "\t\tq := app.%s.Where(conds...).Select(cols...)\n", name)
 		b.WriteString("\t\tif len(sorts) > 0 {\n")
@@ -915,17 +980,24 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		generateCreateHandler(b, m, apiName, enums, needAuth, modelAuth)
 
 	case "update":
-		generateUpdateHandler(b, m, apiName, idType, enums, needAuth, modelAuth)
+		g.generateUpdateHandler(b, m, apiName, idType, enums, needAuth, modelAuth)
 
 	case "delete":
 		soft := isSoftDelete(m)
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		if needAuth {
-			writeCRUDAuthCheck(b, "\t\t", modelAuth)
+			writeModelAuthorization(b, "\t\t", m, true)
 		}
 		writeParamID(b, idType, "\t\t")
-		if soft {
+		own := modelOwnershipField(m) != nil
+		if own {
+			method := "Delete"
+			if soft {
+				method = "SoftDelete"
+			}
+			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.%s.Eq(id)).Where(_ownConditions...).%s(ctx)\n", name, name, idGoName, method)
+		} else if soft {
 			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.%s.Eq(id))\n", name, name, idGoName)
 		} else {
 			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.%s.Eq(id)).Delete(ctx)\n", name, name, idGoName)
@@ -941,10 +1013,16 @@ func generateHandler(b *strings.Builder, m *ast.ModelDecl, op string, enums map[
 		fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 		fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 		if needAuth {
-			writeCRUDAuthCheck(b, "\t\t", modelAuth)
+			writeModelAuthorization(b, "\t\t", m, true)
 		}
 		writeParamIDs(b, idType, "\t\t")
-		if soft {
+		if modelOwnershipField(m) != nil {
+			method := "Delete"
+			if soft {
+				method = "SoftDelete"
+			}
+			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.%s.In(ids...)).Where(_ownConditions...).%s(ctx)\n", name, name, idGoName, method)
+		} else if soft {
 			fmt.Fprintf(b, "\t\tn, err := app.%s.SoftDelete(ctx, %sWhere.%s.In(ids...))\n", name, name, idGoName)
 		} else {
 			fmt.Fprintf(b, "\t\tn, err := app.%s.Where(%sWhere.%s.In(ids...)).Delete(ctx)\n", name, name, idGoName)
@@ -962,7 +1040,7 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 	if needAuth {
-		writeCRUDAuthCheck(b, "\t\t", modelAuth)
+		writeModelAuthorization(b, "\t\t", m, false)
 	}
 	fields := mutationInputFields(m, enums, false)
 	for _, field := range fields {
@@ -970,9 +1048,10 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 	}
 	fmt.Fprintf(b, "\t\tbuilder := app.%s.Create()\n", name)
 	for _, field := range fields {
-		generateMutationInputApply(b, field, "Set"+str.Capitalize(field.field.Name), "\t\t")
+		generateMutationInputApply(b, field, "Set"+str.Capitalize(field.field.Name), "\t\t", m.Name)
 	}
 
+	writeOwnershipMutationCheck(b, m, fields, false)
 	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 	writeComputedResolve(b, m, "[]*"+name+"{result}", "\t\t")
@@ -983,28 +1062,39 @@ func generateCreateHandler(b *strings.Builder, m *ast.ModelDecl, apiName string,
 }
 
 // generateUpdateHandler generates an update handler.
-func generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType string, enums map[string]bool, needAuth bool, modelAuth *ast.Directive) {
+func (g *GeneratorContext) generateUpdateHandler(b *strings.Builder, m *ast.ModelDecl, apiName, idType string, enums map[string]bool, needAuth bool, modelAuth *ast.Directive) {
 	name := m.Name
 	fmt.Fprintf(b, "func handle%s(app *App) api.HandlerFunc {\n", str.Capitalize(apiName))
 	fmt.Fprintf(b, "\treturn func(ctx context.Context, req *api.Request) error {\n")
 	if needAuth {
-		writeCRUDAuthCheck(b, "\t\t", modelAuth)
+		writeModelAuthorization(b, "\t\t", m, true)
 	}
 	writeParamID(b, idType, "\t\t")
 	fields := mutationInputFields(m, enums, true)
 	for _, field := range fields {
 		generateMutationInputRead(b, field, "\t\t", enums)
 	}
-	fmt.Fprintf(b, "\t\texisting, err := app.%s.Find(ctx, id)\n", name)
+	if modelOwnershipField(m) != nil {
+		fmt.Fprintf(b, "\t\texisting, err := app.%s.Where(%sWhere.%s.Eq(id)).Where(_ownConditions...).First(ctx)\n", name, name, primaryKeyGoName(m))
+		b.WriteString("\t\tif err != nil { return err }; if existing == nil && !_authorized { return errors.Forbidden }\n")
+	} else {
+		fmt.Fprintf(b, "\t\texisting, err := app.%s.Find(ctx, id)\n", name)
+	}
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 	fmt.Fprintf(b, "\t\tif existing == nil {\n\t\t\treturn errors.NotFound.WithData(errors.ResourceError{Resource: %q, ID: errors.%s(id)})\n\t\t}\n", name, resourceIDConstructor(idType))
-	tableName := modelTableName(name)
+	tableName := g.sqlTable(name)
 	fmt.Fprintf(b, "\t\tbuilder := new%sUpdateBuilder(app.%s.db, %q, id)\n", name, name, tableName)
 
 	for _, field := range fields {
-		generateMutationInputApply(b, field, "Set"+str.Capitalize(field.field.Name), "\t\t")
+		generateMutationInputApply(b, field, "Set"+str.Capitalize(field.field.Name), "\t\t", m.Name)
 	}
-	fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
+	writeOwnershipMutationCheck(b, m, fields, true)
+	if modelOwnershipField(m) != nil {
+		b.WriteString("\t\tresult, err := builder.ExecWhere(ctx, _ownConditions...)\n")
+		b.WriteString("\t\tif err == nil && result == nil { return errors.Forbidden }\n")
+	} else {
+		fmt.Fprintf(b, "\t\tresult, err := builder.Exec(ctx)\n")
+	}
 	fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 	writeComputedResolve(b, m, "[]*"+name+"{result}", "\t\t")
 	fmt.Fprintf(b, "\t\tif err := result.WriteLuxo(req.Buf, req.FieldMask); err != nil { return err }\n")
@@ -1055,7 +1145,7 @@ func hasHiddenFields(m *ast.ModelDecl) bool {
 
 // generateDefaultCols generates a defaultCols variable that excludes @hidden fields.
 // Used when no $select is provided — prevents querying hidden columns.
-func generateDefaultCols(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+func (g *GeneratorContext) generateDefaultCols(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	fmt.Fprintf(b, "// default%sCols excludes @hidden fields from SELECT *.\n", m.Name)
 	fmt.Fprintf(b, "var default%sCols = []string{", m.Name)
 	first := true
@@ -1066,29 +1156,69 @@ func generateDefaultCols(b *strings.Builder, m *ast.ModelDecl, enums map[string]
 		if !first {
 			b.WriteString(", ")
 		}
-		fmt.Fprintf(b, "%q", str.ToSnakeCase(f.Name))
+		fmt.Fprintf(b, "%q", g.sqlColumn(f.Name))
 		first = false
 	}
 	b.WriteString("}\n\n")
 }
 
-func generateSQLColumnSelector(b *strings.Builder, model *ast.ModelDecl, enums map[string]bool) {
+func (g *GeneratorContext) generateSQLColumnSelector(b *strings.Builder, model *ast.ModelDecl, enums map[string]bool) {
+	private := hasPrivateSQLFields(model)
+	withRequired := g.querySQLSelectors[model.Name]
+	g.writeSQLColumnSelector(b, model, enums, false, withRequired && !private)
+	if private {
+		g.writeSQLColumnSelector(b, model, enums, true, withRequired)
+	}
+}
+
+func hasPrivateSQLFields(model *ast.ModelDecl) bool {
+	if model == nil {
+		return false
+	}
+	for _, field := range model.Fields {
+		if field.Type != nil && field.Computed == nil && (hasDirective(field.Directives, "hidden") || hasDirective(field.Directives, "internal")) {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *GeneratorContext) writeSQLColumnSelector(b *strings.Builder, model *ast.ModelDecl, enums map[string]bool, includePrivate bool, query ...bool) {
+	withRequired := len(query) > 0 && query[0]
 	primaryKey := primaryKeyFieldName(model)
 	relationLocalKeys := make(map[string]string)
 	for _, relation := range analyzeRelations(model, enums) {
 		relationLocalKeys[relation.FieldName] = relation.LocalKey
 	}
 	fmt.Fprintf(b, "// select%sSQLColumns maps API fields to database columns.\n", model.Name)
-	fmt.Fprintf(b, "func select%sSQLColumns(fields []*selection.Field) []string {\n", model.Name)
-	b.WriteString("\tif len(fields) == 0 { return nil }\n")
-	b.WriteString("\tcols := make([]string, 0, len(fields)+1)\n")
+	if includePrivate {
+		// An unnamed pointer receiver keeps this metadata helper allocation-free
+		// and avoids collisions with another model's public selector.
+		fmt.Fprintf(b, "func (*%s) loadSQLColumns(fields []*selection.Field", model.Name)
+	} else {
+		fmt.Fprintf(b, "func select%sSQLColumns(fields []*selection.Field", model.Name)
+	}
+	if withRequired {
+		b.WriteString(", required ...string")
+	}
+	b.WriteString(") []string {\n")
+	b.WriteString("\tif fields == nil { return nil }\n")
+	if withRequired {
+		b.WriteString("\tcols := make([]string, 0, len(fields)+len(required)+1)\n")
+	} else {
+		b.WriteString("\tcols := make([]string, 0, len(fields)+1)\n")
+	}
 	b.WriteString("\thasPrimaryKey := false\n")
-	b.WriteString("\tfor _, field := range fields {\n")
-	b.WriteString("\t\tswitch field.Name {\n")
+	if withRequired {
+		b.WriteString("\tfor index := 0; index < len(fields)+len(required); index++ {\n\t\tvar name string\n\t\tif index < len(fields) { name = fields[index].Name } else { name = required[index-len(fields)] }\n\t\tswitch name {\n")
+	} else {
+		b.WriteString("\tfor _, field := range fields {\n")
+		b.WriteString("\t\tswitch field.Name {\n")
+	}
 	for _, field := range model.Fields {
 		if localKey, ok := relationLocalKeys[field.Name]; ok {
 			fmt.Fprintf(b, "\t\tcase %q:\n", field.Name)
-			fmt.Fprintf(b, "\t\t\tcols = ensureSelectedColumn(cols, %q)\n", str.ToSnakeCase(localKey))
+			fmt.Fprintf(b, "\t\t\tcols = ensureSelectedColumn(cols, %q)\n", g.sqlColumn(localKey))
 			if localKey == primaryKey {
 				b.WriteString("\t\t\thasPrimaryKey = true\n")
 			}
@@ -1096,25 +1226,25 @@ func generateSQLColumnSelector(b *strings.Builder, model *ast.ModelDecl, enums m
 		}
 		if localKey, ok := computedFieldLocalKey(model, field, enums); ok {
 			fmt.Fprintf(b, "\t\tcase %q:\n", field.Name)
-			fmt.Fprintf(b, "\t\t\tcols = ensureSelectedColumn(cols, %q)\n", str.ToSnakeCase(localKey))
+			fmt.Fprintf(b, "\t\t\tcols = ensureSelectedColumn(cols, %q)\n", g.sqlColumn(localKey))
 			if localKey == primaryKey {
 				b.WriteString("\t\t\thasPrimaryKey = true\n")
 			}
 			continue
 		}
 		if field.Type == nil || field.Computed != nil || isRelationField(field, enums) ||
-			hasDirective(field.Directives, "hidden") || hasDirective(field.Directives, "internal") {
+			!includePrivate && (hasDirective(field.Directives, "hidden") || hasDirective(field.Directives, "internal")) {
 			continue
 		}
 		fmt.Fprintf(b, "\t\tcase %q:\n", field.Name)
-		fmt.Fprintf(b, "\t\t\tcols = ensureSelectedColumn(cols, %q)\n", str.ToSnakeCase(field.Name))
+		fmt.Fprintf(b, "\t\t\tcols = ensureSelectedColumn(cols, %q)\n", g.sqlColumn(field.Name))
 		if field.Name == primaryKey {
 			b.WriteString("\t\t\thasPrimaryKey = true\n")
 		}
 	}
 	b.WriteString("\t\t}\n")
 	b.WriteString("\t}\n")
-	fmt.Fprintf(b, "\tif !hasPrimaryKey { cols = append(cols, %q) }\n", str.ToSnakeCase(primaryKey))
+	fmt.Fprintf(b, "\tif !hasPrimaryKey { cols = append(cols, %q) }\n", g.sqlColumn(primaryKey))
 	b.WriteString("\treturn cols\n")
 	b.WriteString("}\n\n")
 }
@@ -1141,203 +1271,6 @@ func firstBoolSet(sets []map[string]bool) map[string]bool {
 		return nil
 	}
 	return sets[0]
-}
-
-func writeNestedComputedResolve(b *strings.Builder, relation Relation, resultExpr, indent string, computedModels map[string]bool) {
-	if !computedModels[relation.TargetName] {
-		return
-	}
-	if !relation.IsList {
-		fmt.Fprintf(b, "%sif err := resolve%sComputedFields(ctx, app, []*%s{%s}, f.Children); err != nil { return err }\n",
-			indent, relation.TargetName, relation.TargetName, resultExpr)
-		return
-	}
-	fmt.Fprintf(b, "%scomputedItems := make([]*%s, len(%s))\n", indent, relation.TargetName, resultExpr)
-	fmt.Fprintf(b, "%sfor i := range %s { computedItems[i] = &%s[i] }\n", indent, resultExpr, resultExpr)
-	fmt.Fprintf(b, "%sif err := resolve%sComputedFields(ctx, app, computedItems, f.Children); err != nil { return err }\n",
-		indent, relation.TargetName)
-}
-
-func writeNestedListComputedResolve(b *strings.Builder, relation Relation, computedModels map[string]bool) {
-	if !computedModels[relation.TargetName] {
-		return
-	}
-	goField := str.Capitalize(relation.FieldName)
-	fmt.Fprintf(b, "\t\t\tcomputedItems := make([]*%s, 0)\n", relation.TargetName)
-	b.WriteString("\t\t\tfor _, item := range items {\n")
-	if relation.IsList {
-		fmt.Fprintf(b, "\t\t\t\tfor i := range item.%s { computedItems = append(computedItems, &item.%s[i]) }\n", goField, goField)
-	} else {
-		fmt.Fprintf(b, "\t\t\t\tif item.%s != nil { computedItems = append(computedItems, item.%s) }\n", goField, goField)
-	}
-	b.WriteString("\t\t\t}\n")
-	fmt.Fprintf(b, "\t\t\tif err := resolve%sComputedFields(ctx, app, computedItems, f.Children); err != nil { return err }\n", relation.TargetName)
-}
-
-// generateRelationResolver generates a resolve<Model>Relations function
-// that loads relation fields via DataLoader based on $select.
-func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool, computedSets ...map[string]bool) {
-	name := m.Name
-	lower := strings.ToLower(name[:1]) + name[1:]
-	computedModels := firstBoolSet(computedSets)
-
-	fmt.Fprintf(b, "// resolve%sRelations loads relation fields for %s based on $select.\n", name, name)
-	fmt.Fprintf(b, "// depth limits recursive resolution to prevent infinite loops.\n")
-	fmt.Fprintf(b, "func resolve%sRelations(ctx context.Context, app *App, %s *%s, fields []*selection.Field, depth ...int) error {\n", name, lower, name)
-	fmt.Fprintf(b, "\tif %s == nil {\n\t\treturn nil\n\t}\n", lower)
-	fmt.Fprintf(b, "\td := MaxRelationDepth\n")
-	fmt.Fprintf(b, "\tif len(depth) > 0 {\n\t\td = depth[0]\n\t}\n")
-	fmt.Fprintf(b, "\tif d <= 0 {\n\t\treturn nil\n\t}\n")
-
-	for _, rel := range rels {
-		fieldName := rel.FieldName
-		loaderField := loaderFieldName(name, rel)
-		localKey := rel.LocalKey
-		goLocalKey := str.Capitalize(localKey)
-		goFieldName := str.Capitalize(fieldName)
-
-		fmt.Fprintf(b, "\tfor _, f := range fields {\n")
-		fmt.Fprintf(b, "\t\tif f.Name == %q && f.Children != nil {\n", fieldName)
-		if rel.FKNullable {
-			fmt.Fprintf(b, "\t\t\tif %s.%s != nil {\n", lower, goLocalKey)
-			fmt.Fprintf(b, "\t\t\t\tresult, err := app.loaders.%s.Load(ctx, *%s.%s, f.Children)\n",
-				loaderField, lower, goLocalKey)
-			fmt.Fprintf(b, "\t\t\t\tif err != nil {\n\t\t\t\t\treturn err\n\t\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t\t\t%s.%s = result\n", lower, goFieldName)
-			writeNestedComputedResolve(b, rel, "result", "\t\t\t\t", computedModels)
-			// Recursive resolve for child's relations
-			if modelRels[rel.TargetName] {
-				fmt.Fprintf(b, "\t\t\t\ttraceCtx := api.WithTraceFieldPath(ctx, f.Name)\n")
-				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sRelations(traceCtx, app, result, f.Children, d-1); err != nil {\n", rel.TargetName)
-				fmt.Fprintf(b, "\t\t\t\t\treturn err\n\t\t\t\t}\n")
-			}
-			fmt.Fprintf(b, "\t\t\t}\n")
-		} else {
-			fmt.Fprintf(b, "\t\t\tresult, err := app.loaders.%s.Load(ctx, %s.%s, f.Children)\n",
-				loaderField, lower, goLocalKey)
-			fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t\t%s.%s = result\n", lower, goFieldName)
-			writeNestedComputedResolve(b, rel, "result", "\t\t\t", computedModels)
-			// Recursive resolve for child's relations
-			if modelRels[rel.TargetName] {
-				fmt.Fprintf(b, "\t\t\ttraceCtx := api.WithTraceFieldPath(ctx, f.Name)\n")
-				if rel.IsList {
-					fmt.Fprintf(b, "\t\t\tif err := resolve%sValueListRelations(traceCtx, app, %s.%s, f.Children, d-1); err != nil {\n", rel.TargetName, lower, goFieldName)
-				} else {
-					fmt.Fprintf(b, "\t\t\tif err := resolve%sRelations(traceCtx, app, result, f.Children, d-1); err != nil {\n", rel.TargetName)
-				}
-				fmt.Fprintf(b, "\t\t\t\treturn err\n\t\t\t}\n")
-			}
-		}
-
-		fmt.Fprintf(b, "\t\t\tbreak\n")
-		fmt.Fprintf(b, "\t\t}\n")
-		fmt.Fprintf(b, "\t}\n")
-	}
-
-	fmt.Fprintf(b, "\treturn nil\n")
-	fmt.Fprintf(b, "}\n\n")
-}
-
-// generateListRelationResolver generates a batch resolve function for LIST handlers.
-// Uses LoadAll (direct dispatch, zero wait) instead of per-item Load.
-func generateListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool, computedSets ...map[string]bool) {
-	generateListRelationResolverMode(b, m, rels, modelRels, false, computedSets...)
-}
-
-func generateValueListRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool, computedSets ...map[string]bool) {
-	generateListRelationResolverMode(b, m, rels, modelRels, true, computedSets...)
-}
-
-func generateListRelationResolverMode(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool, valueSlice bool, computedSets ...map[string]bool) {
-	name := m.Name
-	computedModels := firstBoolSet(computedSets)
-	functionName := "resolve" + name + "ListRelations"
-	itemsType := "[]*" + name
-	if valueSlice {
-		functionName = "resolve" + name + "ValueListRelations"
-		itemsType = "[]" + name
-	}
-
-	fmt.Fprintf(b, "// %s batch-loads all relation fields for a list of %s.\n", functionName, name)
-	fmt.Fprintf(b, "// Uses LoadAll — direct dispatch, zero wait.\n")
-	fmt.Fprintf(b, "func %s(ctx context.Context, app *App, items %s, fields []*selection.Field, depth ...int) error {\n", functionName, itemsType)
-	fmt.Fprintf(b, "\td := MaxRelationDepth\n")
-	fmt.Fprintf(b, "\tif len(depth) > 0 {\n\t\td = depth[0]\n\t}\n")
-	fmt.Fprintf(b, "\tif d <= 0 {\n\t\treturn nil\n\t}\n")
-
-	for _, rel := range rels {
-		fieldName := rel.FieldName
-		loaderField := loaderFieldName(name, rel)
-		localKey := rel.LocalKey
-		goLocalKey := str.Capitalize(localKey)
-		goFieldName := str.Capitalize(fieldName)
-
-		fmt.Fprintf(b, "\tfor _, f := range fields {\n")
-		fmt.Fprintf(b, "\t\tif f.Name == %q && f.Children != nil {\n", fieldName)
-		// Collect all keys
-		fmt.Fprintf(b, "\t\t\tkeys := make([]%s, 0, len(items))\n", rel.KeyGoType)
-		if rel.FKNullable {
-			writeRelationItemLoopStart(b, valueSlice)
-			fmt.Fprintf(b, "\t\t\t\tif item.%s != nil {\n", goLocalKey)
-			fmt.Fprintf(b, "\t\t\t\t\tkeys = append(keys, *item.%s)\n", goLocalKey)
-			fmt.Fprintf(b, "\t\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t\t}\n")
-		} else {
-			writeRelationItemLoopStart(b, valueSlice)
-			fmt.Fprintf(b, "\t\t\t\tkeys = append(keys, item.%s)\n", goLocalKey)
-			fmt.Fprintf(b, "\t\t\t}\n")
-		}
-
-		// LoadAll — direct dispatch, zero wait
-		fmt.Fprintf(b, "\t\t\tresultMap, err := app.loaders.%s.LoadAll(ctx, keys, f.Children)\n", loaderField)
-		fmt.Fprintf(b, "\t\t\tif err != nil {\n\t\t\t\treturn err\n\t\t\t}\n")
-
-		// Map results back
-		if rel.FKNullable {
-			writeRelationItemLoopStart(b, valueSlice)
-			fmt.Fprintf(b, "\t\t\t\tif item.%s != nil {\n", goLocalKey)
-			fmt.Fprintf(b, "\t\t\t\t\titem.%s = resultMap[*item.%s]\n", goFieldName, goLocalKey)
-			fmt.Fprintf(b, "\t\t\t\t}\n")
-			fmt.Fprintf(b, "\t\t\t}\n")
-		} else {
-			writeRelationItemLoopStart(b, valueSlice)
-			fmt.Fprintf(b, "\t\t\t\titem.%s = resultMap[item.%s]\n", goFieldName, goLocalKey)
-			fmt.Fprintf(b, "\t\t\t}\n")
-		}
-		writeNestedListComputedResolve(b, rel, computedModels)
-
-		// Recursive resolve for child's relations
-		if modelRels[rel.TargetName] {
-			fmt.Fprintf(b, "\t\t\ttraceCtx := api.WithTraceFieldPath(ctx, f.Name)\n")
-			if rel.IsList {
-				writeRelationItemLoopStart(b, valueSlice)
-				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sValueListRelations(traceCtx, app, item.%s, f.Children, d-1); err != nil {\n", rel.TargetName, goFieldName)
-				fmt.Fprintf(b, "\t\t\t\t\treturn err\n\t\t\t\t}\n")
-				fmt.Fprintf(b, "\t\t\t}\n")
-			} else {
-				writeRelationItemLoopStart(b, valueSlice)
-				fmt.Fprintf(b, "\t\t\t\tif err := resolve%sRelations(traceCtx, app, item.%s, f.Children, d-1); err != nil {\n", rel.TargetName, goFieldName)
-				fmt.Fprintf(b, "\t\t\t\t\treturn err\n\t\t\t\t}\n")
-				fmt.Fprintf(b, "\t\t\t}\n")
-			}
-		}
-
-		fmt.Fprintf(b, "\t\t\tbreak\n")
-		fmt.Fprintf(b, "\t\t}\n")
-		fmt.Fprintf(b, "\t}\n")
-	}
-
-	fmt.Fprintf(b, "\treturn nil\n")
-	fmt.Fprintf(b, "}\n\n")
-}
-
-func writeRelationItemLoopStart(b *strings.Builder, valueSlice bool) {
-	if valueSlice {
-		b.WriteString("\t\t\tfor i := range items {\n\t\t\t\titem := &items[i]\n")
-		return
-	}
-	b.WriteString("\t\t\tfor _, item := range items {\n")
 }
 
 // generateRegisterFuncWithInferred generates RegisterHandlers with CRUD + inferred handlers.
@@ -1401,7 +1334,7 @@ func writeHandlerRegistrationMode(b *strings.Builder, name string, directives []
 			maxLiteral, maxOK := maxArg.Value.(*ast.Literal)
 			window, windowOK := directiveDuration(d, "window", 1)
 			if maxOK && windowOK {
-				handler = fmt.Sprintf("api.WithRateLimit(%s, %s, %s)", maxLiteral.Value, window, handler)
+				handler = fmt.Sprintf("api.WithRateLimit(%s, %s, %s)", decimalIntegerLiteral(maxLiteral.Value), window, handler)
 			}
 		}
 	}
@@ -1432,7 +1365,7 @@ func directiveDuration(d *ast.Directive, name string, position int) (string, boo
 		return "", false
 	}
 	if literal.Kind == token.Int {
-		return literal.Value + " * time.Second", true
+		return decimalIntegerLiteral(literal.Value) + " * time.Second", true
 	}
 	if literal.Kind != token.Duration {
 		return "", false
@@ -1467,11 +1400,11 @@ func (g *GeneratorContext) generateBatchLoadHandlers(b *strings.Builder, models 
 
 	for _, m := range models {
 		name := m.Name
-		tableName := modelTableName(name)
+		tableName := g.sqlTable(name)
 		scanFn := "scan" + name
 		idType := modelIDTypeName(m)
 		idGoType := idGoType(m)
-		idColumn := str.ToSnakeCase(primaryKeyFieldName(m))
+		idColumn := g.sqlColumn(primaryKeyFieldName(m))
 		paramMethod := idArrayParamMethod(idType)
 
 		fmt.Fprintf(b, "// handleBatchLoad%s handles svc:batchLoad:%s — batch load by PK for remote DataLoaders.\n", name, name)
@@ -1481,6 +1414,7 @@ func (g *GeneratorContext) generateBatchLoadHandlers(b *strings.Builder, models 
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
 		fmt.Fprintf(b, "\t\tfields := select%sSQLColumns(req.Select)\n", name)
 		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.New%s(%q).In(keys...)}\n", goTypeToCondField(idGoType), idColumn)
+		g.generateSoftDeleteCondition(b, isSoftDelete(m), "\t\t")
 		fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", tableName)
 		fmt.Fprintf(b, "\t\trows, err := app.DB.QueryRows(ctx, %s, query, args...)\n", scanFn)
 		fmt.Fprintf(b, "\t\tif err != nil {\n\t\t\treturn err\n\t\t}\n")
@@ -1489,7 +1423,7 @@ func (g *GeneratorContext) generateBatchLoadHandlers(b *strings.Builder, models 
 			fmt.Fprintf(b, "\t\tif err := resolve%sListRelations(ctx, app, rows, req.Select); err != nil { return err }\n", name)
 		}
 		// Write response: binary array of models
-		fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(rows)))\n")
+		writeBinaryAppend(b, "\t\t", "req.Buf.B", "codec.AppendArrayHeader(req.Buf.B, len(rows))", "return err")
 		fmt.Fprintf(b, "\t\tfor _, row := range rows {\n")
 		fmt.Fprintf(b, "\t\t\tif err := row.WriteLuxo(req.Buf, req.FieldMask); err != nil { return err }\n")
 		fmt.Fprintf(b, "\t\t}\n")
@@ -1507,7 +1441,7 @@ func (g *GeneratorContext) generateBatchLoadHandlers(b *strings.Builder, models 
 		apiID := g.apiID(svcName)
 		if apiID > 0 {
 			writeRegistryRoute(b, svcName, apiID)
-			fmt.Fprintf(b, "\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"keys\", Type: %q, IsList: true}}); err != nil { return err }\n", svcName, modelIDTypeName(m))
+			fmt.Fprintf(b, "\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: %d, Name: \"keys\", Type: %q, IsList: true}}); err != nil { return err }\n", svcName, g.apiParamID(svcName, "keys"), modelIDTypeName(m))
 		}
 	}
 	b.WriteString("\treturn nil\n}\n\n")
@@ -1627,18 +1561,16 @@ func (g *GeneratorContext) generateRemoteNamedLoadHandler(b *strings.Builder, mo
 	}
 	fmt.Fprintf(b, "\t\tfields := select%sSQLColumns(req.Select)\n", model.Name)
 	for _, argName := range call.argNames {
-		generateRequiredSQLField(b, str.ToSnakeCase(argName))
+		g.generateRequiredSQLField(b, g.sqlColumn(argName))
 	}
 	if len(call.argNames) == 1 {
 		fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.New%s(%q).In(%sKeys...)}\n",
-			goTypeToCondField(call.argTypes[0]), str.ToSnakeCase(call.argNames[0]), call.argNames[0])
+			goTypeToCondField(call.argTypes[0]), g.sqlColumn(call.argNames[0]), call.argNames[0])
 	} else {
-		generateCompositeLoadConditions(b, "\t\t", call, true)
+		g.generateCompositeLoadConditions(b, "\t\t", call, true)
 	}
-	if isSoftDelete(model) {
-		b.WriteString("\t\tconds = append(conds, lux.NewTimeField(\"deleted_at\").IsNull())\n")
-	}
-	fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", modelTableName(model.Name))
+	g.generateSoftDeleteCondition(b, isSoftDelete(model), "\t\t")
+	fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", g.sqlTable(model.Name))
 	fmt.Fprintf(b, "\t\trows, err := app.DB.QueryRows(ctx, scan%s, query, args...)\n", model.Name)
 	b.WriteString("\t\tif err != nil { return err }\n")
 	writeComputedResolve(b, model, "rows", "\t\t")
@@ -1650,14 +1582,15 @@ func (g *GeneratorContext) generateRemoteNamedLoadHandler(b *strings.Builder, mo
 	fmt.Fprintf(b, "\t\t\tkey := %s\n", loadKeyExpr(call, "row."))
 	b.WriteString("\t\t\tgrouped[key] = append(grouped[key], row)\n")
 	b.WriteString("\t\t}\n")
-	fmt.Fprintf(b, "\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(%sKeys)))\n", call.argNames[0])
+	writeBinaryAppend(b, "\t\t", "req.Buf.B", fmt.Sprintf("codec.AppendArrayHeader(req.Buf.B, len(%sKeys))", call.argNames[0]), "return err")
 	fmt.Fprintf(b, "\t\tfor i := range %sKeys {\n", call.argNames[0])
 	fmt.Fprintf(b, "\t\t\tkey := %s\n", requestLoadKeyExpr(call, keyTypeName))
 	b.WriteString("\t\t\titems := grouped[key]\n")
-	b.WriteString("\t\t\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(items)))\n")
+	writeBinaryAppend(b, "\t\t\t", "req.Buf.B", "codec.AppendArrayHeader(req.Buf.B, len(items))", "return err")
 	b.WriteString("\t\t\ttmp := api.GetBuf()\n")
 	b.WriteString("\t\t\tfor _, item := range items {\n")
 	b.WriteString("\t\t\t\ttmp.Reset()\n")
+	b.WriteString("\t\t\t\ttmp.Identity = req.Buf.Identity\n")
 	b.WriteString("\t\t\t\tif err := item.WriteLuxo(tmp, req.FieldMask); err != nil { api.PutBuf(tmp); return err }\n")
 	b.WriteString("\t\t\t\treq.Buf.B = codec.AppendBytes(req.Buf.B, tmp.B)\n")
 	b.WriteString("\t\t\t}\n")
@@ -1721,12 +1654,12 @@ func (g *GeneratorContext) generateSelectedSQLFields(b *strings.Builder, model *
 	b.WriteString("\t\tvar fields []string\n")
 	b.WriteString("\t\tif len(fieldMask) > 0 {\n")
 	b.WriteString("\t\t\tfields = make([]string, 0, len(fieldMask))\n")
-	fmt.Fprintf(b, "\t\t\tfields = append(fields, %q)\n", str.ToSnakeCase(primaryKeyFieldName(model)))
+	fmt.Fprintf(b, "\t\t\tfields = append(fields, %q)\n", g.sqlColumn(primaryKeyFieldName(model)))
 	for _, field := range model.Fields {
 		if localKey, ok := computedFieldLocalKey(model, field, enums); ok {
 			if fieldID := g.modelFieldID(model.Name, field.Name); fieldID > 0 {
 				fmt.Fprintf(b, "\t\t\tif codec.FieldMaskHas(fieldMask, %d) { fields = ensureSelectedColumn(fields, %q) }\n",
-					fieldID, str.ToSnakeCase(localKey))
+					fieldID, g.sqlColumn(localKey))
 			}
 			continue
 		}
@@ -1738,7 +1671,7 @@ func (g *GeneratorContext) generateSelectedSQLFields(b *strings.Builder, model *
 			continue
 		}
 		fmt.Fprintf(b, "\t\t\tif codec.FieldMaskHas(fieldMask, %d) { fields = append(fields, %q) }\n",
-			fieldID, str.ToSnakeCase(field.Name))
+			fieldID, g.sqlColumn(field.Name))
 	}
 	b.WriteString("\t\t}\n")
 }
@@ -1754,6 +1687,10 @@ func (g *GeneratorContext) writeAPIRegistration(b *strings.Builder, name string,
 		return
 	}
 	writeRegistryRoute(b, name, id)
+	g.writeAPIParameterRegistration(b, name, g.requestParams[name], firstBoolSet(enumSets))
+}
+
+func (g *GeneratorContext) writeAPIParameterRegistration(b *strings.Builder, name string, declarations []*ast.ParamDecl, enums map[string]bool) {
 	params := g.apiParamIDs(name)
 	if len(params) == 0 {
 		return
@@ -1763,7 +1700,7 @@ func (g *GeneratorContext) writeAPIRegistration(b *strings.Builder, name string,
 		id          int
 	}
 	registered := make([]registeredParam, 0, len(params))
-	for _, param := range g.requestParams[name] {
+	for _, param := range declarations {
 		if id := params[param.Name]; id > 0 {
 			registered = append(registered, registeredParam{declaration: param, id: id})
 		}
@@ -1774,7 +1711,7 @@ func (g *GeneratorContext) writeAPIRegistration(b *strings.Builder, name string,
 	slices.SortFunc(registered, func(a, b registeredParam) int { return cmp.Compare(a.id, b.id) })
 	fmt.Fprintf(b, "\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{\n", name)
 	for _, param := range registered {
-		writeRegisteredParam(b, param.declaration, param.id, firstBoolSet(enumSets))
+		g.writeRegisteredParam(b, param.declaration, param.id, enums)
 	}
 	b.WriteString("\t}); err != nil { return err }\n")
 }
@@ -1783,8 +1720,11 @@ func writeRegistryRoute(b *strings.Builder, name string, id int) {
 	fmt.Fprintf(b, "\tif err := router.Registry.Register(%q, %d); err != nil { return err }\n", name, id)
 }
 
-func writeRegisteredParam(b *strings.Builder, param *ast.ParamDecl, id int, enums map[string]bool) {
+func (g *GeneratorContext) writeRegisteredParam(b *strings.Builder, param *ast.ParamDecl, id int, enums map[string]bool) {
 	wireType, typeName := registeredParamType(param.Type.Name, enums)
+	if g.sealedDeclaration(param.Type.Name) != nil {
+		wireType, typeName = "Sealed", param.Type.Name
+	}
 	fmt.Fprintf(b, "\t\t{Name: %q, Type: %q", param.Name, wireType)
 	if typeName != "" {
 		fmt.Fprintf(b, ", TypeName: %q", typeName)
@@ -1894,24 +1834,18 @@ func bodyContainsTransaction(block *ast.Block) bool {
 	if block == nil {
 		return false
 	}
-	for _, stmt := range block.Stmts {
-		if es, ok := stmt.(*ast.ExprStmt); ok {
-			if call, ok := es.Expr.(*ast.CallExpr); ok {
-				if ident, ok := call.Func.(*ast.Ident); ok && ident.Name == "transaction" {
-					return true
-				}
+	found := false
+	ast.WalkExprs(block, func(expression ast.Expr) {
+		switch value := expression.(type) {
+		case *ast.TransactionExpr:
+			found = true
+		case *ast.CallExpr:
+			if name, ok := value.Func.(*ast.Ident); ok && name.Name == "transaction" {
+				found = true
 			}
 		}
-		// Also check val assignments: val result = transaction { ... }
-		if vs, ok := stmt.(*ast.ValStmt); ok {
-			if call, ok := vs.Value.(*ast.CallExpr); ok {
-				if ident, ok := call.Func.(*ast.Ident); ok && ident.Name == "transaction" {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	})
+	return found
 }
 
 // bodyContainsTemplateString checks if an API body uses template strings.
@@ -1966,15 +1900,33 @@ func writeAuthCheck(b *strings.Builder, indent string, directives ...*ast.Direct
 	writeAuthorizationCheck(b, indent, directives[0])
 }
 
+func writeAuthSubjectCheck(b *strings.Builder, indent string, d *ast.Directive) {
+	if d != nil && d.AuthSubject != "" {
+		fmt.Fprintf(b, "%sif identity.Subject() != %q { return errors.Unauthorized }\n", indent, d.AuthSubject)
+	}
+}
+
 func writeAuthorizationCheck(b *strings.Builder, indent string, d *ast.Directive) {
+	writeAuthSubjectCheck(b, indent, d)
+	if !writeAuthorizationDecision(b, indent, d) {
+		return
+	}
+	fmt.Fprintf(b, "%sif !_authorized {\n%s\treturn errors.Forbidden\n%s}\n", indent, indent, indent)
+}
+
+func writeAuthorizationDecision(b *strings.Builder, indent string, d *ast.Directive) bool {
 
 	// Collect roles (positional args) and named args
 	var roles []string
 	var ownField string
-	var permissionBody *ast.Block
+	var permissionExpr string
 
 	for _, arg := range d.Args {
-		if arg.Name == "" {
+		if arg.Name == "role" {
+			if lit, ok := arg.Value.(*ast.Literal); ok && lit.Kind == token.String {
+				roles = append(roles, lit.Value)
+			}
+		} else if arg.Name == "" {
 			// Positional arg = allowed role name
 			if ident, ok := arg.Value.(*ast.Ident); ok {
 				roles = append(roles, ident.Name)
@@ -1987,16 +1939,13 @@ func writeAuthorizationCheck(b *strings.Builder, indent string, d *ast.Directive
 				ownField = ident.Name
 			}
 		} else if arg.Name == "permission" {
-			// Permission lambda: @auth(permission: { my.role == "SUPER" })
-			if lambda, ok := arg.Value.(*ast.LambdaExpr); ok {
-				permissionBody = lambda.Body
-			}
+			permissionExpr = compilePermissionLambda(arg.Value)
 		}
 	}
 
 	// No additional checks needed
-	if len(roles) == 0 && ownField == "" && permissionBody == nil {
-		return
+	if len(roles) == 0 && ownField == "" && permissionExpr == "" {
+		return false
 	}
 
 	// Generate authorization check
@@ -2022,53 +1971,71 @@ func writeAuthorizationCheck(b *strings.Builder, indent string, d *ast.Directive
 
 	// Ownership check: extract param inline for early auth
 	if ownField != "" {
-		fmt.Fprintf(b, "%sif _ownID, _ownErr := req.ParamInt(%q); _ownErr == nil && identity.ID() == _ownID { _authorized = true }\n", indent, ownField)
+		fmt.Fprintf(b, "%sif !_authorized {\n", indent)
+		fmt.Fprintf(b, "%s\tif _identityID, _identityValid := identity.Get(\"id\").Int64(); _identityValid {\n", indent)
+		fmt.Fprintf(b, "%s\t\tif _ownID, _ownErr := req.ParamInt(%q); _ownErr == nil && _identityID == _ownID { _authorized = true }\n", indent, ownField)
+		fmt.Fprintf(b, "%s\t}\n%s}\n", indent, indent)
 	}
 
-	// Permission lambda
-	if permissionBody != nil {
-		// Compile the permission expression — simple case: single ExprStmt that evaluates to bool
-		if len(permissionBody.Stmts) == 1 {
-			if es, ok := permissionBody.Stmts[0].(*ast.ExprStmt); ok {
-				permExpr := compilePermissionExpr(es.Expr)
-				if permExpr != "" {
-					fmt.Fprintf(b, "%sif %s { _authorized = true }\n", indent, permExpr)
-				}
-			}
-		}
+	if permissionExpr != "" {
+		fmt.Fprintf(b, "%sif %s { _authorized = true }\n", indent, permissionExpr)
 	}
 
-	fmt.Fprintf(b, "%sif !_authorized {\n", indent)
-	fmt.Fprintf(b, "%s\treturn errors.Forbidden\n", indent)
-	fmt.Fprintf(b, "%s}\n", indent)
+	return true
+}
+
+// compilePermissionLambda rejects unsupported authorization instead of omitting it.
+func compilePermissionLambda(expr ast.Expr) string {
+	lambda, ok := expr.(*ast.LambdaExpr)
+	if !ok || lambda.Body == nil || len(lambda.Body.Stmts) != 1 {
+		panic(&InternalCompilerError{Detail: "invalid @auth permission: expected one condition expression"})
+	}
+	statement, ok := lambda.Body.Stmts[0].(*ast.ExprStmt)
+	if !ok {
+		panic(&InternalCompilerError{Detail: "invalid @auth permission: expected a condition expression"})
+	}
+	compiled := compilePermissionExpr(statement.Expr)
+	if compiled == "" {
+		compiled = compileTypedPermissionCondition(statement.Expr)
+	}
+	if compiled == "" {
+		panic(&InternalCompilerError{Detail: "unsupported @auth permission expression"})
+	}
+	return compiled
 }
 
 // compilePermissionExpr compiles a permission lambda expression to Go code.
-// Supports: my.field == "value", my.field != "value", my.field == EnumValue
+// Supports text literals and semantically resolved enum constants on the right.
 func compilePermissionExpr(expr ast.Expr) string {
+	if member, ok := expr.(*ast.MemberExpr); ok && member.GetTypeTag() == "Boolean" {
+		if ident, ok := member.Object.(*ast.Ident); ok && ident.Name == "my" {
+			return fmt.Sprintf("func() bool { value, valid := identity.Get(%q).Bool(); return valid && value }()", member.Field)
+		}
+	}
 	bin, ok := expr.(*ast.BinaryExpr)
 	if !ok {
 		return ""
 	}
 
-	// Left side: my.field → identity.String("field") or identity.Int("field")
+	// The current permission emitter only supports text identity comparisons.
 	left := ""
 	if member, ok := bin.Left.(*ast.MemberExpr); ok {
 		if ident, ok := member.Object.(*ast.Ident); ok && ident.Name == "my" {
-			left = fmt.Sprintf("identity.String(%q)", member.Field)
+			left = fmt.Sprintf("identity.Get(%q).String()", member.Field)
 		}
 	}
 	if left == "" {
 		return ""
 	}
 
-	// Right side: string literal or ident
+	// Never reinterpret variable names or arbitrary member names as string values.
 	right := ""
 	if lit, ok := bin.Right.(*ast.Literal); ok {
+		if lit.Kind != token.String {
+			return ""
+		}
 		right = fmt.Sprintf("%q", lit.Value)
-	} else if ident, ok := bin.Right.(*ast.Ident); ok {
-		right = fmt.Sprintf("%q", ident.Name)
-	} else if member, ok := bin.Right.(*ast.MemberExpr); ok {
+	} else if member, ok := bin.Right.(*ast.MemberExpr); ok && member.EnumConstant {
 		// Enum.VALUE → "VALUE"
 		right = fmt.Sprintf("%q", member.Field)
 	}
@@ -2076,7 +2043,11 @@ func compilePermissionExpr(expr ast.Expr) string {
 		return ""
 	}
 
-	return fmt.Sprintf("%s %s %s", left, bin.Op, right)
+	validation := "valid"
+	if member, ok := bin.Left.(*ast.MemberExpr); ok && member.IsEnumType() {
+		validation += " && " + member.GetTypeTag() + "(value).IsValid()"
+	}
+	return fmt.Sprintf("func() bool { value, valid := %s; return %s && value %s %s }()", left, validation, bin.Op, right)
 }
 
 // detectAuthNeeded checks if luvia import is needed in handler.gen.go.
@@ -2201,13 +2172,13 @@ func generateStringValidation(b *strings.Builder, f *ast.FieldDecl, varName, ind
 		if d.Name == "minLength" && len(d.Args) > 0 {
 			if lit, ok := d.Args[0].Value.(*ast.Literal); ok {
 				writeValidationCheck(b, indent, name,
-					fmt.Sprintf("len(%s) < %s", varName, lit.Value), "too short, min "+lit.Value)
+					fmt.Sprintf("len(%s) < %s", varName, compileNumericLiteral(lit)), "too short, min "+lit.Value)
 			}
 		}
 		if d.Name == "maxLength" && len(d.Args) > 0 {
 			if lit, ok := d.Args[0].Value.(*ast.Literal); ok {
 				writeValidationCheck(b, indent, name,
-					fmt.Sprintf("len(%s) > %s", varName, lit.Value), "too long, max "+lit.Value)
+					fmt.Sprintf("len(%s) > %s", varName, compileNumericLiteral(lit)), "too long, max "+lit.Value)
 			}
 		}
 		if d.Name == "pattern" && len(d.Args) > 0 {
@@ -2223,15 +2194,32 @@ func generateStringValidation(b *strings.Builder, f *ast.FieldDecl, varName, ind
 func generateNumericValidation(b *strings.Builder, f *ast.FieldDecl, varName, indent string) {
 	for _, d := range f.Directives {
 		if d.Name == "range" && len(d.Args) >= 2 {
-			minLit, minOk := d.Args[0].Value.(*ast.Literal)
-			maxLit, maxOk := d.Args[1].Value.(*ast.Literal)
+			minimum, minLabel, minOk := numericValidationBound(d.Args[0].Value)
+			maximum, maxLabel, maxOk := numericValidationBound(d.Args[1].Value)
 			if minOk && maxOk {
 				writeValidationCheck(b, indent, f.Name,
-					fmt.Sprintf("%s < %s || %s > %s", varName, minLit.Value, varName, maxLit.Value),
-					"out of range ["+minLit.Value+", "+maxLit.Value+"]")
+					fmt.Sprintf("%s < %s || %s > %s", varName, minimum, varName, maximum),
+					"out of range ["+minLabel+", "+maxLabel+"]")
 			}
 		}
 	}
+}
+
+// A sign is a unary AST node, not part of the literal token. Preserve its
+// numeric type and group nested signs so Go cannot read them as ++ or --.
+func numericValidationBound(expression ast.Expr) (value, label string, ok bool) {
+	switch expression := expression.(type) {
+	case *ast.Literal:
+		return compileNumericLiteral(expression), expression.Value, true
+	case *ast.UnaryExpr:
+		if expression.Op == "+" || expression.Op == "-" {
+			value, label, ok := numericValidationBound(expression.Value)
+			if ok {
+				return compileUnaryOperation(expression, "("+value+")"), expression.Op + label, true
+			}
+		}
+	}
+	return "", "", false
 }
 
 func writeValidationCheck(b *strings.Builder, indent, field, cond, errMsg string) {
@@ -2264,61 +2252,96 @@ func scanModelsForValidation(models []*ast.ModelDecl) (bool, bool) {
 	return hasValidation, hasPattern
 }
 
+// fieldDirectiveFunction lowers field expressions without mutating analyzed source nodes.
+// Nullable guards belong to the writer/save caller; the body sees a present value.
+func fieldDirectiveFunction(field *ast.FieldDecl, directive *ast.Directive, name string) *ast.FnDecl {
+	if field.Type == nil || directive.Body == nil || len(directive.Args) != 0 || len(directive.Body.Stmts) == 0 {
+		panic(&InternalCompilerError{Detail: "invalid field function for " + field.Name})
+	}
+	typ := *field.Type
+	typ.Nullable = false
+	value := &ast.Ident{Name: "it"}
+	value.SetTypeTag(typ.Name)
+	value.SetListType(typ.IsList)
+	value.SetNullable(typ.Nullable)
+	statements := make([]ast.Stmt, 0, len(directive.Body.Stmts)+1)
+	switch directive.Name {
+	case "transform":
+		statement, ok := directive.Body.Stmts[0].(*ast.ExprStmt)
+		if !ok || statement.Expr == nil || len(directive.Body.Stmts) != 1 {
+			panic(&InternalCompilerError{Detail: "invalid @transform expression for field " + field.Name})
+		}
+		statements = append(statements, &ast.ReturnStmt{Pos: statement.Pos, Value: statement.Expr})
+	case "beforeSave":
+		for _, statement := range directive.Body.Stmts {
+			expression, operator := beforeSaveAssignment(statement)
+			if expression == nil {
+				panic(&InternalCompilerError{Detail: "invalid @beforeSave statement for field " + field.Name})
+			}
+			statements = append(statements, &ast.AssignStmt{Pos: field.Pos, Target: value, Op: operator, Value: expression})
+		}
+		statements = append(statements, &ast.ReturnStmt{Pos: field.Pos, Value: value})
+	default:
+		panic(&InternalCompilerError{Detail: "unsupported field function directive " + directive.Name})
+	}
+	return &ast.FnDecl{Pos: field.Pos, Name: name, Params: []*ast.ParamDecl{{Name: "it", Type: &typ}}, ReturnType: &typ, Body: &ast.Block{Pos: directive.Body.Pos, Stmts: statements}}
+}
+
 // generateBeforeSave compiles @beforeSave { body } for a field.
 // `it` in the body refers to the field variable.
 func generateBeforeSave(b *strings.Builder, f *ast.FieldDecl, varName, indent string) {
-	for _, d := range f.Directives {
-		if d.Name != "beforeSave" || d.Body == nil || len(d.Body.Stmts) == 0 {
+	for _, directive := range f.Directives {
+		if directive.Name != "beforeSave" {
 			continue
 		}
-		for _, stmt := range d.Body.Stmts {
-			switch s := stmt.(type) {
-			case *ast.AssignStmt:
-				// it = expr → varName = compiledExpr
-				if s.Value == nil {
-					continue
-				}
-				code := compileFieldExpr(s.Value, varName)
-				if code != "" {
-					fmt.Fprintf(b, "%s%s = %s\n", indent, varName, code)
-				}
-			case *ast.ExprStmt:
-				// it.trim() → varName = strings.TrimSpace(varName)
-				if s.Expr == nil {
-					continue
-				}
-				code := compileFieldExpr(s.Expr, varName)
-				if code != "" {
-					fmt.Fprintf(b, "%s%s = %s\n", indent, varName, code)
-				}
+		if directive.Body == nil || len(directive.Body.Stmts) == 0 || len(directive.Args) != 0 {
+			panic(&InternalCompilerError{Detail: "invalid @beforeSave body for field " + f.Name})
+		}
+		for _, statement := range directive.Body.Stmts {
+			expression, operator := beforeSaveAssignment(statement)
+			if expression == nil {
+				panic(&InternalCompilerError{Detail: "invalid @beforeSave statement for field " + f.Name})
 			}
+			code := compileFieldExpr(expression, varName)
+			if code == "" {
+				panic(&InternalCompilerError{Detail: "unsupported @beforeSave expression for field " + f.Name})
+			}
+			if f.Type != nil && f.Type.Name == "DateTime" && isDurationExpr(expression) && (operator == "+=" || operator == "-=") {
+				code = compileDateOffset(varName, code, strings.TrimSuffix(operator, "="))
+				operator = "="
+			}
+			fmt.Fprintf(b, "%s%s %s %s\n", indent, varName, operator, code)
 		}
 	}
+}
+
+func beforeSaveAssignment(statement ast.Stmt) (ast.Expr, string) {
+	switch value := statement.(type) {
+	case *ast.ExprStmt:
+		return value.Expr, "="
+	case *ast.AssignStmt:
+		target, ok := value.Target.(*ast.Ident)
+		if !ok || target.Name != "it" {
+			return nil, ""
+		}
+		switch value.Op {
+		case "=", "+=", "-=", "*=", "/=", "%=":
+			return value.Value, value.Op
+		}
+	}
+	return nil, ""
 }
 
 // compileFieldExpr compiles a field-level expression where `it` refers to the field variable.
 func compileFieldExpr(expr ast.Expr, itVar string) string {
 	switch e := expr.(type) {
+	case *ast.BinaryExpr:
+		return compileFieldBinary(e, itVar)
+	case *ast.UnaryExpr:
+		return compileFieldUnary(e, itVar)
 	case *ast.CallExpr:
 		if member, ok := e.Func.(*ast.MemberExpr); ok {
-			obj := func() string { return compileFieldExpr(member.Object, itVar) }
-			nargs := len(e.Args)
-			arg := func(i int) string {
-				if i < nargs {
-					return compileFieldExpr(e.Args[i].Value, itVar)
-				}
-				// Defensive: string helpers check nargs before requesting a fixed argument index.
-				return ""
-			}
-			if result := compileStringTransform(member.Field, obj, arg, nargs); result != "" {
-				return result
-			}
-			if result := compileStringQuery(member.Field, obj, arg, nargs); result != "" {
-				return result
-			}
-			if result := compileStringConvert(member.Field, obj); result != "" {
-				return result
-			}
+			return compileFieldMethod(e, member, itVar)
 		}
 		// Free function call: slugify(it) → slugify(varName)
 		if ident, ok := e.Func.(*ast.Ident); ok {
@@ -2333,6 +2356,15 @@ func compileFieldExpr(expr ast.Expr, itVar string) string {
 			return fmt.Sprintf("%s(%s)", ident.Name, strings.Join(args, ", "))
 		}
 	case *ast.MemberExpr:
+		if e.Object != nil && e.Object.GetTypeTag() == "String" && !e.Object.IsListType() {
+			switch e.Field {
+			case "length", "size", "isEmpty":
+				return compileFieldMethod(&ast.CallExpr{Func: e}, e, itVar)
+			}
+		}
+		if ident, ok := e.Object.(*ast.Ident); ok && e.EnumConstant {
+			return ident.Name + e.Field
+		}
 		if ident, ok := e.Object.(*ast.Ident); ok && ident.Name == "it" {
 			return itVar + "." + str.Capitalize(e.Field)
 		}
@@ -2342,12 +2374,98 @@ func compileFieldExpr(expr ast.Expr, itVar string) string {
 		}
 		return e.Name
 	case *ast.Literal:
-		if e.Kind == token.Int || e.Kind == token.Float {
-			return e.Value
+		if e.Kind == token.Duration {
+			code, _ := compileDurationLiteral(e.Value)
+			return code
+		}
+		if e.Kind == token.Int || e.Kind == token.Float || e.Kind == token.True || e.Kind == token.False {
+			return compileNumericLiteral(e)
 		}
 		return fmt.Sprintf("%q", e.Value)
 	}
 	return ""
+}
+
+// Failed children must invalidate the whole generated call.
+// Normal analysis binds the supported fixed argument slots before field-method lowering.
+// Retain invalid-slot handling for inconsistent named-argument metadata.
+func compileFieldMethod(call *ast.CallExpr, member *ast.MemberExpr, itVar string) string {
+	positions, valid := fieldStringArgumentOrder(call, member.Field)
+	if !valid {
+		return ""
+	}
+	failed := false
+	compile := func(expression ast.Expr) string {
+		value := compileFieldExpr(expression, itVar)
+		if value == "" {
+			failed = true
+		}
+		return value
+	}
+	object := func() string { return compile(member.Object) }
+	argument := func(index int) string {
+		index = positions[index]
+		if index < 0 || index >= len(call.Args) || call.Args[index] == nil {
+			failed = true
+			return ""
+		}
+		return compile(call.Args[index].Value)
+	}
+	result := compileStringTransform(member.Field, object, argument, len(call.Args))
+	if result == "" {
+		result = compileStringQuery(member.Field, object, argument, len(call.Args))
+	}
+	if result == "" {
+		result = compileStringConvert(member.Field, object)
+	}
+	if failed {
+		return ""
+	}
+	return result
+}
+
+func fieldStringArgumentOrder(call *ast.CallExpr, method string) ([2]int, bool) {
+	signature, known := builtin.StringMethod(method)
+	if !known {
+		return [2]int{0, 1}, true
+	}
+	for _, argument := range call.Args {
+		if argument == nil {
+			return [2]int{}, false
+		}
+	}
+	positions, issue := signature.Bind(call.Args)
+	return positions, issue.Kind == ""
+}
+
+func compileFieldUnary(expr *ast.UnaryExpr, itVar string) string {
+	value := compileFieldExpr(expr.Value, itVar)
+	if value != "" && (expr.Op == "!" || expr.Op == "-" || expr.Op == "+") {
+		return compileUnaryOperation(expr, "("+value+")")
+	}
+	return ""
+}
+
+func compileFieldBinary(expr *ast.BinaryExpr, itVar string) string {
+	switch expr.Op {
+	case "+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "&&", "||":
+		left := compileFieldExpr(expr.Left, itVar)
+		right := compileFieldExpr(expr.Right, itVar)
+		if left == "" || right == "" {
+			return ""
+		}
+		left = groupBinaryOperand(expr.Left, left)
+		right = groupBinaryOperand(expr.Right, right)
+		if expr.Left.GetTypeTag() == "DateTime" && isDurationExpr(expr.Right) && (expr.Op == "+" || expr.Op == "-") {
+			return compileDateOffset(left, right, expr.Op)
+		}
+		if expression, ok := compileFloatArithmetic(expr, left, right); ok {
+			return expression
+		}
+		return left + " " + expr.Op + " " + right
+	default:
+		return ""
+	}
 }
 
 type computedAggregate struct {
@@ -2399,10 +2517,11 @@ func (g *GeneratorContext) generateComputedResolvers(b *strings.Builder, models 
 		if len(groups) == 0 {
 			continue
 		}
+		g.addComputedBindingSymbol(model.Name)
 		generateComputedResolver(b, model, groups)
 		generateComputedFieldResolver(b, model, groups)
 		for _, group := range groups {
-			generateComputedGroupResolver(b, model, group)
+			g.generateComputedGroupResolver(b, model, group)
 		}
 	}
 }
@@ -2529,7 +2648,7 @@ func computedMaskExpr(fields []computedAggregate) string {
 	return b.String()
 }
 
-func generateComputedGroupResolver(b *strings.Builder, model *ast.ModelDecl, group computedAggregateGroup) {
+func (g *GeneratorContext) generateComputedGroupResolver(b *strings.Builder, model *ast.ModelDecl, group computedAggregateGroup) {
 	valueType := str.LowerFirst(model.Name) + str.Capitalize(group.relation.FieldName) + "ComputedValue"
 	fmt.Fprintf(b, "type %s struct {\n", valueType)
 	for _, aggregate := range group.fields {
@@ -2539,7 +2658,7 @@ func generateComputedGroupResolver(b *strings.Builder, model *ast.ModelDecl, gro
 	fmt.Fprintf(b, "func resolve%s%sComputed(ctx context.Context, app *App, items []*%s, fieldMask []byte) error {\n",
 		model.Name, str.Capitalize(group.relation.FieldName), model.Name)
 	generateComputedKeys(b, model, group.relation)
-	generateComputedQuery(b, group)
+	g.generateComputedQuery(b, group)
 	generateComputedAssignments(b, model, group, valueType)
 	b.WriteString("\treturn nil\n")
 	b.WriteString("}\n\n")
@@ -2555,35 +2674,35 @@ func generateComputedKeys(b *strings.Builder, model *ast.ModelDecl, relation Rel
 	b.WriteString("\tif len(keys) == 0 { return nil }\n")
 }
 
-func generateComputedQuery(b *strings.Builder, group computedAggregateGroup) {
-	query := computedGroupSQL(group)
+func (g *GeneratorContext) generateComputedQuery(b *strings.Builder, group computedAggregateGroup) {
+	query := g.computedGroupSQL(group)
 	fmt.Fprintf(b, "\tquery := `%s`\n", query)
 	b.WriteString("\trows, err := pg.QueryRaw(ctx, app.DB, query, keys)\n")
 	b.WriteString("\tif err != nil { return err }\n")
 	b.WriteString("\tdefer rows.Close()\n")
 }
 
-func computedGroupSQL(group computedAggregateGroup) string {
+func (g *GeneratorContext) computedGroupSQL(group computedAggregateGroup) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, `SELECT "%s"`, str.ToSnakeCase(group.relation.RemoteKey))
+	fmt.Fprintf(&b, `SELECT %s`, g.sqlColumn(group.relation.RemoteKey))
 	for _, aggregate := range group.fields {
 		b.WriteString(", ")
-		b.WriteString(computedAggregateSQLExpr(aggregate))
+		b.WriteString(g.computedAggregateSQLExpr(aggregate))
 	}
-	fmt.Fprintf(&b, ` FROM "%s" WHERE "%s" = ANY($1)`, modelTableName(group.target.Name), str.ToSnakeCase(group.relation.RemoteKey))
+	fmt.Fprintf(&b, ` FROM %s WHERE %s = ANY($1)`, g.sqlTable(group.target.Name), g.sqlColumn(group.relation.RemoteKey))
 	if isSoftDelete(group.target) {
 		b.WriteString(` AND "deleted_at" IS NULL`)
 	}
-	fmt.Fprintf(&b, ` GROUP BY "%s"`, str.ToSnakeCase(group.relation.RemoteKey))
+	fmt.Fprintf(&b, ` GROUP BY %s`, g.sqlColumn(group.relation.RemoteKey))
 	return b.String()
 }
 
-func computedAggregateSQLExpr(aggregate computedAggregate) string {
+func (g *GeneratorContext) computedAggregateSQLExpr(aggregate computedAggregate) string {
 	if aggregate.directive == "count" {
 		return "COUNT(*)::bigint"
 	}
 	cast := map[string]string{"Int": "bigint", "Float": "double precision", "Decimal": "numeric"}[aggregate.field.Type.Name]
-	return fmt.Sprintf(`COALESCE(%s("%s"), 0)::%s`, strings.ToUpper(aggregate.directive), aggregate.targetCol, cast)
+	return fmt.Sprintf(`COALESCE(%s(%s), 0)::%s`, strings.ToUpper(aggregate.directive), g.sqlIdentifier(aggregate.targetCol), cast)
 }
 
 func generateComputedAssignments(b *strings.Builder, model *ast.ModelDecl, group computedAggregateGroup, valueType string) {
@@ -2620,20 +2739,13 @@ func (g *GeneratorContext) scanBodyForBuiltins(block *ast.Block, f *handlerFeatu
 	ast.WalkExprs(block, func(e ast.Expr) {
 		switch v := e.(type) {
 		case *ast.MemberExpr:
+			f.hasLog = f.hasLog || builtin.IsDebugProperty(v)
 			if ident, ok := v.Object.(*ast.Ident); ok && ident.Name == "crypto" {
 				f.hasCrypto = true
 			}
 			switch v.Field {
 			case "days", "hours", "minutes", "seconds", "milliseconds":
 				f.hasTimeFunc = true
-			case "i", "d", "w", "e":
-				// Only count as log if object is a string literal or template
-				if _, isLit := v.Object.(*ast.Literal); isLit {
-					f.hasLog = true
-				}
-				if _, isTmpl := v.Object.(*ast.TemplateString); isTmpl {
-					f.hasLog = true
-				}
 			}
 		case *ast.CallExpr:
 			if ident, ok := v.Func.(*ast.Ident); ok && ident.Name == "now" {
@@ -2708,10 +2820,16 @@ func modelFieldByName(model *ast.ModelDecl, name string) *ast.FieldDecl {
 	return nil
 }
 
-func generateRequiredSQLField(b *strings.Builder, column string) {
+func (g *GeneratorContext) generateRequiredSQLField(b *strings.Builder, column string) {
 	b.WriteString("\t\tif fields != nil {\n")
 	b.WriteString("\t\t\thasRequiredField := false\n")
 	fmt.Fprintf(b, "\t\t\tfor _, field := range fields { if field == %q { hasRequiredField = true; break } }\n", column)
 	fmt.Fprintf(b, "\t\t\tif !hasRequiredField { fields = append(fields, %q) }\n", column)
 	b.WriteString("\t\t}\n")
+}
+
+func (g *GeneratorContext) generateSoftDeleteCondition(b *strings.Builder, soft bool, indent string) {
+	if soft {
+		fmt.Fprintf(b, "%sconds = append(conds, lux.NewTimeField(%q).IsNull())\n", indent, g.sqlColumn("deletedAt"))
+	}
 }

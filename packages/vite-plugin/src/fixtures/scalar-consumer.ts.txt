@@ -1,6 +1,6 @@
 import { LuxoClient } from './client.js'
 import { responseTransport } from './response-transport.js'
-import { decodeLuxoJSON } from '@luxojs/client'
+import { decodeLuxoJSON, Encoder } from '@luxojs/client'
 
 type Receive = (value: unknown) => void
 type Subscribe = (receive: Receive) => Promise<() => void>
@@ -63,6 +63,18 @@ async function verify(type: string, scalar: Invoke, list: Invoke, singleStream: 
 }
 
 async function verifyJSONKinds(type: string, scalar: Invoke, list: Invoke, singleStream: Subscribe, listStream: Subscribe): Promise<void> {
+  if (type === 'JSON') {
+    await verifyJSONDepth(scalar, list, singleStream, listStream)
+    for (const number of [NaN, Infinity, -Infinity]) {
+      for (const value of [number, [number], { nested: number }]) {
+        response = value
+        await verifyInvalidValue('direct non-finite JSON', scalar, singleStream)
+        response = [value]
+        await verifyInvalidValue('direct non-finite JSON list', list, listStream)
+      }
+    }
+    return
+  }
   const textTypes = ['String', 'DateTime', 'UUID', 'Decimal', 'Enum', 'Bytes']
   if (type !== 'Boolean' && !textTypes.includes(type)) return
   const tokens = ['0', '1', '9007199254740993', '1.0', 'null', '[]', '{}']
@@ -78,6 +90,29 @@ async function verifyJSONKinds(type: string, scalar: Invoke, list: Invoke, singl
     response = [decodeLuxoJSON(token)]
     await verifyInvalidValue(type + ' JSON list ' + token, list, listStream)
   }
+}
+
+async function verifyJSONDepth(scalar: Invoke, list: Invoke, singleStream: Subscribe, listStream: Subscribe): Promise<void> {
+  for (const depth of [127, 128, 129]) for (const leaf of ['0', '[]', '{}', '1e400']) {
+    const text = '['.repeat(depth) + leaf + ']'.repeat(depth)
+    const value = decodeLuxoJSON(text)
+    const valid = depth + (leaf === '[]' || leaf === '{}' ? 1 : 0) <= 128
+    const encoder = new Encoder()
+    // Deliberately bypass the JSON writer to exercise malformed server input.
+    encoder.writeString(text)
+    const bytes = Array.from(encoder.bytes())
+    if (valid) {
+      await verifyValid('bounded JSON', bytes, value, scalar, singleStream)
+      await verifyValid('bounded JSON list', [2, ...bytes, ...bytes], [value, value], list, listStream)
+    } else {
+      await verifyInvalid('deep JSON', bytes, scalar, singleStream)
+      await verifyInvalid('deep JSON list', [1, ...bytes], list, listStream)
+    }
+  }
+  const hidden = '{"value":' + '['.repeat(128) + '0' + ']'.repeat(128) + ',"value":0}'
+  const encoder = new Encoder()
+  encoder.writeString(hidden)
+  await verifyInvalid('hidden deep JSON', Array.from(encoder.bytes()), scalar, singleStream)
 }
 
 async function verifyValid(name: string, bytes: number[], value: unknown, invoke: Invoke, subscribe: Subscribe): Promise<void> {

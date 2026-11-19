@@ -65,7 +65,7 @@ const jsonListPayloadAssertions = `package generated
 import ("fmt"; "testing"; "github.com/light-speak/luxo/pkg/lux/codec")
 func TestJSONListPayload(t *testing.T) {
     for _, input := range []bool{false, true} {
-        raw := codec.AppendArrayHeader([]byte{0, 1}, 32)
+        raw := codec.AppendVarint([]byte{0, 1}, uint64(32))
         raw = append(raw, 0)
         dec := codec.NewDecoder(raw)
         var value Payload
@@ -81,7 +81,7 @@ func TestJSONListPayload(t *testing.T) {
 }
 func BenchmarkPayloadJSONList(b *testing.B) {
     for _, count := range []int{0, 1, 128} {
-        data := codec.AppendArrayHeader([]byte{0, 1}, count)
+        data := codec.AppendVarint([]byte{0, 1}, uint64(count))
         for range count { data = codec.AppendBytes(data, []byte("9223372036854775807")) }
         data = append(data, 0)
         for _, before := range []bool{true, false} {
@@ -148,22 +148,124 @@ func writeProtocolFixture(t *testing.T, source, assertions string) string {
 			t.Fatal(err)
 		}
 	}
+	if strings.Contains(assertions, "LUXO_TEST_DATABASE_URL") {
+		if err := os.WriteFile(filepath.Join(dir, "postgres_fixture_test.go"), []byte(protocolPostgresFixture), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return dir
 }
+
+func TestGeneratedPostgresFixtureIsolation(t *testing.T) {
+	connection := os.Getenv("LUXO_TEST_DATABASE_URL")
+	if connection == "" {
+		t.Skip("requires an isolated LUXO_TEST_DATABASE_URL")
+	}
+	root, err := filepath.Abs("../../.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp(root, "postgres-isolation-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if filepath.Dir(dir) != root {
+			t.Fatal("fixture directory escaped project .tmp")
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
+	for _, name := range []string{"first", "second"} {
+		t.Setenv("LUXO_FIXTURE_SCHEMA_RECORD", filepath.Join(dir, name))
+		runGeneratedCompilation(t, &GenerateResult{Files: map[string][]byte{"model.gen.go": []byte("package generated\n")}}, postgresIsolationWriter)
+	}
+	first, err := os.ReadFile(filepath.Join(dir, "first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(filepath.Join(dir, "second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) == string(second) {
+		t.Fatal("independent consumers reused a schema")
+	}
+	t.Setenv("LUXO_FIXTURE_AUDIT_URL", connection)
+	t.Setenv("LUXO_FIXTURE_SCHEMAS", string(first)+","+string(second))
+	runGeneratedCompilation(t, &GenerateResult{Files: map[string][]byte{"model.gen.go": []byte("package generated\n")}}, postgresIsolationInspector)
+}
+
+func TestGeneratedPostgresFixtureWithoutDatabase(t *testing.T) {
+	t.Setenv("LUXO_TEST_DATABASE_URL", "")
+	runGeneratedCompilation(t, &GenerateResult{Files: map[string][]byte{"model.gen.go": []byte("package generated\n")}}, `package generated
+import("os";"testing")
+func TestNoDatabase(t *testing.T){if os.Getenv("LUXO_TEST_DATABASE_URL")!=""{t.Fatal("empty database environment changed")}}
+`)
+}
+
+const postgresIsolationWriter = `package generated
+import("os";"strings";"testing";"github.com/light-speak/luxo/pkg/lux/pg")
+func TestOwnSchema(t *testing.T){
+ db,err:=pg.NewDB(t.Context(),os.Getenv("LUXO_TEST_DATABASE_URL"));if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
+ name,err:=db.QueryScalar[string](t.Context(),"SELECT current_schema()");if err!=nil||!strings.HasPrefix(name,"luxo_fixture_"){t.Fatal("consumer did not get a private schema",name,err)}
+ if _,err:=pg.Exec(t.Context(),db,"CREATE TABLE users(id bigint PRIMARY KEY)");err!=nil{t.Fatal(err)}
+ if err:=os.WriteFile(os.Getenv("LUXO_FIXTURE_SCHEMA_RECORD"),[]byte(name),0600);err!=nil{t.Fatal(err)}
+}
+`
+
+const postgresIsolationInspector = `package generated
+import("os";"strings";"testing";"github.com/light-speak/luxo/pkg/lux/pg")
+func TestSchemasWereRemoved(t *testing.T){
+ db,err:=pg.NewDB(t.Context(),os.Getenv("LUXO_FIXTURE_AUDIT_URL"));if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
+ for _,name:=range strings.Split(os.Getenv("LUXO_FIXTURE_SCHEMAS"),","){
+  present,err:=db.QueryScalar[bool](t.Context(),"SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)",name)
+  if err!=nil||present{t.Fatal("consumer schema survived cleanup",name,err)}
+ }
+}
+`
+
+// This source is compiled only by consumers that already require the PG adapter.
+const protocolPostgresFixture = `package generated
+import("context";"crypto/rand";"encoding/hex";"fmt";"net/url";"os";"testing";"time";"github.com/light-speak/luxo/pkg/lux/pg")
+func TestMain(m *testing.M){ os.Exit(runIsolatedPostgresFixture(m)) }
+func runIsolatedPostgresFixture(m *testing.M) int {
+ connection:=os.Getenv("LUXO_TEST_DATABASE_URL");if connection==""{return m.Run()}
+ parsed,err:=url.Parse(connection);if err!=nil||(parsed.Scheme!="postgres"&&parsed.Scheme!="postgresql"){fmt.Fprintln(os.Stderr,"postgres fixture: invalid database URL");return 1}
+ var random [12]byte;if _,err:=rand.Read(random[:]);err!=nil{fmt.Fprintln(os.Stderr,"postgres fixture:",err);return 1}
+ name:="luxo_fixture_"+hex.EncodeToString(random[:])
+ setup,cancel:=context.WithTimeout(context.Background(),20*time.Second)
+ admin,err:=pg.NewDB(setup,connection);if err!=nil{cancel();fmt.Fprintln(os.Stderr,"postgres fixture:",err);return 1};defer admin.Close()
+ _,err=pg.Exec(setup,admin,"CREATE SCHEMA "+name);cancel();if err!=nil{fmt.Fprintln(os.Stderr,"postgres fixture:",err);return 1}
+ query:=parsed.Query();query.Set("search_path",name);parsed.RawQuery=query.Encode()
+ code:=1
+ if err:=os.Setenv("LUXO_TEST_DATABASE_URL",parsed.String());err!=nil{fmt.Fprintln(os.Stderr,"postgres fixture:",err)}else{code=m.Run()}
+ cleanup,cancel:=context.WithTimeout(context.Background(),20*time.Second);defer cancel()
+ if _,err:=pg.Exec(cleanup,admin,"DROP SCHEMA "+name+" CASCADE");err!=nil{fmt.Fprintln(os.Stderr,"postgres fixture cleanup:",err);return 1}
+ return code
+}
+`
 
 func protocolTestArgs() ([]string, bool) {
 	args := []string{"test", "-count=1", "-timeout=30s", "."}
 	benchmark := false
 	for _, option := range []struct{ env, name, duration, count string }{
 		{"LUXO_ARRAY_BENCHMARK", "BenchmarkArray", "200ms", "3"},
+		{"LUXO_SCAN_VALIDATION_BENCHMARK", "BenchmarkScanValidation", "200ms", "1"},
 		{"LUXO_SCANNER_BENCHMARK", "BenchmarkScannerDiscard", "200ms", "1"},
 		{"LUXO_NESTED_BENCHMARK", "BenchmarkNested", "200ms", "3"},
 		{"LUXO_FLOAT_BENCHMARK", "BenchmarkGeneratedFloat", "500ms", "1"},
 		{"LUXO_PAYLOAD_BENCHMARK", "BenchmarkPayload", "300ms", "1"},
 		{"LUXO_STRUCTURED_PARAM_BENCHMARK", "BenchmarkStructuredTransport", "200ms", "1"},
 		{"LUXO_ENUM_BENCHMARK", "BenchmarkEnum", "200ms", "1"},
+		{"LUXO_ERROR_MODEL_LIST_BENCHMARK", "BenchmarkErrorModelList", "200ms", "1"},
 		{"LUXO_CACHE_BENCHMARK", "BenchmarkCacheBoundary", "500ms", "1"},
 		{"LUXO_LOADER_BINDING_BENCHMARK", "BenchmarkLoaderBinding", "300ms", "1"},
+		{"LUXO_RELATION_CARDINALITY_BENCHMARK", "BenchmarkRelationCardinality", "300ms", "1"},
 		{"LUXO_EVENT_BENCHMARK", "BenchmarkEventNullable", "300ms", "1"},
 		{"LUXO_EVENT_SNAPSHOT_BENCHMARK", "BenchmarkEventSnapshot", "300ms", "1"},
 		{"LUXO_JSON_INPUT_BENCHMARK", "BenchmarkJSONInput", "200ms", "1"},
@@ -477,7 +579,7 @@ func writePointerArrayColumn(buf *api.ResponseBuf, items []Payload, mask []byte)
             values := item.Values
             if values == nil { continue }
             var cb []byte
-            cb = codec.AppendArrayHeader(cb, len(values))
+            cb = codec.AppendVarint(cb, uint64(len(values)))
             for _, v := range values { cb = codec.AppendSvarint(cb, v) }
             cells[i] = cb
             vals[i] = &cells[i]

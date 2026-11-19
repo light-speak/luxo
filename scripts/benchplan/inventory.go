@@ -14,17 +14,49 @@ import (
 
 type inventory map[string]map[string]struct{}
 
+// Both test binaries and go test package summaries can report failure.
+func isBenchmarkFailure(line string) bool {
+	return line == "FAIL" || strings.HasPrefix(line, "FAIL\t") ||
+		strings.HasPrefix(line, "FAIL ") || strings.HasPrefix(line, "--- FAIL:")
+}
+
+type benchmarkCompletion struct {
+	pending bool
+	passed  bool
+}
+
+func (state *benchmarkCompletion) observe(line string) error {
+	switch {
+	case line == "PASS":
+		state.pending, state.passed = false, true
+	case strings.HasPrefix(line, "pkg: "):
+		if state.pending {
+			return errors.New("benchmark run has no PASS before next package")
+		}
+	case strings.HasPrefix(line, "Benchmark"):
+		state.pending = true
+	}
+	return nil
+}
+
+func (state benchmarkCompletion) finish() error {
+	if state.pending || !state.passed {
+		return errors.New("benchmark run requires a final PASS after measurements")
+	}
+	return nil
+}
+
 func readInventory(input io.Reader) (inventory, error) {
 	result := make(inventory)
 	scanner := bufio.NewScanner(input)
-	passed := false
+	var completion benchmarkCompletion
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "FAIL" || strings.HasPrefix(line, "--- FAIL:") {
+		if isBenchmarkFailure(line) {
 			return nil, errors.New("benchmark inventory failed")
 		}
-		if line == "PASS" {
-			passed = true
+		if err := completion.observe(line); err != nil {
+			return nil, err
 		}
 		if !strings.HasPrefix(line, "Benchmark") {
 			continue
@@ -36,7 +68,10 @@ func readInventory(input io.Reader) (inventory, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	if !passed || len(result) == 0 {
+	if err := completion.finish(); err != nil {
+		return nil, err
+	}
+	if len(result) == 0 {
 		return nil, errors.New("inventory requires successful benchmark measurements and PASS")
 	}
 	return result, nil

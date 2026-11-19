@@ -6,6 +6,7 @@ import (
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux/str"
+	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
@@ -377,11 +378,12 @@ func TestGenerateModelRelationList(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateModel(&b, m, nil)
+	g := defaultGenerator().withModelReferences(&semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{m, {Name: "Post"}}}}})
+	g.generateModel(&b, m, nil)
 	got := b.String()
 
-	// List relation should use []Post (not pointer)
-	if !strings.Contains(got, "[]Post") {
+	// Model list fields share the reference representation used by callable bodies.
+	if !strings.Contains(got, "[]*Post") {
 		t.Errorf("list relation should use slice type:\n%s", got)
 	}
 	// Should have json-only tag (db:"-" → json only)
@@ -557,22 +559,22 @@ func TestGenerateModelWithAuth(t *testing.T) {
 	}
 	generateModel(&b, m, nil)
 	out := b.String()
-	if !strings.Contains(out, "func (m *Member) CreateToken() (string, error)") {
+	if !strings.Contains(out, "func (value *Member) CreateToken() (string, error)") {
 		t.Errorf("missing CreateToken: %s", out)
 	}
-	if !strings.Contains(out, "func (m *Member) RefreshToken(oldToken string) (string, error)") {
+	if !strings.Contains(out, "func (value *Member) RefreshToken(oldToken string) (string, error)") {
 		t.Errorf("missing RefreshToken: %s", out)
 	}
-	if !strings.Contains(out, `w.Int(m.Id)`) {
+	if !strings.Contains(out, `w.Int(value.Id)`) {
 		t.Errorf("missing static id writer: %s", out)
 	}
-	if !strings.Contains(out, `w.String(m.Role)`) {
+	if !strings.Contains(out, `w.String(value.Role)`) {
 		t.Errorf("missing static role writer: %s", out)
 	}
-	if !strings.Contains(out, "auth.Sign(cfg, m.AppendClaimsJSON)") || strings.Contains(out, "map[string]any") {
+	if !strings.Contains(out, `auth.SignForSubject(cfg, "Member", value.AppendClaimsJSON)`) || strings.Contains(out, "map[string]any") {
 		t.Errorf("missing auth.Sign call: %s", out)
 	}
-	if !strings.Contains(out, "auth.VerifyRefresh(cfg, oldToken)") {
+	if !strings.Contains(out, `auth.RefreshForSubject(cfg, "Member", oldToken)`) {
 		t.Errorf("missing auth.VerifyRefresh call: %s", out)
 	}
 }

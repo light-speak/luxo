@@ -327,3 +327,68 @@ func (e *rpcErrorEnvelopeWithoutData) readField(data []byte, offset int, field u
 	}
 	return size
 }
+
+// Frozen reference retains all data checks but has no native panic boundary.
+func encodeApplicationErrorBeforePanicIsolation(value *luxerrors.AppError) ([]byte, error) {
+	message := value.Message
+	if value.Internal {
+		message = "error.internal"
+	}
+	var raw, text []byte
+	if value.Data != nil && !value.Internal && value.Code < 500 {
+		var err error
+		raw, text, err = encodeRPCErrorData(value.Data)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return encodeRPCError(value.Code, value.Name, message, raw, text, value.Internal)
+}
+
+var panicIsolationEncoded []byte
+var panicIsolationError error
+
+func BenchmarkRPCErrorPanicIsolation(b *testing.B) {
+	for _, sample := range []struct {
+		name  string
+		value *luxerrors.AppError
+	}{
+		{"NoData", luxerrors.BadRequest},
+		{"Internal", luxerrors.InternalError.WithData(rpcPrecisionData{})},
+		{"Small", luxerrors.BadRequest.WithData(rpcNativeData{raw: `{"n":1}`})},
+		{"Precision", luxerrors.BadRequest.WithData(rpcPrecisionData{})},
+		{"Long", luxerrors.BadRequest.WithData(rpcNativeData{raw: `"` + strings.Repeat("a", 73728) + `"`})},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			before, beforeErr := encodeApplicationErrorBeforePanicIsolation(sample.value)
+			after, afterErr := encodeApplicationError(sample.value)
+			if beforeErr != nil || afterErr != nil || !bytes.Equal(before, after) {
+				b.Fatalf("panic isolation changed valid wire: %v / %v", beforeErr, afterErr)
+			}
+			for _, version := range []struct {
+				name string
+				call func(*luxerrors.AppError) ([]byte, error)
+			}{
+				{"Before", encodeApplicationErrorBeforePanicIsolation}, {"After", encodeApplicationError},
+			} {
+				b.Run(version.name, func(b *testing.B) {
+					b.ReportAllocs()
+					for b.Loop() {
+						panicIsolationEncoded, panicIsolationError = version.call(sample.value)
+					}
+				})
+			}
+		})
+	}
+}
+func BenchmarkRPCErrorPanicRecovery(b *testing.B) {
+	for _, text := range []bool{false, true} {
+		b.Run(fmt.Sprint(text), func(b *testing.B) {
+			value := luxerrors.BadRequest.WithData(panickingRPCErrorData{text})
+			b.ReportAllocs()
+			for b.Loop() {
+				panicIsolationEncoded, panicIsolationError = encodeApplicationError(value)
+			}
+		})
+	}
+}

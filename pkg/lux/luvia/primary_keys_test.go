@@ -35,6 +35,85 @@ func TestPrimaryKeysRequireCompleteParent(t *testing.T) {
 	}
 }
 
+func TestConvenienceKeysRequireCompleteParent(t *testing.T) {
+	_, model := primaryKeysTestSchema()
+	for _, columnar := range []bool{false, true} {
+		valid := primaryKeysTestMessage(columnar, false)
+		for name, data := range map[string][]byte{
+			"missing_end": valid[:len(valid)-1],
+			"trailing":    append(bytes.Clone(valid), 0),
+			"bad_tail":    append(bytes.Clone(valid[:len(valid)-1]), 2, 0x80),
+			"unknown":     append(bytes.Clone(valid[:len(valid)-1]), 99, 0),
+			"duplicate":   append(bytes.Clone(valid[:len(valid)-1]), 1, 2, 0),
+		} {
+			t.Run(map[bool]string{false: "row/", true: "column/"}[columnar]+name, func(t *testing.T) {
+				if columnar {
+					if ids := ExtractIDColumn(data, 1, model); ids != nil {
+						t.Fatal("invalid parent returned IDs", ids)
+					}
+				} else if id, ok := ExtractID(data, 1, map[int]codec.FieldSkipType{2: codec.SkipVarint}); ok || id != 0 {
+					t.Fatal("invalid parent returned ID", id, ok)
+				}
+			})
+		}
+	}
+}
+
+func TestConvenienceKeyColumnRequiresIntScalar(t *testing.T) {
+	data := []byte{1, 0, 1, 0, 0}
+	for _, field := range []schema.Field{
+		{ID: 1, Name: "key", Type: schema.FieldString},
+		{ID: 1, Name: "key", Type: schema.FieldInt, Nullable: true},
+		{ID: 1, Name: "key", Type: schema.FieldInt, IsList: true},
+	} {
+		registry := schema.New()
+		if err := registry.RegisterModel(&schema.Model{Name: "Parent", Fields: []schema.Field{field}}); err != nil {
+			t.Fatal(err)
+		}
+		if ids := ExtractIDColumn(data, 1, registry.Models["Parent"]); ids != nil {
+			t.Fatal("non-Int scalar column returned integer IDs", field, ids)
+		}
+	}
+	if ids := ExtractIDColumn(data, 1, nil); ids != nil {
+		t.Fatal("nil model returned IDs", ids)
+	}
+}
+
+func TestConvenienceKeysPreserveInt64Boundaries(t *testing.T) {
+	_, model := primaryKeysTestSchema()
+	for _, value := range []int64{0, -1, 1, -1 << 63, 1<<63 - 1} {
+		for _, keyLast := range []bool{false, true} {
+			row := []byte{0}
+			if keyLast {
+				row = append(row, 2, 0)
+			}
+			row = codec.AppendSvarint(append(row, 1), value)
+			if !keyLast {
+				row = append(row, 2, 0)
+			}
+			row = append(row, 0)
+			if id, ok := ExtractID(row, 1, map[int]codec.FieldSkipType{2: codec.SkipVarint}); !ok || id != value {
+				t.Fatal("valid Int64 changed", value, id, ok)
+			}
+			if ids := ExtractIDColumn(append([]byte{1}, row...), 1, model); len(ids) != 1 || ids[0] != value {
+				t.Fatal("valid Int64 column changed", value, ids)
+			}
+		}
+	}
+}
+
+func TestPrimaryKeysReferenceRequiresArenaPayload(t *testing.T) {
+	for _, columnar := range []bool{false, true} {
+		data := []byte{32, 1, 2, 0}
+		if columnar {
+			data = append([]byte{1}, data...)
+		}
+		if _, valid := primaryKeysReference(data, columnar); valid {
+			t.Fatal("independent oracle accepted arena larger than remaining payload")
+		}
+	}
+}
+
 func TestPrimaryKeysRejectNullableOrListKey(t *testing.T) {
 	for _, key := range []schema.Field{
 		{ID: 1, Type: schema.FieldInt, Nullable: true},

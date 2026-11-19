@@ -90,10 +90,14 @@ func verifySamples(input io.Reader, expected []sampleKey) error {
 func countSamples(input io.Reader, counts map[sampleKey]int) error {
 	scanner := bufio.NewScanner(input)
 	packagePath := ""
+	var completion benchmarkCompletion
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "FAIL" || strings.HasPrefix(line, "--- FAIL:") {
+		if isBenchmarkFailure(line) {
 			return errors.New("benchmark process failed")
+		}
+		if err := completion.observe(line); err != nil {
+			return err
 		}
 		if strings.HasPrefix(line, "pkg: ") {
 			packagePath = strings.TrimPrefix(line, "pkg: github.com/light-speak/luxo/")
@@ -102,14 +106,53 @@ func countSamples(input io.Reader, counts map[sampleKey]int) error {
 			continue
 		}
 		fields := strings.Fields(line)
-		if err := addMeasurement(make(inventory), fields); err != nil {
+		if err := countMeasurement(packagePath, fields, counts); err != nil {
 			return err
 		}
-		key := sampleKey{Package: packagePath, Name: fields[0]}
-		if _, exists := counts[key]; !exists {
-			return fmt.Errorf("unexpected benchmark measurement: %+v", key)
-		}
-		counts[key]++
 	}
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	return completion.finish()
+}
+
+func countMeasurement(packagePath string, fields []string, counts map[sampleKey]int) error {
+	if err := addMeasurement(make(inventory), fields); err != nil {
+		return err
+	}
+	if err := requireStandardMetrics(fields); err != nil {
+		return fmt.Errorf("%s/%s: %w", packagePath, fields[0], err)
+	}
+	key := sampleKey{Package: packagePath, Name: fields[0]}
+	if _, exists := counts[key]; !exists {
+		return fmt.Errorf("unexpected benchmark measurement: %+v", key)
+	}
+	counts[key]++
+	return nil
+}
+
+// CI uses -benchmem: every sample must retain time, bytes and allocations.
+func requireStandardMetrics(fields []string) error {
+	var present uint8
+	for i := 3; i < len(fields); i += 2 {
+		var bit uint8
+		switch fields[i] {
+		case "ns/op":
+			bit = 1
+		case "B/op":
+			bit = 2
+		case "allocs/op":
+			bit = 4
+		default:
+			continue
+		}
+		if present&bit != 0 {
+			return fmt.Errorf("duplicate benchmark metric %q", fields[i])
+		}
+		present |= bit
+	}
+	if present != 7 {
+		return errors.New("benchmark sample requires ns/op, B/op and allocs/op")
+	}
+	return nil
 }

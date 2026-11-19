@@ -212,8 +212,11 @@ func TestFixtureGatewayFollowsGeneratedHelpers(t *testing.T) {
 	source := []byte(`package main
 import "fmt"
 import "net"
-func proxyHandler() { proxyFirst(); proxyFirst() }
-func proxyFirst() { proxySecond() }
+type proxyConfig struct { state proxyState }
+type proxyState struct { apiID int }
+type unusedType struct { conn net.Conn }
+func proxyHandler() { proxyFirst(proxyConfig{}); proxyFirst(proxyConfig{}) }
+func proxyFirst(config proxyConfig) { proxySecond() }
 func proxySecond() { fmt.Print("helper"); proxyFirst() }
 func rpcStreamProxy() {}
 func unused() { net.Listen("tcp", "") }
@@ -223,15 +226,23 @@ func main() { unused() }
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, included := range []string{"func proxyFirst(", "func proxySecond(", `"fmt"`} {
+	for _, included := range []string{"func proxyFirst(", "func proxySecond(", "type proxyConfig struct", "type proxyState struct", `"fmt"`} {
 		if !bytes.Contains(generated, []byte(included)) {
 			t.Errorf("missing reachable helper dependency %q", included)
 		}
 	}
-	for _, excluded := range []string{"func main(", "func unused(", `"net"`} {
+	for _, excluded := range []string{"func main(", "func unused(", "type unusedType struct", `"net"`} {
 		if bytes.Contains(generated, []byte(excluded)) {
 			t.Errorf("included unrelated deployment code %q", excluded)
 		}
+	}
+}
+
+func TestFixtureGatewayCanSelectUnaryRoot(t *testing.T) {
+	source := []byte("package main\nfunc proxyHandler() { helper() }; func helper() {}; func unused() {}")
+	generated, err := fixtureGatewayProxies(source, "proxyHandler")
+	if err != nil || !bytes.Contains(generated, []byte("func helper(")) || bytes.Contains(generated, []byte("func unused(")) {
+		t.Fatalf("unary gateway dependencies: %v\n%s", err, generated)
 	}
 }
 

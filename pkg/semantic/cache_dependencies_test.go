@@ -29,7 +29,7 @@ return user.team.id`},
 model User { id: Int @id
 score: Int
 teamId: Int
-team: Team @by(teamId) }
+team: Team @by(id, teamId) }
 ` + test.declarations + "\napi cached(): " + returnType + " @cache(policy: \"preview\") {\n" + test.body + "\n}"
 			result := analyzeCached(t, source)
 			expectNoErrors(t, result)
@@ -82,7 +82,7 @@ func TestCacheDependenciesMergeNativeAndModuleReads(t *testing.T) {
 	reader := parseFileWithName(t, `extend User { id: Int @id }
 model Audit { id: Int @id }
 fn rates(): Result<Int> @native @cacheable(dependsOn: [Audit, "rates"])
-fn helper(): Int { return User.load(1).id + rates()? }
+fn helper(): Int { val user = User.load(1) ?: throw error.NotFound return user.id + rates()? }
 api cached(): Int @cache(policy: "preview") { return helper() + Audit.count() }`, "origin/reports/api.luxo")
 	want := []CacheDependency{
 		{Kind: CacheModelDependency, Name: "Audit", Module: "reports"},

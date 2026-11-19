@@ -4,17 +4,23 @@ import 'dart:typed_data';
 
 import 'package:web/web.dart' as web;
 
+import 'deadline.dart';
+
 class LuxoSocket {
   final web.WebSocket _socket;
   final _messages = StreamController<Object>();
   late final StreamSubscription<web.MessageEvent> _messageSubscription;
   late final StreamSubscription<web.CloseEvent> _closeSubscription;
   bool _closed = false;
+  int? _closeCode;
+
+  int? get closeCode => _closeCode;
 
   LuxoSocket(this._socket) {
     _socket.binaryType = 'arraybuffer';
     _messageSubscription = _socket.onMessage.listen(_receive);
-    _closeSubscription = _socket.onClose.listen((_) {
+    _closeSubscription = _socket.onClose.listen((event) {
+      _closeCode = event.code;
       unawaited(_finish(closeSocket: false));
     });
     _messages.onCancel = close;
@@ -56,7 +62,10 @@ class LuxoSocket {
   }
 }
 
-Future<LuxoSocket> connectSocket(String url) async {
+Future<LuxoSocket> connectSocket(
+  String url, {
+  Duration timeout = const Duration(seconds: 30),
+}) async {
   final socket = web.WebSocket(url);
   final completer = Completer<void>();
   final openSub = socket.onOpen.listen((_) {
@@ -70,7 +79,7 @@ Future<LuxoSocket> connectSocket(String url) async {
   final errorSub = socket.onError.listen(fail);
   final closeSub = socket.onClose.listen(fail);
   try {
-    await completer.future;
+    await withDeadline(completer.future, timeout);
     return LuxoSocket(socket);
   } catch (_) {
     socket.close();

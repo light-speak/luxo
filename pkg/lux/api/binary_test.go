@@ -25,6 +25,21 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+func TestEncodeBinaryRequestRejectsOversizedArrays(t *testing.T) {
+	for _, sample := range []struct {
+		kind  string
+		value any
+	}{
+		{"Boolean", make([]any, codec.MaxArrayElements+1)},
+		{"Model", make(BinaryMessages, codec.MaxArrayElements+1)},
+	} {
+		data, err := EncodeBinaryRequest(1, nil, map[string]any{"items": sample.value}, []ParamMeta{{FieldID: 1, Name: "items", Type: sample.kind, IsList: true}})
+		if data != nil || err != codec.ErrInvalidArrayCount {
+			t.Fatal("oversized request", sample.kind, len(data), err)
+		}
+	}
+}
+
 func TestEncodeBinaryRequestOwnsOutput(t *testing.T) {
 	meta := []ParamMeta{{Name: "data", Type: "Bytes", FieldID: 1}}
 	data := bytes.Repeat([]byte{0x5a}, 4096)
@@ -426,6 +441,36 @@ func TestBinaryRequestRetainsCanonicalWireBytes(t *testing.T) {
 	}
 	if !bytes.Equal(req.BinaryRequest(), body) {
 		t.Fatalf("binary request changed: got %x want %x", req.BinaryRequest(), body)
+	}
+}
+
+func TestBinaryDecimalRequestCompactOutput(t *testing.T) {
+	registry := NewAPIRegistry()
+	if err := registry.Register("decimal", 1); err != nil {
+		t.Fatal(err)
+	}
+	metadata := []ParamMeta{{Name: "value", Type: "Decimal", FieldID: 1}, {Name: "values", Type: "Decimal", IsList: true, FieldID: 2}}
+	if err := registry.RegisterParams("decimal", metadata); err != nil {
+		t.Fatal(err)
+	}
+	for _, exponent := range []int32{-2147483648, 2147483647} {
+		value := decimal.New(123, exponent)
+		body := mustEncodeBinaryRequest(t, 1, nil, map[string]any{"value": value, "values": []decimal.Decimal{value}}, metadata)
+		if len(body) > 128 {
+			t.Fatal("decimal request expanded", len(body))
+		}
+		request, err := registry.ParseBinaryRequest(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scalar, err := request.ParamDecimal("value")
+		if err != nil || scalar.Exponent() != exponent || scalar.Coefficient().Int64() != 123 {
+			t.Fatal("scalar representation changed", err)
+		}
+		items, err := request.ParamDecimalArray("values")
+		if err != nil || len(items) != 1 || items[0].Exponent() != exponent || items[0].Coefficient().Int64() != 123 {
+			t.Fatal("list representation changed", err)
+		}
 	}
 }
 
@@ -1244,7 +1289,7 @@ func TestBinaryListPreflightsElementPayload(t *testing.T) {
 				width = 16
 			}
 			for end := range 3 * width {
-				data := append(codec.AppendArrayHeader([]byte{42}, 3), make([]byte, end)...)
+				data := append(codec.AppendVarint([]byte{42}, uint64(3)), make([]byte, end)...)
 				value, consumed, err := readBinaryListParam(data, 1, ParamMeta{Name: "values", Type: kind})
 				if value != nil || consumed != 0 || err == nil || !strings.Contains(err.Error(), "insufficient element bytes") {
 					t.Fatalf("short payload not rejected before decoding: end=%d consumed=%d err=%v", end, consumed, err)
@@ -1366,6 +1411,13 @@ func TestParseBinaryRequestAppliesPaginationParams(t *testing.T) {
 	reg.Register("listUsers", 1)
 	meta := []ParamMeta{{Name: "page", Type: "Int", FieldID: 1}, {Name: "pageSize", Type: "Int", FieldID: 2}}
 	reg.RegisterParams("listUsers", meta)
+	s := schema.New()
+	if err := s.RegisterAPI(&schema.API{ID: 1, Name: "listUsers", Paginated: true, DefaultPageSize: defaultPageSize}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.SetSchema(s); err != nil {
+		t.Fatal(err)
+	}
 	req, err := reg.ParseBinaryRequest(mustEncodeBinaryRequest(t, 1, nil, map[string]any{"page": 3, "pageSize": 40}, meta))
 	if err != nil {
 		t.Fatal(err)
@@ -1792,7 +1844,7 @@ func TestStructuredBinaryParamsRejectInvalidMessageContainers(t *testing.T) {
 	if _, _, err := readBinaryParam(nil, 0, ParamMeta{Name: "input", Type: "Model", TypeName: "CreateInput"}); err == nil {
 		t.Fatal("truncated structured message was decoded")
 	}
-	body := codec.AppendArrayHeader(nil, 1)
+	body := codec.AppendVarint(nil, uint64(1))
 	if _, _, err := readBinaryParam(body, 0, ParamMeta{Name: "inputs", Type: "Model", TypeName: "CreateInput", IsList: true}); err == nil {
 		t.Fatal("truncated structured message list was decoded")
 	}
@@ -1899,6 +1951,33 @@ func TestNullableBinaryParamRequiresMarker(t *testing.T) {
 	registry.RegisterParams("update", []ParamMeta{{Name: "name", Type: "String", FieldID: 1, Nullable: true}})
 	if _, err := registry.ParseBinaryRequest([]byte{10, 0, 1}); err == nil {
 		t.Fatal("missing nullable marker should fail")
+	}
+}
+
+func TestNullableJSONBinaryParamsNormalizeNull(t *testing.T) {
+	meta := []ParamMeta{{Name: "document", Type: "JSON", FieldID: 1, Nullable: true}, {Name: "missing", Type: "JSON", FieldID: 2, Nullable: true}}
+	registry := NewAPIRegistry()
+	registry.Register("update", 10)
+	registry.RegisterParams("update", meta)
+	for _, text := range []string{"null", " \t\r\nnull \t\r\n"} {
+		wire := mustEncodeBinaryRequest(t, 10, nil, map[string]any{"document": json.RawMessage(text)}, meta)
+		if !bytes.Equal(wire, []byte{10, 0, 1, 0, 0}) {
+			t.Fatalf("nullable JSON wire: %x", wire)
+		}
+		legacy := append(append([]byte{10, 0, 1, 1}, codec.AppendBytes(nil, []byte(text))...), 0)
+		for _, input := range [][]byte{wire, legacy} {
+			req, err := registry.ParseBinaryRequest(input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !req.HasParam("document") || !req.ParamIsNull("document") || req.HasParam("missing") || req.ParamIsNull("missing") {
+				t.Fatal("explicit null, present null and missing were confused")
+			}
+		}
+	}
+	legacy := append(append([]byte{10, 0, 1, 1}, codec.AppendBytes(nil, []byte("null false"))...), 0)
+	if _, err := registry.ParseBinaryRequest(legacy); err == nil {
+		t.Fatal("malformed former null payload accepted")
 	}
 }
 
@@ -2251,13 +2330,13 @@ func TestParseBinaryRequestFieldMaskLenOverflow(t *testing.T) {
 	}
 }
 
-// --- ParseBinaryRequest: too many params ---
+// --- ParseBinaryRequest: extended parameter storage ---
 
-func TestParseBinaryRequestTooManyParams(t *testing.T) {
+func TestParseBinaryRequestExtendedParams(t *testing.T) {
 	reg := NewAPIRegistry()
 	reg.Register("test", 1)
 
-	// Register 17 params (> 16 limit)
+	// Register one parameter beyond the inline storage.
 	var params []ParamMeta
 	for i := 0; i < 17; i++ {
 		params = append(params, ParamMeta{
@@ -2268,7 +2347,7 @@ func TestParseBinaryRequestTooManyParams(t *testing.T) {
 	}
 	reg.RegisterParams("test", params)
 
-	// Build request with param at index 16 (exceeds limit)
+	// The last registered parameter must remain readable.
 	var body []byte
 	body = codec.AppendVarint(body, 1) // API ID
 	body = codec.AppendVarint(body, 0) // mask=0
@@ -2277,12 +2356,12 @@ func TestParseBinaryRequestTooManyParams(t *testing.T) {
 	body = codec.AppendSvarint(body, int64(1)) // value
 	body = append(body, 0x00)                  // end
 
-	_, err := reg.ParseBinaryRequest(body)
-	if err == nil {
-		t.Fatal("should error when param index >= 16")
+	req, err := reg.ParseBinaryRequest(body)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(err.Error(), "too many params") {
-		t.Errorf("unexpected error: %v", err)
+	if value, err := req.ParamInt("p16"); err != nil || value != 1 {
+		t.Fatal(value, err)
 	}
 }
 
@@ -2501,12 +2580,12 @@ func TestReadBinaryParamRejectsMalformedWireValues(t *testing.T) {
 }
 
 func TestReadBinaryListParamRejectsMalformedWireValues(t *testing.T) {
-	truncatedElement := codec.AppendArrayHeader(nil, 1)
-	invalidDecimal := codec.AppendArrayHeader(nil, 1)
+	truncatedElement := codec.AppendVarint(nil, uint64(1))
+	invalidDecimal := codec.AppendVarint(nil, uint64(1))
 	invalidDecimal = codec.AppendBytes(invalidDecimal, []byte("invalid"))
-	invalidJSON := codec.AppendArrayHeader(nil, 1)
+	invalidJSON := codec.AppendVarint(nil, uint64(1))
 	invalidJSON = codec.AppendBytes(invalidJSON, []byte(`{"ok":`))
-	overLimit := codec.AppendArrayHeader(nil, codec.MaxArrayElements+1)
+	overLimit := codec.AppendVarint(nil, uint64(codec.MaxArrayElements+1))
 	tests := []struct {
 		name     string
 		typeName string
@@ -2526,7 +2605,7 @@ func TestReadBinaryListParamRejectsMalformedWireValues(t *testing.T) {
 		{name: "bytes", typeName: "Bytes", data: truncatedElement},
 		{name: "JSON", typeName: "JSON", data: truncatedElement},
 		{name: "invalid JSON", typeName: "JSON", data: invalidJSON},
-		{name: "unknown", typeName: "Unknown", data: codec.AppendArrayHeader(nil, 0)},
+		{name: "unknown", typeName: "Unknown", data: codec.AppendVarint(nil, uint64(0))},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -2535,5 +2614,96 @@ func TestReadBinaryListParamRejectsMalformedWireValues(t *testing.T) {
 				t.Fatal("malformed binary list parameter was accepted")
 			}
 		})
+	}
+}
+
+func TestBinaryParameterCapacityPreservesStates(t *testing.T) {
+	for _, count := range []int{17, 32, 65} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			registry := NewAPIRegistry()
+			if err := registry.Register("wide", 1); err != nil {
+				t.Fatal(err)
+			}
+			meta := make([]ParamMeta, count)
+			for i := range meta {
+				meta[i] = ParamMeta{Name: fmt.Sprintf("p%d", i), Type: "Int", Nullable: true, FieldID: i + 1}
+			}
+			if err := registry.RegisterParams("wide", meta); err != nil {
+				t.Fatal(err)
+			}
+			values := map[string]any{"p0": int64(math.MaxInt64), "p15": int64(math.MinInt64), "p16": nil}
+			if count > 17 {
+				values[meta[count-1].Name] = int64(42)
+			}
+			body, err := EncodeBinaryRequest(1, nil, values, meta)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := registry.ParseBinaryRequest(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range meta {
+				name := meta[i].Name
+				want, present := values[name]
+				got, found := req.findParam(name)
+				if found != present || got != want || req.ParamIsNull(name) != (present && want == nil) {
+					t.Fatalf("%s value=%v present=%v null=%v want=%v present=%v", name, got, found, req.ParamIsNull(name), want, present)
+				}
+			}
+			duplicate := append([]byte(nil), body[:len(body)-1]...)
+			duplicate = codec.AppendVarint(duplicate, 17)
+			duplicate = append(duplicate, 0, 0) // Explicit null followed by the parameter terminator.
+			if _, err := registry.ParseBinaryRequest(duplicate); err == nil || !strings.Contains(err.Error(), "duplicate param") {
+				t.Fatalf("duplicate overflow parameter accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestExtendedParameterRequestReuseAndStreamSnapshot(t *testing.T) {
+	registry := NewAPIRegistry()
+	for id, name := range []string{"wide", "small"} {
+		if err := registry.Register(name, id+1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	meta := make([]ParamMeta, 65)
+	for i := range meta {
+		meta[i] = ParamMeta{Name: fmt.Sprintf("p%d", i), Type: "Int", Nullable: true, FieldID: i + 1}
+	}
+	if err := registry.RegisterParams("wide", meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.RegisterParams("small", meta[:1]); err != nil {
+		t.Fatal(err)
+	}
+	body, err := EncodeBinaryRequest(1, nil, map[string]any{"p16": nil, "p64": int64(42)}, meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req Request
+	if err := registry.ParseBinaryRequestInto(body, &req); err != nil {
+		t.Fatal(err)
+	}
+	params := binaryStreamParams(&req)
+	if value, present := params["p16"]; !present || value != nil || params["p64"] != int64(42) || len(params) != 2 {
+		t.Fatal(params)
+	}
+	small, err := EncodeBinaryRequest(2, nil, map[string]any{"p0": int64(7)}, meta[:1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.ParseBinaryRequestInto(small, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.HasParam("p16") || req.HasParam("p64") || req.ParamIsNull("p16") {
+		t.Fatal("previous request state retained")
+	}
+	if value, err := req.ParamInt("p0"); err != nil || value != 7 {
+		t.Fatal(value, err)
+	}
+	if params["p64"] != int64(42) {
+		t.Fatal("stream parameter snapshot changed after reuse")
 	}
 }

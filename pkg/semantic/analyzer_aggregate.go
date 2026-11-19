@@ -36,7 +36,7 @@ func (a *Analyzer) checkScalarAggregate(call *ast.CallExpr, scope *Scope) (*Reso
 	if member.Field == "avg" && result.Kind == TypeInt {
 		result = a.types["Float"]
 	}
-	setExprResolvedType(expr, field.Type)
+	a.setExprResolvedType(expr, field.Type)
 	return result, true
 }
 

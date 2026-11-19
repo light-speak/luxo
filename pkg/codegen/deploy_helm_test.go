@@ -1,13 +1,60 @@
 package codegen
 
 import (
+	"bytes"
 	"strings"
 	"testing"
+	"text/template"
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
+	"gopkg.in/yaml.v3"
 )
+
+func TestHelmConditionalResourceHeader(t *testing.T) {
+	helm := GenerateHelmFiles(makeHelmResult("user"), "probe")
+	for _, sample := range []struct {
+		file, flag, option, apiVersion, kind string
+	}{
+		{"serviceaccount.yaml", "serviceAccount", "create", "v1", "ServiceAccount"},
+		{"ingress.yaml", "ingress", "enabled", "networking.k8s.io/v1", "Ingress"},
+	} {
+		for _, enabled := range []bool{false, true} {
+			label := "disabled"
+			if enabled {
+				label = "enabled"
+			}
+			t.Run(sample.file+"/"+label, func(t *testing.T) {
+				source := helm.Files["templates/"+sample.file]
+				end := bytes.Index(source, []byte("\nmetadata:"))
+				if end < 0 {
+					t.Fatal("generated resource has no metadata boundary")
+				}
+				// Header actions use Go's template engine; full Helm consumption is checked separately.
+				header, err := template.New("header").Parse(string(source[:end]) + "\n{{- end }}\n")
+				if err != nil {
+					t.Fatal(err)
+				}
+				values := map[string]map[string]map[string]bool{"Values": {sample.flag: {sample.option: enabled}}}
+				var rendered bytes.Buffer
+				if err := header.Execute(&rendered, values); err != nil {
+					t.Fatal(err)
+				}
+				var resource struct {
+					APIVersion string `yaml:"apiVersion"`
+					Kind       string `yaml:"kind"`
+				}
+				if err := yaml.Unmarshal(rendered.Bytes(), &resource); err != nil {
+					t.Fatal(err)
+				}
+				if enabled && (resource.APIVersion != sample.apiVersion || resource.Kind != sample.kind) || !enabled && (resource.APIVersion != "" || resource.Kind != "") {
+					t.Fatalf("conditional resource header is invalid: %+v\n%s", resource, rendered.String())
+				}
+			})
+		}
+	}
+}
 
 func makeHelmResult(modules ...string) *semantic.Result {
 	var files []*ast.File

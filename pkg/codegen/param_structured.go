@@ -8,22 +8,23 @@ import (
 )
 
 // Local JSON reads the generated type directly; binary/RPC keeps wire readers.
-func writeStructuredParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string) {
+func writeStructuredParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string, keys ...string) {
 	writeStructuredParamDeclaration(b, param, enums, indent)
 	fmt.Fprintf(b, "%sif req.Params != nil {\n", indent)
-	writeStructuredJSONParamDecode(b, param, indent+"\t")
+	writeStructuredJSONParamDecode(b, param, indent+"\t", keys...)
 	fmt.Fprintf(b, "%s} else {\n", indent)
 	if param.Type.IsList {
-		writeStructuredListParamDecode(b, param, indent+"\t")
+		writeStructuredListParamDecode(b, param, indent+"\t", keys...)
 	} else {
-		writeStructuredScalarParamDecode(b, param, indent+"\t")
+		writeStructuredScalarParamDecode(b, param, indent+"\t", keys...)
 	}
 	fmt.Fprintf(b, "%s}\n", indent)
 }
 
-func writeStructuredJSONParamDecode(b *strings.Builder, param *ast.ParamDecl, indent string) {
+func writeStructuredJSONParamDecode(b *strings.Builder, param *ast.ParamDecl, indent string, keys ...string) {
 	name := param.Name
-	fmt.Fprintf(b, "%s_%sInput, _%sPresent, err := req.ParamInput(%q, %t, %t)\n", indent, name, name, name, param.Default != nil, param.Type.Nullable)
+	key := paramWireKey(param, keys)
+	fmt.Fprintf(b, "%s_%sInput, _%sPresent, err := req.ParamInput(%q, %t, %t)\n", indent, name, name, key, param.Default != nil, param.Type.Nullable)
 	fmt.Fprintf(b, "%sif err != nil { return err }\n", indent)
 	fmt.Fprintf(b, "%sif _%sPresent && _%sInput != nil {\n", indent, name, name)
 	if param.Type.IsList {
@@ -34,13 +35,14 @@ func writeStructuredJSONParamDecode(b *strings.Builder, param *ast.ParamDecl, in
 		}
 		fmt.Fprintf(b, "%s\terr = %s.ReadJSONInput(_%sInput)\n", indent, name, name)
 	}
-	fmt.Fprintf(b, "%s\tif err != nil { return api.InvalidParam(%q, err) }\n", indent, name)
+	fmt.Fprintf(b, "%s\tif err != nil { return api.InvalidParam(%q, err) }\n", indent, key)
 	writeStructuredNullBranch(b, param, indent)
 }
 
-func writeStructuredScalarParamDecode(b *strings.Builder, param *ast.ParamDecl, indent string) {
+func writeStructuredScalarParamDecode(b *strings.Builder, param *ast.ParamDecl, indent string, keys ...string) {
 	name := param.Name
-	fmt.Fprintf(b, "%s_%sMessage, _%sPresent, err := req.ParamMessage(%q, %t, %t)\n", indent, name, name, name, param.Default != nil, param.Type.Nullable)
+	key := paramWireKey(param, keys)
+	fmt.Fprintf(b, "%s_%sMessage, _%sPresent, err := req.ParamMessage(%q, %t, %t)\n", indent, name, name, key, param.Default != nil, param.Type.Nullable)
 	fmt.Fprintf(b, "%sif err != nil { return err }\n", indent)
 	fmt.Fprintf(b, "%sif _%sPresent && _%sMessage != nil {\n", indent, name, name)
 	fmt.Fprintf(b, "%s\t_%sDecoder := codec.NewDecoder(_%sMessage)\n", indent, name, name)
@@ -48,20 +50,21 @@ func writeStructuredScalarParamDecode(b *strings.Builder, param *ast.ParamDecl, 
 		fmt.Fprintf(b, "%s\t%s = &%s{}\n", indent, name, param.Type.Name)
 	}
 	fmt.Fprintf(b, "%s\t%s.ReadLuxoInput(_%sDecoder)\n", indent, name, name)
-	fmt.Fprintf(b, "%s\tif err := _%sDecoder.Finish(); err != nil { return api.InvalidParam(%q, err) }\n", indent, name, name)
+	fmt.Fprintf(b, "%s\tif err := _%sDecoder.Finish(); err != nil { return api.InvalidParam(%q, err) }\n", indent, name, key)
 	writeStructuredNullBranch(b, param, indent)
 }
 
-func writeStructuredListParamDecode(b *strings.Builder, param *ast.ParamDecl, indent string) {
+func writeStructuredListParamDecode(b *strings.Builder, param *ast.ParamDecl, indent string, keys ...string) {
 	name := param.Name
-	fmt.Fprintf(b, "%s_%sMessages, _%sPresent, err := req.ParamMessageArray(%q, %t, %t)\n", indent, name, name, name, param.Default != nil, param.Type.Nullable)
+	key := paramWireKey(param, keys)
+	fmt.Fprintf(b, "%s_%sMessages, _%sPresent, err := req.ParamMessageArray(%q, %t, %t)\n", indent, name, name, key, param.Default != nil, param.Type.Nullable)
 	fmt.Fprintf(b, "%sif err != nil { return err }\n", indent)
 	fmt.Fprintf(b, "%sif _%sPresent && _%sMessages != nil {\n", indent, name, name)
 	fmt.Fprintf(b, "%s\t%s = make([]%s, len(_%sMessages))\n", indent, name, param.Type.Name, name)
 	fmt.Fprintf(b, "%s\tfor _index := range _%sMessages {\n", indent, name)
 	fmt.Fprintf(b, "%s\t\t_%sDecoder := codec.NewDecoder(_%sMessages[_index])\n", indent, name, name)
 	fmt.Fprintf(b, "%s\t\t%s[_index].ReadLuxoInput(_%sDecoder)\n", indent, name, name)
-	fmt.Fprintf(b, "%s\t\tif err := _%sDecoder.Finish(); err != nil { return api.InvalidParam(%q, err) }\n", indent, name, name)
+	fmt.Fprintf(b, "%s\t\tif err := _%sDecoder.Finish(); err != nil { return api.InvalidParam(%q, err) }\n", indent, name, key)
 	fmt.Fprintf(b, "%s\t}\n", indent)
 	writeStructuredNullBranch(b, param, indent)
 }
@@ -71,4 +74,13 @@ func writeStructuredNullBranch(b *strings.Builder, param *ast.ParamDecl, indent 
 		fmt.Fprintf(b, "%s} else if _%sPresent {\n%s\t%s = nil\n", indent, param.Name, indent, param.Name)
 	}
 	fmt.Fprintf(b, "%s}\n", indent)
+}
+
+// Readers retain contiguous object storage; only the reference index is added.
+func writeModelListParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent, key string) {
+	fmt.Fprintf(b, "%svar %s []*%s\n%s{\n", indent, param.Name, param.Type.Name, indent)
+	values := *param
+	values.Name = "_modelValues" + param.Name
+	writeStructuredParamExtraction(b, &values, enums, indent+"\t", key)
+	fmt.Fprintf(b, "%s\t%s = reference%sList(%s)\n%s}\n", indent, param.Name, param.Type.Name, values.Name, indent)
 }

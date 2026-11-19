@@ -6,15 +6,17 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/light-speak/luxo/pkg/lux"
 	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 )
 
 type methodTestRows struct {
 	pgx.Rows
-	left    int
-	closed  bool
-	err     error
-	scanErr error
+	left     int
+	closed   bool
+	closeErr error
+	err      error
+	scanErr  error
 }
 
 func TestQueryFirstRequired(t *testing.T) {
@@ -57,7 +59,12 @@ func TestQueryFirstRequired(t *testing.T) {
 	}
 }
 
-func (r *methodTestRows) Close()     { r.closed = true }
+func (r *methodTestRows) Close() {
+	r.closed = true
+	if r.closeErr != nil {
+		r.err = r.closeErr
+	}
+}
 func (r *methodTestRows) Err() error { return r.err }
 func (r *methodTestRows) Next() bool {
 	r.left--
@@ -166,7 +173,7 @@ func TestDBQueryRowsMethods(t *testing.T) {
 
 func TestDBQueryRowMethods(t *testing.T) {
 	wantErr := errors.New("row failure")
-	for _, failure := range []string{"none", "empty", "query", "scan", "iterate"} {
+	for _, failure := range []string{"none", "empty", "query", "scan", "iterate", "completion"} {
 		t.Run(failure, func(t *testing.T) {
 			rows := &methodTestRows{left: 1}
 			c := &methodTestConn{rows: rows}
@@ -179,6 +186,8 @@ func TestDBQueryRowMethods(t *testing.T) {
 				rows.scanErr = wantErr
 			case "iterate":
 				rows.left, rows.err = 0, wantErr
+			case "completion":
+				rows.closeErr = wantErr
 			}
 			db := &DB{conn: c}
 			value, err := db.QueryRow[int64](t.Context(), scanMethodValue, "SELECT value WHERE id=$1", int64(7))
@@ -214,5 +223,157 @@ func assertMethodDispatch(t *testing.T, c *methodTestConn, closedOK bool) {
 	t.Helper()
 	if !closedOK || c.ctx != t.Context() || c.sql != "SELECT value WHERE id=$1" || len(c.args) != 1 || c.args[0] != int64(7) {
 		t.Fatal("method did not preserve connection, context, arguments or row lifetime")
+	}
+}
+
+func TestUpdateBaseExecWhereKeepsIdentityAndAuthorizationAtomic(t *testing.T) {
+	for _, column := range []string{"", "key"} {
+		for _, present := range []bool{false, true} {
+			rows := &methodTestRows{}
+			if present {
+				rows.left = 1
+			}
+			connection := &methodTestConn{rows: rows}
+			builder := &UpdateBase[int64, int64]{Db: &DB{conn: connection}, Table: "records", IDColumn: column, ID: 7, Scan: scanMethodValue}
+			builder.Set("name", "new")
+			value, err := builder.ExecWhere(t.Context(), lux.NewIntField("owner_id").Eq(42))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if present != (value != nil) {
+				t.Fatal("missing row became a successful result", value)
+			}
+			key := column
+			if key == "" {
+				key = "id"
+			}
+			want := "UPDATE records SET name = $1 WHERE (" + key + " = $2) AND owner_id = $3 RETURNING *"
+			if connection.sql != want {
+				t.Fatalf("query=%q want=%q", connection.sql, want)
+			}
+			if len(connection.args) != 3 || connection.args[0] != "new" || connection.args[1] != int64(7) || connection.args[2] != int64(42) {
+				t.Fatal(connection.args)
+			}
+			if !rows.closed {
+				t.Fatal("returning rows leaked")
+			}
+		}
+	}
+}
+
+func TestUpdateBaseExecWherePreservesFailures(t *testing.T) {
+	for _, stage := range []string{"query", "scan", "completion", "unrestricted"} {
+		t.Run(stage, func(t *testing.T) {
+			failure := errors.New(stage)
+			rows := &methodTestRows{left: 1}
+			connection := &methodTestConn{rows: rows}
+			switch stage {
+			case "query":
+				connection.queryErr = failure
+			case "scan":
+				rows.scanErr = failure
+			case "completion":
+				rows.closeErr = failure
+			}
+			builder := &UpdateBase[int64, int64]{Db: &DB{conn: connection}, Table: "records", ID: 7, Scan: scanMethodValue}
+			builder.Set("name", "new")
+			conditions := []lux.Condition{lux.NewIntField("owner_id").Eq(42)}
+			if stage == "unrestricted" {
+				conditions = nil
+			}
+			value, err := builder.ExecWhere(t.Context(), conditions...)
+			if stage == "unrestricted" {
+				if err != nil || value == nil || *value != 42 || len(connection.args) != 2 {
+					t.Fatal(value, err, connection.args)
+				}
+			} else if !errors.Is(err, failure) || value != nil {
+				t.Fatal(value, err)
+			}
+			if rows.closed != (stage != "query") {
+				t.Fatal("rows cleanup changed")
+			}
+		})
+	}
+}
+
+func TestDefaultInsertQueries(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		for _, fail := range []bool{false, true} {
+			rows := &methodTestRows{left: 1}
+			connection := &methodTestConn{rows: rows}
+			want := errors.New("default insert failed")
+			if fail {
+				connection.queryErr = want
+			}
+			db := &DB{conn: connection}
+			var err error
+			if batch {
+				_, err = InsertManyReturning(t.Context(), db, scanMethodValue, "records", nil, [][]any{nil, {}})
+				if connection.sql != "INSERT INTO records SELECT FROM generate_series(1, $1::bigint) RETURNING *" || len(connection.args) != 1 || connection.args[0] != int64(2) {
+					t.Fatal(connection.sql, connection.args)
+				}
+			} else {
+				_, err = InsertReturning(t.Context(), db, scanMethodValue, "records", nil, nil)
+				if connection.sql != "INSERT INTO records DEFAULT VALUES RETURNING *" || len(connection.args) != 0 {
+					t.Fatal(connection.sql, connection.args)
+				}
+			}
+			if fail && !errors.Is(err, want) || !fail && err != nil {
+				t.Fatal(err)
+			}
+			if rows.closed != !fail {
+				t.Fatal("incorrect cleanup")
+			}
+		}
+	}
+}
+
+func TestDefaultInsertRejectsValuesWithoutColumns(t *testing.T) {
+	connection := &methodTestConn{rows: &methodTestRows{left: 1}}
+	db := &DB{conn: connection}
+	if _, err := InsertReturning(t.Context(), db, scanMethodValue, "records", nil, []any{42}); err == nil {
+		t.Fatal("single ignored values")
+	}
+	if _, err := InsertManyReturning(t.Context(), db, scanMethodValue, "records", nil, [][]any{nil, {42}}); err == nil {
+		t.Fatal("batch ignored values")
+	}
+	if connection.sql != "" {
+		t.Fatal("invalid input reached database")
+	}
+}
+
+func TestInsertRejectsRowWidthMismatch(t *testing.T) {
+	for _, sample := range []struct {
+		name   string
+		values []any
+	}{
+		{"missing", nil}, {"short", []any{int64(1)}}, {"extra", []any{int64(1), int64(2), int64(3)}},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			for _, batch := range []bool{false, true} {
+				t.Run(map[bool]string{false: "single", true: "batch"}[batch], func(t *testing.T) {
+					defer func() {
+						if value := recover(); value != nil {
+							t.Errorf("invalid input panicked: %v", value)
+						}
+					}()
+					connection := &methodTestConn{rows: &methodTestRows{left: 1}}
+					db := &DB{conn: connection}
+					cols := []string{"first", "second"}
+					var err error
+					if batch {
+						_, err = InsertManyReturning(t.Context(), db, scanMethodValue, "records", cols, [][]any{{int64(1), int64(2)}, sample.values})
+					} else {
+						_, err = InsertReturning(t.Context(), db, scanMethodValue, "records", cols, sample.values)
+					}
+					if err == nil {
+						t.Error("width mismatch accepted")
+					}
+					if connection.sql != "" {
+						t.Error("invalid input reached database")
+					}
+				})
+			}
+		})
 	}
 }

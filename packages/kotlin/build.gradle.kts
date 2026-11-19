@@ -61,6 +61,12 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+    inputs.file("../../pkg/lux/codec/testdata/protocol-v1.json")
+    val renewalUrl = providers.environmentVariable("LUXO_WS_RENEWAL_URL")
+    inputs.property("liveGoRenewalUrl", renewalUrl.orElse(""))
+    inputs.property("liveGoRenewalStream", providers.environmentVariable("LUXO_WS_RENEWAL_STREAM").orElse(""))
+    // An owned Go fixture is external state; never reuse an earlier network test execution.
+    outputs.upToDateWhen { !renewalUrl.isPresent }
     dependsOn(tasks.jar)
     doFirst {
         systemProperty("luxo.testRuntimeClasspath", sourceSets["test"].runtimeClasspath.asPath)

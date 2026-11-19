@@ -162,7 +162,7 @@ func BenchmarkEnumRows(b *testing.B) {
         if shape=="nullable" {data=[]byte{4,2,1,4,'O','P','E','N',0}}
         if shape=="list1" || shape=="list128" {
             if shape=="list128" {count=128}
-            data=codec.AppendArrayHeader([]byte{0,3},count)
+            encoded,err:=codec.AppendArrayHeader([]byte{0,3},count);if err!=nil{b.Fatal(err)};data=encoded
             for range count {data=append(data,4,'O','P','E','N')}
             data=append(data,0)
         }

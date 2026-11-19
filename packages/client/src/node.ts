@@ -37,9 +37,14 @@ export class NodeHTTP2Transport extends FetchTransport {
   private peerMaximum = 0
   private draining = false
   private closed = false
+  private readonly refreshAbort?: AbortController
 
   constructor(private readonly address: string, options: NodeHTTP2Options = {}) {
     super(address, options)
+    if (options.onTokenExpired) {
+      this.refreshAbort = new AbortController()
+      this.refreshAbortSignal = this.refreshAbort.signal
+    }
     const url = new URL(address)
     if (url.protocol !== 'https:' || url.username || url.password) throw new Error('Node HTTP/2 requires an HTTPS endpoint without URL credentials')
     this.origin = url.origin
@@ -56,6 +61,7 @@ export class NodeHTTP2Transport extends FetchTransport {
   close(): void {
     if (this.closed) return
     this.closed = true
+    this.refreshAbort?.abort()
     for (const exchange of this.pending) exchange.fail(new DOMException('Node HTTP/2 transport closed', 'AbortError'))
     this.session?.destroy()
     this.session = undefined
@@ -75,7 +81,10 @@ export class NodeHTTP2Transport extends FetchTransport {
       this.pending.add(exchange)
       exchange.start(body)
       return exchange.response
-    } catch (error) { return Promise.reject(error) }
+    } catch (error) {
+      this.retire()
+      return Promise.reject(error)
+    }
   }
 
   private requestBody(init: RequestInit): string | Uint8Array | ArrayBuffer {

@@ -1,9 +1,12 @@
 package pg
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/url"
 	"os"
 	"slices"
@@ -13,6 +16,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/light-speak/luxo/internal/testutil"
 	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -31,7 +37,7 @@ func testDB(t testing.TB) *DB {
 
 func containerTestDB(t testing.TB, ctx context.Context) *DB {
 	t.Helper()
-	container, err := postgres.Run(ctx, "postgres:17-alpine",
+	container, err := postgres.Run(ctx, testutil.PostgresImage(),
 		postgres.WithDatabase("luxo_test"),
 		postgres.WithUsername("test"),
 		postgres.WithPassword("test"),
@@ -193,12 +199,53 @@ func TestNewDBInvalidPoolSize(t *testing.T) {
 	}
 }
 
+func TestNewDBRejectsPoolConfigNarrowing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pool int
+		idle int
+	}{
+		{"wrapped-positive-pool", 1<<32 + 1, 0},
+		{"negative-pool-wraps-positive", -(1 << 32) + 1, 0},
+		{"wrapped-zero-idle", 20, 1 << 32},
+		{"negative-idle", 20, -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := NewDBWithConfig(t.Context(), "postgres://localhost/unused", lux.DBConfig{
+				Pool: tc.pool, Idle: tc.idle,
+			})
+			if db != nil {
+				db.Close()
+				t.Fatal("invalid pool configuration was silently accepted")
+			}
+			if err == nil {
+				t.Fatal("invalid pool configuration did not return an error")
+			}
+		})
+	}
+}
+
 func TestQueryRowsError(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
 	_, err := QueryRows(ctx, db, scanUser, "SELECT * FROM nonexistent_table")
 	if err == nil {
 		t.Fatal("expected error for nonexistent table")
+	}
+}
+
+func TestQueryRowPreservesLateServerError(t *testing.T) {
+	db := testDB(t)
+	scanned := false
+	_, err := db.QueryRow(t.Context(), func(rows Rows) (*int64, error) {
+		var value, quotient int64
+		err := rows.Scan(&value, &quotient)
+		scanned = err == nil && value == 1 && quotient == 10
+		return &value, err
+	}, "SELECT value, 10 / (2 - value) FROM generate_series(1, 2) AS value")
+	var pgErr *pgconn.PgError
+	if !scanned || !errors.As(err, &pgErr) || pgErr.Code != "22012" {
+		t.Fatalf("lost late division-by-zero error: scanned=%t err=%v", scanned, err)
 	}
 }
 
@@ -1151,4 +1198,65 @@ func TestQueryWhere(t *testing.T) {
 	if len(results) != 1 || results[0].Name != "alice" {
 		t.Errorf("Where filter failed: got %d results", len(results))
 	}
+}
+
+func TestRequiredTLSRejectsServerDeclineWithoutStartup(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	observed := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			observed <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+		observed <- rejectPostgresTLS(conn)
+	}()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	db, err := NewDBWithConfig(ctx, "postgres://test:test@"+listener.Addr().String()+"/test?sslmode=require",
+		lux.DBConfig{Pool: 1, Timeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Pool().Ping(ctx); err == nil {
+		t.Fatal("TLS refusal became a successful connection")
+	}
+	select {
+	case err := <-observed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("TLS probe did not finish")
+	}
+}
+
+func rejectPostgresTLS(conn net.Conn) error {
+	expected, err := (&pgproto3.SSLRequest{}).Encode(nil)
+	if err != nil {
+		return err
+	}
+	request := make([]byte, len(expected))
+	if _, err := io.ReadFull(conn, request); err != nil {
+		return err
+	}
+	if !bytes.Equal(request, expected) {
+		return fmt.Errorf("expected SSLRequest, got %x", request)
+	}
+	if _, err := conn.Write([]byte{'N'}); err != nil {
+		return err
+	}
+	var next [1]byte
+	n, err := conn.Read(next[:])
+	if n != 0 || !errors.Is(err, io.EOF) {
+		return fmt.Errorf("client did not close after TLS refusal: bytes=%d err=%v", n, err)
+	}
+	return nil
 }

@@ -3,7 +3,27 @@ model Product @noTime {
   name: String
   price: Int
   description: String
+  secret: Int @hidden
 }
 api products(): [Product] { return Product.all() }
 api selectedProducts(): [Product] { return Product.select().all() }
+api pricedProducts(): [Product] {
+  val rows = Product.select().all()
+  return rows.filter { it.price > 0 }
+}
 api listProducts(): [Product]
+api privateProducts(): [Product] { return Product.select().all().filter { it.secret > 0 } }
+fn storedProducts(): [Product] { return Product.select().all() }
+api calledProducts(): [Product] { return storedProducts().filter { it.price > 0 } }
+api calledPrivateProducts(): [Product] { return storedProducts().filter { it.secret > 0 } }
+api nestedProducts(): [Product] { return Product.select().all().filter { [0].any { number -> it.price > number } } }
+fn pricedStoredProducts(): [Product] { return Product.select().all().filter { it.price > 0 } }
+fn privateStoredProducts(): [Product] { return Product.select().all().filter { it.secret > 0 } }
+fn combinedStoredProducts(): [Product] { return pricedStoredProducts().filter { it.secret > 0 } }
+fn forwardedStoredProducts(): [Product] { val rows = combinedStoredProducts() val alias = rows return alias }
+api ownProducts(): [Product] { return pricedStoredProducts() }
+api ownPrivateProducts(): [Product] { return privateStoredProducts() }
+api combinedProducts(): [Product] { return pricedStoredProducts().filter { it.secret > 0 } }
+api forwardedProducts(): [Product] { return forwardedStoredProducts() }
+api scalarCalledProducts(): [String] { return pricedStoredProducts().map { it.name } }
+api aliasedOwnProducts(): [Product] { val rows = privateStoredProducts() return rows.filter { it.price > 0 } }

@@ -754,3 +754,25 @@ func assertCanonicalJSONParameter(t *testing.T, raw string, list bool, values []
 		t.Fatalf("canonical request cannot be decoded: %v", err)
 	}
 }
+
+func TestRawJSONArrayIndependentDepth(t *testing.T) {
+	for _, depth := range []int{127, 128, 129} {
+		for _, leaf := range []string{"0", "[]", "{}"} {
+			count := depth
+			if leaf != "0" {
+				count++
+			}
+			document := strings.Repeat("[", depth) + leaf + strings.Repeat("]", depth)
+			var enc codec.Encoder
+			enc.WriteInt(42)
+			before := bytes.Clone(enc.Bytes())
+			err := encodeRawJSONArray(&enc, ParamMeta{Name: "values", Type: "JSON", IsList: true}, []byte("["+document+",null]"))
+			if (err == nil) != (count <= 128) {
+				t.Errorf("containers=%d accepted=%v error=%v", count, err == nil, err)
+			}
+			if err != nil && !bytes.Equal(before, enc.Bytes()) {
+				t.Fatal("depth failure emitted partial array")
+			}
+		}
+	}
+}

@@ -81,8 +81,10 @@ type ExtendResult struct {
 // gateway can forward them as a list parameter without decoding, reflection,
 // or per-key allocation.
 type BinaryKeys struct {
-	count  int
-	values []byte
+	count      int
+	values     []byte
+	fieldStart int
+	fieldEnd   int
 }
 
 // Len returns the number of encoded keys.
@@ -99,10 +101,11 @@ func (k BinaryKeys) EncodeParam(fieldID int) []byte {
 	return append(result, 0)
 }
 
-// EncodeResolveParams adds the requested value shape without re-encoding keys.
-func (k BinaryKeys) EncodeResolveParams(shape int) []byte {
-	result := k.EncodeParam(1)
-	result = append(result[:len(result)-1], 2)
+// EncodeResolveParams uses registered parameter IDs without re-encoding keys.
+// The caller validates the parameter IDs and shape against resolver metadata.
+func (k BinaryKeys) EncodeResolveParams(shape, keysID, shapeID int) []byte {
+	result := k.EncodeParam(keysID)
+	result = codec.AppendVarint(result[:len(result)-1], uint64(shapeID))
 	result = codec.AppendSvarint(result, int64(shape))
 	return append(result, 0)
 }
@@ -116,7 +119,11 @@ func ExtractPrimaryKeys(primary []byte, keyField *schema.Field, model *schema.Mo
 	dec := codec.NewDecoder(primary)
 	dec.ReadArenaSize()
 	var keys BinaryKeys
-	for dec.NextField() {
+	for {
+		fieldStart := dec.Offset()
+		if !dec.NextField() {
+			break
+		}
 		fieldID := dec.FieldID()
 		field := model.FieldByID(fieldID)
 		if field == nil {
@@ -130,7 +137,7 @@ func ExtractPrimaryKeys(primary []byte, keyField *schema.Field, model *schema.Mo
 			if keys.count != 0 {
 				return BinaryKeys{}, false
 			}
-			keys = BinaryKeys{count: 1, values: primary[start:dec.Offset()]}
+			keys = BinaryKeys{count: 1, values: primary[start:dec.Offset()], fieldStart: fieldStart, fieldEnd: dec.Offset()}
 		}
 	}
 	if dec.Finish() != nil || keys.count == 0 {
@@ -141,29 +148,38 @@ func ExtractPrimaryKeys(primary []byte, keyField *schema.Field, model *schema.Mo
 
 // ExtractID reads the id field from a primary binary response using schema type info.
 // Handles any field ordering by skipping fields of known types.
-// Returns (id, true) on success.
+// Returns (id, true) only after the complete parent boundary is validated.
 func ExtractID(primary []byte, idFieldID int, fieldTypes map[int]codec.FieldSkipType) (int64, bool) {
 	if len(primary) == 0 {
 		return 0, false
 	}
 	dec := codec.NewDecoder(primary)
 	dec.SkipArenaHeader()
+	var id int64
+	found := false
 	for dec.NextField() {
 		fid := dec.FieldID()
 		if fid == idFieldID {
-			return dec.ReadInt(), dec.Err() == nil
+			if found {
+				return 0, false
+			}
+			id, found = dec.ReadInt(), true
+		} else {
+			// Skip this field based on its known type.
+			st, ok := fieldTypes[fid]
+			if !ok {
+				return 0, false
+			}
+			skipField(dec, st)
 		}
-		// Skip this field based on its known type
-		st, ok := fieldTypes[fid]
-		if !ok {
-			return 0, false // unknown field, can't skip
-		}
-		skipField(dec, st)
 		if dec.Err() != nil {
 			return 0, false
 		}
 	}
-	return 0, false
+	if !found || dec.Finish() != nil {
+		return 0, false
+	}
+	return id, true
 }
 
 // skipField advances the decoder past one field value of the given type.
@@ -176,63 +192,104 @@ func skipField(dec *codec.Decoder, st codec.FieldSkipType) {
 
 // ExtractIDColumn reads the ID column values from columnar-encoded data.
 // Uses the model schema to skip non-ID columns (need type info to advance past column data).
-// Returns nil if the ID column is not found.
+// Returns nil for an invalid parent or a key that is not a non-null scalar Int.
 func ExtractIDColumn(data []byte, idFieldID int, model *schema.Model) []int64 {
+	if model == nil {
+		return nil
+	}
+	field := model.FieldByID(idFieldID)
+	if field == nil || field.Type != schema.FieldInt || field.Nullable || field.IsList {
+		return nil
+	}
 	r := codec.NewColumnarReader(data)
 	if r.Err() != nil || r.Count() == 0 {
 		return nil
 	}
-	for r.NextColumn() {
-		if r.FieldID() == idFieldID {
-			return r.ReadColumnInt()
+	var ids []int64
+	for {
+		columnStart := r.Offset()
+		if !r.NextColumn() {
+			end, size := codec.ReadVarint(data, columnStart)
+			if r.Err() != nil || size <= 0 || end != 0 || columnStart+size != len(data) {
+				return nil
+			}
+			return ids
 		}
-		// Skip this column using schema type info
-		f := model.FieldByID(r.FieldID())
-		if f == nil {
-			return nil // unknown column, can't skip
+		column := model.FieldByID(r.FieldID())
+		if column == nil {
+			return nil
 		}
-		skipColumnarColumn(r, f)
+		if column.ID == idFieldID {
+			if ids != nil {
+				return nil
+			}
+			ids = r.ReadColumnInt()
+		} else {
+			skipColumnarColumn(r, column)
+		}
 		if r.Err() != nil {
 			return nil
 		}
 	}
-	return nil
 }
 
 // ExtractPrimaryKeyColumn extracts a complete primary-key column while
 // preserving its wire representation. The returned bytes reference data.
 func ExtractPrimaryKeyColumn(data []byte, keyField *schema.Field, model *schema.Model) (BinaryKeys, bool) {
+	keys, _, ok := extractPrimaryKeyColumn(data, keyField, model, false)
+	return keys, ok
+}
+
+// ExtractPrimaryKeyPage validates a columnar page and its three metadata values.
+// The returned offset separates columns (including their terminator) from metadata.
+// Both slices may then be merged without copying or re-encoding pagination values.
+func ExtractPrimaryKeyPage(data []byte, keyField *schema.Field, model *schema.Model) (BinaryKeys, int, bool) {
+	keys, end, ok := extractPrimaryKeyColumn(data, keyField, model, true)
+	if !ok {
+		return BinaryKeys{}, 0, false
+	}
+	tail := codec.NewDecoder(data[end:])
+	tail.ReadInt()
+	tail.ReadInt()
+	tail.ReadInt()
+	if tail.Finish() != nil {
+		return BinaryKeys{}, 0, false
+	}
+	return keys, end, true
+}
+
+func extractPrimaryKeyColumn(data []byte, keyField *schema.Field, model *schema.Model, page bool) (BinaryKeys, int, bool) {
 	if len(data) == 0 || keyField == nil || model == nil || !isFederationKeyType(keyField.Type) || keyField.Nullable || keyField.IsList {
-		return BinaryKeys{}, false
+		return BinaryKeys{}, 0, false
 	}
 	r := codec.NewColumnarReader(data)
-	if r.Err() != nil || r.Count() == 0 {
-		return BinaryKeys{}, false
+	if r.Err() != nil || (!page && r.Count() == 0) {
+		return BinaryKeys{}, 0, false
 	}
 	var keys BinaryKeys
 	for {
 		columnStart := r.Offset()
 		if !r.NextColumn() {
 			end, size := codec.ReadVarint(data, columnStart)
-			if r.Err() != nil || size <= 0 || end != 0 || columnStart+size != len(data) || keys.count == 0 {
-				return BinaryKeys{}, false
+			if r.Err() != nil || size <= 0 || end != 0 || (!page && columnStart+size != len(data)) || (keys.count == 0 && r.Count() != 0) {
+				return BinaryKeys{}, 0, false
 			}
-			return keys, true
+			return keys, columnStart + size, true
 		}
 		field := model.FieldByID(r.FieldID())
 		if field == nil {
-			return BinaryKeys{}, false
+			return BinaryKeys{}, 0, false
 		}
 		start := r.Offset()
 		skipColumnarColumn(r, field)
 		if r.Err() != nil {
-			return BinaryKeys{}, false
+			return BinaryKeys{}, 0, false
 		}
 		if field.ID == keyField.ID {
-			if keys.count != 0 {
-				return BinaryKeys{}, false
+			if keys.fieldEnd != 0 {
+				return BinaryKeys{}, 0, false
 			}
-			keys = BinaryKeys{count: r.Count(), values: data[start:r.Offset()]}
+			keys = BinaryKeys{count: r.Count(), values: data[start:r.Offset()], fieldStart: columnStart, fieldEnd: r.Offset()}
 		}
 	}
 }
@@ -312,11 +369,25 @@ func MergeColumnar(primary []byte, extends []ExtendColumnResult) []byte {
 // A row uses the same field layout with exactly one blob per extend field.
 // Source buffers must not overlap dst's backing array and remain unchanged.
 func AppendMergedColumnar(dst, primary []byte, extends []ExtendColumnResult) []byte {
+	return appendMergedColumnar(dst, nil, primary, extends)
+}
+
+// AppendMergedSelected omits a federation-only primary key while appending
+// validated fields. keys must come from the same unchanged primary message.
+// It copies each retained byte once, without decoding or an intermediate buffer.
+func AppendMergedSelected(dst, primary []byte, extends []ExtendColumnResult, keys BinaryKeys, includeKey bool) []byte {
+	if includeKey || keys.count == 0 {
+		return AppendMergedColumnar(dst, primary, extends)
+	}
+	return appendMergedColumnar(dst, primary[:keys.fieldStart], primary[keys.fieldEnd:], extends)
+}
+
+func appendMergedColumnar(dst, prefix, primary []byte, extends []ExtendColumnResult) []byte {
 	if len(extends) == 0 {
-		return append(dst, primary...)
+		return append(append(dst, prefix...), primary...)
 	}
 
-	totalSize := len(primary)
+	totalSize := len(prefix) + len(primary)
 	for _, ext := range extends {
 		if len(ext.Blobs) == 0 {
 			continue
@@ -330,6 +401,7 @@ func AppendMergedColumnar(dst, primary []byte, extends []ExtendColumnResult) []b
 		totalSize++
 	}
 	result := slices.Grow(dst, totalSize)
+	result = append(result, prefix...)
 
 	// Copy primary WITHOUT end marker
 	if len(primary) > 0 && primary[len(primary)-1] == 0x00 {

@@ -543,7 +543,7 @@ func TestGenerateEntryFileWithEvents(t *testing.T) {
 	if !strings.Contains(code, "RegisterEvents") {
 		t.Errorf("should call RegisterEvents:\n%s", code)
 	}
-	for _, required := range []string{"eventBus := event.NewChanBus(256)", "taskQueue := queue.NewMemoryQueue(", "if err := user_luxo.RegisterEvents(", "fatal: register events:"} {
+	for _, required := range []string{"eventBus := event.NewChanBus(256)", "taskQueue, err := queue.NewMemoryQueue(", "fatal: initialize messaging:", "if err := user_luxo.RegisterEvents(", "fatal: register events:"} {
 		if !strings.Contains(code, required) {
 			t.Errorf("embedded entry must propagate messaging failures: missing %q", required)
 		}
@@ -770,7 +770,7 @@ func TestGenerateModuleEntryFiles_WithEvents(t *testing.T) {
 	if !strings.Contains(src, "RegisterEvents") {
 		t.Errorf("should register events:\n%s", src)
 	}
-	for _, required := range []string{"eventBus := event.NewChanBus(256)", "taskQueue := queue.NewMemoryQueue(", "if err := order_luxo.RegisterEvents(", "fatal: register events:"} {
+	for _, required := range []string{"eventBus := event.NewChanBus(256)", "taskQueue, err := queue.NewMemoryQueue(", "fatal: initialize messaging:", "if err := order_luxo.RegisterEvents(", "fatal: register events:"} {
 		if !strings.Contains(src, required) {
 			t.Errorf("module entry must propagate messaging failures: missing %q", required)
 		}
@@ -858,7 +858,7 @@ func TestGenerateGatewayEntry(t *testing.T) {
 		`Name: "response.merge"`,
 		"luvia.ExtractPrimaryKeyColumn",
 		"luvia.ExtractPrimaryKeys",
-		"keys.EncodeResolveParams(shape)",
+		"keys.EncodeResolveParams(shape, binding.keysID, binding.shapeID)",
 	}
 	for _, check := range checks {
 		if !strings.Contains(src, check) {
@@ -1455,7 +1455,7 @@ func main() {` + guard + "}\n"
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build guard: %v\n%s", err, output)
 	}
-	for _, mode := range []string{"missing", "valid", "malformed", "directory"} {
+	for _, mode := range []string{"missing", "valid", "malformed", "directory", "invalid-key", "invalid-value"} {
 		t.Run(mode, func(t *testing.T) { checkGeneratedDotEnvGuard(t, binary, dir, mode) })
 	}
 }
@@ -1476,6 +1476,12 @@ func checkGeneratedDotEnvGuard(t *testing.T, binary, root, mode string) {
 		if mode == "malformed" {
 			text = "invalid assignment\n"
 		}
+		if mode == "invalid-key" {
+			text = "LUXO_ENTRY_INVALID\x00KEY=private-value\n"
+		}
+		if mode == "invalid-value" {
+			text = "LUXO_ENTRY_INVALID_VALUE=private\x00value\n"
+		}
 		if err := os.WriteFile(path, []byte(text), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -1483,11 +1489,14 @@ func checkGeneratedDotEnvGuard(t *testing.T, binary, root, mode string) {
 	command := exec.CommandContext(t.Context(), binary)
 	command.Dir = dir
 	output, err := command.CombinedOutput()
-	rejected := mode == "malformed" || mode == "directory"
+	rejected := mode != "missing" && mode != "valid"
 	if (err != nil) != rejected {
 		t.Fatalf("%s: error=%v output=%s", mode, err, output)
 	}
 	if rejected && !strings.Contains(string(output), "fatal: load .env:") {
 		t.Fatalf("missing error diagnostic: %s", output)
+	}
+	if strings.HasPrefix(mode, "invalid-") && strings.Contains(string(output), "private") {
+		t.Fatalf("startup diagnostic exposed environment value: %s", output)
 	}
 }

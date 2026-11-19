@@ -1,13 +1,13 @@
 import { describe, expect, test } from 'vitest'
 import { createRequire } from 'node:module'
-import { join } from 'node:path'
+import { resolve } from 'node:path'
 
 // Use the same native modules as the production build, without Vite export getters.
 const compiled = process.env.LUXO_BENCH_MODULES
 if (!compiled) throw new Error('Compile CommonJS modules under .tmp and set LUXO_BENCH_MODULES')
 const requireCompiled = createRequire(import.meta.url)
-const { JSONParamValidator } = requireCompiled(join(compiled, 'json-params.js')) as typeof import('./json-params')
-const { encodeLuxoJSON } = requireCompiled(join(compiled, 'json.js')) as typeof import('./json')
+const { JSONParamValidator } = requireCompiled(resolve(compiled, 'json-params.js')) as typeof import('./json-params')
+const { encodeLuxoJSON } = requireCompiled(resolve(compiled, 'json.js')) as typeof import('./json')
 
 const validator = new JSONParamValidator()
 validator.setSchema({ echo: { id: 1, params: [

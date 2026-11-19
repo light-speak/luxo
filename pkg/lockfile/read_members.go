@@ -1,7 +1,7 @@
 package lockfile
 
 // Member bits only track JSON metadata keys; they are not protocol field IDs.
-type lockMember uint16
+type lockMember uint32
 
 const (
 	lockVersion lockMember = 1 << iota
@@ -19,6 +19,8 @@ const (
 	lockParamTypes
 	lockReturnType
 	lockContract
+	lockKind
+	lockDefaultFields
 )
 
 // The token text is compared before advancing the decoder. Only names stored
@@ -55,6 +57,10 @@ func lockMemberFor(name string) lockMember {
 		return lockReturnType
 	case "contract":
 		return lockContract
+	case "kind":
+		return lockKind
+	case "default_fields":
+		return lockDefaultFields
 	default:
 		return 0
 	}

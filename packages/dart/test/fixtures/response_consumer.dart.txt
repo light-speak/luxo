@@ -1,6 +1,20 @@
 part of 'int64_consumer_test.dart';
 
 void verifyScalarResponses() {
+  test('generated JSON roots preserve literal null in calls and streams', () async {
+    final transport = _ResponseTransport();
+    final client = LuxoClient(transport);
+    for (final response in <Object?>[null, Uint8List.fromList([4, 110, 117, 108, 108])]) {
+      transport.response = response;
+      expect(await client.scalarJSON(), isNull);
+      final values = <Object?>[];
+      final stop = await client.subscribeWatchJSON(onData: values.add);
+      transport.emit(response);
+      expect(values, [null]);
+      stop();
+    }
+    client.close();
+  });
   test('generated calls and streams retain selection plan identity', () async {
     final transport = _ResponseTransport()..response = <String, dynamic>{};
     final client = LuxoClient(transport);
@@ -223,17 +237,17 @@ void verifyScalarResponses() {
     final client = LuxoClient(transport);
     for (final value in [sdk.LuxoInt64.minValue, sdk.LuxoInt64.maxValue]) {
       transport.response = value.toBigInt();
-      expect(await client.implicitInteger(), value);
+      expect(await client.explicitInteger(), value);
       transport.response = (sdk.LuxoEncoder()..writeSvarint(value)).bytes();
-      expect(await client.implicitInteger(), value);
+      expect(await client.explicitInteger(), value);
       transport.response = [value.toBigInt()];
-      expect(await client.implicitIntegers(), [value]);
+      expect(await client.explicitIntegers(), [value]);
       transport.response =
           (sdk.LuxoEncoder()
                 ..writeVarint(1)
                 ..writeSvarint(value))
               .bytes();
-      expect(await client.implicitIntegers(), [value]);
+      expect(await client.explicitIntegers(), [value]);
     }
   });
 
@@ -289,7 +303,7 @@ String _describeStatus(TaskStatus status) => switch (status) {
   TaskStatusUnknown(:final rawValue) => rawValue,
 };
 
-typedef _Subscribe = Future<void Function()> Function(void Function(Object));
+typedef _Subscribe = Future<void Function()> Function(void Function(Object?));
 
 List<_Subscribe> _streamSubscribers(LuxoClient c, {required bool array}) =>
     array
@@ -390,7 +404,7 @@ Future<void> _verifySubscription(
   Object json,
   List<List<int>> malformed,
 ) async {
-  final delivered = <Object>[];
+  final delivered = <Object?>[];
   final stop = await subscribe(delivered.add);
   expect(transport.params, isEmpty);
   transport.emit(bytes);

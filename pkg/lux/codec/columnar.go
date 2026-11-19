@@ -1,8 +1,8 @@
 // Package codec — columnar encoding for Luxo binary protocol.
 //
-// Columnar format (used for both single records and lists):
+// Columnar format (used for list responses, including one-element lists):
 //
-//	[record count varint]
+//	[record count varint] [total string bytes varint]
 //	[fieldID varint] [value0] [value1] ... [valueN]   ← column 1
 //	[fieldID varint] [value0] [value1] ... [valueN]   ← column 2
 //	...
@@ -10,7 +10,7 @@
 //
 // Nullable columns: each value prefixed with 0x00 (null) or 0x01 (present) + value.
 //
-// Single record = count 1, same format. Zero overhead vs row encoding.
+// A one-element list has count 1; standalone objects use the separate row format.
 // List of N records: fieldID written once per column (not per row), saves (N-1)*F bytes.
 package codec
 

@@ -55,9 +55,25 @@ class SelectionParser {
   private readIdentifier(): string {
     const start = this.offset
     const first = this.input.charCodeAt(this.offset)
-    if (!isIdentifierStart(first)) return ''
-    this.offset++
-    while (isIdentifierPart(this.input.charCodeAt(this.offset))) this.offset++
+    if (first < 128) {
+      if (!isIdentifierStart(first)) return ''
+      this.offset++
+    } else {
+      const code = this.input.codePointAt(this.offset) ?? -1
+      if (!isIdentifierStart(code)) return ''
+      this.offset += code > 0xffff ? 2 : 1
+    }
+    while (this.offset < this.input.length) {
+      const unit = this.input.charCodeAt(this.offset)
+      if (unit < 128) {
+        if (!isIdentifierPart(unit)) break
+        this.offset++
+      } else {
+        const code = this.input.codePointAt(this.offset)!
+        if (!isIdentifierPart(code)) break
+        this.offset += code > 0xffff ? 2 : 1
+      }
+    }
     return this.input.slice(start, this.offset)
   }
 
@@ -70,8 +86,11 @@ class SelectionParser {
   }
 }
 
+const unicodeLetter = /^\p{L}$/u
+
 function isIdentifierStart(code: number): boolean {
   return code === 95 || (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+    || (code >= 128 && unicodeLetter.test(String.fromCodePoint(code)))
 }
 
 function isIdentifierPart(code: number): boolean {

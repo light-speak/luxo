@@ -3,18 +3,102 @@ import 'dart:js_interop';
 import 'dart:typed_data';
 import 'package:luxo_client/luxo_client.dart';
 import '__WEBSOCKET_ID_CASES__';
+import '__HTTP_REFRESH_CASES__';
 
 @JS('process.argv')
 external JSArray<JSString> get arguments;
 
 Future<void> main() async {
   final endpoint = arguments.toDart.last.toDart;
+  await verifyHTTPBinaryPresence();
+  await verifyWebSocketBinaryPresence('$endpoint/missing-binary-body');
   await verifyWebSocketIDs(endpoint);
   await verifySocketAdapterFault(endpoint);
   for (final mode in TransportMode.values) {
+    await verifyHandshakeTimeout(endpoint, mode);
+    await verifyHTTPRefreshIdentity(mode);
+    await verifyHTTPRefreshDeadline(mode);
+    await verifyHTTPRefreshRetryDeadline(mode);
+    await verifyHTTPRefreshRequestSnapshot(mode);
+    await verifyHTTPRefreshRequestSnapshot(mode, generated: true);
+    for (final failLate in [false, true]) await verifyHTTPRefreshClose(mode, failLate);
+    await verifyHTTPRefreshCloseSettlement(mode);
+    for (final completion in ['null', 'reject', 'throw']) await verifyHTTPRefreshFailure(mode, completion);
+    await verifyCancellationFailure(endpoint, mode);
+    await verifyCallSendFailure(endpoint, mode);
     for (final parse in [false, true]) await verifySocketFailure(endpoint, mode, parse);
   }
   print('web socket protocol verified');
+}
+
+Future<void> verifyHandshakeTimeout(String endpoint, TransportMode mode) async {
+  final transport = WsTransport('$endpoint/stalled-handshake',
+    options: TransportOptions(mode: mode), autoReconnect: false,
+    timeout: const Duration(milliseconds: 100));
+  Future<void> check(Future<Object?> operation) async {
+    try {
+      await operation;
+      throw StateError('stalled handshake completed successfully');
+    } on LuxoError catch (error) {
+      if (error.error != 'TimeoutError') rethrow;
+    }
+  }
+  try {
+    await Future.wait([
+      check(transport.call<Object>('echo')),
+      check(transport.subscribe('echo', {}, (_) {}, decoder: (value) => value)),
+    ]).timeout(const Duration(seconds: 2));
+  } finally {
+    transport.close();
+  }
+}
+
+Future<void> verifyCallSendFailure(String endpoint, TransportMode mode) async {
+  final transport = WsTransport('$endpoint/call-send-fault',
+    options: TransportOptions(mode: mode), autoReconnect: false,
+    timeout: const Duration(seconds: 3));
+  transport.setSchema({'echo': const APISchemaEntry(7, [ParamSchema(1, 'value', 'Int')])});
+  LuxoInt64 decode(Object? data) => data is Uint8List
+      ? LuxoDecoder(data).readIntChecked() : luxoInt64FromJSON(data);
+  try {
+    Object? failure;
+    try {
+      await transport.call('echo', params: {'value': LuxoInt64.maxValue}, decoder: decode);
+    } catch (error) {
+      failure = error;
+    }
+    if (failure == null || !failure.toString().contains('injected call send failure')) {
+      throw StateError('send failure was lost: $failure');
+    }
+    final result = await transport.call('echo',
+      params: {'value': LuxoInt64.maxValue}, decoder: decode);
+    if (result != LuxoInt64.maxValue) throw StateError('sibling call was corrupted');
+  } finally {
+    transport.close();
+  }
+}
+
+Future<void> verifyCancellationFailure(String endpoint, TransportMode mode) async {
+  final transport = WsTransport('$endpoint/timeout-cancel',
+    options: TransportOptions(mode: mode), autoReconnect: false,
+    timeout: const Duration(milliseconds: 100));
+  transport.setSchema({'echo': const APISchemaEntry(7, [ParamSchema(1, 'value', 'Int')])});
+  try {
+    try {
+      await transport.subscribe('echo', {'value': LuxoInt64.maxValue},
+        (_) => throw StateError('timed-out subscription delivered'), decoder: (value) => value);
+      throw StateError('subscription unexpectedly acknowledged');
+    } on LuxoError catch (error) {
+      if (error.error != 'TimeoutError') rethrow;
+    }
+    final received = Completer<void>();
+    final stop = await transport.subscribe('echo', {'value': LuxoInt64.maxValue},
+      (_) => received.complete(), decoder: (value) => value);
+    await received.future.timeout(const Duration(seconds: 3));
+    stop();
+  } finally {
+    transport.close();
+  }
 }
 
 Future<void> verifySocketFailure(String endpoint, TransportMode mode, bool parse) async {

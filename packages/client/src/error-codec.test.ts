@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Encoder } from './codec'
+import { Encoder, decodeJSONValue } from './codec'
 import { LuxoError } from './error'
 import { decodeJSONEnvelope, encodeLuxoJSON, jsonNumber } from './json'
 import { decodeBinaryError, FetchTransport, jsonResponseError } from './transport'
@@ -10,6 +10,94 @@ afterEach(() => vi.unstubAllGlobals())
 const jsonError = { error: 'Unauthorized', code: 401, message: 'expired' }
 
 describe('strict error envelopes', () => {
+  it.each(['error', 'code', 'message'] as const)('rejects inherited required JSON error metadata (%s)', field => {
+    const json: Record<string, unknown> = Object.create({ [field]: jsonError[field] })
+    Object.assign(json, jsonError)
+    delete json[field]
+    expect(jsonResponseError(json, 502)).toMatchObject({ error: 'ParseError', code: 502 })
+  })
+
+  it.each(['traceId', 'cause', 'data'] as const)('ignores inherited optional JSON error metadata without reading getters (%s)', field => {
+    let reads = 0
+    const prototype = Object.defineProperty({}, field, { get() { reads++; return 'inherited secret' } })
+    const json: Record<string, unknown> = Object.assign(Object.create(prototype), jsonError)
+    const error = jsonResponseError(json, 502)
+    expect(error).toMatchObject(jsonError)
+    expect(error[field]).toBeUndefined()
+    expect(reads).toBe(0)
+  })
+
+  it('normalizes non-finite direct error data to ParseError', () => {
+    for (const number of [NaN, Infinity, -Infinity]) {
+      for (const data of [number, [number], { value: number }]) {
+        expect(jsonResponseError({ ...jsonError, data }, 401).error).toBe('ParseError')
+      }
+    }
+    const data = jsonNumber('1e400')
+    expect(jsonResponseError({ ...jsonError, data }, 401).data).toBe(data)
+  })
+
+  it('rejects document BOM prefixes in Binary JSON values and error data', () => {
+    for (const text of ['null', '42', '{}', '[]', '"value"']) {
+      const raw = '\ufeff' + text
+      expect(() => decodeJSONValue(new TextEncoder().encode(raw))).toThrow()
+      const encoder = new Encoder()
+      for (const field of [1, 2, 3]) writeErrorField(encoder, field)
+      encoder.writeFieldString(5, raw)
+      encoder.writeEnd()
+      expect(decodeBinaryError(encoder.bytes(), 502).error).toBe('ParseError')
+    }
+    expect(decodeJSONValue(new TextEncoder().encode('"\ufeffvalue"'))).toBe('\ufeffvalue')
+  })
+
+  it('applies the existing JSON error data depth guard to Binary errors', () => {
+    for (const depth of [1, 127, 128, 129, 130]) {
+      for (const [open, close] of [['[', ']'], ['{"child":', '}']]) {
+        const data = open.repeat(depth) + '0' + close.repeat(depth)
+        const encoder = new Encoder()
+        for (const field of [1, 2, 3]) writeErrorField(encoder, field)
+        encoder.writeFieldString(5, data)
+        encoder.writeEnd()
+        const json = jsonResponseError(decodeJSONEnvelope(
+          `{"error":"Unauthorized","code":401,"message":"expired","data":${data}}`,
+        ), 502)
+        const binary = decodeBinaryError(encoder.bytes(), 502)
+        const expected = depth > 128 ? 'ParseError' : 'Unauthorized'
+        expect(json.error).toBe(expected)
+        expect(binary.error).toBe(expected)
+        if (depth <= 128) expect(binary.data).toEqual(json.data)
+      }
+    }
+  })
+
+  it('preserves prototype-named opaque data keys in both encodings', () => {
+    const data = '{"__proto__":{"luxoAuditMarker":"value"},"constructor":{"prototype":{"luxoAuditMarker":"value"}},"hasOwnProperty":false,"toJSON":"literal","n":9007199254740993,"precise":1.2300}'
+    const encoder = new Encoder()
+    for (const field of [1, 2, 3]) writeErrorField(encoder, field)
+    encoder.writeFieldString(5, data)
+    encoder.writeEnd()
+    const errors = [
+      jsonResponseError(decodeJSONEnvelope(`{"error":"Unauthorized","code":401,"message":"expired","data":${data}}`), 502),
+      decodeBinaryError(encoder.bytes(), 502),
+    ]
+    for (const error of errors) {
+      expect(error.error).not.toBe('ParseError')
+      const value = error.data as Record<string, unknown>
+      expect(Object.hasOwn(value, '__proto__')).toBe(true)
+      expect(Object.hasOwn(value, 'constructor')).toBe(true)
+      expect(Object.getPrototypeOf(value)).toBe(Object.prototype)
+      expect(encodeLuxoJSON(value)).toBe(data)
+    }
+    expect(Object.hasOwn(Object.prototype, 'luxoAuditMarker')).toBe(false)
+  })
+
+  it('rejects non-error status codes in both encodings', () => {
+    for (const code of [Number.MIN_SAFE_INTEGER, -1, 0, 200, 399, 600, 1000, Number.MAX_SAFE_INTEGER]) {
+      expect(jsonResponseError({ ...jsonError, code }, 502).error).toBe('ParseError')
+      expect(decodeBinaryError(binaryError(BigInt(code)), 502).error).toBe('ParseError')
+    }
+  })
+
   it('rejects invalid Unicode supplied directly in error fields or opaque data', () => {
     for (const field of ['error', 'message', 'traceId', 'cause']) {
       expect(jsonResponseError({ ...jsonError, [field]: '\ud800' }, 502))
@@ -49,19 +137,19 @@ describe('strict error envelopes', () => {
     }
   })
 
-  it('preserves valid error fields and the existing safe-int code range', () => {
-    for (const code of [0, -1, 401, Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER]) {
+  it('preserves valid error fields and the HTTP error status range', () => {
+    for (const code of [400, 401, 500, 599]) {
       const error = jsonResponseError({ ...jsonError, code, traceId: null, cause: null }, 502)
       expect(error).toMatchObject({ ...jsonError, code })
       expect(error.traceId).toBeUndefined()
       expect(error.cause).toBeUndefined()
     }
     const error = jsonResponseError(decodeJSONEnvelope(
-      '{"error":"","code":0,"message":"","traceId":"trace","cause":"原因","data":{"id":9223372036854775807,"ratio":1.5}}',
+      '{"error":"","code":400,"message":"","traceId":"trace","cause":"原因","data":{"id":9223372036854775807,"ratio":1.5}}',
     ), 502)
-    expect(error).toMatchObject({ error: '', code: 0, message: '', traceId: 'trace', cause: '原因',
+    expect(error).toMatchObject({ error: '', code: 400, message: '', traceId: 'trace', cause: '原因',
       data: { id: 9223372036854775807n, ratio: jsonNumber('1.5') } })
-    expect(jsonResponseError(decodeJSONEnvelope('{"error":"Custom","code":-0,"message":"failure"}')).code).toBe(-0)
+    expect(jsonResponseError(decodeJSONEnvelope('{"error":"Custom","code":-0,"message":"failure"}')).error).toBe('ParseError')
   })
 
   it('turns malformed nested error data into a parse error without throwing', () => {
@@ -128,7 +216,7 @@ describe('strict error envelopes', () => {
     encoder.writeEnd()
     expect(decodeBinaryError(encoder.bytes(), 502)).toMatchObject({ ...jsonError,
       traceId: 'trace', cause: '原因', data: { id: 9223372036854775807n, ratio: jsonNumber('1.5') } })
-    expect(decodeBinaryError(binaryError(0n), 502)).toMatchObject({ ...jsonError, code: 0 })
+    expect(decodeBinaryError(binaryError(400n), 502)).toMatchObject({ ...jsonError, code: 400 })
   })
 
   it('rejects invalid binary JSON syntax but preserves empty optional strings', () => {
@@ -140,12 +228,12 @@ describe('strict error envelopes', () => {
       expect(decodeBinaryError(encoder.bytes(), 502).error).toBe('ParseError')
     }
     const encoder = new Encoder()
-    encoder.writeFieldInt(1, 0n)
+    encoder.writeFieldInt(1, 400n)
     for (const field of [2, 3, 4, 6]) encoder.writeFieldString(field, '')
     encoder.writeFieldString(5, 'null')
     encoder.writeEnd()
     expect(decodeBinaryError(encoder.bytes(), 502)).toMatchObject({
-      error: '', code: 0, message: '', traceId: '', cause: '', data: null,
+      error: '', code: 400, message: '', traceId: '', cause: '', data: null,
     })
     expect(jsonResponseError({ ...jsonError, code: false }).code).toBe(0)
   })
@@ -185,7 +273,8 @@ describe.each(['json', 'binary'] as const)('%s HTTP error boundaries', mode => {
       vi.stubGlobal('fetch', fetch)
       const transport = new FetchTransport('http://localhost/luvia', { mode, onTokenExpired: refresh })
       transport.setSchema({ echo: { id: 1 } })
-      await expect(transport.call('echo')).rejects.toMatchObject({ error: 'Unauthorized', code })
+      await expect(transport.call('echo')).rejects.toMatchObject(code === 0
+        ? { error: 'ParseError', code: status } : { error: 'Unauthorized', code })
       expect(refresh).toHaveBeenCalledTimes(status === 401 && code === 401 ? 1 : 0)
       expect(fetch).toHaveBeenCalledTimes(status === 401 && code === 401 ? 2 : 1)
     }

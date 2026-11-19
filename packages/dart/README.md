@@ -211,6 +211,14 @@ backend-specific collection limits still apply independently.
 
 ### WebSocket — Real-time Subscriptions
 
+`timeout` separately bounds connection setup, each response/subscription ACK and
+token renewal. A stalled handshake fails its waiters with `TimeoutError` and
+releases the socket; it is not a single deadline covering all these phases.
+
+Pass `onTokenExpired` to `WsTransport` to obtain a new access token after server close code `4001`. Concurrent callers share renewal; failure or timeout stops reconnecting with the expired credential. Reconnection never replays calls or subscriptions. `autoReconnect: false` still permits renewal for subsequent explicit calls.
+
+`WsTransport` 可配置 `onTokenExpired`，在服务端以 `4001` 关闭到期连接后获取新的 access token。并发调用共享刷新；失败或超时后停止使用过期凭据重连，不重放旧调用和订阅。`autoReconnect: false` 仍允许后续显式调用等待刷新后连接。
+
 Connection auto-reconnect uses exponential backoff (1s → 2s → 4s → ... → 30s max).
 Disconnect terminates existing subscriptions with `NetworkError`; applications
 explicitly subscribe again. Reconnection does not replay or recover missed events.
@@ -431,6 +439,18 @@ server combines it with fields required by business logic and associations.
 
 The analyzer follows local aliases, nested relations, null-aware access, list
 indexing/iteration, pagination items and inline collection/Future callbacks.
+Parentheses, `as` casts and `!` preserve inline collection and `onData` callback
+bindings; lifecycle callbacks are matched independently.
+Core `where`, `toList`, `firstWhere`, `lastWhere` and `singleWhere` preserve the
+element source through downstream reads and aliases. A scalar `map` result
+collects the fields read by its visible callback.
+Local list/set literals, literal map indexing and record fields retain model
+sources through aliases and nested reads. Inline collection callbacks and
+collection-for elements keep those sources; passing a model inside a container
+or returning it from a closure still requires an explicit selection.
+Nullable fallbacks (`??` and `??=`) retain both possible sources. Unknown map
+keys remain possible matches. Interpolating or throwing a model, or storing it
+in a field, index or global variable, requires an explicit selection.
 `Selected.value`, collection helpers and pagination metadata are not schema
 fields. Selections belong to resolved invocations, not API-wide hint tables;
 same-named variables and other client libraries cannot contaminate them.
@@ -438,7 +458,10 @@ Dart 3.13 primary-constructor fields are supported through resolved types.
 
 An explicit `select:` always takes precedence. This is static analysis, not
 whole-program tracing: opaque helper calls and dynamic result usage require an
-explicit selection. Custom SDK output locations use `--client lib/path/client.dart`.
+explicit selection. This includes model or page extension getters, bound model
+methods, and models passed into constructors. Only methods declared by the
+configured generated SDK are rewritten; ordinary subclass or extension methods
+keep their business arguments. Custom SDK output locations use `--client lib/path/client.dart`.
 Unsafe or empty inference fails instead of selecting all fields. The old
 build_runner hint builder is disabled by default and rejects explicit use with a
 migration diagnostic. Use the call-site build entry above; API-wide hint output
@@ -471,6 +494,43 @@ first converting to double. This applies to Binary-embedded JSON and error
 `data`, not only JSON transport. The legacy `preserveNumberSyntax` argument no
 longer enables a lossy mode; `normalizeLuxoJSON` checks depth without converting
 numbers or copying/mutating caller-owned collections.
+
+Generated HTTP and WebSocket JSON responses carry static `JSONResponseSchema` metadata.
+Model/type objects allow at most 64 object layers (the root counts as one;
+lists and pagination shells add no object layers). Each generic JSON field
+starts its own 128-container budget, including fields inside model lists.
+Error responses always treat `data` as generic JSON. Duplicate source values are
+validated before replacement, and token refresh retains the original response
+schema. WebSocket calls and subscriptions retain their schema and mode from
+operation start, including connection setup. Model depth failures retire only
+the correlated operation with `DecodeError`; malformed source JSON closes the
+connection with `ParseError`. Unknown, cancelled and pre-ACK stream payloads are
+syntax checked and discarded. Syntax validation is iterative; only 128 frame
+entries are retained; deeper scratch storage loses its references after each
+message and is reclaimed by the garbage collector.
+Direct `decodeLuxoJSON` and `decodeLuxoJSONEnvelope` callers can provide
+the same optional `response` metadata; without it they read generic JSON.
+These response metadata checks apply to HTTP, WebSocket and direct JSON reads
+with explicit response metadata. Generated model/type `fromJson` factories,
+including input types, and Binary row, columnar and paginated readers also
+enforce the 64-object limit. Nested lists do not add object layers, and embedded
+JSON retains its independent 128-container budget. Regenerate clients to obtain
+these checks.
+
+Generated model/input `toJson()` projections, Binary `writeLuxo()` writers and
+the generated-model path in `encodeLuxoJSON()` also enforce 64 object layers.
+Each generic JSON field and each `[JSON]` element retains its own 128-container
+budget. Generated inputs keep `toLuxoParameters()` shallow; request encoding
+checks nested values while writing. Regenerate model files for these write checks.
+`encodeLuxoJSON(value, opaque: true)` explicitly treats the value as generic JSON,
+counting its serialized objects and arrays from the value's own root.
+Existing handwritten `LuxoJSONEncodable` implementations remain supported.
+
+生成模型和输入的 `toJson()`、Binary `writeLuxo()` 以及 `encodeLuxoJSON()` 的生成模型
+写入路径也检查64层对象上限。通用JSON字段和`[JSON]`的每个元素各自允许128层容器，
+列表不增加模型对象层数。`toLuxoParameters()`保持浅投影，实际请求在写入时检查嵌套值；
+旧模型文件需要重新生成。`opaque: true`明确按通用JSON计算整个值的对象／数组层数，
+手写`LuxoJSONEncodable`接口继续保留。
 
 ```dart
 final amount = LuxoJSONNumber.parse('0.12345678901234567890123456789');
@@ -578,17 +638,17 @@ VM/JS/Wasm 分别验证两种编码与 HTTP/WebSocket。需要 Go、Dart、Node�
 dart test test/readme_test.dart
 ```
 
-The test extracts the nine Dart examples above into separate libraries,
+The test extracts the eleven Dart examples above into separate libraries,
 preserving their imports and checking against a freshly generated client.
 Only application-package paths, endpoints and the surrounding async/lifecycle
-context are supplied by the fixture. It runs the real selection-hint builder,
+context are supplied by the fixture. It runs the real call-site selection build entry,
 strict analysis and loopback HTTP/WebSocket calls, including full-width JSON,
 Binary decoding, pagination and one-time token refresh. It also checks that
 type-only Bytes/JSON schemas retain their required conversion imports while
 ordinary/unused types do not add unused imports. Existing installed test tools
 are reused; this is not a fresh package installation or live Go-server test.
 
-测试直接提取上文九段 Dart 代码，保留各自 import，配合真实生成客户端和字段选择
+测试直接提取上文十一段 Dart 代码，保留各自 import，配合真实生成客户端和字段选择
 构建器进行严格分析与回环 HTTP/WebSocket 验证；只补充应用包路径、测试地址及
 async/生命周期上下文。覆盖全宽 JSON 整数、Binary 解码、分页和一次刷新重试，
 同时检查生成器按实际字段保留或省略转换库导入。复用已安装工具，不把此测试当作
@@ -706,6 +766,10 @@ connection and terminates pending calls/setup and established subscriptions with
 `ParseError`. The transport never guesses IDs from a damaged document or replays
 subscriptions on reconnection. This differs from a valid envelope with invalid
 business data, which remains a subscription-local `DecodeError`.
+Invalid Binary frame tags, missing/truncated IDs or UInt64 overflow also retire
+the connection with `ParseError`. With a valid ID, a successful Binary ACK carrying
+trailing bytes fails only that subscription; peers and ordinary calls continue.
+Valid late or retired IDs remain ignored.
 Subscription decoding is separate from application delivery. A typed decoder
 failure removes only that subscription, attempts remote cancellation and notifies
 `onError` once with `DecodeError`, never `onDone`. Late data and repeated cancellation

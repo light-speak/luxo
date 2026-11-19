@@ -7,13 +7,13 @@ import (
 	"github.com/light-speak/luxo/pkg/ast"
 )
 
-func writeEnumParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string) {
+func writeEnumParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string, keys ...string) {
 	writeStructuredParamDeclaration(b, param, enums, indent)
-	writeEnumParamAssignment(b, param, false, indent)
+	writeEnumParamAssignment(b, param, false, indent, keys...)
 }
 
 // Inferred queries pass string values directly to typed database conditions.
-func writeInferredEnumParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string) {
+func writeInferredEnumParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string, keys ...string) {
 	textType := *param.Type
 	textType.Name = "String"
 	if param.Default == nil || isNullLiteral(param.Default) {
@@ -27,22 +27,23 @@ func writeInferredEnumParamExtraction(b *strings.Builder, param *ast.ParamDecl, 
 			fmt.Fprintf(b, "%svar %s string = string(%s)\n", indent, param.Name, value)
 		}
 	}
-	writeEnumParamAssignment(b, param, true, indent)
+	writeEnumParamAssignment(b, param, true, indent, keys...)
 }
 
-func writeEnumParamAssignment(b *strings.Builder, param *ast.ParamDecl, text bool, indent string) {
+func writeEnumParamAssignment(b *strings.Builder, param *ast.ParamDecl, text bool, indent string, keys ...string) {
+	key := paramWireKey(param, keys)
 	outer := indent
 	if param.Default != nil {
-		fmt.Fprintf(b, "%sif req.HasParam(%q) {\n", indent, param.Name)
+		fmt.Fprintf(b, "%sif req.HasParam(%q) {\n", indent, key)
 		indent += "\t"
 	}
 	if param.Type.Nullable {
-		fmt.Fprintf(b, "%sif req.ParamIsNull(%q) {\n", indent, param.Name)
+		fmt.Fprintf(b, "%sif req.ParamIsNull(%q) {\n", indent, key)
 		fmt.Fprintf(b, "%s\t%s = nil\n%s} else {\n", indent, param.Name, indent)
-		writeEnumParamValue(b, param.Name, param.Name, param.Type, text, indent+"\t")
+		writeEnumParamValue(b, key, param.Name, param.Type, text, indent+"\t")
 		fmt.Fprintf(b, "%s}\n", indent)
 	} else {
-		writeEnumParamValue(b, param.Name, param.Name, param.Type, text, indent)
+		writeEnumParamValue(b, key, param.Name, param.Type, text, indent)
 	}
 	if param.Default != nil {
 		fmt.Fprintf(b, "%s}\n", outer)

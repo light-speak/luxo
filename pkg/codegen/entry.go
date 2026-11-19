@@ -11,6 +11,7 @@ import (
 type moduleInfo struct {
 	name          string
 	hasRuntime    bool // has executable or storage declarations, not only shared types
+	hasDatabase   bool // requires the configured database adapter
 	hasCrud       bool
 	hasLoaders    bool
 	hasExtend     bool // has cross-module extend (needs remote loaders in cluster mode)
@@ -44,23 +45,34 @@ func collectModules(result *semantic.Result) []moduleInfo {
 	for _, file := range result.Files {
 		sourceModule := moduleNameFromFile(file.Name)
 		for _, ext := range file.Extends {
-			if owner := modelOwners[ext.Name]; owner != "" && owner != sourceModule {
+			owner := modelOwners[ext.Name]
+			if owner == sourceModule {
+				continue
+			}
+			grouped[sourceModule].hasLoaders = true
+			grouped[sourceModule].hasExtend = true
+			if owner != "" {
 				grouped[owner].hasBatchRPC = true
 			}
 		}
 	}
 	for _, call := range collectLoadCalls(result) {
-		if len(call.argNames) == 0 {
-			continue
-		}
+		source := grouped[call.sourceModule]
+		source.hasLoaders = true
 		if owner := modelOwners[call.modelName]; owner != "" && owner != call.sourceModule {
-			grouped[owner].hasRemoteLoad = true
+			source.hasExtend = true
+			if len(call.argNames) == 0 {
+				grouped[owner].hasBatchRPC = true
+			} else {
+				grouped[owner].hasRemoteLoad = true
+			}
 		}
 	}
 
 	var modules []moduleInfo
 	for _, name := range order {
 		if grouped[name].hasRuntime {
+			grouped[name].hasDatabase = grouped[name].hasDatabase || grouped[name].hasLoaders
 			modules = append(modules, *grouped[name])
 		}
 	}
@@ -69,6 +81,7 @@ func collectModules(result *semantic.Result) []moduleInfo {
 
 func collectModuleFileInfo(info *moduleInfo, file *ast.File, moduleName string, enums map[string]bool, modelOwners map[string]string) {
 	info.hasRuntime = info.hasRuntime || len(file.Models)+len(file.Extends)+len(file.APIs)+len(file.Functions)+len(file.Events)+len(file.Listeners)+len(file.Middlewares) > 0
+	info.hasDatabase = info.hasDatabase || fileAppUsesDatabase(file)
 	for _, model := range file.Models {
 		modelOwners[model.Name] = moduleName
 		if hasDirective(model.Directives, "crud") {
@@ -78,10 +91,6 @@ func collectModuleFileInfo(info *moduleInfo, file *ast.File, moduleName string, 
 		if len(analyzeRelations(model, enums)) > 0 {
 			info.hasLoaders = true
 		}
-	}
-	if len(file.Extends) > 0 {
-		info.hasLoaders = true
-		info.hasExtend = true
 	}
 	info.hasEvents = info.hasEvents || len(file.Events) > 0 || len(file.Listeners) > 0
 	info.emitsEvents = info.emitsEvents || fileEmitsEvents(file)
@@ -95,6 +104,7 @@ func collectModuleFileInfo(info *moduleInfo, file *ast.File, moduleName string, 
 		}
 	}
 	info.hasServiceFns = info.hasServiceFns || functionsHaveDirective(file.Functions, "service")
+	info.hasSchema = info.hasSchema || info.hasServiceFns
 }
 
 func apisHaveDirective(apis []*ast.ApiDecl, name string) bool {
@@ -167,8 +177,11 @@ func generateEntryFile(result *semantic.Result, modulePath string, backends Entr
 	writeEntryModuleImports(&b, modules, modulePath)
 	anyEvents, anyServiceFns := entryCapabilities(modules)
 	anyLoaders := modulesNeedLoaders(modules)
+	anyDatabase := modulesNeedDatabase(modules)
 
-	b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux\"\n")
+	if anyDatabase {
+		b.WriteString("\n\t\"github.com/light-speak/luxo/pkg/lux\"\n")
+	}
 	if anyLoaders {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
 	}
@@ -181,8 +194,10 @@ func generateEntryFile(result *semantic.Result, modulePath string, backends Entr
 		writeEventBackendImport(&b, backends.Events)
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/pg/migrate\"\n")
-	b.WriteString("\tpg \"github.com/light-speak/luxo/pkg/lux/pg\"\n")
+	if anyDatabase {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/pg/migrate\"\n")
+		b.WriteString("\tpg \"github.com/light-speak/luxo/pkg/lux/pg\"\n")
+	}
 	writeQueueBackendImports(&b, backends.Queue)
 	if entryNeedsRPC(modules, anyServiceFns) {
 		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/rpc\"\n")
@@ -199,7 +214,9 @@ func generateEntryFile(result *semantic.Result, modulePath string, backends Entr
 	b.WriteString("\t\tos.Exit(1)\n")
 	b.WriteString("\t}\n\n")
 
-	writeAutoMigration(&b)
+	if anyDatabase {
+		writeAutoMigration(&b)
+	}
 	writeEmbeddedGatewaySchema(&b, modules, backends.Cache)
 
 	writeModuleApps(&b, modules)
@@ -223,7 +240,8 @@ func generateEntryFile(result *semantic.Result, modulePath string, backends Entr
 
 // GenerateEntryFileChecked generates and validates the embedded entry point.
 func GenerateEntryFileChecked(result *semantic.Result, modulePath string, options ...EntryBackends) ([]byte, error) {
-	if err := validateEntryCacheContracts(result); err != nil {
+	result, err := prepareEntryCompilation(result)
+	if err != nil {
 		return nil, err
 	}
 	backends, err := entryBackendSelection(options)
@@ -237,7 +255,7 @@ func GenerateEntryFileChecked(result *semantic.Result, modulePath string, option
 	if source == nil {
 		return nil, nil
 	}
-	return formatGeneratedChecked(source)
+	return formatGeneratedWithIdentifiers(source, needsUnicodeGoExports(result))
 }
 
 func writeAutoMigration(b *strings.Builder) {
@@ -393,18 +411,24 @@ func writeEmbeddedRPCWiring(b *strings.Builder, modules []moduleInfo, hasService
 }
 
 func writeModuleApps(b *strings.Builder, modules []moduleInfo) {
-	// Embedded mode: all modules share one DB connection pool
-	b.WriteString("\tcfg := lux.DBConfigFromEnv()\n")
-	b.WriteString("\tdb, err := pg.NewDBWithConfig(ctx, cfg.ConnectionString(), cfg)\n")
-	b.WriteString("\tif err != nil {\n")
-	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: database: %v\\n\", err)\n")
-	b.WriteString("\t\tos.Exit(1)\n")
-	b.WriteString("\t}\n")
-	b.WriteString("\tdefer db.Close()\n\n")
-	b.WriteString("\tgw.SetRuntimeDependencyStatsProvider(db)\n\n")
+	if modulesNeedDatabase(modules) {
+		// Embedded mode: all modules share one DB connection pool
+		b.WriteString("\tcfg := lux.DBConfigFromEnv()\n")
+		b.WriteString("\tdb, err := pg.NewDBWithConfig(ctx, cfg.ConnectionString(), cfg)\n")
+		b.WriteString("\tif err != nil {\n")
+		b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: database: %v\\n\", err)\n")
+		b.WriteString("\t\tos.Exit(1)\n")
+		b.WriteString("\t}\n")
+		b.WriteString("\tdefer db.Close()\n\n")
+		b.WriteString("\tgw.SetRuntimeDependencyStatsProvider(db)\n\n")
+	}
 
 	for _, m := range modules {
-		fmt.Fprintf(b, "\t%sApp := %s_luxo.NewFromDB(db)\n", m.name, m.name)
+		if m.hasDatabase {
+			fmt.Fprintf(b, "\t%sApp := %s_luxo.NewFromDB(db)\n", m.name, m.name)
+		} else {
+			writeStatelessModuleApp(b, m.name)
+		}
 	}
 	b.WriteString("\n")
 	for _, m := range modules {
@@ -514,7 +538,6 @@ func writeQueueWiring(b *strings.Builder, modules []moduleInfo, backend string) 
 func writeBackendInitialization(b *strings.Builder, variable, constructor string) {
 	fmt.Fprintf(b, "\t%s, err := %s\n", variable, constructor)
 	b.WriteString("\tif err != nil {\n\t\tfmt.Fprintf(os.Stderr, \"fatal: initialize messaging: %v\\n\", err)\n\t\tos.Exit(1)\n\t}\n")
-	fmt.Fprintf(b, "\tdefer %s.Close()\n\n", variable)
 }
 
 func writeEventRegistration(b *strings.Builder, module, app string) {
@@ -552,7 +575,8 @@ func generateModuleEntryFiles(result *semantic.Result, modulePath string, backen
 
 // GenerateModuleEntryFilesChecked generates and validates every cluster entry point.
 func GenerateModuleEntryFilesChecked(result *semantic.Result, modulePath string, options ...EntryBackends) (map[string][]byte, error) {
-	if err := validateEntryCacheContracts(result); err != nil {
+	result, err := prepareEntryCompilation(result)
+	if err != nil {
 		return nil, err
 	}
 	backends, err := entryBackendSelection(options)
@@ -564,7 +588,7 @@ func GenerateModuleEntryFilesChecked(result *semantic.Result, modulePath string,
 	}
 	entries := generateModuleEntryFiles(result, modulePath, backends)
 	for name, source := range entries {
-		formatted, err := formatGeneratedChecked(source)
+		formatted, err := formatGeneratedWithIdentifiers(source, needsUnicodeGoExports(result))
 		if err != nil {
 			return nil, fmt.Errorf("format module entry %s: %w", name, err)
 		}
@@ -580,33 +604,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	b.WriteString("// Code generated by luxo. DO NOT EDIT.\n")
 	fmt.Fprintf(&b, "// Source: %s/main.gen.go (cluster entry for %s module)\n\n", target.name, target.name)
 	b.WriteString("package main\n\n")
-	b.WriteString("import (\n")
-	b.WriteString("\t\"context\"\n")
-	b.WriteString("\t\"errors\"\n")
-	b.WriteString("\t\"fmt\"\n")
-	b.WriteString("\t\"os\"\n\n")
-
-	// Import only this module
-	fmt.Fprintf(&b, "\t%s_luxo \"%s/service/%s/luxo\"\n", target.name, modulePath, target.name)
-	fmt.Fprintf(&b, "\t%s_resolver \"%s/service/%s/resolver\"\n", target.name, modulePath, target.name)
-
-	b.WriteString("\n")
-	if target.hasLoaders {
-		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
-	}
-	if target.hasCache {
-		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
-		writeCacheBackendImport(&b, backends.Cache)
-	}
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
-	if target.hasEvents || target.emitsEvents || target.hasStreams {
-		writeEventBackendImport(&b, backends.Events)
-	}
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/pg/migrate\"\n")
-	writeQueueBackendImports(&b, backends.Queue)
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/rpc\"\n")
-	b.WriteString(")\n\n")
+	writeSingleModuleEntryImports(&b, target, modulePath, backends)
 
 	b.WriteString("var Version = \"dev\"\n\n")
 
@@ -618,11 +616,13 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	b.WriteString("\t}\n\n")
 
 	// Cluster mode: DB name = PROJECT_MODULE (e.g., wechat_user)
-	fmt.Fprintf(&b, "\tif prefix := os.Getenv(\"DATABASE_PREFIX\"); prefix != \"\" {\n")
-	fmt.Fprintf(&b, "\t\tos.Setenv(\"DATABASE_PREFIX\", prefix+\"_%s\")\n", target.name)
-	fmt.Fprintf(&b, "\t}\n\n")
+	if target.hasDatabase {
+		fmt.Fprintf(&b, "\tif prefix := os.Getenv(\"DATABASE_PREFIX\"); prefix != \"\" {\n")
+		fmt.Fprintf(&b, "\t\tos.Setenv(\"DATABASE_PREFIX\", prefix+\"_%s\")\n", target.name)
+		fmt.Fprintf(&b, "\t}\n\n")
 
-	writeAutoMigration(&b)
+		writeAutoMigration(&b)
+	}
 	writeGatewayCacheWiring(&b, target.name, target.hasCache, backends.Cache)
 	fmt.Fprintf(&b, "\tgw.AddModule(%q)\n", target.name)
 	if target.hasSchema {
@@ -637,7 +637,9 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	b.WriteString("\t\tos.Exit(1)\n")
 	b.WriteString("\t}\n")
 	b.WriteString("\tdefer app.Close()\n\n")
-	b.WriteString("\tgw.SetRuntimeDependencyStatsProvider(app.DB)\n\n")
+	if target.hasDatabase {
+		b.WriteString("\tgw.SetRuntimeDependencyStatsProvider(app.DB)\n\n")
+	}
 	fmt.Fprintf(&b, "\t%s_resolver.Setup(app)\n\n", target.name)
 
 	// DataLoader
@@ -871,7 +873,7 @@ func collectGatewayRateLimits(result *semantic.Result) map[string]gatewayRateLim
 				maxLiteral, maxOK := maxArg.Value.(*ast.Literal)
 				window, windowOK := directiveDuration(directive, "window", 1)
 				if maxOK && windowOK {
-					limits[apiDecl.Name] = gatewayRateLimit{max: maxLiteral.Value, window: window}
+					limits[apiDecl.Name] = gatewayRateLimit{max: decimalIntegerLiteral(maxLiteral.Value), window: window}
 				}
 			}
 		}
@@ -881,7 +883,8 @@ func collectGatewayRateLimits(result *semantic.Result) map[string]gatewayRateLim
 
 // GenerateGatewayEntryChecked generates and validates the routing gateway entry point.
 func GenerateGatewayEntryChecked(result *semantic.Result, modulePath string, options ...EntryBackends) ([]byte, error) {
-	if err := validateEntryCacheContracts(result); err != nil {
+	result, err := prepareEntryCompilation(result)
+	if err != nil {
 		return nil, err
 	}
 	backends, err := entryBackendSelection(options)
@@ -895,7 +898,7 @@ func GenerateGatewayEntryChecked(result *semantic.Result, modulePath string, opt
 	if source == nil {
 		return nil, nil
 	}
-	return formatGeneratedChecked(source)
+	return formatGeneratedWithIdentifiers(source, needsUnicodeGoExports(result))
 }
 
 func writeGatewayNativeStreamWiring(b *strings.Builder, modules []moduleInfo) {
@@ -989,4 +992,37 @@ func collectGatewayFileRoutes(file *ast.File, compiledAPIs map[string]bool, addR
 			addRoute(api.Name, moduleName)
 		}
 	}
+}
+
+func writeSingleModuleEntryImports(b *strings.Builder, target moduleInfo, modulePath string, backends EntryBackends) {
+	b.WriteString("import (\n")
+	b.WriteString("\t\"context\"\n")
+	b.WriteString("\t\"errors\"\n")
+	b.WriteString("\t\"fmt\"\n")
+	b.WriteString("\t\"os\"\n\n")
+
+	// Import only this module
+	fmt.Fprintf(b, "\t%s_luxo \"%s/service/%s/luxo\"\n", target.name, modulePath, target.name)
+	fmt.Fprintf(b, "\t%s_resolver \"%s/service/%s/resolver\"\n", target.name, modulePath, target.name)
+
+	b.WriteString("\n")
+	if target.hasLoaders {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/dataloader\"\n")
+	}
+	if target.hasCache {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
+		writeCacheBackendImport(b, backends.Cache)
+	}
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
+	if target.hasEvents || target.emitsEvents || target.hasStreams {
+		writeEventBackendImport(b, backends.Events)
+	}
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
+	if target.hasDatabase {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/pg/migrate\"\n")
+	}
+	writeQueueBackendImports(b, backends.Queue)
+	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/rpc\"\n")
+	b.WriteString(")\n\n")
+
 }

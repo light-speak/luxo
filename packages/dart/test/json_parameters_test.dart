@@ -1,12 +1,575 @@
+import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:luxo_client/luxo_client.dart';
-import 'package:luxo_client/src/json.dart' show JSONRequestEncoder;
+import 'package:luxo_client/src/json.dart'
+    show JSONRequestEncoder, LuxoSealedJSONWritable, LuxoJSONOutput;
 import 'package:test/test.dart';
 
 void main() {
+  test(
+    'sealed JSON map inputs preserve strict payloads, depth and caller values',
+    () {
+      const types = {
+        '@sealed:Outcome': {
+          'Done': SelectionFieldSchema(1, 'Outcome.Done', 'Model'),
+          'Next': SelectionFieldSchema(2, 'Outcome.Next', 'Model'),
+        },
+        'Outcome.Done': {'child': SelectionFieldSchema(1, 'Child', 'Model')},
+        'Outcome.Next': {
+          'child': SelectionFieldSchema(1, 'Outcome', 'Sealed', false, true),
+        },
+        'Child': {'value': SelectionFieldSchema(1, null, 'Int')},
+      };
+      final writer = JSONRequestEncoder({
+        'echo': const APISchemaEntry(
+          1,
+          [ParamSchema(1, 'value', 'Sealed', false, false, 'Outcome')],
+          {},
+          types,
+        ),
+      });
+      final child = {'value': LuxoInt64.fromInt(7)};
+      final input = {
+        'Done': {'child': child},
+      };
+      expect(jsonDecode(writer.encode('echo', {'value': input})), {
+        r'$api': 'echo',
+        'value': {
+          'Done': {
+            'child': {'value': 7},
+          },
+        },
+      });
+      expect(child['value'], LuxoInt64.fromInt(7));
+      expect(
+        writer.encode('echo', {
+          'value': {'Done': _SealedPayload(child)},
+        }),
+        contains('"value":7'),
+      );
+      for (final value in [
+        null,
+        {},
+        {'Done': {}, 'Next': {}},
+        {'Future': {}},
+        {
+          'Done': {'extra': 1},
+        },
+      ]) {
+        expect(
+          () => writer.encode('echo', {'value': value}),
+          throwsA(isA<LuxoError>()),
+        );
+      }
+      expect(
+        () => writer.encode('echo', {'value': const _DifferentSealedOwner()}),
+        throwsA(
+          isA<LuxoError>().having(
+            (e) => e.message,
+            'message',
+            contains('wrong sealed owner'),
+          ),
+        ),
+      );
+      Object nested = {
+        'Next': {'child': null},
+      };
+      for (var i = 1; i < 32; i++) {
+        nested = {
+          'Next': {'child': nested},
+        };
+      }
+      expect(() => writer.encode('echo', {'value': nested}), returnsNormally);
+      nested = {
+        'Next': {'child': nested},
+      };
+      expect(
+        () => writer.encode('echo', {'value': nested}),
+        throwsA(isA<LuxoError>()),
+      );
+      const response = JSONResponseSchema(
+        modelType: '@sealed:Outcome',
+        types: types,
+      );
+      expect(
+        () => decodeLuxoJSON(jsonEncode(nested), response: response),
+        throwsFormatException,
+      );
+      for (final raw in [
+        '42',
+        '[]',
+        '{',
+        '{"Done"}',
+        '{"Done":null}',
+        '{"Done":{}',
+      ]) {
+        expect(
+          () => decodeLuxoJSON(raw, response: response),
+          throwsFormatException,
+          reason: raw,
+        );
+      }
+      expect(
+        () => decodeLuxoJSON('{"Future":{}}', response: response),
+        throwsFormatException,
+      );
+      expect(
+        () => decodeLuxoJSON('{"Done":{"extra":1}}', response: response),
+        throwsFormatException,
+      );
+      expect(
+        () => decodeLuxoJSON(
+          '{"Done":{}}',
+          response: const JSONResponseSchema(modelType: '@sealed:Missing'),
+        ),
+        throwsFormatException,
+      );
+    },
+  );
+  group('JSON Bytes parameters', () {
+    test(
+      'preserves scalar/list and nullable contracts across schema plans',
+      () {
+        final bytes = Uint8List.fromList([0, 255]);
+        for (final list in [false, true]) {
+          for (final nullable in [false, true]) {
+            final writer = JSONRequestEncoder({
+              'bytes': APISchemaEntry(7, [
+                ParamSchema(1, 'value', 'Bytes', list, nullable),
+              ]),
+            });
+            expect(
+              decodeLuxoJSON(
+                writer.encode('bytes', {
+                  'value': list ? [bytes] : bytes,
+                }),
+              ),
+              {
+                r'$api': 'bytes',
+                'value': list ? ['AP8='] : 'AP8=',
+              },
+            );
+            if (nullable) {
+              expect(decodeLuxoJSON(writer.encode('bytes', {'value': null})), {
+                r'$api': 'bytes',
+                'value': null,
+              });
+            } else {
+              expect(
+                () => writer.encode('bytes', {'value': null}),
+                throwsA(
+                  isA<LuxoError>().having(
+                    (error) => error.error,
+                    'error',
+                    'ConfigError',
+                  ),
+                ),
+              );
+            }
+            if (list) {
+              expect(
+                () => writer.encode('bytes', {
+                  'value': [null],
+                }),
+                _exactParameterFailure(
+                  'value[0]',
+                  'must be Uint8List or a Base64 string',
+                ),
+              );
+            }
+          }
+        }
+      },
+    );
+
+    final schema = {
+      'bytes': APISchemaEntry(
+        7,
+        [
+          const ParamSchema(1, 'value', 'Bytes'),
+          const ParamSchema(2, 'values', 'Bytes', true, true),
+          const ParamSchema(3, 'node', 'Node'),
+          const ParamSchema(4, 'json', 'JSON'),
+        ],
+        const {},
+        {
+          'Node': {
+            'value': SelectionFieldSchema(1, null, 'Bytes'),
+            'values': SelectionFieldSchema(2, null, 'Bytes', true, true),
+          },
+        },
+      ),
+    };
+    test('writes Base64 for scalar, list and nested values without changing generic JSON', () {
+      final bytes = Uint8List.fromList([0, 127, 128, 255]);
+      final writer = JSONRequestEncoder(schema);
+      expect(
+        decodeLuxoJSON(
+          writer.encode('bytes', {
+            'value': bytes,
+            'values': [bytes, Uint8List(0)],
+            'node': {
+              'value': bytes,
+              'values': [Uint8List(0), bytes],
+            },
+            'json': bytes,
+          }),
+        ),
+        {
+          r'$api': 'bytes',
+          'value': 'AH+A/w==',
+          'values': ['AH+A/w==', ''],
+          'node': {
+            'value': 'AH+A/w==',
+            'values': ['', 'AH+A/w=='],
+          },
+          'json': [0, 127, 128, 255],
+        },
+      );
+    });
+    test(
+      'preserves byte-view bounds, null lists and existing encoded text',
+      () {
+        final bytes = Uint8List.fromList([99, 0, 255, 88]);
+        final view = Uint8List.sublistView(bytes, 1, 3);
+        final writer = JSONRequestEncoder(schema);
+        expect(
+          decodeLuxoJSON(
+            writer.encode('bytes', {
+              'value': view,
+              'values': null,
+              'node': {'value': 'AP8=', 'values': null},
+            }),
+          ),
+          {
+            r'$api': 'bytes',
+            'value': 'AP8=',
+            'values': null,
+            'node': {'value': 'AP8=', 'values': null},
+          },
+        );
+        expect(bytes, [99, 0, 255, 88]);
+        expect(writer.encode('bytes', const {}), '{"\$api":"bytes"}');
+      },
+    );
+    test('rejects unsupported Bytes values with their full parameter path', () {
+      final writer = JSONRequestEncoder(schema);
+      for (final value in [
+        null,
+        42,
+        true,
+        <int>[0, 255],
+        {},
+      ]) {
+        expect(
+          () => writer.encode('bytes', {'value': value}),
+          _exactParameterFailure(
+            'value',
+            'must be Uint8List or a Base64 string',
+          ),
+        );
+      }
+      expect(
+        () => writer.encode('bytes', {
+          'values': [Uint8List(0), null],
+        }),
+        _exactParameterFailure(
+          'values[1]',
+          'must be Uint8List or a Base64 string',
+        ),
+      );
+      expect(
+        () => writer.encode('bytes', {
+          'node': {'value': false},
+        }),
+        _exactParameterFailure(
+          'node.value',
+          'must be Uint8List or a Base64 string',
+        ),
+      );
+    });
+  });
+
+  test('JSON parameter failures retain complete paths and recover', () {
+    final cases = <(List<(String, bool)>, String)>[
+      ([('root', false)], 'root'),
+      ([('', false)], ''),
+      ([('root', true)], 'root[11]'),
+      ([('', true)], '[11]'),
+      ([('root', false), ('leaf', false)], 'root.leaf'),
+      ([('root', false), ('', false)], 'root'),
+      ([('', false), ('leaf', false)], '.leaf'),
+      ([('', false), ('', false), ('leaf', false)], '..leaf'),
+      ([('', false), ('', false), ('', false)], ''),
+      ([('root', false), ('', false), ('leaf', false)], 'root..leaf'),
+      ([('root', false), ('[x]', false)], 'root[x]'),
+      ([('root', false), ('', false), ('[x]', false)], 'root[x]'),
+      ([('root', false), ('[x]', false), ('leaf', false)], 'root[x].leaf'),
+      ([('root', true), ('', false), ('leaf', true)], 'root[11]..leaf[11]'),
+      ([('', true), ('', true), ('', true)], '[11][11][11]'),
+      ([('字段😀', false), ('\u0000"\\.', false)], '字段😀.\u0000"\\.'),
+    ];
+    cases.add((List.filled(17, ('', false)), ''));
+    cases.add((List.filled(17, ('', true)), List.filled(17, '[11]').join()));
+    cases.add((List.filled(65, ('', false)), ''));
+    cases.add((List.filled(65, ('', true)), List.filled(65, '[11]').join()));
+    final bracket = '[${'x' * 64}]';
+    cases.add((
+      [('root', false), ...List.filled(64, (bracket, false))],
+      'root${List.filled(64, bracket).join()}',
+    ));
+    final longName = '字段${'λ' * 128}';
+    cases.add((
+      [...List.filled(17, ('', false)), (longName, false), ('id', false)],
+      '${'.' * 17}$longName.id',
+    ));
+    for (final (fields, path) in cases) {
+      final (writer, params) = _pathRequest(fields);
+      expect(
+        () => writer.encode('paths', params),
+        _exactParameterFailure(path, 'must be LuxoInt64'),
+        reason: fields.toString(),
+      );
+      expect(writer.encode('paths', const {}), '{"\$api":"paths"}');
+    }
+  });
+
+  test('JSON parameter failures retain deep object and list paths', () {
+    for (final length in [1, 2, 8, 9, 16, 17, 64, 65]) {
+      for (final list in [false, true]) {
+        for (final name in ['node', '字段😀${'λ' * 64}']) {
+          final fields = List.filled(length, (name, list));
+          final (writer, params) = _pathRequest(fields);
+          final path = List.filled(
+            length,
+            '$name${list ? '[11]' : ''}',
+          ).join('.');
+          expect(
+            () => writer.encode('paths', params),
+            _exactParameterFailure(path, 'must be LuxoInt64'),
+          );
+          expect(writer.encode('paths', const {}), '{"\$api":"paths"}');
+        }
+      }
+    }
+  });
+
+  test('JSON parameter failures preserve path promotion boundaries', () {
+    for (final remaining in [7, 8, 9]) {
+      for (final length in [127, 128, 129]) {
+        final fields = [
+          ...List.filled(remaining + 1, ('node', false)),
+          ('x' * (length - 3), false),
+          ('id', false),
+        ];
+        final (writer, params) = _pathRequest(fields);
+        expect(
+          () => writer.encode('paths', params),
+          _exactParameterFailure(
+            fields.map((e) => e.$1).join('.'),
+            'must be LuxoInt64',
+          ),
+        );
+        expect(writer.encode('paths', const {}), '{"\$api":"paths"}');
+      }
+    }
+  });
+
+  test('JSON request keys preserve quoting through root and model plans', () {
+    for (final key in [
+      '',
+      'plain',
+      'k' * 63,
+      'k' * 64,
+      'k' * 65,
+      '字段😀',
+      'quoted"',
+      'slash${String.fromCharCode(92)}',
+      'control${String.fromCharCode(0)}',
+      'long_${'x' * 4096}',
+    ]) {
+      expect(
+        JSONRequestEncoder().encode('keys', {key: 'value'}),
+        jsonEncode({r'$api': 'keys', key: 'value'}),
+      );
+      final writer = JSONRequestEncoder({
+        'keys': APISchemaEntry(
+          7,
+          [ParamSchema(1, 'input', 'Model', false, false, 'Payload')],
+          const {},
+          {
+            'Payload': {key: const SelectionFieldSchema(1, null, 'Int')},
+          },
+        ),
+      });
+      expect(
+        writer.encode('keys', {
+          'input': {key: LuxoInt64.fromInt(7)},
+        }),
+        jsonEncode({
+          r'$api': 'keys',
+          'input': {key: 7},
+        }),
+      );
+    }
+  });
+  test('request model64 and each JSON128 retain independent budgets', () {
+    const types = {
+      'Node': {
+        'child': SelectionFieldSchema(1, 'Node', 'Model', false, true),
+        'children': SelectionFieldSchema(2, 'Node', 'Model', true, true),
+        'metadata': SelectionFieldSchema(3, null, 'JSON'),
+        'jsons': SelectionFieldSchema(4, null, 'JSON', true),
+      },
+    };
+    final writer = JSONRequestEncoder()
+      ..setSchema({
+        'echo': APISchemaEntry(
+          7,
+          [
+            ParamSchema(1, 'value', 'Model', false, false, 'Node'),
+            ParamSchema(2, 'values', 'Model', true, false, 'Node'),
+            ParamSchema(3, 'raw', 'JSON'),
+            ParamSchema(4, 'raws', 'JSON', true),
+          ],
+          const {},
+          types,
+        ),
+      });
+    Object? json(int layers) {
+      Object? value;
+      for (var i = 0; i < layers; i++) value = [value];
+      return value;
+    }
+
+    Map<String, Object?> node(int layers, bool lists, {int jsonDepth = 128}) {
+      var value = <String, Object?>{
+        'metadata': json(jsonDepth),
+        'jsons': [json(jsonDepth)],
+        'children': [],
+      };
+      for (var i = 1; i < layers; i++)
+        value = lists
+            ? {
+                'children': [value],
+              }
+            : {'child': value};
+      return value;
+    }
+
+    for (final lists in [false, true]) {
+      for (final layers in [63, 64]) {
+        expect(
+          () => writer.encode('echo', {
+            'value': node(layers, lists),
+            'values': [node(layers, lists), node(layers, lists)],
+          }),
+          returnsNormally,
+        );
+      }
+      expect(
+        () => writer.encode('echo', {'value': node(65, lists)}),
+        _invalid('value'),
+      );
+      expect(
+        () => writer.encode('echo', {
+          'values': [node(65, lists)],
+        }),
+        _invalid('values[0]'),
+      );
+      expect(
+        () => writer.encode('echo', {'value': node(64, lists, jsonDepth: 129)}),
+        throwsFormatException,
+      );
+    }
+    expect(
+      () => writer.encode('echo', {
+        'raw': json(128),
+        'raws': [json(128), json(128)],
+      }),
+      returnsNormally,
+    );
+    expect(
+      () => writer.encode('echo', {'raw': json(129)}),
+      throwsFormatException,
+    );
+    expect(
+      () => writer.encode('echo', {
+        'raws': [json(129)],
+      }),
+      throwsFormatException,
+    );
+    final cycle = <String, Object?>{};
+    cycle['child'] = cycle;
+    expect(() => writer.encode('echo', {'value': cycle}), _invalid('value'));
+    expect(
+      writer.encode('echo', {'value': <String, Object?>{}}),
+      contains('"value":{}'),
+    );
+  });
+
+  test('JSON request writing preserves host Float signs and extremes', () {
+    final writer = JSONRequestEncoder()
+      ..setSchema({
+        'echo': APISchemaEntry(7, [
+          ParamSchema(1, 'scalar', 'Float'),
+          ParamSchema(2, 'items', 'Float', true),
+          ParamSchema(3, 'raw', 'JSON'),
+        ]),
+      });
+    for (final value in [0.0, -0.0, 5e-324, -5e-324, double.maxFinite]) {
+      final text = writer.encode('echo', {
+        'scalar': value,
+        'items': [value],
+        'raw': {'nested': value},
+      });
+      final decoded = decodeLuxoJSON(text) as Map<String, Object?>;
+      for (final encoded in [
+        decoded['scalar'],
+        (decoded['items'] as List).single,
+        (decoded['raw'] as Map)['nested'],
+        decodeLuxoJSON(encodeLuxoJSON(value)),
+      ]) {
+        final actual = luxoDoubleFromJSON(encoded);
+        expect(actual, value);
+        expect(actual.isNegative, value.isNegative, reason: text);
+      }
+    }
+  });
+
+  test('DateTime input failures preserve parameter and list paths', () {
+    for (final list in [false, true]) {
+      final writer = JSONRequestEncoder()
+        ..setSchema({
+          'echo': APISchemaEntry(7, [ParamSchema(1, 'at', 'DateTime', list)]),
+        });
+      for (final invalid in <Object?>[
+        42,
+        null,
+        true,
+        'invalid',
+        '2026-01-01T00:00:00.1234567890Z',
+      ]) {
+        expect(
+          () => writer.encode('echo', {
+            'at': list ? [invalid] : invalid,
+          }),
+          _invalid(list ? 'at[0]' : 'at'),
+        );
+      }
+      const valid = '2026-01-01T00:00:00.123456789+01:00';
+      expect(
+        writer.encode('echo', {
+          'at': list ? [valid] : valid,
+        }),
+        contains(valid),
+      );
+    }
+  });
   test('typed JSON projection preserves integers without a generic JSON conversion', () {
     final writer = JSONRequestEncoder()..setSchema({'echo': _recursiveSchema});
     final input = _TypedInput({'id': LuxoInt64.maxValue});
@@ -276,52 +839,56 @@ void main() {
     expect(invalid.calls, 1);
   });
 
-  test('recursive values and deep empty objects and lists are bounded', () {
-    final encoder = JSONRequestEncoder()..setSchema({'echo': _recursiveSchema});
-    final cycle = <String, Object?>{};
-    cycle['next'] = cycle;
-    expect(
-      () => encoder.encode('echo', {'value': cycle}),
-      _invalid('value.next'),
-    );
-    final input = _Input({});
-    input.value['next'] = input;
-    expect(
-      () => encoder.encode('echo', {'value': input}),
-      _invalid('value.next'),
-    );
-    Object? projected = _Input({});
-    for (var i = 0; i < 127; i++) {
-      projected = {'next': projected};
-    }
-    expect(
-      () => encoder.encode('echo', {'value': projected}),
-      _invalid('nesting exceeds 128 levels'),
-    );
-    for (var depth = 120; depth <= 130; depth++) {
-      for (final leaf in [
-        <String, Object?>{},
-        <String, Object?>{'children': <Object?>[]},
-      ]) {
-        var value = leaf;
-        for (var i = 0; i < depth; i++) {
-          value = {'next': value};
-        }
-        final params = {'value': value};
-        if (depth <= (leaf.isEmpty ? 126 : 125)) {
-          expect(
-            encoder.encode('echo', params),
-            encodeLuxoJSON({r'$api': 'echo', ...params}),
-          );
-        } else {
-          expect(
-            () => encoder.encode('echo', params),
-            _invalid('nesting exceeds 128 levels'),
-          );
+  test(
+    'recursive models use 64 object layers without counting empty lists',
+    () {
+      final encoder = JSONRequestEncoder()
+        ..setSchema({'echo': _recursiveSchema});
+      final cycle = <String, Object?>{};
+      cycle['next'] = cycle;
+      expect(
+        () => encoder.encode('echo', {'value': cycle}),
+        _invalid('value.next'),
+      );
+      final input = _Input({});
+      input.value['next'] = input;
+      expect(
+        () => encoder.encode('echo', {'value': input}),
+        _invalid('value.next'),
+      );
+      Object? projected = _Input({});
+      for (var i = 0; i < 127; i++) {
+        projected = {'next': projected};
+      }
+      expect(
+        () => encoder.encode('echo', {'value': projected}),
+        _invalid('nesting exceeds 64 levels'),
+      );
+      for (var depth = 60; depth <= 66; depth++) {
+        for (final leaf in [
+          <String, Object?>{},
+          <String, Object?>{'children': <Object?>[]},
+        ]) {
+          var value = leaf;
+          for (var i = 0; i < depth; i++) {
+            value = {'next': value};
+          }
+          final params = {'value': value};
+          if (depth <= 63) {
+            expect(
+              encoder.encode('echo', params),
+              encodeLuxoJSON({r'$api': 'echo', ...params}),
+            );
+          } else {
+            expect(
+              () => encoder.encode('echo', params),
+              _invalid('nesting exceeds 64 levels'),
+            );
+          }
         }
       }
-    }
-  });
+    },
+  );
 
   test(
     'request metadata cannot be overridden or confused with signed parameters',
@@ -450,6 +1017,64 @@ void main() {
   );
 }
 
+(JSONRequestEncoder, Map<String, Object?>) _pathRequest(
+  List<(String, bool)> fields,
+) {
+  final types = <String, Map<String, SelectionFieldSchema>>{};
+  Object? value = true;
+  for (var i = fields.length - 1; i >= 0; i--) {
+    final (name, list) = fields[i];
+    final leaf = i == fields.length - 1;
+    if (list) {
+      value = [
+        ...List<Object?>.generate(11, (_) => leaf ? LuxoInt64.zero : {}),
+        value,
+      ];
+    }
+    if (i > 0) {
+      types['Path${i - 1}'] = {
+        name: SelectionFieldSchema(
+          1,
+          leaf ? null : 'Path$i',
+          leaf ? 'Int' : 'Model',
+          list,
+        ),
+      };
+      value = <String, Object?>{name: value};
+    }
+  }
+  final (name, list) = fields.first;
+  final writer = JSONRequestEncoder({
+    'paths': APISchemaEntry(
+      7,
+      [
+        ParamSchema(
+          1,
+          name,
+          fields.length == 1 ? 'Int' : 'Model',
+          list,
+          false,
+          fields.length == 1 ? null : 'Path0',
+        ),
+      ],
+      const {},
+      types,
+    ),
+  });
+  return (writer, {name: value});
+}
+
+Matcher _exactParameterFailure(String path, String reason) => throwsA(
+  isA<LuxoError>()
+      .having((e) => e.error, 'error', 'ConfigError')
+      .having((e) => e.code, 'code', 0)
+      .having(
+        (e) => e.message,
+        'message',
+        'invalid JSON parameter $path: $reason',
+      ),
+);
+
 class _Input implements LuxoJSONEncodable {
   final Map<String, Object?> value;
   var calls = 0;
@@ -494,3 +1119,25 @@ Matcher _invalid(String path) => throwsA(
       .having((e) => e.error, 'error', 'ConfigError')
       .having((e) => e.message, 'path', contains(path)),
 );
+
+final class _SealedPayload implements LuxoJSONEncodable {
+  final Map<String, Object?> child;
+  const _SealedPayload(this.child);
+  @override
+  Map<String, Object?> toJson() => {'child': child};
+}
+
+final class _DifferentSealedOwner implements LuxoSealedJSONWritable {
+  const _DifferentSealedOwner();
+  @override
+  String get $sealedType => 'Other';
+  @override
+  Map<String, Object?> toJson() =>
+      throw StateError('wrong owner was projected');
+  @override
+  void $writeJSON(LuxoJSONOutput output) =>
+      throw StateError('wrong owner was written');
+  @override
+  void $writeSealedJSON(LuxoJSONOutput output, int depth) =>
+      throw StateError('wrong owner was written');
+}

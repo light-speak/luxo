@@ -139,7 +139,7 @@ func (q *Query[T]) AggregateBatch(ctx context.Context, specs ...lux.AggregateSpe
 		}
 		destinations[index] = &values[index]
 	}
-	if err := q.db.conn.QueryRow(ctx, query, args...).Scan(destinations...); err != nil {
+	if err := q.db.queryRowBound(ctx, query, args...).Scan(destinations...); err != nil {
 		return nil, err
 	}
 	return values, nil
@@ -338,4 +338,26 @@ func (b *UpdateBase[T, ID]) Set(col string, val any) {
 // Exec updates the record and returns it via RETURNING *.
 func (b *UpdateBase[T, ID]) Exec(ctx context.Context) (*T, error) {
 	return UpdateReturningBy(ctx, b.Db, b.Scan, b.Table, b.IDColumn, b.ID, b.Sets)
+}
+
+// ExecWhere applies additional record constraints in the same UPDATE statement.
+// A missing or unauthorized row returns nil, just like QueryRow. The primary key
+// is always retained; callers cannot replace it with their own conditions.
+func (b *UpdateBase[T, ID]) ExecWhere(ctx context.Context, conditions ...lux.Condition) (*T, error) {
+	if len(conditions) == 0 {
+		return b.Exec(ctx)
+	}
+	column := b.IDColumn
+	if column == "" {
+		column = "id"
+	}
+	constraints := make([]lux.Condition, 1, len(conditions)+1)
+	constraints[0] = lux.RawCondition(column+" = $1", b.ID)
+	constraints = append(constraints, conditions...)
+	query, args := lux.BuildUpdateSQL(b.Table, b.Sets, constraints)
+	result, err := QueryRow(ctx, b.Db, b.Scan, query+" RETURNING *", args...)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }

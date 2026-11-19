@@ -14,7 +14,105 @@ function fixture(): Record<string, APISchema> {
 }
 
 describe('runtime Schema registration', () => {
+  it('owns response metadata and validates its strings and flags before replacing a schema', () => {
+    const schema = fixture()
+    schema.read.response = { type: 'Model', typeName: 'Input', isList: true, paginated: false }
+    let reads = 0
+    Object.defineProperty(schema.read.response, 'isList', { get: () => ++reads === 1 })
+    const snapshot = snapshotAPISchema(schema)
+    expect(reads).toBe(1)
+    schema.read.response.type = 'JSON'
+    expect(snapshot.read.response).toEqual({ type: 'Model', typeName: 'Input', isList: true, paginated: false })
+    expect(Object.isFrozen(snapshot.read.response)).toBe(true)
+    for (const TransportClass of [FetchTransport, WsTransport, WxTransport]) {
+      const transport = new TransportClass('http://localhost/luxo')
+      transport.setSchema(snapshot)
+      for (const field of ['type', 'typeName', 'isList', 'paginated']) {
+        for (const value of [0, {}, [], true, 'true', undefined, null]) {
+          if ((field === 'isList' || field === 'paginated') && (value === true || value == null)) continue
+          if (field === 'typeName' && (value === 'true' || value == null)) continue
+          if (field === 'type' && value === 'true') continue
+          const response = { type: 'JSON', [field]: value }
+          const invalid = { read: { id: 1, response } } as unknown as Record<string, APISchema>
+          expect(() => transport.setSchema(invalid)).toThrow(TypeError)
+        }
+      }
+    }
+  })
+
+  it('validates the owned flags without reading caller accessors twice', () => {
+    const schema = fixture()
+    let paramReads = 0, fieldReads = 0, nameReads = 0
+    schema.read.params!.push({ fieldID: 2, name: 'other', type: 'Int' })
+    Object.defineProperty(schema.read.params![0], 'name', {
+      get: () => ++nameReads === 1 ? 'value' : 'other',
+    })
+    Object.defineProperty(schema.read.params![0], 'nullable', {
+      get: () => ++paramReads === 1 ? false : 'false',
+    })
+    Object.defineProperty(schema.read.fields!.id, 'isList', {
+      get: () => ++fieldReads === 1 ? false : 'false',
+    })
+    const snapshot = snapshotAPISchema(schema)
+    expect(snapshot.read.params![0].nullable).toBe(false)
+    expect(snapshot.read.fields!.id.isList).toBe(false)
+    expect([paramReads, fieldReads, nameReads]).toEqual([1, 1, 1])
+  })
+
   for (const TransportClass of [FetchTransport, WsTransport, WxTransport]) {
+    it(`${TransportClass.name} rejects duplicate parameter names with distinct IDs`, () => {
+      const transport = new TransportClass('http://localhost/luxo')
+      for (const name of ['value', '__proto__', '用户']) {
+        const params = [{ fieldID: 1, name, type: 'Int' }, { fieldID: 2, name, type: 'Int' }]
+        expect(() => transport.setSchema({ read: { id: 1, params } })).toThrow(/duplicate.*name/)
+        expect(() => transport.setSchema({
+          read: { id: 1, params: params.slice(0, 1) },
+          other: { id: 2, params: params.slice(0, 1) },
+        })).not.toThrow()
+      }
+    })
+
+    it(`${TransportClass.name} rejects non-string type metadata`, () => {
+      const transport = new TransportClass('http://localhost/luxo')
+      for (const target of ['param', 'field', 'type']) {
+        for (const member of ['type', 'typeName']) {
+          const values = target === 'param' && member === 'type'
+            ? [undefined, null, false, true, 0, 7, [], {}] : [false, true, 0, 7, [], {}]
+          for (const value of values) {
+            const schema = fixture()
+            const metadata = target === 'param' ? schema.read.params![0]
+              : target === 'field' ? schema.read.fields!.id : schema.read.types!.Input.id
+            Object.assign(metadata, { [member]: value })
+            expect(() => transport.setSchema(schema)).toThrow(new RegExp(`${member}.*string`))
+          }
+        }
+      }
+    })
+
+    it(`${TransportClass.name} rejects non-string parameter names`, () => {
+      const transport = new TransportClass('http://localhost/luxo')
+      for (const name of [undefined, null, false, true, 0, 7, [], {}]) {
+        const schema = fixture()
+        Object.assign(schema.read.params![0], { name })
+        expect(() => transport.setSchema(schema)).toThrow(/name.*string/)
+      }
+    })
+
+    it(`${TransportClass.name} rejects non-boolean parameter and selection flags`, () => {
+      const transport = new TransportClass('http://localhost/luxo')
+      for (const target of ['param', 'field', 'type']) {
+        for (const flag of ['isList', 'nullable']) {
+          for (const value of ['true', 'false', 0, 1, [], {}]) {
+            const schema = fixture()
+            const metadata = target === 'param' ? schema.read.params![0]
+              : target === 'field' ? schema.read.fields!.id : schema.read.types!.Input.id
+            Object.assign(metadata, { [flag]: value })
+            expect(() => transport.setSchema(schema)).toThrow(/boolean/)
+          }
+        }
+      }
+    })
+
     it(`${TransportClass.name} rejects illegal IDs in every directory`, () => {
       const transport = new TransportClass('http://localhost/luxo')
       for (const target of ['api', 'param', 'field', 'type'] as const) {
@@ -60,6 +158,25 @@ describe('runtime Schema registration', () => {
 
   it('validates WeChat constructor metadata as well as setSchema', () => {
     expect(() => new WxTransport('http://localhost/luxo', { schema: { read: { id: 0 } } })).toThrow(/ID/)
+    const schema = fixture()
+    Object.assign(schema.read.params![0], { nullable: 'false' })
+    expect(() => new WxTransport('http://localhost/luxo', { schema })).toThrow(/boolean/)
+  })
+
+  it('keeps the JSON validation plan after duplicate parameter names are rejected', async () => {
+    const request = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => new Response('{"data":true}'))
+    vi.stubGlobal('fetch', request)
+    const transport = new FetchTransport('http://localhost/luxo', { mode: 'json' })
+    transport.setSchema(fixture())
+    expect(() => transport.setSchema({ read: { id: 9, params: [
+      { fieldID: 1, name: 'value', type: 'Float' }, { fieldID: 2, name: 'value', type: 'Float' },
+    ] } })).toThrow(/duplicate.*name/)
+    await expect(transport.call('read', { value: 1.5 })).rejects.toThrow()
+    expect(request).not.toHaveBeenCalled()
+    expect(await transport.call('read', { value: 7n })).toBe(true)
+    const body = request.mock.calls[0]?.[1]?.body
+    expect(body).toContain('"value":7')
+    expect(body).toContain('"$api":"read"')
   })
 
   it('owns metadata and preserves old registration after a rejected update', async () => {
@@ -73,6 +190,30 @@ describe('runtime Schema registration', () => {
     schema.read.params![0].type = 'String'
     schema.read.fields!.id.fieldID = 2
     expect(() => transport.setSchema({ read: { id: 0 } })).toThrow(/ID/)
+    const malformed = fixture()
+    Object.assign(malformed.read.params![0], { isList: 'false' })
+    expect(() => transport.setSchema(malformed)).toThrow(/boolean/)
+    const duplicate = fixture()
+    duplicate.read.id = 9
+    duplicate.read.params!.push({ fieldID: 2, name: 'value', type: 'Int' })
+    expect(() => transport.setSchema(duplicate)).toThrow(/duplicate.*name/)
+    for (const name of [undefined, null, false, true, 0, 7, [], {}]) {
+      const changed = fixture()
+      changed.read.id = 2
+      changed.read.params![0].fieldID = 2
+      Object.assign(changed.read.params![0], { name })
+      expect(() => transport.setSchema(changed)).toThrow(/name.*string/)
+    }
+    for (const target of ['param', 'field', 'type']) {
+      for (const member of ['type', 'typeName']) {
+        const changed = fixture()
+        changed.read.id = 2
+        const metadata = target === 'param' ? changed.read.params![0]
+          : target === 'field' ? changed.read.fields!.id : changed.read.types!.Input.id
+        Object.assign(metadata, { [member]: false })
+        expect(() => transport.setSchema(changed)).toThrow(new RegExp(`${member}.*string`))
+      }
+    }
     await transport.call('read', { value: 7n, $select: 'id' })
     const body = request.mock.calls[0]?.[1]?.body
     expect(body).toBeInstanceOf(ArrayBuffer)
@@ -106,6 +247,25 @@ describe('runtime Schema registration', () => {
     const updated = snapshotAPISchema(schema)
     expect(updated.read.types!.Input.id).toMatchObject({ fieldID: 2, type: 'String' })
     expect(updated.read.types).not.toBe(snapshot.read.types)
+  })
+
+  it('preserves optional type metadata and reads owned type properties once', () => {
+    for (const value of [undefined, null, '']) {
+      const schema = fixture()
+      Object.assign(schema.read.params![0], { typeName: value })
+      Object.assign(schema.read.fields!.id, { type: value, typeName: value })
+      expect(snapshotAPISchema(schema).read.fields!.id).toMatchObject({ type: value, typeName: value })
+    }
+    const schema = fixture()
+    let paramReads = 0, fieldReads = 0, typeNameReads = 0
+    Object.defineProperty(schema.read.params![0], 'type', { get: () => ++paramReads === 1 ? 'Int' : false })
+    Object.defineProperty(schema.read.fields!.id, 'type', { get: () => ++fieldReads === 1 ? 'Int' : false })
+    Object.defineProperty(schema.read.fields!.id, 'typeName', { get: () => ++typeNameReads === 1 ? undefined : false })
+    const snapshot = snapshotAPISchema(schema)
+    expect(snapshot.read.params![0].type).toBe('Int')
+    expect(snapshot.read.fields!.id.type).toBe('Int')
+    expect(snapshot.read.fields!.id.typeName).toBeUndefined()
+    expect([paramReads, fieldReads, typeNameReads]).toEqual([1, 1, 1])
   })
 
   it('keeps the old JSON plan when a replacement is rejected', async () => {

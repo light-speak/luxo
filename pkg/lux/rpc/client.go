@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -11,6 +12,8 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 )
+
+var errEmptyStreamPayload = errors.New("rpc: empty stream data payload")
 
 // Client sends RPC requests to a remote Luxo service.
 // Uses connection pooling for high throughput.
@@ -110,16 +113,28 @@ func (c *Client) CallWithMaskTargetContext(ctx context.Context, bearerToken stri
 	if trace == nil {
 		return c.callRequest(ctx, callRequest{apiID: apiID, token: bearerToken, mask: fieldMask, params: params})
 	}
+	traceID := api.TraceID(ctx)
+	if traceID == "" {
+		return c.callRequest(ctx, callRequest{apiID: apiID, token: bearerToken, mask: fieldMask, params: params})
+	}
+	return c.callWithTrace(ctx, bearerToken, apiID, fieldMask, params, target, trace, traceID)
+}
+
+// Keep optional trace assembly out of the ordinary call stack frame.
+func (c *Client) callWithTrace(ctx context.Context, bearerToken string, apiID int, fieldMask, params []byte, target TraceTarget, trace *api.DebugTraceSession, traceID string) ([]byte, error) {
 	fieldPath := target.FieldPath
 	if fieldPath == "" {
 		fieldPath = api.JoinTraceFieldPath(api.TraceFieldPath(ctx), target.Field)
+	}
+	if size := tracedCallFrameSize(bearerToken, traceID, fieldPath, apiID, fieldMask, params); size > maxFrameSize || size < 0 {
+		return nil, errRequestFrameTooLarge
 	}
 	target.FieldPath = fieldPath
 	_, callSpan := trace.StartSpan(ctx, api.DebugSpanMeta{
 		Name: "service.call", Category: "service", Service: c.traceName(), Operation: target.Operation,
 		Field: target.Field, FieldPath: fieldPath, Selection: target.Selection, Dependency: target.Dependency,
 	})
-	payload := prepareTracedCallFrame(bearerToken, api.TraceID(ctx), fieldPath, trace.DatabaseDetails(), apiID, fieldMask, params)
+	payload := prepareTracedCallFrame(bearerToken, traceID, fieldPath, trace.DatabaseDetails(), apiID, fieldMask, params)
 	body, remote, err := c.callTracedPayload(ctx, payload)
 	applyTraceDefaults(&remote, c.traceName(), target)
 	trace.MergeSpan(callSpan, remote)
@@ -130,6 +145,9 @@ func (c *Client) CallWithMaskTargetContext(ctx context.Context, bearerToken stri
 // SubscribeContext opens a dedicated binary RPC stream. The connection is not
 // returned to the unary pool because it remains owned by the subscription.
 func (c *Client) SubscribeContext(ctx context.Context, bearerToken string, apiID int, fieldMask []byte, params []byte) (*Subscription, error) {
+	if size := callFrameSize(bearerToken, apiID, fieldMask, params); size > maxFrameSize || size < 0 {
+		return nil, errRequestFrameTooLarge
+	}
 	payload := prepareCallFrame(requestKindStream, bearerToken, apiID, fieldMask, params)
 	conn, err := c.pool.GetContext(ctx)
 	if err != nil {
@@ -150,11 +168,17 @@ func (c *Client) SubscribeContext(ctx context.Context, bearerToken string, apiID
 	}
 	subscription.stop = context.AfterFunc(streamCtx, func() { conn.Close() })
 	if err := writePreparedFrame(conn, payload); err != nil {
+		if contextErr := contextErrorAfterIO(ctx, err); contextErr != nil {
+			err = contextErr
+		}
 		subscription.finish(fmt.Errorf("rpc: stream write: %w", err))
 		return nil, err
 	}
 	ack, err := ReadFrame(conn, nil)
 	if err != nil {
+		if contextErr := contextErrorAfterIO(ctx, err); contextErr != nil {
+			err = contextErr
+		}
 		subscription.finish(fmt.Errorf("rpc: stream ack: %w", err))
 		return nil, err
 	}
@@ -183,8 +207,8 @@ func (s *Subscription) readLoop(ctx context.Context) {
 	for {
 		frame, err := ReadFrame(s.conn, nil)
 		if err != nil {
-			if ctx.Err() != nil {
-				s.finish(ctx.Err())
+			if contextErr := contextErrorAfterIO(ctx, err); contextErr != nil {
+				s.finish(contextErr)
 			} else {
 				s.finish(fmt.Errorf("rpc: stream read: %w", err))
 			}
@@ -196,6 +220,10 @@ func (s *Subscription) readLoop(ctx context.Context) {
 		}
 		switch frame[0] {
 		case statusStream:
+			if len(frame) == 1 {
+				s.finish(errEmptyStreamPayload)
+				return
+			}
 			select {
 			case s.messages <- frame[1:]:
 			case <-ctx.Done():
@@ -299,8 +327,8 @@ func (c *Client) exchangeRequest(ctx context.Context, payload []byte, request *c
 	// Send request frame
 	if err := writePreparedFrame(conn, payload); err != nil {
 		closeConnection()
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		if contextErr := contextErrorAfterIO(ctx, err); contextErr != nil {
+			return nil, contextErr
 		}
 		return nil, fmt.Errorf("rpc: write: %w", err)
 	}
@@ -309,8 +337,8 @@ func (c *Client) exchangeRequest(ctx context.Context, payload []byte, request *c
 	resp, err := ReadFrame(conn, nil)
 	if err != nil {
 		closeConnection()
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		if contextErr := contextErrorAfterIO(ctx, err); contextErr != nil {
+			return nil, contextErr
 		}
 		return nil, fmt.Errorf("rpc: read: %w", err)
 	}
@@ -430,4 +458,22 @@ func EncodeParams(fields ...ParamField) ([]byte, error) {
 type ParamField struct {
 	FieldID int
 	Value   any
+}
+
+// Socket and context timers can become ready independently. Only reclassify an
+// actual I/O timeout after the caller's deadline; preserve unrelated failures.
+// Called on failed I/O only, so successful requests need no extra clock read.
+func contextErrorAfterIO(ctx context.Context, err error) error {
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
+	}
+	deadline, hasDeadline := ctx.Deadline()
+	if !hasDeadline {
+		return nil
+	}
+	timeout, ok := errors.AsType[net.Error](err)
+	if ok && timeout.Timeout() && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }

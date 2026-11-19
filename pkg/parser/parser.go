@@ -10,16 +10,17 @@ import (
 // Precedence levels for Pratt parser.
 const (
 	precNone       = 0
-	precOr         = 1  // ||
-	precAnd        = 2  // &&
-	precElvis      = 3  // ?:
-	precEquality   = 4  // == !=
-	precComparison = 5  // > >= < <= in is
-	precRange      = 6  // ..
-	precAdd        = 7  // + -
-	precMul        = 8  // * / %
-	precUnary      = 9  // ! -
-	precCall       = 10 // () . ?.
+	precSend       = 1  // <-
+	precOr         = 2  // ||
+	precAnd        = 3  // &&
+	precElvis      = 4  // ?:
+	precEquality   = 5  // == !=
+	precComparison = 6  // > >= < <= in is
+	precRange      = 7  // ..
+	precAdd        = 8  // + -
+	precMul        = 9  // * / %
+	precUnary      = 10 // ! -
+	precCall       = 11 // () . ?.
 )
 
 // Error represents a parser error.

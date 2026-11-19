@@ -13,11 +13,29 @@ import (
 
 func main() {
 	var http1Requests atomic.Int64
+	var redirectTargets atomic.Int64
 	bodyStarted := make(chan struct{})
 	bodyCancelled := make(chan struct{})
 	largeCancelled := make(chan struct{})
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/redirect-target":
+			redirectTargets.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		case "/redirect-target-count":
+			_, _ = io.WriteString(w, strconv.FormatInt(redirectTargets.Load(), 10))
+			return
+		case "/redirect":
+			status, err := strconv.Atoi(r.URL.Query().Get("status"))
+			if err != nil || (status != 301 && status != 302 && status != 303 && status != 307 && status != 308) {
+				http.Error(w, "invalid redirect status", 400)
+				return
+			}
+			w.Header().Set("Location", r.URL.Query().Get("target"))
+			w.Header().Set("X-Test-Connection", r.RemoteAddr)
+			w.WriteHeader(status)
+			return
 		case "/http1-count":
 			_, _ = io.WriteString(w, strconv.FormatInt(http1Requests.Load(), 10))
 			return

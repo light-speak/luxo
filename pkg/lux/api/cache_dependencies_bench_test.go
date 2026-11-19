@@ -108,6 +108,34 @@ func BenchmarkCacheExecutionDependencyCollection(b *testing.B) {
 	}
 }
 
+func BenchmarkUnaryRouteStartup(b *testing.B) {
+	for _, internal := range []bool{false, true} {
+		for _, count := range []int{1, 128} {
+			b.Run(fmt.Sprintf("internal=%t/routes=%d", internal, count), func(b *testing.B) {
+				names := make([]string, count)
+				for i := range names {
+					names[i] = fmt.Sprintf("route%d", i)
+				}
+				handler := func(context.Context, *Request) error { return nil }
+				b.ReportAllocs()
+				for b.Loop() {
+					rt := NewRouterWithOptions(RouterOptions{})
+					for _, name := range names {
+						if internal {
+							rt.HandleInternal(name, handler)
+						} else {
+							rt.Handle(name, handler)
+						}
+					}
+					if err := rt.Prepare(); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
 // Both variants start with registered metadata; neither includes listening,
 // network traffic or backend construction. The shared case must not rebuild.
 func BenchmarkRouterPreparation(b *testing.B) {

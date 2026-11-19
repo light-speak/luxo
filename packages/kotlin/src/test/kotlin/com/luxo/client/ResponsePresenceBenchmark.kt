@@ -201,7 +201,7 @@ object ResponsePresenceBenchmark {
         writeVarint(type); writeVarint(id); writeRawBytes(payload)
     }.bytes()
 
-    private class ImmediateHTTPClient(private val body: ByteArray) : OkHttpClient() {
+    private class ImmediateHTTPClient(private val body: ByteArray) : DirectHTTPBenchmarkClient() {
         var calls = 0
             private set
 

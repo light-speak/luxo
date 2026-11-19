@@ -11,12 +11,37 @@ import (
 
 	"github.com/google/uuid"
 	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 	"github.com/shopspring/decimal"
 )
 
 func makeReq(body string) *http.Request {
 	r, _ := http.NewRequest(http.MethodPost, "/luvia", strings.NewReader(body))
 	return r
+}
+
+func parsePaginatedRequest(body string) (*Request, error) {
+	req, err := ParseRequest(makeReq(body))
+	if err != nil {
+		return nil, err
+	}
+	s := schema.New()
+	if err := s.RegisterAPI(&schema.API{ID: 1, Name: req.API, Paginated: true, DefaultPageSize: defaultPageSize,
+		Params: []schema.Param{
+			{ID: 1, Name: "page", Type: schema.FieldInt, HasDefault: true},
+			{ID: 2, Name: "pageSize", Type: schema.FieldInt, HasDefault: true},
+		},
+	}); err != nil {
+		return nil, err
+	}
+	registry := NewAPIRegistry()
+	if err := registry.RegisterSchemaAPIs(s); err != nil {
+		return nil, err
+	}
+	if err := registry.prepareLocalJSONRequest(req); err != nil {
+		return nil, err
+	}
+	return req, nil
 }
 
 type errReader struct{}
@@ -740,7 +765,7 @@ func TestParseRequestWithSorters(t *testing.T) {
 
 func TestParseRequestPagination(t *testing.T) {
 	body := `{"$api":"listUsers","page":3,"pageSize":50}`
-	req, err := ParseRequest(makeReq(body))
+	req, err := parsePaginatedRequest(body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -750,15 +775,15 @@ func TestParseRequestPagination(t *testing.T) {
 	if req.PageSize != 50 {
 		t.Errorf("pageSize = %d, want 50", req.PageSize)
 	}
-	// page/pageSize should NOT be in Params
-	if req.HasParam("page") || req.HasParam("pageSize") {
-		t.Error("page/pageSize should not be in Params")
+	// Schema parameters remain available to generated typed readers.
+	if !req.HasParam("page") || !req.HasParam("pageSize") {
+		t.Error("pagination input was removed from Params")
 	}
 }
 
 func TestParseRequestPaginationDefaults(t *testing.T) {
 	body := `{"$api":"listUsers"}`
-	req, err := ParseRequest(makeReq(body))
+	req, err := parsePaginatedRequest(body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -772,7 +797,7 @@ func TestParseRequestPaginationDefaults(t *testing.T) {
 
 func TestParseRequestPaginationClamp(t *testing.T) {
 	body := `{"$api":"listUsers","page":-1,"pageSize":999}`
-	req, err := ParseRequest(makeReq(body))
+	req, err := parsePaginatedRequest(body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -823,8 +848,11 @@ func TestParseRequestReservedNotInParams(t *testing.T) {
 	if !req.HasParam("name") {
 		t.Error("name should be in params")
 	}
-	if req.HasParam("$filters") || req.HasParam("$sorters") || req.HasParam("page") {
+	if req.HasParam("$filters") || req.HasParam("$sorters") {
 		t.Error("reserved fields should not be in params")
+	}
+	if !req.HasParam("page") || !req.HasParam("pageSize") {
+		t.Error("ordinary parameter names were consumed as envelope controls")
 	}
 }
 
@@ -949,7 +977,7 @@ func TestSetParamSlotTypeMismatch(t *testing.T) {
 
 func TestParseRequestBadPageType(t *testing.T) {
 	body := `{"$api":"test","page":"not-int"}`
-	_, err := ParseRequest(makeReq(body))
+	_, err := parsePaginatedRequest(body)
 	if err == nil {
 		t.Fatal("expected error for non-integer page")
 	}
@@ -960,7 +988,7 @@ func TestParseRequestBadPageType(t *testing.T) {
 
 func TestParseRequestBadPageSizeType(t *testing.T) {
 	body := `{"$api":"test","pageSize":"not-int"}`
-	_, err := ParseRequest(makeReq(body))
+	_, err := parsePaginatedRequest(body)
 	if err == nil {
 		t.Fatal("expected error for non-integer pageSize")
 	}
@@ -986,7 +1014,7 @@ func TestParseRequestSortersLimit(t *testing.T) {
 
 func TestParseRequestPageSizeZero(t *testing.T) {
 	body := `{"$api":"test","pageSize":0}`
-	req, err := ParseRequest(makeReq(body))
+	req, err := parsePaginatedRequest(body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -998,7 +1026,7 @@ func TestParseRequestPageSizeZero(t *testing.T) {
 
 func TestParseRequestPageSizeNegative(t *testing.T) {
 	body := `{"$api":"test","pageSize":-5}`
-	req, err := ParseRequest(makeReq(body))
+	req, err := parsePaginatedRequest(body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1180,5 +1208,23 @@ func TestParamUUIDArrayVariants(t *testing.T) {
 				t.Fatal("invalid UUID list was accepted")
 			}
 		})
+	}
+}
+
+func TestSetBinaryParamsReconfigurationClearsPreviousValues(t *testing.T) {
+	var req Request
+	names := make([]string, 17)
+	for i := range names {
+		names[i] = fmt.Sprintf("p%d", i)
+	}
+	req.SetBinaryParams(names, len(names))
+	req.SetParamSlot(0, int64(42))
+	req.SetParamSlot(16, nil)
+	if !req.ParamIsNull("p16") {
+		t.Fatal("overflow null missing")
+	}
+	req.SetBinaryParams(names[:1], 1)
+	if req.HasParam("p0") || req.HasParam("p16") || req.ParamIsNull("p16") {
+		t.Fatal("old values survived reconfiguration")
 	}
 }

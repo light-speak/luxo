@@ -114,6 +114,7 @@ func TestBuiltinErrors(t *testing.T) {
 		{ValidationFailed, "ValidationFailed", 422},
 		{RateLimited, "RateLimited", 429},
 		{ServiceTimeout, "ServiceTimeout", 502},
+		{RelationDepthExceeded, "RelationDepthExceeded", 400},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

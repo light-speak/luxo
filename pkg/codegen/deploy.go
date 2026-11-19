@@ -13,7 +13,7 @@ type DeployFiles struct {
 	DockerCompose []byte
 }
 
-// GenerateDeployFiles produces Dockerfile, docker-compose.yml, and init-db.sh
+// GenerateDeployFiles produces Dockerfile and docker-compose.yml
 // from the semantic result. Auto-detects modules, dependencies, and infra needs.
 func GenerateDeployFiles(result *semantic.Result, projectName string) *DeployFiles {
 	modules := collectModules(result)

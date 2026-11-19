@@ -70,10 +70,10 @@ func TestRawRequestTransfersOwnedParameterMap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req.API != "text" || req.Page != 2 || req.PageSize != 10 || len(req.Select) != 1 {
+	if req.API != "text" || string(req.Params["page"]) != "2" || string(req.Params["pageSize"]) != "10" || len(req.Select) != 1 {
 		t.Fatalf("metadata lost during ownership transfer: %+v", req)
 	}
-	if len(raw) != 2 || string(raw["value"]) != "null" || string(raw["raw"]) != `{"n":123456789012345678901234567890}` {
+	if len(raw) != 4 || string(raw["value"]) != "null" || string(raw["raw"]) != `{"n":123456789012345678901234567890}` {
 		t.Fatalf("protocol fields retained or parameters changed: %v", raw)
 	}
 	// The internal caller relinquishes the map; no second parameter map is built.
@@ -84,7 +84,7 @@ func TestRawRequestTransfersOwnedParameterMap(t *testing.T) {
 }
 
 func TestRawRequestFailureDoesNotConsumeEnvelope(t *testing.T) {
-	for _, extra := range []string{`"$api":null`, `"$api":""`, `"$select":null`, `"page":null`, `"$sorters":[{}]`} {
+	for _, extra := range []string{`"$api":null`, `"$api":""`, `"$select":null`, `"$sorters":[{}]`} {
 		raw, err := jsonutil.ParseObject([]byte(`{"$id":1,"$api":"text","value":1,` + extra + `}`))
 		if err != nil {
 			t.Fatal(err)
@@ -104,7 +104,7 @@ func TestJSONRequestDuplicateControlsRemainLastWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req.API != "text" || req.Page != 3 || len(req.Select) != 1 || len(req.Params) != 1 || string(req.Params["value"]) != "null" {
+	if req.API != "text" || string(req.Params["page"]) != "3" || len(req.Select) != 1 || len(req.Params) != 2 || string(req.Params["value"]) != "null" {
 		t.Fatalf("duplicate controls changed semantics: %+v", req)
 	}
 }

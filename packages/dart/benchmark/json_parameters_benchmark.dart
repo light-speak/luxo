@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
 import '../lib/src/int64.dart';
 import '../lib/src/json.dart';
 import '../lib/src/schema.dart';
@@ -7,6 +10,10 @@ const _iterations = 1000;
 String _jsonResult = '';
 
 void main(List<String> arguments) {
+  if (arguments.contains('bytes')) {
+    _benchmarkBytes();
+    return;
+  }
   if (arguments.contains('projection')) {
     _benchmarkProjection();
     return;
@@ -56,6 +63,42 @@ void main(List<String> arguments) {
   ]);
   print(
     'Full JSON requests; excludes schema/fixture construction, network and allocation measurements.',
+  );
+}
+
+void _benchmarkBytes() {
+  const schema = APISchemaEntry(1, [ParamSchema(1, 'value', 'Bytes')]);
+  final encoder = JSONRequestEncoder({'echo': schema});
+  for (final size in [0, 16, 256, 65536]) {
+    final payload = Uint8List(size)..fillRange(0, size, 37);
+    final params = <String, Object?>{'value': payload};
+    final expected = _previous({'value': base64Encode(payload)});
+    if (encoder.encode('echo', params) != expected) {
+      throw StateError('Bytes request must use canonical Base64');
+    }
+    final iterations = size >= 65536 ? 8 : _iterations;
+    int run(bool typed) {
+      var sum = 0;
+      for (var i = 0; i < iterations; i++) {
+        _jsonResult = typed
+            ? encoder.encode('echo', params)
+            : _previous({'value': base64Encode(payload)});
+        sum += _jsonResult.length;
+      }
+      return sum;
+    }
+
+    compareBenchmarks(
+      'Bytes $size: explicit canonical wire construction vs typed plan',
+      () => run(false),
+      () => run(true),
+      iterations: iterations,
+      includeRange: true,
+    );
+    if (_jsonResult != expected) throw StateError('Bytes wire changed');
+  }
+  print(
+    'Equivalent canonical Bytes requests; excludes schema setup, network and allocation accounting. This reference is not the former invalid-array implementation.',
   );
 }
 

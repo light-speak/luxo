@@ -14,6 +14,31 @@ import kotlin.test.assertFailsWith
 
 class LuxoEncoderDecoderTest {
     @Test
+    fun `static nullable marker preserves canonical flags and errors`() {
+        for (present in listOf(false, true)) {
+            val decoder = LuxoDecoder(byteArrayOf(if (present) 1 else 0))
+            assertEquals(present, decoder.readNullableMarker())
+            decoder.checkComplete()
+        }
+        for (bytes in listOf(byteArrayOf(), byteArrayOf(2), byteArrayOf(255.toByte()))) {
+            val direct = assertFailsWith<LuxoCodecException> { LuxoDecoder(bytes).readNullableMarker() }
+            val previous = assertFailsWith<LuxoCodecException> { LuxoDecoder(bytes).readNullable { true } }
+            assertEquals(previous.message, direct.message)
+        }
+    }
+
+    @Test
+    fun `compact Decimal text from Go preserves precision without numeric conversion`() {
+        for (text in listOf("1e2147483647", "-1e-2147483648", "1.23")) {
+            val payload = byteArrayOf(text.length.toByte()) + text.encodeToByteArray()
+            val decoder = LuxoDecoder(payload)
+            assertEquals(text, decoder.readString())
+            decoder.checkComplete()
+            assertEquals(text, decodeLuxoJsonString(Json.parseToJsonElement("\"$text\"")))
+        }
+    }
+
+    @Test
     fun `nullable root marker requires exactly one canonical presence byte`() {
         assertTrue(isNullRoot(byteArrayOf(0)))
         assertFalse(isNullRoot(byteArrayOf(1, 0)))

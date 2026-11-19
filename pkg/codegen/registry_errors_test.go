@@ -8,6 +8,19 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/schema"
 )
 
+func TestGeneratedBatchLoadRegistrationUsesStableKeyParameter(t *testing.T) {
+	runGeneratedFixture(t, `model Post @crud @noTime { id: Int @id }`, `package generated
+import("testing";"github.com/light-speak/luxo/pkg/lux/api")
+func TestBatchLoadRegistration(t *testing.T){
+ router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+ if err:=router.Registry.RegisterSchemaAPIs(router.Schema);err!=nil{t.Fatal(err)}
+ if err:=RegisterBatchLoaders(router,&App{});err!=nil{t.Fatal("batch registration contradicts stable schema",err)}
+ params:=router.Registry.ParamOrder("svc:batchLoad:Post")
+ if len(params)!=1||params[0].Name!="keys"||params[0].FieldID!=7{t.Fatal("stable key parameter changed",params)}
+}
+`, StableIDs{APIs: map[string]int{"svc:batchLoad:Post": 42}, APIParams: map[string]map[string]int{"svc:batchLoad:Post": {"keys": 7}}, ModelFields: map[string]map[string]int{"Post": {"id": 1}}})
+}
+
 func TestRegistryErrorsPropagateFromGeneratedHandlers(t *testing.T) {
 	g := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
 		APIs: map[string]int{"read": 1}, APIParams: map[string]map[string]int{"read": {"id": 1}},
@@ -42,8 +55,25 @@ func TestSchemaExportPropagatesRegistrationErrors(t *testing.T) {
 				ModelFields: map[string]map[string]int{"Record": {"value": 1, "id": 2}},
 				APIs:        map[string]int{"read": 1}, APIParams: map[string]map[string]int{"read": {"value": 1}},
 			}})
-			if data, err := g.BuildSchemaJSON(buildResult(file), nil); err == nil || data != nil || !strings.Contains(err.Error(), "duplicate") {
-				t.Fatalf("export ignored %s registration error: %s / %v", name, data, err)
+			input := buildResult(file)
+			want := "same Go field"
+			if name == "API" {
+				want = "duplicate"
+			}
+			if data, err := g.BuildSchemaJSON(input, nil); err == nil || data != nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("export ignored %s declaration error: %s / %v", name, data, err)
+			}
+			var err error
+			switch name {
+			case "API":
+				err = g.buildSchemaAPIs(schema.New(), input, nil)
+			case "type":
+				err = g.buildSchemaTypes(schema.New(), input, nil)
+			default:
+				err = g.buildSchemaModels(schema.New(), input, nil)
+			}
+			if err == nil || !strings.Contains(err.Error(), "duplicate") {
+				t.Fatalf("registry error was not propagated for %s: %v", name, err)
 			}
 		})
 	}

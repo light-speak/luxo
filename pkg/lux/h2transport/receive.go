@@ -43,6 +43,8 @@ type receivedRequest struct {
 	complete bool
 }
 
+const idleRequestBodyLimit = 64 << 10
+
 // All state belongs to one reader. Completed requests remain charged until the
 // business consumer explicitly releases them. This is not a goroutine/task queue.
 type requestReceiver struct {
@@ -143,14 +145,15 @@ func (r *requestReceiver) data(frame *http2.DataFrame) (*receivedRequest, receiv
 	if !req.window.consume(size) {
 		return r.rejectData(id, size, http2.ErrCodeFlowControl)
 	}
-	if !r.appendBody(req, frame.Data()) {
+	ended := frame.StreamEnded()
+	if !r.appendBody(req, frame.Data(), ended) {
 		return r.rejectData(id, size, http2.ErrCodeEnhanceYourCalm)
 	}
-	if req.head.contentLength >= 0 && (int64(len(req.body)) > req.head.contentLength || frame.StreamEnded() && int64(len(req.body)) != req.head.contentLength) {
+	if req.head.contentLength >= 0 && (int64(len(req.body)) > req.head.contentLength || ended && int64(len(req.body)) != req.head.contentLength) {
 		return r.rejectData(id, size, http2.ErrCodeProtocol)
 	}
-	credit := receiveCredit{connection: r.window.release(size, frame.StreamEnded())}
-	if frame.StreamEnded() {
+	credit := receiveCredit{connection: r.window.release(size, ended)}
+	if ended {
 		req.complete = true
 		return req, credit, nil
 	}
@@ -167,7 +170,7 @@ func (r *requestReceiver) rejectData(id, size uint32, code http2.ErrCode) (*rece
 	return nil, receiveCredit{connection: r.window.release(size, true)}, http2.StreamError{StreamID: id, Code: code}
 }
 
-func (r *requestReceiver) appendBody(req *receivedRequest, data []byte) bool {
+func (r *requestReceiver) appendBody(req *receivedRequest, data []byte, ended bool) bool {
 	if len(data) > r.maxBody-len(req.body) {
 		return false
 	}
@@ -180,8 +183,12 @@ func (r *requestReceiver) appendBody(req *receivedRequest, data []byte) bool {
 		// Discard idle storage before growth so it cannot consume live budget.
 		r.budget.give(cap(r.spare))
 		r.spare = nil
-		grown := cap(req.body) + min(cap(req.body), r.maxBody-cap(req.body))
-		capacity := min(r.maxBody, max(needed, max(1024, grown)))
+		capacity := needed
+		// A finished body above the idle limit cannot be reused by this connection.
+		if !ended || needed <= idleRequestBodyLimit {
+			grown := cap(req.body) + min(cap(req.body), r.maxBody-cap(req.body))
+			capacity = min(r.maxBody, max(needed, max(1024, grown)))
+		}
 		// Include both old and new buffers while growing, rather than charging len.
 		if capacity > r.limit-r.buffered {
 			capacity = needed
@@ -205,7 +212,7 @@ func (r *requestReceiver) appendBody(req *receivedRequest, data []byte) bool {
 func (r *requestReceiver) release(id uint32) {
 	if req := r.streams[id]; req != nil {
 		r.buffered -= cap(req.body)
-		if capacity := cap(req.body); capacity > 0 && capacity <= 64<<10 && capacity > cap(r.spare) {
+		if capacity := cap(req.body); capacity > 0 && capacity <= idleRequestBodyLimit && capacity > cap(r.spare) {
 			r.budget.give(cap(r.spare))
 			r.spare = req.body[:0]
 		} else {

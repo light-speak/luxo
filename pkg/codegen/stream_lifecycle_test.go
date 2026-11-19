@@ -8,6 +8,35 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
+func TestGeneratedNativeStreamPreservesEncodingIdentity(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{Name: "native.luxo", Models: []*ast.ModelDecl{{Name: "Post", Fields: []*ast.FieldDecl{testField("id", "Int")}}}, APIs: []*ast.ApiDecl{
+		{Name: "watch", ReturnType: &ast.TypeRef{Name: "Post"}, Directives: []*ast.Directive{{Name: "native"}, {Name: "stream"}}},
+	}}}}
+	runGeneratedProtocolPackage(t, string(generateStreamFile(result, "generated")), `package generated
+import("context";"fmt";"testing";"github.com/light-speak/luxo/pkg/lux/api")
+type identityKey struct{}
+type Post struct{expected any}
+func(p Post)WriteLuxo(buf *api.ResponseBuf,_ []byte)error{
+ if buf.Identity!=p.expected{return fmt.Errorf("stream encoding identity lost: got %v want %v",buf.Identity,p.expected)}
+ buf.AppendByte(1);return nil
+}
+type identityResolver struct{}
+func(*identityResolver)HandleWatch(_ context.Context,_ *WatchStreamParams,identity any,stream *api.TypedStream[Post])error{
+ for range 2{if err:=stream.Send(Post{expected:identity});err!=nil{return err}};return nil
+}
+func TestNativeEncodingIdentity(t *testing.T){
+ router:=api.NewRouter();router.IdentityExtractor=func(ctx context.Context)any{return ctx.Value(identityKey{})}
+ if err:=RegisterStreams(router,nil,&identityResolver{});err!=nil{t.Fatal(err)}
+ for _,identity:=range []any{int64(42),nil,int64(99)}{
+  ctx:=t.Context();if identity!=nil{ctx=context.WithValue(ctx,identityKey{},identity)}
+  sub,err:=router.OpenInternalStream(ctx,&api.Request{API:"watch",BinaryMode:true});if err!=nil{t.Fatal(err)}
+  count:=0;for range sub.Messages(){count++};sub.Close()
+  if err:=sub.Err();err!=nil||count!=2{t.Fatal("encoding failed",identity,count,err)}
+ }
+}
+`)
+}
+
 func TestGeneratedNativeStreamReturnsTypedErrors(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{{Name: "native.luxo", APIs: []*ast.ApiDecl{
 		{Name: "watch", ReturnType: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "native"}, {Name: "stream"}}},
@@ -142,6 +171,23 @@ func TestBridgeTerminalOrder(t *testing.T) {
             if err!=nil||string(raw)!=precisionData{t.Fatalf("raw precision lost: %s, %v",raw,err)}
         }else if sub.Err()!=nil{t.Fatal(sub.Err())}
     }
+}
+func TestBridgeRejectsEmptyRPCStreamData(t *testing.T) {
+ backend:=api.NewRouter()
+ if err:=backend.Registry.Register("watch",1);err!=nil{t.Fatal(err)}
+ backend.HandleStreamNative("watch",func(_ context.Context,_ *api.StreamParams,_ any,stream *api.Stream)error{
+  if err:=stream.Send([]byte{0});err!=nil{return err};return stream.Send(nil)
+ })
+ client:=startStreamBackend(t,backend)
+ gateway:=api.NewRouter()
+ if err:=gateway.Schema.RegisterAPI(&schema.API{ID:1,Name:"watch",Stream:true,ReturnType:"Int"});err!=nil{t.Fatal(err)}
+ gateway.HandleStreamForwarded("watch",rpcStreamProxy(client,gateway,"watch"))
+ ctx,cancel:=context.WithTimeout(t.Context(),3*time.Second);defer cancel()
+ sub,err:=gateway.OpenInternalStream(ctx,&api.Request{API:"watch"});if err!=nil{t.Fatal(err)};defer sub.Close()
+ count:=0
+ for message:=range sub.Messages(){if count!=0||!bytes.Equal(message,[]byte{0}){t.Fatalf("invalid data forwarded: %x",message)};count++}
+ if count!=1||sub.Err()==nil{t.Fatalf("protocol failure became normal completion: count=%d error=%v",count,sub.Err())}
+ if gateway.Streams.SubCount("watch")!=0{t.Fatal("failed forwarded stream retained subscription")}
 }
 func startStreamBackend(t *testing.T,router *api.Router)*rpc.Client{
     t.Helper()

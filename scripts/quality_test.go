@@ -681,3 +681,87 @@ func TestReactCIInstallsImportedGeneratorDependencies(t *testing.T) {
 		t.Fatalf("React must install imported generator dependencies before tests: install=%d test=%d", install, test)
 	}
 }
+
+func TestEditorCacheCatalogIsNotIgnored(t *testing.T) {
+	command := exec.Command("git", "check-ignore", "--no-index", "editors/vscode/examples/luxo.cache.json")
+	command.Dir = ".."
+	output, err := command.CombinedOutput()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+		t.Fatalf("editor cache catalog must be publishable: %s (%v)", output, err)
+	}
+}
+
+func TestCoverageCIFailsClosed(t *testing.T) {
+	type coverageCase struct {
+		name, output string
+		exit         int
+		pass         bool
+	}
+	checked := 0
+	for _, step := range readQualityWorkflow(t).Jobs["test"].Steps {
+		if step.Name != "Coverage summary" && step.Name != "Coverage floor (minimum 95.0%)" {
+			continue
+		}
+		checked++
+		cases := []coverageCase{
+			{"valid", "total: (statements) 96.0%", 0, true},
+			{"command_failure", "total: (statements) 96.0%", 42, false},
+		}
+		if strings.HasPrefix(step.Name, "Coverage floor") {
+			cases = append(cases, []coverageCase{
+				{"empty", "", 0, false},
+				{"malformed", "total: (statements) invalid", 0, false},
+				{"above_range", "total: (statements) 101.0%", 0, false},
+				{"below_floor", "total: (statements) 94.9%", 0, false},
+				{"at_floor", "total: (statements) 95.0%", 0, true},
+				{"maximum", "total: (statements) 100.0%", 0, true},
+				{"missing_percent", "total: (statements) 99.0", 0, false},
+				{"duplicate_total", "total: (statements) 99.0%\ntotal: (statements) 99.0%", 0, false},
+			}...)
+		}
+		for _, tc := range cases {
+			t.Run(step.Name+"/"+tc.name, func(t *testing.T) {
+				fixture := newQualityFixture(t)
+				fixture.tool(t, "go", "printf '%s\n' "+shellQualityQuote(tc.output)+"\nexit "+fmt.Sprint(tc.exit), false)
+				output, _, err := fixture.run(t, "set -e\nexport PATH=\"$PATH:/usr/bin:/bin\"\n"+step.Run)
+				if (err == nil) != tc.pass {
+					t.Fatalf("pass=%v err=%v output=%s", tc.pass, err, output)
+				}
+			})
+		}
+	}
+	if checked != 2 {
+		t.Fatalf("checked %d coverage steps, want 2", checked)
+	}
+}
+
+func TestFuzzCIPreservesCommandFailures(t *testing.T) {
+	checked := 0
+	for _, step := range readQualityWorkflow(t).Jobs["fuzz"].Steps {
+		if step.Name != "Prepare fuzz diagnostics" && !strings.HasPrefix(step.Name, "Fuzz ") {
+			continue
+		}
+		checked++
+		for _, failure := range []string{"none", "go", "tee"} {
+			t.Run(step.Name+"/"+failure, func(t *testing.T) {
+				fixture := newQualityFixture(t)
+				body := "printf 'successful command\n'"
+				if failure == "go" {
+					body = "if [ \"$1\" != env ]; then exit 42; fi"
+				}
+				fixture.tool(t, "go", body, false)
+				if failure == "tee" {
+					fixture.tool(t, "tee", "cat >/dev/null\nexit 42", false)
+				}
+				output, _, err := fixture.run(t, "set -e\nexport PATH=\"$PATH:/usr/bin:/bin\"\nmkdir -p .tmp/fuzz\n"+step.Run)
+				if (err != nil) != (failure != "none") {
+					t.Fatalf("failure=%s err=%v output=%s", failure, err, output)
+				}
+			})
+		}
+	}
+	if checked != 4 {
+		t.Fatalf("checked %d fuzz steps, want 4", checked)
+	}
+}

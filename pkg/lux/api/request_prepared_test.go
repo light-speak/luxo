@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/lux/schema"
@@ -139,8 +138,8 @@ func TestPreparedJSONClearsCacheOnLaterFailures(t *testing.T) {
 	}
 }
 
-func TestPreparedJSONParamSlotLimit(t *testing.T) {
-	for _, count := range []int{16, 17} {
+func TestPreparedJSONExtendedParamSlots(t *testing.T) {
+	for _, count := range []int{16, 17, 65} {
 		s := schema.New()
 		s.RegisterType(&schema.TypeDecl{Name: "Input", Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt}}})
 		definition := &schema.API{ID: 1, Name: "create"}
@@ -154,16 +153,10 @@ func TestPreparedJSONParamSlotLimit(t *testing.T) {
 		r := NewAPIRegistry()
 		r.RegisterSchemaAPIs(s)
 		err := r.prepareJSONRequest(req)
-		if count == 17 {
-			if err == nil || !strings.Contains(err.Error(), "too many params") || req.paramNames != nil {
-				t.Fatalf("slot limit: %v", err)
-			}
-			continue
-		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		if value, present, err := req.ParamMessage("input15", false, false); err != nil || !present || len(value) == 0 {
+		if value, present, err := req.ParamMessage(fmt.Sprintf("input%d", count-1), false, false); err != nil || !present || len(value) == 0 {
 			t.Fatalf("last slot: %x %t %v", value, present, err)
 		}
 	}

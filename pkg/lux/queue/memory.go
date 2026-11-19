@@ -2,22 +2,32 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/light-speak/luxo/internal/diagnostics"
+	"github.com/light-speak/luxo/internal/panicerror"
 )
 
 // MemoryQueue implements Queue using buffered Go channels.
 // Tasks are not persisted — lost on restart. Suitable for dev / embedded mode.
 type MemoryQueue struct {
-	cfg    Config
-	mu     sync.Mutex
-	queues map[string]*memQueue
-	done   chan struct{}
-	once   sync.Once
-	wg     sync.WaitGroup
-	closed bool
+	cfg             Config
+	mu              sync.Mutex
+	queues          map[string]*memQueue
+	done            chan struct{}
+	stopped         chan struct{}
+	once            sync.Once
+	wg              sync.WaitGroup
+	work            sync.WaitGroup
+	closed          bool
+	closeErr        error // Published to all Close callers by once.
+	reports         *diagnostics.Reporter
+	reportsClosed   bool
+	reportsRejected atomic.Uint64
 }
 
 // memQueue holds the channel and handler for one named queue.
@@ -35,13 +45,17 @@ const shutdownTimeout = 10 * time.Second
 var _ Queue = (*MemoryQueue)(nil)
 
 // NewMemoryQueue creates an in-memory queue with the given config.
-func NewMemoryQueue(cfg Config) *MemoryQueue {
+func NewMemoryQueue(cfg Config) (*MemoryQueue, error) {
 	cfg.SetDefaults()
-	return &MemoryQueue{
-		cfg:    cfg,
-		queues: make(map[string]*memQueue),
-		done:   make(chan struct{}),
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
+	return &MemoryQueue{
+		cfg:     cfg,
+		queues:  make(map[string]*memQueue),
+		done:    make(chan struct{}),
+		stopped: make(chan struct{}),
+	}, nil
 }
 
 // Publish sends a task payload to the named queue.
@@ -56,6 +70,10 @@ func (m *MemoryQueue) Publish(ctx context.Context, queue string, payload []byte)
 		return fmt.Errorf("queue: closed")
 	}
 	mq, ok := m.queues[queue]
+	if ok {
+		// Registration under mu prevents Add from racing shutdown admission.
+		m.work.Add(1)
+	}
 	m.mu.Unlock()
 
 	if !ok {
@@ -77,8 +95,10 @@ func (m *MemoryQueue) Publish(ctx context.Context, queue string, payload []byte)
 	case mq.ch <- cp:
 		return nil
 	case <-m.done:
+		m.work.Done()
 		return fmt.Errorf("queue: closed")
 	case <-ctx.Done():
+		m.work.Done()
 		return ctx.Err()
 	}
 }
@@ -86,6 +106,9 @@ func (m *MemoryQueue) Publish(ctx context.Context, queue string, payload []byte)
 // Subscribe registers a handler for the named queue and starts worker goroutines.
 // Only one handler per queue name is allowed.
 func (m *MemoryQueue) Subscribe(queue string, handler Handler) error {
+	if handler == nil {
+		return fmt.Errorf("queue: handler is required")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -110,52 +133,78 @@ func (m *MemoryQueue) Subscribe(queue string, handler Handler) error {
 	return nil
 }
 
+// memoryTask retains an accepted task across abnormal worker termination.
+// attempt counts started business calls, including calls terminated by Goexit.
+type memoryTask struct {
+	payload []byte
+	attempt int
+	delay   time.Duration
+	active  bool
+}
+
 // worker reads tasks from the channel and executes the handler with retry.
-// Channels are never closed; workers detect shutdown exclusively via m.done.
+// Channels stay open; accepted tasks and derived dead letters drain before stop.
 func (m *MemoryQueue) worker(name string, mq *memQueue) {
-	defer m.wg.Done()
+	m.runWorker(name, mq, memoryTask{})
+}
+
+func (m *MemoryQueue) runWorker(name string, mq *memQueue, task memoryTask) {
+	stopped := false
+	defer func() {
+		if stopped {
+			m.wg.Done()
+			return
+		}
+		// Goexit cannot be recovered. Transfer this worker's existing wait-group
+		// reference and in-flight task to its replacement, without re-enqueuing it.
+		go m.runWorker(name, mq, task)
+	}()
+	if task.active {
+		m.finishTask(name, mq.handler, &task)
+	}
 	for {
 		select {
 		case payload := <-mq.ch:
-			m.executeWithRetry(name, mq.handler, payload)
-		case <-m.done:
-			// Drain remaining messages in the channel before exiting.
-			for {
-				select {
-				case payload := <-mq.ch:
-					m.executeWithRetry(name, mq.handler, payload)
-				default:
-					return
-				}
-			}
+			task = memoryTask{payload: payload, delay: m.cfg.RetryDelay, active: true}
+			m.finishTask(name, mq.handler, &task)
+		case <-m.stopped:
+			stopped = true
+			return
 		}
 	}
 }
 
-// executeWithRetry runs the handler with exponential backoff retry.
-// After MaxRetries failures, publishes to the dead-letter queue.
-func (m *MemoryQueue) executeWithRetry(name string, handler Handler, payload []byte) {
-	delay := m.cfg.RetryDelay
-	for attempt := 1; attempt <= m.cfg.MaxRetries; attempt++ {
-		err := InvokeHandler(handler, context.Background(), payload)
-		if err == nil {
-			return
-		}
-		fmt.Fprintf(os.Stderr, "queue %s: attempt %d/%d failed: %v\n",
-			name, attempt, m.cfg.MaxRetries, err)
+func (m *MemoryQueue) finishTask(name string, handler Handler, task *memoryTask) {
+	m.executeTask(name, handler, task)
+	m.work.Done()
+	*task = memoryTask{}
+}
 
-		if attempt < m.cfg.MaxRetries {
+// executeTask resumes after a failed attempt, preserving its retry budget.
+func (m *MemoryQueue) executeTask(name string, handler Handler, task *memoryTask) {
+	for task.attempt < m.cfg.MaxRetries {
+		if task.attempt > 0 {
 			select {
-			case <-time.After(delay):
+			case <-time.After(task.delay):
 			case <-m.done:
 				return
 			}
-			delay *= 2 // exponential backoff
+			// Saturate before doubling; overflow must not turn backoff into an immediate retry.
+			const longestDelay = time.Duration(1<<63 - 1)
+			if task.delay > longestDelay/2 {
+				task.delay = longestDelay
+			} else {
+				task.delay *= 2
+			}
 		}
+		task.attempt++
+		err := InvokeHandler(handler, context.Background(), task.payload)
+		if err == nil {
+			return
+		}
+		m.reportDiagnostic(memoryDiagnostic{queue: name, attempt: task.attempt, limit: m.cfg.MaxRetries, cause: err})
 	}
-
-	// All retries exhausted — send to DLQ.
-	m.sendToDLQ(name, payload)
+	m.sendToDLQ(name, task.payload)
 }
 
 // sendToDLQ publishes the failed task to the dead-letter queue if it exists.
@@ -166,22 +215,26 @@ func (m *MemoryQueue) sendToDLQ(name string, payload []byte) {
 	m.mu.Unlock()
 
 	if !ok {
-		fmt.Fprintf(os.Stderr, "queue %s: task dead-lettered (no DLQ subscriber)\n", name)
+		m.reportDiagnostic(memoryDiagnostic{queue: name, operation: "task dead-lettered (no DLQ subscriber)"})
 		return
 	}
 
+	// The parent task still holds a work reference until this transfer finishes.
+	m.work.Add(1)
 	select {
 	case mq.ch <- payload:
 	default:
-		fmt.Fprintf(os.Stderr, "queue %s: DLQ buffer full, task dropped\n", name)
+		m.work.Done()
+		m.reportDiagnostic(memoryDiagnostic{queue: name, operation: "DLQ buffer full, task dropped"})
 	}
 }
 
-// Close shuts down all workers and waits for in-flight tasks to complete.
-// Returns an error if shutdown times out.
+// Close rejects new publications and waits for accepted work and its queued
+// dead-letter transfers before stopping workers. Memory storage is not durable.
+// Returns an error if shutdown times out or diagnostic reporting fails.
 func (m *MemoryQueue) Close() error {
-	var timedOut bool
 	m.once.Do(func() {
+		deadline := time.Now().Add(shutdownTimeout)
 		m.mu.Lock()
 		m.closed = true
 		m.mu.Unlock()
@@ -189,32 +242,34 @@ func (m *MemoryQueue) Close() error {
 		close(m.done)
 
 		// Do NOT close mq.ch here — Publish may still be in a select
-		// racing to send on mq.ch. Workers detect shutdown via m.done.
+		// racing to send on mq.ch. Workers stop only after accepted work drains.
 
 		// Wait with timeout.
 		ch := make(chan struct{})
 		go func() {
+			m.work.Wait()
+			close(m.stopped)
 			m.wg.Wait()
 			close(ch)
 		}()
 
 		select {
 		case <-ch:
-		case <-time.After(shutdownTimeout):
-			timedOut = true
+		case <-time.After(time.Until(deadline)):
+			m.closeErr = fmt.Errorf("queue: shutdown timed out after %v", shutdownTimeout)
+		}
+		if err := m.closeReports(deadline); err != nil {
+			m.closeErr = errors.Join(m.closeErr, err)
 		}
 	})
-	if timedOut {
-		return fmt.Errorf("queue: shutdown timed out after %v", shutdownTimeout)
-	}
-	return nil
+	return m.closeErr
 }
 
 // InvokeHandler invokes the handler with panic recovery.
 func InvokeHandler(h Handler, ctx context.Context, payload []byte) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("queue handler panic: %v", r)
+			err = panicerror.New("queue handler panic: ", r)
 		}
 	}()
 	return h(ctx, payload)

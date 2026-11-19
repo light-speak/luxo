@@ -10,6 +10,23 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
+func TestGenericMetadataIsBoundToOneCompilation(t *testing.T) {
+	base := defaultGenerator()
+	left, right := &ast.Ident{Name: "left"}, &ast.Ident{Name: "right"}
+	channel := &semantic.ResolvedType{Name: "Channel", TypeArgs: []*semantic.ResolvedType{{Name: "Int", Nullable: true}}}
+	bound := base.withModelReferences(&semantic.Result{GenericExprTypes: map[ast.Expr]*semantic.ResolvedType{left: channel, right: channel}})
+	if base.genericExprTypes != nil || len(bound.genericExprTypes) != 2 || bound.genericExprTypes[left] != bound.genericExprTypes[right] {
+		t.Fatal("generic metadata must share one converted type within its compilation")
+	}
+	bound.genericExprTypes[left].TypeArgs[0].Name = "String"
+	if channel.TypeArgs[0].Name != "Int" {
+		t.Fatal("generator modified semantic metadata")
+	}
+	if next := bound.withModelReferences(&semantic.Result{}); next.genericExprTypes != nil {
+		t.Fatal("generic metadata leaked into a later compilation")
+	}
+}
+
 func TestGeneratorRejectsUnsupportedDriver(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -133,5 +150,51 @@ func TestGeneratorTakesConfigurationSnapshot(t *testing.T) {
 	call := generator.events.remoteLoadCalls["user"][0]
 	if call.argNames[0] != "id" || call.argTypes[0] != "int64" || call.argTypeNames[0] != "Int" {
 		t.Fatalf("nested load metadata was not copied: %+v", call)
+	}
+}
+
+func TestGeneratorDoesNotRetainOwnedModelMetadata(t *testing.T) {
+	ids := StableIDs{ModelFields: map[string]map[string]int{
+		"Target": {"key": 1, "uuid": 2},
+		"Source": {"id": 1, "targetKey": 2, "targetUuid": 3, "target": 4},
+	}}
+	first := analyzePermissionFixture(t, `model Target @noTime { key: String @id } model Source @noTime { id: Int @id targetKey: String target: Target }`)
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: completeFixtureAPIIDs(first, ids)})
+	for _, sample := range []struct{ key, keyType, local string }{{"key", "String", "targetKey"}, {"uuid", "UUID", "targetUuid"}, {"key", "String", "targetKey"}} {
+		input := analyzePermissionFixture(t, "model Target @noTime { "+sample.key+": "+sample.keyType+" @id } model Source @noTime { id: Int @id "+sample.local+": "+sample.keyType+" target: Target }")
+		if len(input.Errors) != 0 {
+			t.Fatal(input.Errors)
+		}
+		generated, err := generator.Generate(input, "generated", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "result[row." + strings.ToUpper(sample.key[:1]) + sample.key[1:] + "] = row"
+		if !strings.Contains(string(generated.Files["dataloader.gen.go"]), want) {
+			t.Fatal("generator retained a previous primary key", sample, string(generated.Files["dataloader.gen.go"]))
+		}
+	}
+}
+
+func TestOwnedModelKeysAndExternalProjectionMetadata(t *testing.T) {
+	base := defaultGenerator()
+	base.events = &EventContext{ModelIDField: map[string]string{"External": "uuid", "Local": "stale"}, ModelIDType: map[string]string{"External": "UUID", "Local": "Int"}}
+	bound := base.withModelReferences(&semantic.Result{Files: []*ast.File{{
+		Models:  []*ast.ModelDecl{{Name: "Local", Fields: []*ast.FieldDecl{{Name: "sku", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "id"}}}}}, {Name: "NoKey"}},
+		Extends: []*ast.ExtendDecl{{Name: "External"}, {Name: "Local"}},
+	}}})
+	for _, sample := range []struct {
+		name, key, keyType string
+		reference          bool
+	}{
+		{"Local", "sku", "String", true}, {"NoKey", "id", "Int", true},
+		{"External", "uuid", "UUID", true}, {"Missing", "id", "Int", false},
+	} {
+		if bound.externalModelIDFieldName(sample.name) != sample.key || bound.externalModelIDTypeName(sample.name) != sample.keyType || bound.isModelReference(sample.name) != sample.reference {
+			t.Fatalf("wrong model metadata for %+v", sample)
+		}
+	}
+	if base.isModelReference("Local") {
+		t.Fatal("borrowed declarations leaked into the reusable generator")
 	}
 }

@@ -1,0 +1,29 @@
+import { FetchTransport } from '@luxojs/client'
+import { LuxoClient } from './client.js'
+import type { ModelResultInput } from './types.js'
+
+function check(value: boolean, message: string): void {
+  if (!value) throw new Error(message)
+}
+
+async function verifyModelPayload(): Promise<void> {
+  for (const mode of ['json', 'binary'] as const) {
+    const client = new LuxoClient(new FetchTransport('http://sealed.fixture.invalid', { mode }))
+    try {
+      const input: ModelResultInput = { $case: 'Owner', person: { id: 7n, name: 'first' }, people: [{ id: 8n, name: 'second' }] }
+      const full = await client.echo({ value: input, $select: 'Owner{person{id,name},people{id,name}}' })
+      check(full.$case === 'Owner' && full.person?.id === 7n && full.person.name === 'first', 'ordinary model is decoded')
+      check(full.$case === 'Owner' && full.people?.[0]?.id === 8n && full.people[0].name === 'second', 'ordinary model list is decoded')
+      const tag = await client.echo({ value: input, $select: 'Owner' })
+      check(tag.$case === 'Owner' && tag.person === undefined && tag.people === undefined, 'tag-only leaves payload unselected')
+      const selected = await client.echo({ value: input })
+      if (selected.$case === 'Owner') {
+        check(selected.person?.id === 7n, 'model field selection is retained')
+        check(selected.people?.[0]?.name === 'second', 'model list field selection is retained')
+      } else throw new Error('expected Owner')
+    } finally { client.close() }
+    console.log(`sealed typed client ${mode} passed`)
+  }
+}
+
+void verifyModelPayload().finally(() => { globalThis.fetch = originalFetch }).catch(error => { throw error })

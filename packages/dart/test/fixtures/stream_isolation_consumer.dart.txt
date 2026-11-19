@@ -8,6 +8,42 @@ typedef _StartStream = Future<void Function()> Function(
 );
 
 void verifyStreamIsolation() {
+  test('generated WS responses preserve JSON128 and isolate model65', () async {
+    final client = LuxoClient(
+      sdk.WsTransport('__STREAM_ENDPOINT__/depth', autoReconnect: false),
+    );
+    addTearDown(client.close);
+    expect((await client.createSnapshot()).metadata.value, isA<List>());
+    expect((await client.listPayloads()).single.metadata.value, isA<List>());
+    expect(
+      (await client.listPayloadPage()).items.single.metadata.value,
+      isA<List>(),
+    );
+    final one = Completer<Payload>();
+    final stop = await client.subscribeWatchPayload(
+      projectId: sdk.LuxoInt64.fromInt(1),
+      onData: one.complete,
+    );
+    expect((await one.future).metadata.value, isA<List>());
+    stop();
+    final list = Completer<List<Payload>>();
+    final stopList = await client.subscribeWatchPayloadList(
+      onData: list.complete,
+    );
+    expect((await list.future).single.metadata.value, isA<List>());
+    stopList();
+    await expectLater(
+      client.projection(),
+      throwsA(
+        isA<sdk.LuxoError>().having(
+          (error) => error.error,
+          'error',
+          'DecodeError',
+        ),
+      ),
+    );
+    expect(await client.scalarInt(), sdk.LuxoInt64.fromInt(7));
+  });
   final cases = <String, _StartStream>{
     'Payload[]': (c, data, error, done) => c.subscribeWatchPayloadList(
       select: 'metadata',

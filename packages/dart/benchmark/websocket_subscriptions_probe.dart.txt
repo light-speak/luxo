@@ -13,6 +13,8 @@ void main() {
 
 void _compareDispatch(TransportMode mode, int count, Object id) {
   final current = WsTransport('ws://unused', autoReconnect: false);
+  final socket = _ProbeSocket();
+  current._ws = socket;
   var beforeCount = 0;
   var afterCount = 0;
   final schema = {for (var i = 0; i < count; i++) 'api$i': APISchemaEntry(i + 1)};
@@ -30,7 +32,7 @@ void _compareDispatch(TransportMode mode, int count, Object id) {
   void before() => mode == TransportMode.json
       ? previous.json(oldJSON) : previous.binary(oldBinary);
   void after() => mode == TransportMode.json
-      ? current._handleJsonResponse(newJSON) : current._handleBinaryResponse(newBinary);
+      ? current._handleJsonResponse(newJSON, socket) : current._handleBinaryResponse(newBinary, socket);
   before(); after();
   if (beforeCount != 1 || afterCount != 1) throw StateError('Probe failed to dispatch');
   benchmark.compareBenchmarks('$mode schema=$count id=${id is int ? 'small' : 'maximum'}',

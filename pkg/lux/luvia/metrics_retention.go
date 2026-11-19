@@ -3,6 +3,7 @@ package luvia
 import (
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"slices"
+	"strings"
 )
 
 const (
@@ -50,6 +51,26 @@ func traceTextBytes(r api.TraceRecord) int {
 	size := uint64(len(r.TraceID)) + uint64(len(r.APIName)) + uint64(len(r.ClientName)) +
 		uint64(len(r.ClientVersion)) + uint64(len(r.Spans)) + uint64(len(r.Selection))
 	return int(min(size, maxTraceTextBytes+1))
+}
+
+// Own retained text so a short substring cannot pin an arbitrarily large parent.
+// Copies happen only after sampling, shutdown and record-size checks pass.
+func ownedTraceText(r api.TraceRecord, size int) api.TraceRecord {
+	// One bounded backing string avoids allocating separately for every field.
+	var buffer strings.Builder
+	buffer.Grow(size)
+	own := func(part string) string {
+		start := buffer.Len()
+		buffer.WriteString(part)
+		return buffer.String()[start:]
+	}
+	r.TraceID = own(r.TraceID)
+	r.APIName = own(r.APIName)
+	r.ClientName = own(r.ClientName)
+	r.ClientVersion = own(r.ClientVersion)
+	r.Spans = own(r.Spans)
+	r.Selection = own(r.Selection)
+	return r
 }
 
 // Stable overflow replaces a ring slot instead of repeatedly growing a sliced queue.

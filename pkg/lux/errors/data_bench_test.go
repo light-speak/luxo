@@ -2,6 +2,7 @@ package errors
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	stderrors "errors"
 	"math"
@@ -99,5 +100,55 @@ func benchmarkErrorDataConstruction(b *testing.B, label string, former bool) {
 	}
 	if err := json.Unmarshal(output, &result); err != nil || result.Resource != label || result.ID != math.MaxInt64 {
 		b.Fatal("baseline and static values differ")
+	}
+}
+
+// Preserve the previous nil behavior for a scoped comparison, not as a valid
+// nullable contract: generated writers already decide presence before Bytes.
+func (w *DataWriter) bytesBeforeNullabilityFix(value []byte) {
+	if value == nil {
+		w.Token("null")
+		return
+	}
+	w.dst = append(w.dst, '"')
+	w.dst = base64.StdEncoding.AppendEncode(w.dst, value)
+	w.dst = append(w.dst, '"')
+}
+
+func BenchmarkDataWriterBytesNullability(b *testing.B) {
+	for _, sample := range []struct {
+		name  string
+		value []byte
+	}{
+		{"nil", nil}, {"empty", []byte{}}, {"8B", make([]byte, 8)}, {"4KiB", make([]byte, 4096)},
+	} {
+		for _, version := range []struct {
+			name  string
+			write func(*DataWriter, []byte)
+		}{
+			{"before", (*DataWriter).bytesBeforeNullabilityFix}, {"current", (*DataWriter).Bytes},
+		} {
+			b.Run(sample.name+"/"+version.name, func(b *testing.B) {
+				dst := make([]byte, 0, base64.StdEncoding.EncodedLen(len(sample.value))+4)
+				expected := "\"" + base64.StdEncoding.EncodeToString(sample.value) + "\""
+				if sample.value == nil && version.name == "before" {
+					expected = "null"
+				}
+				w := NewDataWriter(dst)
+				version.write(&w, sample.value)
+				if got, err := w.Result(); err != nil || string(got) != expected {
+					b.Fatalf("%s: %v", got, err)
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for b.Loop() {
+					w = NewDataWriter(dst[:0])
+					version.write(&w, sample.value)
+					if _, err := w.Result(); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
 	}
 }

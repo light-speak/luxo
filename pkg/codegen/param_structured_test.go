@@ -13,7 +13,6 @@ func TestGeneratedStaticStructuredParams(t *testing.T) {
 	var source strings.Builder
 	source.WriteString(`package generated
 import (
-    "bytes"
     "encoding/json"
     "fmt"
     "time"

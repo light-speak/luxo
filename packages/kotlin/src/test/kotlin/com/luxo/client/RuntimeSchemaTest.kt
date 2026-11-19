@@ -1,6 +1,7 @@
 package com.luxo.client
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
@@ -10,6 +11,120 @@ import okio.Buffer
 import kotlin.test.*
 
 class RuntimeSchemaTest {
+    @Test
+    fun originalJavaSchemaSourceStillCompilesAndRuns() = SchemaSourceCompatibility.verify()
+
+    @Test
+    fun independentlyCompiledIntrospectionSchemaABIRemainsCallable() {
+        val type = LuxoSchema::class.java
+        val map = Map::class.java
+        val marker = Class.forName("kotlin.jvm.internal.DefaultConstructorMarker")
+        val oldConstructor = type.getConstructor(map,map,map,map)
+        val empty = emptyMap<String,LuxoModel>()
+        assertTrue((oldConstructor.newInstance(empty,empty,empty,empty) as LuxoSchema).sealeds.isEmpty())
+        val defaults = type.getConstructor(map,map,map,map,Int::class.javaPrimitiveType,marker)
+        assertTrue((defaults.newInstance(null,null,null,null,15,null) as LuxoSchema).sealeds.isEmpty())
+        val directory = mapOf("Choice" to LuxoSealed("Choice"))
+        val original = LuxoSchema(sealeds=directory)
+        val copy = type.getDeclaredMethod("copy",map,map,map,map)
+        val copyDefault = type.getDeclaredMethod("copy\$default",type,map,map,map,map,Int::class.javaPrimitiveType,Any::class.java)
+        val first = copy.invoke(original,original.models,original.apis,original.enums,original.types) as LuxoSchema
+        val second = copyDefault.invoke(null,original,null,null,null,null,15,null) as LuxoSchema
+        for (value in listOf(first,second)) assertSame(directory,value.sealeds)
+    }
+
+    @Test
+    fun independentlyCompiledSchemaConstructorAndCopyABIRemainCallable() {
+        val type = APISchemaEntry::class.java
+        val map = Map::class.java
+        val list = List::class.java
+        val int = Int::class.javaPrimitiveType!!
+        val marker = Class.forName("kotlin.jvm.internal.DefaultConstructorMarker")
+        val full = type.getConstructor(int, list, map, map)
+        val defaults = type.getConstructor(int, list, map, map, int, marker)
+        assertEquals(7, (full.newInstance(7,emptyList<ParamSchema>(),emptyMap<String,SelectionFieldSchema>(),
+            emptyMap<String,Map<String,SelectionFieldSchema>>()) as APISchemaEntry).id)
+        assertEquals(7, (defaults.newInstance(7,null,null,null,14,null) as APISchemaEntry).id)
+        val response = SelectionFieldSchema(0,"Outcome",type="Sealed")
+        val original = APISchemaEntry(7,responseType=response)
+        val copy = type.getDeclaredMethod("copy",int,list,map,map)
+        val copyDefault = type.getDeclaredMethod("copy\$default",type,int,list,map,map,int,Any::class.java)
+        val first = copy.invoke(original,8,original.params,original.fields,original.types) as APISchemaEntry
+        val second = copyDefault.invoke(null,original,8,null,null,null,14,null) as APISchemaEntry
+        for (value in listOf(first,second)) { assertEquals(8,value.id);assertSame(response,value.responseType) }
+    }
+
+    @Test
+    fun rejectsDuplicateParameterNamesWithDistinctIDs() {
+        val socket = LuxoWebSocket("ws://localhost/luvia", autoReconnect = false)
+        try {
+            for (transport in listOf<Transport>(OkHttpTransport("http://localhost/luvia"), socket)) {
+                for (name in listOf("value", "__proto__", "用户")) {
+                    val params = listOf(ParamSchema(1, name, "Int"), ParamSchema(2, name, "Int"))
+                    val error = assertFailsWith<IllegalArgumentException> {
+                        transport.setSchema(mapOf("read" to APISchemaEntry(1, params)))
+                    }
+                    assertTrue(error.message.orEmpty().contains("duplicate parameter name"))
+                    transport.setSchema(mapOf("read" to APISchemaEntry(1, params.take(1)),
+                        "other" to APISchemaEntry(2, params.take(1))))
+                }
+            }
+        } finally {
+            socket.close()
+        }
+    }
+
+    @Test
+    fun generatedHTTPJSONRetainsPlanDuringSchemaReplacement() = runBlocking {
+        val fixture = Requests(TransportMode.JSON)
+        val transport = OkHttpTransport("http://localhost/luvia", client = fixture.client)
+        transport.setSchema(mapOf("read" to APISchemaEntry(7, listOf(ParamSchema(1, "value", "Int")))))
+        val request = object : GeneratedRequest {
+            override val apiID = 7
+            override fun writeParameters(encoder: LuxoEncoder) {}
+            override fun toJSONParameters(): Map<String, Any?> {
+                transport.setSchema(mapOf("read" to APISchemaEntry(7, listOf(ParamSchema(1, "value", "Float")))))
+                return mapOf("value" to 1.5)
+            }
+        }
+        try {
+            assertEquals("ConfigError", assertFailsWith<LuxoError> { transport.call("read", request) }.error)
+            assertTrue(fixture.bodies.isEmpty())
+            transport.call("read", mapOf("value" to 1.5))
+            assertEquals(1, fixture.bodies.size)
+        } finally {
+            fixture.client.dispatcher.executorService.shutdownNow()
+            fixture.client.connectionPool.evictAll()
+        }
+    }
+
+    @Test
+    fun paginationRequiresStableParameterDirectory() {
+        for (missing in listOf("page", "pageSize")) {
+            val params = listOf("page", "pageSize").filter { it != missing }
+                .map { LuxoParam(7, it, "Int") }
+            val api = LuxoAPI(1, "browse", "test", paginated = true, params = params)
+            assertFailsWith<IllegalArgumentException> {
+                LuxoSchema(models = emptyMap(), apis = mapOf("browse" to api)).validateIDs()
+            }
+        }
+    }
+
+    @Test
+    fun paginationRejectsMalformedParameterShapes() {
+        val page = LuxoParam(7, "page", "Int")
+        for (invalid in listOf(
+            listOf(page.copy(type = "String")), listOf(page.copy(nullable = true)),
+            listOf(page.copy(isList = true)), listOf(page, page.copy(id = 8)),
+        )) {
+            val params = invalid + LuxoParam(9, "pageSize", "Int")
+            val api = LuxoAPI(1, "browse", "test", paginated = true, params = params)
+            assertFailsWith<IllegalArgumentException> {
+                LuxoSchema(models = emptyMap(), apis = mapOf("browse" to api)).validateIDs()
+            }
+        }
+    }
+
     @Test
     fun parameterCopiesDoNotBorrowSourceStorageAtAnySupportedListShape() {
         for (count in listOf(0, 1, 16, 128)) {
@@ -119,6 +234,10 @@ class RuntimeSchemaTest {
                     "invalid" to APISchemaEntry(0),
                 ))
             }
+            assertFailsWith<IllegalArgumentException> {
+                transport.setSchema(mapOf("read" to APISchemaEntry(9,
+                    listOf(ParamSchema(1, "value", "Int"), ParamSchema(2, "value", "Int")))))
+            }
             transport.call("read", mapOf("value" to 7L))
             fixture.assertBody()
             assertFailsWith<LuxoError> { transport.call("read", mapOf("value" to "7")) }
@@ -157,7 +276,8 @@ class RuntimeSchemaTest {
         fun assertBody() {
             for (body in bodies) {
                 if (mode == TransportMode.BINARY) assertContentEquals(byteArrayOf(1, 0, 1, 14, 0), body)
-                else assertEquals("{\"\$api\":\"read\",\"value\":7}", body.decodeToString())
+                else assertEquals(Json.parseToJsonElement("{\"\$api\":\"read\",\"value\":7}"),
+                    Json.parseToJsonElement(body.decodeToString()))
             }
         }
     }

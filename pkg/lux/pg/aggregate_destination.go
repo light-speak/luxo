@@ -71,7 +71,7 @@ func (q *Query[T]) AggregateBatchTo(ctx context.Context, targets []AggregateDest
 			return err
 		}
 	}
-	if err := q.db.conn.QueryRow(ctx, query, args...).Scan(destinations...); err != nil {
+	if err := q.db.queryRowBound(ctx, query, args...).Scan(destinations...); err != nil {
 		return err
 	}
 	for i := range targets {

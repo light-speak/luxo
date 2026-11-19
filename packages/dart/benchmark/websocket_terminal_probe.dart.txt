@@ -9,6 +9,7 @@ void main() {
     }
   }
   print('Baseline keeps pre-terminal dispatch with current shared decoding/storage; not the original release.');
+  print('JSON pairs also differ in response-schema routing/validation; not an isolated terminal-feature cost.');
   print('Terminal columns are complete/error absolute costs, not a regression comparison.');
   print('Local dispatch only; excludes sockets, setup, callback decoding and allocation measurements.');
 }
@@ -22,6 +23,8 @@ Uint8List _frame(int tag, Object id, List<int> payload) {
 void _compareDispatch(TransportMode mode, Object id, bool unary) {
   final before = _BeforeTerminal();
   final after = WsTransport('ws://unused', autoReconnect: false);
+  before._ws = _ProbeSocket();
+  after._ws = _ProbeSocket();
   var oldCount = 0;
   var newCount = 0;
   before._subscriptions[id] = _Subscription(mode, (value) => value, (_) => oldCount++, null);
@@ -30,9 +33,9 @@ void _compareDispatch(TransportMode mode, Object id, bool unary) {
   final binary = _frame(unary ? 2 : 0x12, id, [42]);
   int run(WsTransport transport) {
     for (var i = 0; i < _iterations; i++) {
-      if (unary) transport._pending[id] = Completer<dynamic>.sync();
-      if (mode == TransportMode.json) transport._handleJsonResponse(json);
-      else transport._handleBinaryResponse(binary);
+      if (unary) transport._pending[id] = _PendingCall(mode, null);
+      if (mode == TransportMode.json) transport._handleJsonResponse(json, transport._ws!);
+      else transport._handleBinaryResponse(binary, transport._ws!);
     }
     return unary ? transport._pending.length : (identical(transport, before) ? oldCount : newCount);
   }
@@ -46,6 +49,7 @@ void _compareDispatch(TransportMode mode, Object id, bool unary) {
 
 void _measureTermination(TransportMode mode, Object id) {
   final transport = WsTransport('ws://unused', autoReconnect: false);
+  transport._ws = _ProbeSocket();
   var count = 0;
   final subscription = _Subscription(mode, (value) => value, (_) => throw StateError('Unexpected data'), null,
     onDone: () => count++, onError: (error) { if (error.error != 'Rejected') throw error; count++; });
@@ -56,8 +60,8 @@ void _measureTermination(TransportMode mode, Object id) {
   int run(int failure) {
     for (var i = 0; i < _iterations; i++) {
       transport._subscriptions[id] = subscription;
-      if (mode == TransportMode.json) transport._handleJsonResponse(json[failure]);
-      else transport._handleBinaryResponse(binary[failure]);
+      if (mode == TransportMode.json) transport._handleJsonResponse(json[failure], transport._ws!);
+      else transport._handleBinaryResponse(binary[failure], transport._ws!);
     }
     return count;
   }
@@ -77,7 +81,7 @@ class _BeforeTerminal extends WsTransport {
   _BeforeTerminal() : super('ws://unused', autoReconnect: false);
 
   @override
-  void _handleJsonResponse(String data) {
+  void _handleJsonResponse(String data, LuxoSocket ws) {
     try {
       final json = decodeLuxoJSON(data, preserveNumberSyntax: true) as Map<String, dynamic>;
       if (json.containsKey(r'$sub')) {
@@ -95,7 +99,7 @@ class _BeforeTerminal extends WsTransport {
       }
       final id = uint64FromJSON(json[r'$id']);
       if (id == null) return;
-      final c = _pending.remove(id);
+      final c = _pending.remove(id)?.completer;
       if (c == null) return;
       if (json.containsKey('error')) c.completeError(decodeJSONError(json, 0));
       else c.complete(json['data']);
@@ -103,7 +107,7 @@ class _BeforeTerminal extends WsTransport {
   }
 
   @override
-  void _handleBinaryResponse(Uint8List data) {
+  void _handleBinaryResponse(Uint8List data, LuxoSocket ws) {
     if (data.length < 2) return;
     final frameType = data[0];
     if (frameType != BinaryFrameType.callSuccess && frameType != BinaryFrameType.callError &&
@@ -134,7 +138,7 @@ class _BeforeTerminal extends WsTransport {
       _deliverSubscription(id, TransportMode.binary, Uint8List.sublistView(data, off));
       return;
     }
-    final c = _pending.remove(id);
+    final c = _pending.remove(id)?.completer;
     if (c == null) return;
     if (frameType == BinaryFrameType.callError) c.completeError(decodeBinaryError(Uint8List.sublistView(data, off), 0));
     else c.complete(Uint8List.sublistView(data, off));

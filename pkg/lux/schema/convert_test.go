@@ -252,7 +252,7 @@ func TestBinaryScalarToJSON_Duration(t *testing.T) {
 }
 
 func TestBinaryScalarListToJSON(t *testing.T) {
-	data := codec.AppendArrayHeader(nil, 3)
+	data := codec.AppendVarint(nil, uint64(3))
 	data = codec.AppendBytes(data, []byte("A"))
 	data = codec.AppendBytes(data, []byte("B"))
 	data = codec.AppendBytes(data, []byte("C"))
@@ -285,7 +285,7 @@ func TestBinaryScalarListToJSONAllWireTypes(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			data := codec.AppendArrayHeader(nil, 1)
+			data := codec.AppendVarint(nil, uint64(1))
 			data = test.append(data)
 			if got := string(checkedJSON(t)(BinaryScalarListToJSON(nil, data, test.typeName))); got != test.want {
 				t.Fatalf("%s list = %s, want %s", test.typeName, got, test.want)
@@ -293,7 +293,7 @@ func TestBinaryScalarListToJSONAllWireTypes(t *testing.T) {
 		})
 	}
 
-	data := codec.AppendArrayHeader(nil, 1)
+	data := codec.AppendVarint(nil, uint64(1))
 	data = codec.AppendSvarint(data, 1)
 	if got, err := BinaryScalarListToJSON(nil, data, "Unknown"); err == nil || len(got) != 0 {
 		t.Fatalf("unknown scalar list accepted: %s, %v", got, err)
@@ -881,12 +881,12 @@ func TestColumnarScalarArrayToJSON(t *testing.T) {
 	var w codec.ColumnarWriter
 	w.SetCount(2)
 	// record 0: ["x","y"], record 1: []
-	cell0 := codec.AppendArrayHeader(nil, 2)
+	cell0 := codec.AppendVarint(nil, uint64(2))
 	cell0 = codec.AppendBytes(cell0, []byte("x"))
 	cell0 = codec.AppendBytes(cell0, []byte("y"))
-	cell1 := codec.AppendArrayHeader(nil, 0)
+	cell1 := codec.AppendVarint(nil, uint64(0))
 	w.WriteColumnBytes(1, [][]byte{cell0, cell1})
-	out := checkedJSON(t)(columnarToJSON(nil, testutil.Bytes(t)(w.Bytes()), m))
+	out := checkedJSON(t)(columnarToJSON(nil, testutil.Bytes(t)(w.Bytes()), m, 1))
 	want := `[{"tags":["x","y"]},{"tags":[]}]`
 	if string(out) != want {
 		t.Errorf("columnar scalar array:\n got %s\nwant %s", out, want)
@@ -931,7 +931,7 @@ func TestBinaryListToJSON_NullableStringColumn(t *testing.T) {
 func TestAppendColumnValueJSON_Default(t *testing.T) {
 	// typedColumn with no typed slices set — should output "null"
 	col := &typedColumn{field: &Field{ID: 1, Name: "unknown", Type: FieldInt}}
-	dst := checkedJSON(t)(appendColumnValueJSON(nil, col, 0))
+	dst := checkedJSON(t)(appendColumnValueJSON(nil, col, 0, 1))
 	if string(dst) != "null" {
 		t.Errorf("default branch should output null, got %q", dst)
 	}
@@ -1110,61 +1110,61 @@ func TestAppendArrayFieldJSON_AllTypes(t *testing.T) {
 		want string
 	}{
 		{"Int", FieldInt, func() []byte {
-			c := codec.AppendArrayHeader(nil, 2)
+			c := codec.AppendVarint(nil, uint64(2))
 			c = codec.AppendSvarint(c, 1)
 			c = codec.AppendSvarint(c, -3)
 			return c
 		}, `[1,-3]`},
 		{"Duration", FieldDuration, func() []byte {
-			c := codec.AppendArrayHeader(nil, 1)
+			c := codec.AppendVarint(nil, uint64(1))
 			c = codec.AppendSvarint(c, 1000000)
 			return c
 		}, `[1000000]`},
 		{"DateTime", FieldDateTime, func() []byte {
-			c := codec.AppendArrayHeader(nil, 2)
+			c := codec.AppendVarint(nil, uint64(2))
 			c = testutil.Bytes(t)(codec.AppendDateTime(c, time.Unix(1776427200, 0))) // 2026-04-17T12:00:00Z
 			c = testutil.Bytes(t)(codec.AppendDateTime(c, time.Unix(-1, 123456789)))
 			return c
 		}, `["2026-04-17T12:00:00Z","1969-12-31T23:59:59.123456789Z"]`},
 		{"Float", FieldFloat, func() []byte {
-			c := codec.AppendArrayHeader(nil, 2)
+			c := codec.AppendVarint(nil, uint64(2))
 			c = binary.LittleEndian.AppendUint64(c, math.Float64bits(1.5))
 			c = binary.LittleEndian.AppendUint64(c, math.Float64bits(-2.25))
 			return c
 		}, `[1.5,-2.25]`},
 		{"Bool", FieldBool, func() []byte {
-			c := codec.AppendArrayHeader(nil, 3)
+			c := codec.AppendVarint(nil, uint64(3))
 			c = codec.AppendBool(c, true)
 			c = codec.AppendBool(c, false)
 			c = codec.AppendBool(c, true)
 			return c
 		}, `[true,false,true]`},
 		{"UUID", FieldUUID, func() []byte {
-			c := codec.AppendArrayHeader(nil, 2)
+			c := codec.AppendVarint(nil, uint64(2))
 			c = codec.AppendUUID(c, [16]byte{0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00})
 			c = codec.AppendUUID(c, [16]byte{})
 			return c
 		}, `["550e8400-e29b-41d4-a716-446655440000","00000000-0000-0000-0000-000000000000"]`},
 		{"Bytes", FieldBytes, func() []byte {
-			c := codec.AppendArrayHeader(nil, 2)
+			c := codec.AppendVarint(nil, uint64(2))
 			c = codec.AppendBytes(c, []byte{0xff, 0x00})
 			c = codec.AppendBytes(c, nil)
 			return c
 		}, `["/wA=",""]`},
 		{"Enum", FieldEnum, func() []byte {
-			c := codec.AppendArrayHeader(nil, 2)
+			c := codec.AppendVarint(nil, uint64(2))
 			c = codec.AppendBytes(c, []byte("ADMIN"))
 			c = codec.AppendBytes(c, []byte("USER"))
 			return c
 		}, `["ADMIN","USER"]`},
 		{"JSON", FieldJSON, func() []byte {
-			c := codec.AppendArrayHeader(nil, 2)
+			c := codec.AppendVarint(nil, uint64(2))
 			c = codec.AppendBytes(c, []byte(`{"ok":true}`))
 			c = codec.AppendBytes(c, []byte("null"))
 			return c
 		}, `[{"ok":true},null]`},
 		{"Unknown_emptyArray", FieldModel, func() []byte {
-			return codec.AppendArrayHeader(nil, 0)
+			return codec.AppendVarint(nil, uint64(0))
 		}, `[]`},
 	}
 	for _, tc := range cases {
@@ -1243,7 +1243,7 @@ func TestColumnarModelBlobToJSON(t *testing.T) {
 	var w codec.ColumnarWriter
 	w.SetCount(1)
 	w.WriteColumnBytes(1, [][]byte{inner})
-	out := checkedJSON(t)(columnarToJSON(nil, testutil.Bytes(t)(w.Bytes()), outer, s))
+	out := checkedJSON(t)(columnarToJSON(nil, testutil.Bytes(t)(w.Bytes()), outer, 1, s))
 	want := `[{"sub":{"n":7}}]`
 	if string(out) != want {
 		t.Errorf("got %s want %s", out, want)

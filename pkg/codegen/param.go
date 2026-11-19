@@ -68,8 +68,11 @@ func validateCacheContract(declaration *ast.ApiDecl, result *semantic.Result) er
 	return nil
 }
 
-// Entry-only generation must not bypass the cache contract checked by handlers.
-func validateEntryCacheContracts(result *semantic.Result) error {
+// Entry-only generation requires valid analysis and the same cache contracts as handlers.
+func validateEntryContracts(result *semantic.Result) error {
+	if err := validateSemanticResult(result); err != nil {
+		return err
+	}
 	for _, file := range result.Files {
 		for _, declaration := range file.APIs {
 			if err := validateCacheContract(declaration, result); err != nil {
@@ -78,6 +81,13 @@ func validateEntryCacheContracts(result *semantic.Result) error {
 		}
 	}
 	return nil
+}
+
+func prepareEntryCompilation(result *semantic.Result) (*semantic.Result, error) {
+	if err := validateEntryContracts(result); err != nil {
+		return nil, err
+	}
+	return semantic.CompilationView(result)
 }
 
 func validateCacheDirective(name string, directive *ast.Directive, result *semantic.Result) error {
@@ -129,7 +139,7 @@ func writeRequiredParam(b *strings.Builder, variable, name, method, indent strin
 
 // Built-in arguments use concrete getters. Presence and nullability are
 // generated branches, not inferred from a reflected destination pointer.
-func writeBuiltinParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string) bool {
+func writeBuiltinParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, indent string, keys ...string) bool {
 	if param.Type == nil {
 		return false
 	}
@@ -141,28 +151,29 @@ func writeBuiltinParamExtraction(b *strings.Builder, param *ast.ParamDecl, enums
 	}
 	if !param.Type.Nullable {
 		if param.Default != nil {
-			writeOptionalParamExtraction(b, param, enums, method, indent)
+			writeOptionalParamExtraction(b, param, enums, method, indent, keys...)
 		} else {
-			writeRequiredParam(b, param.Name, param.Name, method, indent)
+			writeRequiredParam(b, param.Name, paramWireKey(param, keys), method, indent)
 		}
 		return true
 	}
-	writeNullableBuiltinParam(b, param, enums, method, indent)
+	writeNullableBuiltinParam(b, param, enums, method, indent, keys...)
 	return true
 }
 
-func writeNullableBuiltinParam(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, method, indent string) {
+func writeNullableBuiltinParam(b *strings.Builder, param *ast.ParamDecl, enums map[string]bool, method, indent string, keys ...string) {
+	key := paramWireKey(param, keys)
 	writeStructuredParamDeclaration(b, param, enums, indent)
 	outer := indent
 	if param.Default != nil {
-		fmt.Fprintf(b, "%sif req.HasParam(%q) {\n", indent, param.Name)
+		fmt.Fprintf(b, "%sif req.HasParam(%q) {\n", indent, key)
 		indent += "\t"
 	}
-	fmt.Fprintf(b, "%sif req.ParamIsNull(%q) {\n", indent, param.Name)
+	fmt.Fprintf(b, "%sif req.ParamIsNull(%q) {\n", indent, key)
 	fmt.Fprintf(b, "%s\t%s = nil\n", indent, param.Name)
 	fmt.Fprintf(b, "%s} else {\n", indent)
 	value := "_value" + str.Capitalize(param.Name)
-	fmt.Fprintf(b, "%s\t%s, err := req.Param%s(%q)\n", indent, value, method, param.Name)
+	fmt.Fprintf(b, "%s\t%s, err := req.Param%s(%q)\n", indent, value, method, key)
 	fmt.Fprintf(b, "%s\tif err != nil { return err }\n", indent)
 	if !param.Type.IsList {
 		value = "&" + value
@@ -171,4 +182,22 @@ func writeNullableBuiltinParam(b *strings.Builder, param *ast.ParamDecl, enums m
 	if param.Default != nil {
 		fmt.Fprintf(b, "%s}\n", outer)
 	}
+}
+
+// Compare declared shapes; absent type metadata never matches.
+func sameTypeRef(left, right *ast.TypeRef) bool {
+	if left == nil || right == nil || left.Name != right.Name || left.IsList != right.IsList || left.Nullable != right.Nullable || len(left.TypeArgs) != len(right.TypeArgs) || len(left.Tuple) != len(right.Tuple) {
+		return false
+	}
+	for i := range left.TypeArgs {
+		if !sameTypeRef(left.TypeArgs[i], right.TypeArgs[i]) {
+			return false
+		}
+	}
+	for i := range left.Tuple {
+		if !sameTypeRef(left.Tuple[i], right.Tuple[i]) {
+			return false
+		}
+	}
+	return true
 }

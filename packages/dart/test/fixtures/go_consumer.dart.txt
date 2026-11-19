@@ -13,6 +13,21 @@ import 'types.dart';
 const _selection = 'value, duration, optional, values, label';
 final _integers = integerCases.map(sdk.LuxoInt64.parse).toList();
 
+Future<void> _verifyBytesParameters(LuxoClient client) async {
+  final backing = Uint8List.fromList([99, 0, 127, 128, 255, 88]);
+  final values = [
+    Uint8List(0),
+    Uint8List.fromList([0, 127, 128, 255]),
+    Uint8List.sublistView(backing, 1, 5),
+  ];
+  for (final value in values) {
+    expect(await client.echoBytes(value: value), value);
+  }
+  expect(await client.echoByteLists(values: values), values);
+  expect(await client.echoByteLists(values: []), isEmpty);
+  expect(backing, [99, 0, 127, 128, 255, 88]);
+}
+
 Future<void> _verifyNullableRootCalls(LuxoClient client) async {
   for (final value in [
     null,
@@ -629,6 +644,7 @@ void registerErrorTests() {
 }
 
 void registerSuccessAndStreamTests() {
+  registerGeneratedWSRenewalTests();
   for (final mode in sdk.TransportMode.values) {
     test(
       'HTTP refresh preserves purpose and identity: $mode',
@@ -676,6 +692,11 @@ void registerSuccessAndStreamTests() {
           );
         });
         tearDown(() => client.close());
+
+        test(
+          'Bytes root and list parameters use canonical wire encoding',
+          () => _verifyBytesParameters(client),
+        );
 
         test(
           'nullable root presence survives the complete request chain',
@@ -893,53 +914,19 @@ void registerSuccessAndStreamTests() {
 
         test(
           'all eleven scalar arrays match Go values and preserve selection',
-          () async {
-            for (final state in [0, 1, 2, 3]) {
-              final input = _scalarArraysInput(state);
-              final rows = await client.listScalarArrays(
-                input: input,
-                select: _scalarSelection,
-              );
-              expect(rows, hasLength(2));
-              rows.add(
-                await client.echoScalarArrays(
-                  input: input,
-                  select: _scalarSelection,
-                ),
-              );
-              for (final row in rows) {
-                expect(row.toJson(), input.toJson());
-                _verifyFloatSigns(row, input);
-              }
-              final partials = await client.listScalarArrays(
-                input: input,
-                select: 'tail',
-              );
-              partials.add(
-                await client.echoScalarArrays(input: input, select: 'tail'),
-              );
-              for (final row in partials) {
-                expect(row.toJson(), {'tail': BigInt.from(42)});
-              }
-              if (!websocket) continue;
-              final row = await _firstStream<ScalarArrays>(
-                (receive) => client.subscribeWatchScalarArrays(
-                  state: sdk.LuxoInt64.fromInt(state),
-                  select: _scalarSelection,
-                  onData: receive,
-                ),
-              );
-              // This native stream returns fixed fixture data, not the unary input.
-              expect(
-                row.toJson(),
-                _scalarArraysInput(state, fixedStream: true).toJson(),
-              );
-              _verifyFloatSigns(row, input);
-            }
-          },
+          () => _verifyScalarArrays(client, websocket),
         );
 
         test('signed 64-bit scalar, Duration and array round trips', () async {
+          expect(await client.echoManyParameters(), sdk.LuxoInt64.fromInt(7));
+          expect(
+            await client.echoManyParameters(
+              p0: sdk.LuxoInt64.fromInt(1),
+              p16: sdk.LuxoInt64.fromInt(-1),
+              p64: sdk.LuxoInt64.maxValue,
+            ),
+            sdk.LuxoInt64.maxValue,
+          );
           for (final value in _integers) {
             expect(await client.echoInteger(value: value), value);
             expect(await client.echoDuration(value: value), value);
@@ -1176,6 +1163,114 @@ void registerSuccessAndStreamTests() {
         }
       });
     }
+  }
+}
+
+void registerGeneratedWSRenewalTests() {
+  for (final mode in sdk.TransportMode.values) {
+    test('generated WS expiry and explicit resubscription: $mode', () async {
+      final bootstrap = LuxoClient.create(
+        endpoint,
+        options: sdk.TransportOptions(mode: mode),
+      );
+      try {
+        await _verifyGeneratedWSRenewal(bootstrap, mode);
+      } finally {
+        bootstrap.close();
+      }
+    });
+  }
+}
+
+Future<void> _verifyGeneratedWSRenewal(
+  LuxoClient bootstrap,
+  sdk.TransportMode mode,
+) async {
+  final first = Completer<String>(), ended = Completer<sdk.LuxoError>();
+  final renewed = Completer<void>();
+  var values = 0, errors = 0, completed = 0, attempts = 0;
+  final refresh = await bootstrap.issueFixtureRefresh();
+  final token = await bootstrap.issueExpiringFixtureAccess();
+  final transport = sdk.WsTransport(
+    endpoint.replaceFirst('http:', 'ws:'),
+    options: sdk.TransportOptions(mode: mode, token: token),
+    timeout: const Duration(seconds: 5),
+    onTokenExpired: () async {
+      attempts++;
+      final access = await bootstrap.exchangeFixtureRefresh(token: refresh);
+      if (!renewed.isCompleted) renewed.complete();
+      return access;
+    },
+  );
+  final client = LuxoClient(transport);
+  const timestamp = '2020-01-02T03:04:05.123456789Z';
+  final expected = sdk.LuxoInt64.parse('9007199254740993');
+  try {
+    final before = await _generatedFixtureStreamStats(bootstrap);
+    expect(before.active, 0);
+    expect(await client.fixtureIdentity(), expected);
+    final stopOld = await client.subscribeWatchFixtureTimestamp(
+      value: timestamp,
+      onData: (value) {
+        values++;
+        if (!first.isCompleted) first.complete(value);
+      },
+      onError: (error) {
+        errors++;
+        if (!ended.isCompleted) ended.complete(error);
+      },
+      onDone: () {
+        completed++;
+      },
+    );
+    expect(await first.future.timeout(const Duration(seconds: 8)), timestamp);
+    await _waitGeneratedFixtureStreams(bootstrap, before.started + 1, 1);
+    expect((await ended.future.timeout(const Duration(seconds: 8))).code, 401);
+    await renewed.future.timeout(const Duration(seconds: 8));
+    expect(await client.fixtureIdentity(), expected);
+    expect(attempts, 1);
+    expect((values, errors, completed), (1, 1, 0));
+    await _waitGeneratedFixtureStreams(bootstrap, before.started + 1, 0);
+    final fresh = Completer<String>();
+    final stopFresh = await client.subscribeWatchFixtureTimestamp(
+      value: timestamp,
+      onData: fresh.complete,
+    );
+    expect(await fresh.future.timeout(const Duration(seconds: 8)), timestamp);
+    stopOld();
+    expect(await client.fixtureIdentity(), expected);
+    expect((values, errors, completed), (1, 1, 0));
+    await _waitGeneratedFixtureStreams(bootstrap, before.started + 2, 1);
+    stopFresh();
+    await _waitGeneratedFixtureStreams(bootstrap, before.started + 2, 0);
+  } finally {
+    client.close();
+  }
+}
+
+Future<({int started, int active})> _generatedFixtureStreamStats(
+  LuxoClient client,
+) async {
+  final value = await client.fixtureStreamStats(select: 'started, active');
+  return (
+    started: value.started.value.toInt(),
+    active: value.active.value.toInt(),
+  );
+}
+
+Future<void> _waitGeneratedFixtureStreams(
+  LuxoClient client,
+  int started,
+  int active,
+) async {
+  final clock = Stopwatch()..start();
+  for (;;) {
+    final value = await _generatedFixtureStreamStats(client);
+    expect(value.started, started);
+    if (value.active == active) return;
+    if (clock.elapsed > const Duration(seconds: 5))
+      fail('Stream cleanup stalled: ${value.active} != $active');
+    await Future<void>.delayed(const Duration(milliseconds: 10));
   }
 }
 
@@ -1424,6 +1519,69 @@ void _verifyNestedBoundaries() {
 const _scalarSelection =
     'ints, floats, strings, bools, dates, durations, uuids, bytes, decimals, jsons, enums, tail';
 
+void registerGeneratedDecimalTests() {
+  for (final mode in sdk.TransportMode.values) {
+    for (final websocket in [false, true]) {
+      test('generated compact Decimal $mode websocket=$websocket', () async {
+        final client = LuxoClient.create(
+          websocket ? endpoint.replaceFirst('http:', 'ws:') : endpoint,
+          options: sdk.TransportOptions(mode: mode),
+        );
+        try {
+          await _verifyScalarArrays(client, websocket, states: const [4]);
+        } finally {
+          client.close();
+        }
+      });
+    }
+  }
+}
+
+Future<void> _verifyScalarArrays(
+  LuxoClient client,
+  bool websocket, {
+  Iterable<int> states = const [0, 1, 2, 3, 4],
+}) async {
+  for (final state in states) {
+    final input = _scalarArraysInput(state);
+    await _verifyScalarArrayCalls(client, input);
+    if (!websocket) continue;
+    final row = await _firstStream<ScalarArrays>(
+      (receive) => client.subscribeWatchScalarArrays(
+        state: sdk.LuxoInt64.fromInt(state),
+        select: _scalarSelection,
+        onData: receive,
+      ),
+    );
+    // This native stream returns fixed fixture data, not the unary input.
+    expect(row.toJson(), _scalarArraysInput(state, fixedStream: true).toJson());
+    _verifyFloatSigns(row, input);
+  }
+}
+
+Future<void> _verifyScalarArrayCalls(
+  LuxoClient client,
+  ScalarArraysInput input,
+) async {
+  final rows = await client.listScalarArrays(
+    input: input,
+    select: _scalarSelection,
+  );
+  expect(rows, hasLength(2));
+  rows.add(
+    await client.echoScalarArrays(input: input, select: _scalarSelection),
+  );
+  for (final row in rows) {
+    expect(row.toJson(), input.toJson());
+    _verifyFloatSigns(row, input);
+  }
+  final partials = await client.listScalarArrays(input: input, select: 'tail');
+  partials.add(await client.echoScalarArrays(input: input, select: 'tail'));
+  for (final row in partials) {
+    expect(row.toJson(), {'tail': BigInt.from(42)});
+  }
+}
+
 void _verifyFloatSigns(ScalarArrays row, ScalarArraysInput input) {
   final actual = row.floats.value;
   expect(actual, input.floats);
@@ -1496,6 +1654,8 @@ ScalarArraysInput _scalarArraysInput(int state, {bool fixedStream = false}) =>
           ? null
           : state == 1
           ? []
+          : state == 4
+          ? ['1e2147483647', '-1e-2147483648']
           : ['1234567890.123456789', '-0.000000001'],
       jsons: state == 0
           ? null

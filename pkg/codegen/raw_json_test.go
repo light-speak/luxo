@@ -42,12 +42,76 @@ func TestGeneratedRawJSONStream(t *testing.T) {
 	runGeneratedProtocolPackage(t, string(generateStreamFile(result, "generated")), rawJSONStreamAssertions)
 }
 
+func TestGeneratedNullableJSONOutput(t *testing.T) {
+	runGeneratedFixture(t, `
+type Document { required: JSON optional: JSON? }
+sealed DocumentChoice { Value(value: JSON?) }
+fn choice(value: JSON?): DocumentChoice { return DocumentChoice.Value(value: value) }
+event DocumentChanged(value: JSON?)
+api nativeJSON(): JSON? @native
+fn nullableJSONSource(): Result<JSON?> @native
+fn requiredJSONSource(): Result<JSON> @native
+api compiledJSON(): JSON? { return nullableJSONSource()? }
+api promotedJSON(): JSON? { return requiredJSONSource()? }
+api watchJSON(): JSON? @stream @native
+api watchChanged(): JSON? @stream(DocumentChanged) { true }
+`, nullableJSONOutputAssertions, StableIDs{
+		ModelFields: map[string]map[string]int{
+			"Document": {"required": 1, "optional": 2}, "DocumentChoice": {"Value": 1}, "DocumentChoice.Value": {"value": 1},
+		},
+		EventFields: map[string]map[string]int{"DocumentChanged": {"value": 1}},
+	})
+}
+
+const nullableJSONOutputAssertions = `package generated
+import("bytes";"context";"encoding/json";"testing";"time";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/event")
+type nullableJSONResolver struct{ raw json.RawMessage }
+func(r nullableJSONResolver)NativeJSON(context.Context)(*json.RawMessage,error){return &r.raw,nil}
+func(r nullableJSONResolver)NullableJSONSource(context.Context)(*json.RawMessage,error){return &r.raw,nil}
+func(r nullableJSONResolver)RequiredJSONSource(context.Context)(json.RawMessage,error){return r.raw,nil}
+func(r nullableJSONResolver)HandleWatchJSON(_ context.Context,_ *WatchJSONStreamParams,_ any,stream *api.TypedStream[*json.RawMessage])error{return stream.Send(&r.raw)}
+func TestPublicNullableJSONOutput(t *testing.T){
+ for _,text:=range []string{"null"," \t\r\nnull \t\r\n", "{\"n\":123456789012345678901234567890}"}{
+  raw:=json.RawMessage(text);want:=[]byte{0};if text[0]=='{'{want=codec.AppendBytes([]byte{1},raw)}
+  app:=&App{Resolver:nullableJSONResolver{raw:raw}}
+  choice,err:=app.choice(t.Context(),&raw);if err!=nil{t.Fatal(err)}
+  payload:=[]byte{0,1,0,0};if text[0]=='{'{payload=append(codec.AppendBytes([]byte{0,1,1},raw),0)}
+  choiceWant:=codec.AppendBytes([]byte{1},payload);var choiceBuf api.ResponseBuf
+  if err:=choice.WriteLuxo(&choiceBuf,nil);err!=nil||!bytes.Equal(choiceBuf.B,choiceWant){t.Fatal("sealed nullable JSON",choiceBuf.B,choiceWant,err)}
+  var decoded DocumentChoice;dec:=codec.NewDecoder(choiceBuf.B);decoded.ReadLuxoInput(dec)
+  if err:=dec.Finish();err!=nil{t.Fatal(err)}
+  choiceBuf.B=nil;if err:=decoded.WriteLuxo(&choiceBuf,nil);err!=nil||!bytes.Equal(choiceBuf.B,choiceWant){t.Fatal("sealed roundtrip",choiceBuf.B,err)}
+  for _,handler:=range []api.HandlerFunc{handleNativeJSON(app),handleCompiledJSON(app),handlePromotedJSON(app)}{
+   req:=&api.Request{Buf:&api.ResponseBuf{},BinaryMode:true}
+   if err:=handler(t.Context(),req);err!=nil||!bytes.Equal(req.Buf.B,want){t.Fatal("unary JSON?",req.Buf.B,want,err)}
+  }
+  router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+  bus:=event.NewChanBus(2);if err:=RegisterStreams(router,bus,app.Resolver);err!=nil{t.Fatal(err)}
+  for _,name:=range []string{"watchJSON","watchChanged"}{
+   sub,err:=router.OpenInternalStream(t.Context(),&api.Request{API:name,BinaryMode:true});if err!=nil{t.Fatal(err)}
+   if name=="watchChanged"{if err:=EmitDocumentChanged(t.Context(),bus,DocumentChangedEvent{Value:&raw});err!=nil{t.Fatal(err)}}
+   select{case data,ok:=<-sub.Messages():
+    if !ok||!bytes.Equal(data,want){t.Fatal("JSON? stream",name,ok,data,want)}
+    projected,err:=router.StreamPayloadJSON(name,data);if err!=nil||(!bytes.Equal(data,[]byte{0})&&!bytes.Equal(projected,raw))||(bytes.Equal(data,[]byte{0})&&string(projected)!="null"){t.Fatal("JSON stream projection",projected,err)}
+   case<-time.After(3*time.Second):t.Fatal("stream treated null as completion")}
+   sub.Close()
+  }
+  bus.Close()
+  // Internal snapshots must retain the two storage states.
+  input:=DocumentChangedEvent{Value:&raw};encoded,err:=input.MarshalLuxo();if err!=nil{t.Fatal(err)}
+  var out DocumentChangedEvent;if err:=out.UnmarshalLuxo(encoded);err!=nil||out.Value==nil||!bytes.Equal(*out.Value,raw){t.Fatal("internal event changed",out.Value,err)}
+  if string(raw)!=text{t.Fatal("writer mutated source")}
+ }
+}
+`
+
 const rawJSONAssertions = `package generated
 import (
 "github.com/light-speak/luxo/internal/testutil"
 
     "bytes"
     "encoding/json"
+    "strings"
     "testing"
     "github.com/light-speak/luxo/pkg/lux/api"
     "github.com/light-speak/luxo/pkg/lux/codec"
@@ -64,7 +128,8 @@ func jsonPayload(raw json.RawMessage) Payload {
 
 func badJSONValues() []json.RawMessage {
     return []json.RawMessage{nil, {}, []byte("{"), []byte("null true"), []byte("\"\\uD800\""),
-        []byte("{\"\\uDC00\":1}"), []byte("{\"a\":\"\\uD800\",\"a\":0}"), []byte("\"\xff\""), []byte("NaN")}
+        []byte("{\"\\uDC00\":1}"), []byte("{\"a\":\"\\uD800\",\"a\":0}"), []byte("\"\xff\""), []byte("NaN"),
+        []byte(strings.Repeat("[", 128) + "[]" + strings.Repeat("]", 128))}
 }
 
 func TestRawJSONWrites(t *testing.T) {
@@ -129,6 +194,7 @@ func TestRawJSONReads(t *testing.T) {
 
 func TestRawJSONExactRoundtrip(t *testing.T) {
     for _, raw := range []json.RawMessage{[]byte("null"), []byte(" {} "), []byte("[null,{},[]]"),
+        []byte(strings.Repeat("[", 127) + "[]" + strings.Repeat("]", 127)),
         []byte("{\"n\":123456789012345678901234567890,\"f\":1.2345678901234567890123456789,\"z\":-0.00,\"e\":1e-9999,\"t\":\"\\uD800\\uDC00東京\"}")} {
         value := jsonPayload(raw)
         for field := 1; field <= 6; field++ {
@@ -157,6 +223,10 @@ func TestRawJSONExactRoundtrip(t *testing.T) {
 
 func checkJSONField(t *testing.T, value Payload, field int, want []byte) {
     t.Helper()
+    if field == 2 && bytes.Equal(bytes.Trim(want, " \t\r\n"), []byte("null")) {
+        if value.Optional != nil { t.Fatal("nullable JSON null was not normalized") }
+        return
+    }
     var raw []byte
     switch field {
     case 1: raw = value.Value
@@ -167,6 +237,37 @@ func checkJSONField(t *testing.T, value Payload, field int, want []byte) {
     case 6: if len(value.Children) == 1 { raw = value.Children[0].Value }
     }
     if !bytes.Equal(raw, want) { t.Fatalf("field %d lost raw text: %q / %q", field, raw, want) }
+}
+
+func TestNullableJSONCanonicalWire(t *testing.T) {
+    for _, text := range []string{"null", " \t\r\nnull \t\r\n"} {
+        raw := json.RawMessage(text)
+        value := jsonPayload(raw)
+        for _, selected := range []bool{false, true} {
+            var mask []byte
+            if selected { mask = jsonMask(t, 2) } else { value = Payload{Value:raw, Optional:&raw, Child:&Child{Value:raw}} }
+            buf := &api.ResponseBuf{}
+            if err := value.WriteLuxo(buf, mask); err != nil { t.Fatal(err) }
+            if selected && !bytes.Equal(buf.B, []byte{0,2,0,0}) { t.Fatalf("nullable row wire: %x", buf.B) }
+            var out Payload
+            dec := codec.NewDecoder(buf.B); out.ReadLuxo(dec)
+            if err := dec.Finish(); err != nil || out.Optional != nil { t.Fatal("nullable row", out.Optional, err) }
+        }
+        buf := &api.ResponseBuf{}
+        if err := WriteColumnarPayload(buf, []Payload{{Optional:&raw}}, jsonMask(t,2)); err != nil { t.Fatal(err) }
+        if !bytes.Equal(buf.B, []byte{1,0,2,0,0}) { t.Fatalf("nullable column wire: %x",buf.B) }
+        // Accept the former present-null frame, but expose the same public null.
+        legacy := append(append([]byte{0,2,1}, codec.AppendBytes(nil,raw)...),0)
+        for _, input := range []bool{false,true} {
+            out := Payload{Optional:&raw}; dec := codec.NewDecoder(legacy)
+            if input { out.ReadLuxoInput(dec) } else { out.ReadLuxo(dec) }
+            if err := dec.Finish(); err != nil || out.Optional != nil { t.Fatal("legacy nullable row", input, out.Optional, err) }
+        }
+        legacy = append(append([]byte{1,0,2,1},codec.AppendBytes(nil,raw)...),0)
+        rows,err := ReadColumnarPayload(legacy)
+        if err != nil || len(rows)!=1 || rows[0].Optional!=nil { t.Fatal("legacy nullable column",rows,err) }
+        if string(raw)!=text || value.Optional==nil || string(*value.Optional)!=text { t.Fatal("encoding mutated stored JSON") }
+    }
 }
 `
 
@@ -250,3 +351,28 @@ func TestRawJSONNativeStream(t *testing.T) {
     }
 }
 `
+
+func TestGeneratedJSONIndependentContainerDepth(t *testing.T) {
+	runGeneratedFixture(t, `
+ type Child { value: JSON }
+ type Packet { value: JSON children: [Child] }
+ api echo(input: Packet): Packet { return input }
+ `, `package generated
+import("bytes";"fmt";"net/http";"net/http/httptest";"strings";"testing";"github.com/light-speak/luxo/pkg/lux/api")
+func TestJSONDepthInModelAndProtocol(t *testing.T){
+ router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)};if err:=RegisterHandlers(router,&App{});err!=nil{t.Fatal(err)};if err:=router.Prepare();err!=nil{t.Fatal(err)}
+ for _,depth:=range []int{127,128,129}{for _,leaf:=range []string{"0","[]","{}"}{
+  count:=depth;if leaf!="0"{count++};valid:=count<=128
+  value:=strings.Repeat("[",depth)+leaf+strings.Repeat("]",depth)
+  input:=[]byte(fmt.Sprintf("{\"value\":%s,\"children\":[{\"value\":%s}]}",value,value))
+  var packet Packet;err:=packet.ReadJSONInput(input)
+  if (err==nil)!=valid{t.Errorf("direct count=%d err=%v",count,err)}
+  body:=append([]byte("{\"$api\":\"echo\",\"$select\":\"value,children{value}\",\"input\":"),input...);body=append(body,'}')
+  request:=httptest.NewRequest(http.MethodPost,"/luvia",bytes.NewReader(body));response:=httptest.NewRecorder();router.ServeHTTP(response,request)
+  want:=http.StatusBadRequest;if valid{want=http.StatusOK}
+  if response.Code!=want{t.Errorf("HTTP count=%d status=%d want=%d body=%s",count,response.Code,want,response.Body.String())}
+  if valid&&!bytes.Contains(response.Body.Bytes(),[]byte(value)){t.Fatal("payload changed")}
+ }}
+}
+`, StableIDs{APIs: map[string]int{"echo": 1}, ModelFields: map[string]map[string]int{"Child": {"value": 1}, "Packet": {"value": 1, "children": 2}}})
+}

@@ -2,6 +2,7 @@
 package ratelimit
 
 import (
+	"math"
 	"sync"
 	"time"
 )
@@ -65,9 +66,10 @@ func (l *Limiter) Allow(key string) bool {
 	}
 	refill := int(now.Sub(b.lastFill) / interval)
 	if refill > 0 {
-		b.tokens += refill
-		if b.tokens > l.max {
+		if refill >= l.max-b.tokens {
 			b.tokens = l.max
+		} else {
+			b.tokens += refill
 		}
 		b.lastFill = b.lastFill.Add(time.Duration(refill) * interval)
 	}
@@ -91,7 +93,11 @@ func shardIndex(key string) uint32 {
 }
 
 func (l *Limiter) cleanupShard(shard *limiterShard, now time.Time) {
-	cutoff := now.Add(-10 * l.window)
+	retention := time.Duration(math.MaxInt64)
+	if l.window <= retention/10 {
+		retention = 10 * l.window
+	}
+	cutoff := now.Add(-retention)
 	for key, current := range shard.buckets {
 		if current.lastSeen.Before(cutoff) {
 			delete(shard.buckets, key)

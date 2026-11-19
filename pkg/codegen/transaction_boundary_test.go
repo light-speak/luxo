@@ -128,7 +128,16 @@ func runGeneratedFixture(t *testing.T, source, assertions string, ids StableIDs,
 	if err != nil {
 		t.Fatal(err)
 	}
+	runGeneratedCompilation(t, generated, assertions, additional...)
+}
+
+func runGeneratedCompilation(t *testing.T, generated *GenerateResult, assertions string, additional ...string) {
+	t.Helper()
 	dir := writeProtocolFixture(t, "package generated\n", assertions)
+	natsAdapter := strings.Contains(assertions+strings.Join(additional, ""), "github.com/light-speak/luxo/pkg/lux/nats/event")
+	if natsAdapter {
+		writeAdapterFixtureModule(t, dir, "pkg/lux/nats", "pkg/lux/pg")
+	}
 	for i, source := range additional {
 		if err := os.WriteFile(filepath.Join(dir, "additional_"+strconv.Itoa(i)+"_test.go"), []byte(source), 0o600); err != nil {
 			t.Fatal(err)
@@ -143,6 +152,9 @@ func runGeneratedFixture(t *testing.T, source, assertions string, ids StableIDs,
 		}
 	}
 	args := []string{"test", "-count=1", "-timeout=90s"}
+	if natsAdapter {
+		args = append(args, "-mod=mod")
+	}
 	if testing.Verbose() {
 		args = append(args, "-v")
 	}
@@ -160,6 +172,9 @@ func runGeneratedFixture(t *testing.T, source, assertions string, ids StableIDs,
 	}
 	command := exec.Command("go", append(args, ".")...)
 	command.Dir = dir
+	if natsAdapter {
+		command.Env = append(os.Environ(), "GOWORK=off")
+	}
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("generated transaction regression: %v\n%s", err, output)
 	} else if testing.Verbose() || os.Getenv("LUXO_TRANSACTION_BENCHMARK") == "1" {
@@ -219,6 +234,7 @@ import (
   "github.com/light-speak/luxo/pkg/lux/selection"
   "github.com/testcontainers/testcontainers-go"
   "github.com/testcontainers/testcontainers-go/modules/postgres"
+ "github.com/light-speak/luxo/internal/testutil"
 )
 type fixtureResolver struct{}
 func (*fixtureResolver) NativeMarker(context.Context) (int64,error) { return 7,nil }
@@ -235,7 +251,7 @@ func TestGeneratedEventKeepsAssignedField(t *testing.T) {
 func transactionFixtureDB(t testing.TB) *pg.DB {
   t.Helper()
   ctx:=t.Context()
-  container,err:=postgres.Run(ctx,"postgres:17-alpine",postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+  container,err:=postgres.Run(ctx,testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
   testcontainers.CleanupContainer(t,container)
   if err!=nil { t.Fatal(err) }
   connection,err:=container.ConnectionString(ctx,"sslmode=disable")
@@ -252,7 +268,9 @@ func TestGeneratedTransactions(t *testing.T) {
   db:=transactionFixtureDB(t)
   app:=NewFromDB(db)
   app.Resolver=&fixtureResolver{}
-  app.Queue=queue.NewMemoryQueue(queue.DefaultConfig())
+  taskQueue,err:=queue.NewMemoryQueue(queue.DefaultConfig())
+  if err!=nil {t.Fatal(err)}
+  app.Queue=taskQueue
   app.EventBus=event.NewChanBus(8)
   t.Cleanup(func(){_=app.Queue.Close();app.EventBus.Close()})
   for _,tc:=range []struct{name string; handler api.HandlerFunc; want string; wantError bool}{
@@ -324,7 +342,7 @@ func testCustomTransactionFactory(t *testing.T,app *App) {
 
 func testTransactionLoaders(t *testing.T,app *App) {
   t.Helper()
-  ctx:=t.Context()
+  ctx,scopeErr:=dataloader.NewScope(t.Context());if scopeErr!=nil{t.Fatal(scopeErr)}
   app.SetLoaders(NewDefaultLoaders(app,dataloader.DefaultConfig()))
   original:=app.loaders.PostUser
   fields:=[]*selection.Field{{Name:"id"},{Name:"name"}}
@@ -376,7 +394,7 @@ func TestGeneratedTransactionalReadMethods(t *testing.T) {
   db:=transactionFixtureDB(t)
     app:=NewFromDB(db)
     err:=app.Tx(t.Context(),func(tx *App)error {
-      if _,err:=tx.User.Where(UserWhere.Id.Eq(1)).Update(t.Context(),lux.SetField{Col:"name",Val:"uncommitted"});err!=nil {return err}
+      if _,err:=tx.User.Where(UserWhere.Id.Eq(1)).Update().SetName("uncommitted").Exec(t.Context());err!=nil {return err}
       if err:=tx.Tx(t.Context(),func(inner *App)error {
         rows,total,err:=inner.User.Where().Limit(1).AllWithCount(t.Context())
         if err!=nil {return err}

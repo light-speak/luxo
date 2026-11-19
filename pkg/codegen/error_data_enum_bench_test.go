@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
@@ -118,6 +119,67 @@ func benchErrorEnumPair(b *testing.B,name string,sample enumErrorSample) {
     b.ReportAllocs();b.ResetTimer()
     for b.Loop(){result,ok:=version.text(dst[:0],"value");if !ok || len(result)!=len(expected){b.Fatal("invalid text")}}
    })
+ }
+}
+`
+
+func TestGeneratedErrorModelListPerformanceFixture(t *testing.T) {
+	detail := &ast.ModelDecl{Name: "Detail", Fields: []*ast.FieldDecl{
+		{Name: "id", Type: &ast.TypeRef{Name: "Int"}}, {Name: "level", Type: &ast.TypeRef{Name: "Int"}},
+	}}
+	file := &ast.File{Models: []*ast.ModelDecl{detail}, Errors: []*ast.ErrorDecl{{Name: "Rejected", Code: 422, Fields: []*ast.ParamDecl{
+		{Name: "details", Type: &ast.TypeRef{Name: "Detail", IsList: true}},
+	}}}}
+	source := string(generateErrorFile(&semantic.Result{Files: []*ast.File{file}}, "generated"))
+	before := strings.ReplaceAll(source, "Rejected", "UncheckedRejected")
+	before = strings.ReplaceAll(before, "appendErrorDetail", "appendUncheckedErrorDetail")
+	guard := `if data.field0[i] == nil { w.Reject("model list element is nil"); return }`
+	if strings.Count(before, guard) != 1 {
+		t.Fatal("generated nil guard changed")
+	}
+	before = strings.Replace(before, guard, "", 1)
+	start := strings.Index(before, "// NewUncheckedRejected")
+	if start < 0 {
+		t.Fatal("generated constructor missing")
+	}
+	source += "\ntype Detail struct { Id int64; Level int64 }\n" + before[start:]
+	runGeneratedProtocolPackage(t, source, errorModelListBenchmarks)
+}
+
+// The reference differs only by omitting the new per-element nil check.
+// It is not the historical generator, whose model-list code did not compile.
+const errorModelListBenchmarks = `package generated
+import("bytes";"fmt";"testing")
+func TestModelListBenchmarkParity(t *testing.T){
+ values:=[]*Detail{{Id:1,Level:42},{Id:2,Level:0}}
+ before:=NewUncheckedRejected(values).Data
+ after:=NewRejected(values).Data
+ expected,err:=before.AppendJSON(nil);if err!=nil{t.Fatal(err)}
+ actual,err:=after.AppendJSON(nil);if err!=nil||!bytes.Equal(actual,expected){t.Fatalf("%s != %s: %v",actual,expected,err)}
+ values[0]=nil
+ func(){
+  defer func(){if recover()==nil{t.Fatal("unchecked reference unexpectedly accepted nil")}}()
+  _,_=before.AppendJSON(nil)
+ }()
+ if actual,err:=after.AppendJSON([]byte("prefix:"));err==nil||string(actual)!="prefix:"{t.Fatalf("invalid accepted %s: %v",actual,err)}
+}
+func BenchmarkErrorModelList(b *testing.B){
+ for _,count:=range []int{0,1,128}{
+  values:=make([]*Detail,count)
+  for i:=range values{values[i]=&Detail{Id:int64(i),Level:42}}
+  before:=NewUncheckedRejected(values).Data.(*UncheckedRejectedErrorData)
+  after:=NewRejected(values).Data.(*RejectedErrorData)
+  for _,version:=range []struct{name string;write func([]byte)([]byte,error)}{
+   {"Unchecked",before.AppendJSON},{"Checked",after.AppendJSON},
+  }{
+   b.Run(fmt.Sprintf("%d/%s",count,version.name),func(b *testing.B){
+    dst:=make([]byte,0,16384)
+    expected,err:=before.AppendJSON(nil);if err!=nil{b.Fatal(err)}
+    actual,err:=version.write(dst[:0]);if err!=nil||!bytes.Equal(actual,expected){b.Fatal("wire mismatch",err)}
+    b.ReportAllocs();b.ResetTimer()
+    for b.Loop(){raw,err:=version.write(dst[:0]);if err!=nil||len(raw)!=len(expected){b.Fatal("invalid output",err)}}
+   })
+  }
  }
 }
 `

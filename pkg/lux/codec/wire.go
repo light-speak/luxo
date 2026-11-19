@@ -19,6 +19,12 @@ import (
 	"unicode/utf8"
 )
 
+// MaxModelDepth counts model/type objects from one; lists and JSON use separate budgets.
+const MaxModelDepth = 64
+
+// ErrModelDepth rejects a structured object beyond MaxModelDepth.
+var ErrModelDepth = errors.New("codec: model nesting exceeds 64 levels")
+
 // ErrNonFiniteFloat rejects values outside the protocol's finite Float domain.
 var ErrNonFiniteFloat = errors.New("luxo: Float must be finite")
 
@@ -34,6 +40,9 @@ var ErrInsufficientElementBytes = errors.New("codec: insufficient element bytes"
 
 // ErrInsufficientArenaBytes rejects an allocation larger than the available payload.
 var ErrInsufficientArenaBytes = errors.New("codec: insufficient arena bytes")
+
+// ErrNullModelElement rejects nil entries in non-null model lists.
+var ErrNullModelElement = errors.New("codec: null model list element")
 
 // ErrEmptyColumnarProjection rejects nonempty lists with no returned column.
 var ErrEmptyColumnarProjection = errors.New("codec: nonempty list requires at least one column")
@@ -55,6 +64,8 @@ const (
 	// MaxSelectionFieldID bounds model/type/extend masks to 8 KiB per level.
 	MaxSelectionFieldID   = (1 << 16) - 1
 	MaxSelectionMaskBytes = (MaxSelectionFieldID + 7) / 8
+	// MaxSelectionDepth counts the root selection node as the first level.
+	MaxSelectionDepth = 32
 	// MaxAPIID and MaxEventFieldID fit the common signed 32-bit metadata domain.
 	MaxAPIID        = (1 << 31) - 1
 	MaxEventFieldID = (1 << 31) - 1
@@ -85,7 +96,7 @@ func AppendVarint(dst []byte, v uint64) []byte {
 func ReadVarint(buf []byte, off int) (uint64, int) {
 	var v uint64
 	var shift uint
-	for i := off; i < len(buf); i++ {
+	for i := off; uint(i) < uint(len(buf)); i++ {
 		b := buf[i]
 		v |= uint64(b&0x7F) << shift
 		if b < 0x80 {
@@ -144,7 +155,7 @@ func IsFiniteFloat(value float64) bool {
 // ReadFixed64 reads a finite float64 from 8 bytes at offset.
 // A non-finite or truncated value consumes no bytes.
 func ReadFixed64(buf []byte, off int) (float64, int) {
-	if off+8 > len(buf) {
+	if len(buf) < 8 || uint(off) > uint(len(buf)-8) {
 		return 0, 0
 	}
 	bits := binary.LittleEndian.Uint64(buf[off:])
@@ -177,6 +188,7 @@ func appendString(dst []byte, v string) []byte {
 }
 
 // ReadBytes reads length-prefixed bytes from buf at offset.
+// The returned slice aliases buf; copy it before the input can be reused.
 // Returns the bytes slice (pointing into buf) and total bytes consumed.
 func ReadBytes(buf []byte, off int) ([]byte, int) {
 	if off < 0 {
@@ -195,6 +207,7 @@ func ReadBytes(buf []byte, off int) ([]byte, int) {
 
 // ReadString reads strict UTF-8, preserving a leading U+FEFF as field data.
 // Malformed text consumes no bytes; opaque binary values use ReadBytes.
+// The returned string does not alias buf and survives input reuse.
 func ReadString(buf []byte, off int) (string, int) {
 	b, n := readStringBytes(buf, off)
 	if n == 0 {
@@ -238,9 +251,22 @@ func ReadBool(buf []byte, off int) (bool, int) {
 
 // --- Array (count + items) ---
 
-// AppendArrayHeader appends the array count as a varint.
-func AppendArrayHeader(dst []byte, count int) []byte {
-	return AppendVarint(dst, uint64(count))
+// ErrInvalidArrayCount rejects counts outside the common array wire domain.
+var ErrInvalidArrayCount = errors.New("codec: array count must be between 0 and 1000000")
+
+func validateArrayCount(count int) error {
+	if uint(count) > MaxArrayElements {
+		return ErrInvalidArrayCount
+	}
+	return nil
+}
+
+// AppendArrayHeader validates before changing the destination.
+func AppendArrayHeader(dst []byte, count int) ([]byte, error) {
+	if err := validateArrayCount(count); err != nil {
+		return dst, err
+	}
+	return AppendVarint(dst, uint64(count)), nil
 }
 
 // ReadArrayHeader reads a count within MaxArrayElements before narrowing to int.
@@ -274,7 +300,7 @@ func AppendPresent(dst []byte) []byte {
 
 // ReadNullable reads the nullable flag. Returns true if value is present.
 func ReadNullable(buf []byte, off int) (present bool, n int) {
-	if off >= len(buf) {
+	if uint(off) >= uint(len(buf)) {
 		return false, 0
 	}
 	switch buf[off] {

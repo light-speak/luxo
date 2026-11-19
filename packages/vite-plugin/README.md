@@ -8,15 +8,19 @@
 
 ```bash
 pnpm add @luxojs/client
-pnpm add -D @luxojs/vite-plugin typescript@7
+pnpm add -D @luxojs/vite-plugin typescript@7.0.2
 ```
 
-Requires Node.js `^22.18.0 || >=24.11.0` and TypeScript 7. Field analysis uses
-Babel 8's typed AST; the generated consumers are checked with the native TS 7
-compiler. Node.js requirements apply to build tools, not to the browser bundle.
+Requires Node.js `^22.18.0 || >=24.11.0` and TypeScript `7.0.2`. The native
+compiler verifies generated SDK method declarations before Babel traces fields;
+unrelated methods with the same name are left unchanged. Its semantic API is
+currently unstable, so this beta pins the validated compiler version. Compiler
+sessions exist only during builds; generated requests add no identity checks.
 
-要求 Node.js `^22.18.0 || >=24.11.0`、TypeScript 7。构建期使用 Babel 8 AST
-追踪字段，生成客户端使用原生 TS 7 编译器验收；Node.js 门槛不等同于浏览器门槛。
+要求 Node.js `^22.18.0 || >=24.11.0`、TypeScript `7.0.2`。构建期先由原生
+编译器核验生成SDK的方法声明，再用Babel追踪字段；普通同名方法不改写。语义API
+当前仍属unstable导出，因此本beta绑定已验证的编译器版本。会话只在构建期存在，
+生成请求不增加身份判断；Node.js门槛不等同于浏览器门槛。
 
 ## Vite Config / 配置
 
@@ -112,9 +116,10 @@ post.comments.forEach(c => {
 - Lambda params: `arr.forEach(item => item.field)`
 - Variable alias: `const author = post.user; author.name`
 - Paginated and list results: `page.items.map(user => user.name)`
-- Stream callback payloads: `subscribeLiveUsers(params, user => user.name)`
+- Stream callback payloads: `subscribeLiveUsers(params, user => user.name, observer)`
 - Destructuring: `const { name, email } = await client.getUser({ id: 1n })`
-- Type wrappers: `as`, `satisfies`, non-null assertions and parentheses preserve field tracking
+- Spread tuples: `client.getUser(...args)` retain argument order, options and an explicit `$select`
+- Type wrappers: `as`, `satisfies`, non-null assertions and parentheses preserve result and inline callback field tracking
 - Source modules: `.ts`, `.tsx`, `.mts`, `.cts`; JSX is parsed only in `.tsx`
 - Surrounding syntax: decorators, auto-accessors, const type parameters and resource declarations
 - Conservative escape fallback: dynamic or externally consumed results receive an explicit safe projection
@@ -128,6 +133,9 @@ below. Supply `$select` explicitly when a helper's field usage is not visible.
 不支持或非法的源码语法会携带文件名报错并阻止构建。上述支持不等于全程序类型分析；
 无法静态追踪的结果使用下述有界显式投影。辅助函数内的字段使用不可见时，请显式提供
 `$select`。Luxo `Int`、`Duration` 参数使用 `bigint`，不要先转成 `Number`。
+展开元组调用保留参数顺序、options、流回调和显式 `$select`；仅为首个参数补充自动选择，
+不修改原元组或参数对象。不可见回调内的字段使用仍遵循有界显式投影规则。
+订阅的 observer 不影响 onData 推断；内联回调的类型包裹同样保留字段选择。
 
 ### Code generation / 代码生成
 

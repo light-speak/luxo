@@ -51,5 +51,9 @@ func RandInt(min, max int64) int64 {
 	if min >= max {
 		return min
 	}
-	return min + rand.Int64N(max-min+1)
+	width := uint64(max) - uint64(min) + 1
+	if width == 0 {
+		return int64(rand.Uint64()) // The full Int64 domain has 2^64 values.
+	}
+	return int64(uint64(min) + rand.Uint64N(width))
 }

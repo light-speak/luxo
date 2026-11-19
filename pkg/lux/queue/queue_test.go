@@ -4,6 +4,18 @@ import (
 	"testing"
 )
 
+func TestConfigDefaultsDoNotHideNegativeValues(t *testing.T) {
+	for _, original := range []Config{{MaxRetries: -1}, {RetryDelay: -1}, {Concurrency: -1}} {
+		cfg := original
+		cfg.SetDefaults()
+		if original.MaxRetries < 0 && cfg.MaxRetries >= 0 ||
+			original.RetryDelay < 0 && cfg.RetryDelay >= 0 ||
+			original.Concurrency < 0 && cfg.Concurrency >= 0 {
+			t.Errorf("negative configuration was silently defaulted: %+v -> %+v", original, cfg)
+		}
+	}
+}
+
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.MaxRetries != 3 {
@@ -35,8 +47,46 @@ func TestConfigValidateKeepsExplicit(t *testing.T) {
 
 func TestExplicitMemoryQueueIgnoresNATSAddress(t *testing.T) {
 	t.Setenv("NATS_URL", "nats://127.0.0.1:1")
-	q := NewMemoryQueue(DefaultConfig())
+	q := mustMemoryQueue(t, DefaultConfig())
 	if err := q.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func mustMemoryQueue(t testing.TB, cfg Config) *MemoryQueue {
+	t.Helper()
+	q, err := NewMemoryQueue(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return q
+}
+
+func TestMemoryQueueRejectsNegativeConfiguration(t *testing.T) {
+	for _, cfg := range []Config{{MaxRetries: -1}, {RetryDelay: -1}, {Concurrency: -1}} {
+		q, err := NewMemoryQueue(cfg)
+		if q != nil {
+			_ = q.Close()
+		}
+		if q != nil || err != errNegativeConfig {
+			t.Errorf("negative configuration accepted: %+v, %v", cfg, err)
+		}
+	}
+}
+
+func TestConfigValidation(t *testing.T) {
+	for _, cfg := range []Config{{}, DefaultConfig(), {MaxRetries: 1, RetryDelay: 1, Concurrency: 1}} {
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("valid configuration rejected: %+v, %v", cfg, err)
+		}
+		q := mustMemoryQueue(t, cfg)
+		want := cfg
+		want.SetDefaults()
+		if q.cfg != want {
+			t.Errorf("constructor changed explicit/default configuration: %+v != %+v", q.cfg, want)
+		}
+		if err := q.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

@@ -48,3 +48,34 @@ func BenchmarkInternalRouteExport(b *testing.B) {
 		}
 	}
 }
+
+// Compare identity binding with the former direct dispatch. This excludes
+// verification, network I/O, registration and generated model encoding.
+func BenchmarkRouteResponseIdentity(b *testing.B) {
+	type identityKey struct{}
+	ctx := context.WithValue(b.Context(), identityKey{}, "verified")
+	for _, configured := range []bool{false, true} {
+		router := NewRouter()
+		if configured {
+			router.IdentityExtractor = func(ctx context.Context) any { return ctx.Value(identityKey{}) }
+		}
+		fn := HandlerFunc(func(_ context.Context, req *Request) error { req.Buf.AppendByte(1); return nil })
+		router.Handle("call", fn)
+		bound := router.ExportHandlers()["call"]
+		for _, candidate := range []struct {
+			name string
+			call HandlerFunc
+		}{{"before", fn}, {"after", bound}} {
+			b.Run(fmt.Sprintf("configured=%v/%s", configured, candidate.name), func(b *testing.B) {
+				req := &Request{Buf: &ResponseBuf{B: make([]byte, 0, 8)}}
+				b.ReportAllocs()
+				for b.Loop() {
+					req.Buf.B = req.Buf.B[:0]
+					if err := candidate.call(ctx, req); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}

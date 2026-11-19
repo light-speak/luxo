@@ -5,47 +5,51 @@ String _requestCall(
   required bool selection,
   bool stream = false,
 }) {
-  final args = api.params.map((p) => '${p.name}: ${p.name}').toList();
+  final args = api.params
+      .map(
+        (p) =>
+            '${dartSourceIdentifier(p.name)}: ${dartSourceIdentifier(p.name)}',
+      )
+      .toList();
   if (selection) {
     final selected = stream ? r'select ?? $selectionPlan?.text' : 'sel';
     args.add('sel: $selected');
     args.add(r'$selectionPlan: $selectionPlan');
   }
   if (api.paginated) {
-    for (final name in _paginationNames) {
-      if (!api.params.any((p) => p.name == name)) args.add('$name: $name');
-    }
     args.addAll(['filters: filters', 'sorters: sorters']);
   }
-  return '_${api.name}Request(${args.join(', ')})';
+  return '_${dartSourceIdentifier(api.name)}Request(${args.join(', ')})';
 }
 
 void _genRequest(
   StringBuffer b,
   LuxoAPI api,
   LuxoSchema schema,
-  Map<String, TypeUsage> usages,
+  _TypeUsages usages,
 ) {
-  final selection = api.paginated || !_isScalar(_responseType(api, schema));
+  final selection = _apiNeedsSelection(api, schema);
   final (fields, declarations) = _requestFields(api, usages, selection);
   final stored = {
     for (final (index, name) in fields.keys.indexed) name: '_p$index',
   };
-  b.writeln('\nclass _${api.name}Request extends GeneratedRequest {');
+  b.writeln(
+    '\nclass _${dartSourceIdentifier(api.name)}Request extends GeneratedRequest {',
+  );
   for (final entry in fields.entries) {
     b.writeln('  final ${entry.value} ${stored[entry.key]};');
   }
   final args = declarations.isEmpty ? '' : '{${declarations.join(', ')}}';
   final init = fields.isEmpty
       ? ''
-      : ' : ${fields.keys.map((name) => '${stored[name]} = $name').join(', ')}';
-  b.writeln('  _${api.name}Request($args)$init;');
+      : ' : ${fields.keys.map((name) => '${stored[name]} = ${dartSourceIdentifier(name)}').join(', ')}';
+  b.writeln('  _${dartSourceIdentifier(api.name)}Request($args)$init;');
   b.writeln('  @override\n  int get apiID => ${api.id};');
   _writeRequestAccessors(b, api, selection, stored);
   b.writeln('  @override\n  Map<String, dynamic> toJSONParameters() {');
   for (final name in fields.keys) {
     if (name == r'$selectionPlan') continue;
-    b.writeln('    final $name = ${stored[name]};');
+    b.writeln('    final ${dartSourceIdentifier(name)} = ${stored[name]};');
   }
   b.writeln('    return {');
   _writeUnaryParams(b, api, selection: selection);
@@ -59,7 +63,7 @@ void _genRequest(
 
 (Map<String, String>, List<String>) _requestFields(
   LuxoAPI api,
-  Map<String, TypeUsage> usages,
+  _TypeUsages usages,
   bool selection,
 ) {
   final fields = <String, String>{};
@@ -82,12 +86,6 @@ void _genRequest(
     declarations.add(r'PreparedSelection? $selectionPlan');
   }
   if (api.paginated) {
-    for (final name in _paginationNames) {
-      if (!fields.containsKey(name)) {
-        fields[name] = 'LuxoInt64?';
-        declarations.add('LuxoInt64? $name');
-      }
-    }
     fields.addAll({
       'filters': 'List<LuxoFilter>?',
       'sorters': 'List<LuxoSorter>?',
@@ -151,7 +149,7 @@ void _writeRequestParam(
   );
   if (p.isList) {
     b.writeln(
-      '      encoder.writeVarint($value.length);\n      for (final item in $value) {',
+      '      encoder.writeArrayHeader($value.length);\n      for (final item in $value) {',
     );
     _writeRequestScalar(b, field, 'item', schema);
     b.writeln('      }');

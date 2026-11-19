@@ -4,7 +4,9 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json/jsontext"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +20,8 @@ import (
 // Generated writers and Claims.AppendJSON satisfy this contract without maps,
 // reflection, or decoding values merely to encode them again.
 type ClaimsWriter func([]byte) ([]byte, error)
+
+const signedJWTHeader = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
 
 const (
 	accessPurpose  = "access"
@@ -117,6 +121,10 @@ func SignWithExpiry(cfg *Config, data ClaimsWriter, expires time.Duration) (stri
 }
 
 func signWithPurpose(cfg *Config, data ClaimsWriter, expires time.Duration, purpose string) (string, error) {
+	return signWithSubject(cfg, data, expires, purpose, "")
+}
+
+func signWithSubject(cfg *Config, data ClaimsWriter, expires time.Duration, purpose, subject string) (string, error) {
 	if cfg == nil || strings.TrimSpace(cfg.Secret) == "" {
 		return "", fmt.Errorf("JWT secret is required")
 	}
@@ -124,7 +132,6 @@ func signWithPurpose(cfg *Config, data ClaimsWriter, expires time.Duration, purp
 		return "", fmt.Errorf("JWT claims writer is required")
 	}
 	now := time.Now()
-	const header = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
 	prefix := `{"token_use":"access","data":`
 	if purpose == refreshPurpose {
 		prefix = `{"token_use":"refresh","data":`
@@ -141,12 +148,18 @@ func signWithPurpose(cfg *Config, data ClaimsWriter, expires time.Duration, purp
 	if err := jsonutil.VisitUniqueObject(payload[len(prefix):], func(_, _ []byte) error { return nil }); err != nil {
 		return "", fmt.Errorf("invalid claims object: %w", err)
 	}
+	if subject != "" {
+		payload, err = jsontext.AppendQuote(append(payload, `,"sub":`...), subject)
+		if err != nil {
+			return "", fmt.Errorf("invalid JWT subject: %w", err)
+		}
+	}
 	envelope := strconv.AppendInt(append(payload, `,"exp":`...), now.Add(expires).Unix(), 10)
 	envelope = strconv.AppendInt(append(envelope, `,"iat":`...), now.Unix(), 10)
 	payloadB64 := base64Encode(append(envelope, '}'))
 
-	sig := hmacSign(header+"."+payloadB64, cfg.Secret)
-	return header + "." + payloadB64 + "." + sig, nil
+	sig := hmacSign(signedJWTHeader+"."+payloadB64, cfg.Secret)
+	return signedJWTHeader + "." + payloadB64 + "." + sig, nil
 }
 
 // Verify accepts access tokens only. Returns the claims data if valid.
@@ -189,6 +202,9 @@ func verifyPurpose(cfg *Config, token, purpose string) (Claims, int64, error) {
 	if !hmac.Equal([]byte(parts[2]), []byte(expectedSig)) {
 		return Claims{}, 0, fmt.Errorf("invalid signature")
 	}
+	if err := validateJWTHeader(parts[0]); err != nil {
+		return Claims{}, 0, err
+	}
 
 	// Decode payload
 	payload, err := base64Decode(parts[1])
@@ -205,6 +221,50 @@ func verifyPurpose(cfg *Config, token, purpose string) (Claims, int64, error) {
 	}
 
 	return data, expiresAt, nil
+}
+
+// Our own fixed header needs no JSON parsing; alternate encodings still must
+// declare HS256 in one complete, unambiguous object.
+func validateJWTHeader(encoded string) error {
+	if encoded == signedJWTHeader {
+		return nil
+	}
+	raw, err := base64Decode(encoded)
+	if err != nil {
+		return fmt.Errorf("decode JWT header: %w", err)
+	}
+	var algorithm bool
+	err = jsonutil.VisitUniqueObject(raw, func(name, value []byte) error {
+		switch string(name) {
+		case "crit":
+			return fmt.Errorf("JWT critical header extensions are not supported")
+		case "b64":
+			if string(value) != "true" {
+				return fmt.Errorf("JWT payload must use base64url encoding")
+			}
+			return nil
+		case "alg":
+		default:
+			return nil
+		}
+		if string(value) == `"HS256"` {
+			algorithm = true
+			return nil
+		}
+		alg, err := jsonutil.ParseString(value)
+		if err != nil || alg != "HS256" {
+			return fmt.Errorf("JWT algorithm must be HS256")
+		}
+		algorithm = true
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("invalid JWT header: %w", err)
+	}
+	if !algorithm {
+		return fmt.Errorf("JWT algorithm is required")
+	}
+	return nil
 }
 
 // SignRefresh creates a refresh token with longer expiry.
@@ -273,25 +333,35 @@ func parseDurationWithMultiplier(s string) (time.Duration, error) {
 		if part == "" {
 			continue
 		}
+		var duration time.Duration
 		if idx := strings.Index(part, "*"); idx >= 0 {
 			numStr := part[:idx]
 			durStr := part[idx+1:]
-			var num float64
-			if _, err := fmt.Sscanf(numStr, "%f", &num); err != nil {
+			num, err := strconv.ParseFloat(numStr, 64)
+			if err != nil {
 				return 0, fmt.Errorf("invalid duration %q", s)
 			}
 			d, err := time.ParseDuration(durStr)
 			if err != nil {
 				return 0, fmt.Errorf("invalid duration %q: %w", s, err)
 			}
-			total += time.Duration(num * float64(d))
+			product := num * float64(d)
+			// The positive bound is exclusive: float64(MaxInt64) rounds to 2^63.
+			if math.IsNaN(product) || math.IsInf(product, 0) || product >= 0x1p63 || product < -0x1p63 {
+				return 0, fmt.Errorf("duration %q overflows", s)
+			}
+			duration = time.Duration(product)
 		} else {
 			d, err := time.ParseDuration(part)
 			if err != nil {
 				return 0, fmt.Errorf("invalid duration %q: %w", s, err)
 			}
-			total += d
+			duration = d
 		}
+		if duration > 0 && total > math.MaxInt64-duration || duration < 0 && total < math.MinInt64-duration {
+			return 0, fmt.Errorf("duration %q overflows", s)
+		}
+		total += duration
 	}
 	return total, nil
 }

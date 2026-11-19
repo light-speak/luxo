@@ -77,9 +77,13 @@ private class SelectionParser(private val input: String) {
 
     private fun readIdentifier(): String {
         val start = offset
-        if (offset >= input.length || !input[offset].isIdentifierStart()) return ""
-        offset++
-        while (offset < input.length && input[offset].isIdentifierPart()) offset++
+        if (offset >= input.length || !input.codePointAt(offset).isIdentifierStart()) return ""
+        offset += Character.charCount(input.codePointAt(offset))
+        while (offset < input.length) {
+            val code = input.codePointAt(offset)
+            if (!code.isIdentifierPart()) break
+            offset += Character.charCount(code)
+        }
         return input.substring(start, offset)
     }
 
@@ -91,8 +95,9 @@ private class SelectionParser(private val input: String) {
         throw LuxoError("ConfigError", 0, "$message at position $offset")
 }
 
-private fun Char.isIdentifierStart(): Boolean = this == '_' || this in 'A'..'Z' || this in 'a'..'z'
-private fun Char.isIdentifierPart(): Boolean = isIdentifierStart() || this in '0'..'9'
+private fun Int.isIdentifierStart(): Boolean = this == 95 || this in 65..90 || this in 97..122 ||
+    (this >= 128 && Character.isLetter(this))
+private fun Int.isIdentifierPart(): Boolean = isIdentifierStart() || this in 48..57
 
 internal fun writeFieldMask(enc: LuxoEncoder, meta: APISchemaEntry, selection: String?, plan: PreparedSelection? = null) {
     if (meta.fields.isEmpty()) {

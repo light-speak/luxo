@@ -1,6 +1,7 @@
 import { isUtf8 } from 'node:buffer'
 import { describe, expect, it } from 'vitest'
 import { ColumnarDecoder, Decoder, Encoder, decodeJSONValue, decodeScalarArray } from './codec'
+import { decodeLuxoJSON, stringFromJSON } from './json'
 
 const utf8 = new TextEncoder()
 const invalid = [
@@ -11,6 +12,18 @@ const invalid = [
 ].map(bytes => Uint8Array.from(bytes))
 
 describe('lossless binary UTF-8', () => {
+  it('preserves compact Decimal text from Go without numeric conversion', () => {
+    for (const text of ['1e2147483647', '-1e-2147483648', '1.23']) {
+      const payload = stringWire(utf8.encode(text))
+      const decoder = new Decoder(payload)
+      expect(decoder.readString()).toBe(text)
+      expect(decoder.error).toBeNull()
+      expect(decoder.remaining).toBe(0)
+      expect(decodeScalarArray(Uint8Array.from([1, ...payload]), 'Decimal')).toEqual([text])
+      expect(stringFromJSON(decodeLuxoJSON(`"${text}"`))).toBe(text)
+    }
+  })
+
   it.each(['', 'ascii', '发布检查', '\u0000', '\ufffd', '\ufeff', '\ufefftext', 'a\ufeffb', '\u{10ffff}'])
   ('preserves valid string code points: %j', value => {
     const bytes = utf8.encode(value)

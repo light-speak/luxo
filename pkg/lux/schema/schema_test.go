@@ -249,14 +249,11 @@ func TestFieldTypeMarshalJSON(t *testing.T) {
 }
 
 func TestFieldTypeMarshalJSON_Unknown(t *testing.T) {
-	// Out-of-range FieldType should produce "Unknown"
+	// Out-of-range FieldType must not be exported as a supported wire type.
 	ft := FieldType(999)
 	b, err := ft.MarshalJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(b) != `"Unknown"` {
-		t.Errorf("got %s, want %q", b, "Unknown")
+	if err == nil || b != nil {
+		t.Fatalf("invalid type exported: %s / %v", b, err)
 	}
 }
 
@@ -720,10 +717,7 @@ func TestInvalidNegativeFieldTypeIsUnknown(t *testing.T) {
 		t.Fatalf("String() = %q", got)
 	}
 	data, err := FieldType(-1).MarshalJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != `"Unknown"` {
-		t.Fatalf("MarshalJSON() = %s", data)
+	if err == nil || data != nil {
+		t.Fatalf("invalid type exported: %s / %v", data, err)
 	}
 }

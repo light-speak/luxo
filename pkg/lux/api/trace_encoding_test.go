@@ -15,6 +15,13 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/codec"
 )
 
+func TestDebugTraceRejectsOversizedSpanArray(t *testing.T) {
+	snapshot := DebugTraceSnapshot{TraceID: "test", Spans: make([]DebugSpan, codec.MaxArrayElements+1)}
+	if data, err := EncodeDebugTrace(snapshot); data != nil || !errors.Is(err, codec.ErrInvalidArrayCount) {
+		t.Fatal("oversized trace array", len(data), err)
+	}
+}
+
 func TestDebugTraceRejectsInvalidOptionalText(t *testing.T) {
 	snapshot := DebugTraceSnapshot{TraceID: "valid", Spans: []DebugSpan{{DebugSpanMeta: DebugSpanMeta{
 		Name: "service.call", Category: "service", Service: "bad\xff",
@@ -76,7 +83,7 @@ func TestDebugTraceFailureMergeAndSampling(t *testing.T) {
 	}
 	trace.record(DebugSpan{DebugSpanMeta: DebugSpanMeta{Name: "stage", Category: "service", Statement: "private\xff"}})
 	req := httptest.NewRequest(http.MethodPost, "/", nil).WithContext(ctx)
-	record := newTraceRecord(req, "ok", nil, time.Now(), time.Millisecond, nil)
+	record := newTraceRecord(req, "ok", nil, time.Now(), time.Millisecond, http.StatusOK)
 	if record.StatusCode != 200 || record.Spans != failedDebugTraceJSON {
 		t.Fatalf("sample changed business result: %+v", record)
 	}

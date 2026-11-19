@@ -73,19 +73,39 @@ func (a *Analyzer) validateEventPayload(root eventPayloadField, fields map[strin
 				"event payload '%s' has unsupported wire type '%s' / 事件载荷 '%s' 使用了不支持的传输类型 '%s'",
 				path, resolved.Name, path, resolved.Name)
 		}
-		if resolved.Kind != TypeCustom || visited[resolved.Name] {
+		if (resolved.Kind != TypeCustom && resolved.Kind != TypeSealed) || visited[resolved.Name] {
 			continue
 		}
 		visited[resolved.Name] = true
+		if resolved.Kind == TypeSealed {
+			pending = appendEventSealedFields(pending, resolved, index)
+			continue
+		}
 		for _, nested := range fields[resolved.Name] {
 			pending = append(pending, eventPayloadField{nested.Type, nested.Name, nested.Pos, index})
 		}
 	}
 }
 
+// Registered variants retain their parsed source pointer; normal registration cannot add a nil source.
+// Retain the guard for incomplete variant metadata.
+func appendEventSealedFields(pending []eventPayloadField, owner *ResolvedType, parent int) []eventPayloadField {
+	for _, variant := range owner.Variants {
+		if variant.source == nil {
+			continue
+		}
+		index := len(pending)
+		pending = append(pending, eventPayloadField{path: variant.Name, parent: parent})
+		for _, field := range variant.source.Fields {
+			pending = append(pending, eventPayloadField{field.Type, field.Name, field.Pos, index})
+		}
+	}
+	return pending
+}
+
 func isEventWireKind(kind TypeKind) bool {
 	switch kind {
-	case TypeInt, TypeFloat, TypeString, TypeBool, TypeDateTime, TypeDuration, TypeUUID, TypeDecimal, TypeBytes, TypeJSON, TypeCustom, TypeEnum:
+	case TypeInt, TypeFloat, TypeString, TypeBool, TypeDateTime, TypeDuration, TypeUUID, TypeDecimal, TypeBytes, TypeJSON, TypeCustom, TypeEnum, TypeSealed:
 		return true
 	default:
 		return false

@@ -27,6 +27,26 @@ func FuzzPrimaryKeysCompleteParent(f *testing.F) {
 		if ok != valid || ok && (got.count != want.count || !bytes.Equal(got.values, want.values)) {
 			t.Fatalf("key extraction disagrees with independent framing reader: ok=%v want=%v data=%x", ok, valid, data)
 		}
+		if columnar {
+			ids := ExtractIDColumn(data, 1, model)
+			if (ids != nil) != valid || valid && len(ids) != want.count {
+				t.Fatalf("Int column extraction disagrees with framing oracle: %x", data)
+			}
+			offset := 0
+			for _, id := range ids {
+				expected, size := binary.Varint(want.values[offset:])
+				if size <= 0 || id != expected {
+					t.Fatal("Int column value changed")
+				}
+				offset += size
+			}
+		} else {
+			id, ok := ExtractID(data, 1, map[int]codec.FieldSkipType{2: codec.SkipVarint})
+			expected, _ := binary.Varint(want.values)
+			if ok != valid || valid && id != expected {
+				t.Fatalf("Int row extraction disagrees with framing oracle: %x", data)
+			}
+		}
 	})
 }
 
@@ -46,6 +66,9 @@ func primaryKeysReference(data []byte, columnar bool) (BinaryKeys, bool) {
 		return BinaryKeys{}, false
 	}
 	offset += size
+	if arena > uint64(len(data)-offset) {
+		return BinaryKeys{}, false
+	}
 	var keys BinaryKeys
 	for offset < len(data) {
 		id, size := binary.Uvarint(data[offset:])

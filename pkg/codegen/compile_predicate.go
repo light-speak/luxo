@@ -1,10 +1,114 @@
 package codegen
 
 import (
+	"fmt"
+
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux/str"
+	"github.com/light-speak/luxo/pkg/token"
 	"strings"
 )
+
+func (c *compiler) modelTerminalFunctionModel(call *ast.CallExpr) (*ast.Ident, string) {
+	name, builtin := call.Func.(*ast.Ident)
+	if !builtin {
+		return nil, ""
+	}
+	resultType := inferred.ModelTerminalType(name.Name)
+	if resultType == "" || c.functions[name.Name] != nil {
+		return nil, ""
+	}
+	if len(call.Args) > 0 && call.Args[0] != nil && call.Args[0].Name == "" {
+		if model, ok := call.Args[0].Value.(*ast.Ident); ok && c.models[model.Name] != nil {
+			if _, local := c.vars[model.Name]; !local {
+				return model, resultType
+			}
+		}
+	}
+	position := call.Pos
+	panic(queryCompilerFailure(position, name.Name, " requires a positional model argument"))
+}
+
+func (c *compiler) validateBulkUpdate(model *ast.ModelDecl, arguments []*ast.NamedArg, position token.Position) {
+	for _, argument := range arguments {
+		var field inferred.MutationField
+		if model != nil && argument != nil && argument.Name != "where" {
+			if declaration := modelField(model, argument.Name); declaration != nil && declaration.Type != nil {
+				field = inferred.MutationField{TypeName: declaration.Type.Name, List: declaration.Type.IsList,
+					Nullable: declaration.Type.Nullable, Computed: declaration.Computed != nil,
+					Immutable: hasDirective(declaration.Directives, "immutable"), Relation: c.models[declaration.Type.Name] != nil}
+			}
+		}
+		_, message := inferred.MutationArgument(argument, field)
+		if message != "" {
+			if argument != nil && argument.Value != nil {
+				position = argument.Value.GetPos()
+			}
+			panic(queryCompilerFailure(position, "updateMany", message))
+		}
+	}
+}
+
+func (c *compiler) compileQueryWhere(b *strings.Builder, link chainLink) ast.Expr {
+	where, index, message := inferred.QueryWhere(link.args)
+	if message != "" {
+		position := token.Position{}
+		if link.expr != nil {
+			position = link.expr.GetPos()
+		}
+		if argument := link.args[index]; argument != nil && argument.Value != nil {
+			position = argument.Value.GetPos()
+		}
+		panic(queryCompilerFailure(position, link.method, message))
+	}
+	c.captureQueryReceiver(b, link.args)
+	return where
+}
+
+func (c *compiler) compileDeleteMany(b *strings.Builder, model string, link chainLink) {
+	where := c.compileQueryWhere(b, link)
+	c.compileBulkMutationBase(b, model, where)
+	if declaration := c.models[model]; declaration != nil && isSoftDelete(declaration) {
+		b.WriteString(".SoftDelete(ctx)")
+	} else {
+		b.WriteString(".Delete(ctx)")
+	}
+}
+
+func queryCompilerFailure(position token.Position, context, message string) *InternalCompilerError {
+	return &InternalCompilerError{Detail: fmt.Sprintf("%s:%d:%d: %s%s", position.File, position.Line, position.Col, context, message)}
+}
+
+func (c *compiler) checkModelQueryReceiver(call *ast.CallExpr) {
+	for {
+		member, ok := call.Func.(*ast.MemberExpr)
+		if !ok {
+			return
+		}
+		if !member.DeclaredField && inferred.RequiresModelQueryReceiver(member.Field) && c.isInstanceQueryReceiver(member.Object) {
+			message := fmt.Sprintf("query method %q requires a model type or query builder receiver", member.Field)
+			panic(queryCompilerFailure(member.Pos, "", message))
+		}
+		call, ok = member.Object.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+	}
+}
+
+func (c *compiler) isInstanceQueryReceiver(expression ast.Expr) bool {
+	if name, ok := expression.(*ast.Ident); ok {
+		if value, local := c.vars[name.Name]; local {
+			if c.queryAliasModel(name.Name) != "" {
+				return false
+			}
+			return value.isModel || c.models[name.Name] != nil
+		}
+		return false
+	}
+	return expression.IsModelType() && !expression.IsListType() && c.models[expression.GetTypeTag()] != nil
+}
 
 func (c *compiler) compileWhereBoolean(model string, expr ast.Expr, receiver string) string {
 	if field := c.whereBooleanField(model, expr, receiver); field != "" {
@@ -60,12 +164,13 @@ func findReturnsList(link chainLink) bool {
 
 func (c *compiler) compileFindChain(b *strings.Builder, model string, link chainLink) {
 	for _, argument := range link.args {
+		c.captureQueryReceiver(b, []*ast.NamedArg{argument})
 		switch argument.Name {
 		case "where":
 			appendFindCondition(b, model, c.compileWhereArg(model, argument.Value))
 		case "order":
 			seedFindBuilder(b, model)
-			c.compileOrderByChain(b, []*ast.NamedArg{argument})
+			c.compileOrderByChain(b, model, []*ast.NamedArg{argument})
 		case "limit", "offset":
 			seedFindBuilder(b, model)
 			c.compileModifierMethod(b, model, chainLink{method: argument.Name, args: []*ast.NamedArg{argument}}, 1, 2, false)
@@ -133,8 +238,7 @@ func wherePredicateField(expr ast.Expr, receiver string) string {
 func (c *compiler) compileWhereMembership(model, field string, expr *ast.BinaryExpr) string {
 	prefix := model + "Where." + str.Capitalize(field)
 	if bounds, ok := expr.Right.(*ast.RangeExpr); ok {
-		start := c.compileExpr(bounds.Start)
-		end := c.compileExpr(bounds.End)
+		start, end := c.compileRangeBounds(bounds)
 		return prefix + ".Between(" + start + ", " + end + ")"
 	}
 	name := expr.Left.GetTypeTag()

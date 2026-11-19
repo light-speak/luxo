@@ -2,11 +2,58 @@ package h2transport
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
+
+func TestRejectedHeadersPreserveNextStreamHPACKState(t *testing.T) {
+	for name, invalid := range map[string][]hpack.HeaderField{
+		"duplicate-method":  append([]hpack.HeaderField{{Name: ":method", Value: "GET"}}, requestFields()...),
+		"late-pseudo":       requestFields(hpack.HeaderField{Name: "x-extra", Value: "value"}, hpack.HeaderField{Name: ":path", Value: "/other"}),
+		"length-conflict":   requestFields(hpack.HeaderField{Name: "content-length", Value: "0"}, hpack.HeaderField{Name: "content-length", Value: "1"}),
+		"connection-header": requestFields(hpack.HeaderField{Name: "connection", Value: "close"}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var wire, block bytes.Buffer
+			encoder := hpack.NewEncoder(&block)
+			writer := http2.NewFramer(&wire, nil)
+			shared := hpack.HeaderField{Name: "x-retained", Value: "dynamic-entry-from-rejected-stream"}
+			for index, fields := range [][]hpack.HeaderField{append(invalid, shared), requestFields(shared)} {
+				block.Reset()
+				for _, field := range fields {
+					if err := encoder.WriteField(field); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := writer.WriteHeaders(http2.HeadersFrameParam{
+					StreamID: uint32(index*2 + 1), EndStream: true, EndHeaders: true, BlockFragment: block.Bytes(),
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reader := newRequestFramer(&wire)
+			frame, err := reader.ReadFrame()
+			if err == nil {
+				_, err = parseRequestHead(frame.(*http2.MetaHeadersFrame))
+			}
+			var streamErr http2.StreamError
+			if !errors.As(err, &streamErr) || streamErr.StreamID != 1 || streamErr.Code != http2.ErrCodeProtocol {
+				t.Fatalf("malformed headers did not fail only stream 1: %v", err)
+			}
+			frame, err = reader.ReadFrame()
+			if err != nil {
+				t.Fatal("rejected headers corrupted next stream", err)
+			}
+			head, err := parseRequestHead(frame.(*http2.MetaHeadersFrame))
+			if err != nil || len(head.fields) != 1 || head.fields[0] != shared {
+				t.Fatalf("next stream lost shared HPACK entry: %+v err=%v", head, err)
+			}
+		})
+	}
+}
 
 func requestFields(extra ...hpack.HeaderField) []hpack.HeaderField {
 	return append([]hpack.HeaderField{{Name: ":method", Value: "POST"}, {Name: ":scheme", Value: "http"}, {Name: ":authority", Value: "localhost"}, {Name: ":path", Value: "/?debug=1"}}, extra...)

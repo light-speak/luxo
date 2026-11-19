@@ -13,13 +13,13 @@ import (
 
 // The fixture replaces only deployment startup. Proxy bodies and their imports
 // come from the real gateway generator, never a handwritten transport copy.
-func fixtureGatewayProxies(source []byte) ([]byte, error) {
+func fixtureGatewayProxies(source []byte, roots ...string) ([]byte, error) {
 	positions := token.NewFileSet()
 	file, err := parser.ParseFile(positions, "gateway/main.gen.go", source, parser.AllErrors)
 	if err != nil {
 		return nil, err
 	}
-	functions, err := fixtureProxyFunctions(file.Decls)
+	functions, err := fixtureProxyFunctions(file.Decls, roots...)
 	if err != nil {
 		return nil, err
 	}
@@ -33,16 +33,25 @@ func fixtureGatewayProxies(source []byte) ([]byte, error) {
 	return output.Bytes(), nil
 }
 
-func fixtureProxyFunctions(declarations []ast.Decl) ([]ast.Decl, error) {
-	functions := make(map[string]*ast.FuncDecl)
+func fixtureProxyFunctions(declarations []ast.Decl, roots ...string) ([]ast.Decl, error) {
+	dependencies := make(map[string]ast.Node)
 	for _, declaration := range declarations {
 		if function, ok := declaration.(*ast.FuncDecl); ok {
-			functions[function.Name.Name] = function
+			dependencies[function.Name.Name] = function
+		}
+		if group, ok := declaration.(*ast.GenDecl); ok && group.Tok == token.TYPE {
+			for _, spec := range group.Specs {
+				definition := spec.(*ast.TypeSpec)
+				dependencies[definition.Name.Name] = definition
+			}
 		}
 	}
-	queue := []string{"proxyHandler", "rpcStreamProxy"}
+	if len(roots) == 0 {
+		roots = []string{"proxyHandler", "rpcStreamProxy"}
+	}
+	queue := append([]string(nil), roots...)
 	for _, name := range queue {
-		if functions[name] == nil {
+		if _, ok := dependencies[name].(*ast.FuncDecl); !ok {
 			return nil, fmt.Errorf("gateway generator omitted fixture proxy: %s", name)
 		}
 	}
@@ -54,22 +63,36 @@ func fixtureProxyFunctions(declarations []ast.Decl) ([]ast.Decl, error) {
 			continue
 		}
 		selected[name] = true
-		ast.Inspect(functions[name], func(node ast.Node) bool {
-			if call, ok := node.(*ast.CallExpr); ok {
-				if identifier, ok := call.Fun.(*ast.Ident); ok && functions[identifier.Name] != nil {
-					queue = append(queue, identifier.Name)
-				}
+		ast.Inspect(dependencies[name], func(node ast.Node) bool {
+			if identifier, ok := node.(*ast.Ident); ok && dependencies[identifier.Name] != nil {
+				queue = append(queue, identifier.Name)
 			}
 			return true
 		})
 	}
+	return fixtureProxyDeclarations(declarations, selected), nil
+}
+
+func fixtureProxyDeclarations(declarations []ast.Decl, selected map[string]bool) []ast.Decl {
 	var result []ast.Decl
 	for _, declaration := range declarations {
 		if function, ok := declaration.(*ast.FuncDecl); ok && selected[function.Name.Name] {
 			result = append(result, declaration)
 		}
+		if group, ok := declaration.(*ast.GenDecl); ok && group.Tok == token.TYPE {
+			owned := *group
+			owned.Specs = nil
+			for _, spec := range group.Specs {
+				if selected[spec.(*ast.TypeSpec).Name.Name] {
+					owned.Specs = append(owned.Specs, spec)
+				}
+			}
+			if len(owned.Specs) != 0 {
+				result = append(result, &owned)
+			}
+		}
 	}
-	return result, nil
+	return result
 }
 
 func fixtureProxyImports(imports []*ast.ImportSpec, declarations []ast.Decl) *ast.GenDecl {

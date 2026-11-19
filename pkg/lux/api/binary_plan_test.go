@@ -135,3 +135,23 @@ func TestBinaryParamLookupCollisions(t *testing.T) {
 		}
 	}
 }
+
+func TestBinaryParamLookupExtendedSparseIDs(t *testing.T) {
+	for _, count := range []int{17, 65} {
+		params := make([]ParamMeta, count)
+		for i := range params {
+			params[i].FieldID = 2147483647 - i*1009
+		}
+		lookup := newBinaryParamLookup(params)
+		for i, param := range params {
+			if got := lookup.find(param.FieldID); got != i {
+				t.Fatalf("id=%d index=%d want=%d", param.FieldID, got, i)
+			}
+		}
+		for _, missing := range []int{-1, 0, 1, 2147483646} {
+			if lookup.find(missing) != -1 {
+				t.Fatal("unknown ID matched", missing)
+			}
+		}
+	}
+}

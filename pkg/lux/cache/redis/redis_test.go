@@ -6,6 +6,9 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 )
 
 func skipNoRedis(t testing.TB) *RedisCache {
@@ -30,6 +33,54 @@ func skipNoRedis(t testing.TB) *RedisCache {
 		}
 	})
 	return c
+}
+
+func TestRedisCache_EmptyStoredValue(t *testing.T) {
+	c := skipNoRedis(t)
+	for _, value := range [][]byte{nil, {}, {0}} {
+		if err := c.Set(t.Context(), "stored", value, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		got, err := c.Get(t.Context(), "stored")
+		if err != nil || got == nil || len(got) != len(value) {
+			t.Fatal("stored empty/zero value changed", got, err)
+		}
+		if len(value) > 0 && got[0] != value[0] {
+			t.Fatal("zero byte changed", got)
+		}
+	}
+	if missing, err := c.Get(t.Context(), "missing"); err != nil || missing != nil {
+		t.Fatal("missing key changed", missing, err)
+	}
+}
+
+func TestRedisCache_VoidResponseHits(t *testing.T) {
+	c := skipNoRedis(t)
+	binding, err := api.NewResponseCache(c, api.CacheNamespace{Project: "test", Environment: "test", Service: "void", Revision: "r"}, api.ResponseOriginOptions{MaxConcurrent: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := api.NewRouterWithOptions(api.RouterOptions{ResponseCache: binding})
+	if err := router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "cached", CacheDependencies: &schema.CacheDependencies{}, CachePolicy: &schema.CachePolicy{Mode: "ttl", TTL: time.Minute, Scope: "private"}}); err != nil {
+		t.Fatal(err)
+	}
+	router.RequireCache("cached")
+	calls := 0
+	router.Handle("cached", func(ctx context.Context, req *api.Request) error {
+		return api.CacheResponsePolicy(ctx, req, "", func() error { calls++; return nil })
+	})
+	if err := router.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	handler := router.ExportHandlers()["cached"]
+	for range 2 {
+		if err := handler(t.Context(), &api.Request{API: "cached", Buf: &api.ResponseBuf{}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 1 {
+		t.Fatal("Redis could not cache a legitimate empty Void response", calls)
+	}
 }
 
 func TestRedisCache_SetGet(t *testing.T) {

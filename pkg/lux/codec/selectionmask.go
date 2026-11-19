@@ -43,7 +43,7 @@ func checkedSelectionChildren(fields []byte, children []SelectionMaskChild) ([]S
 		if !FieldMaskHas(fields, child.FieldID) || len(child.Mask) == 0 {
 			return nil, ErrInvalidSelectionMask
 		}
-		if _, _, ok := SplitSelectionMask(child.Mask); !ok {
+		if _, _, ok := splitSelectionMask(child.Mask, 1); !ok {
 			return nil, ErrInvalidSelectionMask
 		}
 		if child.FieldID <= previous {
@@ -65,8 +65,12 @@ func checkedSelectionChildren(fields []byte, children []SelectionMaskChild) ([]S
 }
 
 // SplitSelectionMask returns the current node's bitmap and encoded child area.
-// An empty mask means select all. Malformed nodes return ok=false.
+// An empty mask means select all. Malformed or over-depth nodes return ok=false.
 func SplitSelectionMask(mask []byte) (fields, children []byte, ok bool) {
+	return splitSelectionMask(mask, 0)
+}
+
+func splitSelectionMask(mask []byte, depth int) (fields, children []byte, ok bool) {
 	if len(mask) == 0 {
 		return nil, nil, true
 	}
@@ -76,15 +80,18 @@ func SplitSelectionMask(mask []byte) (fields, children []byte, ok bool) {
 	}
 	end := n + int(fieldLen)
 	fields = mask[n:end]
-	if !validSelectionBitmap(fields) || !validSelectionChildren(mask[end:]) {
+	if !validSelectionBitmap(fields) || !validSelectionChildren(mask[end:], depth) {
 		return nil, nil, false
 	}
 	return fields, mask[end:], true
 }
 
-func validSelectionChildren(children []byte) bool {
+func validSelectionChildren(children []byte, depth int) bool {
 	previousID := uint64(0)
 	for off := 0; off < len(children); {
+		if depth >= MaxSelectionDepth-1 {
+			return false
+		}
 		fieldID, n := ReadVarint(children, off)
 		if n <= 0 || fieldID == 0 || fieldID > MaxSelectionFieldID || fieldID <= previousID {
 			return false
@@ -96,7 +103,7 @@ func validSelectionChildren(children []byte) bool {
 		}
 		off += n
 		end := off + int(length)
-		if _, _, ok := SplitSelectionMask(children[off:end]); !ok {
+		if _, _, ok := splitSelectionMask(children[off:end], depth+1); !ok {
 			return false
 		}
 		off = end

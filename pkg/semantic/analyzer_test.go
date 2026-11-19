@@ -71,6 +71,27 @@ func TestFunctionIndexIsBuiltOnlyForDeclaredCalls(t *testing.T) {
 	}
 }
 
+func TestRejectedTypeTrackingIsLazyAndReused(t *testing.T) {
+	a := New()
+	valid := parseFileWithName(t, `model Entry { keep: Int } interface Label { keep: Int } type Packet { keep: Int }`, "valid.luxo")
+	a.collectDeclarations(valid)
+	if a.rejectedTypeDeclarations != nil {
+		t.Fatal("valid declarations allocated a rejection index")
+	}
+	duplicates := parseFileWithName(t, `model Entry { bad: String } interface Label { bad: String } type Packet { bad: String }`, "duplicates.luxo")
+	a.collectDeclarations(duplicates)
+	if len(a.rejectedTypeDeclarations) != 3 {
+		t.Fatalf("expected three rejected declarations in the same index: %v", a.rejectedTypeDeclarations)
+	}
+	a.resolveFields(valid)
+	a.resolveFields(duplicates)
+	for _, name := range []string{"Entry", "Label", "Packet"} {
+		if a.types[name].Fields["keep"] == nil || a.types[name].Fields["bad"] != nil {
+			t.Fatal("rejected declaration changed accepted fields", name)
+		}
+	}
+}
+
 func TestFunctionArgumentTypeCheckDoesNotAllocate(t *testing.T) {
 	a := New()
 	argument := &ast.NamedArg{Value: &ast.Ident{Name: "value"}}
@@ -98,9 +119,9 @@ func TestLazyFunctionIndexPreservesAcceptedDeclarations(t *testing.T) {
 	a.files = []*ast.File{file}
 	a.collectDeclarations(file)
 	a.checkDeclaredFunctionCall(&ast.CallExpr{Func: &ast.Ident{Name: "helper"}}, nil)
-	a.checkDeclaredFunctionCall(&ast.CallExpr{Func: &ast.Ident{Name: "endpoint"}}, nil)
-	if a.functions["helper"] != first || a.functions["endpoint"] != nil || len(a.errors) != 0 {
-		t.Fatalf("index must only retain accepted function declarations: %v", a.errors)
+	a.checkDeclaredFunctionCall(&ast.CallExpr{Func: &ast.Ident{Name: "endpoint"}, Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "1"}}}}, []*ResolvedType{a.types["Int"]})
+	if a.functions["helper"] != first || a.functions["endpoint"] != shadowed || len(a.errors) != 0 {
+		t.Fatalf("index must retain the first fn and resolve local calls independently of API names: %v", a.errors)
 	}
 }
 
@@ -127,7 +148,7 @@ func TestFunctionCallWithLargeParameterList(t *testing.T) {
 func TestFunctionArgumentComplexTypeResolution(t *testing.T) {
 	for _, ref := range []*ast.TypeRef{
 		nil,
-		{Name: "Result", TypeArgs: []*ast.TypeRef{{Name: "Int"}}},
+		{Name: "Channel", TypeArgs: []*ast.TypeRef{{Name: "Int"}}},
 		{Tuple: []*ast.TypeRef{{Name: "Int"}, {Name: "String"}}},
 	} {
 		a := New()
@@ -612,7 +633,7 @@ api test(id: Int): User {
 func TestCRUDUpdateReturnType(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
-api test(id: Int): User {
+api test(id: Int): Int {
   val user = User.find(id: id)
   val updated = user.update(name: "new")
   updated
@@ -739,7 +760,7 @@ func TestCRUDItDisambiguation(t *testing.T) {
 	result := analyze(t, `
 model Room { roomId: Int  name: String }
 api test(roomId: Int): Room {
-  val room = Room.find(where: it.roomId == roomId).firstOrNull
+  val room = Room.findFirst(where: it.roomId == roomId)
     ?: throw error.not_found
   room
 }
@@ -751,7 +772,7 @@ func TestCRUDItNoAmbiguity(t *testing.T) {
 	result := analyze(t, `
 model User { name: String  email: String }
 api test(input: String): User {
-  val user = User.find(where: email == input).firstOrNull
+  val user = User.findFirst(where: email == input)
     ?: throw error.not_found
   user
 }
@@ -1178,7 +1199,7 @@ func TestCollectAmbiguousIdentsDifferentNames(t *testing.T) {
 	result := analyze(t, `
 model User { userId: Int  name: String }
 api test(id: Int): User {
-  val user = User.find(where: userId == id).firstOrNull
+  val user = User.findFirst(where: userId == id)
     ?: throw error.not_found
   user
 }
@@ -1198,7 +1219,7 @@ func TestCheckBinaryAmbiguityDisambiguated(t *testing.T) {
 	result := analyze(t, `
 model User { email: String  name: String }
 api test(email: String): User {
-  val user = User.find(where: it.email == email).firstOrNull
+  val user = User.findFirst(where: it.email == email)
     ?: throw error.not_found
   user
 }
@@ -1608,9 +1629,9 @@ func TestCheckBodiesListenerWithBody(t *testing.T) {
 	result := analyze(t, `
 event OrderPlaced(orderId: Int, userId: Int)
 on OrderPlaced {
-  orderId, userId ->
-  val x = orderId
-  val y = userId
+  payload ->
+  val x = payload.orderId
+  val y = payload.userId
 }
 `)
 	expectNoErrors(t, result)
@@ -1882,6 +1903,8 @@ api test(): Int {
 func TestWithAuthDirective(t *testing.T) {
 	result := analyze(t, `
 model User @withAuth(stores: [id, role]) {
+  id: Int @id
+  role: String
   name: String
   email: String
 }
@@ -1911,6 +1934,8 @@ model User @withAuth(stores: [id, role]) {
 func TestWithAuthDirectiveRefreshTokenDoc(t *testing.T) {
 	result := analyze(t, `
 model User @withAuth(stores: [id, role]) {
+  id: Int @id
+  role: String
   name: String
   email: String
 }
@@ -2120,6 +2145,8 @@ func TestMethodWithCallOK(t *testing.T) {
 	// user.createToken() with () should be fine
 	result := analyze(t, `
 model User @withAuth(stores: [id, role]) {
+  id: Int @id
+  role: String
   name: String
   email: String
 }
@@ -2226,6 +2253,8 @@ func TestWithAuthIsMethodFlag(t *testing.T) {
 	// verify that IsMethod flag is set on injected auth methods
 	result := analyze(t, `
 model User @withAuth(stores: [id, role]) {
+  id: Int @id
+  role: String
   name: String
   email: String
 }
@@ -3227,7 +3256,7 @@ func TestResolveQueryMethodCRUDChain(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.method, func(t *testing.T) {
-			got := a.resolveQueryMethod(tt.method, orderType)
+			got := a.resolveQueryMethod(tt.method, orderType, nil, nil)
 			if tt.wantNil {
 				if got != nil {
 					t.Errorf("resolveQueryMethod(%q) = %v, want nil", tt.method, got)
@@ -4056,4 +4085,97 @@ on UserCreated {
 }
 `)
 	expectNoErrors(t, result)
+}
+
+func TestPasswordVerificationArguments(t *testing.T) {
+	for _, method := range []string{"verify", "verifyPassword"} {
+		for _, sample := range []struct{ args, diagnostic string }{
+			{`"secret"`, ""}, {`plain: "secret"`, ""},
+			{``, "missing required argument 'plain'"},
+			{`1`, "expects 'String'"}, {`null`, "expects 'String'"},
+			{`"one", "two"`, "expects at most 1"},
+			{`password: "secret"`, "unknown argument 'password'"},
+			{`plain: "one", plain: "two"`, "duplicate argument 'plain'"},
+		} {
+			t.Run(method+"("+sample.args+")", func(t *testing.T) {
+				result := analyze(t, `model User @withAuth(stores: [id]) { id: Int @id password: String @hash }
+fn check(user: User): Boolean { return user.`+method+`(`+sample.args+`) }`)
+				if sample.diagnostic == "" {
+					expectNoErrors(t, result)
+				} else {
+					expectError(t, result, sample.diagnostic)
+				}
+			})
+		}
+	}
+}
+
+func TestHashVerificationFieldContract(t *testing.T) {
+	for _, sample := range []struct{ name, source, diagnostic string }{
+		{"named", `model User { id: Int @id secret: String @hash } fn check(u: User): Boolean { return u.verifySecret(plain: "ok") }`, ""},
+		{"wrong-name", `model User { id: Int @id secret: String @hash } fn check(u: User): Boolean { return u.verifyPassword("ok") }`, "verifyPassword"},
+		{"wrong-argument", `model User { id: Int @id secret: String @hash } fn check(u: User): Boolean { return u.verifySecret(1) }`, "expects 'String'"},
+		{"multiple-explicit", `model User { id: Int @id secret: String @hash password: String @hash } fn check(u: User): Boolean { return u.verifySecret("ok") && u.verifyPassword("ok") }`, ""},
+		{"single-short", `model User @withAuth(stores: [id]) { id: Int @id secret: String @hash } fn check(u: User): Boolean { return u.verify("ok") }`, ""},
+		{"no-hash", `model User @withAuth(stores: [id]) { id: Int @id } fn check(u: User): Boolean { return u.verify("ok") }`, "exactly one @hash field"},
+		{"ambiguous", `model User @withAuth(stores: [id]) { id: Int @id secret: String @hash password: String @hash } fn check(u: User): Boolean { return u.verify("ok") }`, "exactly one @hash field"},
+		{"inherited", `model User: Base @withAuth(stores: [id]) { label: String } model Base { id: Int @id secret: String @hash } fn check(u: User): Boolean { return u.verifySecret("ok") && u.verify("ok") }`, ""},
+		{"collision", `model User { id: Int @id secret: String @hash verifySecret: Boolean }`, "conflicts with @hash"},
+		{"inherited-collision", `model User: Base { secret: String @hash } model Base { id: Int @id verifySecret: Boolean }`, "conflicts with @hash"},
+		{"shadowed-hash", `model Base { id: Int @id secret: String @hash } model User: Base { secret: String } fn check(u: User): Boolean { return u.verifySecret("ok") }`, "no matching @hash field"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			result := analyze(t, sample.source)
+			if sample.diagnostic == "" {
+				expectNoErrors(t, result)
+			} else {
+				expectError(t, result, sample.diagnostic)
+			}
+		})
+	}
+}
+
+func TestInstanceMutationReturnTypes(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		source  string
+		invalid bool
+	}{
+		{"delete", "fn remove(user: User): Int { return user.delete() }", false},
+		{"update", "fn rename(user: User): Int { return user.update(name: \"new\") }", false},
+		{"local", "fn remove(user: User): Int { val target = user return target.delete() }", false},
+		{"nullableDelete", "fn remove(user: User?): Int? { return user?.delete() }", false},
+		{"nullableUpdate", "fn rename(user: User?): Int? { return user?.update(name: \"new\") }", false},
+		{"rejectModel", "fn remove(user: User): User { return user.delete() }", true},
+		{"rejectNullableModel", "fn rename(user: User?): User? { return user?.update(name: \"new\") }", true},
+		{"rejectUnsafeNull", "fn remove(user: User?): Int { return user.delete() }", true},
+		{"modelDelete", "fn remove(): User { return User.delete(id: 1) }", false},
+		{"modelUpdate", "fn rename(): User { return User.update(id: 1, name: \"new\") }", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := analyze(t, "model User @noTime { id: Int @id name: String }\n"+test.source)
+			if (len(result.Errors) != 0) != test.invalid {
+				t.Fatalf("invalid=%v, errors=%v", test.invalid, result.Errors)
+			}
+		})
+	}
+}
+
+func TestStringNumericConversionRequiresPropagation(t *testing.T) {
+	for _, method := range []string{"toInt", "toFloat"} {
+		kind := "Int"
+		if method == "toFloat" {
+			kind = "Float"
+		}
+		for _, propagate := range []bool{false, true} {
+			suffix := ""
+			if propagate {
+				suffix = "?"
+			}
+			result := analyze(t, "fn parse(value: String): "+kind+" { return value."+method+"()"+suffix+" }")
+			if (len(result.Errors) == 0) != propagate {
+				t.Errorf("%s%s: %v", method, suffix, result.Errors)
+			}
+		}
+	}
 }

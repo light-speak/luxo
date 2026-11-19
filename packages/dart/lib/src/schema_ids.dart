@@ -37,6 +37,7 @@ Map<String, APISchemaEntry> snapshotAPISchema(
         _snapshotParams(entry.params, name),
         snapshots.fields(entry.fields, 'API $name'),
         snapshots.types(entry.types),
+        snapshots.response(entry.response),
       );
       _selectionSnapshots[copy] = true;
       return MapEntry(name, copy);
@@ -46,6 +47,7 @@ Map<String, APISchemaEntry> snapshotAPISchema(
 
 List<ParamSchema> _snapshotParams(List<ParamSchema> params, String api) {
   final seen = <int>{};
+  final names = params.length > 1 ? <String>{} : null;
   final owner = 'API $api parameter';
   return List.unmodifiable(
     params.map((param) {
@@ -58,6 +60,9 @@ List<ParamSchema> _snapshotParams(List<ParamSchema> params, String api) {
         param.typeName,
       );
       checkSchemaID(copy.fieldID, maxParamID, seen, owner, copy.name);
+      if (names != null && !names.add(copy.name)) {
+        throw FormatException('$owner: duplicate name ${copy.name}');
+      }
       return copy;
     }),
   );
@@ -66,6 +71,20 @@ List<ParamSchema> _snapshotParams(List<ParamSchema> params, String api) {
 final class _SchemaSnapshots {
   final _fieldCopies = Map<_Fields, _Fields>.identity();
   final _typeCopies = Map<_Types, _Types>.identity();
+
+  JSONResponseSchema? response(JSONResponseSchema? value) {
+    if (value == null) return null;
+    final directory = types(value.types);
+    if (value.modelType != null && !directory.containsKey(value.modelType)) {
+      throw FormatException('missing JSON model schema: ${value.modelType}');
+    }
+    return JSONResponseSchema(
+      modelType: value.modelType,
+      types: directory,
+      isList: value.isList,
+      paginated: value.paginated,
+    );
+  }
 
   _Fields fields(_Fields fields, String owner) {
     final cached = _fieldCopies[fields];

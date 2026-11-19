@@ -115,7 +115,7 @@ func TestMerge_WithExtend(t *testing.T) {
 
 	// Extend: posts data (already encoded, without fieldID prefix)
 	var postsData []byte
-	postsData = codec.AppendArrayHeader(postsData, 2) // count = 2
+	postsData = codec.AppendVarint(postsData, uint64(2)) // count = 2
 	// Post 1: [arenaHeader][field1=1][0x00]
 	postsData = codec.AppendVarint(postsData, 0) // arena
 	postsData = codec.AppendVarint(postsData, 1) // field 1
@@ -1222,7 +1222,7 @@ func TestSkipNestedRowFieldHandlesSchemaAndWireFailures(t *testing.T) {
 	if skipNestedRowField(codec.NewDecoder(nil), list, registry, 1) {
 		t.Fatal("truncated nested list header was accepted")
 	}
-	row := codec.AppendArrayHeader(nil, 1)
+	row := codec.AppendVarint(nil, uint64(1))
 	row = codec.AppendVarint(row, 0)
 	row = codec.AppendVarint(row, 1)
 	row = codec.AppendSvarint(row, 42)
@@ -1230,7 +1230,7 @@ func TestSkipNestedRowFieldHandlesSchemaAndWireFailures(t *testing.T) {
 	if !skipNestedRowField(codec.NewDecoder(codec.AppendBytes(nil, row)), list, registry, 1) {
 		t.Fatal("valid nested list was not skipped")
 	}
-	unknownField := codec.AppendArrayHeader(nil, 1)
+	unknownField := codec.AppendVarint(nil, uint64(1))
 	unknownField = codec.AppendVarint(unknownField, 0)
 	unknownField = codec.AppendVarint(unknownField, 2)
 	unknownField = codec.AppendSvarint(unknownField, 42)
@@ -1317,5 +1317,101 @@ func TestExtractPrimaryKeyColumnRejectsInvalidInputs(t *testing.T) {
 	truncated := []byte{1, 0, 2}
 	if _, ok := ExtractPrimaryKeyColumn(truncated, keyField, model); ok {
 		t.Fatal("truncated column was accepted")
+	}
+}
+
+func TestExtractPrimaryKeyPage(t *testing.T) {
+	model := &schema.Model{Name: "Item", Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt, PrimaryKey: true}}}
+	registry := schema.New()
+	if err := registry.RegisterModel(model); err != nil {
+		t.Fatal(err)
+	}
+	model = registry.Models[model.Name]
+	key := model.PrimaryKeyField()
+	for _, empty := range []bool{false, true} {
+		columns := []byte{1, 0, 1, 84, 0}
+		if empty {
+			columns = []byte{0, 0, 0}
+		}
+		metadata := codec.AppendSvarint(nil, 44)
+		metadata = codec.AppendSvarint(metadata, 3)
+		metadata = codec.AppendSvarint(metadata, 10)
+		page := append(bytes.Clone(columns), metadata...)
+		keys, end, ok := ExtractPrimaryKeyPage(page, key, model)
+		if !ok || end != len(columns) || keys.Len() != map[bool]int{true: 0, false: 1}[empty] {
+			t.Fatalf("page empty=%v: keys=%v end=%d valid=%v", empty, keys, end, ok)
+		}
+		if _, ok := ExtractPrimaryKeyColumn(page, key, model); ok {
+			t.Fatal("ordinary list accepted pagination trailer")
+		}
+		for cut := range len(metadata) {
+			if _, _, ok := ExtractPrimaryKeyPage(page[:len(columns)+cut], key, model); ok {
+				t.Fatal("truncated metadata accepted")
+			}
+		}
+		if _, _, ok := ExtractPrimaryKeyPage(append(page, 0), key, model); ok {
+			t.Fatal("trailing data accepted")
+		}
+	}
+	for _, invalid := range [][]byte{nil, {1}, {1, 0, 2, 84, 0, 0, 2, 20}, {1, 0, 1, 84, 1, 86, 0, 0, 2, 20}, {0, 0, 1, 1, 0, 0, 2, 20}} {
+		if _, _, ok := ExtractPrimaryKeyPage(invalid, key, model); ok {
+			t.Fatalf("invalid page accepted: %x", invalid)
+		}
+	}
+}
+
+func TestAppendMergedSelectedKeyPositions(t *testing.T) {
+	registry := schema.New()
+	if err := registry.RegisterModel(&schema.Model{Name: "Item", Fields: []schema.Field{
+		{ID: 1, Name: "id", Type: schema.FieldInt, PrimaryKey: true},
+		{ID: 2, Name: "count", Type: schema.FieldInt},
+		{ID: 3, Name: "active", Type: schema.FieldBool},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	model := registry.Models["Item"]
+	for _, list := range []bool{false, true} {
+		for _, position := range []int{0, 1, 2} {
+			header := []byte{0}
+			if list {
+				header = []byte{1, 0}
+			}
+			primary := bytes.Clone(header)
+			fields := [][]byte{{2, 14}, {3, 1}}
+			for i := 0; i < 3; i++ {
+				if i == position {
+					primary = append(primary, 1, 84)
+					continue
+				}
+				primary = append(primary, fields[0]...)
+				fields = fields[1:]
+			}
+			primary = append(primary, 0)
+			original := bytes.Clone(primary)
+			var keys BinaryKeys
+			var ok bool
+			if list {
+				keys, ok = ExtractPrimaryKeyColumn(primary, model.PrimaryKeyField(), model)
+			} else {
+				keys, ok = ExtractPrimaryKeys(primary, model.PrimaryKeyField(), model, registry)
+			}
+			if !ok {
+				t.Fatal("invalid fixture")
+			}
+			expected := append(append([]byte{0x77}, header...), 2, 14, 3, 1, 0)
+			actual := AppendMergedSelected([]byte{0x77}, primary, nil, keys, false)
+			if !bytes.Equal(actual, expected) {
+				t.Fatalf("list=%v position=%d: %x != %x", list, position, actual, expected)
+			}
+			if !bytes.Equal(primary, original) {
+				t.Fatal("mutated borrowed response")
+			}
+			if !bytes.Equal(AppendMergedSelected(nil, primary, nil, keys, true), primary) {
+				t.Fatal("selected key omitted")
+			}
+		}
+	}
+	if got := AppendMergedSelected(nil, []byte{0, 0, 0}, nil, BinaryKeys{}, false); !bytes.Equal(got, []byte{0, 0, 0}) {
+		t.Fatal("empty list changed")
 	}
 }

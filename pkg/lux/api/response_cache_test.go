@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"strings"
@@ -45,6 +46,11 @@ func testCacheRoute(t testing.TB, backend cache.Cache, service, name string) *ca
 	return rt.cacheBindings[name]
 }
 
+func writeCacheTestZero(req *Request) error {
+	req.Buf.B = codec.AppendSvarint(req.Buf.B, 0)
+	return nil
+}
+
 type observedResponseCache struct {
 	cache.Nop
 	gets, sets int
@@ -68,7 +74,7 @@ func TestResponseCacheRequiresPreparedRoute(t *testing.T) {
 			rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "cached", ReturnType: "Int", CachePolicy: testPrivateCachePolicy(time.Minute), CacheDependencies: &schema.CacheDependencies{}})
 			calls := 0
 			rt.Handle("cached", func(ctx context.Context, req *Request) error {
-				return CacheResponsePolicy(ctx, req, "", func() error { calls++; return nil })
+				return CacheResponsePolicy(ctx, req, "", func() error { calls++; return writeCacheTestZero(req) })
 			})
 			if state != "undeclared" {
 				rt.RequireCache("cached")
@@ -112,7 +118,7 @@ func TestResponseCachePreparationRetryAndReplacedHandler(t *testing.T) {
 	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "cached", ReturnType: "Int", CachePolicy: testPrivateCachePolicy(time.Minute), CacheDependencies: &schema.CacheDependencies{}})
 	rt.RequireCache("cached")
 	handler := func(ctx context.Context, req *Request) error {
-		return CacheResponsePolicy(ctx, req, "", func() error { return nil })
+		return CacheResponsePolicy(ctx, req, "", func() error { return writeCacheTestZero(req) })
 	}
 	rt.Handle("cached", handler)
 	old := rt.ExportHandlers()["cached"]
@@ -145,7 +151,7 @@ func TestResponseCacheConcurrentPreparationPublication(t *testing.T) {
 	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "cached", ReturnType: "Int", CachePolicy: testPrivateCachePolicy(time.Minute), CacheDependencies: &schema.CacheDependencies{}})
 	rt.RequireCache("cached")
 	rt.Handle("cached", func(ctx context.Context, req *Request) error {
-		return CacheResponsePolicy(ctx, req, "", func() error { return nil })
+		return CacheResponsePolicy(ctx, req, "", func() error { return writeCacheTestZero(req) })
 	})
 	handler := rt.ExportHandlers()["cached"]
 	var workers sync.WaitGroup
@@ -235,6 +241,64 @@ func TestResponseCacheNamespaceIsolation(t *testing.T) {
 		if calls != 1 {
 			t.Fatalf("scope %d executed %d times", i, calls)
 		}
+	}
+}
+
+func TestResponseCacheFailedFillDoesNotPublishPartialData(t *testing.T) {
+	backend := cache.NewMemory()
+	t.Cleanup(func() { _ = backend.Close() })
+	route := testCacheRoute(t, backend, "test", "cached")
+	req := &Request{API: "cached", Buf: &ResponseBuf{}, responseCache: route}
+	failure := errors.New("origin failed after writing a partial response")
+	err := CacheResponsePolicy(t.Context(), req, "verified-user", func() error {
+		req.Buf.B = append(req.Buf.B, "partial"...)
+		return failure
+	})
+	if !errors.Is(err, failure) || backend.Len() != 0 {
+		t.Fatalf("failed fill published a response: err=%v entries=%d", err, backend.Len())
+	}
+	calls := 0
+	for range 2 {
+		req.Buf.B = req.Buf.B[:0]
+		err = CacheResponsePolicy(t.Context(), req, "verified-user", func() error {
+			calls++
+			req.Buf.B = append(req.Buf.B, "complete"...)
+			return nil
+		})
+		if err != nil || string(req.Buf.B) != "complete" {
+			t.Fatalf("retry returned partial cached data: %q, %v", req.Buf.B, err)
+		}
+	}
+	if calls != 1 || backend.Len() != 1 {
+		t.Fatalf("successful retry was not cached: calls=%d entries=%d", calls, backend.Len())
+	}
+}
+
+func TestResponseCacheConcurrentIdentitiesOwnTheirBuffers(t *testing.T) {
+	backend := cache.NewMemory()
+	t.Cleanup(func() { _ = backend.Close() })
+	route := testCacheRoute(t, backend, "test", "cached")
+	for worker := range 8 {
+		t.Run(fmt.Sprintf("identity-%d", worker), func(t *testing.T) {
+			t.Parallel()
+			req := &Request{API: "cached", Buf: &ResponseBuf{B: make([]byte, 0, 64)}, responseCache: route}
+			want := codec.AppendSvarint(nil, int64(worker+1))
+			calls := 0
+			for round := range 3 {
+				prefix := []byte{0xfa, byte(round)}
+				req.Buf.B = append(req.Buf.B[:0], prefix...)
+				err := CacheResponsePolicy(t.Context(), req, t.Name(), func() error {
+					calls++
+					req.Buf.B = append(req.Buf.B, want...)
+					return nil
+				})
+				if err != nil || !bytes.Equal(req.Buf.B, append(prefix, want...)) || calls != 1 {
+					t.Fatalf("round %d reused mutable or foreign data: body=%x calls=%d err=%v", round, req.Buf.B, calls, err)
+				}
+				// Reuse storage after both a fill and a hit, as pooled responses do.
+				clear(req.Buf.B)
+			}
+		})
 	}
 }
 

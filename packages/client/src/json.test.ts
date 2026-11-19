@@ -3,9 +3,181 @@ import { readFileSync } from 'node:fs'
 import { decodeLuxoJSON, encodeLuxoJSON, int64FromJSON, floatFromJSON, stringFromJSON, booleanFromJSON, normalizeLuxoJSON, jsonNumber, isJSONNumber } from './json'
 import { decodeJSONValue, Encoder } from './codec'
 import { decodeBinaryError, jsonResponseError } from './error-codec'
-import { decodeJSONEnvelope } from './json'
+import { decodeBoundedLuxoJSON, decodeJSONEnvelope } from './json'
+import { encodeJSONParam, encodeParam } from './transport'
+import { Decoder } from './codec'
 
 describe('lossless JSON', () => {
+  it.each([undefined, () => {}, Symbol('not JSON'), { toJSON: () => undefined }])
+  ('rejects non-serializable roots consistently through the binary JSON parameter encoder: %s', value => {
+    expect(() => encodeLuxoJSON(value)).toThrow(TypeError)
+    expect(() => encodeJSONParam(value)).toThrow('value is not JSON encodable')
+  })
+
+  it('propagates a business serializer error through the binary JSON parameter encoder', () => {
+    const failure = new Error('business serialization failed')
+    const value = { toJSON() { throw failure } }
+    expect(() => encodeJSONParam(value)).toThrow(failure)
+  })
+
+  it.each(['rawJSON', 'isRawJSON'])('rejects unsupported runtimes before encoding or parsing (%s)', name => {
+    const original = Object.getOwnPropertyDescriptor(JSON, name)
+    expect(original).toBeDefined()
+    Object.defineProperty(JSON, name, { ...original, value: undefined })
+    try {
+      expect(() => encodeLuxoJSON({ value: 42n })).toThrow('requires JSON.rawJSON')
+      expect(() => decodeLuxoJSON('{"value":9223372036854775807}')).toThrow('requires JSON.rawJSON')
+    } finally { Object.defineProperty(JSON, name, original!) }
+  })
+
+  it.each(['null', '[]', '"text"', '1', '1e0'])('rejects non-object response envelopes (%s)', text => {
+    expect(() => decodeJSONEnvelope(text)).toThrow('expected a JSON response object')
+  })
+
+  it('rejects unterminated long strings even when quoted delimiters trigger the depth scanner', () => {
+    const opening = '["' + '['.repeat(300)
+    for (const text of [opening, opening + '\\"']) {
+      expect(() => decodeBoundedLuxoJSON(text)).toThrow(SyntaxError)
+      expect(() => decodeJSONValue(new TextEncoder().encode(text))).toThrow(SyntaxError)
+    }
+  })
+
+  it('bounds every binary JSON value without counting typed list wrappers', () => {
+    for (const depth of [127, 128, 129]) for (const leaf of ['0', '[]', '{}', '1e400']) {
+      const text = '['.repeat(depth) + leaf + ']'.repeat(depth)
+      const value = decodeLuxoJSON(text)
+      const valid = depth + (leaf === '[]' || leaf === '{}' ? 1 : 0) <= 128
+      const bytes = new TextEncoder().encode(text)
+      const enc = new Encoder()
+      enc.writeString('prefix')
+      const prefix = enc.bytes().slice()
+      if (valid) {
+        expect(encodeLuxoJSON(decodeJSONValue(bytes))).toBe(text)
+        enc.writeJSON(value)
+        const dec = new Decoder(enc.bytes())
+        expect(new TextDecoder().decode(dec.readBytes())).toBe('prefix')
+        expect(new TextDecoder().decode(dec.readBytes())).toBe(text)
+        expect(new TextDecoder().decode(encodeJSONParam(value))).toBe(text)
+        const list = new Encoder()
+        encodeParam(list, { fieldID: 1, type: 'JSON', isList: true }, [value, value])
+        const listReader = new Decoder(list.bytes())
+        expect(listReader.nextField()).toBe(true)
+        const items = listReader.readBytesArray()
+        expect(items).toHaveLength(2)
+        for (const item of items) expect(encodeLuxoJSON(decodeJSONValue(item))).toBe(text)
+      } else {
+        expect(() => decodeJSONValue(bytes), `read ${depth}/${leaf}`).toThrow('128')
+        expect(() => enc.writeJSON(value)).toThrow('128')
+        expect(enc.bytes()).toEqual(prefix)
+        expect(() => encodeJSONParam(value)).toThrow('128')
+      }
+    }
+  })
+
+  it('rejects deep values hidden by duplicate names before native parsing discards them', () => {
+    for (const leaf of ['[]', '{}', '0']) {
+      const text = '{"value":' + '['.repeat(128) + leaf + ']'.repeat(128) + ',"value":0}'
+      expect(() => decodeBoundedLuxoJSON(text)).toThrow('128')
+      expect(() => decodeJSONValue(new TextEncoder().encode(text))).toThrow('128')
+    }
+  })
+
+  it('checks serialized generic JSON including toJSON output, with atomic failure', () => {
+    const deep = decodeLuxoJSON('['.repeat(129) + '0' + ']'.repeat(129))
+    const enc = new Encoder()
+    enc.writeString('prefix')
+    const prefix = enc.bytes().slice()
+    expect(() => enc.writeJSON({ toJSON: () => deep })).toThrow('128')
+    expect(enc.bytes()).toEqual(prefix)
+    expect(() => encodeJSONParam({ toJSON: () => deep })).toThrow('128')
+    const scalar = { deep, toJSON: () => 42 }
+    enc.writeJSON(scalar)
+    expect(new TextDecoder().decode(encodeJSONParam(scalar))).toBe('42')
+  })
+
+  it('ignores quoted delimiters and handles escaped quotes at depth boundaries', () => {
+    const leaves = ['[]{}'.repeat(100), '\\"[]{}'.repeat(100), '\\\\"'.repeat(100), '中文'.repeat(200)]
+    for (const leaf of leaves) for (const depth of [0, 127, 128, 129]) {
+      const text = '['.repeat(depth) + JSON.stringify(leaf) + ']'.repeat(depth)
+      if (depth <= 128) expect(encodeLuxoJSON(decodeBoundedLuxoJSON(text))).toBe(text)
+      else expect(() => decodeBoundedLuxoJSON(text)).toThrow('128')
+    }
+    for (const text of ['"' + 'x'.repeat(300), '"' + 'x'.repeat(300) + '\\"', ']'.repeat(300), '['.repeat(128) + '0'.repeat(300)]) {
+      expect(() => decodeBoundedLuxoJSON(text)).toThrow()
+      expect(() => decodeBoundedLuxoJSON('[' + text)).toThrow()
+    }
+  })
+
+  it('matches known mixed-container depths across deterministic generated documents', () => {
+    let state = 20261110
+    const random = (): number => { state = Math.imul(state, 1664525) + 1013904223 | 0; return state >>> 0 }
+    for (let sample = 0; sample < 1000; sample++) {
+      const depth = random() % 132
+      const leaf = [null, [], {}, '[]"\\{}'.repeat(80), 42][random() % 5]
+      let text = JSON.stringify(leaf)
+      for (let layer = 0; layer < depth; layer++) {
+        text = random() % 2 ? `[${text}]` : `{"\\\"[]":${text}}`
+      }
+      const total = depth + (leaf !== null && typeof leaf === 'object' ? 1 : 0)
+      if (total <= 128) expect(encodeLuxoJSON(decodeBoundedLuxoJSON(text))).toBe(encodeLuxoJSON(decodeLuxoJSON(text)))
+      else expect(() => decodeBoundedLuxoJSON(text)).toThrow('128')
+    }
+  })
+
+  it('rejects excessive source depth before invoking the native reviver', () => {
+    const parse = vi.spyOn(JSON, 'parse')
+    try {
+      expect(() => decodeBoundedLuxoJSON('['.repeat(3000) + '0' + ']'.repeat(3000))).toThrow('128')
+      expect(parse).not.toHaveBeenCalled()
+    } finally { parse.mockRestore() }
+  })
+
+  it('does not confuse wide containers with deep siblings after closed prefixes', () => {
+    const prefix = '{},'.repeat(128)
+    const wide = '[' + prefix + '{}]'
+    expect(encodeLuxoJSON(decodeBoundedLuxoJSON(wide))).toBe(wide)
+    for (const depth of [127, 128, 129]) {
+      const text = '[' + prefix + '['.repeat(depth) + '0' + ']'.repeat(depth) + ']'
+      if (depth === 127) expect(encodeLuxoJSON(decodeBoundedLuxoJSON(text))).toBe(text)
+      else expect(() => decodeBoundedLuxoJSON(text)).toThrow('128')
+    }
+  })
+
+  it('counts generic JSON containers at entry, including empty leaves and error data', () => {
+    for (const shape of ['array', 'object'] as const) {
+      for (const depth of [127, 128, 129]) {
+        for (const leaf of ['0', '[]', '{}', '1e400']) {
+          const open = shape === 'array' ? '[' : '{"child":'
+          const close = shape === 'array' ? ']' : '}'
+          const text = open.repeat(depth) + leaf + close.repeat(depth)
+          const value = decodeLuxoJSON(text)
+          const valid = depth + (leaf === '[]' || leaf === '{}' ? 1 : 0) <= 128
+          const binary = new Encoder()
+          binary.writeFieldInt(1, 400n)
+          binary.writeFieldString(2, 'Custom')
+          binary.writeFieldString(3, 'failure')
+          binary.writeFieldString(5, text)
+          binary.writeEnd()
+          const jsonError = jsonResponseError(decodeJSONEnvelope(`{"error":"Custom","code":400,"message":"failure","data":${text}}`))
+          const binaryError = decodeBinaryError(binary.bytes(), 400)
+          if (valid) {
+            expect(normalizeLuxoJSON(value)).toBe(value)
+            expect(encodeLuxoJSON(decodeBoundedLuxoJSON(text))).toBe(text)
+            expect(jsonError.error).toBe('Custom')
+            expect(binaryError.error).toBe('Custom')
+            expect(encodeLuxoJSON(jsonError.data)).toBe(text)
+            expect(encodeLuxoJSON(binaryError.data)).toBe(text)
+          } else {
+            expect(() => normalizeLuxoJSON(value), `${shape}/${depth}/${leaf}`).toThrow('128')
+            expect(() => decodeBoundedLuxoJSON(text)).toThrow('128')
+            expect(jsonError.error).toBe('ParseError')
+            expect(binaryError.error).toBe('ParseError')
+          }
+        }
+      }
+    }
+  })
+
   it('requires actual JSON strings and booleans without coercion', () => {
     for (const value of ['', 'false', '9007199254740993', '发布 café', '\ufefftext']) {
       expect(stringFromJSON(value)).toBe(value)
@@ -90,7 +262,7 @@ describe('lossless JSON', () => {
       expect(value.rawJSON).toBe(token)
       expect(encodeLuxoJSON(value)).toBe(token)
     }
-    for (const token of ['', ' 1', '1 ', '01', '+1', '1.', '1e', 'NaN', 'Infinity', 'null', 'true', '"1"', '[]', '{}']) {
+    for (const token of ['', ' 1', '1 ', '01', '+1', '1.', '1e', 'NaN', 'Infinity', 'null', 'true', '"1"', '[]', '{}', '0,1', '0,"extra":true', '0,"value":1']) {
       expect(() => jsonNumber(token)).toThrow()
     }
     expect(isJSONNumber({ rawJSON: '1.2' })).toBe(false)
@@ -155,11 +327,39 @@ describe('lossless JSON', () => {
     expect(encodeLuxoJSON(frozen)).toBe('{"values":[1.2300,1]}')
   })
 
+  it('validates only own enumerable JSON properties', () => {
+    const prototype = { inherited: '\ud800' }
+    Object.defineProperty(prototype, 'unreadable', {
+      enumerable: true,
+      get: () => { throw new Error('inherited property must not be read') },
+    })
+    const value = Object.create(prototype) as Record<string, unknown>
+    Object.defineProperty(value, 'hasOwnProperty', { value: false, enumerable: true })
+    value.name = 'valid'
+    Object.defineProperty(value, 'hidden', { value: '\ud800', enumerable: false })
+    expect(normalizeLuxoJSON(value)).toBe(value)
+    value.name = '\ud800'
+    expect(() => normalizeLuxoJSON(value)).toThrow()
+  })
+
   it('rejects invalid JSON and non-finite numbers instead of silently emitting null', () => {
     for (const text of ['', '01', '[1,]', '{"x":}', '+1']) expect(() => decodeLuxoJSON(text)).toThrow()
     for (const value of [NaN, Infinity, -Infinity, undefined]) expect(() => encodeLuxoJSON(value)).toThrow()
     const cycle: unknown[] = []
     cycle.push(cycle)
     expect(() => encodeLuxoJSON(cycle)).toThrow()
+  })
+
+  it('rejects direct non-finite JSON values without narrowing exact raw numbers', () => {
+    for (const number of [NaN, Infinity, -Infinity]) {
+      for (const value of [number, [number], { value: number }]) {
+        expect(() => normalizeLuxoJSON(value)).toThrow()
+      }
+    }
+    for (const value of [0, -0, Number.MIN_VALUE, Number.MAX_VALUE]) {
+      expect(normalizeLuxoJSON(value)).toBe(value)
+    }
+    const exact = jsonNumber('1e400')
+    expect(normalizeLuxoJSON(exact)).toBe(exact)
   })
 })

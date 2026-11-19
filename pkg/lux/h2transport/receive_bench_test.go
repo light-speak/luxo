@@ -37,7 +37,7 @@ func BenchmarkReceiveBurst(b *testing.B) {
 			for b.Loop() {
 				for i := range count {
 					r.streams[uint32(i+1)] = &requests[i]
-					if !r.appendBody(&requests[i], body) {
+					if !r.appendBody(&requests[i], body, false) {
 						b.Fatal("append")
 					}
 				}

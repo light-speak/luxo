@@ -17,7 +17,7 @@ func BenchmarkRawJSONValidation(b *testing.B) {
 		data := codec.AppendBytes(nil, []byte(sample.raw))
 		b.Run(sample.name, func(b *testing.B) { benchmarkRawJSONConverters(b, data, "JSON", false) })
 		if sample.name == "small" {
-			list := codec.AppendArrayHeader(nil, 128)
+			list := codec.AppendVarint(nil, uint64(128))
 			for range 128 {
 				list = append(list, data...)
 			}

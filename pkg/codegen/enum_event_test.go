@@ -97,7 +97,7 @@ func TestEnumEventNullAndWire(t *testing.T) {
     data,err:=event.MarshalLuxo()
     if err!=nil || !bytes.Equal(data,eventWire(t,0,"")) {t.Fatalf("wire: %x %v",data,err)}
     if err:=event.UnmarshalLuxo(append(data,0));err==nil {t.Fatal("accepted trailing event data")}
-    short:=codec.AppendArrayHeader([]byte{3},10000)
+    short:=codec.AppendVarint([]byte{3}, uint64(10000))
     var empty StateChangedEvent
     if err:=empty.UnmarshalLuxo(short);err==nil || empty.Values!=nil {t.Fatal("accepted or allocated short array")}
     if err:=empty.UnmarshalLuxo([]byte{1,2,'O'});err==nil || errors.Is(err,codec.ErrInvalidEnum) {t.Fatalf("lost original malformed string error: %v",err)}

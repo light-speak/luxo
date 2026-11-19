@@ -1,6 +1,9 @@
 import { assertInt64 } from './int64'
 import { dateTimeFromJSON } from './datetime'
 import { enumRawValue } from './enum'
+import { encodeLuxoJSON } from './json'
+import { assertJSONResourceSource, JSONResourceCompiler, opaqueJSONResource } from './json-resource'
+import type { JSONResourcePlan } from './json-resource'
 import type { APISchema, SelectionFieldSchema } from './transport'
 
 type TypeSchema = NonNullable<APISchema['types']>
@@ -23,6 +26,8 @@ interface FieldPlan {
 interface ParameterPlan {
   checks: FieldPlan[]
   projections?: FieldPlan[]
+  resource?: JSONResourcePlan
+  response?: JSONResourcePlan
 }
 
 const emptyTypes: TypeSchema = Object.freeze({})
@@ -32,25 +37,14 @@ const nativeBytes = Uint8Array.prototype as Uint8Array & { toBase64(): string }
 
 /** Compile scalar checks and wire projections once, outside the request path. */
 export class JSONParamValidator {
-  private plans = new Map<string, ParameterPlan>()
+  private plans: Map<string, ParameterPlan>
+
+  constructor(schema?: Record<string, APISchema>) {
+    this.plans = schema ? compileParameterPlans(schema) : new Map()
+  }
 
   setSchema(schema: Record<string, APISchema>): void {
-    const plans = new Map<string, ParameterPlan>()
-    const compilers = new Map<TypeSchema, { checks: FieldPlanCompiler; projections: FieldPlanCompiler }>()
-    for (const [api, meta] of Object.entries(schema)) {
-      if (!meta.params?.length) continue
-      const types = meta.types ?? emptyTypes
-      let compiler = compilers.get(types)
-      if (!compiler) {
-        compiler = { checks: new FieldPlanCompiler(types, checkedScalarTypes), projections: new FieldPlanCompiler(types, projectedTypes) }
-        compilers.set(types, compiler)
-      }
-      const checks = compiler.checks.fields(meta.params)
-      const projections = compiler.projections.fields(meta.params)
-      const hasProjections = hasScalarLeaf(projections, new Set())
-      if (checks.length || hasProjections) plans.set(api, { checks, projections: hasProjections ? projections : undefined })
-    }
-    this.plans = plans
+    this.plans = compileParameterPlans(schema)
   }
 
   validate(api: string, params?: Record<string, unknown>): void {
@@ -66,6 +60,45 @@ export class JSONParamValidator {
     validateObject(plan.checks, params, 0)
     return plan.projections ? projectFields(plan.projections, params, 0) : params
   }
+
+  encode(api: string, body: Record<string, unknown>): string {
+    const resource = this.plans.get(api)?.resource
+    const text = encodeLuxoJSON(body)
+    if (resource) assertJSONResourceSource(text, resource, true)
+    return text
+  }
+
+  validateEncoded(api: string, text: string): string {
+    const resource = this.plans.get(api)?.resource
+    if (resource) assertJSONResourceSource(text, resource)
+    return text
+  }
+
+  response(api: string): JSONResourcePlan {
+    return this.plans.get(api)?.response ?? opaqueJSONResource
+  }
+}
+
+function compileParameterPlans(schema: Record<string, APISchema>): Map<string, ParameterPlan> {
+  const plans = new Map<string, ParameterPlan>()
+  const compilers = new Map<TypeSchema, { checks: FieldPlanCompiler; projections: FieldPlanCompiler; resources?: JSONResourceCompiler }>()
+  for (const [api, meta] of Object.entries(schema)) {
+    if (!meta.params?.length && !meta.response) continue
+    const types = meta.types ?? emptyTypes
+    let compiler = compilers.get(types)
+    if (!compiler) {
+      compiler = { checks: new FieldPlanCompiler(types, checkedScalarTypes), projections: new FieldPlanCompiler(types, projectedTypes) }
+      compilers.set(types, compiler)
+    }
+    const checks = compiler.checks.fields(meta.params ?? [])
+    const projections = compiler.projections.fields(meta.params ?? [])
+    const hasProjections = hasScalarLeaf(projections, new Set())
+    const resource = meta.params?.some(field => field.type === 'Model' || field.type === 'Sealed' || field.type === 'JSON')
+      ? (compiler.resources ??= new JSONResourceCompiler(types)).parameters(meta.params) : undefined
+    const response = meta.response ? (compiler.resources ??= new JSONResourceCompiler(types)).response(meta.response) : undefined
+    if (checks.length || hasProjections || resource || response) plans.set(api, { checks, projections: hasProjections ? projections : undefined, resource, response })
+  }
+  return plans
 }
 
 class FieldPlanCompiler {
@@ -109,7 +142,7 @@ function hasScalarLeaf(fields: readonly FieldPlan[], visited: Set<ObjectPlan>): 
 }
 
 function projectFields(fields: readonly FieldPlan[], value: Record<string, unknown>, depth: number): Record<string, unknown> {
-  if (depth > 128) throw new RangeError('JSON parameter nesting exceeds 128 levels')
+  if (depth > 64) throw new RangeError('model nesting exceeds 64 levels')
   let result = value
   for (const field of fields) {
     const item = value[field.name]
@@ -150,7 +183,7 @@ function projectValue(field: FieldPlan, value: unknown, depth: number): unknown 
 }
 
 function validateObject(fields: readonly FieldPlan[], value: Record<string, unknown>, depth: number): void {
-  if (depth > 128) throw new RangeError('JSON parameter nesting exceeds 128 levels')
+  if (depth > 64) throw new RangeError('model nesting exceeds 64 levels')
   for (const field of fields) {
     const item = value[field.name]
     if (item === undefined || (item === null && field.nullable)) continue

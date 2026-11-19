@@ -19,6 +19,7 @@ func generateEventFile(result *semantic.Result, packageName string) []byte {
 }
 
 func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageName string) []byte {
+	g = g.bindingContext(result, nil)
 	var events []*ast.EventDecl
 	var listeners []*ast.OnDecl
 
@@ -40,13 +41,14 @@ func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageNam
 	var b strings.Builder
 	writeHeader(&b, packageName, "event.gen.go")
 
-	crossModuleImports := g.collectCrossModuleEventImports(result, listeners, currentModule)
+	crossModuleImports := g.collectCrossModuleEventImports(listeners, currentModule)
+	g.addImportBindingSymbols(crossModuleImports)
 	enums := CollectEnumsFromResult(result)
 	objects := collectEventObjectTypes(result)
 
 	b.WriteString("import (\n")
 	b.WriteString("\t\"context\"\n")
-	if len(events) > 0 {
+	if len(events) > 0 || len(nativeEventNames(listeners)) > 0 {
 		b.WriteString("\t\"fmt\"\n")
 	}
 	if len(events) > 0 {
@@ -83,8 +85,10 @@ func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageNam
 	// Reuse the API model registry so listeners also recognize extend projections.
 	modelMap, _ := collectInferredAPIs(result)
 
+	g.writeNativeEventHandlers(&b, nativeEventNames(listeners), currentModule)
+
 	// RegisterEvents function — wires all on-listeners
-	g.generateRegisterEvents(&b, listeners, currentModule, currentModule, modelMap, enums)
+	g.generateRegisterEvents(&b, listeners, currentModule, currentModule, modelMap, enums, result)
 
 	// Generate Unmarshal functions for LOCAL events (exported for cross-module use)
 	for _, e := range events {
@@ -101,17 +105,33 @@ func (g *GeneratorContext) generateEventFile(result *semantic.Result, packageNam
 	body := b.String()
 	var out strings.Builder
 	out.WriteString(importPrefix)
-	// Include types used only inside nested snapshot copies, not just root fields.
-	writeScalarTypeImports(&out, body)
-	if generatedPackages(body).has("bytes") {
-		out.WriteString("\t\"bytes\"\n")
-	}
-	if generatedPackages(body).has("selection") {
-		out.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/selection\"\n")
-	}
+	writeEventBodyImports(&out, body)
 	out.WriteString(")\n\n")
 	out.WriteString(body)
 	return []byte(out.String())
+}
+
+// Imports follow generated references, including expressions nested in listeners.
+func writeEventBodyImports(b *strings.Builder, body string) {
+	writeScalarTypeImports(b, body)
+	packages := generatedPackages(body)
+	for _, name := range []string{"bytes", "strconv", "strings"} {
+		if packages.has(name) {
+			fmt.Fprintf(b, "\t%q\n", name)
+		}
+	}
+	writeRuntimeUtilityImports(b, packages)
+	for _, name := range []string{"errors", "selection", "luxolog"} {
+		if packages.has(name) {
+			fmt.Fprintf(b, "\t%q\n", "github.com/light-speak/luxo/pkg/lux/"+name)
+		}
+	}
+	if packages.has("lux") {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
+	}
+	if packages.has("luxocrypto") {
+		b.WriteString("\tluxocrypto \"github.com/light-speak/luxo/pkg/lux/crypto\"\n")
+	}
 }
 
 func collectEventObjectTypes(result *semantic.Result) map[string]bool {
@@ -121,6 +141,9 @@ func collectEventObjectTypes(result *semantic.Result) map[string]bool {
 			objects[model.Name] = true
 		}
 		for _, declaration := range file.Types {
+			objects[declaration.Name] = true
+		}
+		for _, declaration := range file.Sealeds {
 			objects[declaration.Name] = true
 		}
 	}
@@ -160,7 +183,7 @@ func generateEventStruct(b *strings.Builder, e *ast.EventDecl) {
 // generateEventCodec generates MarshalLuxo/UnmarshalLuxo for binary encoding.
 // Field IDs come from luxo.lock (stable across schema evolution).
 func (g *GeneratorContext) generateEventCodec(b *strings.Builder, e *ast.EventDecl, enums, objects map[string]bool) {
-	c := eventWireCodec{name: e.Name + "Event", marshalName: "MarshalLuxo", unmarshalName: "UnmarshalLuxo", fields: e.Params, ids: g.ids.EventFields[e.Name]}
+	c := eventWireCodec{name: e.Name + "Event", marshalName: "MarshalLuxo", unmarshalName: "UnmarshalLuxo", fields: e.Params, ids: g.ids.EventFields[e.Name], generator: g}
 	c.write(b, enums, objects)
 }
 
@@ -168,17 +191,17 @@ func (g *GeneratorContext) writeEventMarshalField(b *strings.Builder, eventName 
 	writeEventMarshalField(b, g.eventFieldID(eventName, param.Name), param, isEnum, isObject)
 }
 
-func writeEventMarshalField(b *strings.Builder, fieldID int, param *ast.ParamDecl, isEnum, isObject bool) {
+func writeEventMarshalField(b *strings.Builder, fieldID int, param *ast.ParamDecl, isEnum, isObject bool, methods ...string) {
 	if fieldID == 0 || param.Type == nil {
 		return
 	}
 	value := "e." + str.Capitalize(param.Name)
 	if param.Type.IsList {
-		writeEventListMarshal(b, fieldID, value, param.Type, isEnum, isObject)
+		writeEventListMarshal(b, fieldID, value, param.Type, isEnum, isObject, methods...)
 		return
 	}
 	if isObject {
-		writeEventObjectMarshal(b, fieldID, value, param.Type.Nullable)
+		writeEventObjectMarshal(b, fieldID, value, param.Type.Nullable, methods...)
 		return
 	}
 	if isEventBuiltin(param.Type.Name) || isEnum {
@@ -222,7 +245,7 @@ func eventScalarWriteStatement(typeName, value string, isEnum bool) string {
 	case "UUID":
 		return "enc.WriteUUID([16]byte(" + value + "))"
 	case "Decimal":
-		return binaryCallStatement("enc.WriteString("+value+".String())", "return nil, err")
+		return binaryCallStatement("enc.WriteString(lux.FormatDecimal("+value+"))", "return nil, err")
 	case "Bytes":
 		return "enc.WriteBytes(" + value + ")"
 	case "JSON":
@@ -231,16 +254,16 @@ func eventScalarWriteStatement(typeName, value string, isEnum bool) string {
 	return ""
 }
 
-func writeEventListMarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, isEnum, isObject bool) {
+func writeEventListMarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, isEnum, isObject bool, methods ...string) {
 	fmt.Fprintf(b, "\tenc.WriteFieldHeader(%d)\n", fieldID)
 	if ref.Nullable {
 		fmt.Fprintf(b, "\tif %s == nil { enc.WriteNull() } else {\n\tenc.WritePresent()\n", value)
 	}
-	fmt.Fprintf(b, "\tenc.WriteArrayHeader(len(%s))\n", value)
+	writeBinaryCall(b, "\t", fmt.Sprintf("enc.WriteArrayHeader(len(%s))", value), "return nil, err")
 	fmt.Fprintf(b, "\tfor i := range %s {\n", value)
 	item := value + "[i]"
 	if isObject {
-		writeEventObjectValue(b, item, "\t\t")
+		writeEventObjectValue(b, item, "\t\t", methods...)
 	} else if isEventBuiltin(ref.Name) || isEnum {
 		fmt.Fprintf(b, "\t\t%s\n", eventScalarWriteStatement(ref.Name, item, isEnum))
 	}
@@ -250,23 +273,27 @@ func writeEventListMarshal(b *strings.Builder, fieldID int, value string, ref *a
 	}
 }
 
-func writeEventObjectMarshal(b *strings.Builder, fieldID int, value string, nullable bool) {
+func writeEventObjectMarshal(b *strings.Builder, fieldID int, value string, nullable bool, methods ...string) {
 	fmt.Fprintf(b, "\tenc.WriteFieldHeader(%d)\n", fieldID)
 	if nullable {
 		fmt.Fprintf(b, "\tif %s == nil { enc.WriteNull() } else {\n", value)
 		b.WriteString("\t\tenc.WritePresent()\n")
-		writeEventObjectValue(b, value, "\t\t")
+		writeEventObjectValue(b, value, "\t\t", methods...)
 		b.WriteString("\t}\n")
 		return
 	}
 	b.WriteString("\t{\n")
-	writeEventObjectValue(b, value, "\t\t")
+	writeEventObjectValue(b, value, "\t\t", methods...)
 	b.WriteString("\t}\n")
 }
 
-func writeEventObjectValue(b *strings.Builder, value, indent string) {
+func writeEventObjectValue(b *strings.Builder, value, indent string, methods ...string) {
+	method := "marshalEventSnapshot"
+	if len(methods) != 0 {
+		method = methods[0]
+	}
 	fmt.Fprintf(b, "%sbuf := api.GetBuf()\n", indent)
-	fmt.Fprintf(b, "%sraw, err := %s.marshalEventSnapshot(buf.B, depth + 1)\n", indent, value)
+	fmt.Fprintf(b, "%sraw, err := %s.%s(buf.B, depth + 1)\n", indent, value, method)
 	fmt.Fprintf(b, "%sif err != nil { api.PutBuf(buf); return nil, err }\n", indent)
 	fmt.Fprintf(b, "%sbuf.B = raw\n%senc.WriteBytes(raw)\n%sapi.PutBuf(buf)\n", indent, indent, indent)
 }
@@ -275,17 +302,21 @@ func (g *GeneratorContext) writeEventUnmarshalField(b *strings.Builder, eventNam
 	writeEventUnmarshalField(b, g.eventFieldID(eventName, param.Name), param, isEnum, isObject, false)
 }
 
-func writeEventUnmarshalField(b *strings.Builder, fieldID int, param *ast.ParamDecl, isEnum, isObject, objectPointer bool) {
+func writeEventUnmarshalField(b *strings.Builder, fieldID int, param *ast.ParamDecl, isEnum, isObject, objectPointer bool, methods ...string) {
 	if fieldID == 0 || param.Type == nil {
 		return
 	}
 	value := "e." + str.Capitalize(param.Name)
 	if param.Type.IsList {
-		writeEventListUnmarshal(b, fieldID, value, param.Type, isEnum, isObject)
+		writeEventListUnmarshal(b, fieldID, value, param.Type, isEnum, isObject, methods...)
 		return
 	}
 	if isObject {
-		writeEventObjectUnmarshal(b, fieldID, value, param.Type, objectPointer)
+		method := "unmarshalEventSnapshot"
+		if len(methods) != 0 {
+			method = methods[0]
+		}
+		writeEventObjectUnmarshalMethod(b, fieldID, value, param.Type, method, objectPointer)
 		return
 	}
 	if isEventBuiltin(param.Type.Name) || isEnum {
@@ -376,7 +407,7 @@ func eventNullableReadClosure(typeName string, isEnum bool) string {
 	return "func() *" + goType + " { raw := " + read + "; if raw == nil { return nil }; value := " + conversion + "; return &value }()"
 }
 
-func writeEventListUnmarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, isEnum, isObject bool) {
+func writeEventListUnmarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, isEnum, isObject bool, methods ...string) {
 	fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
 	if ref.Nullable {
 		fmt.Fprintf(b, "\t\t\tif !dec.ReadBool() { %s = nil; break }\n", value)
@@ -392,7 +423,7 @@ func writeEventListUnmarshal(b *strings.Builder, fieldID int, value string, ref 
 	fmt.Fprintf(b, "\t\t\tfor i := range %s {\n", value)
 	item := value + "[i]"
 	if isObject {
-		writeEventObjectReadValue(b, item, "\t\t\t\t")
+		writeEventObjectReadValue(b, item, "\t\t\t\t", methods...)
 	} else if typeName == "Decimal" {
 		b.WriteString("\t\t\t\tparsed, err := decimal.NewFromString(dec.ReadString()); if err != nil { return err }\n")
 		fmt.Fprintf(b, "\t\t\t\t%s = parsed\n", item)
@@ -407,24 +438,32 @@ func writeEventListUnmarshal(b *strings.Builder, fieldID int, value string, ref 
 }
 
 func writeEventObjectUnmarshal(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, objectPointer ...bool) {
+	writeEventObjectUnmarshalMethod(b, fieldID, value, ref, "unmarshalEventSnapshot", objectPointer...)
+}
+
+func writeEventObjectUnmarshalMethod(b *strings.Builder, fieldID int, value string, ref *ast.TypeRef, method string, objectPointer ...bool) {
 	fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
 	if ref.Nullable {
 		b.WriteString("\t\t\tif dec.ReadBool() {\n")
 		fmt.Fprintf(b, "\t\t\t\t%s = &%s{}\n", value, ref.Name)
-		writeEventObjectReadValue(b, value, "\t\t\t\t")
+		writeEventObjectReadValue(b, value, "\t\t\t\t", method)
 		fmt.Fprintf(b, "\t\t\t} else { %s = nil }\n", value)
 		return
 	}
 	if len(objectPointer) > 0 && objectPointer[0] {
 		fmt.Fprintf(b, "\t\t\t%s = &%s{}\n", value, ref.Name)
 	}
-	writeEventObjectReadValue(b, value, "\t\t\t")
+	writeEventObjectReadValue(b, value, "\t\t\t", method)
 }
 
-func writeEventObjectReadValue(b *strings.Builder, value, indent string) {
+func writeEventObjectReadValue(b *strings.Builder, value, indent string, methods ...string) {
+	method := "unmarshalEventSnapshot"
+	if len(methods) != 0 {
+		method = methods[0]
+	}
 	fmt.Fprintf(b, "%sraw := dec.ReadBytes()\n", indent)
 	fmt.Fprintf(b, "%sif err := dec.Err(); err != nil { return err }\n", indent)
-	fmt.Fprintf(b, "%sif err := %s.unmarshalEventSnapshot(raw, depth + 1); err != nil { return err }\n", indent, value)
+	fmt.Fprintf(b, "%sif err := %s.%s(raw, depth + 1); err != nil { return err }\n", indent, value, method)
 }
 
 // generateEmitFunc generates a typed emit function.
@@ -438,10 +477,10 @@ func generateEmitFunc(b *strings.Builder, e *ast.EventDecl) {
 }
 
 // generateRegisterEvents generates RegisterEvents that wires all on-listeners.
-// Default uses OnQueueDecode with moduleName as the queue group (competing consumers).
-// Listeners with @broadcast use OnDecode (every instance receives).
+// Default uses OnQueueValueDecode with moduleName as the queue group (competing consumers).
+// Listeners with @broadcast use OnValueDecode (every instance receives).
 // Unmarshal uses Luxo binary (UnmarshalLuxo) for wire decoding.
-func (g *GeneratorContext) generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string, currentModule string, models map[string]*ast.ModelDecl, enums map[string]bool) {
+func (g *GeneratorContext) generateRegisterEvents(b *strings.Builder, listeners []*ast.OnDecl, moduleName string, currentModule string, models map[string]*ast.ModelDecl, enums map[string]bool, result *semantic.Result) {
 	if len(listeners) == 0 {
 		b.WriteString("// RegisterEvents — no listeners in this module.\n")
 		b.WriteString("func RegisterEvents(bus event.Bus, app *App) error { return nil }\n\n")
@@ -449,43 +488,54 @@ func (g *GeneratorContext) generateRegisterEvents(b *strings.Builder, listeners 
 	}
 	b.WriteString("// RegisterEvents registers all event listeners with the bus.\n")
 	b.WriteString("func RegisterEvents(bus event.Bus, app *App) error {\n")
+	writeNativeEventChecks(b, nativeEventNames(listeners))
 
+	functions := collectFunctionDeclarations(result)
+	nativeFunctions := collectNativeFunctionNames(result)
+	compiledFunctions := collectCompiledFunctions(result)
+	selectionFunctions := collectSelectionAwareFunctions(compiledFunctions, models)
+	scopeFunctions := collectScopeAwareFunctions(compiledFunctions)
+	explicitSelections := collectSelectionAwareFunctions(compiledFunctions)
 	for _, l := range listeners {
-		paramName := "payload"
-		if len(l.Params) > 0 {
-			paramName = l.Params[0]
-		}
+		sourceName, paramName, bindings := g.listenerPayloadBinding(l)
 
-		// Check if event is cross-module
-		eventTypePrefix := ""
-		unmarshalFunc := fmt.Sprintf("Unmarshal%s", l.EventName)
-		if g.events != nil {
-			evModule := g.events.EventModule[l.EventName]
-			if evModule != "" && evModule != currentModule {
-				eventTypePrefix = evModule + "_luxo."
-				unmarshalFunc = evModule + "_luxo.Unmarshal" + l.EventName
-			}
-		}
+		eventTypePrefix := g.eventTypePrefix(l.EventName, currentModule)
 		eventType := eventTypePrefix + l.EventName + "Event"
-		if l.Broadcast {
-			fmt.Fprintf(b, "\tif err := event.OnDecode(bus, %q, %s, func(ctx context.Context, %s %s) error {\n", l.EventName, unmarshalFunc, paramName, eventType)
-		} else {
-			fmt.Fprintf(b, "\tif err := event.OnQueueDecode(bus, %q, %q, %s, func(ctx context.Context, %s %s) error {\n", l.EventName, moduleName, unmarshalFunc, paramName, eventType)
+		if l.Native {
+			writeNativeEventRegistration(b, l, moduleName, eventType)
+			continue
 		}
+		if l.Broadcast {
+			fmt.Fprintf(b, "\tif err := event.OnValueDecode(bus, %q, ", l.EventName)
+		} else {
+			fmt.Fprintf(b, "\tif err := event.OnQueueValueDecode(bus, %q, %q, ", l.EventName, moduleName)
+		}
+		writeEventValueDecoder(b, eventType)
+		fmt.Fprintf(b, ", func(ctx context.Context, %s %s) error {\n", paramName, eventType)
 		// Compile on-handler body if present
 		if l.Body != nil && len(l.Body.Stmts) > 0 {
+			loadSelections := analyzeLoadProjections(l.Body, models, nil)
+			if len(loadSelections) > 0 || bodyCallsScopedFunction(l.Body, scopeFunctions) {
+				writeRequestScope(b, "\t\t", "ctx")
+			}
 			c := &compiler{
-				generator:      g,
-				b:              b,
-				indent:         "\t\t",
-				models:         models,
-				enums:          enums,
-				vars:           make(map[string]valType),
-				api:            &ast.ApiDecl{Pos: l.Pos},
-				loadSelections: analyzeLoadSelections(l.Body, models),
+				generator:          g,
+				b:                  b,
+				indent:             "\t\t",
+				models:             models,
+				enums:              enums,
+				vars:               make(map[string]valType),
+				bindings:           bindings,
+				functions:          functions,
+				nativeFunctions:    nativeFunctions,
+				selectionFunctions: selectionFunctions,
+				explicitSelections: explicitSelections,
+				clientSelection:    "nil",
+				api:                &ast.ApiDecl{Pos: l.Pos},
+				loadSelections:     loadSelections,
 			}
 			// Register event param as a known variable so event.field compiles correctly
-			c.vars[paramName] = valType{name: l.EventName + "Event"}
+			c.vars[sourceName] = valType{name: l.EventName + "Event"}
 			for _, stmt := range l.Body.Stmts {
 				c.compileStmt(stmt)
 			}
@@ -502,32 +552,53 @@ func (g *GeneratorContext) generateRegisterEvents(b *strings.Builder, listeners 
 	// Note: Unmarshal functions are generated in generateEventFile, not here
 }
 
+// A non-capturing decoder preserves static types without adding global symbols.
+func writeEventValueDecoder(b *strings.Builder, eventType string) {
+	fmt.Fprintf(b, "func(data []byte) (%s, error) { var decoded %s; err := decoded.UnmarshalLuxo(data); return decoded, err }", eventType, eventType)
+}
+
 // collectCrossModuleEventImports finds which event modules need to be imported.
-func (g *GeneratorContext) collectCrossModuleEventImports(result *semantic.Result, listeners []*ast.OnDecl, currentModule string) map[string]string {
+func (g *GeneratorContext) collectCrossModuleEventImports(listeners []*ast.OnDecl, currentModule string) map[string]string {
 	imports := make(map[string]string)
 	if g.events == nil {
 		return imports
 	}
-	for _, l := range listeners {
-		evModule := g.events.EventModule[l.EventName]
-		if evModule != "" && evModule != currentModule {
-			imports[evModule] = evModule + "_luxo"
+	add := func(name string) {
+		module := g.events.EventModule[name]
+		if module != "" && module != currentModule {
+			imports[module] = module + "_luxo"
 		}
 	}
-	for _, file := range result.Files {
-		for _, api := range file.APIs {
-			if api.Body == nil {
-				continue
-			}
-			for _, stmt := range api.Body.Stmts {
-				if emit, ok := stmt.(*ast.EmitStmt); ok {
-					evModule := g.events.EventModule[emit.EventName]
-					if evModule != "" && evModule != currentModule {
-						imports[evModule] = evModule + "_luxo"
-					}
-				}
-			}
+	visitor := ast.Visitor{Stmt: func(stmt ast.Stmt) {
+		if emit, ok := stmt.(*ast.EmitStmt); ok {
+			add(emit.EventName)
 		}
+	}}
+	for _, listener := range listeners {
+		add(listener.EventName)
+		ast.Walk(listener.Body, visitor)
 	}
 	return imports
+}
+
+// Keep the source payload binding separate from callback implementation names.
+func listenerPayloadBinding(listener *ast.OnDecl) (string, string, localBindings) {
+	return defaultGenerator().listenerPayloadBinding(listener)
+}
+
+func (g *GeneratorContext) listenerPayloadBinding(listener *ast.OnDecl) (string, string, localBindings) {
+	source := "it"
+	if len(listener.Params) > 0 {
+		source = listener.Params[0]
+	}
+	bindings := g.parameterBindings([]*ast.ParamDecl{{Name: source}}, listener.Body, nil, nil, "payload")
+	name := bindings.name(source)
+	if len(listener.Params) == 0 {
+		name = "payload"
+		if bindings == nil {
+			bindings = make(localBindings)
+		}
+		bindings[source] = name
+	}
+	return source, name, bindings
 }

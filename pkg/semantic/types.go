@@ -1,6 +1,24 @@
 package semantic
 
-import "github.com/light-speak/luxo/pkg/token"
+import (
+	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/token"
+)
+
+// TypeRef returns an independent declaration-shaped copy of this resolved type.
+func (t *ResolvedType) TypeRef() *ast.TypeRef {
+	if t == nil {
+		return nil
+	}
+	ref := &ast.TypeRef{Name: t.Name, Nullable: t.Nullable, IsList: t.IsList}
+	for _, argument := range t.TypeArgs {
+		ref.TypeArgs = append(ref.TypeArgs, argument.TypeRef())
+	}
+	for _, item := range t.Tuple {
+		ref.Tuple = append(ref.Tuple, item.TypeRef())
+	}
+	return ref
+}
 
 // TypeKind represents the category of a resolved type.
 type TypeKind int
@@ -101,6 +119,7 @@ type FieldInfo struct {
 type SealedVariantInfo struct {
 	Name   string
 	Fields []*FieldInfo
+	source *ast.SealedVariant // Resolve payloads after all type names are registered.
 }
 
 // BuiltinTypes returns the built-in primitive types with their properties.
@@ -121,7 +140,7 @@ func BuiltinTypes() map[string]*ResolvedType {
 		"trimStart": {Name: "trimStart", Type: nil, IsMethod: true},
 		"trimEnd":   {Name: "trimEnd", Type: nil, IsMethod: true},
 		"reversed":  {Name: "reversed", Type: nil, IsMethod: true},
-		// methods that take args — return type varies but LSP won't error
+		// Method counts and parameter types are checked by the String call validator.
 		"contains":   {Name: "contains", Type: boolType, IsMethod: true},
 		"startsWith": {Name: "startsWith", Type: boolType, IsMethod: true},
 		"endsWith":   {Name: "endsWith", Type: boolType, IsMethod: true},
@@ -133,8 +152,8 @@ func BuiltinTypes() map[string]*ResolvedType {
 		"repeat":     {Name: "repeat", Type: nil, IsMethod: true},
 		"padStart":   {Name: "padStart", Type: nil, IsMethod: true},
 		"padEnd":     {Name: "padEnd", Type: nil, IsMethod: true},
-		"toInt":      {Name: "toInt", Type: intType, IsMethod: true},
-		"toFloat":    {Name: "toFloat", Type: floatType, IsMethod: true},
+		"toInt":      {Name: "toInt", Type: &ResolvedType{Kind: TypeGeneric, Name: "Result", TypeArgs: []*ResolvedType{intType}}, IsMethod: true},
+		"toFloat":    {Name: "toFloat", Type: &ResolvedType{Kind: TypeGeneric, Name: "Result", TypeArgs: []*ResolvedType{floatType}}, IsMethod: true},
 	}}
 	// self-reference for string methods that return String
 	stringReturnMethods := []string{
@@ -144,16 +163,10 @@ func BuiltinTypes() map[string]*ResolvedType {
 	for _, m := range stringReturnMethods {
 		stringType.Fields[m].Type = stringType
 	}
-	// split returns list (approximate — not typed as [String] but won't error)
+	// split returns a typed String list.
 	stringType.Fields["split"].Type = &ResolvedType{Kind: TypeString, Name: "String", IsList: true}
 
-	identityType := &ResolvedType{Kind: TypeModel, Name: "Identity", Fields: map[string]*FieldInfo{
-		"id":   {Name: "id", Type: intType},
-		"load": {Name: "load", Type: nil, IsMethod: true, Doc: ".load(fields...): Identity — Lazy load user fields / 懒加载用户字段"}, // my.load(fields...) — lazy load
-		"role": {Name: "role", Type: nil},                                                                                      // role from JWT stores, type resolved at codegen
-	}}
-	// self-reference: load() returns Identity
-	identityType.Fields["load"].Type = identityType
+	identityType := newIdentityType()
 
 	return map[string]*ResolvedType{
 		"Int":      intType,
@@ -244,9 +257,23 @@ func (t *ResolvedType) LookupField(name string) *FieldInfo {
 	if f, ok := t.Fields[name]; ok {
 		return f
 	}
+	if len(t.Parents) == 0 {
+		return nil
+	}
+	return t.lookupInheritedField(name, make(map[*ResolvedType]bool))
+}
+
+func (t *ResolvedType) lookupInheritedField(name string, visited map[*ResolvedType]bool) *FieldInfo {
+	if t == nil || visited[t] {
+		return nil
+	}
+	visited[t] = true
+	if field := t.Fields[name]; field != nil {
+		return field
+	}
 	for _, parent := range t.Parents {
-		if f := parent.LookupField(name); f != nil {
-			return f
+		if field := parent.lookupInheritedField(name, visited); field != nil {
+			return field
 		}
 	}
 	return nil
@@ -269,4 +296,16 @@ func (t *ResolvedType) inheritsFrom(name string) bool {
 		pending = append(pending, parent.Parents...)
 	}
 	return false
+}
+
+func newIdentityType() *ResolvedType {
+	identityType := &ResolvedType{Kind: TypeModel, Name: "Identity", Fields: map[string]*FieldInfo{
+		"id":   {Name: "id", Type: nil},                                                                                        // Resolved from stores, otherwise defaults to Int before body analysis.
+		"load": {Name: "load", Type: nil, IsMethod: true, Doc: ".load(fields...): Identity — Lazy load user fields / 懒加载用户字段"}, // my.load(fields...) — lazy load
+		"role": {Name: "role", Type: nil},                                                                                      // role from JWT stores, type resolved at codegen
+	}}
+	// self-reference: load() returns Identity
+	identityType.Fields["load"].Type = identityType
+
+	return identityType
 }

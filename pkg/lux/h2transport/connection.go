@@ -44,6 +44,7 @@ type candidateConnection struct {
 	writer              *controlWriter
 	receiver            *requestReceiver
 	mu                  sync.Mutex // Reader state and worker completion, never held around handler/I/O.
+	workers             sync.WaitGroup
 	tasks               map[uint32]*requestTask
 	draining            bool
 	openingComplete     bool
@@ -69,16 +70,15 @@ func (c *candidateConnection) run() error {
 	c.ctx = ctx
 	writerDone := make(chan error, 1)
 	go func() { writerDone <- c.writer.run(ctx, c.conn, c.inbox, c.limits.WriteTimeout) }()
-	var workers sync.WaitGroup
 	for range 8 {
-		workers.Go(c.work)
+		c.startWorker()
 	}
 	err := c.read()
 	cancel()
 	_ = c.conn.Close()
 	close(c.jobs)
 	<-writerDone
-	workers.Wait()
+	c.workers.Wait()
 	c.mu.Lock()
 	for _, task := range c.tasks {
 		task.cancel()

@@ -8,6 +8,93 @@ import { generateTypes } from './codegen'
 import type { LuxoSchema } from '@luxojs/client'
 
 const runFile = promisify(execFile)
+
+it.each([
+  ['commonjs', true], ['module', true], ['commonjs', false], ['module', false],
+] as const)('generated %s client releases encoded inputs with static requests=%s', async (moduleType, staticRequests) => {
+  const root = resolve(import.meta.dirname, '../../..')
+  const temporaryRoot = join(root, '.tmp')
+  mkdirSync(temporaryRoot, { recursive: true })
+  const directory = mkdtempSync(join(temporaryRoot, 'ts-input-lifetime-'))
+  try {
+    await generateTypes({ models: {}, apis: { live: { id: 7, name: 'live', module: 'test', returnType: 'Int',
+      params: [{ id: 1, name: 'blob', type: 'Bytes' }],
+    } } }, directory, { staticRequests })
+    const scope = join(directory, 'node_modules/@luxojs')
+    mkdirSync(scope, { recursive: true })
+    symlinkSync(join(root, 'packages/client'), join(scope, 'client'), 'dir')
+    writeFileSync(join(directory, 'package.json'), JSON.stringify({ type: moduleType }))
+    writeFileSync(join(directory, 'tsconfig.json'), JSON.stringify({ compilerOptions: {
+      target: 'ES2022', module: 'NodeNext', moduleResolution: 'NodeNext',
+      strict: true, outDir: 'out', types: [],
+    }, include: ['*.ts'] }))
+    await runFile(join(root, 'packages/client/node_modules/.bin/tsc'), ['-p', directory], { timeout: 60000 })
+    const extension = moduleType === 'commonjs' ? 'cjs' : 'mjs'
+    const imports = extension === 'cjs'
+      ? "const sdk = require('@luxojs/client'); const { LuxoClient } = require('./out/client.js')"
+      : "import * as sdk from '@luxojs/client'; import { LuxoClient } from './out/client.js'"
+    const script = join(directory, `lifetime.${extension}`)
+    writeFileSync(script, imports + generatedInputLifetimeConsumer)
+    const result = await runFile(process.execPath, ['--expose-gc', script], { timeout: 15000 })
+    expect(result.stdout.trim()).toBe('generated-input-lifetime-ok:4')
+  } catch (error) {
+    if (error instanceof Error && 'stderr' in error) error.message += '\n' + String(error.stderr)
+    throw error
+  } finally {
+    if (directory.startsWith(temporaryRoot + sep)) rmSync(directory, { recursive: true })
+  }
+}, 90000)
+
+const generatedInputLifetimeConsumer = `
+const immediate = () => new Promise(resolve => setImmediate(resolve))
+let socket, finishHTTP
+class Socket {
+  static OPEN = 1
+  readyState = 0
+  constructor() { socket = this; queueMicrotask(() => { this.readyState = 1; this.onopen?.() }) }
+  send() {}
+  close() { this.readyState = 3; this.onclose?.() }
+}
+class HTTP extends sdk.FetchTransport {
+  executeRequest() { return new Promise(resolve => { finishHTTP = resolve }) }
+}
+async function begin(channel, mode) {
+  const transport = channel === 'ws' ? new sdk.WsTransport('ws://example.invalid', { mode }) : new HTTP('https://example.invalid', { mode })
+  const client = new LuxoClient(transport)
+  const blob = new Uint8Array(256 * 1024), params = { blob }
+  const refs = [new WeakRef(params), new WeakRef(blob)]
+  const pending = client.live(params)
+  await immediate()
+  return { client, pending, refs }
+}
+async function main() {
+  globalThis.WebSocket = Socket
+  const failures = []
+  for (const channel of ['ws', 'http']) for (const mode of ['json', 'binary']) {
+    const state = await begin(channel, mode)
+    try {
+      for (let i = 0; i < 8; i++) { await immediate(); globalThis.gc(); await immediate() }
+      if (state.refs.some(ref => ref.deref() !== undefined)) failures.push(channel + '/' + mode)
+    } finally {
+      if (channel === 'ws') socket.onmessage?.({ data: mode === 'json' ? '{"$id":1,"data":42}' : Uint8Array.of(2, 1, 84).buffer })
+      else {
+        const bytes = mode === 'json' ? new TextEncoder().encode('{"data":42}') : Uint8Array.of(84)
+        finishHTTP({ status: 200, arrayBuffer: async () => bytes.buffer })
+      }
+      try { if (await state.pending !== 42n) throw new Error('decoded response changed') }
+      finally { state.client.close() }
+    }
+  }
+  const failure = new Error('synchronous transport failure')
+  const client = new LuxoClient({ setSchema() {}, call() { throw failure }, callGenerated() { throw failure } })
+  const pending = client.live({ blob: new Uint8Array() })
+  await pending.then(() => { throw new Error('failure swallowed') }, error => { if (error !== failure) throw error })
+  if (failures.length) throw new Error('retained generated inputs: ' + failures.join(', '))
+  console.log('generated-input-lifetime-ok:4')
+}
+main().catch(error => { console.error(error); process.exitCode = 1 })
+`
+
 const scalarTypes = ['String', 'Float', 'Boolean', 'Int', 'Duration', 'DateTime', 'UUID', 'Bytes', 'Decimal', 'JSON', 'Enum']
 
 const schema: LuxoSchema = {
@@ -33,7 +120,10 @@ const schema: LuxoSchema = {
     getMetric: { id: 1, name: 'getMetric', module: 'test', returnType: 'Metric', params: [{ id: 1, name: 'id', type: 'Int' }] },
     count: { id: 2, name: 'count', module: 'test', returnType: 'Int' },
     durations: { id: 3, name: 'durations', module: 'test', returnType: 'Duration', returnList: true },
-    listMetrics: { id: 4, name: 'listMetrics', module: 'test', returnType: 'Metric', returnList: true, paginated: true },
+    listMetrics: { id: 4, name: 'listMetrics', module: 'test', returnType: 'Metric', returnList: true, paginated: true, params: [
+        { id: 7, name: 'page', type: 'Int', hasDefault: true },
+        { id: 9, name: 'pageSize', type: 'Int', hasDefault: true },
+      ] },
     liveMetrics: { id: 5, name: 'liveMetrics', module: 'test', returnType: 'Metric', stream: true },
     echoDuration: { id: 6, name: 'echoDuration', module: 'test', returnType: 'Duration', params: [{ id: 1, name: 'value', type: 'Duration' }] },
     getTextValues: { id: 7, name: 'getTextValues', module: 'test', returnType: 'TextValues' },
@@ -50,7 +140,7 @@ for (const type of scalarTypes) {
     }
   }
 }
-schema.apis.implicitCount = { id: 100, name: 'implicitCount', module: 'test' }
+schema.apis.implicitCount = { id: 100, name: 'implicitCount', module: 'test', returnType: 'Int' }
 for (const [index, name] of ['optionalInt', 'optionalMetric', 'optionalRows', 'optionalValueStream', 'optionalModelStream', 'optionalRowsStream'].entries()) {
   schema.apis[name] = { id: 200 + index, name, module: 'test', returnNullable: true,
     returnType: name === 'optionalInt' || name === 'optionalValueStream' ? 'Int' : 'Metric',

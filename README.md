@@ -52,6 +52,10 @@ Luxo is a **schema-first compiled backend language and platform**. It compiles `
 
 Luxo is designed to unify workloads commonly split across REST, GraphQL, gRPC, an ORM, and handwritten client glue. PostgreSQL is the implemented database backend today; MySQL, SQLite, and MongoDB remain roadmap targets.
 
+Generated SQL identifiers are quoted by the selected dialect during generation, including migrations and rollback SQL. Schema field names and scan labels remain unchanged; generated Go field constants contain SQL tokens and can be passed directly to query builders. Custom Go `lux.Dialect` implementations must provide `QuoteIdentifier(name string) string`, `ValidateIdentifier(name string) error`, `GeneratedIdentifier(name string) string`, `UniqueConstraintName(table, column string) string`, and `RenameUnique(table, oldColumn, newColumn string) string`. Explicit low-level SQL expressions remain caller-owned; do not quote those expressions as identifiers. This changes generated Go SQL tokens, not SDK wire identifiers. `codegen.GenerateMigrationSQL` returns `(up, down string, err error)` and rejects invalid metadata before emitting SQL; callers must propagate that error. `codegen.Diff` also returns `([]DiffOp, error)`. Raw PostgreSQL table/column names must fit 63 bytes; generated index/unique names use a deterministic UTF-8-safe prefix and hash suffix when needed. Rename planning preserves field identities through chains, cycles, and reuse of a vacated name; unsupported table identity or primary-key/serial changes require an explicit migration.
+
+PostgreSQL stores `Duration` as whole-microsecond `INTERVAL`. Writes that cannot be preserved exactly return `pg.ErrDurationPrecision` before statement execution, including optional/list parameters and SQL-rewriter output. Generated Create/Update and transactions propagate the error; JSON/Binary `Duration` still uses the full signed Int64 nanosecond range. This does not migrate existing columns or round values automatically.
+
 ```luxo
 model User @crud {
   name:     String @filterable
@@ -83,7 +87,9 @@ One source definition drives the generated server, database layer, migrations, s
 
 Luxo is a backend programming language, not only a schema DSL. Its scalar types are `Int`, `Float`, `String`, `Boolean`, `DateTime`, `Duration`, `UUID`, `Decimal`, `Bytes`, and `JSON`; generic runtime types include `Result<T>`, `Channel<T>`, `Page<T>`, and `Cursor<T>`. Luxo compiles to Go.
 
-DateTime preserves nanoseconds in both JSON and Binary. JSON requires timezone-bearing RFC3339 with at most nine fractional digits and UTC years 0000–9999; Binary carries floor Unix seconds plus unsigned nanoseconds. Excess precision and out-of-range values are rejected. This pre-release change requires matching regenerated services and SDKs, with no legacy time fallback. Database storage precision and performance are separate acceptance gates. Internal RPC is now version 4, adding explicit nullable root responses; the corresponding four-SDK migration is not complete and the release is not frozen.
+DateTime preserves nanoseconds in both JSON and Binary. JSON requires timezone-bearing RFC3339 with at most nine fractional digits and UTC years 0000–9999; Binary carries floor Unix seconds plus unsigned nanoseconds. Excess precision and out-of-range values are rejected. This pre-release change requires matching regenerated services and SDKs, with no legacy time fallback. Database storage precision and performance are separate acceptance gates. Internal RPC is now version 4, adding explicit nullable root responses. The core and all four SDK generators implement this envelope; final candidate acceptance remains incomplete and the release is not frozen.
+
+PostgreSQL stores `DateTime` in native `timestamptz` at microsecond precision. Sub-microsecond digits are truncated at this storage boundary; generated Create/CreateMany results and later API reads contain the actual stored value. JSON/Binary transport still preserves nanoseconds. See [PostgreSQL date/time types](https://www.postgresql.org/docs/16/datatype-datetime.html).
 
 ### Null Safety
 
@@ -213,6 +219,9 @@ TTL starts when an entry is filled; it does not bound the age of the underlying 
 Use uncached queries for decisions that require fresh data. Identity isolation is preserved;
 an explicit backend, deployment namespace and bounded origin concurrency are required at startup.
 The `invalidation` mode is rejected rather than silently converted to TTL.
+The legacy `cache.BuildKey`, `BuildKeyRaw`, and `InvalidatePrefix` helpers have been removed.
+Generated responses use the configured response-cache policy and its scoped key path;
+custom application caches must define their own keys through the `cache.Cache` backend interface.
 
 ```luxo
 // 1. Zero code — framework generates everything
@@ -352,7 +361,9 @@ requires regenerating and rebuilding. For NATS, add
 
 JSON and Luxo Binary are both production transports. HTTP clients select them through the SDK transport mode or `X-Luxo-Mode: json|binary`; WebSocket supports JSON text and canonical binary frames, while native RPC uses its binary framing. `APP_ENV` never silently changes the wire contract.
 
-Both encodings preserve the same value semantics. Business `Int`/`Duration` are signed int64; WebSocket call IDs (`$id` in JSON, `sequence` in Binary) are unsigned uint64. JSON IDs must be unquoted decimal integer tokens in `0…18446744073709551615`, not booleans, strings, fractions or exponents. Invalid/missing/overflowing IDs are dropped before handler dispatch, never coerced to zero. Successful and failed calls echo the exact valid ID. SDK counters must fail on exhaustion instead of rounding, narrowing or overwriting pending calls; complete cross-SDK boundary acceptance remains a beta release gate.
+Both encodings enforce the same numeric and text boundaries. Nullable JSON has an unresolved representation boundary before freeze: database reads distinguish SQL NULL from the JSON literal `null`; generated model Binary output preserves that distinction, while JSON output represents both as `null`. The public representation remains undecided; the database distinction is preserved.
+
+Business `Int`/`Duration` are signed int64; WebSocket call IDs (`$id` in JSON, `sequence` in Binary) are unsigned uint64. JSON IDs must be unquoted decimal integer tokens in `0…18446744073709551615`, not booleans, strings, fractions or exponents. Invalid/missing/overflowing IDs are dropped before handler dispatch, never coerced to zero. Successful and failed calls echo the exact valid ID. SDK counters must fail on exhaustion instead of rounding, narrowing or overwriting pending calls; complete cross-SDK boundary acceptance remains a beta release gate.
 
 ### Gateway HTTP implementation
 
@@ -362,6 +373,9 @@ WebSocket retain the standard Go HTTP path on the same listener. Set
 `APP_HTTP_TRANSPORT=standard` explicitly to use the standard HTTP implementation
 for HTTP/2 as well. Unknown values fail at startup. This startup setting selects
 the server implementation, not the JSON/Binary encoding or a client's HTTP version.
+Obsolete `Upgrade: h2c` requests remain HTTP/1.1; use TLS ALPN or cleartext
+prior knowledge for HTTP/2. Both modes retain ownership of their HTTP/2 connections
+during shutdown.
 
 ### Request and SQL Tracing
 
@@ -398,7 +412,7 @@ Registration, heartbeats, deregistration, metrics, and trace exports never follo
 
 ### Release and Stability Policy
 
-Cross-repository Swift CI pins candidate commit `c0fa9cc3334045ce488bd5d97d1a3a8c82ff8071` and checks that its `VERSION` matches the core, rather than following floating `main`. Local conformance against that commit does not replace remote checkout after pushing, the complete release gates, or publication; every candidate update must record the tested revisions and compatibility matrix again.
+The configured cross-repository Swift CI checkout is pinned to commit `9e45d47284827e06d1dfd649ff54876d0116d249` and checks that its `VERSION` matches the core, rather than following floating `main`. This configured revision does not verify the current uncommitted Swift working tree. Local conformance does not replace remote checkout after pushing, the complete release gates, or publication; every candidate update must record the tested revisions and compatibility matrix again.
 
 The next release target is **`v1.0.0-beta.1`**, not an already published stable release. Luxo follows [Semantic Versioning](https://semver.org/): Git tags use the `v` prefix; package versions use the format required by their ecosystem.
 
@@ -432,6 +446,8 @@ Go adapters and the CLI remain in this repository but are independently versione
 
 This table defines release coordinates, not publication status. Publish only after the release gates pass and authorization is granted. Verify the released coordinates in an external consumer with `GOWORK=off` and no local replacements; workspace builds alone cannot prove published dependency resolution. Applications require only their selected adapters. All Luxo module requirements, including the CLI's PG dependency, must match the first candidate version.
 
+The S3 adapter uses HTTPS when no endpoint is configured. Explicit HTTPS and `UseSSL=true` also require TLS; explicit HTTP remains available for private endpoints. Invalid bucket names return errors during construction or alternate-bucket URL generation.
+
 Studio releases must pin the tested core Go module, CLI, frontend SDKs, and CI checkout to the recorded release/commit, never floating `main` or `latest`. Local source overrides are development-only. Studio keeps an independent version; any later independent SDK releases still need a compatibility matrix, not an assumption based on version numbers. PostgreSQL is the currently implemented database backend; future database backends and new Studio features are outside this release freeze.
 
 #### Pre-Beta Internal RPC Upgrade (Under Validation)
@@ -456,6 +472,11 @@ Each new TCP connection exchanges a fixed preface and requires an exact `rpc.Pro
 Internal relation resolvers now require `keys` (field 1) and `shape` (field 2: bit 0 list, bit 1 nullable). Each response group is the canonical field value, including presence and length, with an object or columnar-list body generated by the target service. The gateway validates and copies those bytes without model decoding/re-encoding. Required missing objects and multiple rows for a single relation fail; empty lists and selected null values remain distinct. Regenerate both gateways and services together.
 
 Nested response regressions pass for the new format. Unary RPC errors now preserve raw JSON data, differing interpolation text and the internal-error flag without converting numbers to floating point. Generated TS, Dart, Kotlin and Swift consumers exercise error data through gateways over HTTP/WebSocket and JSON/Binary. Native stream completion and structured terminal errors also have direct-service and gateway consumer regressions in all four SDKs; complete release, device and remaining performance gates stay open. This does not freeze Beta.
+
+
+#### Pre-Beta Binary Array Writer Migration
+
+Ordinary Binary arrays use the same 0–1,000,000 element bound when reading and writing. Go `codec.AppendArrayHeader` now returns `([]byte, error)`; `Encoder.WriteArrayHeader` and typed array field writers return `error`. Swift `writeArrayHeader` now throws. Propagate these errors in handwritten encoders and regenerate clients/services. Generated requests, scalar-list responses, stream messages and event writers use checked counts; in-memory event snapshots reject oversized lists before copying. Columnar record counts retain their separate limit. Valid wire bytes are unchanged.
 
 #### Pre-Beta Error Data Interface Migration
 
@@ -503,6 +524,17 @@ consumers or reset delivery state as a task-recovery shortcut.
 `codec.LuxoMarshaler.MarshalLuxo` now returns `([]byte, error)`; rerun `luxo gen` for events and update handwritten implementations. Encoder Float value/field/array writers and ColumnarWriter Float column writers return `error`, rejecting NaN/infinities without committing a partial field or column. `rpc.EncodeParams` also returns `([]byte, error)` and rejects unsupported values instead of dropping parameters. NATS does not publish when marshaling fails; the existing `Emit` error return is unchanged.
 
 Generated model/type `WriteLuxo` and all `WriteColumnar` variants now return `error`; `codec.AppendFixed64` returns `([]byte,error)`, and `ResponseBuf.AppendFloat` returns `error`. Nested events, compiled/native handlers and internal RPC propagate failures. Direct ResponseBuf callers must discard the current output after a write error.
+
+Generated Go row/columnar model codecs and direct JSON/Binary input readers use
+`codec.MaxModelDepth` (64): the root object counts as one, list containers do not
+add object levels, and JSON fields retain their independent 128-level budget.
+Direct Go callers can test `errors.Is(err, codec.ErrModelDepth)`. Public codec
+signatures are unchanged; regenerate with the matching core runtime. Declaration
+sets without structured fields have a statically proven maximum object depth of
+one and retain the direct path. Discarded duplicate values, shared Schema
+conversion, all SDKs, complete coverage and performance remain beta acceptance
+work.
+
 
 `codec.ColumnarWriter.Bytes()` now returns `([]byte, error)`. It rejects nonempty zero-column output, invalid record/arena counts, nonpositive field IDs and inconsistent column lengths before touching the output buffer; failures return nil bytes. Callers must check the error. Empty lists retain `00 00 00`, and a selected all-null column remains valid. Call `Reset()` after inconsistent columns or invalid field IDs; generated direct writers already return errors and do not use this buffered helper. This API change does not imply performance acceptance for unmeasured workloads.
 

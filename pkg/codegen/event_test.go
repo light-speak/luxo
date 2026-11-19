@@ -1,13 +1,241 @@
 package codegen
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lexer"
+	"github.com/light-speak/luxo/pkg/parser"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestNativeEventHandlersCrossModule(t *testing.T) {
+	g := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
+		EventModule: map[string]string{"Changed": "producer"}, ModulePath: "example.com/service",
+	}})
+	result := &semantic.Result{Files: []*ast.File{{Name: "origin/consumer/events.luxo", Listeners: []*ast.OnDecl{
+		{EventName: "Changed", Native: true}, {EventName: "Changed", Native: true, Broadcast: true},
+	}}}}
+	code := string(g.generateEventFile(result, "luxo"))
+	for _, expected := range []string{
+		`"fmt"`, `producer_luxo "example.com/service/producer/luxo"`,
+		`OnChanged func(context.Context, producer_luxo.ChangedEvent) error`,
+		`nativeOnChanged := app.EventHandlers.OnChanged`,
+		`func(data []byte) (producer_luxo.ChangedEvent, error)`,
+	} {
+		if !strings.Contains(code, expected) {
+			t.Fatalf("missing %q in generated listener:\n%s", expected, code)
+		}
+	}
+	if strings.Count(code, "OnChanged func(") != 1 || strings.Count(code, "nativeOnChanged :=") != 1 {
+		t.Fatal("duplicate native handler declaration")
+	}
+	app := string(generateAppFile(result, "luxo", nil, DriverPG))
+	if !strings.Contains(app, "EventHandlers NativeEventHandlers") || !strings.Contains(app, "EventBus event.Bus") {
+		t.Fatalf("listener-only module has no event dependencies:\n%s", app)
+	}
+}
+
+func TestGeneratedValueDecoderRegistrations(t *testing.T) {
+	tokens, lexErrors := lexer.New(eventValueDecoderSource, "events.luxo").Tokenize()
+	if len(lexErrors) != 0 {
+		t.Fatal(lexErrors)
+	}
+	file, parseErrors := parser.New(tokens).Parse("events.luxo")
+	if len(parseErrors) != 0 {
+		t.Fatal(parseErrors)
+	}
+	result := semantic.Analyze([]*ast.File{file})
+	if len(result.Errors) != 0 {
+		t.Fatal(result.Errors)
+	}
+	ids := StableIDs{ModelFields: map[string]map[string]int{"DecodePlain": {"value": 1}}, EventFields: map[string]map[string]int{
+		"Plain": {"value": 1}, "Named": {"value": 1}, "Native": {"value": 1}, "Captured": {"value": 1},
+	}}
+	g := mustNewGenerator(t, GeneratorConfig{IDs: completeFixtureAPIIDs(result, ids)})
+	generated, err := g.Generate(result, "generated", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, streams := string(generated.Files["event.gen.go"]), string(generated.Files["stream.gen.go"])
+	for _, want := range []string{"event.OnQueueValueDecode(", "event.OnValueDecode(", "func(data []byte) (PlainEvent, error)", "func UnmarshalPlain(data []byte, v any) error"} {
+		if !strings.Contains(events, want) {
+			t.Errorf("missing %q in event source", want)
+		}
+	}
+	if !strings.Contains(streams, "event.OnValueDecode[PlainEvent](") || !strings.Contains(streams, "func(data []byte) (PlainEvent, error)") {
+		t.Error("event-backed stream retained pointer-target decoding")
+	}
+	if strings.Contains(events, "func DecodePlain(") || strings.Contains(events, "func DecodeNamed(") {
+		t.Error("value decoder introduced a global name that collides with business declarations")
+	}
+	if t.Failed() {
+		return
+	}
+	runGeneratedCompilation(t, generated, eventValueDecoderAssertions)
+}
+
+const eventValueDecoderSource = `
+type DecodePlain { value: Int }
+fn DecodeNamed(value: Int): Int { return value }
+api decoderNames(DecodePlain: Int, DecodeNamed: Int): Int { return DecodePlain + DecodeNamed }
+event Plain(value: Int)
+event Named(value: Int)
+event Native(value: Int)
+event Captured(value: Int)
+on Plain { emit Captured(value: it.value) }
+on Named @broadcast { emit Captured(value: it.value) }
+on Native @native
+api watch(): Int @stream(Plain) { true }
+`
+
+const eventValueDecoderAssertions = `package generated
+import("bytes";"context";"errors";"testing";"time";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/event")
+type valueDecoderBus struct{event.Bus;handlers map[string][]event.Handler;captured int64;queues []string}
+func(b *valueDecoderBus)On(name string,h event.Handler)error{b.handlers[name]=append(b.handlers[name],h);return nil}
+func(b *valueDecoderBus)OnQueue(name,group string,h event.Handler)error{b.queues=append(b.queues,group);return b.On(name,h)}
+func(b *valueDecoderBus)Emit(_ context.Context,name string,p any)error{if name!="Captured"{return errors.New("unexpected emission")};b.captured=p.(*CapturedEvent).Value;return nil}
+func(b *valueDecoderBus)deliver(ctx context.Context,name string,p any)error{for _,h:=range b.handlers[name]{if err:=h(ctx,p);err!=nil{return err}};return nil}
+func TestGeneratedValueEventListeners(t *testing.T){
+ bus:=&valueDecoderBus{handlers:map[string][]event.Handler{}}
+ var native int64;failure:=errors.New("native listener failed")
+ app:=&App{EventBus:bus,EventHandlers:NativeEventHandlers{OnNative:func(_ context.Context,p NativeEvent)error{native=p.Value;return failure}}}
+ if err:=RegisterEvents(bus,app);err!=nil{t.Fatal(err)}
+ for _,sample:=range []struct{name string;payload any;want int64}{{"Plain",PlainEvent{Value:7},7},{"Named",NamedEvent{Value:9},9}}{
+  if err:=bus.deliver(t.Context(),sample.name,sample.payload);err!=nil||bus.captured!=sample.want{t.Fatal(err,bus.captured)}
+ }
+ plain,err:=(&PlainEvent{Value:13}).MarshalLuxo();if err!=nil{t.Fatal(err)}
+ named,err:=(&NamedEvent{Value:17}).MarshalLuxo();if err!=nil{t.Fatal(err)}
+ for _,sample:=range []struct{name string;raw []byte;want int64}{{"Plain",plain,13},{"Named",named,17}}{
+  if err:=bus.deliver(t.Context(),sample.name,sample.raw);err!=nil||bus.captured!=sample.want{t.Fatal(err,bus.captured)}
+ }
+ if err:=bus.deliver(t.Context(),"Native",NativeEvent{Value:19});!errors.Is(err,failure)||native!=19{t.Fatal(err,native)}
+ raw,err:=(&NativeEvent{Value:23}).MarshalLuxo();if err!=nil{t.Fatal(err)}
+ if err:=bus.deliver(t.Context(),"Native",raw);!errors.Is(err,failure)||native!=23{t.Fatal(err,native)}
+ for _,name:=range []string{"Plain","Named","Native"}{
+  if err:=bus.deliver(t.Context(),name,[]byte{255});err==nil{t.Fatal("malformed wire reached listener",name)}
+  if err:=bus.deliver(t.Context(),name,42);!errors.Is(err,event.ErrUnexpectedPayload){t.Fatal(name,err)}
+ }
+ if bus.captured!=17||native!=23{t.Fatal("rejected payload changed business result")}
+ if got,err:=app.DecodeNamed(t.Context(),41);err!=nil||got!=41{t.Fatal(got,err)}
+ _=DecodePlain{Value:1}
+}
+func TestLegacyGeneratedEventDecoderCompatibility(t *testing.T){
+ var broadcast func(event.Bus,string,func([]byte,any)error,func(context.Context,PlainEvent)error)error=event.OnDecode[PlainEvent]
+ var queue func(event.Bus,string,string,func([]byte,any)error,func(context.Context,PlainEvent)error)error=event.OnQueueDecode[PlainEvent]
+ bus:=&valueDecoderBus{handlers:map[string][]event.Handler{}};var got int64
+ handler:=func(_ context.Context,p PlainEvent)error{got=p.Value;return nil}
+ if err:=broadcast(bus,"old",UnmarshalPlain,handler);err!=nil{t.Fatal(err)}
+ if err:=queue(bus,"queue","",UnmarshalPlain,handler);err!=nil{t.Fatal(err)}
+ raw,err:=(&PlainEvent{Value:29}).MarshalLuxo();if err!=nil{t.Fatal(err)}
+ for _,name:=range []string{"old","queue"}{if err:=bus.deliver(t.Context(),name,raw);err!=nil||got!=29{t.Fatal(err,got)}}
+ var decoded PlainEvent;if err:=UnmarshalPlain(raw,&decoded);err!=nil||decoded.Value!=29{t.Fatal(err,decoded)}
+ if err:=UnmarshalPlain(raw,&NamedEvent{});err==nil{t.Fatal("legacy target validation removed")}
+ if len(bus.queues)!=1||bus.queues[0]!=""{t.Fatal("empty queue group changed route")}
+}
+func TestGeneratedValueEventStream(t *testing.T){
+ bus:=&valueDecoderBus{handlers:map[string][]event.Handler{}};router:=api.NewRouter()
+ if err:=RegisterStreams(router,bus,nil);err!=nil{t.Fatal(err)}
+ sub,err:=router.OpenInternalStream(t.Context(),&api.Request{API:"watch",BinaryMode:true});if err!=nil{t.Fatal(err)};defer sub.Close()
+ raw,err:=(&PlainEvent{Value:9}).MarshalLuxo();if err!=nil{t.Fatal(err)}
+ for _,sample:=range []struct{payload any;wire []byte}{{PlainEvent{Value:8},[]byte{16}},{raw,[]byte{18}}}{
+  if err:=bus.deliver(t.Context(),"Plain",sample.payload);err!=nil{t.Fatal(err)}
+  select{case body:=<-sub.Messages():if !bytes.Equal(body,sample.wire){t.Fatalf("stream wire %x, want %x",body,sample.wire)};case <-time.After(time.Second):t.Fatal("stream event missing")}
+ }
+ if err:=bus.deliver(t.Context(),"Plain",[]byte{255});err==nil{t.Fatal("invalid stream wire accepted")}
+ if err:=bus.deliver(t.Context(),"Plain",42);!errors.Is(err,event.ErrUnexpectedPayload){t.Fatal(err)}
+}
+`
+
+func TestGeneratedValueDecoderOwnership(t *testing.T) {
+	files := make([]*ast.File, 0, 2)
+	for index, source := range []string{
+		"type DecodeRemote { value: Int }\nfn DecodeNativeRemote(value: Int): Int { return value }\nevent Remote(value: Int)\nevent NativeRemote(value: Int)",
+		"on Remote {}\non NativeRemote @native @broadcast\napi remoteWatch(): Int @stream(Remote) { true }",
+	} {
+		name := []string{"origin/producer/events.luxo", "origin/consumer/events.luxo"}[index]
+		tokens, lexErrors := lexer.New(source, name).Tokenize()
+		file, parseErrors := parser.New(tokens).Parse(name)
+		if len(lexErrors)+len(parseErrors) != 0 {
+			t.Fatal(lexErrors, parseErrors)
+		}
+		files = append(files, file)
+	}
+	result := semantic.AnalyzeModules(files)
+	if len(result.Errors) != 0 {
+		t.Fatal(result.Errors)
+	}
+	dir := writeProtocolFixture(t, "package generated\n", "package generated\n")
+	module := "github.com/light-speak/luxo/.tmp/" + filepath.Base(dir)
+	ids := StableIDs{ModelFields: map[string]map[string]int{"DecodeRemote": {"value": 1}}, EventFields: map[string]map[string]int{
+		"Remote": {"value": 1}, "NativeRemote": {"value": 1},
+	}}
+	g := mustNewGenerator(t, GeneratorConfig{IDs: completeFixtureAPIIDs(result, ids), Events: BuildEventContext(files, module)})
+	for index, file := range files {
+		generated, err := g.Generate(&semantic.Result{Files: []*ast.File{file}}, "generated", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := dir
+		if index == 0 {
+			target = filepath.Join(dir, "producer", "luxo")
+		} else {
+			for _, source := range []string{string(generated.Files["event.gen.go"]), string(generated.Files["stream.gen.go"])} {
+				if !strings.Contains(source, "func(data []byte) (producer_luxo.RemoteEvent, error)") {
+					t.Fatal("decoder lost its event owner prefix")
+				}
+			}
+		}
+		if err := os.MkdirAll(target, 0700); err != nil {
+			t.Fatal(err)
+		}
+		for name, data := range generated.Files {
+			if err := os.WriteFile(filepath.Join(target, name), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	assertions := strings.ReplaceAll(eventValueOwnerAssertions, "MODULE", module)
+	if err := os.WriteFile(filepath.Join(dir, "wire_test.go"), []byte(assertions), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout=90s", ".")
+	cmd.Dir = dir
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("cross-module value decoder: %v\n%s", err, output)
+	}
+}
+
+const eventValueOwnerAssertions = `package generated
+import("bytes";"context";"errors";"testing";"time";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/event";producer "MODULE/producer/luxo")
+type ownerDecoderBus struct{event.Bus;handlers map[string][]event.Handler;group string}
+func(b *ownerDecoderBus)On(name string,h event.Handler)error{b.handlers[name]=append(b.handlers[name],h);return nil}
+func(b *ownerDecoderBus)OnQueue(name,group string,h event.Handler)error{b.group=group;return b.On(name,h)}
+func(b *ownerDecoderBus)deliver(ctx context.Context,name string,p any)error{for _,h:=range b.handlers[name]{if err:=h(ctx,p);err!=nil{return err}};return nil}
+func TestOwnedValueDecoders(t *testing.T){
+ bus:=&ownerDecoderBus{handlers:map[string][]event.Handler{}};var got int64
+ app:=&App{EventBus:bus,EventHandlers:NativeEventHandlers{OnNativeRemote:func(_ context.Context,p producer.NativeRemoteEvent)error{got=p.Value;return nil}}}
+ if err:=RegisterEvents(bus,app);err!=nil{t.Fatal(err)}
+ if bus.group!="consumer"{t.Fatal("queue module changed",bus.group)}
+ if err:=bus.deliver(t.Context(),"NativeRemote",producer.NativeRemoteEvent{Value:7});err!=nil||got!=7{t.Fatal(err,got)}
+ raw,err:=(&producer.NativeRemoteEvent{Value:9}).MarshalLuxo();if err!=nil{t.Fatal(err)}
+ if err:=bus.deliver(t.Context(),"NativeRemote",raw);err!=nil||got!=9{t.Fatal(err,got)}
+ router:=api.NewRouter();if err:=RegisterStreams(router,bus,nil);err!=nil{t.Fatal(err)}
+ sub,err:=router.OpenInternalStream(t.Context(),&api.Request{API:"remoteWatch",BinaryMode:true});if err!=nil{t.Fatal(err)};defer sub.Close()
+ raw,err=(&producer.RemoteEvent{Value:11}).MarshalLuxo();if err!=nil{t.Fatal(err)}
+ if err:=bus.deliver(t.Context(),"Remote",raw);err!=nil{t.Fatal(err)}
+ select{case body:=<-sub.Messages():if !bytes.Equal(body,[]byte{22}){t.Fatalf("wire %x",body)};case <-time.After(time.Second):t.Fatal("owned stream event missing")}
+ if err:=bus.deliver(t.Context(),"Remote",[]byte{255});err==nil{t.Fatal("bad remote wire accepted")}
+ if err:=bus.deliver(t.Context(),"Remote",42);!errors.Is(err,event.ErrUnexpectedPayload){t.Fatal(err)}
+ var legacy producer.RemoteEvent;if err:=producer.UnmarshalRemote(raw,&legacy);err!=nil||legacy.Value!=11{t.Fatal(err,legacy)}
+ _=producer.DecodeRemote{Value:1};if got,err:=(&producer.App{}).DecodeNativeRemote(t.Context(),13);err!=nil||got!=13{t.Fatal(got,err)}
+}
+`
 
 func TestEventFieldWritersLeaveIncompleteFieldsUnchanged(t *testing.T) {
 	for _, field := range []struct {
@@ -32,8 +260,8 @@ func TestCrossModuleEventImportsIgnoreBodylessAPI(t *testing.T) {
 		EventModule: map[string]string{"Created": "owner"},
 	}})
 	result := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{Name: "listUsers"}}}}}
-	if imports := g.collectCrossModuleEventImports(result, nil, "consumer"); len(imports) != 0 {
-		t.Fatalf("bodyless API imported event owners: %v", imports)
+	if source := g.generateEventFile(result, "consumer"); source != nil {
+		t.Fatalf("bodyless API generated event file: %s", source)
 	}
 }
 
@@ -131,7 +359,7 @@ func TestGeneratedEventNullableReplacement(t *testing.T) {
 		{Name: "child", Type: &ast.TypeRef{Name: "EventChild", Nullable: true}},
 	}}
 	var source strings.Builder
-	source.WriteString("package generated\nimport (\"fmt\";\"github.com/shopspring/decimal\";\"github.com/light-speak/luxo/pkg/lux/codec\";\"github.com/light-speak/luxo/pkg/lux/api\";\"github.com/light-speak/luxo/pkg/lux/event\")\n")
+	source.WriteString("package generated\nimport (\"github.com/light-speak/luxo/pkg/lux\";\"fmt\";\"github.com/shopspring/decimal\";\"github.com/light-speak/luxo/pkg/lux/codec\";\"github.com/light-speak/luxo/pkg/lux/api\";\"github.com/light-speak/luxo/pkg/lux/event\")\n")
 	generateModel(&source, child, nil)
 	g.generateTypeWriteLuxo(&source, child, nil)
 	g.generateReadLuxo(&source, child, nil)
@@ -241,8 +469,8 @@ func TestEventFiniteBits(t *testing.T) {
 func TestEventRegistrationPropagatesSubscriptionErrors(t *testing.T) {
 	var b strings.Builder
 	g := &GeneratorContext{}
-	g.generateRegisterEvents(&b, []*ast.OnDecl{{EventName: "Completed"}}, "activity", "activity", nil, nil)
-	for _, expected := range []string{"func RegisterEvents(bus event.Bus, app *App) error", "if err := event.OnQueueDecode", "}); err != nil {", "return err"} {
+	g.generateRegisterEvents(&b, []*ast.OnDecl{{EventName: "Completed"}}, "activity", "activity", nil, nil, &semantic.Result{})
+	for _, expected := range []string{"func RegisterEvents(bus event.Bus, app *App) error", "if err := event.OnQueueValueDecode", "}); err != nil {", "return err"} {
 		if !strings.Contains(b.String(), expected) {
 			t.Errorf("missing %q in generated registration", expected)
 		}
@@ -318,7 +546,7 @@ func TestEventScalarWriteStatements(t *testing.T) {
 		{name: "datetime", typeName: "DateTime", want: "if err := enc.WriteDateTime(value); err != nil { return nil, err }"},
 		{name: "duration", typeName: "Duration", want: "enc.WriteInt(int64(value))"},
 		{name: "uuid", typeName: "UUID", want: "enc.WriteUUID([16]byte(value))"},
-		{name: "decimal", typeName: "Decimal", want: "if err := enc.WriteString(value.String()); err != nil { return nil, err }"},
+		{name: "decimal", typeName: "Decimal", want: "if err := enc.WriteString(lux.FormatDecimal(value)); err != nil { return nil, err }"},
 		{name: "bytes", typeName: "Bytes", want: "enc.WriteBytes(value)"},
 		{name: "json", typeName: "JSON", want: "if err := enc.WriteJSON(value); err != nil { return nil, err }"},
 		{name: "unknown", typeName: "Unknown", want: ""},
@@ -435,7 +663,7 @@ func TestGenerateEventFile(t *testing.T) {
 		"func (e *OrderCreatedEvent) MarshalLuxo() ([]byte, error)",
 		"event OrderCreated: expected *OrderCreatedEvent, got %T",
 		"func RegisterEvents(bus event.Bus, app *App)",
-		`event.OnQueueDecode(bus, "OrderCreated", "test", UnmarshalOrderCreated, func(ctx context.Context, e OrderCreatedEvent)`,
+		`event.OnQueueValueDecode(bus, "OrderCreated", "test", func(data []byte) (OrderCreatedEvent, error)`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(code, check) {
@@ -495,12 +723,12 @@ func TestGenerateEventListenerBroadcast(t *testing.T) {
 	src := generateEventFile(result, "mymodule")
 	code := string(src)
 
-	// @broadcast should use event.OnDecode (not event.OnQueueDecode)
-	if !strings.Contains(code, `event.OnDecode(bus, "ConfigChanged"`) {
-		t.Errorf("@broadcast should use event.OnDecode:\n%s", code)
+	// @broadcast should use the value-decoding broadcast entrypoint.
+	if !strings.Contains(code, `event.OnValueDecode(bus, "ConfigChanged"`) {
+		t.Errorf("@broadcast should use event.OnValueDecode:\n%s", code)
 	}
-	if strings.Contains(code, `event.OnQueueDecode`) {
-		t.Errorf("@broadcast should NOT use event.OnQueueDecode:\n%s", code)
+	if strings.Contains(code, `event.OnQueueValueDecode`) {
+		t.Errorf("@broadcast should not use event.OnQueueValueDecode:\n%s", code)
 	}
 }
 
@@ -522,11 +750,11 @@ func TestGenerateEventListenerMixed(t *testing.T) {
 	src := generateEventFile(result, "order")
 	code := string(src)
 
-	if !strings.Contains(code, `event.OnQueueDecode(bus, "OrderCreated", "test"`) {
-		t.Errorf("default listener should use OnQueueDecode:\n%s", code)
+	if !strings.Contains(code, `event.OnQueueValueDecode(bus, "OrderCreated", "test"`) {
+		t.Errorf("default listener should use OnQueueValueDecode:\n%s", code)
 	}
-	if !strings.Contains(code, `event.OnDecode(bus, "CacheInvalidate"`) {
-		t.Errorf("@broadcast listener should use OnDecode:\n%s", code)
+	if !strings.Contains(code, `event.OnValueDecode(bus, "CacheInvalidate"`) {
+		t.Errorf("@broadcast listener should use OnValueDecode:\n%s", code)
 	}
 }
 
@@ -684,9 +912,9 @@ func TestGenerateEventListenerNoParams(t *testing.T) {
 	if !strings.Contains(code, "payload PingEvent") {
 		t.Errorf("should default to 'payload' param:\n%s", code)
 	}
-	// Default should use OnQueueDecode
-	if !strings.Contains(code, `event.OnQueueDecode(bus, "Ping", "test"`) {
-		t.Errorf("default should use OnQueueDecode:\n%s", code)
+	// Default listeners retain queue delivery with a concrete decoder.
+	if !strings.Contains(code, `event.OnQueueValueDecode(bus, "Ping", "test"`) {
+		t.Errorf("default should use OnQueueValueDecode:\n%s", code)
 	}
 }
 
@@ -770,14 +998,14 @@ func TestCollectCrossModuleEventImports(t *testing.T) {
 	}
 	listeners := result.Files[0].Listeners
 
-	imports := generator.collectCrossModuleEventImports(result, listeners, "monitoring")
+	imports := generator.collectCrossModuleEventImports(listeners, "monitoring")
 	if imports["common"] != "common_luxo" {
 		t.Errorf("expected common_luxo import, got %v", imports)
 	}
 }
 
 func TestCollectCrossModuleEventImports_NoContext(t *testing.T) {
-	imports := defaultGenerator().collectCrossModuleEventImports(&semantic.Result{}, nil, "test")
+	imports := defaultGenerator().collectCrossModuleEventImports(nil, "test")
 	if len(imports) != 0 {
 		t.Error("should return empty without context")
 	}
@@ -816,8 +1044,8 @@ func TestGenerateEventFileCrossModule(t *testing.T) {
 	if !strings.Contains(code, "common_luxo.ProjectDeletedEvent") {
 		t.Errorf("should use cross-module event type:\n%s", code)
 	}
-	if !strings.Contains(code, "common_luxo.UnmarshalProjectDeleted") {
-		t.Errorf("should use cross-module unmarshal:\n%s", code)
+	if !strings.Contains(code, "func(data []byte) (common_luxo.ProjectDeletedEvent, error)") {
+		t.Errorf("should use the event owner's concrete decoder:\n%s", code)
 	}
 }
 
@@ -854,3 +1082,126 @@ func TestGenerateEventFileNeedsTime(t *testing.T) {
 		t.Errorf("listener with now() should import time:\n%s", code)
 	}
 }
+
+func TestCrossModuleEventImportsFollowListenerBodies(t *testing.T) {
+	g := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{EventModule: map[string]string{"Incoming": "source", "Outgoing": "target", "APIOnly": "other"}}})
+	listener := &ast.OnDecl{EventName: "Incoming", Body: &ast.Block{Stmts: []ast.Stmt{&ast.IfStmt{Condition: &ast.Literal{Kind: token.True, Value: "true"}, Then: &ast.Block{Stmts: []ast.Stmt{&ast.EmitStmt{EventName: "Outgoing"}}}}}}}
+	result := &semantic.Result{Files: []*ast.File{{APIs: []*ast.ApiDecl{{Body: &ast.Block{Stmts: []ast.Stmt{&ast.EmitStmt{EventName: "APIOnly"}}}}}}}}
+	result.Files[0].Name = "origin/consumer/events.luxo"
+	result.Files[0].Listeners = []*ast.OnDecl{listener}
+	code := string(g.generateEventFile(result, "consumer"))
+	if strings.Contains(code, "other_luxo") {
+		t.Fatalf("API-only import in event file: %s", code)
+	}
+	for _, want := range []string{"source_luxo.IncomingEvent", "target_luxo.EmitOutgoing"} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("missing %s in %s", want, code)
+		}
+	}
+	imports := g.collectCrossModuleEventImports([]*ast.OnDecl{listener}, "consumer")
+	if imports["source"] != "source_luxo" || imports["target"] != "target_luxo" {
+		t.Fatalf("missing listener imports: %v", imports)
+	}
+	if _, ok := imports["other"]; ok {
+		t.Fatalf("API-only import leaks into event file: %v", imports)
+	}
+}
+
+func TestGeneratedNativeListenerOnlyModule(t *testing.T) {
+	dir := writeProtocolFixture(t, "package generated\n", "package generated\n")
+	modulePath := "github.com/light-speak/luxo/.tmp/" + filepath.Base(dir)
+	files := []*ast.File{
+		{Name: "origin/source/events.luxo", Events: []*ast.EventDecl{{Name: "Incoming"}}},
+		{Name: "origin/consumer/events.luxo", Listeners: []*ast.OnDecl{{EventName: "Incoming", Native: true}}},
+	}
+	analyzed := semantic.AnalyzeModules(files)
+	if len(analyzed.Errors) != 0 {
+		t.Fatal(analyzed.Errors)
+	}
+	generator := mustNewGenerator(t, GeneratorConfig{Events: BuildEventContext(files, modulePath)})
+	for index, file := range files {
+		generated, err := generator.Generate(&semantic.Result{Files: []*ast.File{file}}, "generated", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := dir
+		if index == 0 {
+			target = filepath.Join(dir, "source", "luxo")
+		}
+		if err := os.MkdirAll(target, 0700); err != nil {
+			t.Fatal(err)
+		}
+		for name, data := range generated.Files {
+			if err := os.WriteFile(filepath.Join(target, name), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	assertions := strings.ReplaceAll(`package generated
+import("context";"testing";"time";"github.com/light-speak/luxo/pkg/lux/event";source "MODULE/source/luxo")
+func TestNativeListenerOnly(t *testing.T){
+ bus:=event.NewChanBus(4);defer bus.Close()
+ app:=&App{EventBus:bus}
+ if err:=RegisterEvents(bus,app);err==nil{t.Fatal("missing callback accepted")}
+ received:=make(chan struct{},1)
+ app.EventHandlers.OnIncoming=func(context.Context,source.IncomingEvent)error{received<-struct{}{};return nil}
+ if err:=RegisterEvents(bus,app);err!=nil{t.Fatal(err)}
+ if err:=source.EmitIncoming(t.Context(),bus,source.IncomingEvent{});err!=nil{t.Fatal(err)}
+ select{case <-received:case <-time.After(time.Second):t.Fatal("native listener not invoked")}
+}
+`, "MODULE", modulePath)
+	if err := os.WriteFile(filepath.Join(dir, "wire_test.go"), []byte(assertions), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout=30s", ".")
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("native listener-only module: %v\n%s", err, out)
+	}
+}
+
+func TestGeneratedCrossModuleListenerForwarding(t *testing.T) {
+	dir := writeProtocolFixture(t, "package generated\n", "package generated\n")
+	modulePath := "github.com/light-speak/luxo/.tmp/" + filepath.Base(dir)
+	context := &EventContext{ModulePath: modulePath, EventModule: map[string]string{"Incoming": "source", "Outgoing": "target", "APIOnly": "other"}}
+	generator := mustNewGenerator(t, GeneratorConfig{Events: context})
+	for _, item := range []struct{ module, event string }{{"source", "Incoming"}, {"target", "Outgoing"}} {
+		result := &semantic.Result{Files: []*ast.File{{Name: "origin/" + item.module + "/events.luxo", Events: []*ast.EventDecl{{Name: item.event}}}}}
+		path := filepath.Join(dir, item.module, "luxo")
+		if err := os.MkdirAll(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "event.gen.go"), generator.generateEventFile(result, "generated"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "app.go"), []byte("package generated\ntype App struct{}\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listener := &ast.OnDecl{EventName: "Incoming", Body: &ast.Block{Stmts: []ast.Stmt{&ast.IfStmt{Condition: &ast.Literal{Kind: token.True, Value: "true"}, Then: &ast.Block{Stmts: []ast.Stmt{&ast.EmitStmt{EventName: "Outgoing"}}}}}}}
+	result := &semantic.Result{Files: []*ast.File{{Name: "origin/consumer/events.luxo", Listeners: []*ast.OnDecl{listener}, APIs: []*ast.ApiDecl{{Body: &ast.Block{Stmts: []ast.Stmt{&ast.EmitStmt{EventName: "APIOnly"}}}}}}}}
+	if err := os.WriteFile(filepath.Join(dir, "event.gen.go"), generator.generateEventFile(result, "generated"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	assertion := strings.ReplaceAll(crossModuleListenerAssertions, "MODULE", modulePath)
+	if err := os.WriteFile(filepath.Join(dir, "wire_test.go"), []byte(assertion), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("go", "test", "-race", "-count=1", "-timeout=30s", ".")
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("cross-module listener: %v\n%s", err, out)
+	}
+}
+
+const crossModuleListenerAssertions = `package generated
+import("context";"testing";"time";"github.com/light-speak/luxo/pkg/lux/event";source "MODULE/source/luxo";target "MODULE/target/luxo")
+type App struct{EventBus event.Bus}
+func TestForwarding(t *testing.T){
+ bus:=event.NewChanBus(4);defer bus.Close();received:=make(chan struct{},1)
+ if err:=event.OnDecode(bus,"Outgoing",target.UnmarshalOutgoing,func(context.Context,target.OutgoingEvent)error{received<-struct{}{};return nil});err!=nil{t.Fatal(err)}
+ if err:=RegisterEvents(bus,&App{EventBus:bus});err!=nil{t.Fatal(err)}
+ if err:=source.EmitIncoming(t.Context(),bus,source.IncomingEvent{});err!=nil{t.Fatal(err)}
+ select{case <-received:case <-time.After(5*time.Second):t.Fatal("missing cross-module event")}
+}
+`

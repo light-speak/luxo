@@ -3,6 +3,8 @@ import 'dart:io';
 // Compile a scratch copy so the probe can exercise real private dispatch methods
 // without adding benchmark hooks or reflection to the shipped transport.
 Future<void> main(List<String> args) async {
+  final verify = args.contains('--verify');
+  args = args.where((arg) => arg != '--verify').toList();
   if (args.isEmpty || !['exe', 'js', 'wasm'].contains(args.first)) {
     throw ArgumentError('Expected exe, js or wasm');
   }
@@ -40,6 +42,7 @@ Future<void> main(List<String> args) async {
       '-o',
       output,
     ]);
+    if (verify) return;
     final executable = platform == 'exe' ? output : 'node';
     final arguments = platform == 'exe'
         ? <String>[]
@@ -133,10 +136,11 @@ File _writeProbe(Directory directory, String kind, String? before) {
   final probe = File('benchmark/websocket_${kind}_probe.dart.txt')
       .readAsStringSync();
   final baseline = before == null ? '' : _snapshotBaseline(before);
+  final lifecycle = File('benchmark/websocket_lifecycle_support.dart.txt')
+      .readAsStringSync();
   final support = before == null
-      ? ''
-      : File('benchmark/websocket_lifecycle_support.dart.txt')
-            .readAsStringSync();
+      ? lifecycle.substring(lifecycle.indexOf('class _ProbeSocket '))
+      : lifecycle;
   return File('${directory.path}/probe.dart')..writeAsStringSync(
     "import '$benchmark' as benchmark;\n"
     "import '$clockNative' if (dart.library.js_interop) '$clockWeb' as clock;\n"

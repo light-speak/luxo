@@ -43,6 +43,7 @@ type ModelLock struct {
 	Fields     map[string]int    `json:"fields"`
 	FieldTypes map[string]string `json:"field_types,omitempty"`
 	Reserved   []int             `json:"reserved,omitempty"`
+	typeInfo   *typeLockMetadata
 }
 
 // MarshalJSON outputs fields sorted by ID value instead of alphabetically.
@@ -61,6 +62,12 @@ func (ml *ModelLock) MarshalJSON() ([]byte, error) {
 
 	var b []byte
 	b = append(b, '{')
+	if ml.kind() != "" {
+		b = append(b, `"kind":`...)
+		kind, _ := json.Marshal(ml.kind())
+		b = append(b, kind...)
+		b = append(b, ',')
+	}
 	b = append(b, `"next_id":`...)
 	b = strconv.AppendInt(b, int64(ml.NextID), 10)
 
@@ -79,6 +86,11 @@ func (ml *ModelLock) MarshalJSON() ([]byte, error) {
 		b = append(b, `,"field_types":`...)
 		fieldTypes, _ := json.Marshal(ml.FieldTypes)
 		b = append(b, fieldTypes...)
+	}
+	if ml.typeInfo != nil && len(ml.typeInfo.defaultIDs) != 0 {
+		b = append(b, `,"default_fields":`...)
+		defaults, _ := json.Marshal(ml.typeInfo.defaultIDs)
+		b = append(b, defaults...)
 	}
 
 	if len(ml.Reserved) > 0 {
@@ -183,6 +195,7 @@ func (lf *LockFile) updateTypes(files []*ast.File) {
 			}
 			currentTypes[td.Name] = fields
 		}
+		collectSealedIDSpaces(currentTypes, file.Sealeds)
 	}
 
 	// Reserve IDs for removed fields.
@@ -206,6 +219,7 @@ func (lf *LockFile) updateTypes(files []*ast.File) {
 				}
 				lf.Types[td.Name] = ml
 			}
+			ml.setKind("")
 			for _, f := range td.Fields {
 				if _, ok := ml.Fields[f.Name]; ok {
 					continue
@@ -214,6 +228,7 @@ func (lf *LockFile) updateTypes(files []*ast.File) {
 				ml.NextID++
 			}
 		}
+		lf.updateSealedIDs(file.Sealeds)
 	}
 }
 
@@ -358,6 +373,10 @@ func (lf *LockFile) assignModelFields(m *ast.ModelDecl) {
 
 // reserveAllFields moves all field IDs to reserved.
 func (lf *LockFile) reserveAllFields(ml *ModelLock) {
+	// Retired payload namespaces retain their kind, but no active defaults.
+	if ml.typeInfo != nil {
+		ml.typeInfo.defaultIDs = nil
+	}
 	reserved := make(map[int]bool, len(ml.Reserved))
 	for _, id := range ml.Reserved {
 		reserved[id] = true

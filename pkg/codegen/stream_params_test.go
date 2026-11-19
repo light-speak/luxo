@@ -32,12 +32,14 @@ func TestGeneratedStructuredStreamSnapshot(t *testing.T) {
 		{Name: "children", Type: &ast.TypeRef{Name: "Child", IsList: true}},
 	}}
 	g := generatorWithModelFieldIDs(map[string]map[string]int{"Child": {"data": 1, "document": 2}, "Input": {"name": 1, "data": 2, "document": 3, "child": 4, "children": 5}})
+	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{child, input}}}}
+	g = g.withModelReferences(result)
 	var source strings.Builder
 	source.WriteString(`package generated
 import("bytes";"encoding/json";"fmt";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/jsonutil";"github.com/light-speak/luxo/pkg/lux/schema")
 `)
 	for _, model := range []*ast.ModelDecl{child, input} {
-		generateModel(&source, model, nil)
+		g.generateModel(&source, model, nil)
 		g.generateReadLuxo(&source, model, nil)
 		g.generateReadColumnar(&source, model, nil)
 		g.generateReadJSONInput(&source, model, nil)
@@ -60,7 +62,6 @@ import("bytes";"encoding/json";"fmt";"github.com/light-speak/luxo/pkg/lux/api";"
 			}
 		}
 	}
-	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{child, input}}}}
 	writeStreamInputOwners(&source, result, streams, nil)
 	metadata := string(g.generateSchemaFile(result, "generated", nil))
 	source.WriteString(metadata[strings.Index(metadata, "func RegisterSchema"):])
@@ -86,10 +87,21 @@ func TestStructuredOwnership(t *testing.T){
 `
 
 func TestGeneratedNativeStreamPreparedACK(t *testing.T) {
+	testGeneratedNativeStreamPreparedACK(t, "limit")
+}
+
+func TestGeneratedNativeStreamBindingNamesAcrossRPC(t *testing.T) {
+	for _, name := range []string{"req", "snapshot", "err"} {
+		t.Run(name, func(t *testing.T) { testGeneratedNativeStreamPreparedACK(t, name) })
+	}
+}
+
+func testGeneratedNativeStreamPreparedACK(t *testing.T, parameter string) {
+	t.Helper()
 	file := &ast.File{Name: "stream.luxo", Enums: []*ast.EnumDecl{{Name: "State", Values: []string{"OPEN", "CLOSED"}}}, APIs: []*ast.ApiDecl{{
 		Name: "watch", ReturnType: &ast.TypeRef{Name: "Int"}, Params: []*ast.ParamDecl{
 			{Name: "state", Type: &ast.TypeRef{Name: "State"}},
-			{Name: "limit", Type: &ast.TypeRef{Name: "Int"}, Default: &ast.Literal{Kind: token.Int, Value: "7"}},
+			{Name: parameter, Type: &ast.TypeRef{Name: "Int"}, Default: &ast.Literal{Kind: token.Int, Value: "7"}},
 		}, Directives: []*ast.Directive{{Name: "native"}, {Name: "stream"}, {Name: "auth", Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "Admin"}}}}},
 	}}}
 	var proxy strings.Builder
@@ -98,6 +110,8 @@ func TestGeneratedNativeStreamPreparedACK(t *testing.T) {
 	if os.Getenv("LUXO_STREAM_PREPARE_BENCHMARK") == "1" {
 		assertions = strings.Replace(assertions, `"bytes";`, `"bytes";"encoding/json";`, 1) + nativePreparedLifecycleBenchmark
 	}
+	assertions = strings.ReplaceAll(assertions, "limit", parameter)
+	assertions = strings.ReplaceAll(assertions, "Limit", strings.ToUpper(parameter[:1])+parameter[1:])
 	runGeneratedProtocolPackage(t, string(generateStreamFile(&semantic.Result{Files: []*ast.File{file}}, "generated")), assertions)
 }
 
@@ -108,10 +122,6 @@ import("bytes";"context";"fmt";"net";"net/http";"net/http/httptest";"strings";"s
 "github.com/light-speak/luxo/pkg/lux/auth";"nhooyr.io/websocket")
 type State string
 func(s State)IsValid()bool{return s=="OPEN"||s=="CLOSED"}
-type claims string
-func(c claims)ID()int64{return 42}
-func(c claims)Int(string)int64{return 42}
-func(c claims)String(string)string{return string(c)}
 type preparedResolver struct{calls atomic.Int32}
 func(r *preparedResolver)HandleWatch(_ context.Context,p *WatchStreamParams,_ any,s *api.TypedStream[int64])error {r.calls.Add(1);return s.Send(p.Limit)}
 func preparedTestRouter(role string)(*api.Router,*preparedResolver,error){
@@ -121,7 +131,12 @@ func preparedTestRouter(role string)(*api.Router,*preparedResolver,error){
         {ID:1,Name:"state",Type:schema.FieldEnum,TypeName:"State"},{ID:2,Name:"limit",Type:schema.FieldInt,HasDefault:true},
     }});err!=nil{return nil,nil,err}
     if err:=router.Registry.RegisterSchemaAPIs(router.Schema);err!=nil{return nil,nil,err}
-    router.IdentityExtractor=func(context.Context)any{if role==""{return nil};return claims(role)}
+    if role!=""{
+        cfg:=&auth.Config{Secret:"prepared-stream-identity-test",Expires:time.Hour}
+        token,err:=auth.Sign(cfg,func(dst []byte)([]byte,error){return fmt.Appendf(dst,"{\"id\":42,\"role\":%q}",role),nil});if err!=nil{return nil,nil,err}
+        identity,err:=auth.Verify(cfg,token);if err!=nil{return nil,nil,err}
+        router.IdentityExtractor=func(context.Context)any{return identity}
+    }
     resolver:=&preparedResolver{};err:=RegisterStreams(router,nil,resolver)
     return router,resolver,err
 }
@@ -197,6 +212,25 @@ func BenchmarkStreamPreparationLifecycle(b *testing.B){
     })}
 }
 `
+
+func TestGeneratedStreamSnapshotBindingNames(t *testing.T) {
+	params := []*ast.ParamDecl{}
+	for _, name := range []string{"ctx", "req", "err", "snapshot", "_luxoParam0"} {
+		params = append(params, &ast.ParamDecl{Name: name, Type: &ast.TypeRef{Name: "Int"}})
+	}
+	var source strings.Builder
+	source.WriteString("package generated\nimport \"github.com/light-speak/luxo/pkg/lux/api\"\n")
+	writeStreamParameterSnapshot(&source, streamInfo{apiName: "watch", params: params}, nil)
+	runGeneratedProtocolPackage(t, source.String(), `package generated
+import("encoding/json";"testing";"github.com/light-speak/luxo/pkg/lux/api")
+func TestSnapshotNames(t *testing.T){
+ request:=&api.Request{Params:map[string]json.RawMessage{"ctx":[]byte("1"),"req":[]byte("2"),"err":[]byte("3"),"snapshot":[]byte("4"),"_luxoParam0":[]byte("5")}}
+ var snapshot WatchStreamParams
+ if err:=snapshot.readRequest(request);err!=nil{t.Fatal(err)}
+ if snapshot.Ctx!=1 || snapshot.Req!=2 || snapshot.Err!=3 || snapshot.Snapshot!=4 {t.Fatal(snapshot)}
+}
+`)
+}
 
 func TestGeneratedStreamParameterSnapshot(t *testing.T) {
 	declaration := &ast.ApiDecl{Name: "watch", Params: []*ast.ParamDecl{

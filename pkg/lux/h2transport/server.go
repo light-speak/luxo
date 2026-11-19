@@ -11,8 +11,8 @@ import (
 )
 
 // Server implements bounded HTTP/2 unary transport for Luxo handlers.
-// HTTP/1.1 upgrades and WebSocket connections need a separate HTTP/1.1 handler.
-// Gateway integration and production acceptance are separate from this engine.
+// ConfigureHTTPServer keeps HTTP/1.1 and WebSocket upgrades with net/http.
+// Gateway owners drain both servers; HTTP/2 peers use this engine's limits.
 type Server struct {
 	limits      Limits
 	budget      byteBudget

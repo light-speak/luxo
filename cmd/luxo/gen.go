@@ -72,23 +72,27 @@ func runGen(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	modulePath, err := goModulePath()
+	if err != nil {
+		return err
+	}
+
 	lf, err := updateLockFileAndReturn(files)
 	if err != nil {
 		return err
 	}
 
-	generator, err := buildProjectGenerator(lf, files)
+	generator, err := buildProjectGeneratorWithModulePath(lf, files, modulePath)
 	if err != nil {
 		return err
 	}
 
-	totalFiles, err := generateModules(result, generator)
+	totalFiles, err := generateModulesWithModulePath(result, generator, modulePath)
 	if err != nil {
 		return err
 	}
 
 	// Generate entry points
-	modulePath, _ := readModulePath()
 	if modulePath != "" {
 		// Embedded entry: lucis/app/main.gen.go (all modules, single process)
 		if err := generateEntry(result, modulePath, backends); err != nil {
@@ -166,6 +170,14 @@ func loadGenerationEnvironment(path string) error {
 }
 
 func buildProjectGenerator(lf *lockfile.LockFile, files []*ast.File) (*codegen.GeneratorContext, error) {
+	modulePath, err := goModulePath()
+	if err != nil {
+		return nil, err
+	}
+	return buildProjectGeneratorWithModulePath(lf, files, modulePath)
+}
+
+func buildProjectGeneratorWithModulePath(lf *lockfile.LockFile, files []*ast.File, modulePath string) (*codegen.GeneratorContext, error) {
 	eventIDs := make(map[string]map[string]int, len(lf.Events))
 	for name, event := range lf.Events {
 		eventIDs[name] = event.Fields
@@ -184,7 +196,6 @@ func buildProjectGenerator(lf *lockfile.LockFile, files []*ast.File) (*codegen.G
 		paramIDs[name] = api.Params
 	}
 
-	modulePath := goModulePath()
 	sharedEnumPackage := ""
 	if modulePath != "" {
 		sharedEnumPackage = modulePath + "/internal/luxotypes"
@@ -216,13 +227,14 @@ func findSchemaFiles() ([]string, error) {
 			files = append(files, filepath.Join("origin", e.Name()))
 		} else if e.IsDir() {
 			// Directory module: origin/user/*.luxo
-			subEntries, err := os.ReadDir(filepath.Join("origin", e.Name()))
+			moduleDir := filepath.Join("origin", e.Name())
+			subEntries, err := os.ReadDir(moduleDir)
 			if err != nil {
-				continue
+				return nil, err
 			}
 			for _, se := range subEntries {
 				if !se.IsDir() && strings.HasSuffix(se.Name(), ".luxo") {
-					files = append(files, filepath.Join("origin", e.Name(), se.Name()))
+					files = append(files, filepath.Join(moduleDir, se.Name()))
 				}
 			}
 		}
@@ -282,7 +294,7 @@ func analyzeFiles(files []*ast.File) (*semantic.Result, error) {
 	for _, w := range result.Warnings {
 		fmt.Fprintf(os.Stderr, "warning: %s:%d: %s\n", w.Pos.File, w.Pos.Line, w.Message)
 	}
-	return result, nil
+	return semantic.CompilationView(result)
 }
 
 func loadCachePolicies(path string) (*cachepolicy.Catalog, error) {
@@ -324,6 +336,14 @@ func validateWireCompatibility(lf *lockfile.LockFile, files []*ast.File, allow b
 }
 
 func generateModules(result *semantic.Result, generator *codegen.GeneratorContext) (int, error) {
+	modulePath, err := goModulePath()
+	if err != nil {
+		return 0, err
+	}
+	return generateModulesWithModulePath(result, generator, modulePath)
+}
+
+func generateModulesWithModulePath(result *semantic.Result, generator *codegen.GeneratorContext, modulePath string) (int, error) {
 	files := result.Files
 	if err := generateSharedEnums(generator); err != nil {
 		return 0, err
@@ -342,6 +362,7 @@ func generateModules(result *semantic.Result, generator *codegen.GeneratorContex
 	}
 	// Group files by module — directory name or file name without .luxo
 	modules := groupByModule(files)
+	commonGlobals := commonModuleGlobals(modules["common"])
 
 	total := 0
 	for moduleName, moduleFiles := range modules {
@@ -349,7 +370,11 @@ func generateModules(result *semantic.Result, generator *codegen.GeneratorContex
 		if err := os.MkdirAll(outDir, 0755); err != nil {
 			return 0, fmt.Errorf("create %s: %w", outDir, err)
 		}
-		singleResult := &semantic.Result{Files: moduleFiles, ExecutionCacheDependencies: result.ExecutionCacheDependencies, CachePolicies: result.CachePolicies}
+		sharedGlobals := commonGlobals
+		if moduleName == "common" {
+			sharedGlobals = nil
+		}
+		singleResult := moduleCompilationResult(result, moduleFiles, sharedGlobals)
 		gr, err := generator.Generate(singleResult, "luxo", softModels)
 		if err != nil {
 			return 0, fmt.Errorf("generate module %s: %w", moduleName, err)
@@ -381,14 +406,15 @@ func generateModules(result *semantic.Result, generator *codegen.GeneratorContex
 		// Auto-create resolver package if it doesn't exist
 		resolverDir := filepath.Join("service", moduleName, "resolver")
 		resolverFile := filepath.Join(resolverDir, "resolver.go")
-		if _, err := os.Stat(resolverFile); os.IsNotExist(err) {
+		if _, err := os.Stat(resolverFile); err != nil {
+			if !os.IsNotExist(err) {
+				return 0, err
+			}
 			if err := os.MkdirAll(resolverDir, 0755); err != nil {
 				return 0, fmt.Errorf("create %s: %w", resolverDir, err)
 			}
-			// Read go.mod to get module path
-			modPath, _ := readModulePath()
 			resolverSrc := fmt.Sprintf("package resolver\n\nimport luxo %q\n\n// Setup registers @native resolvers.\nfunc Setup(app *luxo.App) {}\n",
-				modPath+"/service/"+moduleName+"/luxo")
+				modulePath+"/service/"+moduleName+"/luxo")
 			if err := os.WriteFile(resolverFile, []byte(resolverSrc), 0644); err != nil {
 				return 0, fmt.Errorf("write %s: %w", resolverFile, err)
 			}
@@ -537,9 +563,16 @@ func generateSharedEnums(generator *codegen.GeneratorContext) error {
 	return os.WriteFile(path, source, 0644)
 }
 
-func goModulePath() string {
-	p, _ := readModulePath()
-	return p
+// A missing module file preserves service-only generation and deploy defaults.
+func goModulePath() (string, error) {
+	path, err := readModulePath()
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read go.mod module path: %w", err)
+	}
+	return path, nil
 }
 
 func generateEntry(result *semantic.Result, modulePath string, backends ...codegen.EntryBackends) error {

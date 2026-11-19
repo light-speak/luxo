@@ -16,15 +16,18 @@ type Bus interface {
 
 	// On registers a broadcast handler — every instance receives the event.
 	// Use for cache invalidation, config refresh, etc.
+	// A nil handler is rejected before creating subscription resources.
 	On(name string, handler Handler) error
 
 	// OnQueue registers a queue handler — only one instance per group
 	// receives each event. Different groups each get a copy.
 	// group is typically the module name (auto-set by codegen).
+	// A nil handler is rejected before creating subscription resources.
 	OnQueue(name string, group string, handler Handler) error
 
-	// Close shuts down the bus and all subscriptions.
-	Close()
+	// Close shuts down the bus and all subscriptions, returning shutdown failures.
+	// Concurrent or repeated calls preserve the first shutdown result.
+	Close() error
 }
 
 // Handler processes an event payload and returns an error if processing fails.

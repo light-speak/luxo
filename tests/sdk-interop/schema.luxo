@@ -11,6 +11,11 @@ api issueFixtureAccess(): String {
   return principal.createToken()
 }
 
+api issueExpiringFixtureAccess(): String {
+  val principal = fixturePrincipal()?
+  return principal.createToken(expires: 3s)
+}
+
 api issueFixtureRefresh(): String {
   val principal = fixturePrincipal()?
   return principal.createRefreshToken()
@@ -22,6 +27,15 @@ api exchangeFixtureRefresh(token: String): String {
 }
 
 api fixtureIdentity(): Int @auth { return my.id }
+
+type FixtureStreamStats {
+  started: Int
+  active: Int
+}
+
+api fixtureStreamStats(): FixtureStreamStats @native
+
+api watchFixtureTimestamp(value: DateTime): DateTime @auth @stream @native
 
 /// Invalid queries must be rejected before accessing this unconfigured database.
 model QueryProbe @crud(only: [list]) {
@@ -294,3 +308,87 @@ api listScalarArrays(input: ScalarArrays): [ScalarArrays] {
 }
 
 api watchScalarArrays(state: Int): ScalarArrays @stream @native
+
+// Exercise inline and overflow slots through generated SDK requests.
+api echoManyParameters(
+  p0: Int = 0,
+  p1: Int = 0,
+  p2: Int = 0,
+  p3: Int = 0,
+  p4: Int = 0,
+  p5: Int = 0,
+  p6: Int = 0,
+  p7: Int = 0,
+  p8: Int = 0,
+  p9: Int = 0,
+  p10: Int = 0,
+  p11: Int = 0,
+  p12: Int = 0,
+  p13: Int = 0,
+  p14: Int = 0,
+  p15: Int = 0,
+  p16: Int = 0,
+  p17: Int = 0,
+  p18: Int = 0,
+  p19: Int = 0,
+  p20: Int = 0,
+  p21: Int = 0,
+  p22: Int = 0,
+  p23: Int = 0,
+  p24: Int = 0,
+  p25: Int = 0,
+  p26: Int = 0,
+  p27: Int = 0,
+  p28: Int = 0,
+  p29: Int = 0,
+  p30: Int = 0,
+  p31: Int = 0,
+  p32: Int = 0,
+  p33: Int = 0,
+  p34: Int = 0,
+  p35: Int = 0,
+  p36: Int = 0,
+  p37: Int = 0,
+  p38: Int = 0,
+  p39: Int = 0,
+  p40: Int = 0,
+  p41: Int = 0,
+  p42: Int = 0,
+  p43: Int = 0,
+  p44: Int = 0,
+  p45: Int = 0,
+  p46: Int = 0,
+  p47: Int = 0,
+  p48: Int = 0,
+  p49: Int = 0,
+  p50: Int = 0,
+  p51: Int = 0,
+  p52: Int = 0,
+  p53: Int = 0,
+  p54: Int = 0,
+  p55: Int = 0,
+  p56: Int = 0,
+  p57: Int = 0,
+  p58: Int = 0,
+  p59: Int = 0,
+  p60: Int = 0,
+  p61: Int = 0,
+  p62: Int = 0,
+  p63: Int = 0,
+  p64: Int = 7
+): Int {
+  return p0 + p16 + p64
+}
+
+/// JSON null remains a supplied field inside structured inputs and projections.
+type JSONSnapshot {
+  payload: JSON
+}
+
+api zEchoJSONSnapshot(input: JSONSnapshot): JSONSnapshot {
+  return input
+}
+
+api zListJSONSnapshots(inputs: [JSONSnapshot]): [JSONSnapshot] {
+  return inputs
+}

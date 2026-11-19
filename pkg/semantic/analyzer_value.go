@@ -2,6 +2,24 @@ package semantic
 
 import "github.com/light-speak/luxo/pkg/ast"
 
+func (a *Analyzer) checkIsolatedLoopBlock(block *ast.Block, scope *Scope) {
+	previous := a.loopDepth
+	a.loopDepth = 0
+	a.checkBlock(block, scope)
+	a.loopDepth = previous
+}
+
+func (a *Analyzer) checkAsyncExpr(expr *ast.AsyncExpr, scope *Scope) *ResolvedType {
+	if a.asyncResult == nil {
+		a.asyncResult = &ResolvedType{Kind: TypeVoid, Name: "Void"}
+	}
+	previous := a.expectedReturn
+	a.expectedReturn = a.asyncResult
+	a.checkIsolatedLoopBlock(expr.Body, scope.Child())
+	a.expectedReturn = previous
+	return a.asyncResult
+}
+
 // A branch block has its own return boundary. Its result is the first
 // unconditional return or the final expression, never an implicit zero value.
 func (a *Analyzer) checkWhenBranch(expr ast.Expr, scope *Scope, required bool) *ResolvedType {
@@ -17,10 +35,13 @@ func (a *Analyzer) checkWhenBranch(expr ast.Expr, scope *Scope, required bool) *
 }
 
 func (a *Analyzer) checkWhenBlock(block *ast.LambdaExpr, child *Scope, required bool) *ResolvedType {
-	previousLambda, previousReturn := a.inLambda, a.expectedReturn
-	a.inLambda, a.expectedReturn = true, nil
+	previousReturn, previousDepth := a.expectedReturn, a.loopDepth
+	a.expectedReturn = nil
+	if required {
+		a.loopDepth = 0
+	}
 	a.checkResultBlock(block.Body, child, required)
-	a.inLambda, a.expectedReturn = previousLambda, previousReturn
+	a.expectedReturn, a.loopDepth = previousReturn, previousDepth
 	var result *ResolvedType
 	var value ast.Expr
 	if block.Body != nil {
@@ -32,9 +53,9 @@ func (a *Analyzer) checkWhenBlock(block *ast.LambdaExpr, child *Scope, required 
 	}
 	if result != nil {
 		if required {
-			a.checkCollectionReturns(block.Body, result, false)
+			a.checkCollectionReturns(block.Body, result)
 		}
-		setExprResolvedType(block, result)
+		a.setExprResolvedType(block, result)
 	}
 	return result
 }
@@ -58,6 +79,8 @@ func (a *Analyzer) checkResultBlock(block *ast.Block, scope *Scope, required boo
 	}
 }
 
+// The normal caller supplies a parsed lambda body, including a non-nil empty block.
+// Retain the nil-body fallback for incomplete metadata.
 func blockThrows(block *ast.Block) bool {
 	if block == nil {
 		return false

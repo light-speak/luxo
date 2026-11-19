@@ -119,7 +119,7 @@ func (countClient) Count(ctx context.Context) (int64,error) { return luvia.Ident
 	declaration := cachedTestAPI(false)
 	declaration.Name, declaration.Body = "countUsersById", nil
 	model := testModel("User", nil, []*ast.FieldDecl{testField("id", "Int")})
-	generateInferredHandler(&source, declaration, &InferredAPI{
+	defaultGenerator().generateInferredHandler(&source, declaration, &InferredAPI{
 		Action: "count", ModelName: "User", Groups: []ClauseGroup{{Clauses: []InferClause{{Field: "id", Op: "eq"}}}},
 	}, nil, model)
 	source.WriteString("func registercountUsersById(router *api.Router) { app:=&App{};")
@@ -137,7 +137,7 @@ func TestInferredCacheInheritsModelAuthorization(t *testing.T) {
 		declaration.Directives = declaration.Directives[1:]
 		model := testModel("User", []*ast.Directive{{Name: authName}}, []*ast.FieldDecl{testField("id", "Int")})
 		var source strings.Builder
-		generateInferredHandler(&source, declaration, &InferredAPI{
+		defaultGenerator().generateInferredHandler(&source, declaration, &InferredAPI{
 			Action: "count", ModelName: "User", Groups: []ClauseGroup{{Clauses: []InferClause{{Field: "id", Op: "eq"}}}},
 		}, nil, model)
 		code := source.String()

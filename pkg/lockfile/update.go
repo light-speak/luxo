@@ -35,7 +35,7 @@ func cloneModelLocks(source map[string]*ModelLock) map[string]*ModelLock {
 		fields := make(map[string]int, len(model.Fields))
 		maps.Copy(fields, model.Fields)
 		cloned[name] = &ModelLock{
-			NextID: model.NextID, Fields: fields,
+			NextID: model.NextID, Fields: fields, typeInfo: cloneTypeLockMetadata(model.typeInfo),
 			FieldTypes: maps.Clone(model.FieldTypes), Reserved: slices.Clone(model.Reserved),
 		}
 	}

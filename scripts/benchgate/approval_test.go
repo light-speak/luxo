@@ -47,13 +47,32 @@ func TestApprovalRequiresCompleteMeasurementsAndAuditOutput(t *testing.T) {
 		incomplete := strings.Replace(complete, ","+unit+",", ",unsupported,", 1)
 		path := writeRunInput(t, incomplete)
 		err := run([]string{"--approved-costs", policy, "--base-sha", approvedBase, path, path}, io.Discard)
-		if err == nil || !strings.Contains(err.Error(), "requires both") {
+		if err == nil || !strings.Contains(err.Error(), "missing paired "+unit+" comparison") {
 			t.Fatalf("missing %s error = %v", unit, err)
 		}
 	}
 	path := writeRunInput(t, complete)
 	if err := run([]string{"--approved-costs", policy, "--base-sha", approvedBase, path, path}, errorWriter{}); err == nil || !strings.Contains(err.Error(), "write failure") {
 		t.Fatalf("audit output error = %v", err)
+	}
+}
+
+func TestApprovalRejectsIncompleteMeasurementState(t *testing.T) {
+	cost := approvedCost{ID: "sample", Package: "sample", Benchmark: "sample", MaxNanoseconds: 1, MaxBytes: 1, MaxAllocs: 1}
+	for _, unit := range []string{"sec/op", "B/op", "allocs/op"} {
+		for _, second := range []bool{false, true} {
+			primary, confirmation := coldCostMeasurements(cost), coldCostMeasurements(cost)
+			group := primary
+			if second {
+				group = confirmation
+			}
+			key := comparisonKey{cost.Package, cost.Benchmark, unit}
+			delete(group.Measurements, key)
+			result := evaluation{Regressions: []regression{{Key: comparisonKey{cost.Package, cost.Benchmark, "B/op"}}}}
+			if err := applyApprovedCosts(&result, primary, confirmation, map[costKey]approvedCost{{cost.Package, cost.Benchmark}: cost}, io.Discard); err == nil {
+				t.Fatalf("approval accepted missing %s in second=%v", unit, second)
+			}
+		}
 	}
 }
 

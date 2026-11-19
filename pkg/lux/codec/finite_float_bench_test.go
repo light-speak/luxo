@@ -95,7 +95,7 @@ func (e *Encoder) writeFieldFloatBaseline(fieldID int, v float64) {
 
 func (e *Encoder) writeFieldFloatArrayBaseline(fieldID int, v []float64) {
 	e.buf = AppendVarint(e.buf, uint64(fieldID))
-	e.buf = AppendArrayHeader(e.buf, len(v))
+	e.buf = AppendVarint(e.buf, uint64(len(v)))
 	for _, item := range v {
 		e.buf = appendFixed64Baseline(e.buf, item)
 	}

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { stripTypeScriptTypes } from 'node:module'
 import * as runtime from '@luxojs/client'
 import type { LuxoSchema, GeneratedRequest } from '@luxojs/client'
@@ -23,6 +23,137 @@ function compileStatic(schema: LuxoSchema): runtime.RequestEncoder<Record<string
 }
 
 describe('generated parameter writers', () => {
+  it.each([false, true].flatMap(staticRequest => [false, true].map(list => ({ staticRequest, list }))))
+  ('bounds generated model inputs at 64 object layers ($staticRequest, $list)', ({ staticRequest, list }) => {
+    const params = [{ id: 1, name: 'value', type: 'Model', typeName: 'Input' }]
+    const schema: LuxoSchema = { models: {}, types: { Input: { name: 'Input', fields: [
+      { id: 1, name: 'next', type: 'Model', typeName: 'Input', isList: list, nullable: true },
+      { id: 2, name: 'json', type: 'JSON' },
+    ] } }, apis: { save: { id: 7, name: 'save', module: 'test', returnType: 'Int', params } } }
+    const Request = compile(schema), codec = compileStatic(schema)
+    const meta = { id: 7, params: [{ ...params[0], fieldID: 1 }] }
+    let json: unknown = {}
+    for (let i = 1; i < 128; i++) json = { child: json }
+    const input = (layers: number): Record<string, unknown> => {
+      let value: Record<string, unknown> = { next: list ? [] : null, json }
+      for (let i = 1; i < layers; i++) value = { next: list ? [value] : value }
+      return value
+    }
+    const encode = (value: Record<string, unknown>): Uint8Array => staticRequest
+      ? runtime.encodeStaticRequestBody(meta, codec, { value }) : encodeBinaryBody(meta, new Request({ value }))
+    expect(encode(input(64)).byteLength).toBeGreaterThan(128)
+    expect(() => encode(input(65))).toThrow(/model nesting exceeds 64 levels/)
+    const cyclic: Record<string, unknown> = {}
+    cyclic.next = list ? [cyclic] : cyclic
+    expect(() => encode(cyclic)).toThrow(/model nesting exceeds 64 levels/)
+    expect(encode(input(1)).byteLength).toBeGreaterThan(128)
+  })
+
+  it.each([false, true])('rejects oversized generated lists at top level and nested inputs (static=%s)', staticRequest => {
+    for (const nested of [false, true]) {
+      const params = [{ id: 1, name: 'value', type: nested ? 'Model' : 'Boolean', typeName: nested ? 'Input' : undefined, isList: !nested }]
+      const schema: LuxoSchema = { models: {}, types: { Input: { name: 'Input', fields: [
+        { id: 1, name: 'flags', type: 'Boolean', isList: true },
+      ] } }, apis: { save: { id: 7, name: 'save', module: 'test', returnType: 'Int', params } } }
+      const meta = { id: 7, params: params.map(p => ({ ...p, fieldID: p.id })) }
+      const Request = compile(schema), codec = compileStatic(schema)
+      const list = Array<boolean>(1_000_001)
+      const values = { value: nested ? { flags: list } : list }
+      expect(() => staticRequest ? runtime.encodeStaticRequestBody(meta, codec, values)
+        : encodeBinaryBody(meta, new Request(values))).toThrow(RangeError)
+    }
+  })
+
+  it.each([false, true])('rejects arrays supplied as one generated input (static=%s)', (staticRequest) => {
+    const params = [{ id: 1, name: 'value', type: 'Model', typeName: 'Input' }]
+    const schema: LuxoSchema = { models: {}, types: { Input: { name: 'Input', fields: [
+      { id: 1, name: 'enabled', type: 'Boolean', nullable: true },
+    ] } }, apis: { save: { id: 7, name: 'save', module: 'test', returnType: 'Int', params } } }
+    const meta = { id: 7, params: [{ ...params[0], fieldID: 1 }] }
+    const Request = compile(schema), codec = compileStatic(schema)
+    for (const value of [[], Object.assign([], { enabled: true })]) {
+      expect(() => staticRequest ? runtime.encodeStaticRequestBody(meta, codec, { value })
+        : encodeBinaryBody(meta, new Request({ value }))).toThrow()
+    }
+  })
+
+  it.each([false, true].flatMap(staticRequest => [false, 0, '', 'null'].map(payload => ({ staticRequest, payload }))))
+  ('keeps non-null JSON payload distinct from null ($staticRequest, $payload)', ({ staticRequest, payload }) => {
+    const params = [{ id: 1, name: 'value', type: 'Model', typeName: 'Input' }]
+    const schema: LuxoSchema = { models: {}, types: { Input: { name: 'Input', fields: [
+      { id: 1, name: 'payload', type: 'JSON' },
+    ] } }, apis: { save: { id: 7, name: 'save', module: 'test', returnType: 'Int', params } } }
+    const meta = { id: 7, params: [{ ...params[0], fieldID: 1 }] }
+    const Request = compile(schema), codec = compileStatic(schema)
+    const values = { value: { payload } }
+    const utf8 = vi.spyOn(TextEncoder.prototype, 'encode')
+    let body: Uint8Array, utf8Calls: number
+    try {
+      body = staticRequest ? runtime.encodeStaticRequestBody(meta, codec, values) : encodeBinaryBody(meta, new Request(values))
+      utf8Calls = utf8.mock.calls.length
+    } finally {
+      utf8.mockRestore()
+    }
+    expect(utf8Calls).toBe(0)
+    const json = new TextEncoder().encode(JSON.stringify(payload))
+    expect(body).toEqual(new Uint8Array([7, 0, 1, json.length + 4, 0, 1, json.length, ...json, 0, 0]))
+  })
+
+  it.each([[false, false], [true, false], [false, true], [true, true]])
+  ('writes JSON null directly (static=%s, list=%s)', (staticRequest, list) => {
+    const params = [{ id: 1, name: 'value', type: 'Model', typeName: 'Input' }]
+    const schema: LuxoSchema = { models: {}, types: { Input: { name: 'Input', fields: [
+      { id: 1, name: 'payload', type: 'JSON', isList: list },
+    ] } }, apis: { save: { id: 7, name: 'save', module: 'test', returnType: 'Int', params } } }
+    const meta = { id: 7, params: [{ ...params[0], fieldID: 1 }] }
+    const Request = compile(schema), codec = compileStatic(schema)
+    const values = { value: { payload: list ? [null] : null } }
+    const request = new Request(values)
+    const serialize = vi.spyOn(JSON, 'stringify'), utf8 = vi.spyOn(TextEncoder.prototype, 'encode')
+    let body: Uint8Array, jsonCalls: number, utf8Calls: number
+    try {
+      body = staticRequest ? runtime.encodeStaticRequestBody(meta, codec, values) : encodeBinaryBody(meta, request)
+      jsonCalls = serialize.mock.calls.length
+      utf8Calls = utf8.mock.calls.length
+    } finally {
+      serialize.mockRestore()
+      utf8.mockRestore()
+    }
+    expect(body).toEqual(new Uint8Array([7, 0, 1, list ? 9 : 8, 0, 1,
+      ...(list ? [1] : []), 4, 110, 117, 108, 108, 0, 0]))
+    expect(jsonCalls).toBe(0)
+    expect(utf8Calls).toBe(0)
+  })
+
+  it.each([[false, false], [true, false], [false, true], [true, true]])
+  ('preserves JSON null within structured inputs (static=%s, list=%s)', (staticRequest, list) => {
+    const params = [{ id: 1, name: 'value', type: 'Model', typeName: 'Input' }]
+    const fields = [{ id: 1, name: 'payload', type: 'JSON', isList: list }]
+    const schema: LuxoSchema = { models: {}, types: { Input: { name: 'Input', fields } },
+      apis: { save: { id: 7, name: 'save', module: 'test', returnType: 'Int', params } } }
+    const meta = { id: 7, params: [{ ...params[0], fieldID: 1 }], types: {
+      Input: { payload: { fieldID: 1, type: 'JSON', isList: list } },
+    } }
+    const values = { value: { payload: list ? [null] : null } }
+    const expected = new Uint8Array([7, 0, 1, list ? 9 : 8, 0, 1,
+      ...(list ? [1] : []), 4, 110, 117, 108, 108, 0, 0])
+    const Request = compile(schema), codec = compileStatic(schema)
+    const encode = (input: Record<string, unknown>) => staticRequest
+      ? runtime.encodeStaticRequestBody(meta, codec, input) : encodeBinaryBody(meta, new Request(input))
+    expect(encode(values)).toEqual(expected)
+    expect(() => encode({ value: null })).toThrow()
+    if (list) expect(() => encode({ value: { payload: null } })).toThrow()
+  })
+
+  it('preserves JSON null in the dynamic structured writer with the same exact wire', () => {
+    const meta = { id: 7, params: [{ fieldID: 1, name: 'value', type: 'Model', typeName: 'Input' }],
+      types: { Input: { payload: { fieldID: 1, type: 'JSON' } } } }
+    const expected = new Uint8Array([7, 0, 1, 8, 0, 1, 4, 110, 117, 108, 108, 0, 0])
+    expect(encodeBinaryBody(meta, { value: { payload: null } })).toEqual(expected)
+    expect(() => encodeBinaryBody({ id: 7, params: [{ fieldID: 1, name: 'value', type: 'JSON' }] },
+      { value: null })).toThrow()
+  })
+
   it('writes nested static parameters without per-element capturing callbacks', () => {
     const schema: LuxoSchema = { models: {}, types: { Input: { name: 'Input', fields: [
       { id: 1, name: 'text', type: 'String' },

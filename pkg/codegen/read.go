@@ -15,25 +15,58 @@ func generateReadLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]boo
 
 func (g *GeneratorContext) generateReadLuxo(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	g.generateRowReader(b, m, enums, false)
-	if g.hasWriteRelation(m, enums) {
+	if g.hasWriteRelation(m, enums) || len(g.objectDefaults[m.Name]) > 0 || g.instanceSaves[m.Name] != nil {
 		g.generateRowReader(b, m, enums, true)
 	} else {
 		fmt.Fprintf(b, "// ReadLuxoInput reads an input with the same scalar-only layout.\nfunc (v *%s) ReadLuxoInput(dec *codec.Decoder) { v.ReadLuxo(dec) }\n\n", m.Name)
+		if !g.singleObjectDepth {
+			fmt.Fprintf(b, "func (v *%s) %s(dec *codec.Decoder, depth int) { v.%s(dec, depth) }\n\n", m.Name, g.valueDepthMethod(m.Name, "readLuxoInputDepth"), g.valueDepthMethod(m.Name, "readLuxoDepth"))
+		}
 	}
 }
 
 func (g *GeneratorContext) generateRowReader(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool, input bool) {
 	name := m.Name
-	recv := strings.ToLower(name[:1])
+	recv := receiverName(name)
 	useArena := g.hasArenaFields(m, enums)
-	method := "ReadLuxo"
+	method, private := "ReadLuxo", "readLuxoDepth"
 	if input {
-		method = "ReadLuxoInput"
+		method, private = "ReadLuxoInput", "readLuxoInputDepth"
 	}
+	private = g.valueDepthMethod(name, private)
 
 	fmt.Fprintf(b, "// %s decodes %s from Luxo binary format.\n", method, name)
 	fmt.Fprintf(b, "func (%s *%s) %s(dec *codec.Decoder) {\n", recv, name, method)
+	if !g.singleObjectDepth {
+		fmt.Fprintf(b, "\t%s.%s(dec, 1)\n}\n\n", recv, private)
+		fmt.Fprintf(b, "func (%s *%s) %s(dec *codec.Decoder, depth int) {\n", recv, name, private)
+		writeModelDepthGuard(b, "dec.Fail(codec.ErrModelDepth); return")
+	}
+	writeRowReadArena(b, useArena)
+	if plan := g.instanceSaves[name]; plan != nil {
+		plan.write(b, "%s._luxoSaveLoaded = [%d]uint64{}; %s._luxoSaveExplicit = [%d]uint64{}; %s._luxoSaveConstructed = true; %s._luxoSaveHasSnapshot = false\n", recv, plan.words, recv, plan.words, recv, recv)
+	}
+	seen := ""
+	if input && len(g.objectDefaults[name]) > 0 {
+		seen = "_" + recv + "DefaultSeen"
+		fmt.Fprintf(b, "\tvar %s [%d]uint64\n", seen, (len(g.objectDefaults[name])+63)/64)
+	}
+	fmt.Fprintf(b, "\tfor dec.NextField() {\n")
+	fmt.Fprintf(b, "\t\tswitch dec.FieldID() {\n")
+	g.writeRowReadFields(b, m, recv, seen, enums, input, useArena)
+	fmt.Fprintf(b, "\t\tdefault: dec.SkipField()\n")
+	fmt.Fprintf(b, "\t\t}\n")
+	fmt.Fprintf(b, "\t}\n")
+	if seen != "" {
+		g.writeBinaryInputDefaults(b, name, recv, seen, enums)
+	}
+	if plan := g.instanceSaves[name]; plan != nil && !input {
+		plan.write(b, "if dec.Err() == nil { %s._luxoSaveCapture() }\n", recv)
+	}
+	fmt.Fprintf(b, "}\n\n")
+}
 
+func writeRowReadArena(b *strings.Builder, useArena bool) {
 	if useArena {
 		fmt.Fprintf(b, "\t_arenaSize := dec.ReadArenaSize()\n")
 		fmt.Fprintf(b, "\tvar _arena []byte\n")
@@ -44,38 +77,48 @@ func (g *GeneratorContext) generateRowReader(b *strings.Builder, m *ast.ModelDec
 	} else {
 		fmt.Fprintf(b, "\tdec.SkipArenaHeader()\n")
 	}
+}
 
-	fmt.Fprintf(b, "\tfor dec.NextField() {\n")
-	fmt.Fprintf(b, "\t\tswitch dec.FieldID() {\n")
-
+func (g *GeneratorContext) writeRowReadFields(b *strings.Builder, m *ast.ModelDecl, recv, seen string, enums map[string]bool, input, useArena bool) {
+	defaultIndex := 0
 	for _, f := range m.Fields {
+		index := -1
+		if seen != "" && hasObjectDefault(f) {
+			index = defaultIndex
+			defaultIndex++
+		}
 		if f.Type == nil {
 			continue
 		}
 		if hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
 			continue
 		}
-		fieldID := g.modelFieldID(name, f.Name)
+		fieldID := g.modelFieldID(m.Name, f.Name)
 		if fieldID == 0 {
 			continue
 		}
 
 		goField := recv + "." + str.Capitalize(f.Name)
-
+		fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
+		if index >= 0 {
+			fmt.Fprintf(b, "\t\t\t%s[%d] |= uint64(1) << %d\n", seen, index/64, index%64)
+		}
+		if plan := g.instanceSaves[m.Name]; plan != nil {
+			if slot, ok := plan.index[f.Name]; ok {
+				fmt.Fprintf(b, "%s\n", plan.bitSet(recv, "Loaded", slot))
+				if input {
+					fmt.Fprintf(b, "%s\n", plan.bitSet(recv, "Explicit", slot))
+				}
+			}
+		}
 		if isRelationField(f, enums) {
-			fmt.Fprintf(b, "\t\tcase %d:\n", fieldID)
-			writeReadNestedValue(b, f, goField, input)
+			g.writeReadNestedValue(b, f, goField, input, g.isModelReference(f.Type.Name))
 		} else if useArena && isArenaField(f, enums) {
-			writeReadLuxoFieldArena(b, f, fieldID, goField, enums)
+			writeReadLuxoValueArena(b, f, goField, enums)
 		} else {
-			writeReadLuxoField(b, f, fieldID, goField, enums)
+			writeReadLuxoValue(b, f, goField, enums)
 		}
 	}
-
-	fmt.Fprintf(b, "\t\tdefault: dec.SkipField()\n")
-	fmt.Fprintf(b, "\t\t}\n") // end switch
-	fmt.Fprintf(b, "\t}\n")   // end for
-	fmt.Fprintf(b, "}\n\n")
 }
 
 func writeReadLuxoFieldArena(b *strings.Builder, f *ast.FieldDecl, fieldID int, goField string, enums map[string]bool) {
@@ -175,7 +218,7 @@ func writeReadLuxoTypedValue(b *strings.Builder, f *ast.FieldDecl, goField strin
 	case "Bytes", "JSON":
 		if f.Type.Nullable {
 			if f.Type.Name == "JSON" {
-				writeReadNullableConversion(b, "dec.ReadJSONPtr()", "json.RawMessage(*_raw)", goField)
+				writeReadNullableConversion(b, "dec.ReadNullableJSON()", "json.RawMessage(_raw)", goField)
 			} else {
 				fmt.Fprintf(b, " %s = dec.ReadBytesValuePtr()\n", goField)
 			}

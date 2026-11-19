@@ -7,12 +7,31 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 // commandHook exercises the real client's command API without a Redis process.
 type commandHook func(context.Context, redis.Cmder) error
+
+func TestRedisCacheRejectsNegativeTTLBeforeCommands(t *testing.T) {
+	c := mustRedis(t, "unused:6379")
+	t.Cleanup(func() { _ = c.Close() })
+	var commands []string
+	c.client.AddHook(commandHook(func(_ context.Context, command redis.Cmder) error {
+		commands = append(commands, command.String())
+		return nil
+	}))
+	for _, ttl := range []time.Duration{-1, -time.Second, -1 << 63} {
+		if err := c.Set(t.Context(), "entry", []byte("replacement"), ttl); err == nil {
+			t.Errorf("negative TTL %v was accepted", ttl)
+		}
+	}
+	if len(commands) != 0 {
+		t.Fatalf("invalid TTL reached Redis commands: %v", commands)
+	}
+}
 
 func (h commandHook) DialHook(next redis.DialHook) redis.DialHook {
 	return func(context.Context, string, string) (net.Conn, error) {
@@ -46,6 +65,39 @@ func TestRedisGetPreservesFailure(t *testing.T) {
 	data, err := c.Get(context.Background(), "private-key")
 	if data != nil || !errors.Is(err, want) {
 		t.Fatalf("Get = (%q, %v), want (nil, backend error)", data, err)
+	}
+}
+
+func TestRedisGetDistinguishesStoredEmptyFromMiss(t *testing.T) {
+	c := mustRedis(t, "unused:6379")
+	t.Cleanup(func() { _ = c.Close() })
+	c.client.AddHook(commandHook(func(_ context.Context, command redis.Cmder) error {
+		value, ok := command.(*redis.StringCmd)
+		if !ok {
+			t.Fatal("unexpected cache command", command.Name())
+		}
+		if command.Args()[1] == "missing" {
+			value.SetErr(redis.Nil)
+			return redis.Nil
+		}
+		if command.Args()[1] == "text" {
+			value.SetVal("payload")
+		} else {
+			value.SetVal("")
+		}
+		return nil
+	}))
+	stored, err := c.Get(t.Context(), "empty")
+	if err != nil || stored == nil || len(stored) != 0 {
+		t.Fatal("stored empty value became a cache miss", stored, err)
+	}
+	missing, err := c.Get(t.Context(), "missing")
+	if err != nil || missing != nil {
+		t.Fatal("cache miss became a stored value", missing, err)
+	}
+	text, err := c.Get(t.Context(), "text")
+	if err != nil || string(text) != "payload" {
+		t.Fatal("nonempty cache value changed", text, err)
 	}
 }
 

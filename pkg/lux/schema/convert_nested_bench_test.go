@@ -11,7 +11,7 @@ import (
 
 // Freeze the entire old nested dispatch, including both fallback branches.
 // Valid payloads use the unchanged child converters on both sides.
-func appendNestedColumnBlobBeforeStrict(dst, blob []byte, f *Field, schemas ...*Schema) ([]byte, error) {
+func appendNestedColumnBlobBeforeStrict(dst, blob []byte, f *Field, depth int, schemas ...*Schema) ([]byte, error) {
 	if len(blob) == 0 {
 		if f.IsList {
 			return append(dst, "[]"...), nil
@@ -57,14 +57,14 @@ func benchmarkNestedJSONBoundary(b *testing.B, plainType, list bool, count int) 
 		count = 1
 	}
 	schemas := []*Schema{s}
-	expected, err := appendNestedColumnBlobBeforeStrict(nil, child, field, schemas...)
-	actual, currentErr := appendNestedColumnBlobJSON(nil, child, field, schemas...)
+	expected, err := appendNestedColumnBlobBeforeStrict(nil, child, field, 1, schemas...)
+	actual, currentErr := appendNestedColumnBlobJSON(nil, child, field, 1, schemas...)
 	if err != nil || currentErr != nil || !bytes.Equal(expected, actual) {
 		b.Fatalf("invalid baseline: %v / %v", err, currentErr)
 	}
 	for _, version := range []struct {
 		name    string
-		convert func([]byte, []byte, *Field, ...*Schema) ([]byte, error)
+		convert func([]byte, []byte, *Field, int, ...*Schema) ([]byte, error)
 	}{
 		{"before", appendNestedColumnBlobBeforeStrict}, {"strict", appendNestedColumnBlobJSON},
 	} {
@@ -74,7 +74,7 @@ func benchmarkNestedJSONBoundary(b *testing.B, plainType, list bool, count int) 
 			for b.Loop() {
 				dst = dst[:0]
 				for range count {
-					dst, err = version.convert(dst, child, field, schemas...)
+					dst, err = version.convert(dst, child, field, 1, schemas...)
 					if err != nil {
 						b.Fatal(err)
 					}

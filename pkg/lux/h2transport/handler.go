@@ -9,30 +9,59 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// A handler may call Goexit, which runs defers but cannot be recovered. Replace
+// only that worker; task cleanup enqueues its reset before replacement starts.
+func (c *candidateConnection) startWorker() {
+	c.workers.Go(c.runWorker)
+}
+
+func (c *candidateConnection) runWorker() {
+	returned := false
+	defer func() {
+		if !returned {
+			c.startWorker()
+		}
+	}()
+	c.work()
+	returned = true
+}
+
 func (c *candidateConnection) work() {
+	var active *requestTask
+	defer func() {
+		if active != nil {
+			c.finishWork(active, nil, errResponse)
+		}
+	}()
 	for task := range c.jobs {
+		active = task
 		result, err := c.execute(task)
-		command := controlCommand{kind: responseCommand, streamID: task.id, response: result}
-		if err != nil {
-			command = controlCommand{kind: abortStreamCommand, streamID: task.id, code: http2.ErrCodeInternal}
-			if errors.Is(err, errQueueFull) {
-				command.code = http2.ErrCodeEnhanceYourCalm
-			}
+		active = nil
+		c.finishWork(task, result, err)
+	}
+}
+
+func (c *candidateConnection) finishWork(task *requestTask, result *response, err error) {
+	command := controlCommand{kind: responseCommand, streamID: task.id, response: result}
+	if err != nil {
+		command = controlCommand{kind: abortStreamCommand, streamID: task.id, code: http2.ErrCodeInternal}
+		if errors.Is(err, errQueueFull) {
+			command.code = http2.ErrCodeEnhanceYourCalm
 		}
-		c.mu.Lock()
-		task.response = result
-		task.done = true
-		c.releaseTask(task)
-		c.mu.Unlock()
-		if err := c.inbox.put(command); err != nil {
-			_ = c.conn.Close()
-		}
+	}
+	c.mu.Lock()
+	task.response = result
+	task.done = true
+	c.releaseTask(task)
+	c.mu.Unlock()
+	if err := c.inbox.put(command); err != nil {
+		_ = c.conn.Close()
 	}
 }
 
 func (c *candidateConnection) execute(task *requestTask) (result *response, err error) {
 	defer func() {
-		if recovered := recover(); recovered != nil {
+		if recovered := recover(); recovered != nil || err == errResponse {
 			result.release()
 			result, err = nil, errResponse
 		}
@@ -71,6 +100,8 @@ func (c *candidateConnection) execute(task *requestTask) (result *response, err 
 		}
 	}
 	result = &response{header: make(http.Header), limit: c.limits.MaxResponseBodyBytes, budget: c.budget}
+	// Goexit leaves this failure marker in place while running cleanup defers.
+	err = errResponse
 	c.handler.ServeHTTP(result, request)
 	if result.status == 0 {
 		result.WriteHeader(http.StatusOK)

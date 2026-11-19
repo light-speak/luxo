@@ -2,16 +2,67 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
+	"time"
 
+	"github.com/light-speak/luxo/pkg/lux/codec"
 	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 	"github.com/light-speak/luxo/pkg/lux/schema"
 )
+
+func TestPreparedStreamBenchmarkPayload(t *testing.T) {
+	for _, binary := range []bool{false, true} {
+		name := "JSON"
+		if binary {
+			name = "Binary"
+		}
+		t.Run(name, func(t *testing.T) { testPreparedStreamBenchmarkPayload(t, binary) })
+	}
+}
+
+func testPreparedStreamBenchmarkPayload(t *testing.T, binary bool) {
+	t.Helper()
+	router := newPreparedBenchmarkRouter(t)
+	var req *Request
+	var err error
+	if binary {
+		req, err = router.Registry.ParseBinaryRequest([]byte{1, 0, 1, 18, 0})
+	} else {
+		req, _, err = router.prepareWSJSONSubscription(map[string]json.RawMessage{
+			"$sub": []byte(`"watch"`), "limit": []byte(`9`),
+		})
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	stream, err := router.PrepareInternalStream(ctx, req)
+	PutRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	stream.Start()
+	count := 0
+	for payload := range stream.Messages() {
+		decoder := codec.NewDecoder(payload)
+		value := decoder.ReadInt()
+		if err := decoder.Finish(); err != nil || value != 9 {
+			t.Fatalf("decoded stream payload = %d, error = %v; want 9", value, err)
+		}
+		count++
+	}
+	if err := stream.Err(); err != nil || count != 1 {
+		t.Fatalf("stream completed with count = %d, error = %v", count, err)
+	}
+}
 
 func TestNativeStreamPanicFinishesOnlyItsSubscription(t *testing.T) {
 	for _, exit := range []struct {
@@ -142,6 +193,62 @@ func TestInternalStreamCloseBeforeNativeSend(t *testing.T) {
 			t.Fatalf("closed native stream send = %v", err)
 		}
 	})
+}
+
+func TestInternalStreamReleaseCanReenterClose(t *testing.T) {
+	for _, trigger := range []string{"Close", "CanceledStart", "ConcurrentClose", "ConcurrentCanceledStart"} {
+		t.Run(trigger, func(t *testing.T) { testInternalStreamReleaseReentry(t, trigger) })
+	}
+}
+
+func testInternalStreamReleaseReentry(t *testing.T, trigger string) {
+	t.Helper()
+	router := NewRouter()
+	var stream *InternalStream
+	var released, started atomic.Int32
+	router.HandleStreamForwarded("watch", func(context.Context, *Request, any) (PreparedStreamSource, error) {
+		return PreparedStreamSource{
+			Run: func(context.Context, *Stream) error { started.Add(1); return nil },
+			Close: func() {
+				released.Add(1)
+				stream.Close()
+				stream.Start()
+			},
+		}, nil
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var err error
+	stream, err = router.PrepareInternalStream(ctx, &Request{API: "watch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch trigger {
+	case "Close":
+		stream.Close()
+	case "CanceledStart":
+		cancel()
+		stream.Start()
+	case "ConcurrentClose", "ConcurrentCanceledStart":
+		if trigger == "ConcurrentCanceledStart" {
+			cancel()
+		}
+		var group sync.WaitGroup
+		for range 16 {
+			group.Go(stream.Close)
+			if trigger == "ConcurrentCanceledStart" {
+				group.Go(stream.Start)
+			}
+		}
+		group.Wait()
+	}
+	stream.Close()
+	if released.Load() != 1 || started.Load() != 0 || router.Streams.SubCount("watch") != 0 || stream.ctx.Err() != context.Canceled {
+		t.Fatalf("release=%d started=%d subscriptions=%d context=%v", released.Load(), started.Load(), router.Streams.SubCount("watch"), stream.ctx.Err())
+	}
+	if _, open := <-stream.Messages(); open || stream.Err() != context.Canceled {
+		t.Fatal("reentrant cleanup left an active subscription")
+	}
 }
 
 func TestInternalNativeStreamResultAndAcceptedQueue(t *testing.T) {

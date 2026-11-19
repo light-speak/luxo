@@ -45,6 +45,13 @@ func requireRPCProtocolError(t *testing.T, err error) {
 	}
 }
 
+func TestRPCErrorRejectsInvalidStatus(t *testing.T) {
+	for _, code := range []int64{-1, 0, 200, 399, 600, 1000, math.MaxInt64} {
+		fields := rpcErrorFields(code, "Private", "private diagnostic")
+		requireRPCEnvelopeFailure(t, rpcErrorBody(fields[:]...))
+	}
+}
+
 func TestRPCErrorRejectsDuplicateFields(t *testing.T) {
 	fields := rpcErrorFields(422, "Rejected", "error.rejected")
 	for i, duplicate := range rpcErrorFields(403, "Different", "different message") {
@@ -91,12 +98,8 @@ func TestRPCErrorTextBoundaries(t *testing.T) {
 				if !ok || value.Name != text || value.Code != int(code) {
 					t.Fatalf("text ownership changed: %+v", value)
 				}
-				if code < 500 && value.Message != text {
+				if value.Message != text || value.Internal || value.Cause != nil {
 					t.Fatalf("message changed: %q", value.Message)
-				}
-				if code >= 500 && (!value.Internal || value.Message != "error.internal" ||
-					value.Cause == nil || value.Cause.Error() != fmt.Sprintf("rpc error %d %s: %s", code, text, text)) {
-					t.Fatalf("internal text changed: %+v", value)
 				}
 			})
 		}
@@ -170,20 +173,13 @@ func TestRPCErrorCodeDoesNotNarrow(t *testing.T) {
 	for _, code := range []int64{math.MinInt64, math.MaxInt64, math.MinInt32 - 1, math.MaxInt32 + 1} {
 		fields := rpcErrorFields(code, "Rejected", "error.rejected")
 		body := rpcErrorBody(fields[:]...)
-		if strconv.IntSize == 32 {
-			requireRPCEnvelopeFailure(t, body)
-			continue
-		}
-		value, ok := stderrors.AsType[*luxerrors.AppError](decodeError(body))
-		if !ok || int64(value.Code) != code {
-			t.Fatalf("code %d changed: %+v", code, value)
-		}
+		requireRPCEnvelopeFailure(t, body)
 	}
 }
 
 func TestRPCErrorInternalRedactionIsPreserved(t *testing.T) {
 	fields := rpcErrorFields(503, "Unavailable", "private diagnostic")
-	value, ok := stderrors.AsType[*luxerrors.AppError](decodeError(rpcErrorBody(fields[:]...)))
+	value, ok := stderrors.AsType[*luxerrors.AppError](decodeError(rpcErrorBody(fields[0], fields[1], fields[2], []byte{6, 1})))
 	if !ok || value.Code != 503 || value.Name != "Unavailable" || value.Message != "error.internal" || !value.Internal ||
 		value.Cause == nil || value.Cause.Error() != "rpc error 503 Unavailable: private diagnostic" {
 		t.Fatalf("internal error redaction changed: %+v", value)
@@ -193,8 +189,13 @@ func TestRPCErrorInternalRedactionIsPreserved(t *testing.T) {
 func TestRPCMalformedErrorAtEveryResponseBoundary(t *testing.T) {
 	fields := rpcErrorFields(422, "Rejected", "error.rejected")
 	for name, body := range map[string][]byte{
-		"duplicate": rpcErrorBody(fields[0], fields[1], fields[2], fields[0]),
-		"bad text":  rpcErrorBody(fields[0], fields[1], codec.AppendBytes([]byte{3}, []byte("\xff"))),
+		"duplicate":          rpcErrorBody(fields[0], fields[1], fields[2], fields[0]),
+		"bad text":           rpcErrorBody(fields[0], fields[1], codec.AppendBytes([]byte{3}, []byte("\xff"))),
+		"invalid data":       rpcErrorBody(fields[0], fields[1], fields[2], codec.AppendBytes([]byte{4}, []byte(`{"private":`))),
+		"orphan text":        rpcErrorBody(fields[0], fields[1], fields[2], codec.AppendBytes([]byte{5}, []byte(`{"n":"1"}`))),
+		"duplicate data":     rpcErrorBody(fields[0], fields[1], fields[2], []byte{4, 4, 'n', 'u', 'l', 'l'}, []byte{4, 4, 'n', 'u', 'l', 'l'}),
+		"invalid internal":   rpcErrorBody(fields[0], fields[1], fields[2], []byte{6, 2}),
+		"duplicate internal": rpcErrorBody(fields[0], fields[1], fields[2], []byte{6, 0}, []byte{6, 1}),
 	} {
 		t.Run(name, func(t *testing.T) {
 			frame := append([]byte{statusError}, body...)
@@ -284,5 +285,108 @@ func testRPCStreamErrorFrame(t *testing.T, frame []byte) {
 	}
 	if _, ok := <-subscription.Messages(); ok {
 		t.Fatal("malformed error delivered a stream value")
+	}
+}
+
+type hostileHandlerPanic struct{ formatted *bool }
+
+func (p hostileHandlerPanic) String() string {
+	*p.formatted = true
+	panic("panic payload formatter must not run")
+}
+
+func TestHandlerPanicDoesNotFormatPayload(t *testing.T) {
+	formatted := false
+	server := NewServer(api.NewRouter())
+	err := server.callHandler(t.Context(), func(context.Context, *api.Request) error {
+		panic(hostileHandlerPanic{&formatted})
+	}, nil)
+	if formatted || err == nil {
+		t.Fatal("handler recovery evaluated arbitrary panic payload")
+	}
+}
+
+type hostileReturnedError struct{ unwrap bool }
+
+func (e hostileReturnedError) Error() string { panic("private error text") }
+func (e hostileReturnedError) Unwrap() error {
+	if e.unwrap {
+		panic("private unwrap detail")
+	}
+	return nil
+}
+
+func TestReturnedErrorMethodsCannotEscapeRPC(t *testing.T) {
+	for _, unwrap := range []bool{false, true} {
+		t.Run(strconv.FormatBool(unwrap), func(t *testing.T) {
+			defer func() {
+				if recover() != nil {
+					t.Fatal("returned error callback escaped RPC isolation")
+				}
+			}()
+			router := api.NewRouter()
+			if err := router.Registry.Register("fail", 1); err != nil {
+				t.Fatal(err)
+			}
+			router.Handle("fail", func(context.Context, *api.Request) error { return hostileReturnedError{unwrap} })
+			var response bytes.Buffer
+			if err := NewServer(router).processRequest(&response, encodeRequestEnvelope(requestKindCall, "", []byte{1, 0, 0})); err != nil {
+				t.Fatal(err)
+			}
+			frame, err := ReadFrame(&response, nil)
+			if err != nil || len(frame) == 0 || frame[0] != statusError {
+				t.Fatalf("invalid failure frame: %x / %v", frame, err)
+			}
+			fields, err := readRPCErrorFields(frame[1:])
+			if err != nil || fields.code != 500 || string(fields.message) != "error.internal" || fields.data != nil {
+				t.Fatalf("unsafe error envelope: %+v / %v", fields, err)
+			}
+		})
+	}
+}
+
+func TestStreamReturnedErrorMethodsCannotEscapeRPC(t *testing.T) {
+	defer func() {
+		if recover() != nil {
+			t.Fatal("stream error callback escaped RPC isolation")
+		}
+	}()
+	var response bytes.Buffer
+	if err := writeStreamResult(&response, hostileReturnedError{unwrap: true}); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := ReadFrame(&response, nil)
+	if err != nil || len(frame) == 0 || frame[0] != statusError {
+		t.Fatalf("invalid failure frame: %x / %v", frame, err)
+	}
+	fields, err := readRPCErrorFields(frame[1:])
+	if err != nil || fields.code != 500 || string(fields.message) != "error.internal" {
+		t.Fatalf("unsafe stream error: %+v / %v", fields, err)
+	}
+}
+
+type callbackReturnedError string
+
+func (e callbackReturnedError) Error() string { return "private native detail" }
+func (e callbackReturnedError) As(any) bool {
+	if e == "as" {
+		panic("private As failure")
+	}
+	return false
+}
+func (e callbackReturnedError) Is(error) bool { panic("private Is failure") }
+
+func TestNormalizeHandlerErrorIsolatesChainCallbacks(t *testing.T) {
+	for _, err := range []error{callbackReturnedError("as"), callbackReturnedError("is")} {
+		if value := normalizeHandlerError(err, true); value != luxerrors.InternalError {
+			t.Fatal("callback failure did not become Internal")
+		}
+	}
+	value := luxerrors.New("Rejected", 422, "error.rejected")
+	if normalizeHandlerError(fmt.Errorf("wrapped: %w", value), false) != value {
+		t.Fatal("wrapped business error identity changed")
+	}
+	if normalizeHandlerError(fmt.Errorf("wrapped: %w", api.ErrStreamFull), true) != errSlowConsumer {
+		t.Fatal("wrapped slow consumer identity changed")
 	}
 }

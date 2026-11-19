@@ -8,7 +8,9 @@ import kotlinx.serialization.json.jsonObject
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MediaType
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.OkHttpClient
+import okio.Buffer
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.ResponseBody.Companion.toResponseBody
 
@@ -19,10 +21,12 @@ object HttpProtocolBenchmark {
     @Volatile private var errorSink: LuxoError? = null
     @Volatile private var headersSink: Any? = null
     @Volatile private var jsonSink: JsonElement? = null
+    @Volatile private var bodySink: RequestBody? = null
 
     @JvmStatic
     fun main(args: Array<String>) {
         if (args.contains("--endpoint-init-only")) { measureEndpointInitialization(); return }
+        if (args.contains("--request-body-only")) { compareRequestBodies(); return }
         println("JDK ${System.getProperty("java.version")}; 12 warmup pairs, 20 alternating samples; ns/op and B/op")
         if (args.contains("--endpoint-only")) { compareEndpoints(); return }
         compareJSONBodies(candidate = args.contains("--candidate"))
@@ -30,6 +34,45 @@ object HttpProtocolBenchmark {
         compareLengths()
         compareHeaders()
         for (detailed in listOf(false, true)) compareErrors(detailed)
+    }
+
+    private fun compareRequestBodies() {
+        for ((name, text) in linkedMapOf("compact" to """{"${'$'}api":"mutate"}""",
+            "unicode" to """{"value":"发布 café"}""", "large" to "\"${"发布检查".repeat(6144)}\"")) {
+            compareRequestBodyCase("JSON $name", text.toByteArray(Charsets.UTF_8),
+                { text.toRequestBody(HttpProtocolHeaders.JSON_MEDIA_TYPE) },
+                { HTTPRequestBody(text.toByteArray(Charsets.UTF_8), HttpProtocolHeaders.JSON_MEDIA_TYPE) })
+        }
+        for (size in listOf(0, 32, 4096, 73728)) {
+            val bytes = ByteArray(size) { it.toByte() }
+            compareRequestBodyCase("Binary $size", bytes,
+                { bytes.toRequestBody(HttpProtocolHeaders.BINARY_MEDIA_TYPE) },
+                { HTTPRequestBody(bytes, HttpProtocolHeaders.BINARY_MEDIA_TYPE) })
+        }
+    }
+
+    private fun compareRequestBodyCase(name: String, bytes: ByteArray, before: () -> RequestBody, after: () -> RequestBody) {
+        val previous = before()
+        val current = after()
+        check(!previous.isOneShot() && current.isOneShot())
+        for (body in listOf(previous, current)) {
+            val output = Buffer()
+            body.writeTo(output)
+            check(output.readByteArray().contentEquals(bytes))
+            check(body.contentLength() == bytes.size.toLong())
+        }
+        val iterations = if (bytes.size < 4096) 50_000 else if (bytes.size < 73728) 5000 else 1000
+        PairedJvmBenchmark.compare("HTTP request body construct $name", LongSupplier {
+            bodySink = before(); bodySink!!.contentLength()
+        }, LongSupplier {
+            bodySink = after(); bodySink!!.contentLength()
+        }, iterations = iterations)
+        val output = Buffer()
+        PairedJvmBenchmark.compare("HTTP request body write $name", LongSupplier {
+            previous.writeTo(output); val count = output.size; output.clear(); count
+        }, LongSupplier {
+            current.writeTo(output); val count = output.size; output.clear(); count
+        }, iterations = iterations)
     }
 
     private fun measureEndpointInitialization() {

@@ -72,7 +72,7 @@ func encodePayloadBenchmarkList(meta ParamMeta, value any) ([]byte, error) {
 }
 
 func binaryListPayloadFixture(kind string, count int) []byte {
-	data := codec.AppendArrayHeader(nil, count)
+	data := codec.AppendVarint(nil, uint64(count))
 	for range count {
 		switch kind {
 		case "Int", "Duration":

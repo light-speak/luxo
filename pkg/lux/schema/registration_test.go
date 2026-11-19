@@ -1,10 +1,83 @@
 package schema
 
 import (
+	"math"
+	"strconv"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 )
+
+func TestRegistrationRejectsUnknownFieldKinds(t *testing.T) {
+	for _, kind := range []FieldType{-1, FieldSealed + 1, FieldType(math.MaxInt)} {
+		t.Run(kind.String()+"/"+strconv.Itoa(int(kind)), func(t *testing.T) {
+			s := New()
+			if err := s.RegisterModel(&Model{Name: "Record", Fields: []Field{{ID: 1, Name: "id", Type: FieldInt}}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.RegisterType(&TypeDecl{Name: "Value", Fields: []Field{{ID: 1, Name: "id", Type: FieldInt}}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.RegisterAPI(&API{Name: "read", ID: 1, Params: []Param{{ID: 1, Name: "id", Type: FieldInt}}}); err != nil {
+				t.Fatal(err)
+			}
+			model, typ, api := s.LookupModel("Record"), s.LookupModel("Value"), s.APIs["read"]
+			if err := s.RegisterModel(&Model{Name: "Record", Fields: []Field{{ID: 2, Name: "bad", Type: kind}}}); err == nil {
+				t.Error("unknown model field kind accepted")
+			}
+			if err := s.RegisterType(&TypeDecl{Name: "Value", Fields: []Field{{ID: 2, Name: "bad", Type: kind}}}); err == nil {
+				t.Error("unknown type field kind accepted")
+			}
+			if err := s.RegisterAPI(&API{Name: "read", ID: 1, Params: []Param{{ID: 2, Name: "bad", Type: kind}}}); err == nil {
+				t.Error("unknown parameter kind accepted")
+			}
+			if s.LookupModel("Record") != model || s.LookupModel("Value") != typ || s.APIs["read"] != api {
+				t.Error("rejected registration replaced working metadata")
+			}
+		})
+	}
+}
+
+func TestPrepareRejectsUnknownFieldKindsBeforeReplacingIndexes(t *testing.T) {
+	for _, target := range []string{"model", "type", "param"} {
+		t.Run(target, func(t *testing.T) {
+			s := New()
+			if err := s.RegisterModel(&Model{Name: "Record", Fields: []Field{{ID: 1, Name: "id"}}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.RegisterType(&TypeDecl{Name: "Value", Fields: []Field{{ID: 1, Name: "id"}}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.RegisterAPI(&API{Name: "read", ID: 1, Params: []Param{{ID: 1, Name: "id"}}}); err != nil {
+				t.Fatal(err)
+			}
+			model, typ := s.LookupModel("Record"), s.LookupModel("Value")
+			if target == "model" {
+				s.Models["Record"].Fields[0].Type = -1
+			}
+			if target == "type" {
+				s.Types["Value"].Fields[0].Type = -1
+			}
+			if target == "param" {
+				s.APIs["read"].Params[0].Type = -1
+			}
+			if err := s.Prepare(); err == nil {
+				t.Fatal("unknown field kind accepted by preparation")
+			}
+			if s.LookupModel("Record") != model || s.LookupModel("Value") != typ {
+				t.Fatal("failed preparation replaced indexes")
+			}
+		})
+	}
+}
+
+func TestUnknownFieldKindsCannotBeExported(t *testing.T) {
+	s := New()
+	s.Models["Record"] = &Model{Name: "Record", Fields: []Field{{ID: 1, Name: "bad", Type: -1}}}
+	if data, err := s.ToJSON(); err == nil || data != nil {
+		t.Fatalf("invalid kind exported: %s / %v", data, err)
+	}
+}
 
 func TestRegistrationRejectsInvalidFieldsWithoutReplacingIndexes(t *testing.T) {
 	for _, fields := range [][]Field{

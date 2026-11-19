@@ -1,7 +1,9 @@
 package semantic
 
 import (
+	"slices"
 	"sort"
+	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
@@ -19,9 +21,23 @@ func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
 	case *ast.Ident:
 		resolved = a.checkIdentExpr(e, scope)
 	case *ast.MemberExpr:
+		e.EnumConstant = false
+		e.DeclaredField = false
+		e.SealedConstructor = false
 		resolved = a.checkMemberExpr(e, scope)
+		if resolved != nil {
+			e.EnumConstant = isEnumDeclarationMember(e, resolved, scope)
+			e.ValueNullable = resolved.Nullable
+			if e.SafeCall && a.callTarget != e {
+				resolved = resolved.AsNullable()
+			}
+		}
 	case *ast.CallExpr:
 		resolved = a.checkCallExpr(e, scope)
+		if member, ok := e.Func.(*ast.MemberExpr); ok && member.SafeCall && resolved != nil {
+			member.ValueNullable = resolved.Nullable
+			resolved = resolved.AsNullable()
+		}
 	case *ast.BinaryExpr:
 		resolved = a.checkBinaryExpr(e, scope)
 	case *ast.UnaryExpr:
@@ -29,8 +45,9 @@ func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
 	case *ast.ElvisExpr:
 		resolved = a.checkElvisExpr(e, scope)
 	case *ast.BangElvisExpr:
-		a.checkExpr(e.Left, scope)
-		a.checkExpr(e.Right, scope)
+		a.addError(e.Pos, "operator '!:' is only valid as a guard statement / 运算符 '!:' 只能用作守卫语句")
+		a.checkBangElvisGuard(e, scope)
+		resolved = &ResolvedType{Kind: TypeVoid, Name: "Void"}
 	case *ast.WhenExpr:
 		resolved = a.checkWhenExpr(e, scope)
 	case *ast.LambdaExpr:
@@ -41,7 +58,13 @@ func (a *Analyzer) checkExpr(expr ast.Expr, scope *Scope) *ResolvedType {
 
 	// Write type tag into AST node for codegen to read
 	if resolved != nil {
-		setExprResolvedType(expr, resolved)
+		a.setExprResolvedType(expr, resolved)
+		if !resolved.Nullable && !resolved.IsList {
+			switch resolved.Kind {
+			case TypeInt, TypeDuration:
+				a.checkIntegerConstant(expr)
+			}
+		}
 		if resolved.Kind == TypeGeneric && resolved.Name == "Result" && a.resultOperand == 0 {
 			a.addError(expr.GetPos(), "Result<T> must be consumed directly with '?' / Result<T> 必须直接使用 '?' 解包")
 		}
@@ -65,8 +88,7 @@ func (a *Analyzer) checkCompositeExpr(expr ast.Expr, scope *Scope) (resolved *Re
 	case *ast.YieldExpr:
 		resolved = a.checkExpr(e.Value, scope)
 	case *ast.AsyncExpr:
-		childScope := scope.Child()
-		a.checkBlock(e.Body, childScope)
+		resolved = a.checkAsyncExpr(e, scope)
 	case *ast.AwaitExpr:
 		resolved = a.checkAwaitExpr(e, scope)
 	case *ast.ForStmt:
@@ -87,6 +109,10 @@ func (a *Analyzer) checkListExpr(e *ast.ListExpr, scope *Scope) *ResolvedType {
 	for _, item := range e.Items {
 		actual := a.checkExpr(item, scope)
 		if actual == nil {
+			continue
+		}
+		if isVoidResult(actual) {
+			a.addError(item.GetPos(), "void operation cannot be a list element / 无返回值操作不能作为列表元素")
 			continue
 		}
 		if actual.Kind == TypeUnknown && actual.Name == "null" {
@@ -112,7 +138,7 @@ func (a *Analyzer) checkListExpr(e *ast.ListExpr, scope *Scope) *ResolvedType {
 	return result
 }
 
-func setExprResolvedType(expr ast.Expr, resolved *ResolvedType) {
+func (a *Analyzer) setExprResolvedType(expr ast.Expr, resolved *ResolvedType) {
 	if expr == nil || resolved == nil {
 		return
 	}
@@ -120,6 +146,16 @@ func setExprResolvedType(expr ast.Expr, resolved *ResolvedType) {
 	expr.SetNullable(resolved.Nullable)
 	expr.SetListType(resolved.IsList)
 	expr.SetModelType(resolved.Kind == TypeModel || resolved.Kind == TypeQueryBuilder)
+	expr.SetEnumType(resolved.Kind == TypeEnum)
+	// Result is a transient error ABI; only its unwrapped value reaches codegen.
+	if len(resolved.TypeArgs) > 0 && resolved.Name != "Result" {
+		if a.genericExprTypes == nil {
+			a.genericExprTypes = make(map[ast.Expr]*ResolvedType)
+		}
+		a.genericExprTypes[expr] = resolved
+	} else if a.genericExprTypes != nil {
+		delete(a.genericExprTypes, expr)
+	}
 }
 
 func isEmptyListExpr(expr ast.Expr) bool {
@@ -220,6 +256,9 @@ func (a *Analyzer) resolvedExprType(expr ast.Expr) *ResolvedType {
 	if expr == nil || expr.GetTypeTag() == "" {
 		return nil
 	}
+	if generic := a.genericExprTypes[expr]; generic != nil {
+		return generic
+	}
 	base := a.types[expr.GetTypeTag()]
 	if base == nil {
 		base = &ResolvedType{Kind: TypeUnknown, Name: expr.GetTypeTag()}
@@ -247,6 +286,19 @@ func (a *Analyzer) checkObjectExpr(e *ast.ObjectExpr, scope *Scope) *ResolvedTyp
 		a.addErrorWithSuggestion(e.Pos, e.TypeName, "unknown type '%s' / 未知类型 '%s'", e.TypeName, e.TypeName)
 		return nil
 	}
+	if a.isBuiltinIdentityDataType(typ) {
+		a.reportIdentityDataType(e.Pos)
+		a.checkObjectExprValues(e.Fields, scope)
+		return nil
+	}
+	if a.genericConstructorType(typ) {
+		a.requireConstructorTypeArguments(e.TypeName, e, e.Fields, scope)
+		return nil
+	}
+	if typ.Kind == TypeSealed {
+		a.rejectSealedConstructor(e, e.TypeName, e.Fields, scope)
+		return nil
+	}
 	if a.moduleMap != nil && a.currentFile != nil {
 		if mi := a.moduleMap[a.currentFile.Name]; mi != nil {
 			a.checkNameVisibility(e.TypeName, mi, e.Pos)
@@ -264,7 +316,7 @@ func (a *Analyzer) checkObjectExprValues(fields []*ast.NamedArg, scope *Scope) {
 	}
 }
 
-func (a *Analyzer) validateObjectExprFields(e *ast.ObjectExpr, typ *ResolvedType, scope *Scope) {
+func (a *Analyzer) validateObjectExprFields(e *ast.ObjectExpr, typ *ResolvedType, scope *Scope) map[string]bool {
 	provided := make(map[string]bool, len(e.Fields))
 	for _, value := range e.Fields {
 		if value == nil {
@@ -291,6 +343,7 @@ func (a *Analyzer) validateObjectExprFields(e *ast.ObjectExpr, typ *ResolvedType
 			a.addFieldError(pos, typ, value.Name)
 			continue
 		}
+		value.ExpectedType = field.Type.TypeRef()
 		if field.Type != nil && actual != nil && !isTypeAssignable(field.Type, actual) {
 			a.addError(pos, "field '%s' expects '%s', got '%s' / 字段 '%s' 需要 '%s'，得到 '%s'",
 				value.Name, formatResolvedType(field.Type), formatResolvedType(actual),
@@ -301,6 +354,7 @@ func (a *Analyzer) validateObjectExprFields(e *ast.ObjectExpr, typ *ResolvedType
 	if typ.Kind == TypeCustom {
 		a.checkRequiredObjectFields(e, typ, provided)
 	}
+	return provided
 }
 
 func (a *Analyzer) checkRequiredObjectFields(e *ast.ObjectExpr, typ *ResolvedType, provided map[string]bool) {
@@ -348,7 +402,7 @@ func typeArgsAssignable(expected, actual []*ResolvedType) bool {
 		return false
 	}
 	for i := range expected {
-		if !isTypeAssignable(expected[i], actual[i]) {
+		if !sameResolvedType(expected[i], actual[i]) {
 			return false
 		}
 	}
@@ -356,6 +410,11 @@ func typeArgsAssignable(expected, actual []*ResolvedType) bool {
 }
 
 func formatResolvedType(typ *ResolvedType) string {
+	if len(typ.TypeArgs) != 0 || len(typ.Tuple) != 0 {
+		var result strings.Builder
+		writeGenericTypeKey(&result, typ, true)
+		return result.String()
+	}
 	name := typ.Name
 	if typ.IsList {
 		name = "[" + name + "]"
@@ -383,7 +442,7 @@ func (a *Analyzer) checkTransactionExpr(e *ast.TransactionExpr, scope *Scope) *R
 	childScope := scope.Child()
 	prev := a.inTransaction
 	a.inTransaction = true
-	a.checkBlock(e.Body, childScope)
+	a.checkIsolatedLoopBlock(e.Body, childScope)
 	a.inTransaction = prev
 	return nil
 }
@@ -416,17 +475,25 @@ func (a *Analyzer) checkLiteralExpr(e *ast.Literal) *ResolvedType {
 
 func (a *Analyzer) checkIdentExpr(e *ast.Ident, scope *Scope) *ResolvedType {
 	e.NarrowedTag = false
-	// check if it's a type name
-	if typ, ok := a.types[e.Name]; ok {
-		return typ
-	}
 	sym := scope.Lookup(e.Name)
 	if sym != nil && sym.Kind == SymQueryRow {
 		a.addError(e.Pos, "query value must be row-independent / 查询绑定值不能引用当前行: '%s'", e.Name)
 		return nil
 	}
-	if sym != nil && (sym.Kind == SymFn || sym.Kind == SymApi) && a.callTarget != e {
+	if sym != nil && sym.Kind == SymApi {
+		a.addError(e.Pos, "API '%s' cannot be called locally; extract a fn for shared logic / API '%s' 不能在本地调用；请将复用逻辑抽成 fn", e.Name, e.Name)
+		return nil
+	}
+	if sym != nil && sym.Kind == SymSealed {
+		a.reportSealedValue(e.Pos, e.Name)
+		return nil
+	}
+	if sym != nil && sym.Kind == SymFn && a.callTarget != e {
 		a.addError(e.Pos, "'%s' must be called directly; callable values are not supported / '%s' 必须直接调用，不能作为函数值使用", e.Name, e.Name)
+		return nil
+	}
+	if sym != nil && sym.Kind == SymType && a.isBuiltinIdentityDataType(sym.Type) {
+		a.reportIdentityDataType(e.Pos)
 		return nil
 	}
 	// Preserve lexical shadowing and null narrowing without treating a function's
@@ -438,40 +505,128 @@ func (a *Analyzer) checkIdentExpr(e *ast.Ident, scope *Scope) *ResolvedType {
 	if sym != nil {
 		return sym.Type
 	}
-	// don't error on built-in operations used as expressions
+	if typ, ok := a.types[e.Name]; ok {
+		return typ
+	}
+	if e.Name == "_" {
+		a.addError(e.Pos, "discard binding '_' cannot be read / 丢弃绑定 '_' 不能被读取")
+		return nil
+	}
+	if e.Name == "my" {
+		a.addError(e.Pos, "my requires an authenticated API scope / my 只能在已鉴权的 API 作用域中使用")
+		return nil
+	}
+	// Built-ins are call targets or namespace receivers, never implicit values.
 	if isBuiltinOp(e.Name) {
+		if a.callTarget != e {
+			a.addError(e.Pos, "built-in '%s' cannot be used as a value; call a function or select a member / 内建 '%s' 不能作为值使用；请调用函数或访问成员", e.Name, e.Name)
+		}
 		return nil
 	}
 	a.addErrorWithSuggestion(e.Pos, e.Name, "undefined: '%s' / 未定义: '%s'", e.Name, e.Name)
 	return nil
 }
 
+func isEnumDeclarationMember(expression *ast.MemberExpr, resolved *ResolvedType, scope *Scope) bool {
+	name, ok := expression.Object.(*ast.Ident)
+	if !ok || resolved.Kind != TypeEnum {
+		return false
+	}
+	symbol := scope.Lookup(name.Name)
+	return symbol != nil && symbol.Kind == SymEnum
+}
+
 func (a *Analyzer) checkMemberExpr(e *ast.MemberExpr, scope *Scope) *ResolvedType {
+	if a.checkBuiltinNamespaceMember(e, scope) {
+		return nil
+	}
 	objType := a.checkExpr(e.Object, scope)
 	if objType == nil {
 		return nil
+	}
+	if isEnumDeclarationMember(e, objType, scope) {
+		return a.resolveFieldAccess(e, objType)
+	}
+	if isDebugNamespace(e, objType, scope) {
+		a.addError(e.Pos, "debug receiver requires a runtime value / 日志接收者必须是运行时值，请访问具体字段或实例")
+		return nil
+	}
+
+	if objType.Nullable && !e.SafeCall {
+		a.addError(e.Pos, "cannot access member '%s' on nullable '%s?', guard or use ?. / 不能直接访问可空类型 '%s?' 的成员 '%s'，请先判空或使用 ?.", e.Field, objType.Name, objType.Name, e.Field)
 	}
 
 	if e.SafeCall && !objType.Nullable {
 		a.addWarning(e.Pos, "unnecessary safe call (?.) on non-null type '%s' / 对非空类型 '%s' 使用了不必要的安全调用 (?.)", objType.Name, objType.Name)
 	}
 
+	// Instance mutations return affected-row counts, unlike model-level CRUD.
+	if objType.Kind == TypeModel && !objType.IsList && (e.Field == "update" || e.Field == "delete") {
+		if name, ok := e.Object.(*ast.Ident); ok {
+			if symbol := scope.Lookup(name.Name); symbol != nil && (symbol.Kind == SymVariable || symbol.Kind == SymParam) {
+				return a.types["Int"]
+			}
+		}
+	}
+
 	a.warnStringContains(e, objType)
 
 	// Duration properties: Int.days, Int.hours, Int.minutes, Int.seconds, Int.milliseconds
 	// Only Int, not Float — duration multiplier must be integer
-	if objType.Kind == TypeInt {
+	if objType.Kind == TypeInt && !objType.IsList {
 		switch e.Field {
 		case "days", "hours", "minutes", "seconds", "milliseconds":
+			if a.callTarget == e {
+				a.reportNonCallableMember(e)
+				return nil
+			}
 			return a.types["Duration"]
 		}
 	}
 
-	if result, ok := a.resolveMemberMethod(e, objType); ok {
+	if a.rejectInstanceQueryReceiver(e, objType, scope) {
+		return nil
+	}
+	if result, ok := a.resolveMemberMethod(e, objType, scope); ok {
 		return result
 	}
 
 	return a.resolveFieldAccess(e, objType)
+}
+
+// Namespace syntax does not override local bindings or authenticated identity.
+func (a *Analyzer) checkBuiltinNamespaceMember(expression *ast.MemberExpr, scope *Scope) bool {
+	name, ok := expression.Object.(*ast.Ident)
+	if !ok || name.Name == "my" || !isBuiltinOp(name.Name) || scope.Lookup(name.Name) != nil {
+		return false
+	}
+	if name.Name == "error" && !isBuiltinErrorName(expression.Field) {
+		a.addError(expression.Pos, "unknown built-in error '%s' / 未知内建错误 '%s'", expression.Field, expression.Field)
+	}
+	return true
+}
+
+func isDebugNamespace(member *ast.MemberExpr, receiver *ResolvedType, scope *Scope) bool {
+	if !isDebugMethod(member.Field) {
+		return false
+	}
+	name, ok := member.Object.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	if name.Name == "my" && receiver.Name == "Identity" {
+		return receiver.LookupField(member.Field) == nil
+	}
+	symbol := scope.Lookup(name.Name)
+	if symbol == nil {
+		return false
+	}
+	switch symbol.Kind {
+	case SymModel, SymType, SymInterface, SymSealed:
+		return true
+	default:
+		return false
+	}
 }
 
 // warnStringContains warns about .contains() on String (non-list) without @search.
@@ -485,21 +640,34 @@ func (a *Analyzer) warnStringContains(e *ast.MemberExpr, objType *ResolvedType) 
 
 // resolveMemberMethod attempts to resolve the member access as a built-in method call.
 // Returns (result, true) if resolved, (nil, false) if it should fall through to field access.
-func (a *Analyzer) resolveMemberMethod(e *ast.MemberExpr, objType *ResolvedType) (*ResolvedType, bool) {
-	// debug chain methods — valid on all types, return self
+func (a *Analyzer) resolveMemberMethod(e *ast.MemberExpr, objType *ResolvedType, scope *Scope) (*ResolvedType, bool) {
+	// Debug chains preserve the receiver, including lists.
 	if isDebugMethod(e.Field) {
+		if !objType.IsList && objType.LookupField(e.Field) != nil {
+			return a.resolveFieldAccess(e, objType), true
+		}
+		if a.callTarget == e {
+			a.addError(e.Pos, "debug chain is a property; remove parentheses / 日志链是属性，请移除调用括号")
+		}
+		if e.SafeCall {
+			return objType.AsNonNull(), true
+		}
 		return objType, true
 	}
-	// query builder chain methods — Model.where(...).sum(...) etc.
-	if objType.Kind == TypeModel && isQueryMethod(e.Field) {
-		return a.resolveQueryMethod(e.Field, objType), true
-	}
-	if objType.Kind == TypeQueryBuilder && isQueryMethod(e.Field) {
-		return a.resolveQueryMethod(e.Field, objType.ModelType), true
-	}
-	// collection methods on list types
-	if objType.IsList && isCollectionMethod(e.Field) {
+	// List element kinds never grant scalar or database receiver methods.
+	if objType.IsList {
+		if !isCollectionMethod(e.Field) {
+			return nil, false
+		}
+		if a.collectionMethodNeedsInvocation(e) {
+			a.addError(e.Pos, "collection method requires an invocation / 集合方法必须显式调用")
+			return nil, true
+		}
 		return a.resolveCollectionMethod(e.Field, objType), true
+	}
+	// query builder chain methods — Model.where(...).sum(...) etc.
+	if (objType.Kind == TypeModel || objType.Kind == TypeQueryBuilder) && isQueryMethod(e.Field) {
+		return a.resolveQueryMethod(e.Field, objType, e, scope), true
 	}
 	// .let scope function — works on any type
 	if e.Field == "let" {
@@ -510,11 +678,19 @@ func (a *Analyzer) resolveMemberMethod(e *ast.MemberExpr, objType *ResolvedType)
 
 // resolveFieldAccess resolves a field or enum value access on a type.
 func (a *Analyzer) resolveFieldAccess(e *ast.MemberExpr, objType *ResolvedType) *ResolvedType {
+	if objType.IsList {
+		a.addError(e.Pos, "list has no field '%s'; access an element first / 列表没有字段 '%s'，请先访问列表元素", e.Field, e.Field)
+		return nil
+	}
 	field := objType.LookupField(e.Field)
 	if field == nil {
 		if objType.Kind == TypeEnum {
 			for _, v := range objType.EnumValues {
 				if v == e.Field {
+					if a.callTarget == e {
+						a.reportNonCallableMember(e)
+						return nil
+					}
 					return objType
 				}
 			}
@@ -524,9 +700,17 @@ func (a *Analyzer) resolveFieldAccess(e *ast.MemberExpr, objType *ResolvedType) 
 	}
 
 	// Cross-module field visibility: only extend-declared fields are accessible
+	e.DeclaredField = true
 	a.checkExtendFieldVisibility(e, objType)
 	if objType.Kind == TypeModel {
 		a.recordCacheModelRead(e, field.Type)
+	}
+
+	// String length properties also have an existing explicit-call spelling.
+	if a.callTarget == e && !field.IsMethod &&
+		!(objType.Kind == TypeString && (e.Field == "length" || e.Field == "size" || e.Field == "isEmpty")) {
+		a.reportNonCallableMember(e)
+		return nil
 	}
 
 	// method fields require () to call
@@ -535,11 +719,11 @@ func (a *Analyzer) resolveFieldAccess(e *ast.MemberExpr, objType *ResolvedType) 
 		return field.Type
 	}
 
-	result := field.Type
-	if result != nil && e.SafeCall {
-		result = result.AsNullable()
-	}
-	return result
+	return field.Type
+}
+
+func (a *Analyzer) reportNonCallableMember(e *ast.MemberExpr) {
+	a.addError(e.Pos, "member '%s' is not callable / 成员 '%s' 不能调用", e.Field, e.Field)
 }
 
 // checkExtendFieldVisibility checks that field access on cross-module model types
@@ -566,6 +750,19 @@ func (a *Analyzer) checkExtendFieldVisibility(e *ast.MemberExpr, objType *Resolv
 }
 
 func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
+	e.ConstructorType = nil
+	if member, ok := e.Func.(*ast.MemberExpr); ok {
+		member.SealedConstructor = false
+	}
+	if !a.checkCallTarget(e, scope) {
+		return nil
+	}
+	if result, handled := a.checkGenericConstructor(e, scope); handled {
+		return result
+	}
+	if result, handled := a.checkSealedConstructor(e, scope); handled {
+		return result
+	}
 	if result, handled := a.checkChannelCall(e, scope); handled {
 		return result
 	}
@@ -579,9 +776,10 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 	if result, handled := a.checkCollectionCall(e, scope); handled {
 		return result
 	}
+	declaredFunction := isDeclaredFunctionCall(e, scope)
 
 	// check CRUD inside lambda (function-style and chain-style)
-	if a.inLambda && isCRUDCall(e) {
+	if a.inLambda && isCRUDCall(e) && !declaredFunction {
 		a.addError(e.Pos, "database query inside collection lambda is forbidden, use batch query instead / 集合 lambda 内禁止数据库查询，请使用批量查询")
 	}
 
@@ -595,20 +793,46 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 	}
 
 	// Cross-module model restriction: only load() allowed, not find/where/create etc.
-	a.checkCrossModuleCRUD(e)
+	if !declaredFunction {
+		a.checkCrossModuleCRUD(e)
+	}
 
-	callScope := a.injectCRUDScope(e, scope)
-	isCRUD := isCRUDIdent(e)
-
-	// orderBy(field.desc) — sort expressions are not normal expressions, skip checking
-	if isOrderByMethod(e) {
+	// Sort selectors need only the resolved row, not an injected field scope.
+	if a.checkOrderByArguments(e, callType) {
 		return a.inferCheckedCallReturnType(e, callType)
 	}
 
+	// load accepts key values, not query predicates. Model fields must never
+	// shadow caller parameters, and there is no query scope to allocate here.
+	callScope := scope
+	if !isModelLoadCall(e) && !declaredFunction {
+		callScope = a.injectCRUDScope(e, scope)
+	}
+	isCRUD := isCRUDIdent(e) && !declaredFunction
+
 	argTypes := make([]*ResolvedType, len(e.Args))
+	a.checkCallArguments(e, scope, callScope, callType, isCRUD, argTypes)
+	a.checkQueryWhereArguments(e, scope)
+	a.checkLoadArguments(e, argTypes)
+	a.checkDeclaredFunctionCall(e, argTypes)
+	a.checkErrorConstructor(e, argTypes, scope)
+	a.checkStringCallArguments(e, argTypes)
+	a.checkAuthMethodArguments(e, argTypes)
+
+	if !declaredFunction {
+		a.checkCallCreateFields(e)
+		if result, handled := a.checkScalarAggregate(e, scope); handled {
+			return result
+		}
+	}
+	return a.inferCheckedCallReturnType(e, callType)
+}
+
+func (a *Analyzer) checkCallArguments(e *ast.CallExpr, scope, callScope *Scope, callType *ResolvedType, isCRUD bool, argTypes []*ResolvedType) {
 	for i, arg := range e.Args {
 		// skip order/select/include/distinct — these use query modifier syntax (field.desc)
 		if isCRUD && isQueryModifierArg(arg.Name) {
+			a.checkCRUDOrderArgument(arg, callScope, scope)
 			continue
 		}
 		argScope := callScope
@@ -623,16 +847,14 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 		// (callScope may shadow variables with model fields)
 		if isCRUD && arg.Name != "" {
 			if ident, ok := arg.Value.(*ast.Ident); ok {
-				if sym := scope.Lookup(ident.Name); sym != nil && sym.Kind == SymVariable {
-					sym.Used = true
-				}
+				// Lookup already marks the resolved outer binding as used.
+				scope.Lookup(ident.Name)
 			}
 		}
 	}
-	a.checkLoadArguments(e, argTypes)
-	a.checkDeclaredFunctionCall(e, argTypes)
-	a.checkAuthMethodArguments(e, argTypes)
+}
 
+func (a *Analyzer) checkCallCreateFields(e *ast.CallExpr) {
 	// 1.3: check create required fields (function-style and chain-style)
 	if ident, ok := e.Func.(*ast.Ident); ok && ident.Name == "create" {
 		a.checkCreateRequiredFields(e)
@@ -641,10 +863,28 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 		a.checkChainCreateRequiredFields(e)
 	}
 
-	if result, handled := a.checkScalarAggregate(e, scope); handled {
-		return result
+}
+
+// Calls name a declaration or select a method, never invoke a computed value.
+func (a *Analyzer) checkCallTarget(call *ast.CallExpr, scope *Scope) bool {
+	ident, ok := call.Func.(*ast.Ident)
+	if !ok {
+		if _, member := call.Func.(*ast.MemberExpr); member {
+			return true
+		}
+		a.checkExpr(call.Func, scope)
+		a.addError(call.Pos, "expression is not callable; function values are not supported / 表达式不能调用，当前不支持函数值")
+	} else {
+		symbol := scope.Lookup(ident.Name)
+		if symbol == nil || (symbol.Kind != SymParam && symbol.Kind != SymVariable) {
+			return true
+		}
+		a.addError(call.Pos, "'%s' is not callable; function values are not supported / '%s' 不能调用，当前不支持函数值", ident.Name, ident.Name)
 	}
-	return a.inferCheckedCallReturnType(e, callType)
+	for _, argument := range call.Args {
+		a.checkExpr(argument.Value, scope)
+	}
+	return false
 }
 
 func (a *Analyzer) inferCheckedCallReturnType(call *ast.CallExpr, checked *ResolvedType) *ResolvedType {
@@ -656,12 +896,24 @@ func (a *Analyzer) inferCheckedCallReturnType(call *ast.CallExpr, checked *Resol
 
 // Transaction blocks establish transaction scope rather than collection scope.
 func (a *Analyzer) checkBuiltinValueCall(call *ast.CallExpr, scope *Scope) (*ResolvedType, bool) {
+	if result, handled := a.checkRandomBuiltin(call, scope); handled {
+		return result, true
+	}
 	name, ok := call.Func.(*ast.Ident)
 	if !ok {
 		return nil, false
 	}
 	switch name.Name {
 	case "now", "today":
+		if scope.Lookup(name.Name) != nil {
+			return nil, false
+		}
+		if name.Name == "now" && len(call.Args) != 0 {
+			a.addError(call.Pos, "now accepts no arguments / now不接受参数")
+			for _, argument := range call.Args {
+				a.checkExpr(argument.Value, scope)
+			}
+		}
 		return a.types["DateTime"], true
 	case "transaction":
 		return a.checkTransactionCall(call, scope), true
@@ -670,13 +922,50 @@ func (a *Analyzer) checkBuiltinValueCall(call *ast.CallExpr, scope *Scope) (*Res
 	}
 }
 
+// Random generators return concrete values and propagate failures through the callable error channel.
+func (a *Analyzer) checkRandomBuiltin(call *ast.CallExpr, scope *Scope) (*ResolvedType, bool) {
+	member, ok := call.Func.(*ast.MemberExpr)
+	if !ok {
+		return nil, false
+	}
+	module, ok := member.Object.(*ast.Ident)
+	if !ok || module.Name != "crypto" || scope.Lookup(module.Name) != nil {
+		return nil, false
+	}
+	resultName := ""
+	switch member.Field {
+	case "randomHex":
+		resultName = "String"
+	case "randomBytes":
+		resultName = "Bytes"
+	default:
+		return nil, false
+	}
+	if len(call.Args) > 1 {
+		a.addError(call.Pos, "crypto.%s accepts at most one length argument / 随机数函数最多接受一个长度参数", member.Field)
+	}
+	parameter := ast.ParamDecl{Name: "n", Type: &ast.TypeRef{Name: "Int"}}
+	for _, argument := range call.Args {
+		actual := a.checkExpr(argument.Value, scope)
+		if argument.Name != "" && argument.Name != "n" {
+			a.addError(argument.Value.GetPos(), "unknown random length argument '%s', expected n / 随机数长度参数名必须为n", argument.Name)
+		}
+		a.checkFunctionArgumentType(argument, actual, &parameter)
+	}
+	return a.types[resultName], true
+}
+
 func (a *Analyzer) checkDeclaredFunctionCall(call *ast.CallExpr, argTypes []*ResolvedType) {
 	ident, ok := call.Func.(*ast.Ident)
 	if !ok {
 		return
 	}
+	symbol := a.scope.LookupLocal(ident.Name)
+	if symbol != nil && symbol.serviceFunction {
+		a.addError(call.Pos, "@service fn '%s' cannot be called as a local function / @service fn '%s' 不能作为本地函数调用", ident.Name, ident.Name)
+		return
+	}
 	if a.functions == nil {
-		symbol := a.scope.LookupLocal(ident.Name)
 		if symbol == nil || symbol.Kind != SymFn {
 			return
 		}
@@ -686,11 +975,57 @@ func (a *Analyzer) checkDeclaredFunctionCall(call *ast.CallExpr, argTypes []*Res
 	if fn == nil {
 		return
 	}
-	if hasNamedDirective(fn.Directives, "service") {
-		a.addError(call.Pos, "@service fn '%s' cannot be called as a local function / @service fn '%s' 不能作为本地函数调用", fn.Name, fn.Name)
+	a.checkFunctionArguments(call, fn, argTypes)
+}
+
+// A bare declared error has the same argument contract as an empty constructor call.
+func (a *Analyzer) normalizeErrorConstructor(value ast.Expr, scope *Scope) ast.Expr {
+	name, ok := value.(*ast.Ident)
+	if !ok {
+		return value
+	}
+	if symbol := scope.Lookup(name.Name); symbol != nil && symbol.Kind == SymError {
+		return &ast.CallExpr{Pos: name.Pos, Func: name}
+	}
+	return value
+}
+
+func (a *Analyzer) checkThrownValue(value ast.Expr, scope *Scope, pos token.Position) ast.Expr {
+	if value == nil {
+		a.addError(pos, "throw requires an error value / throw 缺少错误值")
+		return nil
+	}
+	value = a.normalizeErrorConstructor(value, scope)
+	a.checkExpr(value, scope)
+	switch expression := value.(type) {
+	case *ast.MemberExpr:
+		if name, ok := expression.Object.(*ast.Ident); ok && name.Name == "error" && scope.Lookup(name.Name) == nil {
+			return value
+		}
+	case *ast.CallExpr:
+		if name, ok := expression.Func.(*ast.Ident); ok {
+			if symbol := scope.Lookup(name.Name); symbol != nil && symbol.Kind == SymError {
+				return value
+			}
+		}
+	}
+	a.addError(value.GetPos(), "throw requires a built-in error or declared error constructor / throw 需要内建错误或已声明的错误构造")
+	return value
+}
+
+func (a *Analyzer) checkErrorConstructor(call *ast.CallExpr, argTypes []*ResolvedType, scope *Scope) {
+	name, ok := call.Func.(*ast.Ident)
+	if !ok {
 		return
 	}
-	a.checkFunctionArguments(call, fn, argTypes)
+	symbol := scope.Lookup(name.Name)
+	if symbol == nil || symbol.Kind != SymError {
+		return
+	}
+	if declaration := a.errorConstructors[name.Name]; declaration != nil {
+		call.ErrorConstructor = declaration
+		a.checkFunctionArguments(call, &ast.FnDecl{Name: declaration.Name, Params: declaration.Fields}, argTypes)
+	}
 }
 
 func (a *Analyzer) checkFunctionArguments(call *ast.CallExpr, fn *ast.FnDecl, argTypes []*ResolvedType) {
@@ -823,12 +1158,10 @@ func (a *Analyzer) checkMissingFunctionArguments(call *ast.CallExpr, fn *ast.FnD
 
 // checkTransactionCall handles transaction { ... } which is parsed as
 // CallExpr(Ident("transaction"), [LambdaExpr]). It sets inTransaction
-// and suppresses inLambda for the body.
+// and inherits the enclosing database-query restriction.
 func (a *Analyzer) checkTransactionCall(e *ast.CallExpr, scope *Scope) *ResolvedType {
 	prevTx := a.inTransaction
-	prevLambda := a.inLambda
 	a.inTransaction = true
-	a.inLambda = false
 	for _, arg := range e.Args {
 		// If the arg is a LambdaExpr, check its body directly without
 		// entering checkLambdaExpr (which would set inLambda=true).
@@ -838,13 +1171,12 @@ func (a *Analyzer) checkTransactionCall(e *ast.CallExpr, scope *Scope) *Resolved
 				Name: "it",
 				Kind: SymVariable,
 			})
-			a.checkBlock(lambda.Body, childScope)
+			a.checkIsolatedLoopBlock(lambda.Body, childScope)
 		} else {
 			a.checkExpr(arg.Value, scope)
 		}
 	}
 	a.inTransaction = prevTx
-	a.inLambda = prevLambda
 	return nil
 }
 
@@ -873,12 +1205,7 @@ func (a *Analyzer) injectCRUDScope(e *ast.CallExpr, scope *Scope) *Scope {
 		}
 	}
 
-	// chain-style: User.find(where: ...), User.where(email == ...)
-	if _, modelName := chainCRUDInfo(e); modelName != "" {
-		modelType = a.types[modelName]
-	}
-
-	// chain on query builder variable: orders.sum(total) where orders is TypeQueryBuilder
+	// Resolve chain receivers through their actual binding, including query aliases.
 	if modelType == nil {
 		modelType = a.resolveChainModelType(e, scope)
 	}
@@ -1054,6 +1381,11 @@ func (a *Analyzer) inferFindReturnType(e *ast.CallExpr, modelType *ResolvedType)
 	return modelType
 }
 
+func isModelLoadCall(call *ast.CallExpr) bool {
+	member, ok := call.Func.(*ast.MemberExpr)
+	return ok && member.Field == "load"
+}
+
 // inferLoadReturnType infers the return type for Model.load(...).
 // No named args → PK load → nullable model (single result)
 // Named args → FK/multi-condition load → list of models
@@ -1068,7 +1400,7 @@ func (a *Analyzer) inferLoadReturnType(e *ast.CallExpr, modelType *ResolvedType)
 	if hasNamedArgs {
 		return modelType.AsList() // FK load returns list
 	}
-	return modelType // PK load returns single (nullable)
+	return modelType.AsNullable() // Missing primary keys are represented explicitly.
 }
 
 func (a *Analyzer) checkLoadArguments(e *ast.CallExpr, argTypes []*ResolvedType) {
@@ -1080,6 +1412,7 @@ func (a *Analyzer) checkLoadArguments(e *ast.CallExpr, argTypes []*ResolvedType)
 	if modelType == nil {
 		return
 	}
+	a.recordCacheModelRead(e, modelType)
 	if len(e.Args) == 0 {
 		a.addError(e.Pos, "%s.load requires one primary key or named lookup fields / %s.load 需要主键或命名查询字段", modelName, modelName)
 		return
@@ -1107,7 +1440,11 @@ func (a *Analyzer) checkPrimaryKeyLoadArguments(e *ast.CallExpr, modelType *Reso
 		return
 	}
 	idField := resolvedPrimaryKeyField(modelType)
-	if idField == nil || idField.Type == nil || argTypes[0] == nil {
+	if idField == nil || idField.Type == nil {
+		a.addError(e.Pos, "%s.load requires a declared primary key / %s.load 需要声明有效主键", modelType.Name, modelType.Name)
+		return
+	}
+	if argTypes[0] == nil {
 		return
 	}
 	if !isTypeAssignable(idField.Type, argTypes[0]) {
@@ -1121,13 +1458,39 @@ func resolvedPrimaryKeyField(modelType *ResolvedType) *FieldInfo {
 		return nil
 	}
 	for _, field := range modelType.Fields {
-		for _, directive := range field.Directives {
-			if directive == "id" {
+		if field != nil && slices.Contains(field.Directives, "id") {
+			return field
+		}
+	}
+	if len(modelType.Parents) > 0 {
+		visited := map[*ResolvedType]bool{modelType: true}
+		for _, parent := range modelType.Parents {
+			if field := inheritedPrimaryKeyField(modelType, parent, visited); field != nil {
 				return field
 			}
 		}
 	}
 	return modelType.LookupField("id")
+}
+
+// Match expanded-field precedence: local names and earlier parents shadow later
+// declarations. An overridden @id must not reappear through another ancestor.
+func inheritedPrimaryKeyField(root, current *ResolvedType, visited map[*ResolvedType]bool) *FieldInfo {
+	if current == nil || visited[current] {
+		return nil
+	}
+	visited[current] = true
+	for _, field := range current.Fields {
+		if field != nil && slices.Contains(field.Directives, "id") && root.LookupField(field.Name) == field {
+			return field
+		}
+	}
+	for _, parent := range current.Parents {
+		if field := inheritedPrimaryKeyField(root, parent, visited); field != nil {
+			return field
+		}
+	}
+	return nil
 }
 
 func (a *Analyzer) checkNamedLoadArguments(e *ast.CallExpr, modelType *ResolvedType, argTypes []*ResolvedType) {
@@ -1198,7 +1561,7 @@ func (a *Analyzer) inferChainCRUDReturnType(e *ast.CallExpr, method string, mode
 	case "load":
 		return a.inferLoadReturnType(e, modelType)
 	default:
-		return a.resolveQueryMethod(method, modelType)
+		return a.resolveQueryMethod(method, modelType, nil, nil)
 	}
 }
 
@@ -1450,6 +1813,9 @@ func isAggregateFieldRefCall(e *ast.CallExpr) bool {
 
 func (a *Analyzer) checkBinaryExpr(e *ast.BinaryExpr, scope *Scope) *ResolvedType {
 	left := a.checkExpr(e.Left, scope)
+	if e.Op == "is" {
+		return a.checkTypeTestExpr(e, left, scope)
+	}
 	rightScope := scope
 	if e.Op == "&&" || e.Op == "||" {
 		if narrowed := narrowCondition(e.Left, e.Op == "&&", scope, nil); narrowed != nil {
@@ -1464,6 +1830,15 @@ func (a *Analyzer) checkBinaryExpr(e *ast.BinaryExpr, scope *Scope) *ResolvedTyp
 }
 
 func (a *Analyzer) checkUnaryExpr(e *ast.UnaryExpr, scope *Scope) *ResolvedType {
+	if literal, ok := signedIntegralLiteral(e); ok {
+		resolved := a.integralLiteralType(literal, true)
+		a.setExprResolvedType(literal, resolved)
+		return resolved
+	}
+	if e.Op == "throw" {
+		e.Value = a.checkThrownValue(e.Value, scope, e.Pos)
+		return nil // throw never returns
+	}
 	if e.Op == "?" {
 		a.resultOperand++
 	}
@@ -1473,9 +1848,6 @@ func (a *Analyzer) checkUnaryExpr(e *ast.UnaryExpr, scope *Scope) *ResolvedType 
 	}
 	if e.Op == "?" {
 		a.resultOperand--
-	}
-	if e.Op == "throw" {
-		return nil // throw never returns
 	}
 	if e.Op == "?" {
 		if _, ok := e.Value.(*ast.CallExpr); !ok {
@@ -1489,10 +1861,18 @@ func (a *Analyzer) checkUnaryExpr(e *ast.UnaryExpr, scope *Scope) *ResolvedType 
 			a.addError(e.Pos, "operator '?' requires Result<T>, got '%s' / 运算符 '?' 需要 Result<T>，得到 '%s'", name, name)
 			return &ResolvedType{Kind: TypeUnknown, Name: "Unknown"}
 		}
-		return cloneResolvedType(inner.TypeArgs[0])
+		result := cloneResolvedType(inner.TypeArgs[0])
+		e.ResultValueNullable = result.Nullable
+		result.Nullable = result.Nullable || inner.Nullable
+		return result
 	}
 	if e.Op == "!" {
 		return a.checkBooleanNegation(inner, e.Pos)
+	}
+	if e.Op == "-" && inner != nil {
+		if inner.Nullable || inner.IsList || inner.Kind != TypeInt && inner.Kind != TypeFloat && inner.Kind != TypeDecimal && inner.Kind != TypeDuration {
+			a.addError(e.Pos, "numeric negation requires non-null Int, Float, Decimal or Duration / 数值取负需要非空 Int、Float、Decimal 或 Duration")
+		}
 	}
 	return inner
 }
@@ -1502,6 +1882,17 @@ func (a *Analyzer) checkBooleanNegation(inner *ResolvedType, pos token.Position)
 		a.addError(pos, "operator '!' requires non-null Boolean, got '%s' / 运算符 '!' 需要非空 Boolean，得到 '%s'", formatResolvedType(inner), formatResolvedType(inner))
 	}
 	return inner
+}
+
+func (a *Analyzer) checkBangElvisGuard(e *ast.BangElvisExpr, scope *Scope) {
+	if condition := a.checkExpr(e.Left, scope); condition != nil && !condition.IsNonNullBoolean() {
+		a.addError(e.Pos, "operator '!:' requires non-null Boolean / 运算符 '!:' 需要非空 Boolean")
+	}
+	if thrown, ok := e.Right.(*ast.UnaryExpr); !ok || thrown.Op != "throw" {
+		a.addError(e.Pos, "operator '!:' requires a throw expression / 运算符 '!:' 的右侧必须是 throw 表达式")
+	}
+	// The rejected branch cannot narrow values in the continuing scope.
+	a.checkExpr(e.Right, scope.Child())
 }
 
 func (a *Analyzer) checkElvisExpr(e *ast.ElvisExpr, scope *Scope) *ResolvedType {
@@ -1554,7 +1945,7 @@ func (a *Analyzer) checkWhen(e *ast.WhenExpr, scope *Scope, required bool) *Reso
 			seenBranches[b.IsType] = true
 		}
 		if b.Condition != nil {
-			a.checkExpr(b.Condition, scope)
+			a.checkWhenCondition(b.Condition, subjectType, scope)
 		}
 		if b.Body != nil {
 			// sealed variant narrowing: inject variant fields into subject
@@ -1572,7 +1963,20 @@ func (a *Analyzer) checkWhen(e *ast.WhenExpr, scope *Scope, required bool) *Reso
 	}
 	// sealed exhaustiveness check
 	a.checkWhenExhaustive(e, subjectType)
+	a.checkEmptySealedWhen(e, subjectType, required)
 	return resultType
+}
+
+func (a *Analyzer) checkWhenCondition(condition ast.Expr, subject *ResolvedType, scope *Scope) {
+	actual := a.checkExpr(condition, scope)
+	if actual == nil {
+		return
+	}
+	if subject != nil {
+		a.checkBinaryOp("==", subject, actual, condition.GetPos())
+	} else if !actual.IsNonNullBoolean() {
+		a.addError(condition.GetPos(), "when condition requires non-null Boolean / when 条件必须是非空 Boolean")
+	}
 }
 
 func (a *Analyzer) mergeWhenBranchType(current, next *ResolvedType, pos token.Position) *ResolvedType {
@@ -1623,25 +2027,7 @@ func (a *Analyzer) checkWhenExhaustive(e *ast.WhenExpr, subjectType *ResolvedTyp
 		}
 		return
 	}
-	// if there's an else branch, exhaustiveness is guaranteed
-	if e.Else != nil {
-		return
-	}
-	// collect matched variant names
-	matched := map[string]bool{}
-	for _, b := range e.Branches {
-		if b.IsType != "" {
-			matched[b.IsType] = true
-		}
-	}
-	// check for missing variants
-	for _, v := range subjectType.Variants {
-		if !matched[v.Name] {
-			a.addError(e.Pos,
-				"when on sealed type '%s' is not exhaustive, missing variant '%s' / when 未穷举密封类型 '%s'，缺少变体 '%s'",
-				subjectType.Name, v.Name, subjectType.Name, v.Name)
-		}
-	}
+	a.checkSealedWhenExhaustive(e, subjectType)
 }
 
 // checkEnumExhaustive verifies that when on an enum type covers all values.
@@ -1687,7 +2073,7 @@ func (a *Analyzer) checkLambdaExpr(e *ast.LambdaExpr, scope *Scope) *ResolvedTyp
 	previousReturn := a.expectedReturn
 	a.inLambda = true
 	a.expectedReturn = nil
-	a.checkBlock(e.Body, childScope)
+	a.checkIsolatedLoopBlock(e.Body, childScope)
 	a.inLambda = prev
 	a.expectedReturn = previousReturn
 	return nil
@@ -1695,14 +2081,13 @@ func (a *Analyzer) checkLambdaExpr(e *ast.LambdaExpr, scope *Scope) *ResolvedTyp
 
 func (a *Analyzer) literalType(lit *ast.Literal) *ResolvedType {
 	switch lit.Kind {
-	case token.Int:
-		return a.types["Int"]
+	case token.Int, token.Duration:
+		return a.integralLiteralType(lit, false)
 	case token.Float:
+		a.validateFloatLiteral(lit)
 		return a.types["Float"]
 	case token.String:
 		return a.types["String"]
-	case token.Duration:
-		return a.types["Duration"]
 	case token.True, token.False:
 		return a.types["Boolean"]
 	case token.Null:
@@ -1728,12 +2113,17 @@ func (a *Analyzer) checkBinaryOp(op string, left, right *ResolvedType, pos token
 		if left.Kind == TypeString && right.Kind == TypeEnum {
 			a.addError(pos, "cannot compare String with enum '%s', use %s.VALUE / 不能用 String 和枚举 '%s' 比较，请使用 %s.VALUE", right.Name, right.Name, right.Name, right.Name)
 		}
+		a.checkComparisonTypes(op, left, right, pos)
 		return a.types["Boolean"]
 
 	case ">", ">=", "<", "<=":
-		if !left.IsOrderable() {
-			a.addError(pos, "operator '%s' requires orderable type, got '%s' / 运算符 '%s' 需要可排序类型，得到 '%s'", op, left.Name, op, left.Name)
+		if left.Nullable || right.Nullable {
+			a.addError(pos, "operator '%s' requires non-null operands, unwrap first / 运算符 '%s' 要求非可空操作数，请先解除可空性", op, op)
 		}
+		if left.IsList || right.IsList || !left.IsOrderable() || !right.IsOrderable() {
+			a.addError(pos, "operator '%s' requires orderable type on both sides / 运算符 '%s' 的两侧都需要可排序的标量类型", op, op)
+		}
+		a.checkComparisonTypes(op, left, right, pos)
 		return a.types["Boolean"]
 
 	case "&&", "||":
@@ -1745,20 +2135,51 @@ func (a *Analyzer) checkBinaryOp(op string, left, right *ResolvedType, pos token
 	case "in":
 		return a.types["Boolean"]
 
-	case "is":
-		return a.types["Boolean"]
 	}
 
 	return nil
 }
 
+func (a *Analyzer) checkComparisonTypes(op string, left, right *ResolvedType, pos token.Position) {
+	if left.Kind == TypeUnknown || right.Kind == TypeUnknown {
+		return
+	}
+	if left.IsList == right.IsList {
+		if left.Kind == right.Kind && left.Name == right.Name {
+			if left.Kind == TypeSealed && (op == "==" || op == "!=") {
+				a.checkSealedEquality(left, pos)
+			}
+			return
+		}
+		if left.inheritsFrom(right.Name) || right.inheritsFrom(left.Name) {
+			return
+		}
+	}
+	a.addError(pos, "operator '%s' cannot compare incompatible types '%s' and '%s' / 运算符 '%s' 不能比较不兼容类型 '%s' 与 '%s'", op, left.Name, right.Name, op, left.Name, right.Name)
+}
+
 func (a *Analyzer) checkArithmeticOp(op string, left, right *ResolvedType, pos token.Position) *ResolvedType {
+	if left.IsList || right.IsList {
+		a.addError(pos, "operator '%s' requires scalar operands / 运算符 '%s' 需要标量操作数", op, op)
+		return nil
+	}
 	// 1.2: nullable cannot be used in arithmetic
 	if left.Nullable {
 		a.addError(pos, "cannot use '%s' on nullable '%s?', unwrap first with ?: / 不能对可空类型 '%s?' 使用 '%s'，请先用 ?: 解包", op, left.Name, left.Name, op)
 	}
 	if right.Nullable {
 		a.addError(pos, "cannot use '%s' on nullable '%s?', unwrap first with ?: / 不能对可空类型 '%s?' 使用 '%s'，请先用 ?: 解包", op, right.Name, right.Name, op)
+	}
+	// Exact Decimal arithmetic retains the declared decimal result type.
+	if left.Kind == TypeDecimal || right.Kind == TypeDecimal {
+		if left.Kind == right.Kind {
+			switch op {
+			case "+", "-", "*":
+				return a.types["Decimal"]
+			}
+		}
+		a.addError(pos, "operator '%s' does not support Decimal operands / 运算符 '%s' 不支持 Decimal 操作数", op, op)
+		return nil
 	}
 	// DateTime +/- Duration → DateTime
 	if left.Kind == TypeDateTime && right.Kind == TypeDuration && (op == "+" || op == "-") {
@@ -1769,7 +2190,7 @@ func (a *Analyzer) checkArithmeticOp(op string, left, right *ResolvedType, pos t
 		return a.types["Duration"]
 	}
 	if !left.IsNumeric() || !right.IsNumeric() {
-		if op == "+" && left.Kind == TypeString {
+		if op == "+" && left.Kind == TypeString && right.Kind == TypeString {
 			return left // string concatenation
 		}
 		a.addError(pos, "operator '%s' requires numeric types, got '%s' and '%s' / 运算符 '%s' 需要数字类型，得到 '%s' 和 '%s'", op, left.Name, right.Name, op, left.Name, right.Name)

@@ -18,6 +18,7 @@ import (
 func (r *Request) clearPreparedJSON() {
 	if r.paramNames != nil {
 		clear(r.paramSlots[:])
+		r.paramOverflow = nil
 		r.paramNames = nil
 		r.paramCount = 0
 		r.paramSet = 0

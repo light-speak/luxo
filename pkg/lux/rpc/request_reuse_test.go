@@ -8,12 +8,84 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 )
+
+func TestMalformedRequestsDoNotDispatchOrPoisonConnection(t *testing.T) {
+	router := api.NewRouter()
+	if err := router.Registry.Register("echo", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Registry.RegisterParams("echo", []api.ParamMeta{{Name: "id", FieldID: 1, Type: "Int"}}); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	router.Handle("echo", func(_ context.Context, req *api.Request) error {
+		calls.Add(1)
+		req.Buf.B = append(req.Buf.B, req.BinaryParams()...)
+		return nil
+	})
+	server := NewServer(router)
+	conn, err := net.DialTimeout("tcp", startTestRPCServer(t, server), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := initiateHandshake(t.Context(), conn, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for i, body := range [][]byte{
+		{0, 0, 0}, {0x80}, {1, 0x80}, {1, 4, 1}, {1, 0},
+		{1, 0, 1, 0x80}, {1, 0, 1, 2, 1, 4, 0}, {1, 0, 0, 1},
+		append(codec.AppendVarint(nil, uint64(codec.MaxAPIID)+1), 0, 0),
+	} {
+		response := exchangeAuditFrame(t, conn, body)
+		_, err := decodeCallResponse(response, nil)
+		appErr, ok := errors.AsType[*luxerrors.AppError](err)
+		if !ok || appErr.Code != 400 || calls.Load() != int32(i) {
+			t.Fatalf("malformed body %x dispatched or lacked 400: %v; calls=%d", body, err, calls.Load())
+		}
+		response = exchangeAuditFrame(t, conn, []byte{1, 0, 1, 84, 0})
+		if !bytes.Equal(response, []byte{statusOK, 1, 84, 0}) || calls.Load() != int32(i+1) {
+			t.Fatalf("valid request after %x changed: %x; calls=%d", body, response, calls.Load())
+		}
+	}
+}
+
+func exchangeAuditFrame(t *testing.T, conn net.Conn, body []byte) []byte {
+	t.Helper()
+	if err := WriteFrame(conn, encodeRequestEnvelope(requestKindCall, "", body)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := ReadFrame(conn, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
+
+func TestStreamAndTraceRejectOversizeBeforeBorrow(t *testing.T) {
+	c := NewClient("127.0.0.1:1")
+	c.Close()
+	params := make([]byte, maxFrameSize)
+	if sub, err := c.SubscribeContext(t.Context(), "", 1, nil, params); sub != nil || !errors.Is(err, errRequestFrameTooLarge) {
+		t.Errorf("oversized stream reached pool: subscription=%v err=%v", sub, err)
+	}
+	ctx, _ := api.WithDebugTrace(t.Context(), "size-boundary")
+	if body, err := c.CallWithMaskContext(ctx, "", 1, nil, params); body != nil || !errors.Is(err, errRequestFrameTooLarge) {
+		t.Errorf("oversized traced call reached pool: body=%v err=%v", body, err)
+	}
+}
 
 func TestCallFrameConnectionReuse(t *testing.T) {
 	c := &poolConn{}

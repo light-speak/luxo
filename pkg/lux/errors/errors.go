@@ -77,15 +77,17 @@ func Wrap(err error) *AppError {
 	}
 }
 
-// Built-in errors. Use WithData/WithCause to create concrete instances.
+// Common runtime errors. Source-level aliases are defined in internal/builtinerror.
+// Use WithData/WithCause to create concrete instances.
 var (
-	NotFound         = New("NotFound", 404, "error.not_found")
-	Unauthorized     = New("Unauthorized", 401, "error.unauthorized")
-	Forbidden        = New("Forbidden", 403, "error.forbidden")
-	BadRequest       = New("BadRequest", 400, "error.bad_request")
-	Conflict         = New("Conflict", 409, "error.conflict")
-	InternalError    = Wrap(nil)
-	ValidationFailed = New("ValidationFailed", 422, "error.validation_failed")
-	RateLimited      = New("RateLimited", 429, "error.rate_limited")
-	ServiceTimeout   = New("ServiceTimeout", 502, "error.service_timeout")
+	NotFound              = New("NotFound", 404, "error.not_found")
+	Unauthorized          = New("Unauthorized", 401, "error.unauthorized")
+	Forbidden             = New("Forbidden", 403, "error.forbidden")
+	BadRequest            = New("BadRequest", 400, "error.bad_request")
+	Conflict              = New("Conflict", 409, "error.conflict")
+	InternalError         = Wrap(nil)
+	ValidationFailed      = New("ValidationFailed", 422, "error.validation_failed")
+	RateLimited           = New("RateLimited", 429, "error.rate_limited")
+	ServiceTimeout        = New("ServiceTimeout", 502, "error.service_timeout")
+	RelationDepthExceeded = New("RelationDepthExceeded", 400, "relation resolution exceeds configured depth")
 )

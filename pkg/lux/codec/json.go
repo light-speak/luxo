@@ -1,6 +1,7 @@
 package codec
 
 import (
+	"bytes"
 	"errors"
 
 	"github.com/light-speak/luxo/pkg/lux/jsonutil"
@@ -8,6 +9,18 @@ import (
 
 // ErrInvalidJSON rejects malformed JSON text, including invalid Unicode.
 var ErrInvalidJSON = errors.New("codec: JSON must contain one complete valid Unicode JSON value")
+
+// IsJSONNull recognizes only the JSON null token and JSON whitespace.
+// Empty input and non-JSON Unicode whitespace are not null.
+func IsJSONNull(raw []byte) bool {
+	if len(raw) == 4 {
+		return string(raw) == "null"
+	}
+	if len(raw) < 4 || raw[0] > ' ' && raw[0] != 'n' {
+		return false
+	}
+	return bytes.Equal(bytes.Trim(raw, " \t\r\n"), []byte("null"))
+}
 
 // AppendJSON appends a length-prefixed JSON value without decoding its numbers.
 // Invalid input leaves dst unchanged. JSON null is distinct from empty input.
@@ -52,4 +65,25 @@ func (d *Decoder) ReadJSONPtr() *[]byte {
 		return nil
 	}
 	return &raw
+}
+
+// ReadNullableJSON reads a public JSON? value, normalizing the former
+// present-null representation only after validating its entire payload.
+// ReadJSONPtr remains available for internal snapshots that preserve both states.
+func (d *Decoder) ReadNullableJSON() []byte {
+	if d.err != nil || !d.ReadBool() {
+		return nil
+	}
+	raw := d.ReadJSON()
+	// Syntax is already validated. Only null starts with 'n', so inspect the
+	// first token without rescanning trailing whitespace or the JSON payload.
+	for _, char := range raw {
+		if char > ' ' {
+			if char == 'n' {
+				return nil
+			}
+			break
+		}
+	}
+	return raw
 }

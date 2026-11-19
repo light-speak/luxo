@@ -1,14 +1,141 @@
-// Package inferred defines shared compile-time contracts for name-derived APIs.
+// Package inferred defines compile-time conventions shared by analysis and generation.
 package inferred
 
 import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux/str"
+	"github.com/light-speak/luxo/pkg/token"
 )
+
+// QueryWhere validates the complete optional predicate without allocating.
+// Analysis and generation consume this same argument contract.
+// Error suffixes join the caller's method context in the final diagnostic.
+func QueryWhere(arguments []*ast.NamedArg) (ast.Expr, int, string) {
+	var where ast.Expr
+	for index, argument := range arguments {
+		if argument == nil || argument.Name != "where" {
+			return nil, index, " accepts only one named where argument"
+		}
+		if argument.Value == nil {
+			return nil, index, " where requires a value"
+		}
+		if where != nil {
+			return nil, index, " repeats where"
+		}
+		value := argument.Value
+		if !queryPredicate(value) {
+			return nil, index, " where must be a non-null Boolean"
+		}
+		where = value
+	}
+	return where, -1, ""
+}
+
+func queryPredicate(value ast.Expr) bool {
+	if lambda, ok := value.(*ast.LambdaExpr); ok {
+		value, _ = lambda.SingleExpression()
+	}
+	return value != nil && value.GetTypeTag() == "Boolean" && !value.IsListType() && !value.IsNullable()
+}
+
+// MutationField describes resolved write metadata without exposing SDK visibility.
+type MutationField struct {
+	TypeName  string
+	List      bool
+	Nullable  bool
+	Computed  bool
+	Immutable bool
+	Relation  bool
+}
+
+// MutationArgument validates one named setter or query predicate before lowering.
+func MutationArgument(argument *ast.NamedArg, field MutationField) (bool, string) {
+	if argument == nil || argument.Name == "" {
+		return false, " requires named field setters"
+	}
+	if argument.Value == nil {
+		return false, " argument requires a value"
+	}
+	if argument.Name == "where" {
+		if !queryPredicate(argument.Value) {
+			return true, " where must be a non-null Boolean"
+		}
+		return true, ""
+	}
+	if field.TypeName == "" {
+		return false, " setter field does not exist"
+	}
+	if field.Computed || field.Relation {
+		return false, " setter requires a stored field"
+	}
+	if field.Immutable {
+		return false, " cannot change an immutable field"
+	}
+	if !mutationValueMatches(argument.Value, field) {
+		return false, " setter value does not match the field type"
+	}
+	return false, ""
+}
+
+func mutationValueMatches(value ast.Expr, field MutationField) bool {
+	if literal, ok := value.(*ast.Literal); ok && literal.Kind == token.Null {
+		return field.Nullable
+	}
+	if list, ok := value.(*ast.ListExpr); ok && len(list.Items) == 0 {
+		return field.List
+	}
+	return mutationValueName(value) == field.TypeName && value.IsListType() == field.List && (!value.IsNullable() || field.Nullable)
+}
+
+func mutationValueName(value ast.Expr) string {
+	if name := value.GetTypeTag(); name != "" {
+		return name
+	}
+	if literal, ok := value.(*ast.Literal); ok {
+		switch literal.Kind {
+		case token.Int:
+			return "Int"
+		case token.Float:
+			return "Float"
+		case token.String:
+			return "String"
+		case token.True, token.False:
+			return "Boolean"
+		}
+	}
+	return ""
+}
+
+// IsWhereTerminal identifies database terminals with one optional named predicate.
+func IsWhereTerminal(method string) bool {
+	return method != "updateMany" && ModelTerminalType(method) != ""
+}
+
+// ModelTerminalType returns the scalar result for a resolved model terminal.
+func ModelTerminalType(method string) string {
+	switch method {
+	case "deleteMany", "count", "updateMany":
+		return "Int"
+	case "exists":
+		return "Boolean"
+	}
+	return ""
+}
+
+// Query-builder modifiers and predicate terminals require a type/query receiver.
+// Instance update/delete/save and identity methods keep their existing ABI.
+func RequiresModelQueryReceiver(method string) bool {
+	switch method {
+	case "where", "select", "orderBy", "limit", "offset", "groupBy":
+		return true
+	}
+	return ModelTerminalType(method) != ""
+}
 
 // InferredAPI represents a parsed method name like getUserByEmailOrPhone.
 type InferredAPI struct {
@@ -152,18 +279,24 @@ func parseClauseGroups(s string, model *ast.ModelDecl) []ClauseGroup {
 // Ensures separator is between two uppercase-starting parts.
 func SplitBySeparator(s, sep string) []string {
 	var parts []string
-	for {
-		idx := strings.Index(s, sep)
-		if idx <= 0 || idx+len(sep) >= len(s) {
+	for offset := 0; len(sep) > 0 && offset < len(s); {
+		found := strings.Index(s[offset:], sep)
+		if found < 0 {
 			break
 		}
+		idx := offset + found
+		after := idx + len(sep)
 		// Verify separator is between two uppercase-starting parts
-		if unicode.IsUpper(rune(s[idx+len(sep)])) {
-			parts = append(parts, s[:idx])
-			s = s[idx+len(sep):]
-		} else {
-			break
+		if idx > 0 && after < len(s) {
+			next, _ := utf8.DecodeRuneInString(s[after:])
+			if unicode.IsUpper(next) {
+				parts = append(parts, s[:idx])
+				s = s[after:]
+				offset = 0
+				continue
+			}
 		}
+		offset = after
 	}
 	if s != "" {
 		parts = append(parts, s)
@@ -250,6 +383,38 @@ func ParseOrderBy(s string) (string, bool) {
 		return str.LowerFirst(s[:len(s)-3]), false
 	}
 	return str.LowerFirst(s), false
+}
+
+// ParseOrderExpression accepts a field or it.field with an optional asc/desc suffix.
+// For it.asc/it.desc, the final result is an alternative qualified column: callers
+// use it only when no stored column named it exists, preserving suffix precedence.
+func ParseOrderExpression(expression ast.Expr) (string, bool, string) {
+	descending := false
+	if member, ok := expression.(*ast.MemberExpr); ok {
+		if member.SafeCall {
+			return "", false, ""
+		}
+		if row, ok := member.Object.(*ast.Ident); ok && row.Name == "it" {
+			if member.Field == "asc" || member.Field == "desc" {
+				return "it", member.Field == "desc", member.Field
+			}
+			return member.Field, false, ""
+		}
+		if member.Field != "asc" && member.Field != "desc" {
+			return "", false, ""
+		}
+		descending = member.Field == "desc"
+		expression = member.Object
+	}
+	switch field := expression.(type) {
+	case *ast.Ident:
+		return field.Name, descending, ""
+	case *ast.MemberExpr:
+		if row, ok := field.Object.(*ast.Ident); ok && row.Name == "it" && !field.SafeCall {
+			return field.Field, descending, ""
+		}
+	}
+	return "", false, ""
 }
 
 // hasField checks if model has a field with the given name.
@@ -376,6 +541,24 @@ func FieldType(m *ast.ModelDecl, name string) *ast.TypeRef {
 		}
 	}
 	return &ast.TypeRef{Name: "String"}
+}
+
+// InvalidSoftDeleteTimestamp checks effective fields after inheritance expansion.
+// An absent field is valid: the database generator supplies an implicit timestamp.
+func InvalidSoftDeleteTimestamp(model *ast.ModelDecl) *ast.FieldDecl {
+	if !hasDirective(model.Directives, "soft") {
+		return nil
+	}
+	for _, field := range model.Fields {
+		if field.Name != "deletedAt" {
+			continue
+		}
+		typ := field.Type
+		if typ == nil || typ.Name != "DateTime" || !typ.Nullable || typ.IsList || field.Computed != nil {
+			return field
+		}
+	}
+	return nil
 }
 
 func hasDirective(directives []*ast.Directive, name string) bool {

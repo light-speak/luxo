@@ -11,6 +11,23 @@ model Item @noTime {
 }
 `
 
+func TestInferredUnicodeFieldNames(t *testing.T) {
+	for field, suffix := range map[string]string{"école": "École", "用户": "用户", "𐐨value": "𐐀value"} {
+		t.Run(field, func(t *testing.T) {
+			source := "model User @noTime { id: Int @id " + field + ": String }\napi getUserBy" + suffix
+			expectNoErrors(t, analyze(t, source))
+		})
+	}
+}
+
+func TestInferredUnicodeCompoundFields(t *testing.T) {
+	for _, name := range []string{"getUserByNameAndÉcole", "getUserByÉcoleOrName", "getUserByNameOr𐐀value", "getUserByOrderIdOrName"} {
+		t.Run(name, func(t *testing.T) {
+			expectNoErrors(t, analyze(t, "model User @noTime { id: Int @id name: String école: String 𐐨value: String orderId: Int }\napi "+name))
+		})
+	}
+}
+
 func TestAnalyzedFilesIncludeInheritedFieldsForModuleGeneration(t *testing.T) {
 	result := analyze(t, `
 model Base @noTime { id: Int @id }

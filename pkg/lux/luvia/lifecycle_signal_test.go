@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,7 +14,36 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/rpc"
 )
+
+func TestGatewayRPCOriginStartup(t *testing.T) {
+	const childMode = "LUXO_TEST_GATEWAY_RPC_ORIGIN_MODE"
+	if os.Getenv(childMode) != "" {
+		gateway := New()
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		server := rpc.NewServer(gateway.Router)
+		defer server.Close()
+		result := make(chan error, 1)
+		go func() { result <- server.Serve(listener) }()
+		if err := gateway.Serve("origin-startup-test"); err != nil {
+			t.Fatal(err)
+		}
+		server.Close()
+		if err := <-result; err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	t.Setenv("CORS_ORIGIN", "https://app.example:8443")
+	for range 4 {
+		runGatewaySignalProcess(t, childMode, "h2c", syscall.SIGTERM)
+	}
+}
 
 func TestServeHandlesOSSignals(t *testing.T) {
 	const childMode = "LUXO_TEST_GATEWAY_SIGNAL_MODE"
@@ -44,7 +74,8 @@ func runGatewaySignalProcess(t *testing.T, childMode, mode string, sig os.Signal
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestServeHandlesOSSignals$", "-test.count=1")
+	root := strings.Split(t.Name(), "/")[0]
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+root+"$", "-test.count=1")
 	cmd.Env = gatewaySignalEnvironment(childMode, mode)
 	output := &gatewaySignalOutput{ready: make(chan struct{})}
 	cmd.Stdout, cmd.Stderr = output, output

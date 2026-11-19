@@ -38,7 +38,7 @@ func TestGeneratedMutationsWithoutCacheInfrastructure(t *testing.T) {
   if err!=nil || len(rows)!=2 {t.Fatalf("batch: %v %v",rows,err)}
   // Ordinary writes and nested transactions do not require cache metadata.
   err=app.Tx(t.Context(),func(tx *App)error {
-    if _,err:=tx.User.Where(UserWhere.Id.Eq(2)).Update(t.Context(),lux.SetField{Col:"name",Val:"updated"});err!=nil {return err}
+    if _,err:=tx.User.Where(UserWhere.Id.Eq(2)).Update().SetName("updated").Exec(t.Context());err!=nil {return err}
     return tx.Tx(t.Context(),func(child *App)error {
       if _,err:=child.User.Where(UserWhere.Id.Eq(3)).Delete(t.Context());err!=nil {return err}
       _,err:=child.User.Where(UserWhere.Id.Eq(4)).Delete(t.Context())

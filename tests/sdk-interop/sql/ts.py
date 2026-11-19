@@ -20,16 +20,23 @@ def main():
     client = core / 'packages/client'
     plugin = core / 'packages/vite-plugin'
     run(['pnpm', 'build'], cwd=client)
-    run([str(plugin / 'node_modules/.bin/tsdown'), 'src/codegen.ts', '--no-config',
-         '--no-dts', '--format', 'esm', '--deps.never-bundle', '@luxojs/client',
-         '--out-dir', str(work / 'generator')], cwd=plugin)
+    if os.environ.get('LUXO_SQL_INFERRED') == '1':
+        run(['pnpm', 'build'], cwd=plugin)
+    else:
+        run([str(plugin / 'node_modules/.bin/tsdown'), 'src/codegen.ts', '--no-config',
+             '--no-dts', '--format', 'esm', '--deps.never-bundle', '@luxojs/client',
+             '--out-dir', str(work / 'generator')], cwd=plugin)
     run(['node', str(source / 'generate.mjs')])
     consumer = 'projection.mjs' if os.environ.get('LUXO_SQL_PROJECTION') == '1' else 'consumer.mjs'
+    if os.environ.get('LUXO_SQL_PRECISION') == '1':
+        consumer = 'precision.mjs'
     shutil.copy2(source / consumer, work / 'consumer.mjs')
     env = dict(os.environ, NODE_EXTRA_CA_CERTS=os.environ['LUXO_SQL_CERTIFICATE'])
     for mode in ('cjs', 'esm'):
         run(['node', str(work / 'consumer.mjs'), mode, os.environ['LUXO_SQL_ENDPOINT']], env=env)
-    files = [*work.rglob('*'), *client.glob('src/*.ts'), *plugin.glob('src/*.ts')]
+    files = [*work.rglob('*'), *client.glob('src/*.ts'), *plugin.glob('src/*.ts'),
+             *plugin.glob('dist/*'), source / 'Inferred.ts', source / 'Relations.ts', source / 'generate.mjs',
+             source / 'consumer.mjs']
     save_evidence(files, evidence, 'ts', core.parent)
 
 

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 )
 
 var (
@@ -127,4 +128,76 @@ func BenchmarkJSONRequestMetadata(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkRequestPaginationBoundary(b *testing.B) {
+	for _, sample := range []struct {
+		name, body string
+		paginated  bool
+	}{
+		{"ordinary", `{"$api":"read","value":42}`, false},
+		{"paginated", `{"$api":"read","page":3,"pageSize":7}`, true},
+		{"defaults", `{"$api":"read"}`, true},
+	} {
+		registry := paginationBenchmarkRegistry(b, sample.paginated)
+		for _, mode := range []string{"localJSON", "canonicalJSON", "binary"} {
+			b.Run(sample.name+"/"+mode, func(b *testing.B) {
+				benchmarkPaginationMode(b, registry, sample.body, mode)
+			})
+		}
+	}
+}
+
+func benchmarkPaginationMode(b *testing.B, registry *APIRegistry, body, mode string) {
+	reader := strings.NewReader(body)
+	request := &http.Request{Body: io.NopCloser(reader)}
+	prepare := registry.prepareLocalJSONRequest
+	if mode == "canonicalJSON" {
+		prepare = registry.prepareJSONRequest
+	}
+	raw, err := ParseRequest(request)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if err := registry.prepareJSONRequest(raw); err != nil {
+		b.Fatal(err)
+	}
+	wire := raw.BinaryRequest()
+	var reused Request
+	b.ReportAllocs()
+	for b.Loop() {
+		if mode == "binary" {
+			err = registry.ParseBinaryRequestInto(wire, &reused)
+		} else {
+			reader.Reset(body)
+			var req *Request
+			req, err = ParseRequest(request)
+			if err == nil {
+				err = prepare(req)
+			}
+		}
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func paginationBenchmarkRegistry(b *testing.B, paginated bool) *APIRegistry {
+	b.Helper()
+	params := []schema.Param{{ID: 1, Name: "value", Type: schema.FieldInt}}
+	if paginated {
+		params = []schema.Param{
+			{ID: 1, Name: "page", Type: schema.FieldInt, HasDefault: true},
+			{ID: 2, Name: "pageSize", Type: schema.FieldInt, HasDefault: true},
+		}
+	}
+	s := schema.New()
+	if err := s.RegisterAPI(&schema.API{ID: 1, Name: "read", Params: params, Paginated: paginated, DefaultPageSize: 25}); err != nil {
+		b.Fatal(err)
+	}
+	registry := NewAPIRegistry()
+	if err := registry.RegisterSchemaAPIs(s); err != nil {
+		b.Fatal(err)
+	}
+	return registry
 }

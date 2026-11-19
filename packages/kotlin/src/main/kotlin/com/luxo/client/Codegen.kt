@@ -18,6 +18,15 @@ import java.net.URI
  */
 object LuxoCodegen {
 
+    private const val modelDepthParameter = "`\$modelDepth`"
+    private fun depthFunction(name: String): String = "`$name\$depth`"
+
+    private fun StringBuilder.modelDepthCheck(nonempty: String? = null, indent: String = "    ") {
+        val budget = "$modelDepthParameter in 1..64"
+        val condition = if (nonempty == null) budget else "$nonempty == 0 || $budget"
+        appendLine("${indent}require($condition) { \"model nesting exceeds 64 levels\" }")
+    }
+
     fun generate(
         endpoint: String,
         key: String,
@@ -62,44 +71,51 @@ object LuxoCodegen {
     }
 
     internal fun introspectionConnection(endpoint: String, key: String): HttpURLConnection {
-        return (URI("$endpoint?\$schema").toURL().openConnection() as HttpURLConnection).apply {
+        val base = URI(endpoint.substringBefore('#'))
+        val separator = when (base.rawQuery) { null -> "?"; "" -> ""; else -> "&" }
+        return (URI("$base$separator\$schema").toURL().openConnection() as HttpURLConnection).apply {
+            instanceFollowRedirects = false
             requestMethod = "GET"
             setRequestProperty("X-Introspection-Key", key)
         }
     }
 
-    private fun luxoTypeToKt(type: String): String = when (type) {
-        "Int", "Duration" -> "Long"
-        "Float" -> "Double"
-        "String", "DateTime", "UUID", "Decimal", "Enum" -> "String"
-        "Boolean" -> "Boolean"
-        "Bytes" -> "ByteArray"
-        "JSON" -> "JsonElement"
-        else -> type
+    internal fun luxoTypeToKt(type: String, schema: LuxoSchema): String {
+        val base = when (type) {
+            "Int", "Duration" -> "Long"
+            "Float" -> "Double"
+            "String", "DateTime", "UUID", "Decimal", "Enum" -> "String"
+            "Boolean" -> "Boolean"
+            "Bytes" -> "ByteArray"
+            "JSON" -> "JsonElement"
+            else -> return type
+        }
+        if (base !in schema.models && base !in schema.types && base !in schema.enums && base !in schema.sealeds) return base
+        return if (base == "JsonElement") "kotlinx.serialization.json.JsonElement" else "kotlin.$base"
     }
 
-    private fun resolveFieldType(
+    internal fun resolveFieldType(
         f: LuxoField,
         schema: LuxoSchema,
-        usages: Map<String, TypeUsage>,
+        usages: TypeUsages,
         input: Boolean = false,
     ): String {
         val tn = f.typeName ?: f.type
         if (schema.enums.containsKey(tn)) return if (f.isList) "List<$tn>" else tn
-        if (schema.models.containsKey(tn) || schema.types.containsKey(tn)) {
+        if (schema.models.containsKey(tn) || schema.types.containsKey(tn) || schema.sealeds.containsKey(tn)) {
             val name = if (input) inputTypeName(tn, usages) else tn
             return if (f.isList) "List<$name>" else name
         }
-        val base = luxoTypeToKt(f.type)
+        val base = luxoTypeToKt(f.type, schema)
         return if (f.isList) "List<$base>" else base
     }
 
     /** Kotlin type for an API param, wrapping list params in List<>. */
-    private fun paramKtType(p: LuxoParam, schema: LuxoSchema, usages: Map<String, TypeUsage>): String {
+    private fun paramKtType(p: LuxoParam, schema: LuxoSchema, usages: TypeUsages): String {
         val typeName = p.typeName ?: p.type
         val base = if (
-            schema.enums.containsKey(typeName) || schema.models.containsKey(typeName) || schema.types.containsKey(typeName)
-        ) inputTypeName(typeName, usages) else luxoTypeToKt(p.type)
+            schema.enums.containsKey(typeName) || schema.models.containsKey(typeName) || schema.types.containsKey(typeName) || schema.sealeds.containsKey(typeName)
+        ) inputTypeName(typeName, usages) else luxoTypeToKt(p.type, schema)
         return if (p.isList) "List<$base>" else base
     }
 
@@ -109,8 +125,43 @@ object LuxoCodegen {
     private fun hasOutputUsage(usage: TypeUsage): Boolean =
         usage == TypeUsage.OUTPUT || usage == TypeUsage.INPUT_OUTPUT
 
-    private fun inputTypeName(name: String, usages: Map<String, TypeUsage>): String =
-        if (usages[name] == TypeUsage.INPUT_OUTPUT) "${name}Input" else name
+    internal class TypeUsages(
+        states: Map<String, TypeUsage>,
+        val inputAliases: Map<String, String>,
+    ) : Map<String, TypeUsage> by states
+
+    private fun planInputAliases(schema: LuxoSchema, states: Map<String, TypeUsage>): Map<String, String> {
+        var collisions: MutableList<String>? = null
+        for ((name, usage) in states) {
+            if (usage != TypeUsage.INPUT_OUTPUT) continue
+            val preferred = "${name}Input"
+            if ((states[preferred] ?: TypeUsage.UNUSED) != TypeUsage.UNUSED || preferred in schema.enums) {
+                if (collisions == null) collisions = mutableListOf()
+                collisions.add(name)
+            }
+        }
+        val names = collisions ?: return emptyMap()
+        val reserved = schema.enums.keys.toMutableSet()
+        for ((name, usage) in states) {
+            if (usage != TypeUsage.UNUSED) reserved.add(name)
+            if (usage == TypeUsage.INPUT_OUTPUT) reserved.add("${name}Input")
+        }
+        val aliases = mutableMapOf<String, String>()
+        for (name in names.sorted()) {
+            val fields = schema.models[name]?.fields ?: schema.types[name]?.fields ?: emptyList()
+            val members = fields.mapTo(mutableSetOf()) { it.name }
+            val base = "Luxo${name}Input"
+            var candidate = base
+            var ordinal = 2
+            while (candidate in reserved || candidate in members) candidate = base + ordinal++
+            reserved.add(candidate)
+            aliases[name] = candidate
+        }
+        return aliases
+    }
+
+    internal fun inputTypeName(name: String, usages: TypeUsages): String =
+        usages.inputAliases[name] ?: if (usages[name] == TypeUsage.INPUT_OUTPUT) "${name}Input" else name
 
     private fun mergeUsage(current: TypeUsage, next: TypeUsage): TypeUsage = when {
         current == TypeUsage.UNUSED -> next
@@ -119,14 +170,16 @@ object LuxoCodegen {
     }
 
     /** Backward-compatible inference for schema snapshots without explicit usage metadata. */
-    private fun inferTypeUsages(schema: LuxoSchema): Map<String, TypeUsage> {
+    private fun inferTypeUsages(schema: LuxoSchema): TypeUsages {
         val fields = buildMap {
             schema.models.values.forEach { put(it.name, it.fields) }
             schema.types.values.forEach { put(it.name, it.fields) }
+            schema.sealeds.values.forEach { owner -> put(owner.name, owner.variants.flatMap { it.fields }.map { LuxoField(it.id, it.name, it.type, typeName = it.typeName, isList = it.isList, nullable = it.nullable) }) }
         }
         val declared = buildMap {
             schema.models.values.forEach { put(it.name, it.usage) }
             schema.types.values.forEach { put(it.name, it.usage) }
+            schema.sealeds.values.forEach { put(it.name, it.usage) }
         }
         val usages = fields.keys.associateWith { TypeUsage.UNUSED }.toMutableMap()
         val visited = mutableSetOf<String>()
@@ -146,14 +199,14 @@ object LuxoCodegen {
             if (usage == TypeUsage.OUTPUT || usage == TypeUsage.INPUT_OUTPUT) mark(name, TypeUsage.OUTPUT)
             if (usage == null && usages[name] == TypeUsage.UNUSED) mark(name, TypeUsage.OUTPUT)
         }
-        return usages
+        return TypeUsages(usages, planInputAliases(schema, usages))
     }
 
-    private fun isScalar(type: String): Boolean =
-        type in setOf(
-            "Int", "Float", "String", "Boolean", "DateTime", "Duration",
-            "UUID", "Bytes", "Decimal", "JSON", "Enum",
-        )
+    internal fun isScalar(type: String): Boolean = when (type) {
+        "Int", "Float", "String", "Boolean", "DateTime", "Duration",
+        "UUID", "Bytes", "Decimal", "JSON", "Enum" -> true
+        else -> false
+    }
 
     /** Element reader expression for a scalar type (used inside readArray). */
     private fun scalarElementRead(type: String, decoder: String = "dec", enumName: String? = null): String =
@@ -164,7 +217,7 @@ object LuxoCodegen {
         "UUID" -> "$decoder.readUuid()"
         "DateTime" -> "$decoder.readDateTime()" // seconds/nanoseconds -> RFC3339 string
         "Bytes" -> "$decoder.readBytes()"
-        "JSON" -> "decodeLuxoJSON($decoder.readString())"
+        "JSON" -> "decodeBoundedLuxoJSON($decoder.readString())"
         else -> "$decoder.readString()" // String, Decimal, Enum
     }
 
@@ -172,8 +225,14 @@ object LuxoCodegen {
         if (type == "DateTime") "$decoder.readDateTimeArray()"
         else "$decoder.readArray { ${scalarElementRead(type, decoder, enumName)} }"
 
-    private fun binaryRead(f: LuxoField): String {
+    internal fun binaryRead(f: LuxoField): String {
         val n = f.nullable
+        if (f.type == "Sealed") {
+            val typeName = requireNotNull(f.typeName)
+            val raw = if (f.isList) "dec.readArray { ${depthFunction("decode$typeName")}(LuxoDecoder(dec.readBytes()), $modelDepthParameter + 1) }"
+                else "${depthFunction("decode$typeName")}(LuxoDecoder(dec.readBytes()), $modelDepthParameter + 1)"
+            return if (n) "if (dec.readNullableMarker()) $raw else null" else raw
+        }
         if (f.isList && n) return "if (dec.readBool()) ${binaryRead(f.copy(nullable = false))} else null"
         // Scalar arrays: [count][items...] — decode element-by-element.
         if (f.isList && isScalar(f.type)) {
@@ -187,7 +246,7 @@ object LuxoCodegen {
             "Bytes" -> if (n) "dec.readNullable { dec.readBytes() }" else "dec.readBytes()"
             "JSON" -> {
                 val read = scalarElementRead("JSON")
-                if (n) "dec.readNullable { $read }" else read
+                if (n) "dec.readNullable { $read }.takeUnless { it === JsonNull }" else read
             }
             // DateTime: exact seconds/nanoseconds on the wire -> RFC3339 string.
             "DateTime" -> if (n) "dec.readDateTimePtr()" else "dec.readDateTime()"
@@ -197,9 +256,9 @@ object LuxoCodegen {
             else -> {
                 // Responses carry independent, length-delimited row or columnar messages.
                 val tn = f.typeName ?: f.type
-                val decoded = if (f.isList) "decodeColumnar$tn(dec.readBytes())"
-                    else "decode$tn(LuxoDecoder(dec.readBytes()))"
-                if (n) "dec.readNullable { $decoded }" else decoded
+                val decoded = if (f.isList) "${depthFunction("decodeColumnar$tn")}(ColumnarDecoder(dec.readBytes()), $modelDepthParameter + 1)"
+                    else "${depthFunction("decode$tn")}(LuxoDecoder(dec.readBytes()), $modelDepthParameter + 1)"
+                if (n) "if (dec.readNullableMarker()) $decoded else null" else decoded
             }
         }
     }
@@ -217,6 +276,11 @@ object LuxoCodegen {
         appendLine("import com.luxo.client.Page")
         appendLine("import com.luxo.client.Selected")
         appendLine("import com.luxo.client.LuxoSelectionField")
+        if (schema.sealeds.isNotEmpty()) {
+            appendLine("import com.luxo.client.LuxoOptional")
+            appendLine("import com.luxo.client.LuxoSealedType")
+            appendLine("import com.luxo.client.LuxoSealedCase")
+        }
 		appendLine("import com.luxo.client.luxoUtf8Length")
         appendLine("import com.luxo.client.decodeLuxoUtf8")
         appendLine("import com.luxo.client.luxoJsonFloat")
@@ -225,10 +289,11 @@ object LuxoCodegen {
         appendLine("import com.luxo.client.decodeLuxoJsonString")
         appendLine("import com.luxo.client.DateTimeCodec")
         appendLine("import com.luxo.client.decodeLuxoJsonBoolean")
-        appendLine("import com.luxo.client.decodeLuxoJSON")
-        appendLine("import com.luxo.client.encodeLuxoJSON")
+        appendLine("import com.luxo.client.decodeBoundedLuxoJSON")
+        appendLine("import com.luxo.client.encodeBoundedLuxoJSON")
         appendLine("import com.luxo.client.decodeLuxoJsonValue")
         appendLine("import kotlinx.serialization.Serializable")
+        if (schema.enums.isNotEmpty()) appendLine("import kotlinx.serialization.builtins.serializer")
         appendLine("import kotlinx.serialization.json.*\n")
 
         // Enums
@@ -257,6 +322,7 @@ object LuxoCodegen {
                 append(generateKotlinDeclaration(inputTypeName(m.name, usages), m.fields, schema, usages, output = false))
             }
         }
+        for (owner in schema.sealeds.values) append(KotlinSealedCodegen.generate(owner, schema, usages))
         append(generateKotlinJSONArrays(schema, usages))
     }
 
@@ -264,7 +330,7 @@ object LuxoCodegen {
         name: String,
         fields: List<LuxoField>,
         schema: LuxoSchema,
-        usages: Map<String, TypeUsage>,
+        usages: TypeUsages,
         output: Boolean,
     ): String = buildString {
         if (!output) appendLine("@Serializable")
@@ -289,10 +355,15 @@ object LuxoCodegen {
 
 	private fun generateKotlinBinaryEncoder(fields: List<LuxoField>, schema: LuxoSchema): String = buildString {
 		val arenaTerms = fields.filter { !it.isList && (it.type == "String" || it.type == "Enum") }.map {
-            val raw = if (it.type == "Enum") "${it.name}${if (it.nullable) "?." else "."}rawValue" else it.name
+			val value = kotlinBinaryFieldReference(it)
+			val raw = if (it.type == "Enum") "$value${if (it.nullable) "?." else "."}rawValue" else value
 			if (it.nullable) "($raw?.let(::luxoUtf8Length) ?: 0)" else "luxoUtf8Length($raw)"
 		}
 		appendLine("    override fun writeLuxo(encoder: LuxoEncoder) {")
+        appendLine("        ${depthFunction("writeLuxo")}(encoder, 1)")
+        appendLine("    }")
+        appendLine("    internal fun ${depthFunction("writeLuxo")}(encoder: LuxoEncoder, $modelDepthParameter: Int) {")
+        modelDepthCheck(indent = "        ")
 		val arenaLength = if (arenaTerms.isEmpty()) "0" else arenaTerms.joinToString(" + ")
 		appendLine("        encoder.writeVarint(($arenaLength).toLong())")
 		for (field in fields) writeKotlinBinaryField(this, field, schema)
@@ -302,25 +373,29 @@ object LuxoCodegen {
 
     private fun generateKotlinJSONEncoder(name: String, fields: List<LuxoField>, schema: LuxoSchema): String = buildString {
         appendLine()
-        appendLine("    override fun toLuxoJson(): JsonElement = buildJsonObject {")
+        appendLine("    override fun toLuxoJson(): JsonElement = ${depthFunction("toLuxoJson")}(1)")
+        appendLine("    internal fun ${depthFunction("toLuxoJson")}($modelDepthParameter: Int): JsonElement {")
+        modelDepthCheck(indent = "        ")
+        appendLine("        return buildJsonObject {")
         for (field in fields) {
             val value = "this@$name.${field.name}"
             val expression = if (field.nullable) {
                 "$value?.let { value -> ${kotlinJSONValue(field, "value", schema)} } ?: JsonNull"
             } else kotlinJSONValue(field, value, schema)
-            appendLine("        put(\"${field.name}\", $expression)")
+            appendLine("            put(\"${field.name}\", $expression)")
         }
+        appendLine("        }")
         appendLine("    }")
     }
 
-    private fun kotlinJSONValue(field: LuxoField, value: String, schema: LuxoSchema): String =
+    internal fun kotlinJSONValue(field: LuxoField, value: String, schema: LuxoSchema): String =
         if (field.isList) "JsonArray($value.map { item -> ${kotlinJSONScalar(field, "item", schema)} })"
         else kotlinJSONScalar(field, value, schema)
 
     private fun kotlinJSONScalar(field: LuxoField, value: String, schema: LuxoSchema): String {
-        if (isNested(field, schema)) return "$value.toLuxoJson()"
+        if (field.type == "Sealed" || isNested(field, schema)) return "$value.${depthFunction("toLuxoJson")}($modelDepthParameter + 1)"
         return when (field.type) {
-            "JSON" -> value
+            "JSON" -> "decodeLuxoJsonValue($value)"
             "Bytes" -> "JsonPrimitive(java.util.Base64.getEncoder().encodeToString($value))"
             "Float" -> "luxoJsonFloat($value)"
             "Enum" -> "JsonPrimitive($value.rawValue)"
@@ -329,15 +404,22 @@ object LuxoCodegen {
         }
     }
 
+	private fun kotlinBinaryFieldReference(field: LuxoField): String =
+		"this.${field.name}"
+
+    internal fun kotlinNullCondition(field: LuxoField, value: String): String =
+        if (field.type == "JSON" && !field.isList) "$value == null || $value === JsonNull" else "$value == null"
+
 	private fun writeKotlinBinaryField(out: StringBuilder, field: LuxoField, schema: LuxoSchema) {
+		val value = kotlinBinaryFieldReference(field)
 		out.appendLine("        encoder.writeVarint(${field.id}L)")
 		if (!field.nullable) {
-			writeKotlinBinaryValue(out, field, field.name, schema, "        ")
+			writeKotlinBinaryValue(out, field, value, schema, "        ")
 			return
 		}
 		val local = "_${field.name}Value"
-		out.appendLine("        val $local = ${field.name}")
-		out.appendLine("        if ($local == null) {")
+		out.appendLine("        val $local = $value")
+		out.appendLine("        if (${kotlinNullCondition(field, local)}) {")
 		out.appendLine("            encoder.writeBool(false)")
 		out.appendLine("        } else {")
 		out.appendLine("            encoder.writeBool(true)")
@@ -345,7 +427,7 @@ object LuxoCodegen {
 		out.appendLine("        }")
 	}
 
-	private fun writeKotlinBinaryValue(
+	internal fun writeKotlinBinaryValue(
 		out: StringBuilder,
 		field: LuxoField,
 		value: String,
@@ -356,7 +438,7 @@ object LuxoCodegen {
 			writeKotlinBinaryScalar(out, field, value, schema, indent)
 			return
 		}
-		out.appendLine("${indent}encoder.writeVarint($value.size.toLong())")
+		out.appendLine("${indent}encoder.writeArrayHeader($value.size)")
 		out.appendLine("${indent}for (item in $value) {")
 		writeKotlinBinaryScalar(out, field, "item", schema, "$indent    ")
 		out.appendLine("$indent}")
@@ -369,8 +451,12 @@ object LuxoCodegen {
 		schema: LuxoSchema,
 		indent: String,
 	) {
+        if (field.type == "Sealed") {
+            out.appendLine("${indent}encoder.writeDelimitedValue($value) { target, sum -> sum.${depthFunction("writeLuxo")}(target, $modelDepthParameter + 1) }")
+            return
+        }
 		if (isNested(field, schema)) {
-			out.appendLine("${indent}$value.writeLuxo(encoder)")
+			out.appendLine("${indent}$value.${depthFunction("writeLuxo")}(encoder, $modelDepthParameter + 1)")
 			return
 		}
 		val statement = when (field.type) {
@@ -382,7 +468,7 @@ object LuxoCodegen {
 			"DateTime" -> "encoder.writeDateTime($value)"
 			"UUID" -> "encoder.writeUuid($value)"
 			"Bytes" -> "encoder.writeBytes($value)"
-			"JSON" -> "encoder.writeBytes(encodeLuxoJSON($value).toByteArray(Charsets.UTF_8))"
+			"JSON" -> "encoder.writeBytes(encodeBoundedLuxoJSON($value).toByteArray(Charsets.UTF_8))"
 			else -> error("unsupported structured field type ${field.type}")
 		}
 		out.appendLine("$indent$statement")
@@ -392,9 +478,13 @@ object LuxoCodegen {
         name: String,
         fields: List<LuxoField>,
         schema: LuxoSchema,
-        usages: Map<String, TypeUsage>,
+        usages: TypeUsages,
     ): String = buildString {
         appendLine("fun decode$name(dec: LuxoDecoder): $name {")
+        appendLine("    return ${depthFunction("decode$name")}(dec, 1)")
+        appendLine("}\n")
+        appendLine("internal fun ${depthFunction("decode$name")}(dec: LuxoDecoder, $modelDepthParameter: Int): $name {")
+        modelDepthCheck()
         for (f in fields) {
             val base = resolveFieldType(f, schema, usages)
             val value = if (f.nullable) "$base?" else base
@@ -423,9 +513,13 @@ object LuxoCodegen {
         name: String,
         fields: List<LuxoField>,
         schema: LuxoSchema,
-        usages: Map<String, TypeUsage>,
+        usages: TypeUsages,
     ): String = buildString {
         appendLine("fun decodeJSON$name(data: JsonObject): $name {")
+        appendLine("    return ${depthFunction("decodeJSON$name")}(data, 1)")
+        appendLine("}\n")
+        appendLine("internal fun ${depthFunction("decodeJSON$name")}(data: JsonObject, $modelDepthParameter: Int): $name {")
+        modelDepthCheck()
         for (field in fields) {
             val base = resolveFieldType(field, schema, usages)
             val type = if (field.nullable) "$base?" else base
@@ -449,17 +543,26 @@ object LuxoCodegen {
         // Check statically known Selected states, never look up the JSON fields a second time.
         // '$' cannot occur in DSL identifiers; keep the public unary function reference unambiguous.
         appendLine("internal fun `decodeJSON$name\$item`(data: JsonObject): $name {")
-        appendLine("    val value = decodeJSON$name(data)")
+        appendLine("    return ${depthFunction("decodeJSON$name\$item")}(data, 1)")
+        appendLine("}\n")
+        appendLine("internal fun ${depthFunction("decodeJSON$name\$item")}(data: JsonObject, $modelDepthParameter: Int): $name {")
+        appendLine("    val value = ${depthFunction("decodeJSON$name")}(data, $modelDepthParameter)")
         val missing = fields.joinToString(" && ") { "!value.${it.name}.isSelected" }.ifEmpty { "true" }
         appendLine("    if ($missing) throw LuxoError(\"ParseError\", 0, \"$name list item must contain a selected schema field\")")
         appendLine("    return value")
         appendLine("}\n")
     }
 
-    private fun kotlinJSONValue(field: LuxoField, schema: LuxoSchema, value: String): String {
-        if (field.isList) return "${kotlinJSONArrayName(field)}($value.jsonArray)"
+    internal fun kotlinJSONValue(field: LuxoField, schema: LuxoSchema, value: String): String {
         val typeName = field.typeName ?: field.type
-        return if (isNested(field, schema)) "decodeJSON$typeName($value.jsonObject)"
+        if (field.type == "Sealed") {
+            val read = "${depthFunction("decodeJSON$typeName")}(value.jsonObject, $modelDepthParameter + 1)"
+            return if (field.isList) "$value.jsonArray.map { value -> $read }" else read.replace("value.jsonObject", "$value.jsonObject")
+        }
+        if (field.isList) return if (isNested(field, schema))
+            "${depthFunction("decodeJSONArray\$$typeName")}($value.jsonArray, $modelDepthParameter + 1)"
+            else "${kotlinJSONArrayName(field)}($value.jsonArray)"
+        return if (isNested(field, schema)) "${depthFunction("decodeJSON$typeName")}($value.jsonObject, $modelDepthParameter + 1)"
             else scalarJSONRead(field.type, value, field.typeName.takeIf { field.type == "Enum" })
     }
 
@@ -467,19 +570,27 @@ object LuxoCodegen {
         "`decodeJSONArray\$${field.typeName ?: field.type}`"
 
     /** Keep array loops small and shared across all output fields with the same element type. */
-    private fun generateKotlinJSONArrays(schema: LuxoSchema, usages: Map<String, TypeUsage>): String = buildString {
+    private fun generateKotlinJSONArrays(schema: LuxoSchema, usages: TypeUsages): String = buildString {
         val declarations = schema.models.values.map { it.name to it.fields } + schema.types.values.map { it.name to it.fields }
-        val outputFields = declarations.filter { hasOutputUsage(usages[it.first] ?: TypeUsage.UNUSED) }
-            .flatMap { it.second }.filter { it.isList }
-        val returns = schema.apis.values.filter { isStructuredReturn(it, schema) && (it.returnList || it.paginated) }
+        val allDeclarations = if (schema.sealeds.isEmpty()) declarations else declarations +
+            schema.sealeds.values.map { owner -> owner.name to owner.variants.flatMap { variant -> variant.fields.map { LuxoField(it.id, it.name, it.type, typeName = it.typeName, nullable = it.nullable, isList = it.isList) } } }
+        val outputFields = allDeclarations.filter { hasOutputUsage(usages[it.first] ?: TypeUsage.UNUSED) }
+            .flatMap { it.second }.filter { it.isList && it.type != "Sealed" }
+        val returns = schema.apis.values.filter { isStructuredReturn(it, schema) && it.returnType !in schema.sealeds && (it.returnList || it.paginated) }
             .map { LuxoField(0, "", "Model", typeName = it.returnType, isList = true) }
         val fields = (outputFields + returns).distinctBy(::kotlinJSONArrayName)
         for (field in fields) {
             val typeName = field.typeName ?: field.type
-            val read = if (isNested(field, schema)) "`decodeJSON$typeName\$item`(item.jsonObject)"
+            val nested = isNested(field, schema)
+            val read = if (nested) "${depthFunction("decodeJSON$typeName\$item")}(item.jsonObject, $modelDepthParameter)"
                 else scalarJSONRead(field.type, "item", field.typeName.takeIf { field.type == "Enum" })
             val type = resolveFieldType(field, schema, usages)
             appendLine("internal fun ${kotlinJSONArrayName(field)}(data: JsonArray): $type =")
+            if (nested) {
+                val function = depthFunction("decodeJSONArray\$$typeName")
+                appendLine("    $function(data, 1)\n")
+                appendLine("internal fun $function(data: JsonArray, $modelDepthParameter: Int): $type =")
+            }
             appendLine("    data.map { item -> $read }\n")
         }
     }
@@ -488,17 +599,21 @@ object LuxoCodegen {
         name: String,
         fields: List<LuxoField>,
         schema: LuxoSchema,
-        usages: Map<String, TypeUsage>,
+        usages: TypeUsages,
         paginated: Boolean,
     ): String = buildString {
         val function = if (paginated) "decodePaginated$name" else "decodeColumnar$name"
         val result = if (paginated) "Page<$name>" else "List<$name>"
         appendLine("fun $function(data: ByteArray): $result = $function(ColumnarDecoder(data))\n")
         appendLine("fun $function(dec: ColumnarDecoder): $result {")
+        appendLine("    return ${depthFunction(function)}(dec, 1)")
+        appendLine("}\n")
+        appendLine("internal fun ${depthFunction(function)}(dec: ColumnarDecoder, $modelDepthParameter: Int): $result {")
+        modelDepthCheck(nonempty = "dec.count")
         for (f in fields) appendLine("    var _${f.name}: ${kotlinColumnType(f, schema, usages)}? = null")
         appendLine("    while (dec.nextColumn()) {")
         appendLine("        when (dec.fieldID) {")
-        for (f in fields) appendLine("            ${f.id} -> _${f.name} = ${kotlinColumnRead(f, schema)}")
+        for (f in fields) writeKotlinColumnRead(f, schema)
         appendLine("            else -> error(\"unknown $name column ID \${dec.fieldID}\")")
         appendLine("        }")
         appendLine("    }")
@@ -519,13 +634,28 @@ object LuxoCodegen {
         appendLine("}\n")
     }
 
+    private fun StringBuilder.writeKotlinColumnRead(field: LuxoField, schema: LuxoSchema) {
+        val column = "_${field.name}"
+        val read = kotlinColumnRead(field, schema)
+        if (field.type != "Sealed" && !isNested(field, schema) && !field.isList && field.type != "JSON") {
+            appendLine("            ${field.id} -> $column = $read")
+            return
+        }
+        appendLine("            ${field.id} -> {")
+        appendLine("                if ($column != null) for (i in $column.indices) {")
+        appendLine("                    ${kotlinColumnElementValue(field, schema)}")
+        appendLine("                }")
+        appendLine("                $column = $read")
+        appendLine("            }")
+    }
+
     private fun isNested(f: LuxoField, schema: LuxoSchema): Boolean {
         val name = f.typeName ?: f.type
         return f.relation || schema.models.containsKey(name) || schema.types.containsKey(name)
     }
 
-    private fun kotlinColumnType(f: LuxoField, schema: LuxoSchema, usages: Map<String, TypeUsage>): String {
-        if (isNested(f, schema) || f.isList || f.type == "Bytes" || f.type == "JSON") {
+    private fun kotlinColumnType(f: LuxoField, schema: LuxoSchema, usages: TypeUsages): String {
+        if (f.type == "Sealed" || isNested(f, schema) || f.isList || f.type == "Bytes" || f.type == "JSON") {
             return if (f.nullable) "List<ByteArray?>" else "List<ByteArray>"
         }
         val base = if (f.type == "Enum") "String" else resolveFieldType(f, schema, usages)
@@ -533,7 +663,7 @@ object LuxoCodegen {
     }
 
     private fun kotlinColumnRead(f: LuxoField, schema: LuxoSchema): String {
-        if (isNested(f, schema) || f.isList || f.type == "Bytes" || f.type == "JSON") {
+        if (f.type == "Sealed" || isNested(f, schema) || f.isList || f.type == "Bytes" || f.type == "JSON") {
             return if (f.nullable) "dec.readColumnBytesPtr()" else "dec.readColumnBytes()"
         }
         return when (f.type) {
@@ -546,21 +676,30 @@ object LuxoCodegen {
         }
     }
 
-    private fun kotlinColumnValue(f: LuxoField, schema: LuxoSchema, usages: Map<String, TypeUsage>): String {
+    private fun kotlinColumnValue(f: LuxoField, schema: LuxoSchema, usages: TypeUsages): String {
         val column = "_${f.name}"
-        val typeName = f.typeName ?: f.type
         val base = resolveFieldType(f, schema, usages)
         val valueType = if (f.nullable) "$base?" else base
         val absent = "Selected.unselected<$valueType>()"
+        return "if ($column == null) $absent else Selected.value<$valueType>(${kotlinColumnElementValue(f, schema)})"
+    }
+
+    private fun kotlinColumnElementValue(f: LuxoField, schema: LuxoSchema): String {
+        val column = "_${f.name}"
+        val typeName = f.typeName ?: f.type
         val value: String
-        if (isNested(f, schema)) {
+        if (f.type == "Sealed") {
+            val raw = if (f.isList) "${depthFunction("decodeSealedList$typeName")}(LuxoDecoder(data), $modelDepthParameter + 1)"
+                else "${depthFunction("decode$typeName")}(LuxoDecoder(data), $modelDepthParameter + 1)"
+            value = if (f.nullable) "$column[i]?.let { data -> $raw }" else raw.replace("LuxoDecoder(data)", "LuxoDecoder($column[i])")
+        } else if (isNested(f, schema)) {
             value = if (f.isList) {
-                if (f.nullable) "$column[i]?.let { decodeColumnar$typeName(it) }"
-                else "decodeColumnar$typeName($column[i])"
+                if (f.nullable) "$column[i]?.let { ${depthFunction("decodeColumnar$typeName")}(ColumnarDecoder(it), $modelDepthParameter + 1) }"
+                else "${depthFunction("decodeColumnar$typeName")}(ColumnarDecoder($column[i]), $modelDepthParameter + 1)"
             } else if (f.nullable) {
-                "$column[i]?.let { decode$typeName(LuxoDecoder(it)) }"
+                "$column[i]?.let { ${depthFunction("decode$typeName")}(LuxoDecoder(it), $modelDepthParameter + 1) }"
             } else {
-                "decode$typeName(LuxoDecoder($column[i]))"
+                "${depthFunction("decode$typeName")}(LuxoDecoder($column[i]), $modelDepthParameter + 1)"
             }
         } else if (f.isList) {
             val data = if (f.nullable) "data" else "$column[i]"
@@ -570,14 +709,14 @@ object LuxoCodegen {
             value = if (f.nullable) "$column[i]?.let { $typeName.fromValue(it) }" else "$typeName.fromValue($column[i])"
         } else if (f.type == "JSON") {
             value = if (f.nullable) {
-                "$column[i]?.let { decodeLuxoJSON(decodeLuxoUtf8(it)) }"
+                "$column[i]?.let { decodeBoundedLuxoJSON(decodeLuxoUtf8(it)) }.takeUnless { it === JsonNull }"
             } else {
-                "decodeLuxoJSON(decodeLuxoUtf8($column[i]))"
+                "decodeBoundedLuxoJSON(decodeLuxoUtf8($column[i]))"
             }
         } else {
             value = "$column[i]"
         }
-        return "if ($column == null) $absent else Selected.value<$valueType>($value)"
+        return value
     }
 
 	internal fun genSchemaMap(schema: LuxoSchema, pkg: String): String = buildString {
@@ -588,7 +727,7 @@ object LuxoCodegen {
         appendLine("import com.luxo.client.SelectionFieldSchema\n")
         appendLine("private val LUXO_SELECTION_TYPES: Map<String, Map<String, SelectionFieldSchema>> = mapOf(")
         val selectionTypes = schema.types.values.map { it.name to it.fields } +
-            schema.models.values.map { it.name to it.fields }
+            schema.models.values.map { it.name to it.fields } + KotlinSealedCodegen.selectionTypes(schema)
         for ((name, fields) in selectionTypes.sortedBy { it.first }) {
             append("    \"$name\" to mapOf(")
             append(fields.joinToString(", ") { field ->
@@ -605,10 +744,11 @@ object LuxoCodegen {
             if (api.isInternal) continue
             append("    \"${api.name}\" to APISchemaEntry(${api.id}")
             val returnFields = api.returnType?.let { name ->
-                schema.models[name]?.fields ?: schema.types[name]?.fields
+                schema.models[name]?.fields ?: schema.types[name]?.fields ?: KotlinSealedCodegen.caseFields(schema.sealeds[name])
             }.orEmpty()
-			val needsTypes = returnFields.isNotEmpty() || api.params.any { it.type == "Model" }
-            if (api.params.isNotEmpty() || returnFields.isNotEmpty()) {
+			val responseSealed = KotlinSealedCodegen.hasResponseSealed(api.returnType, schema)
+            val needsTypes = responseSealed || returnFields.isNotEmpty() || api.params.any { it.type == "Model" || it.type == "Sealed" }
+            if (api.params.isNotEmpty() || returnFields.isNotEmpty() || needsTypes) {
                 appendLine(", listOf(")
                 for (p in api.params) {
 					val typeName = p.typeName?.let { ", typeName = \"$it\"" }.orEmpty()
@@ -623,6 +763,10 @@ object LuxoCodegen {
 			}
 			if (needsTypes) {
 				append(", LUXO_SELECTION_TYPES")
+            }
+            if (responseSealed) {
+                val kind = if (api.returnType in schema.sealeds) "Sealed" else "Model"
+                append(", responseType = SelectionFieldSchema(0, \"${api.returnType}\", type = \"$kind\", isList = ${api.returnList}, nullable = ${api.returnNullable})")
             }
             appendLine("),")
         }
@@ -664,25 +808,28 @@ object LuxoCodegen {
 
         appendLine("}")
         for (api in schema.apis.values.filterNot { it.isInternal }) {
-            append(KotlinRequestCodegen.generate(api, api.paginated || isStructuredReturn(api, schema),
+            append(KotlinRequestCodegen.generate(api, api.paginated || (isStructuredReturn(api, schema) && schema.sealeds[api.returnType]?.variants?.isEmpty() != true),
                 { paramKtType(it, schema, usages) },
-                { out, field, value -> writeKotlinBinaryScalar(out, field, value, schema, "        ") }))
+                { out, field, value ->
+                    if (field.type == "Sealed") out.appendLine("        encoder.writeDelimitedValue($value) { target, sum -> sum.writeLuxo(target) }")
+                    else writeKotlinBinaryScalar(out, field, value, schema, "        ")
+                }))
         }
     }
 
     private fun genMethod(
-        b: StringBuilder, api: LuxoAPI, schema: LuxoSchema, usages: Map<String, TypeUsage>,
+        b: StringBuilder, api: LuxoAPI, schema: LuxoSchema, usages: TypeUsages,
     ) {
-        val selection = api.paginated || isStructuredReturn(api, schema)
+        val selection = api.paginated || (isStructuredReturn(api, schema) && schema.sealeds[api.returnType]?.variants?.isEmpty() != true)
         val types: (LuxoParam) -> String = { paramKtType(it, schema, usages) }
         val declarations = KotlinRequestCodegen.declarations(api, types, selection).toMutableList()
-        val ret = returnType(api)
+        val ret = returnType(api, schema)
         if (selection) b.appendLine("    @LuxoSelection")
         if (api.stream) {
             declarations += "observer: StreamObserver? = null"
-            declarations += "onData: ($ret) -> Unit"
+            declarations += "onData: ($ret) -> kotlin.Unit"
             val method = "subscribe" + api.name.replaceFirstChar { it.uppercase() }
-            b.appendLine("    suspend fun $method(${declarations.joinToString(", ")}): () -> Unit {")
+            b.appendLine("    suspend fun $method(${declarations.joinToString(", ")}): () -> kotlin.Unit {")
             b.appendLine("        return transport.subscribe(\"${api.name}\", { data -> decode_${api.name}(data) }, ${KotlinRequestCodegen.invocation(api, selection, "select ?: `\$selectionPlan`?.text")}, observer, onData)")
         } else {
             b.appendLine("    suspend fun ${api.name}(${declarations.joinToString(", ")}): $ret {")
@@ -698,7 +845,7 @@ object LuxoCodegen {
         api.returnType?.let { !isScalar(it) && it !in schema.enums } == true
 
     private fun genDecodeHelper(b: StringBuilder, api: LuxoAPI, schema: LuxoSchema) {
-        val ret = returnType(api)
+        val ret = returnType(api, schema)
         if (api.returnNullable) {
             b.appendLine("    private fun decode_${api.name}(data: Any): $ret {")
             b.appendLine("        if (data === JsonNull || (data is ByteArray && isNullRoot(data))) return null")
@@ -706,9 +853,20 @@ object LuxoCodegen {
         } else {
             b.appendLine("    private fun decode_${api.name}(data: Any): $ret = when (data) {")
         }
-        if (isStructuredReturn(api, schema)) genModelResponse(b, api) else genScalarResponse(b, api, schema)
+        if (api.returnType in schema.sealeds) genSealedResponse(b, api)
+        else if (isStructuredReturn(api, schema)) genModelResponse(b, api) else genScalarResponse(b, api, schema)
         if (api.returnNullable) b.appendLine("        }")
         b.appendLine("    }\n")
+    }
+
+    private fun genSealedResponse(b: StringBuilder, api: LuxoAPI) {
+        val type = api.returnType
+        val decoder = if (api.returnNullable) "LuxoDecoder.atOffset(data, 1)" else "LuxoDecoder(data)"
+        val read = if (api.returnList) "${depthFunction("decodeSealedList$type")}($decoder, 1)" else "decode$type($decoder)"
+        val json = if (api.returnList) "${depthFunction("decodeJSONArray\$$type")}(data as JsonArray, 1)"
+            else "decodeJSON$type((data as JsonElement).jsonObject)"
+        b.appendLine("        is ByteArray -> $read")
+        b.appendLine("        else -> $json")
     }
 
     private fun genScalarResponse(b: StringBuilder, api: LuxoAPI, schema: LuxoSchema) {
@@ -716,10 +874,12 @@ object LuxoCodegen {
         val enumName = type.takeIf { it in schema.enums }
         val element = scalarElementRead(type, enumName = enumName)
         val binaryRead = if (api.returnList) scalarArrayRead(type, enumName = enumName) else element
+        val normalizedRead = if (type == "JSON" && api.returnNullable && !api.returnList)
+            "$binaryRead.takeUnless { it === JsonNull }" else binaryRead
         val jsonRead = if (api.returnList) {
             "(data as JsonArray).map { ${scalarJSONRead(type, "it", enumName)} }"
         } else scalarJSONRead(type, "(data as JsonElement)", enumName)
-        b.appendLine("        is ByteArray -> ${completeScalarRead("data", binaryRead, nullableRoot = api.returnNullable)}")
+        b.appendLine("        is ByteArray -> ${completeScalarRead("data", normalizedRead, nullableRoot = api.returnNullable)}")
         b.appendLine("        else -> $jsonRead")
     }
 
@@ -758,8 +918,8 @@ object LuxoCodegen {
         b.appendLine("        else -> $jsonDecode")
     }
 
-    private fun returnType(api: LuxoAPI): String {
-        val t = luxoTypeToKt(api.returnType ?: "Int")
+    private fun returnType(api: LuxoAPI, schema: LuxoSchema): String {
+        val t = luxoTypeToKt(api.returnType ?: "Int", schema)
         val result = when {
             api.paginated -> "Page<$t>"
             api.returnList -> "List<$t>"

@@ -12,6 +12,38 @@ import (
 
 var groupedBenchmarkResult [][]byte
 
+func BenchmarkResolveParameterIDs(b *testing.B) {
+	for _, rows := range []int{1, 128} {
+		keys := BinaryKeys{count: rows}
+		for i := 0; i < rows; i++ {
+			keys.values = codec.AppendSvarint(keys.values, int64(i))
+		}
+		for _, version := range []string{"before-fixed", "stable", "max-id"} {
+			b.Run(strconv.Itoa(rows)+"/"+version, func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					switch version {
+					case "before-fixed":
+						mergedDestinationSink = beforeResolveParameterIDs(keys, 1)
+					case "stable":
+						mergedDestinationSink = keys.EncodeResolveParams(1, 1, 2)
+					case "max-id":
+						mergedDestinationSink = keys.EncodeResolveParams(1, codec.MaxParameterID, 129)
+					}
+				}
+			})
+		}
+	}
+}
+
+// The original fixed-ID implementation is only a benchmark reference.
+func beforeResolveParameterIDs(keys BinaryKeys, shape int) []byte {
+	result := keys.EncodeParam(1)
+	result = append(result[:len(result)-1], 2)
+	result = codec.AppendSvarint(result, int64(shape))
+	return append(result, 0)
+}
+
 // Historical code is retained only for reproducibility, not wire compatibility.
 // Its concatenated-row list is not equivalent to the current canonical payload.
 func BenchmarkHistoricalGroupedResponse(b *testing.B) {
@@ -167,7 +199,7 @@ func parseGroupedResponseBaseline(resp []byte, isList bool) [][]byte {
 			// Collect all items for this key into a list blob:
 			// [count varint][item1 raw bytes][item2 raw bytes]...
 			var listBuf []byte
-			listBuf = codec.AppendArrayHeader(listBuf, int(itemCount))
+			listBuf = codec.AppendVarint(listBuf, uint64(int(itemCount)))
 			for j := 0; j < int(itemCount); j++ {
 				item, rn := codec.ReadBytes(resp, off)
 				if rn == 0 {

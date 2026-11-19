@@ -4,11 +4,32 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 )
+
+func BenchmarkStreamParamsLookupFloat(b *testing.B) {
+	for _, sample := range []struct {
+		name  string
+		value any
+	}{
+		{"ordinary", 1.25}, {"subnormal", math.SmallestNonzeroFloat64},
+		{"maximum", math.MaxFloat64}, {"integer-control", int64(42)},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			params := &StreamParams{values: map[string]any{"value": sample.value}}
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, ok := params.LookupFloat("value"); !ok {
+					b.Fatal("finite value rejected")
+				}
+			}
+		})
+	}
+}
 
 // Freeze the former Send loop only for open subscriptions; racing its close is
 // deliberately excluded because it can panic. This is not a correct equivalent.

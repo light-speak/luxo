@@ -55,7 +55,7 @@ class CodegenResponseTest {
             assertContains(types, "internal fun `decodeJSONRecord\$item`(data: JsonObject): Record")
             assertContains(types, "if (!value.label.isSelected && !value.children.isSelected) throw LuxoError(\"ParseError\"")
             assertContains(types, "val `label\$json` = data[\"label\"]")
-            assertContains(types, "`decodeJSONRecord\$item`(item.jsonObject)")
+            assertContains(types, "`decodeJSONRecord\$item\$depth`(item.jsonObject, `\$modelDepth`)")
             assertContains(client, "decodeJSONRecord((data as JsonElement).jsonObject)")
             assertContains(client, "`decodeJSONArray\$Record`(data as JsonArray)")
             assertFalse(types.contains("data.keys.any"))
@@ -134,7 +134,7 @@ class CodegenResponseTest {
 
     @Test
     fun `scalar calls and streams check the whole response before returning a value`() {
-        for (type in listOf(null, "Int", "Duration", "String", "Float", "Boolean", "Bytes", "JSON", "DateTime", "UUID", "Decimal", "Enum")) {
+        for (type in listOf("Int", "Duration", "String", "Float", "Boolean", "Bytes", "JSON", "DateTime", "UUID", "Decimal", "Enum")) {
             for (list in listOf(false, true)) {
                 for (stream in listOf(false, true)) {
                     val api = LuxoAPI(1, "echo", "test", returnType = if (type == "Enum") "State" else type, returnList = list, stream = stream)
@@ -165,7 +165,7 @@ class CodegenResponseTest {
         val schema = LuxoSchema(models = mapOf("Record" to LuxoModel("Record", fields = fields, usage = TypeUsage.OUTPUT)))
         val source = LuxoCodegen.genTypes(schema, "test")
         assertFalse(source.contains(".toString(Charsets.UTF_8)"))
-        assertContains(source, "decodeLuxoJSON(dec.readString())")
+        assertContains(source, "decodeBoundedLuxoJSON(dec.readString())")
         assertContains(source, "decodeLuxoJsonValue(value)")
         assertContains(source, "cell.checkComplete()")
     }

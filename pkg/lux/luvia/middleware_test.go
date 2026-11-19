@@ -2,13 +2,26 @@ package luvia
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/auth"
+	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/rpc"
+	"github.com/light-speak/luxo/pkg/lux/schema"
+	"nhooyr.io/websocket"
 )
 
 func testCfg() *auth.Config {
@@ -34,6 +47,147 @@ func testIdentity(t testing.TB, raw string) *Claims {
 		t.Fatal(err)
 	}
 	return &claims
+}
+
+func tokenWithTestHeader(t *testing.T, cfg *auth.Config, header string) string {
+	t.Helper()
+	token, err := auth.Sign(cfg, testClaimsJSON(`{"id":42}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(token, ".")
+	unsigned := base64.RawURLEncoding.EncodeToString([]byte(header)) + "." + parts[1]
+	mac := hmac.New(sha256.New, []byte(cfg.Secret))
+	_, _ = mac.Write([]byte(unsigned))
+	return unsigned + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func TestJWTHeaderBoundaryHTTPWebSocketAndInternal(t *testing.T) {
+	auth.ResetConfig()
+	auth.ResetVerifyCache()
+	t.Cleanup(auth.ResetConfig)
+	t.Cleanup(auth.ResetVerifyCache)
+	t.Setenv("JWT_SECRET", "header-boundary-test")
+	cfg, err := auth.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := api.NewRouter()
+	router.Handle("identity", func(ctx context.Context, req *api.Request) error {
+		identity := Identity(ctx)
+		if identity == nil {
+			return errors.Unauthorized
+		}
+		req.Buf.B = codec.AppendSvarint(req.Buf.B, identity.ID())
+		return nil
+	})
+	router.Schema = schema.New()
+	if err := router.Schema.RegisterAPI(&schema.API{ID: 7, Name: "identity", ReturnType: "Int"}); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(AuthMiddleware(cfg, router))
+	defer server.Close()
+	client := headerBoundaryRPCClient(t, router)
+	for _, header := range []string{`{"alg":"HS256"}`, `{"alg":"none"}`, `{"alg":"HS256","alg":"HS256"}`} {
+		t.Run(header, func(t *testing.T) {
+			token := tokenWithTestHeader(t, cfg, header)
+			valid := header == `{"alg":"HS256"}`
+			checkHeaderHTTPAndWS(t, server, token, valid)
+			checkHeaderRPC(t, client, token, valid)
+			ctx, err := internalRequestContext(t.Context(), token)
+			if valid {
+				if err != nil || Identity(ctx) == nil || Identity(ctx).ID() != 42 {
+					t.Fatalf("valid internal identity: %v", err)
+				}
+			} else if err == nil || ctx != nil {
+				t.Fatal("invalid header established internal identity")
+			}
+		})
+	}
+}
+
+func headerBoundaryRPCClient(t *testing.T, router *api.Router) *rpc.Client {
+	t.Helper()
+	router.InternalRequestContext = internalRequestContext
+	if err := router.Registry.RegisterSchemaAPIs(router.Schema); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := rpc.NewServer(router)
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(listener) }()
+	client := rpc.NewClient(listener.Addr().String())
+	t.Cleanup(func() {
+		client.Close()
+		server.Close()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+	return client
+}
+
+func checkHeaderRPC(t *testing.T, client *rpc.Client, token string, valid bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	for range 2 {
+		body, err := client.CallWithMaskContext(ctx, token, 7, nil, nil)
+		if valid {
+			value, consumed := codec.ReadSvarint(body, 0)
+			if err != nil || value != 42 || consumed != len(body) {
+				t.Fatalf("RPC: %x, %v", body, err)
+			}
+		} else if failure, ok := err.(*errors.AppError); !ok || failure.Code != 401 || len(body) != 0 {
+			t.Fatalf("invalid header RPC: %x, %v", body, err)
+		}
+	}
+}
+
+func checkHeaderHTTPAndWS(t *testing.T, server *httptest.Server, token string, valid bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	request := `{"$id":1,"$api":"identity"}`
+	want := `"code":401`
+	if valid {
+		want = `"data":42`
+	}
+	for range 2 {
+		r, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL, strings.NewReader(request))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Authorization", "Bearer "+token)
+		response, err := server.Client().Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil || !strings.Contains(string(body), want) {
+			t.Fatalf("HTTP: %s, %v", body, err)
+		}
+	}
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"?token="+url.QueryEscape(token), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	if err := conn.Write(ctx, websocket.MessageText, []byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	_, response, err := conn.Read(ctx)
+	if err != nil || !strings.Contains(string(response), want) {
+		t.Fatalf("WS: %s, %v", response, err)
+	}
 }
 
 func TestAuthMiddlewareValidToken(t *testing.T) {
@@ -96,6 +250,7 @@ func TestRefreshTokenCannotEstablishRequestIdentity(t *testing.T) {
 		r := httptest.NewRequest("GET", "/luvia", nil)
 		if websocket {
 			r.Header.Set("Upgrade", "websocket")
+			r.Header.Set("Connection", "Upgrade")
 			r.URL.RawQuery = "token=" + url.QueryEscape(token)
 		} else {
 			r.Header.Set("Authorization", "Bearer "+token)
@@ -387,5 +542,154 @@ func TestClaimsFloatFromInt(t *testing.T) {
 	c := testIdentity(t, `{"count":10}`)
 	if c.Float("count") != 10.0 {
 		t.Errorf("Float from int64 = %f, want 10.0", c.Float("count"))
+	}
+}
+
+func TestAuthenticatedIdentityReachesResponseBuffer(t *testing.T) {
+	cfg := testCfg()
+	token, err := auth.Sign(cfg, testClaimsJSON(`{"id":42,"role":"blocked"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := New()
+	handler := func(ctx context.Context, req *api.Request) error {
+		want := Identity(ctx)
+		if want == nil {
+			if req.Buf.Identity != nil {
+				t.Error("anonymous response retained an identity")
+			}
+		} else if api.IdentityString(req.Buf.Identity, "role") != want.String("role") {
+			t.Error("verified identity did not reach response visibility")
+		}
+		req.Buf.AppendString(`7`)
+		return nil
+	}
+	gateway.Router.Handle("public", handler)
+	gateway.Router.HandleInternal("private", handler)
+	wrapped := AuthMiddleware(cfg, gateway.Router)
+	for _, bearer := range []string{token, ""} {
+		request := httptest.NewRequest("POST", "/luvia", strings.NewReader(`{"$api":"public"}`))
+		request.Header.Set("Authorization", "Bearer "+bearer)
+		response := httptest.NewRecorder()
+		wrapped.ServeHTTP(response, request)
+		if response.Code != 200 {
+			t.Fatalf("HTTP failed: %d %s", response.Code, response.Body.String())
+		}
+	}
+	for _, name := range []string{"public", "private"} {
+		buf := &api.ResponseBuf{}
+		for _, signed := range []bool{true, false} {
+			ctx := context.Background()
+			if signed {
+				ctx = context.WithValue(ctx, identityKey, testIdentity(t, `{"id":42,"role":"blocked"}`))
+			}
+			if err := gateway.Router.ExportHandlers()[name](ctx, &api.Request{Buf: buf}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestWebSocketIdentityDoesNotOutliveAccessToken(t *testing.T) {
+	cfg := testCfg()
+	cfg.Expires = 2 * time.Second
+	token, err := auth.Sign(cfg, testClaimsJSON(`{"id":42}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	router := api.NewRouter()
+	router.Schema = schema.New()
+	if err := router.Schema.RegisterAPI(&schema.API{ID: 7, Name: "identity", ReturnType: "Int"}); err != nil {
+		t.Fatal(err)
+	}
+	router.Handle("identity", func(ctx context.Context, req *api.Request) error {
+		identity := Identity(ctx)
+		if identity == nil {
+			return errors.Unauthorized
+		}
+		req.Buf.B = codec.AppendSvarint(req.Buf.B, identity.ID())
+		return nil
+	})
+	server := httptest.NewServer(AuthMiddleware(cfg, router))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"?token="+url.QueryEscape(token), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	request := []byte(`{"$id":1,"$api":"identity"}`)
+	if err := conn.Write(ctx, websocket.MessageText, request); err != nil {
+		t.Fatal(err)
+	}
+	_, response, err := conn.Read(ctx)
+	if err != nil || !strings.Contains(string(response), `"data":42`) {
+		t.Fatalf("initial identity: %s, %v", response, err)
+	}
+	time.Sleep(2 * time.Second)
+	if _, err := auth.Verify(cfg, token); err == nil {
+		t.Fatal("fixture token has not expired")
+	}
+	// Expiration may close the connection or reject the next call, but must not preserve access.
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$id":2,"$api":"identity"}`)); err != nil {
+		if websocket.CloseStatus(err) == -1 {
+			t.Fatalf("unexpected write failure: %v", err)
+		}
+		return
+	}
+	_, response, err = conn.Read(ctx)
+	if err != nil {
+		if websocket.CloseStatus(err) == -1 {
+			t.Fatalf("unexpected read failure: %v", err)
+		}
+		return
+	}
+	if !strings.Contains(string(response), `"code":401`) {
+		t.Fatalf("expired token was not rejected: %s", response)
+	}
+}
+
+func TestAuthMiddlewareDoesNotInheritAnotherVerifierIdentity(t *testing.T) {
+	auth.ResetVerifyCache()
+	t.Cleanup(auth.ResetVerifyCache)
+	outer := testCfg()
+	inner := *outer
+	inner.Secret = "another-application-secret"
+	token, err := auth.Sign(outer, testClaimsJSON(`{"id":42}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, upgrade := range []bool{false, true} {
+		for _, mode := range []string{"other-key", "missing", "invalid"} {
+			t.Run(mode+"/"+strconv.FormatBool(upgrade), func(t *testing.T) {
+				final := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+					if Identity(r.Context()) != nil || BearerToken(r.Context()) != "" {
+						t.Fatal("rejected credential retained outer verifier identity")
+					}
+				})
+				nested := AuthMiddleware(&inner, final)
+				handler := AuthMiddleware(outer, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if Identity(r.Context()) == nil {
+						t.Fatal("outer verifier did not authenticate")
+					}
+					if mode == "missing" {
+						r.Header.Del("Authorization")
+					}
+					if mode == "invalid" {
+						r.Header.Set("Authorization", "Bearer invalid")
+					}
+					nested.ServeHTTP(w, r)
+				}))
+				req := httptest.NewRequest("POST", "/luvia", nil)
+				req.Header.Set("Authorization", "Bearer "+token)
+				if upgrade {
+					req.Method = http.MethodGet
+					req.Header.Set("Upgrade", "websocket")
+					req.Header.Set("Connection", "Upgrade")
+				}
+				handler.ServeHTTP(httptest.NewRecorder(), req)
+			})
+		}
 	}
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { Encoder } from './codec'
+import { encodeParam } from './transport'
 import { inspectBinaryRequest } from './wire-inspector'
 
 describe('inspectBinaryRequest', () => {
@@ -14,6 +15,42 @@ describe('inspectBinaryRequest', () => {
       ],
     },
   }
+
+  it.each([
+    ['DateTime', false, false, '2026-10-31T00:00:00.123456789Z'],
+    ['DateTime', true, false, ['1969-12-31T23:59:59.999999999Z', '0000-01-01T00:00:00Z']],
+    ['Int', false, true, null],
+    ['Int', false, true, 42n],
+    ['String', true, true, ['private']],
+    ['String', true, true, null],
+    ['JSON', false, false, { secret: 'private' }],
+    ['JSON', true, false, [null, { secret: 'private' }]],
+  ] as const)('inspects %s list=%s nullable=%s without losing the next field', (type, isList, nullable, value) => {
+    const param = { fieldID: 1, name: 'value', type, isList, nullable }
+    const tail = { fieldID: 2, name: 'tail', type: 'Int' }
+    const enc = new Encoder()
+    enc.writeVarint(7)
+    enc.writeVarint(0)
+    encodeParam(enc, param, Array.isArray(value) ? [...value] : value)
+    encodeParam(enc, tail, 99n)
+    enc.writeEnd()
+    const result = inspectBinaryRequest(enc.bytes(), { echo: { id: 7, params: [param, tail] } })
+    expect(result.fields.map(field => field.name)).toEqual(['value', 'tail'])
+    expect(JSON.stringify(result)).not.toContain('private')
+  })
+
+  it.each([1_000_000_000, 1_000_000_001])('rejects invalid DateTime fraction %s', nanos => {
+    const enc = new Encoder()
+    enc.writeVarint(7)
+    enc.writeVarint(0)
+    enc.writeVarint(1)
+    enc.writeSvarint(0n)
+    enc.writeVarint(nanos)
+    enc.writeEnd()
+    expect(() => inspectBinaryRequest(enc.bytes(), {
+      echo: { id: 7, params: [{ fieldID: 1, name: 'at', type: 'DateTime' }] },
+    })).toThrow('DateTime')
+  })
 
   it('reports protocol structure without exposing values or raw bytes', () => {
     const secret = 'DO_NOT_LOG_THIS_SECRET'

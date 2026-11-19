@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func invalidTextVectors() [][]byte {
@@ -76,6 +77,22 @@ func TestStringReadersPreserveValidUTF8(t *testing.T) {
 	for _, value := range []string{"", "hello", "\x00\n", "\ufeffstart", "\ufffd", "e\u0301", "東京 café", "\U0001f642", "\U0010ffff"} {
 		for _, tc := range textReaderCases() {
 			checkTextReader(t, tc, []byte(value), true)
+		}
+	}
+}
+
+func TestStringReadersWordBoundaries(t *testing.T) {
+	vectors := append(invalidTextVectors(), []byte("A"), []byte("é"),
+		[]byte("東京"), []byte("\ufeff"), []byte("\U0001f642"), []byte("\U0010ffff"))
+	for _, size := range []int{0, 1, 7, 8, 9, 15, 16, 17, 23, 24, 31, 32, 33, 64} {
+		for _, vector := range vectors {
+			for position := 0; position+len(vector) <= size; position++ {
+				raw := bytes.Repeat([]byte{'a'}, size)
+				copy(raw[position:], vector)
+				for _, tc := range textReaderCases() {
+					checkTextReader(t, tc, raw, utf8.Valid(vector))
+				}
+			}
 		}
 	}
 }

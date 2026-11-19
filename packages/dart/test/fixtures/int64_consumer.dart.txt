@@ -22,6 +22,170 @@ void main() {
   verifyJSONKinds();
   verifyJSONProjection();
   verifyStreamIsolation();
+  test('generated HTTP JSON roots distinguish literal null from missing bodies', () async {
+    for (final mode in sdk.TransportMode.values) {
+      var missing = false;
+      final client = LuxoClient(sdk.HttpTransport('http://example.test/luxo',
+        options: sdk.TransportOptions(mode: mode),
+        client: MockClient((request) async {
+          if (mode == sdk.TransportMode.json) {
+            return http.Response(missing ? '{}' : '{"data":null}', 200);
+          }
+          return http.Response.bytes(missing ? <int>[] : [4, 110, 117, 108, 108], 200);
+        }),
+      ));
+      addTearDown(client.close);
+      expect(await client.scalarJSON(), isNull);
+      missing = true;
+      await expectLater(client.scalarJSON(),
+        throwsA(isA<sdk.LuxoError>().having((error) => error.error, 'error', 'ParseError')));
+      missing = false;
+      expect(await client.scalarJSON(), isNull);
+    }
+  });
+  test('generated JSON fields reject non-finite direct values', () {
+    for (final number in [double.nan, double.infinity, double.negativeInfinity]) {
+      for (final value in <Object?>[number, [number], {'nested': number}]) {
+        expect(() => Payload.fromJson({'metadata': value}), throwsFormatException);
+        expect(() => NumbersInput.fromJson({
+          'id': 1, 'duration': 0, 'values': <Object?>[], 'optional': null,
+          'ratios': <Object?>[], 'metadata': value, 'createdAt': '2026-01-01T00:00:00Z',
+        }), throwsFormatException);
+      }
+    }
+    final exact = sdk.LuxoJSONNumber.parse('1e400');
+    expect(identical(Payload.fromJson({'metadata': exact}).metadata.value, exact), isTrue);
+  });
+  test('generated JSON fields preserve literal null without losing selection', () {
+    final selected = Payload.fromJson({'metadata': null});
+    expect(selected.metadata.isSelected, isTrue);
+    expect(selected.metadata.value, isNull);
+    expect(selected.toJson(), {'metadata': null});
+    expect(Payload.fromJson({}).metadata.isSelected, isFalse);
+    final bytes = Uint8List.fromList(utf8.encode('null'));
+    final row = sdk.LuxoEncoder()
+      ..writeVarint(0)..writeVarint(2)..writeBytes(bytes)..writeEnd();
+    expect(decodePayload(sdk.LuxoDecoder(row.bytes())).toJson(), {'metadata': null});
+    final column = sdk.LuxoEncoder()
+      ..writeVarint(1)..writeVarint(0)..writeVarint(2)..writeBytes(bytes)..writeEnd();
+    expect(decodeColumnarPayload(column.bytes()).single.toJson(), {'metadata': null});
+    final fields = <String, dynamic>{
+      'id': 1, 'duration': 0, 'values': <Object?>[], 'optional': null,
+      'ratios': <Object?>[], 'metadata': null, 'createdAt': '2026-01-01T00:00:00Z',
+    };
+    final input = NumbersInput.fromJson(fields);
+    final output = sdk.LuxoEncoder();
+    input.writeLuxo(output);
+    expect(decodeNumbers(sdk.LuxoDecoder(output.bytes())).metadata.value, isNull);
+    expect(input.toJson().containsKey('metadata'), isTrue);
+    fields.remove('metadata');
+    expect(() => NumbersInput.fromJson(fields), throwsFormatException);
+  });
+
+  test('generated HTTP requests retain JSON null inside structured parameters', () async {
+    final input = NumbersInput.fromJson({
+      'id': 1, 'duration': 0, 'values': <Object?>[], 'optional': null,
+      'ratios': <Object?>[], 'metadata': null, 'createdAt': '2026-01-01T00:00:00Z',
+    });
+    final sent = <Uint8List>[];
+    for (final mode in sdk.TransportMode.values) {
+      final client = LuxoClient(sdk.HttpTransport('http://example.test/luxo',
+        options: sdk.TransportOptions(mode: mode),
+        client: MockClient((request) async {
+          sent.add(request.bodyBytes);
+          final row = sdk.LuxoEncoder()
+            ..writeVarint(0)..writeVarint(6)
+            ..writeBytes(Uint8List.fromList(utf8.encode('null')))..writeEnd();
+          return mode == sdk.TransportMode.binary
+              ? http.Response.bytes(row.bytes(), 200)
+              : http.Response('{"data":{"metadata":null}}', 200);
+        }),
+      ));
+      addTearDown(client.close);
+      final result = await client.inspectNumbers(input: input, select: 'metadata');
+      expect(result.metadata.isSelected, isTrue);
+      expect(result.metadata.value, isNull);
+      if (mode == sdk.TransportMode.json) {
+        final body = sdk.decodeLuxoJSON(utf8.decode(sent.last)) as Map<String, dynamic>;
+        final nested = body['input'] as Map<String, dynamic>;
+        expect(nested.containsKey('metadata'), isTrue);
+        expect(nested['metadata'], isNull);
+      } else {
+        final body = sdk.LuxoDecoder(sent.last);
+        expect(body.readUnsigned(), 16);
+        body.readBytes();
+        expect(body.nextField(), isTrue);
+        expect(body.fieldID, 1);
+        final nested = decodeNumbers(sdk.LuxoDecoder(body.readBytes()));
+        expect(nested.metadata.isSelected, isTrue);
+        expect(nested.metadata.value, isNull);
+        expect(body.nextField(), isFalse);
+        body.checkComplete();
+      }
+    }
+    expect(sent.length, 2);
+  });
+
+  test('generated Binary JSON readers reject document BOMs on every path', () async {
+    var response = Uint8List(0);
+    final client = _binaryClient(() => response);
+    addTearDown(client.close);
+    for (final text in ['false', '42', '{}', '[]', '"value"']) {
+      final bytes = Uint8List.fromList([0xef, 0xbb, 0xbf, ...utf8.encode(text)]);
+      response = (sdk.LuxoEncoder()..writeBytes(bytes)).bytes();
+      await expectLater(client.scalarJSON(), throwsFormatException);
+      response = (sdk.LuxoEncoder()..writeVarint(1)..writeBytes(bytes)).bytes();
+      await expectLater(client.arrayJSON(), throwsFormatException);
+      final row = sdk.LuxoEncoder()
+        ..writeVarint(0)..writeVarint(2)..writeBytes(bytes)..writeEnd();
+      expect(() => decodePayload(sdk.LuxoDecoder(row.bytes())), throwsFormatException);
+      final column = sdk.LuxoEncoder()
+        ..writeVarint(1)..writeVarint(0)..writeVarint(2)..writeBytes(bytes)..writeEnd();
+      expect(() => decodeColumnarPayload(column.bytes()), throwsFormatException);
+    }
+    const expected = '\uFEFFvalue';
+    final value = Uint8List.fromList(utf8.encode('"$expected"'));
+    response = (sdk.LuxoEncoder()..writeBytes(value)).bytes();
+    expect(await client.scalarJSON(), expected);
+    final row = sdk.LuxoEncoder()
+      ..writeVarint(0)..writeVarint(2)..writeBytes(value)..writeEnd();
+    expect(decodePayload(sdk.LuxoDecoder(row.bytes())).metadata.value, expected);
+    final column = sdk.LuxoEncoder()
+      ..writeVarint(1)..writeVarint(0)..writeVarint(2)..writeBytes(value)..writeEnd();
+    expect(decodeColumnarPayload(column.bytes()).single.metadata.value, expected);
+  });
+
+  test('generated pagination writes locked parameter IDs in Binary', () async {
+    final sent = <Uint8List>[];
+    final transport = sdk.HttpTransport('http://localhost/luvia',
+      options: sdk.TransportOptions(mode: sdk.TransportMode.binary),
+      client: MockClient((request) async {
+        sent.add(request.bodyBytes);
+        return http.Response.bytes([0, 0, 0, 0, 2, 20], 200);
+      }));
+    final client = LuxoClient(transport);
+    addTearDown(client.close);
+    await client.searchPayloads(page: sdk.LuxoInt64.fromInt(3),
+      pageSize: sdk.LuxoInt64.fromInt(50), select: 'data');
+    await client.searchPayloads(select: 'data');
+    final first = sdk.LuxoDecoder(sent.first);
+    expect(first.readUnsigned(), 11);
+    first.readBytes();
+    expect(first.nextField(), isTrue);
+    expect(first.fieldID, 7);
+    expect(first.readInt(), sdk.LuxoInt64.fromInt(3));
+    expect(first.nextField(), isTrue);
+    expect(first.fieldID, 9);
+    expect(first.readInt(), sdk.LuxoInt64.fromInt(50));
+    expect(first.nextField(), isFalse);
+    expect(first.error, isNull);
+    expect(first.offset, sent.first.length);
+    final omitted = sdk.LuxoDecoder(sent.last);
+    omitted.readUnsigned(); omitted.readBytes();
+    expect(omitted.nextField(), isFalse);
+    expect(omitted.error, isNull);
+    expect(omitted.offset, sent.last.length);
+  });
   final maximum = sdk.LuxoInt64.maxValue;
   final minimum = sdk.LuxoInt64.minValue;
 
@@ -31,7 +195,7 @@ void main() {
       var response = Uint8List(0);
       final client = _binaryClient(() => response);
       addTearDown(client.close);
-      final cases = <(Future<Object> Function(), List<int>, Object)>[
+      final cases = <(Future<Object?> Function(), List<int>, Object)>[
         (client.scalarInt, [0], sdk.LuxoInt64.zero),
         (client.scalarDuration, [0], sdk.LuxoInt64.zero),
         (client.scalarFloat, List.filled(8, 0), 0.0),
@@ -56,7 +220,9 @@ void main() {
           [...bytes, 99],
         ]) {
           response = Uint8List.fromList(invalid);
-          await expectLater(call(), throwsFormatException);
+          await expectLater(call(), invalid.isEmpty
+            ? throwsA(isA<sdk.LuxoError>().having((error) => error.error, 'error', 'ParseError'))
+            : throwsFormatException);
         }
       }
     },
@@ -68,7 +234,7 @@ void main() {
       var response = Uint8List(0);
       final client = _binaryClient(() => response);
       addTearDown(client.close);
-      final calls = <Future<Object> Function()>[
+      final calls = <Future<Object?> Function()>[
         client.arrayInt,
         client.arrayDuration,
         client.arrayFloat,
@@ -99,7 +265,9 @@ void main() {
           [...cells[index], 99],
         ]) {
           response = Uint8List.fromList(invalid);
-          await expectLater(calls[index](), throwsFormatException);
+          await expectLater(calls[index](), invalid.isEmpty
+            ? throwsA(isA<sdk.LuxoError>().having((error) => error.error, 'error', 'ParseError'))
+            : throwsFormatException);
         }
       }
     },
@@ -257,7 +425,9 @@ void main() {
       response = Uint8List.fromList(invalid);
       await expectLater(
         client.echoInteger(value: maximum),
-        throwsFormatException,
+        invalid.isEmpty
+          ? throwsA(isA<sdk.LuxoError>().having((error) => error.error, 'error', 'ParseError'))
+          : throwsFormatException,
       );
     }
   });

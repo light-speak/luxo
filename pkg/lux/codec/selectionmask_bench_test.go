@@ -9,6 +9,53 @@ import (
 	"github.com/light-speak/luxo/internal/testutil"
 )
 
+var selectionDepthAccepted bool
+var selectionDepthWire []byte
+
+// Use this harness unchanged with a pre-guard source overlay. Over-depth inputs
+// are non-equivalent controls; the accepted metric records each implementation.
+func BenchmarkSelectionMaskDepthGuard(b *testing.B) {
+	for _, depth := range []int{1, 2, 16, 32, 33, 1024} {
+		b.Run(fmt.Sprintf("split/%d", depth), func(b *testing.B) {
+			mask := rawSelectionMaskDepth(depth)
+			_, _, accepted := SplitSelectionMask(mask)
+			b.ReportAllocs()
+			for b.Loop() {
+				_, _, selectionDepthAccepted = SplitSelectionMask(mask)
+			}
+			if selectionDepthAccepted != accepted {
+				b.Fatal("parser result changed")
+			}
+			if accepted {
+				b.ReportMetric(1, "accepted")
+			} else {
+				b.ReportMetric(0, "accepted")
+			}
+		})
+	}
+	for _, childDepth := range []int{1, 31, 32, 1024} {
+		b.Run(fmt.Sprintf("append-child/%d", childDepth), func(b *testing.B) {
+			mask := rawSelectionMaskDepth(childDepth)
+			children := []SelectionMaskChild{{FieldID: 1, Mask: mask}}
+			dst := make([]byte, 0, len(mask)+16)
+			_, checkErr := AppendSelectionMask(dst, []byte{1}, children)
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				selectionDepthWire, err = AppendSelectionMask(dst[:0], []byte{1}, children)
+			}
+			if (err == nil) != (checkErr == nil) {
+				b.Fatal("constructor result changed")
+			}
+			if err == nil {
+				b.ReportMetric(1, "accepted")
+			} else {
+				b.ReportMetric(0, "accepted")
+			}
+		})
+	}
+}
+
 // Frozen pre-error constructors, retained only for equivalent legal-input comparisons.
 func legacyFieldMaskSet(mask []byte, fieldID int) ([]byte, error) {
 	if fieldID <= 0 {

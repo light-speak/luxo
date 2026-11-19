@@ -278,26 +278,59 @@ func (p *Parser) parseError() *ast.ErrorDecl {
 
 	// body: { code: 404, message: error.not_found, internal: true }
 	p.expect(token.LBrace)
+	var seen uint8
 	for !p.check(token.RBrace) && !p.isEOF() {
-		key := p.expectIdent()
-		p.expect(token.Colon)
-		switch key {
-		case "code":
-			code, _ := strconv.Atoi(p.expect(token.Int).Val)
-			errDecl.Code = code
-		case "message":
-			if p.check(token.String) {
-				errDecl.Message = p.advance().Val
-			} else {
-				errDecl.Message = p.parseQualifiedName()
-			}
-		case "internal":
-			errDecl.Internal = p.current().Type == token.True
-			p.advance()
-		}
+		p.parseErrorAttribute(errDecl, &seen)
 	}
 	p.expect(token.RBrace)
 	return errDecl
+}
+
+func (p *Parser) parseErrorAttribute(decl *ast.ErrorDecl, seen *uint8) {
+	pos := p.current().Pos
+	key := p.expectIdent()
+	bit := errorAttributeBit(key)
+	if bit == 0 || *seen&bit != 0 {
+		p.errors = append(p.errors, Error{Pos: pos, Message: "unknown or duplicate error attribute: " + key})
+		panic(bailout{})
+	}
+	*seen |= bit
+	p.expect(token.Colon)
+	switch key {
+	case "code":
+		value := p.expect(token.Int)
+		code, err := strconv.Atoi(value.Val)
+		if err != nil {
+			p.errors = append(p.errors, Error{Pos: value.Pos, Message: "error code is out of range"})
+			return
+		}
+		decl.Code = code
+	case "message":
+		if p.check(token.String) {
+			decl.Message = p.advance().Val
+		} else {
+			decl.Message = p.parseQualifiedName()
+		}
+	case "internal":
+		if !p.check(token.True) && !p.check(token.False) {
+			p.error("internal must be true or false")
+			panic(bailout{})
+		}
+		decl.Internal = p.advance().Type == token.True
+	}
+}
+
+func errorAttributeBit(key string) uint8 {
+	switch key {
+	case "code":
+		return 1
+	case "message":
+		return 2
+	case "internal":
+		return 4
+	default:
+		return 0
+	}
 }
 
 func (p *Parser) parseExtend() *ast.ExtendDecl {
@@ -614,6 +647,7 @@ func (p *Parser) parseTypeRef() *ast.TypeRef {
 	// List type: [Post], [Role] through UserRole
 	if p.match(token.LBracket) {
 		inner := p.parseTypeRef()
+		p.validateListElement(inner)
 		p.expect(token.RBracket)
 		ref := &ast.TypeRef{
 			Pos:      pos,
@@ -644,14 +678,9 @@ func (p *Parser) parseTypeRef() *ast.TypeRef {
 		p.expect(token.Gt)
 	}
 
-	// Custom FK: User(key: authorId)
-	if p.match(token.LParen) {
-		if p.check(token.Ident) && p.current().Val == "key" {
-			p.advance()
-			p.expect(token.Colon)
-			ref.FKField = p.expectIdent()
-		}
-		p.expect(token.RParen)
+	if p.check(token.LParen) {
+		p.error("parenthesized type suffixes are unsupported; use @by(remoteField, localField) for model relations")
+		panic(bailout{})
 	}
 
 	// Nullable: String?
@@ -660,6 +689,15 @@ func (p *Parser) parseTypeRef() *ast.TypeRef {
 	}
 
 	return ref
+}
+
+func (p *Parser) validateListElement(inner *ast.TypeRef) {
+	if inner.IsList || inner.Nullable || len(inner.Tuple) != 0 {
+		p.errors = append(p.errors, Error{
+			Pos:     inner.Pos,
+			Message: "list elements must be non-null, non-list named types / 列表元素必须是非空、非列表的具名类型",
+		})
+	}
 }
 
 func (p *Parser) parseTupleType(pos token.Position) *ast.TypeRef {

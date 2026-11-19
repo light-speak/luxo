@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -33,11 +35,11 @@ type Config struct {
 	AccessKey string // access key ID
 	SecretKey string // secret access key
 	Bucket    string // default bucket name
-	PublicURL string // base URL for public access (e.g., CDN URL)
-	UseSSL    bool   // use HTTPS for endpoint
+	PublicURL string // absolute HTTP(S) public base; no credentials, query or fragment
+	UseSSL    bool   // require HTTPS; an explicit https:// endpoint also enables TLS
 }
 
-// Validate checks that required fields are set.
+// Validate checks required fields and public base URL semantics.
 func (c *Config) Validate() error {
 	if c.AccessKey == "" {
 		return errors.New("storage: access key is required")
@@ -47,6 +49,19 @@ func (c *Config) Validate() error {
 	}
 	if c.Bucket == "" {
 		return errors.New("storage: bucket is required")
+	}
+	return validatePublicURL(c.PublicURL)
+}
+
+// PublicURL is a path prefix, not a presigned object URL. Reject components
+// which would absorb the appended object path or expose embedded credentials.
+func validatePublicURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.ForceQuery || strings.Contains(raw, "#") {
+		return errors.New("storage: public URL must be an absolute HTTP(S) base without credentials, query or fragment")
 	}
 	return nil
 }
@@ -70,11 +85,15 @@ func ConfigFromEnv(getenv func(string) string) Config {
 	}
 }
 
-// GenerateKey builds an object key: {model}/{field}/{uuid}.{ext}
-func GenerateKey(model, field, filename string) string {
+// GenerateKey builds an object key: {model}/{field}/{uuid}.{ext}.
+// Entropy failures return no key; callers must not start an upload on error.
+func GenerateKey(model, field, filename string) (string, error) {
 	ext := path.Ext(filename)
-	id := uuid.New().String()
-	return model + "/" + field + "/" + id + ext
+	id, err := uuid.NewRandom()
+	if err != nil {
+		return "", err
+	}
+	return model + "/" + field + "/" + id.String() + ext, nil
 }
 
 // ParseSize parses a human-readable size string (e.g., "5mb", "100kb", "1gb").
@@ -104,19 +123,27 @@ func ParseSize(s string) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("storage: invalid size number %q: %w", numStr, err)
 	}
+	if n < 0 {
+		return 0, errors.New("storage: size must not be negative")
+	}
 
+	var shift uint
 	switch unit {
 	case "b", "":
 		return n, nil
 	case "kb":
-		return n * 1024, nil
+		shift = 10
 	case "mb":
-		return n * 1024 * 1024, nil
+		shift = 20
 	case "gb":
-		return n * 1024 * 1024 * 1024, nil
+		shift = 30
 	default:
 		return 0, fmt.Errorf("storage: unknown size unit %q (supported: b, kb, mb, gb)", unit)
 	}
+	if n > math.MaxInt64>>shift {
+		return 0, errors.New("storage: size exceeds Int64 range")
+	}
+	return n << shift, nil
 }
 
 // MatchContentType checks if a content type matches an accept pattern.

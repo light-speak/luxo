@@ -147,6 +147,9 @@ func validateBinaryError(result *BinaryError, seen uint8) error {
 	if seen&required != required {
 		return fmt.Errorf("decode binary error: missing required fields")
 	}
+	if result.Code < 400 || result.Code > 599 {
+		return fmt.Errorf("decode binary error: invalid error status")
+	}
 	// String fields have already passed Decoder's UTF-8 validation and Finish.
 	if seen&(1<<binaryErrorDataField) != 0 && !jsonutil.ValidUTF8JSON(result.Data) {
 		return fmt.Errorf("decode binary error: invalid JSON data")

@@ -17,6 +17,7 @@ internal fun snapshotAPISchema(schema: Map<String, APISchemaEntry>): Map<String,
         val owner = "API $name"
         result[name] = entry.copy(params = snapshotParams(entry.params, owner),
             fields = snapshots.fields(entry.fields, owner), types = snapshots.types(entry.types)).also {
+                require(it.paramsByName.size == it.params.size) { "$owner: duplicate parameter name" }
                 it.selectionSnapshot = true
             }
     }

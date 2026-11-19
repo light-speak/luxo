@@ -1,6 +1,260 @@
 package semantic
 
-import "github.com/light-speak/luxo/pkg/ast"
+import (
+	"hash/maphash"
+	"math/bits"
+
+	"github.com/light-speak/luxo/internal/inferred"
+	"github.com/light-speak/luxo/pkg/ast"
+)
+
+// Member dispatch excludes lists and admits only model/query-builder receivers before this helper.
+// Keep both fallbacks when inconsistent receiver metadata bypasses that dispatch.
+func (a *Analyzer) rejectSaveQueryReceiver(member *ast.MemberExpr, receiver *ResolvedType, scope *Scope) bool {
+	if receiver.IsList {
+		return false
+	}
+	if receiver.Kind != TypeQueryBuilder {
+		if receiver.Kind != TypeModel {
+			return false
+		}
+		name, ok := member.Object.(*ast.Ident)
+		if !ok {
+			return false
+		}
+		symbol := scope.Lookup(name.Name)
+		if symbol == nil || symbol.Kind != SymModel {
+			return false
+		}
+	}
+	a.addError(member.Pos, "save requires a model instance receiver; a model type or query builder has no field values to save / save 要求模型实例；模型类型或查询构建器没有可保存的字段值")
+	return true
+}
+
+func (a *Analyzer) rejectInstanceQueryReceiver(member *ast.MemberExpr, receiver *ResolvedType, scope *Scope) bool {
+	if a.callTarget != member || receiver.Kind != TypeModel || receiver.IsList || !inferred.RequiresModelQueryReceiver(member.Field) {
+		return false
+	}
+	if field := receiver.LookupField(member.Field); field != nil && field.IsMethod {
+		return false
+	}
+	if name, ok := member.Object.(*ast.Ident); ok {
+		if symbol := scope.Lookup(name.Name); symbol != nil && symbol.Kind == SymModel {
+			return false
+		}
+	}
+	a.addError(member.Pos, "query method '%s' requires a model type or query builder receiver", member.Field)
+	return true
+}
+
+func isDeclaredFunctionCall(call *ast.CallExpr, scope *Scope) bool {
+	name, ok := call.Func.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	symbol := scope.Lookup(name.Name)
+	return symbol != nil && symbol.Kind == SymFn
+}
+
+func (a *Analyzer) checkQueryWhereArguments(call *ast.CallExpr, scope *Scope) {
+	arguments, method, model := a.queryWhereArguments(call, scope)
+	if model == nil {
+		return
+	}
+	if method == "updateMany" {
+		a.checkBulkUpdateArguments(call, arguments, model)
+		return
+	}
+	_, index, message := inferred.QueryWhere(arguments)
+	if message == "" {
+		return
+	}
+	position := call.Pos
+	if argument := arguments[index]; argument != nil && argument.Value != nil {
+		position = argument.Value.GetPos()
+	}
+	a.addError(position, "%s%s", method, message)
+}
+
+func (a *Analyzer) queryWhereArguments(call *ast.CallExpr, scope *Scope) ([]*ast.NamedArg, string, *ResolvedType) {
+	switch target := call.Func.(type) {
+	case *ast.Ident:
+		if inferred.ModelTerminalType(target.Name) == "" || scope.Lookup(target.Name) != nil {
+			return nil, "", nil
+		}
+		if len(call.Args) > 0 && call.Args[0] != nil && call.Args[0].Name == "" {
+			if model, ok := call.Args[0].Value.(*ast.Ident); ok {
+				if symbol := scope.Lookup(model.Name); symbol != nil && symbol.Kind == SymModel {
+					return call.Args[1:], target.Name, symbol.Type
+				}
+			}
+		}
+		a.addError(call.Pos, "%s requires a positional model argument", target.Name)
+	case *ast.MemberExpr:
+		if inferred.ModelTerminalType(target.Field) == "" || target.DeclaredField || target.Object.IsListType() {
+			return nil, "", nil
+		}
+		if model := a.resolveChainModelType(call, scope); model != nil {
+			return call.Args, target.Field, model
+		}
+	}
+	return nil, "", nil
+}
+
+func (a *Analyzer) checkBulkUpdateArguments(call *ast.CallExpr, arguments []*ast.NamedArg, model *ResolvedType) {
+	a.checkDuplicateBulkSetters(arguments)
+	for _, argument := range arguments {
+		var field inferred.MutationField
+		if argument != nil && argument.Name != "where" {
+			if resolved := model.LookupField(argument.Name); resolved != nil && resolved.Type != nil {
+				field = inferred.MutationField{TypeName: resolved.Type.Name, List: resolved.Type.IsList,
+					Nullable: resolved.Type.Nullable, Computed: resolved.Computed || resolved.IsMethod,
+					Immutable: hasDirective(resolved.Directives, "immutable"), Relation: resolved.Type.Kind == TypeModel}
+			}
+		}
+		_, message := inferred.MutationArgument(argument, field)
+		if message != "" {
+			position := call.Pos
+			if argument != nil && argument.Value != nil {
+				position = argument.Value.GetPos()
+			}
+			a.addError(position, "updateMany%s", message)
+		}
+	}
+}
+
+var bulkSetterHashSeed = maphash.MakeSeed()
+
+// A bulk call may combine where predicates, but each named setter is unique.
+func (a *Analyzer) checkDuplicateBulkSetters(arguments []*ast.NamedArg) {
+	if len(arguments) < 2 {
+		return
+	}
+	// Keep common calls on the stack and bound probing to a half-full table.
+	var local [256]int
+	slots := local[:]
+	if len(arguments) > len(local)/2 {
+		slots = make([]int, 1<<(bits.Len(uint(len(arguments)-1))+1))
+	}
+	mask := uint64(len(slots) - 1)
+	for position, argument := range arguments {
+		if argument == nil || argument.Name == "" || argument.Name == "where" || argument.Value == nil {
+			continue
+		}
+		index := maphash.String(bulkSetterHashSeed, argument.Name) & mask
+		for slots[index] != 0 {
+			previous := arguments[slots[index]-1]
+			if argument.Name == previous.Name {
+				a.addError(argument.Value.GetPos(), "duplicate argument '%s' / 参数 '%s' 重复", argument.Name, argument.Name)
+				break
+			}
+			index = (index + 1) & mask
+		}
+		slots[index] = position + 1
+	}
+}
+
+func (a *Analyzer) checkOrderByArguments(call *ast.CallExpr, resolved *ResolvedType) bool {
+	if !isOrderByMethod(call) || resolved == nil || resolved.Kind != TypeQueryBuilder {
+		return false
+	}
+	a.recordCacheModelRead(call, resolved.ModelType)
+	for _, argument := range call.Args {
+		a.checkQueryOrder(argument.Value, resolved.ModelType)
+	}
+	return true
+}
+
+func (a *Analyzer) checkCRUDOrderArgument(argument *ast.NamedArg, fields, outer *Scope) {
+	if argument.Name == "order" && fields != outer {
+		a.checkQueryOrder(argument.Value, fields.LookupLocal("it").Type)
+	}
+}
+
+func (a *Analyzer) checkScopeOrders(file *ast.File) {
+	for _, declaration := range file.Models {
+		for _, scope := range declaration.Scopes {
+			a.checkScopeOrderExpression(scope.Expr, a.types[declaration.Name])
+		}
+	}
+}
+
+// Scope query modifiers form a single outer chain. Their values and predicates
+// are separate expressions, not additional modifiers of the scope's model.
+func (a *Analyzer) checkScopeOrderExpression(expression ast.Expr, model *ResolvedType) {
+	for expression != nil {
+		call, ok := expression.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		var method string
+		expression = nil
+		switch target := call.Func.(type) {
+		case *ast.Ident:
+			method = target.Name
+		case *ast.MemberExpr:
+			method, expression = target.Field, target.Object
+		}
+		if method == "orderBy" {
+			for _, argument := range call.Args {
+				a.checkQueryOrder(argument.Value, model)
+			}
+		}
+	}
+}
+
+func (a *Analyzer) checkQueryOrder(expression ast.Expr, model *ResolvedType) {
+	if model == nil || model.Kind != TypeModel {
+		return
+	}
+	name, _, alternate := inferred.ParseOrderExpression(expression)
+	if name != "" {
+		field := model.LookupField(name)
+		if alternate != "" && (field == nil || !storedOrderField(field)) {
+			name = alternate
+			field = model.LookupField(name)
+		}
+		if field != nil {
+			if storedOrderField(field) {
+				return
+			}
+		} else if a.managedOrderField(model.Name, name) {
+			return
+		}
+	}
+	a.addError(expression.GetPos(), "order requires a stored field of model '%s' with optional .asc/.desc / 排序需要当前模型的持久字段，可选 .asc/.desc", model.Name)
+}
+
+func storedOrderField(field *FieldInfo) bool {
+	if field.Computed || field.IsMethod || field.Type == nil {
+		return false
+	}
+	switch field.Type.Kind {
+	case TypeInt, TypeFloat, TypeString, TypeBool, TypeDateTime, TypeDuration, TypeUUID, TypeDecimal, TypeBytes, TypeJSON, TypeEnum:
+		return true
+	default:
+		return false
+	}
+}
+
+// Managed timestamps have database columns without declared wire fields. Only
+// these missing names need a declaration lookup; normal fields use their type.
+func (a *Analyzer) managedOrderField(model, name string) bool {
+	if name != "createdAt" && name != "updatedAt" && name != "deletedAt" {
+		return false
+	}
+	for _, file := range a.files {
+		for _, declaration := range file.Models {
+			if declaration.Name == model {
+				if name == "deletedAt" {
+					return hasModelDirective(declaration.Directives, "soft")
+				}
+				return !hasModelDirective(declaration.Directives, "noTime")
+			}
+		}
+	}
+	return false
+}
 
 func (a *Analyzer) checkQueryArgument(call *ast.CallExpr, argument *ast.NamedArg, scope, outer *Scope, callType *ResolvedType) *ResolvedType {
 	member, ok := call.Func.(*ast.MemberExpr)
@@ -84,7 +338,7 @@ func (s *queryValueScope) forExpr(expr ast.Expr) *Scope {
 func (a *Analyzer) checkWhereExpression(expression ast.Expr, fields *Scope, values *queryValueScope) *ResolvedType {
 	if unary, ok := expression.(*ast.UnaryExpr); ok && unary.Op == "!" {
 		resolved := a.checkBooleanNegation(a.checkWhereExpression(unary.Value, fields, values), unary.Pos)
-		setExprResolvedType(unary, resolved)
+		a.setExprResolvedType(unary, resolved)
 		return resolved
 	}
 	if call, ok := expression.(*ast.CallExpr); ok {
@@ -106,7 +360,7 @@ func (a *Analyzer) checkWhereExpression(expression ast.Expr, fields *Scope, valu
 	}
 	resolved := a.checkBinaryOp(binary.Op, left, right, binary.Pos)
 	if resolved != nil {
-		setExprResolvedType(expression, resolved)
+		a.setExprResolvedType(expression, resolved)
 	}
 	return resolved
 }
@@ -126,15 +380,16 @@ func (a *Analyzer) checkWhereStringCall(call *ast.CallExpr, fields *Scope, value
 	if !ok || member.Field != "contains" && member.Field != "startsWith" && member.Field != "endsWith" {
 		return nil, false
 	}
-	previous := a.callTarget
-	a.callTarget = call.Func
-	result := a.checkExpr(call.Func, fields)
-	a.callTarget = previous
 	field := membershipField(member.Object, values.parameter, values.model)
 	if field == nil || !groupScalarField(field) || field.Type.Kind != TypeString {
 		a.addError(call.Pos, "string predicate requires a stored String field / 字符串条件需要已存储的 String 字段")
 		return nil, true
 	}
+	// SQL predicates inspect nullable columns; they do not dereference Go values.
+	a.checkExpr(member.Object, fields)
+	a.warnStringContains(member, field.Type)
+	result := a.types["Boolean"]
+	a.setExprResolvedType(member, result)
 	if len(call.Args) != 1 || call.Args[0].Name != "" {
 		a.addError(call.Pos, "string predicate requires one unnamed String argument / 字符串条件需要一个未命名 String 参数")
 		return nil, true
@@ -144,7 +399,7 @@ func (a *Analyzer) checkWhereStringCall(call *ast.CallExpr, fields *Scope, value
 	if actual == nil || actual.Kind != TypeString || actual.IsList || actual.Nullable {
 		a.addError(argument.GetPos(), "string predicate requires a non-null String value / 字符串条件需要非空 String 值")
 	}
-	setExprResolvedType(call, result)
+	a.setExprResolvedType(call, result)
 	return result, true
 }
 

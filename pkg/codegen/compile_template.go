@@ -41,8 +41,10 @@ func (c *compiler) prepareTemplatePart(part ast.Expr, index int) compiledTemplat
 		return compiledTemplatePart{value: name, numeric: true}
 	case "Boolean":
 		value = "strconv.FormatBool(" + value + ")"
-	case "DateTime", "Duration", "UUID", "Decimal":
+	case "DateTime", "Duration", "UUID":
 		value = "(" + value + ").String()"
+	case "Decimal":
+		value = "lux.FormatDecimal(" + value + ")"
 	case "String":
 	default:
 		// All remaining semantically valid values are string-backed enums.

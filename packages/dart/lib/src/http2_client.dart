@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:http2/transport.dart' as h2;
 
 import 'buffered_http_response.dart';
+import 'deadline.dart';
 
 part 'http2_exchange.dart';
 part 'http2_socket.dart';
@@ -94,22 +95,22 @@ class LuxoHttp2Client extends http.BaseClient {
     final generation = ++_generation;
     final cancelled = Completer<void>();
     _dialCancelled = cancelled;
-    final future =
-        Future.any([
-          _dial(generation),
-          cancelled.future.then<h2.ClientTransportConnection>(
-            (_) => throw http.ClientException('HTTP/2 connection cancelled'),
-          ),
-        ]).timeout(
+    final future = withDeadline(
+      Future.any([
+        _dial(generation),
+        cancelled.future.then<h2.ClientTransportConnection>(
+          (_) => throw http.ClientException('HTTP/2 connection cancelled'),
+        ),
+      ]),
+      connectTimeout,
+      onTimeout: () {
+        _cancelDial();
+        throw TimeoutException(
+          'HTTP/2 connection deadline exceeded',
           connectTimeout,
-          onTimeout: () {
-            _cancelDial();
-            throw TimeoutException(
-              'HTTP/2 connection deadline exceeded',
-              connectTimeout,
-            );
-          },
         );
+      },
+    );
     _connecting = future;
     try {
       return await future;

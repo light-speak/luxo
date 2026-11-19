@@ -152,6 +152,25 @@ func TestSwiftCandidateCheckoutIsPinned(t *testing.T) {
 	}
 }
 
+func TestSwiftCICheckoutIsDocumented(t *testing.T) {
+	var revision string
+	for _, step := range readQualityWorkflow(t).Jobs["sdk-swift-conformance"].Steps {
+		if step.With["repository"] == "light-speak/luxo-swift" {
+			revision = step.With["ref"]
+		}
+	}
+	if revision == "" {
+		t.Fatal("Swift checkout revision is absent")
+	}
+	for _, path := range []string{"../README.md", "../README_CN.md"} {
+		t.Run(path, func(t *testing.T) {
+			if !strings.Contains(readQualityFile(t, path), "`"+revision+"`") {
+				t.Errorf("%s does not document configured Swift checkout %s", path, revision)
+			}
+		})
+	}
+}
+
 func TestSDKInstallationExamplesMatchCandidate(t *testing.T) {
 	version := candidateVersion(t)
 	for path, coordinate := range map[string]string{

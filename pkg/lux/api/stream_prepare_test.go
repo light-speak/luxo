@@ -122,6 +122,51 @@ func TestPreparedStreamChecksBeforeWebSocketACK(t *testing.T) {
 	}
 }
 
+func TestPreparedStreamBusinessPaginationNames(t *testing.T) {
+	for _, binary := range []bool{false, true} {
+		t.Run(fmt.Sprintf("binary=%t", binary), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				router := NewRouter()
+				if err := router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "watch", Stream: true, ReturnType: "Int", Params: []schema.Param{
+					{ID: 1, Name: "page", Type: schema.FieldString},
+					{ID: 2, Name: "pageSize", Type: schema.FieldInt},
+				}}); err != nil {
+					t.Fatal(err)
+				}
+				if err := router.Registry.RegisterSchemaAPIs(router.Schema); err != nil {
+					t.Fatal(err)
+				}
+				router.HandleStreamPrepared("watch", func(_ context.Context, req *Request, _ any) (PreparedStreamHandler, error) {
+					page, err := req.ParamString("page")
+					if err != nil || page != "chapter" {
+						t.Fatalf("business page changed: %s / %v", page, err)
+					}
+					size, err := req.ParamInt("pageSize")
+					if err != nil || size != 101 {
+						t.Fatalf("business pageSize changed: %d / %v", size, err)
+					}
+					return func(_ context.Context, stream *Stream) error {
+						if !stream.Binary() {
+							return stream.Send([]byte("101"))
+						}
+						return stream.Send(codec.AppendSvarint(nil, size))
+					}, nil
+				})
+				ctx, conn := newInMemoryWebSocket(t, router)
+				mode, input := preparedSubscribeFrame(t, router, `"page":"chapter","pageSize":101`, binary)
+				writeWSFrame(t, ctx, conn, mode, input)
+				ack, data := []byte(`{"$sub":1,"ok":true}`), []byte(`{"$stream":1,"data":101}`)
+				if binary {
+					ack = []byte{BinaryFrameSubscribeSuccess, 1}
+					data = codec.AppendSvarint([]byte{BinaryFrameStream, 1}, 101)
+				}
+				requireWSFrame(t, ctx, conn, mode, ack)
+				requireWSFrame(t, ctx, conn, mode, data)
+			})
+		})
+	}
+}
+
 func preparedSubscribeFrame(t *testing.T, router *Router, params string, binary bool) (websocket.MessageType, []byte) {
 	t.Helper()
 	if !binary {
@@ -497,5 +542,154 @@ func requirePreparedSubscriptionError(t *testing.T, ctx context.Context, conn *w
 	}
 	if err := json.Unmarshal(body, &response); err != nil || response.OK || response.Code != code {
 		t.Fatalf("expected %d rejected ACK, received %s: %v", code, body, err)
+	}
+}
+
+func TestForwardedStreamCancellationDuringPreparationReleasesOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		router := preparedInputRouter(t, true)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var started, released atomic.Int32
+		router.HandleStreamForwarded("watch", func(context.Context, *Request, any) (PreparedStreamSource, error) {
+			// The source was acquired while the parent subscription was cancelled.
+			cancel()
+			return PreparedStreamSource{
+				Run: func(context.Context, *Stream) error { started.Add(1); return nil },
+				Close: func() {
+					if router.Streams.SubCount("watch") != 0 {
+						t.Error("source released before removing its hub subscription")
+					}
+					released.Add(1)
+				},
+			}, nil
+		})
+		stream, err := router.PrepareInternalStream(ctx, &Request{API: "watch"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stream.Close()
+		for range 8 {
+			go stream.Start()
+			go stream.Close()
+		}
+		synctest.Wait()
+		if started.Load() != 0 || released.Load() != 1 || router.Streams.SubCount("watch") != 0 {
+			t.Fatalf("cancelled source lifecycle: started=%d released=%d subscribers=%d", started.Load(), released.Load(), router.Streams.SubCount("watch"))
+		}
+		if _, open := <-stream.Messages(); open || stream.Err() != context.Canceled {
+			t.Fatal("cancelled forwarded source did not terminate")
+		}
+	})
+}
+
+func TestStreamIdentityPanicRejectsBeforePreparation(t *testing.T) {
+	for _, fallback := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fallback=%t", fallback), func(t *testing.T) {
+			defer func() {
+				if recover() != nil {
+					t.Error("identity callback panic escaped stream preparation")
+				}
+			}()
+			router := preparedInputRouter(t, true)
+			var prepared atomic.Int32
+			router.HandleStreamPrepared("watch", func(context.Context, *Request, any) (PreparedStreamHandler, error) {
+				prepared.Add(1)
+				return nil, nil
+			})
+			extract := func(context.Context) any { panic("private identity detail") }
+			if fallback {
+				previous := IdentityExtractor
+				IdentityExtractor = extract
+				t.Cleanup(func() { IdentityExtractor = previous })
+			} else {
+				router.IdentityExtractor = extract
+			}
+			stream, err := router.PrepareInternalStream(t.Context(), &Request{API: "watch"})
+			if stream != nil {
+				stream.Close()
+				t.Fatal("identity failure admitted subscription")
+			}
+			if err != luxerrors.InternalError || prepared.Load() != 0 || router.Streams.SubCount("watch") != 0 {
+				t.Fatalf("identity failure was not isolated: %v prepared=%d", err, prepared.Load())
+			}
+		})
+	}
+}
+
+func TestWSStreamIdentityPanicDoesNotCloseConnection(t *testing.T) {
+	for _, binary := range []bool{false, true} {
+		t.Run(fmt.Sprint(binary), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				router := subscriptionIdentityRouter()
+				var calls atomic.Int32
+				router.IdentityExtractor = func(context.Context) any {
+					if calls.Add(1) == 1 {
+						panic("private identity detail")
+					}
+					return nil
+				}
+				ctx, conn := newInMemoryWebSocket(t, router)
+				kind, body := websocket.MessageText, []byte(`{"$id":1,"$sub":"watchIdentity"}`)
+				if binary {
+					kind, body = websocket.MessageBinary, []byte{BinaryFrameSubscribe, 1, 71, 0, 0}
+				}
+				writeWSFrame(t, ctx, conn, kind, body)
+				requireSubscriptionError(t, ctx, conn, binary, 1, 500)
+				if router.Streams.SubCount("watchIdentity") != 0 {
+					t.Fatal("failed identity registered subscription")
+				}
+				subscribeIdentity(t, ctx, conn, binary, 2)
+				unsubscribeIdentity(t, ctx, conn, binary, 2)
+				conn.CloseNow()
+				synctest.Wait()
+				if calls.Load() != 2 || router.Streams.SubCount("watchIdentity") != 0 {
+					t.Fatal("later subscription did not clean up")
+				}
+			})
+		})
+	}
+}
+
+func TestForwardedReleasePanicIsIsolatedAtEveryExit(t *testing.T) {
+	for _, scenario := range []string{"preparation-error", "capacity", "close"} {
+		t.Run(scenario, func(t *testing.T) {
+			router := preparedInputRouter(t, true)
+			var released atomic.Int32
+			router.HandleStreamForwarded("watch", func(context.Context, *Request, any) (PreparedStreamSource, error) {
+				source := PreparedStreamSource{
+					Run:   func(context.Context, *Stream) error { t.Error("unexpected producer start"); return nil },
+					Close: func() { released.Add(1); panic("private cleanup detail") },
+				}
+				if scenario == "preparation-error" {
+					return source, luxerrors.BadRequest
+				}
+				return source, nil
+			})
+			if scenario == "capacity" {
+				router.Streams.subs["watch"] = make([]*StreamSub, MaxSubscribersPerAPI)
+			}
+			stream, err := router.PrepareInternalStream(t.Context(), &Request{API: "watch"})
+			if scenario == "close" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				stream.Close()
+				stream.Close()
+				if router.Streams.SubCount("watch") != 0 {
+					t.Fatal("closed stream remained registered")
+				}
+			} else {
+				if stream != nil || err == nil {
+					t.Fatal("failed admission succeeded")
+				}
+				if scenario == "preparation-error" && err != luxerrors.BadRequest {
+					t.Fatal("cleanup replaced original failure")
+				}
+			}
+			if released.Load() != 1 {
+				t.Fatalf("release count = %d", released.Load())
+			}
+		})
 	}
 }

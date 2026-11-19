@@ -71,11 +71,13 @@ func writeBackendGuard(b *strings.Builder, name, selection string) {
 func writeSelectedEventBus(b *strings.Builder, selection string) {
 	writeBackendGuard(b, "LUXO_EVENT_BACKEND", selection)
 	if selection == "memory" {
-		b.WriteString("\teventBus := event.NewChanBus(256)\n\tdefer eventBus.Close()\n\n")
+		b.WriteString("\teventBus := event.NewChanBus(256)\n")
+		writeBackendCleanup(b, "eventBus", "event bus")
 		return
 	}
 	writeRequiredNATSURL(b, "eventURL")
 	writeBackendInitialization(b, "eventBus", "event.NewNATSBus(eventURL)")
+	writeBackendCleanup(b, "eventBus", "event bus")
 }
 
 func writeSelectedQueue(b *strings.Builder, selection string) {
@@ -84,11 +86,17 @@ func writeSelectedQueue(b *strings.Builder, selection string) {
 		return
 	}
 	if selection == "memory" {
-		b.WriteString("\ttaskQueue := queue.NewMemoryQueue(queue.DefaultConfig())\n\tdefer taskQueue.Close()\n\n")
-		return
+		writeBackendInitialization(b, "taskQueue", "queue.NewMemoryQueue(queue.DefaultConfig())")
+	} else {
+		writeRequiredNATSURL(b, "queueURL")
+		writeBackendInitialization(b, "taskQueue", "natsqueue.NewNATSQueue(queueURL, queue.DefaultConfig())")
 	}
-	writeRequiredNATSURL(b, "queueURL")
-	writeBackendInitialization(b, "taskQueue", "natsqueue.NewNATSQueue(queueURL, queue.DefaultConfig())")
+	writeBackendCleanup(b, "taskQueue", "task queue")
+}
+
+// Report shutdown errors without skipping the remaining deferred cleanup.
+func writeBackendCleanup(b *strings.Builder, variable, label string) {
+	fmt.Fprintf(b, "\tdefer func() {\n\t\tif err := %s.Close(); err != nil {\n\t\t\tfmt.Fprintln(os.Stderr, %q, err)\n\t\t}\n\t}()\n\n", variable, "error: close "+label+":")
 }
 
 func writeRequiredNATSURL(b *strings.Builder, variable string) {

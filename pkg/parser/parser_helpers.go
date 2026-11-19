@@ -24,7 +24,7 @@ func (p *Parser) currentPrec() int {
 	case token.DotDot:
 		return precRange
 	case token.ChanSend:
-		return precAdd
+		return precSend
 	case token.Plus, token.Minus:
 		return precAdd
 	case token.Star, token.Slash, token.Percent:

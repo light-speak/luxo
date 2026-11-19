@@ -11,6 +11,7 @@ import (
 
 // ResponseBuf is a pooled, zero-allocation response buffer.
 // Uses []byte with direct append — no bytes.Buffer overhead.
+// Handlers append to B, preserving any prefix owned by their transport.
 type ResponseBuf struct {
 	B        []byte
 	Identity any // authenticated user, set by handler for @visible/@mask checks
@@ -33,6 +34,7 @@ func GetBuf() *ResponseBuf {
 
 // Reset clears the buffer for reuse, keeping the underlying capacity.
 // Used by generated handlers that write multiple items into one pooled buffer.
+// Only reset caller-owned buffers, never the transport-owned request buffer.
 func (r *ResponseBuf) Reset() {
 	r.B = r.B[:0]
 	r.Identity = nil

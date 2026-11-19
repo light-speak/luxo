@@ -47,7 +47,7 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
 
     /** Write a typed Int/Duration list without a callback or temporary container. */
     fun writeIntList(values: List<Long>) {
-        writeVarint(values.size.toLong())
+        writeArrayHeader(values.size)
         if (values is RandomAccess) {
             var index = 0
             while (index < values.size) {
@@ -164,6 +164,10 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
         pos += 16
     }
 
+    fun writeArrayHeader(count: Int) {
+        writeVarint(checkedArrayWriteCount(count).toLong())
+    }
+
     // -- field writers ----------------------------------------------------
 
     fun writeFieldInt(fieldID: Int, v: Long) {
@@ -202,10 +206,11 @@ class LuxoEncoder(initialCapacity: Int = 1024) {
      * [encode] writes one element per item using the element type's encoding.
      */
     inline fun <T> writeFieldArray(fieldID: Int, items: List<T>, crossinline encode: (T) -> Unit) {
+        val count = checkedArrayWriteCount(items.size)
         val start = arrayWritePosition()
         try {
             writeVarint(fieldID.toLong())
-            writeVarint(items.size.toLong())
+            writeVarint(count.toLong())
             for (item in items) encode(item)
         } catch (error: Throwable) {
             restoreArrayWritePosition(start)
@@ -287,6 +292,13 @@ fun decodeLuxoUtf8(bytes: ByteArray, startIndex: Int = 0, endIndex: Int = bytes.
 
 // Match the Go decoder's allocation limits; these do not narrow business Int64 values.
 private const val MAX_ARRAY_ELEMENTS = 1_000_000
+
+@PublishedApi
+internal fun checkedArrayWriteCount(count: Int): Int {
+    if (count !in 0..MAX_ARRAY_ELEMENTS) throw LuxoCodecException("invalid array count")
+    return count
+}
+
 private const val MAX_COLUMNAR_RECORDS = 10_000_000
 private const val MAX_ARENA_SIZE = 64 * 1024 * 1024
 
@@ -466,6 +478,9 @@ class LuxoDecoder private constructor(private val buf: ByteArray, private var of
         if (!readNullFlag()) return null
         return readDateTime()
     }
+
+    /** Read a canonical nullable presence marker for static generated readers. */
+    fun readNullableMarker(): Boolean = readNullFlag()
 
     /** Read a nullable nested model using a decoder lambda. */
     fun <T> readNullable(decode: () -> T): T? {

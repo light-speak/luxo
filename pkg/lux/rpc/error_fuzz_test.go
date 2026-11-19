@@ -57,7 +57,7 @@ func FuzzRPCErrorEnvelope(f *testing.F) {
 		if !valid {
 			return
 		}
-		if want.Code >= 500 || want.Internal {
+		if want.Internal {
 			want.Message = "error.internal"
 			want.Internal = true
 			want.Data = nil
@@ -109,7 +109,7 @@ func referenceRPCError(body []byte) (luxerrors.AppError, bool) {
 		}
 		if field == 1 {
 			code, size := binary.Varint(body)
-			if size <= 0 || int64(int(code)) != code {
+			if size <= 0 || code < 400 || code > 599 {
 				return value, false
 			}
 			value.Code, body = int(code), body[size:]

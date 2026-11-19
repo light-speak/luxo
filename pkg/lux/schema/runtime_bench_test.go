@@ -108,8 +108,8 @@ func benchmarkPreparedNestedJSON(b *testing.B, plainType, list bool, count int) 
 	if list {
 		count = 1
 	}
-	previous, err := appendNestedJSONBeforePrebuild(nil, child, field, s)
-	current, newErr := appendNestedColumnBlobJSON(nil, child, field, s)
+	previous, err := appendNestedJSONBeforePrebuild(nil, child, field, 1, s)
+	current, newErr := appendNestedColumnBlobJSON(nil, child, field, 1, s)
 	if err != nil || newErr != nil || !bytes.Equal(previous, current) {
 		b.Fatalf("invalid reference: %v / %v", err, newErr)
 	}
@@ -124,7 +124,7 @@ func benchmarkPreparedNestedJSON(b *testing.B, plainType, list bool, count int) 
 			for b.Loop() {
 				dst = dst[:0]
 				for range count {
-					dst, err = convert(dst, child, field, s)
+					dst, err = convert(dst, child, field, 1, s)
 					if err != nil {
 						b.Fatal(err)
 					}

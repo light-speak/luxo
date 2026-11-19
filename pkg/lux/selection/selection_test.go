@@ -1,11 +1,35 @@
 package selection
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/lux/str"
 )
+
+func TestAtBorrowsSubtreesAndPreservesAllVersusEmpty(t *testing.T) {
+	leaves := []*Field{{Name: "café"}, {Name: "id"}}
+	empty := []*Field{}
+	fields := []*Field{nil, {Name: "box", Children: []*Field{{Name: "value", Children: leaves}}}, {Name: "all"}, {Name: "tag", Children: empty}}
+	if got := At(fields, "box", "value"); !slices.Equal(got, leaves) || &got[0] != &leaves[0] {
+		t.Fatal("selected subtree was copied or changed", got)
+	}
+	if At(nil, "box", "value") != nil || At(fields, "all", "value") != nil {
+		t.Fatal("nil all-fields contract was lost")
+	}
+	for _, path := range [][]string{{"missing"}, {"box", "missing"}, {"tag"}, {"tag", "value"}} {
+		if got := At(fields, path...); got == nil || len(got) != 0 {
+			t.Fatal("missing/tag-only path became all fields", path, got)
+		}
+	}
+	if got := At(fields); !slices.Equal(got, fields) {
+		t.Fatal("empty path changed the selection")
+	}
+	if allocations := testing.AllocsPerRun(100, func() { _ = At(fields, "box", "value") }); allocations != 0 {
+		t.Fatal("subtree lookup allocated", allocations)
+	}
+}
 
 func TestParseEmpty(t *testing.T) {
 	fields, err := Parse("")
@@ -474,5 +498,26 @@ func TestSQLColumnsOrWithoutSelect(t *testing.T) {
 	got := SQLColumnsOr(nil, fallback)
 	if len(got) != 3 || got[2] != "email" {
 		t.Fatalf("expected fallback cols, got %v", got)
+	}
+}
+
+func TestParseUnicodeIdentifiers(t *testing.T) {
+	const input = "café,中文2{𐐀_name},_é"
+	fields, err := Parse(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := Format(fields); got != input {
+		t.Fatalf("Unicode wire names changed: %q", got)
+	}
+	if got := SQLColumns(fields); strings.Join(got, ",") != "id,café,_é" {
+		t.Fatalf("unexpected scalar SQL fields: %v", got)
+	}
+	for _, invalid := range []string{"2café", "café²", "e\u0301", "😀", "字\u200d", "\xff", "ok,\xff", "𐐀\xff"} {
+		t.Run(invalid, func(t *testing.T) {
+			if _, err := Parse(invalid); err == nil {
+				t.Fatalf("accepted invalid identifier %q", invalid)
+			}
+		})
 	}
 }

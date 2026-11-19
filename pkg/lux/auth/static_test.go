@@ -12,6 +12,65 @@ func rawClaimsWriter(raw string) ClaimsWriter {
 	return func(dst []byte) ([]byte, error) { return append(dst, raw...), nil }
 }
 
+func TestVerifyRejectsInvalidSignedHeader(t *testing.T) {
+	ResetVerifyCache()
+	t.Cleanup(ResetVerifyCache)
+	cfg := testConfig()
+	for _, raw := range []string{
+		`{}`, `null`, `[]`, `not json`, `{"alg":"none"}`, `{"alg":"RS256"}`,
+		`{"alg":null}`, `{"alg":256}`, `{"alg":"HS256","alg":"HS256"}`,
+		`{"alg":"HS256","\u0061lg":"HS256"}`, `{"alg":"HS256"} true`,
+		`{"alg":"HS256","crit":["custom"],"custom":true}`,
+		`{"alg":"HS256","crit":[]}`, `{"alg":"HS256","b64":false}`,
+		`{"alg":"HS256","b64":"true"}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			for _, purpose := range []string{accessPurpose, refreshPurpose} {
+				payload := `{"data":{"id":42},"exp":4102444800,"token_use":"` + purpose + `"}`
+				unsigned := base64Encode([]byte(raw)) + "." + base64Encode([]byte(payload))
+				token := unsigned + "." + hmacSign(unsigned, cfg.Secret)
+				verify := VerifyRefresh
+				if purpose == accessPurpose {
+					verify = Verify
+				}
+				if claims, err := verify(cfg, token); err == nil || claims.Raw() != "" {
+					t.Errorf("accepted %s header: %s", purpose, raw)
+				}
+				if purpose == accessPurpose {
+					for range 2 {
+						if claims, err := VerifyCached(cfg, token); err == nil || claims.Raw() != "" {
+							t.Errorf("cached invalid header: %s", raw)
+						}
+					}
+				}
+			}
+		})
+	}
+	if got := verifyCacheLen(); got != 0 {
+		t.Errorf("invalid headers populated cache: %d", got)
+	}
+}
+
+func TestJWTHeaderValidation(t *testing.T) {
+	for _, raw := range []string{
+		`{"alg":"HS256"}`, ` { "typ": "JWT", "alg": "HS256" } `,
+		`{"\u0061lg":"HS\u003256"}`, `{"alg":"HS256","kid":"example"}`,
+		`{"alg":"HS256","b64":true}`,
+	} {
+		if err := validateJWTHeader(base64Encode([]byte(raw))); err != nil {
+			t.Errorf("valid header %s: %v", raw, err)
+		}
+	}
+	if err := validateJWTHeader(signedJWTHeader); err != nil {
+		t.Fatal(err)
+	}
+	for _, encoded := range []string{"", "!", "not-base64!"} {
+		if err := validateJWTHeader(encoded); err == nil {
+			t.Errorf("accepted invalid header encoding %q", encoded)
+		}
+	}
+}
+
 func TestStaticAuthRoundTripAndOwnership(t *testing.T) {
 	ResetVerifyCache()
 	t.Cleanup(ResetVerifyCache)

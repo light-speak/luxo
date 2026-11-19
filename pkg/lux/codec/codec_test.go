@@ -13,6 +13,39 @@ import (
 
 // --- Wire-level tests ---
 
+func TestWireReadersRejectInvalidOffsets(t *testing.T) {
+	readers := map[string]func([]byte, int) int{
+		"varint":   func(b []byte, off int) int { _, n := ReadVarint(b, off); return n },
+		"signed":   func(b []byte, off int) int { _, n := ReadSvarint(b, off); return n },
+		"float":    func(b []byte, off int) int { _, n := ReadFixed64(b, off); return n },
+		"bytes":    func(b []byte, off int) int { _, n := ReadBytes(b, off); return n },
+		"string":   func(b []byte, off int) int { _, n := ReadString(b, off); return n },
+		"bool":     func(b []byte, off int) int { _, n := ReadBool(b, off); return n },
+		"array":    func(b []byte, off int) int { _, n := ReadArrayHeader(b, off); return n },
+		"nullable": func(b []byte, off int) int { _, n := ReadNullable(b, off); return n },
+		"uuid":     func(b []byte, off int) int { _, n := ReadUUID(b, off); return n },
+		"datetime": func(b []byte, off int) int { _, n := ReadDateTime(b, off); return n },
+	}
+	for name, read := range readers {
+		t.Run(name, func(t *testing.T) {
+			for _, buf := range [][]byte{nil, make([]byte, 16)} {
+				for _, off := range []int{-1, math.MinInt, math.MaxInt, math.MaxInt - 7, len(buf), len(buf) + 1} {
+					func() {
+						defer func() {
+							if recovered := recover(); recovered != nil {
+								t.Errorf("offset %d panicked: %v", off, recovered)
+							}
+						}()
+						if n := read(buf, off); n != 0 {
+							t.Errorf("offset %d consumed %d bytes", off, n)
+						}
+					}()
+				}
+			}
+		})
+	}
+}
+
 func TestNullableRootEnvelope(t *testing.T) {
 	for _, test := range []struct {
 		data        []byte
@@ -241,7 +274,7 @@ func TestEncoderValueWritersAndReset(t *testing.T) {
 	want = AppendBool(want, true)
 	want = AppendBytes(want, []byte{5, 6})
 	want = AppendUUID(want, uuidValue)
-	want = AppendArrayHeader(want, 2)
+	want = AppendVarint(want, uint64(2))
 	if !bytes.Equal(enc.Bytes(), want) {
 		t.Fatalf("encoded values = %v, want %v", enc.Bytes(), want)
 	}
@@ -405,7 +438,7 @@ func TestDecoderRejectsMissingEndMarker(t *testing.T) {
 }
 
 func TestDecoderReadArrayLength(t *testing.T) {
-	data := AppendArrayHeader(nil, 3)
+	data := AppendVarint(nil, uint64(3))
 	dec := NewDecoder(data)
 	if got := dec.ReadArrayLength(); got != 3 || dec.Err() != nil {
 		t.Fatalf("ReadArrayLength() = %d, err %v", got, dec.Err())
@@ -1558,7 +1591,7 @@ func TestDecoderUUIDArrayErrors(t *testing.T) {
 
 	// item truncated: count=2, only 1 uuid present
 	raw3 := AppendVarint(nil, 1)
-	raw3 = AppendArrayHeader(raw3, 2)
+	raw3 = AppendVarint(raw3, uint64(2))
 	raw3 = AppendUUID(raw3, uuidA)
 	dec3 := NewDecoder(raw3)
 	dec3.NextField()

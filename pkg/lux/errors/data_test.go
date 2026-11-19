@@ -91,7 +91,7 @@ func TestDataWriterNilJSONAndBytes(t *testing.T) {
 	w.Bytes([]byte{})
 	w.Token("]")
 	got, err := w.Result()
-	if err != nil || string(got) != `[null,null,""]` {
+	if err != nil || string(got) != `[null,"",""]` {
 		t.Fatalf("%s: %v", got, err)
 	}
 }

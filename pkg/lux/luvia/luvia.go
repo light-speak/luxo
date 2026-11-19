@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -19,8 +18,7 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/auth"
 	"github.com/light-speak/luxo/pkg/lux/env"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"golang.org/x/net/http/httpguts"
 )
 
 // Gateway is the Luvia API gateway.
@@ -102,9 +100,6 @@ func (g *Gateway) serve(version string, quit <-chan os.Signal) (serveResult erro
 			serveResult = errors.Join(serveResult, fmt.Errorf("request log shutdown: %w", err))
 		}
 	}()
-	if err := g.Router.Prepare(); err != nil {
-		return err
-	}
 	shutdownTimeout, err := positiveDurationEnv("GRACEFUL_TIMEOUT", 30*time.Second)
 	if err != nil {
 		return err
@@ -123,7 +118,13 @@ func (g *Gateway) serve(version string, quit <-chan os.Signal) (serveResult erro
 			return err
 		}
 	}
-	mux, port := g.buildMux(version)
+	mux, port, err := g.buildMux(version)
+	if err != nil {
+		return err
+	}
+	if err := g.Router.Prepare(); err != nil {
+		return err
+	}
 	addr := ":" + port
 
 	// Start metrics collection + gateway registration if Studio is configured
@@ -197,10 +198,17 @@ func startGatewayServerWithBodyLimits(addr string, mux http.Handler, certFile, k
 	}
 	server := &http.Server{
 		Addr:         listener.Addr().String(),
-		Handler:      h2c.NewHandler(mux, &http2.Server{}),
+		Handler:      mux,
 		ReadTimeout:  timeouts.read,
 		WriteTimeout: timeouts.write,
 		IdleTimeout:  timeouts.idle,
+	}
+	if h2 == nil {
+		protocols := new(http.Protocols)
+		protocols.SetHTTP1(true)
+		protocols.SetHTTP2(true)
+		protocols.SetUnencryptedHTTP2(true)
+		server.Protocols = protocols
 	}
 	if certFile != "" && keyFile != "" {
 		certificate, loadErr := tls.LoadX509KeyPair(certFile, keyFile)
@@ -209,14 +217,7 @@ func startGatewayServerWithBodyLimits(addr string, mux http.Handler, certFile, k
 			return nil, nil, fmt.Errorf("load TLS certificate: %w", loadErr)
 		}
 		server.Handler = mux
-		server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
-		if h2 == nil {
-			if configureErr := http2.ConfigureServer(server, &http2.Server{}); configureErr != nil {
-				// This locally owned TLS config has no custom cipher suites; retain upstream error propagation.
-				listener.Close()
-				return nil, nil, fmt.Errorf("configure HTTP/2: %w", configureErr)
-			}
-		}
+		server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
 	}
 	return startConfiguredGatewayServer(listener, server, h2, certFile != "" && keyFile != "")
 }
@@ -283,7 +284,11 @@ func (g *Gateway) waitForShutdown(quit <-chan os.Signal, serveErr <-chan error, 
 
 // buildMux creates the HTTP mux with all routes and middleware.
 // Returns the mux and the port string. Extracted for testability.
-func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
+func (g *Gateway) buildMux(version string) (*http.ServeMux, string, error) {
+	policy, err := configureWebSocketOrigins(g.Router, envOr("CORS_ORIGIN", "*"))
+	if err != nil {
+		return nil, "", fmt.Errorf("CORS_ORIGIN: %w", err)
+	}
 	g.Router.Version = version
 	port := envOr("APP_PORT", "4000")
 	mode := envOr("DEPLOY_MODE", "embedded")
@@ -314,7 +319,6 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 		g.Router.SetDevMode(true)
 	}
 	g.Router.SetDebugTraceKey(envOr("LUXO_API_KEY", ""))
-	configureWebSocketOrigins(g.Router, envOr("CORS_ORIGIN", "*"))
 
 	// Schema introspection key
 	if key := envOr("INTROSPECTION_KEY", ""); key != "" {
@@ -330,47 +334,57 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 			handler = AuthMiddleware(jwtCfg, handler)
 		}
 	}
-	handler = corsMiddleware(handler)
+	handler = corsMiddleware(handler, policy)
 	mux.Handle("/luvia", handler)
 
-	return mux, port
+	return mux, port, nil
 }
 
-func configureWebSocketOrigins(router *api.Router, configured string) {
-	configured = strings.TrimSpace(configured)
-	if configured == "*" {
-		router.WSAllowAllOrigins = true
-		router.WSOrigins = nil
-		return
+func configureWebSocketOrigins(router *api.Router, configured string) (*api.OriginPolicy, error) {
+	policy, err := api.ParseOriginPolicy(configured)
+	if err != nil {
+		return nil, err
 	}
-	origin, err := url.Parse(configured)
-	if err != nil || origin.Scheme == "" || origin.Host == "" || origin.User != nil {
-		return
-	}
-	router.WSAllowAllOrigins = false
-	router.WSOrigins = []string{origin.Host}
+	router.SetOriginPolicy(policy)
+	return policy, nil
 }
+
+const corsRequestHeaders = "Content-Type, Authorization, X-Luxo-Mode, X-Request-Id, X-Luxo-Client, X-Luxo-Client-Version, " +
+	api.DebugTraceRequestHeader + ", " + api.DebugTraceKeyHeader + ", " + api.DebugTraceEnvelopeHeader
+
+const corsResponseHeaders = "Content-Encoding, X-Luxo-Mode, X-Trace-Id, " +
+	api.TraceIDFailureHeader + ", " + api.DebugTraceResponseHeader + ", Server-Timing"
 
 // corsMiddleware handles CORS preflight, response headers, and security headers (XSS, CSP, etc.).
 // Configurable via CORS_ORIGIN env var (default: "*").
-func corsMiddleware(next http.Handler) http.Handler {
-	origin := envOr("CORS_ORIGIN", "*")
+func corsMiddleware(next http.Handler, policy *api.OriginPolicy) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// CORS
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Luxo-Mode, X-Request-Id")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-
 		// Security headers — XSS, clickjacking, MIME sniffing protection
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
 		w.Header().Set("Content-Security-Policy", "default-src 'none'")
+		if !httpguts.HeaderValuesContainsToken(w.Header().Values("Vary"), "Origin") {
+			w.Header().Add("Vary", "Origin")
+		}
+		origin, allowed := policy.Match(r)
+		if !allowed {
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+			return
+		}
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 
 		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", corsRequestHeaders)
+			w.Header().Set("Access-Control-Max-Age", "86400")
 			w.WriteHeader(http.StatusNoContent)
 			return
+		}
+		if r.Header.Get("Origin") != "" {
+			w.Header().Set("Access-Control-Expose-Headers", corsResponseHeaders)
 		}
 		next.ServeHTTP(w, r)
 	})

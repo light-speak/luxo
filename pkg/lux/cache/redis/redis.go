@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/light-speak/luxo/pkg/lux/cache"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -152,11 +153,18 @@ func (r *RedisCache) Get(ctx context.Context, key string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// nil denotes a missing key, not a successfully stored empty value.
+	if data == nil {
+		return []byte{}, nil
+	}
 	return data, nil
 }
 
 // Set stores data with a TTL.
 func (r *RedisCache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if err := cache.ValidateTTL(ttl); err != nil {
+		return err
+	}
 	return r.client.Set(ctx, r.prefixKey(key), value, ttl).Err()
 }
 

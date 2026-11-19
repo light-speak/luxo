@@ -14,7 +14,9 @@ func (r *APIRegistry) prepareLocalJSONRequest(req *Request) error {
 	if err != nil {
 		return err
 	}
-	applyPaginationDefaults(req, definition)
+	if err := prepareJSONPagination(req, definition); err != nil {
+		return err
+	}
 	if err := validateKnownJSONParams(req, r.paramOrder[req.API]); err != nil {
 		return err
 	}
@@ -26,9 +28,7 @@ func (r *APIRegistry) localJSONDefinition(name string) (*schema.API, error) {
 	if _, registered := r.nameToID[name]; !registered || definition == nil {
 		return nil, fmt.Errorf("local input schema unavailable for API %s", name)
 	}
-	if len(r.paramOrder[name]) > len(Request{}.paramSlots) {
-		return nil, fmt.Errorf("too many params (max %d) for API %s", len(Request{}.paramSlots), name)
-	}
+
 	return definition, nil
 }
 

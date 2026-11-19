@@ -1,0 +1,19 @@
+/// Recursive DTOs share the object limit across type and list boundaries.
+type DepthNode {
+  value: Int
+  child: DepthBranch?
+  children: [DepthBranch]?
+  payload: JSON?
+}
+type DepthBranch {
+  value: Int
+  child: DepthNode?
+  children: [DepthNode]?
+  payload: JSON?
+}
+api depthOne(depth: Int, lists: Boolean, jsonDepth: Int): DepthNode @native
+api depthMany(depth: Int, lists: Boolean, jsonDepth: Int): [DepthNode] @native
+api depthEcho(value: DepthNode): DepthNode { return value }
+api depthEchoMany(values: [DepthNode]): [DepthNode] { return values }
+api depthWatch(depth: Int, lists: Boolean, jsonDepth: Int): DepthNode @stream @native
+api depthWatchMany(depth: Int, lists: Boolean, jsonDepth: Int): [DepthNode] @stream @native

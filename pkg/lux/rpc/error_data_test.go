@@ -132,6 +132,91 @@ type rpcNativeData struct {
 	text func([]byte, string) ([]byte, bool)
 }
 
+type panickingRPCErrorData struct{ text bool }
+
+func (d panickingRPCErrorData) AppendJSON(dst []byte) ([]byte, error) {
+	if !d.text {
+		panic("private native JSON detail")
+	}
+	return append(dst, `{"n":1}`...), nil
+}
+func (panickingRPCErrorData) AppendText([]byte, string) ([]byte, bool) {
+	panic("private native text detail")
+}
+
+func TestRPCNativeErrorDataPanicIsIsolated(t *testing.T) {
+	for _, text := range []bool{false, true} {
+		t.Run(fmt.Sprint(text), func(t *testing.T) {
+			defer func() {
+				if failure := recover(); failure != nil {
+					t.Fatalf("native error writer escaped: %v", failure)
+				}
+			}()
+			var output bytes.Buffer
+			if err := writeApplicationError(&output, luxerrors.BadRequest.WithData(panickingRPCErrorData{text}), nil); err != nil {
+				t.Fatal(err)
+			}
+			frame, err := ReadFrame(&output, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = decodeTracedResponse(frame)
+			value, ok := stderrors.AsType[*luxerrors.AppError](err)
+			if !ok || value.Code != 500 || !value.Internal || value.Data != nil || bytes.Contains(output.Bytes(), []byte("private")) {
+				t.Fatalf("unsafe panic response: %+v", value)
+			}
+		})
+	}
+}
+
+func TestRPCNativeErrorPanicKeepsConnectionUsable(t *testing.T) {
+	for _, text := range []bool{false, true} {
+		router := api.NewRouter()
+		router.Handle("fail", func(context.Context, *api.Request) error {
+			return luxerrors.BadRequest.WithData(panickingRPCErrorData{text})
+		})
+		router.Handle("ok", func(_ context.Context, req *api.Request) error {
+			req.Buf.B = append(req.Buf.B, 42)
+			return nil
+		})
+		for id, name := range []string{"fail", "ok"} {
+			if err := router.Registry.Register(name, id+1); err != nil {
+				t.Fatal(err)
+			}
+			if err := router.Registry.RegisterParams(name, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		client := NewClient(startTestRPCServer(t, NewServer(router)))
+		t.Cleanup(client.Close)
+		_, err := client.CallWithMaskContext(t.Context(), "", 1, nil, nil)
+		value, ok := stderrors.AsType[*luxerrors.AppError](err)
+		if !ok || !value.Internal || value.Code != 500 {
+			t.Fatal(err)
+		}
+		if len(client.pool.conns) != 1 {
+			t.Fatal("error response did not preserve the connection")
+		}
+		first, err := client.pool.GetContext(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.pool.Put(first)
+		body, err := client.CallWithMaskContext(t.Context(), "", 2, nil, nil)
+		if err != nil || !bytes.Equal(body, []byte{42}) {
+			t.Fatal(body, err)
+		}
+		next, err := client.pool.GetContext(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		client.pool.Put(next)
+		if next != first {
+			t.Fatal("subsequent call replaced the connection")
+		}
+	}
+}
+
 func (d rpcNativeData) AppendJSON(dst []byte) ([]byte, error) { return append(dst, d.raw...), d.err }
 func (d rpcNativeData) AppendText(dst []byte, field string) ([]byte, bool) {
 	if d.text == nil {

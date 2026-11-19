@@ -17,6 +17,7 @@ func readTokenClaims(payload []byte, purpose string) (Claims, int64, error) {
 		return Claims{}, 0, fmt.Errorf("JWT payload must be an object")
 	}
 	var claims Claims
+	var subject string
 	var expiresAt int64
 	var seen uint8
 	for {
@@ -31,6 +32,18 @@ func readTokenClaims(payload []byte, purpose string) (Claims, int64, error) {
 		case "data":
 			claims, err = readClaimsObject(reader, payload)
 			seen |= 1
+		case "sub":
+			value, readErr := reader.ReadToken()
+			if readErr != nil {
+				return Claims{}, 0, readErr
+			}
+			if value.Kind() != '"' {
+				return Claims{}, 0, fmt.Errorf("JWT subject must be a string")
+			}
+			subject = value.String()
+			if subject == "" {
+				return Claims{}, 0, fmt.Errorf("JWT subject must not be empty")
+			}
 		case "exp":
 			expiresAt, err = readClaimTimestamp(reader)
 			seen |= 2
@@ -58,6 +71,7 @@ func readTokenClaims(payload []byte, purpose string) (Claims, int64, error) {
 	if seen&7 != 7 {
 		return Claims{}, 0, fmt.Errorf("JWT data, exp and token_use are required")
 	}
+	claims.data.subject = subject
 	return claims, expiresAt, nil
 }
 

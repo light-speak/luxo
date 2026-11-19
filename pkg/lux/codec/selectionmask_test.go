@@ -1,10 +1,59 @@
 package codec
 
 import (
+	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/light-speak/luxo/internal/testutil"
 )
+
+func TestSelectionMaskDepthBoundary(t *testing.T) {
+	for _, depth := range []int{1, 2, 31, 32, 33, 1024} {
+		t.Run(fmt.Sprint(depth), func(t *testing.T) {
+			mask := rawSelectionMaskDepth(depth)
+			_, _, ok := SplitSelectionMask(mask)
+			if ok != (depth <= 32) {
+				t.Fatalf("depth %d accepted=%v, want %v", depth, ok, depth <= 32)
+			}
+			if depth > 32 {
+				if fields := SelectionMaskFields(mask); fields != nil {
+					t.Fatal("over-depth mask exposed fields")
+				}
+				if child, found := SelectionMaskNested(mask, 1); found || child != nil {
+					t.Fatal("over-depth mask exposed a child")
+				}
+			}
+		})
+	}
+}
+
+func TestAppendSelectionMaskCountsParentDepthBeforeWriting(t *testing.T) {
+	for _, childDepth := range []int{1, 30, 31, 32, 1024} {
+		t.Run(fmt.Sprint(childDepth), func(t *testing.T) {
+			child := rawSelectionMaskDepth(childDepth)
+			backing := bytes.Repeat([]byte{0x77}, 64)
+			before := bytes.Clone(backing)
+			out, err := AppendSelectionMask(backing[:1], []byte{1}, []SelectionMaskChild{{FieldID: 1, Mask: child}})
+			if childDepth >= 32 {
+				if err == nil || out != nil || !bytes.Equal(backing, before) {
+					t.Fatal("over-depth child accepted or destination modified")
+				}
+			} else if err != nil || !bytes.Equal(out[1:], rawSelectionMaskDepth(childDepth+1)) {
+				t.Fatalf("valid child depth %d changed wire: %v", childDepth, err)
+			}
+		})
+	}
+}
+
+// Construct receiver fixtures independently of the checked production encoder.
+func rawSelectionMaskDepth(depth int) []byte {
+	mask := []byte{1, 1}
+	for level := 1; level < depth; level++ {
+		mask = rawSelectionMask([]byte{1}, SelectionMaskChild{FieldID: 1, Mask: mask})
+	}
+	return mask
+}
 
 func TestSelectionMaskRoundTrip(t *testing.T) {
 	childFields := testutil.Bytes(t)(FieldMaskSet(nil, 2))

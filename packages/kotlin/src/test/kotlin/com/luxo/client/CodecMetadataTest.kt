@@ -8,6 +8,46 @@ import kotlin.test.assertTrue
 
 class CodecMetadataTest {
     @Test
+    fun `integer list specialization rejects oversized lists before reading elements`() {
+        val encoder = LuxoEncoder()
+        encoder.writeBool(true)
+        val values = object : AbstractList<Long>() {
+            override val size: Int = 1_000_001
+            override fun get(index: Int): Long = error("oversized list was iterated")
+        }
+        assertFailsWith<LuxoCodecException> { encoder.writeIntList(values) }
+        assertTrue(encoder.bytes().contentEquals(byteArrayOf(1)))
+    }
+
+    @Test
+    fun `array header bounds preserve output and legal counts`() {
+        for (count in listOf(-1, Int.MIN_VALUE, 1_000_001, Int.MAX_VALUE)) {
+            val encoder = LuxoEncoder()
+            encoder.writeBool(true)
+            assertFailsWith<LuxoCodecException> { encoder.writeArrayHeader(count) }
+            assertTrue(encoder.bytes().contentEquals(byteArrayOf(1)))
+        }
+        for (count in listOf(0, 1, 127, 128, 1_000_000)) {
+            val encoder = LuxoEncoder()
+            encoder.writeArrayHeader(count)
+            assertTrue(encoder.bytes().contentEquals(metadata(count.toLong())))
+        }
+    }
+
+    @Test
+    fun `oversized array fields fail before writing or iterating`() {
+        val encoder = LuxoEncoder()
+        encoder.writeBool(true)
+        val before = encoder.bytes()
+        val items = object : AbstractList<Boolean>() {
+            override val size: Int = 1_000_001
+            override fun get(index: Int): Boolean = error("must not iterate an oversized array")
+        }
+        assertFailsWith<LuxoCodecException> { encoder.writeFieldArray(1, items) { encoder.writeBool(it) } }
+        assertTrue(before.contentEquals(encoder.bytes()))
+    }
+
+    @Test
     fun `nonempty lists require column payload before allocation`() {
         for (count in listOf(1L, 128L, 10_000_000L)) {
             for (payload in listOf(

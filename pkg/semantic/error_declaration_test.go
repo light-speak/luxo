@@ -7,6 +7,20 @@ import (
 	"github.com/light-speak/luxo/pkg/ast"
 )
 
+func TestErrorDeclarationStatusRange(t *testing.T) {
+	for _, code := range []int{0, 99, 200, 399, 600, 999} {
+		source := fmt.Sprintf(`error Rejected { code: %d message: "rejected" }`, code)
+		expectError(t, analyze(t, source), "error status code must be between 400 and 599")
+	}
+	expectError(t, analyze(t, `error Rejected { message: "rejected" }`), "error status code must be between 400 and 599")
+	for _, code := range []int{400, 422, 500, 599} {
+		result := analyze(t, fmt.Sprintf(`error Rejected { code: %d message: "rejected" }`, code))
+		if len(result.Errors) != 0 {
+			t.Fatal(result.Errors)
+		}
+	}
+}
+
 func TestErrorDeclarationRejectsUnknownFieldTypes(t *testing.T) {
 	for _, fieldType := range []string{"Missing", "Missing?", "[Missing]", "Page<Missing>", "(Known, Missing)"} {
 		t.Run(fieldType, func(t *testing.T) {
@@ -20,6 +34,18 @@ error Rejected(value: %s) { code: 422 message: "error.rejected" }`, fieldType)
 func TestErrorDeclarationRejectsDuplicateFields(t *testing.T) {
 	result := analyze(t, `error Rejected(value: Int, value: JSON) { code: 422 message: "error.rejected" }`)
 	expectError(t, result, "duplicate parameter 'value' in error 'Rejected'")
+}
+
+func TestErrorDeclarationRejectsDuplicateNames(t *testing.T) {
+	const declaration = `error Rejected(value: Int) { code: 422 message: "rejected" }`
+	t.Run("same-file", func(t *testing.T) {
+		expectError(t, analyze(t, declaration+"\n"+declaration), "error 'Rejected' already declared")
+	})
+	t.Run("different-modules", func(t *testing.T) {
+		first := parseFileWithName(t, declaration, "origin/task/errors.luxo")
+		second := parseFileWithName(t, declaration, "origin/project/errors.luxo")
+		expectError(t, AnalyzeModules([]*ast.File{first, second}), "error 'Rejected' already declared")
+	})
 }
 
 func TestErrorDeclarationValidatesFieldDefaults(t *testing.T) {

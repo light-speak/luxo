@@ -124,11 +124,13 @@ func TestBodyContainsAwaitRecurses(t *testing.T) {
 
 func TestEventImportsIgnoreLiteralSelection(t *testing.T) {
 	file := &ast.File{Events: []*ast.EventDecl{{Name: "Changed"}}, Listeners: []*ast.OnDecl{{
-		EventName: "Changed", Body: &ast.Block{Stmts: []ast.Stmt{&ast.ValStmt{Name: "message", Value: &ast.Literal{Kind: token.String, Value: "selection.Field"}}}},
+		EventName: "Changed", Body: &ast.Block{Stmts: []ast.Stmt{&ast.ValStmt{Name: "message", Value: &ast.Literal{Kind: token.String, Value: "selection.Field errors.NotFound lux.Or luxolog.Info luxocrypto.RandomHex strings.TrimSpace strconv.Itoa str.Reverse convert.StringToInt"}}}},
 	}}}
 	code := string(generateEventFile(result(file), "luxo"))
-	if strings.Contains(code, `"github.com/light-speak/luxo/pkg/lux/selection"`) {
-		t.Fatalf("literal caused unused import:\n%s", code)
+	for _, path := range []string{"github.com/light-speak/luxo/pkg/lux/selection", "github.com/light-speak/luxo/pkg/lux/errors", "github.com/light-speak/luxo/pkg/lux", "github.com/light-speak/luxo/pkg/lux/luxolog", "github.com/light-speak/luxo/pkg/lux/crypto", "strings", "strconv", "github.com/light-speak/luxo/pkg/lux/str", "github.com/light-speak/luxo/pkg/lux/convert"} {
+		if strings.Contains(code, `"`+path+`"`) {
+			t.Fatalf("literal caused unused import %s:\n%s", path, code)
+		}
 	}
 }
 
@@ -168,6 +170,37 @@ func TestGeneratedContextImport(t *testing.T) {
 			t.Fatalf("context import for %q = %v, want %v", source, got, want)
 		}
 	}
+}
+
+func TestGeneratedAPIImport(t *testing.T) {
+	for source, want := range map[string]bool{
+		`api.GetBuf()`: true,
+		`func f() { api := holder; api.GetBuf() }`: false,
+		`"api.GetBuf()"`: false,
+	} {
+		if got := generatedPackages(source).has("api"); got != want {
+			t.Fatalf("api import for %s = %t, want %t", source, got, want)
+		}
+	}
+}
+
+func TestGeneratedModuleImportsUseRealSelectors(t *testing.T) {
+	for _, sample := range []struct {
+		body string
+		want bool
+	}{
+		{`func f(){common_luxo.Read()}`, true},
+		{`func f(){_="common_luxo.Read()"}`, false},
+		{`func f(){common_luxo:=holder;common_luxo.Read()}`, false},
+		{`func {`, true},
+	} {
+		modules := map[string]bool{"common": true}
+		keepReferencedGeneratedModules(sample.body, modules)
+		if modules["common"] != sample.want {
+			t.Fatal(sample.body, modules)
+		}
+	}
+	keepReferencedGeneratedModules("", nil)
 }
 
 func TestGeneratedPackagesStopsAfterRequiredSet(t *testing.T) {
@@ -220,7 +253,7 @@ func TestFormalLocalPackageName(t *testing.T) {
 fn readInput(selection: Input): Int { return selection.value }`
 	runGeneratedFixture(t, source, `package generated
 import "testing"
-type App struct{}
+
 func TestReadInput(t *testing.T) {
  value,err:=(&App{}).readInput(t.Context(),Input{Value:42})
  if err!=nil || value!=42 {t.Fatal(value,err)}

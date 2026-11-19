@@ -108,3 +108,43 @@ func TestClaimsIntegerTypeBoundary(t *testing.T) {
 		}
 	}
 }
+
+func TestClaimValueDistinguishesMissingFromValidZero(t *testing.T) {
+	claims, err := parseClaims([]byte(`{"nullValue":null,"integer":0,"float":-0.0,"boolean":false,"text":""}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []struct {
+		name                             string
+		integer, floating, boolean, text bool
+	}{
+		{"missing", false, false, false, false},
+		{"nullValue", false, false, false, false},
+		{"integer", true, true, false, false},
+		{"float", false, true, false, false},
+		{"boolean", false, false, true, false},
+		{"text", false, false, false, true},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			value := claims.Get(sample.name)
+			if v, ok := value.Int64(); ok != sample.integer || ok && v != 0 {
+				t.Fatalf("Int64: %v, %v", v, ok)
+			}
+			if v, ok := value.Float64(); ok != sample.floating || ok && v != 0 {
+				t.Fatalf("Float64: %v, %v", v, ok)
+			}
+			if v, ok := value.Bool(); ok != sample.boolean || ok && v {
+				t.Fatalf("Bool: %v, %v", v, ok)
+			}
+			if v, ok := value.String(); ok != sample.text || ok && v != "" {
+				t.Fatalf("String: %q, %v", v, ok)
+			}
+			if claims.Has(sample.name) != (sample.name != "missing") {
+				t.Fatal("presence changed")
+			}
+		})
+	}
+	if v, ok := claims.Get("float").Float64(); !ok || !math.Signbit(v) {
+		t.Fatal("negative zero lost")
+	}
+}

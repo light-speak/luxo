@@ -1,7 +1,7 @@
 part of 'codegen.dart';
 
 void _queryIdentifier(String name) {
-  if (!RegExp(r'^[A-Za-z_][A-Za-z0-9_]*$').hasMatch(name)) {
+  if (!isDSLIdentifier(name)) {
     throw FormatException('invalid query identifier: $name');
   }
 }
@@ -36,7 +36,7 @@ String generateQueryBuilders(LuxoSchema schema) {
   for (final api in schema.apis.values) {
     if (api.internal || api.query == null) continue;
     _queryIdentifier(api.name);
-    final generatedName = 'LuxoQuery_${api.name}';
+    final generatedName = 'LuxoQuery_${dartSourceIdentifier(api.name)}';
     if (schema.models.containsKey(generatedName) ||
         schema.types.containsKey(generatedName) ||
         schema.enums.containsKey(generatedName)) {
@@ -48,7 +48,7 @@ String generateQueryBuilders(LuxoSchema schema) {
       throw FormatException(
         'query controls require a paginated unary API: ${api.name}',
       );
-    b.writeln('abstract final class LuxoQuery_${api.name} {');
+    b.writeln('abstract final class $generatedName {');
     _writeQueryFilters(b, api.query!.filters, schema);
     _writeQuerySorters(b, api.query!.sorters);
     b.writeln('}');
@@ -75,10 +75,12 @@ void _writeQueryFilters(
     for (final op in field.operators) {
       if (!allowed.contains(op) || !seen.add(op))
         throw FormatException('invalid query operator: $op');
-      final type = isEnum ? field.type : _luxoTypeToDart(field.type);
+      final type = isEnum
+          ? dartTypeIdentifier(field.type)
+          : _luxoTypeToDart(field.type);
       final value = isEnum ? 'value.rawValue' : 'value';
       b.writeln(
-        "  static LuxoFilter ${field.field}_$op($type value) => LuxoFilter(field: '${field.field}', op: '$op', value: $value);",
+        "  static LuxoFilter ${dartSourceIdentifier(field.field)}_$op($type value) => LuxoFilter(field: '${field.field}', op: '$op', value: $value);",
       );
     }
   }
@@ -92,7 +94,7 @@ void _writeQuerySorters(StringBuffer b, List<String> sorters) {
       throw FormatException('duplicate sorter field: $field');
     for (final order in ['asc', 'desc']) {
       b.writeln(
-        "  static LuxoSorter ${field}_$order() => LuxoSorter(field: '$field', order: '$order');",
+        "  static LuxoSorter ${dartSourceIdentifier(field)}_$order() => LuxoSorter(field: '$field', order: '$order');",
       );
     }
   }

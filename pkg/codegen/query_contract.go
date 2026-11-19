@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
-	"github.com/light-speak/luxo/pkg/lux/str"
 )
 
 // queryFieldExposed excludes server-only and non-stored fields before dispatch.
@@ -15,7 +14,7 @@ func queryFieldExposed(f *ast.FieldDecl, annotation string) bool {
 }
 
 // generateFilterParser emits static validation before constructing a query.
-func generateFilterParser(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
+func (g *GeneratorContext) generateFilterParser(b *strings.Builder, m *ast.ModelDecl, enums map[string]bool) {
 	fields := exposedQueryFields(m, "filterable", enums)
 	fmt.Fprintf(b, "// parse%sFilters validates every filter before database access.\n", m.Name)
 	fmt.Fprintf(b, "func parse%sFilters(filters []api.Filter) ([]lux.Condition, error) {\n", m.Name)
@@ -31,7 +30,7 @@ func generateFilterParser(b *strings.Builder, m *ast.ModelDecl, enums map[string
 			fmt.Fprintf(b, "\t\t\tif !%s(f.Value).IsValid() { return nil, errors.BadRequest.WithData(errors.ParamError{Param: f.Field, Error: \"undeclared enum filter value\"}) }\n", f.Type.Name)
 			b.WriteString("\t\t\tif f.Operator != \"eq\" && f.Operator != \"ne\" { return nil, errors.BadRequest.WithData(errors.ParamError{Param: f.Field, Error: \"enum filters require eq/ne\"}) }\n")
 		}
-		fmt.Fprintf(b, "\t\t\tcond, err = lux.New%s(%q).FilterOp(f.Operator, f.Value)\n", constructor, str.ToSnakeCase(f.Name))
+		fmt.Fprintf(b, "\t\t\tcond, err = lux.New%s(%q).FilterOp(f.Operator, f.Value)\n", constructor, g.sqlColumn(f.Name))
 	}
 	b.WriteString("\t\tdefault:\n\t\t\treturn nil, errors.BadRequest.WithData(errors.ParamError{Param: f.Field, Error: \"field does not expose filtering\"})\n\t\t}\n")
 	b.WriteString("\t\tif err != nil { return nil, errors.BadRequest.WithData(errors.ParamError{Param: f.Field, Error: err.Error()}) }\n\t\tconds = append(conds, cond)\n\t}\n\treturn conds, nil\n}\n\n")
@@ -70,7 +69,7 @@ func filterFieldConstructor(f *ast.FieldDecl, enums map[string]bool) string {
 
 // generateSorterParser rejects unknown fields and invalid directions, including
 // models with no sortable fields. No user-supplied SQL identifier is emitted.
-func generateSorterParser(b *strings.Builder, m *ast.ModelDecl, enumSets ...map[string]bool) {
+func (g *GeneratorContext) generateSorterParser(b *strings.Builder, m *ast.ModelDecl, enumSets ...map[string]bool) {
 	var enums map[string]bool
 	if len(enumSets) > 0 {
 		enums = enumSets[0]
@@ -84,7 +83,7 @@ func generateSorterParser(b *strings.Builder, m *ast.ModelDecl, enumSets ...map[
 	}
 	b.WriteString("\tvar clauses []string\n\tfor _, s := range sorters {\n\t\tvar col string\n\t\tswitch s.Field {\n")
 	for _, f := range fields {
-		fmt.Fprintf(b, "\t\tcase %q:\n\t\t\tcol = %q\n", f.Name, str.ToSnakeCase(f.Name))
+		fmt.Fprintf(b, "\t\tcase %q:\n\t\t\tcol = %q\n", f.Name, g.sqlColumn(f.Name))
 	}
 	b.WriteString("\t\tdefault:\n\t\t\treturn nil, errors.BadRequest.WithData(errors.ParamError{Param: s.Field, Error: \"field does not expose sorting\"})\n\t\t}\n")
 	b.WriteString("\t\tswitch strings.ToLower(s.Order) {\n\t\tcase \"desc\": clauses = append(clauses, col+\" DESC\")\n\t\tcase \"asc\": clauses = append(clauses, col+\" ASC\")\n\t\tdefault: return nil, errors.BadRequest.WithData(errors.ParamError{Param: s.Field, Error: \"sort order must be asc/desc\"})\n\t\t}\n\t}\n\treturn clauses, nil\n}\n\n")

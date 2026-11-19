@@ -12,6 +12,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,6 +87,172 @@ func TestServerRecordsRPCHandlerMetrics(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRPCRejectsOverwrittenResponsePrefix(t *testing.T) {
+	for _, traced := range []bool{false, true} {
+		for _, mode := range []string{"reset", "nil", "short", "replace", "buffer", "status", "header", "empty"} {
+			t.Run(fmt.Sprintf("%s/traced=%v", mode, traced), func(t *testing.T) {
+				router := api.NewRouter()
+				recorder := &rpcMetricsRecorder{}
+				router.SetMetricsCollector(recorder)
+				broken := true
+				router.Handle("value", func(_ context.Context, req *api.Request) error {
+					if !broken {
+						req.Buf.B = append(req.Buf.B, 84)
+						return nil
+					}
+					switch mode {
+					case "reset":
+						req.Buf.Reset()
+					case "nil":
+						req.Buf.B = nil
+					case "short":
+						req.Buf.B = []byte{84}
+					case "replace":
+						req.Buf.B = []byte{0, 1, 84, 0, 0}
+					case "buffer":
+						req.Buf = &api.ResponseBuf{B: []byte{84}}
+					case "status":
+						req.Buf.B[4] = statusError
+					case "header":
+						req.Buf.B[0] ^= 1
+					}
+					return nil
+				})
+				if err := router.Registry.Register("value", 1); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "empty" {
+					if err := router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "value", ReturnType: "Int"}); err != nil {
+						t.Fatal(err)
+					}
+					if err := router.Registry.RegisterSchemaAPIs(router.Schema); err != nil {
+						t.Fatal(err)
+					}
+				}
+				server := NewServer(router)
+				defer server.Close()
+				envelope := requestEnvelope{body: encodeCallRequest(1, nil, nil)}
+				if traced {
+					envelope.traceID = "prefix-regression"
+				}
+				decode := func(frame []byte) ([]byte, error) {
+					if traced {
+						body, _, err := decodeTracedResponse(frame)
+						return body, err
+					}
+					return decodeCallResponse(frame, nil)
+				}
+				frame := rpcResponsePrefixFrame(t, server, envelope)
+				if _, err := decode(frame); err == nil {
+					t.Fatalf("overwritten response succeeded: %x", frame)
+				} else if appError, ok := stderrors.AsType[*luxerrors.AppError](err); !ok || appError.Code != 500 || !appError.Internal {
+					t.Fatalf("missing explicit internal error: %v", err)
+				}
+				if len(recorder.calls) != 1 || !recorder.calls[0].isError {
+					t.Fatal("invalid response counted as success")
+				}
+				broken = false
+				frame = rpcResponsePrefixFrame(t, server, envelope)
+				body, err := decode(frame)
+				if err != nil || !bytes.Equal(body, []byte{84}) {
+					t.Fatalf("next response damaged: %x/%v", body, err)
+				}
+			})
+		}
+	}
+}
+
+func TestRPCOverwrittenPrefixKeepsConnectionUsable(t *testing.T) {
+	for _, traced := range []bool{false, true} {
+		for _, mode := range []string{"prefix", "empty"} {
+			t.Run(fmt.Sprintf("%s/traced=%v", mode, traced), func(t *testing.T) {
+				router := rpcBrokenFirstResponseRouter(t, mode)
+				server := NewServer(router)
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				counted := &rpcResponseListener{Listener: listener}
+				address := startTestRPCListener(t, server, counted)
+				defer server.Close()
+				client := NewClient(address)
+				defer client.Close()
+				ctx := t.Context()
+				if traced {
+					ctx, _ = api.WithRemoteTrace(ctx, "prefix-network", "", false)
+				}
+				call := func() ([]byte, error) { return client.CallWithMaskTargetContext(ctx, "", 1, nil, nil, TraceTarget{}) }
+				if _, err := call(); err == nil {
+					t.Fatal("invalid response succeeded")
+				} else if appError, ok := stderrors.AsType[*luxerrors.AppError](err); !ok || appError.Code != 500 || !appError.Internal {
+					t.Fatalf("missing Internal error: %v", err)
+				}
+				if value, err := call(); err != nil || !bytes.Equal(value, []byte{84}) {
+					t.Fatalf("next call failed: %x/%v", value, err)
+				}
+				server.connMu.Lock()
+				connections := len(server.connections)
+				server.connMu.Unlock()
+				if connections != 1 || counted.accepted.Load() != 1 {
+					t.Fatalf("connection reuse lost: active=%d accepted=%d", connections, counted.accepted.Load())
+				}
+			})
+		}
+	}
+}
+
+type rpcResponseListener struct {
+	net.Listener
+	accepted atomic.Int32
+}
+
+func (l *rpcResponseListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		l.accepted.Add(1)
+	}
+	return conn, err
+}
+
+func rpcBrokenFirstResponseRouter(t *testing.T, mode string) *api.Router {
+	t.Helper()
+	router := api.NewRouter()
+	var calls atomic.Int32
+	router.Handle("value", func(_ context.Context, req *api.Request) error {
+		if calls.Add(1) > 1 {
+			req.Buf.B = append(req.Buf.B, 84)
+		} else if mode == "prefix" {
+			req.Buf.Reset()
+		}
+		return nil
+	})
+	if err := router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "value", ReturnType: "Int"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Registry.RegisterSchemaAPIs(router.Schema); err != nil {
+		t.Fatal(err)
+	}
+	return router
+}
+
+func rpcResponsePrefixFrame(t *testing.T, server *Server, envelope requestEnvelope) []byte {
+	t.Helper()
+	defer func() {
+		if p := recover(); p != nil {
+			t.Fatalf("response prefix caused panic: %v", p)
+		}
+	}()
+	var output bytes.Buffer
+	if err := server.processCallContext(t.Context(), &output, envelope); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := ReadFrame(&output, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return frame
 }
 
 func TestRPCRoundTrip(t *testing.T) {
@@ -169,9 +336,10 @@ func TestRPCContextEnvelopeForwardsVerifiedIdentity(t *testing.T) {
 		}
 		return context.WithValue(ctx, identityKey{}, int64(42)), nil
 	}
+	rt.IdentityExtractor = func(ctx context.Context) any { return ctx.Value(identityKey{}) }
 	rt.Handle("private", func(ctx context.Context, req *api.Request) error {
 		identity, _ := ctx.Value(identityKey{}).(int64)
-		if identity != 42 {
+		if identity != 42 || req.Buf.Identity != int64(42) {
 			return fmt.Errorf("missing forwarded identity")
 		}
 		if !req.Internal {
@@ -361,7 +529,7 @@ func TestServerTracedAuthenticationAndStreamDecodeErrors(t *testing.T) {
 	defer serverConn.Close()
 	done := make(chan struct{})
 	go func() {
-		server.processStream(serverConn, requestEnvelope{body: []byte{0xff}})
+		server.processStream(t.Context(), serverConn, requestEnvelope{body: []byte{0xff}})
 		close(done)
 	}()
 	frame, err = ReadFrame(clientConn, nil)
@@ -1683,8 +1851,12 @@ func TestClientCallWithMaskServerError(t *testing.T) {
 	if err == nil {
 		t.Fatal("should get error from server")
 	}
-	if !bytes.Contains([]byte(err.Error()), []byte("internal failure")) {
-		t.Fatalf("error should contain message, got: %v", err)
+	value, ok := stderrors.AsType[*luxerrors.AppError](err)
+	if !ok || value.Code != 500 || value.Name != "Internal" || !value.Internal || value.Message != "error.internal" || value.Data != nil {
+		t.Fatalf("unexpected native error classification: %+v", value)
+	}
+	if bytes.Contains([]byte(err.Error()), []byte("internal failure")) {
+		t.Fatal("native diagnostic crossed the RPC boundary")
 	}
 }
 
@@ -2156,16 +2328,16 @@ func TestServerTruncatedParamFieldID(t *testing.T) {
 	}
 }
 
-// --- Server: too many params (paramIdx >= 16) ---
+// --- Server: truncated parameter beyond inline storage ---
 
-func TestServerTooManyParams(t *testing.T) {
+func TestServerTruncatedExtendedParam(t *testing.T) {
 	rt := api.NewRouter()
 	rt.Handle("test", func(ctx context.Context, req *api.Request) error {
 		return nil
 	})
 	rt.Registry.Register("test", 1)
 
-	// Register 17 params to trigger the "too many params" check
+	// Register 17 parameters, then omit the final parameter payload.
 	params := make([]api.ParamMeta, 17)
 	for i := 0; i < 17; i++ {
 		params[i] = api.ParamMeta{
@@ -2185,7 +2357,7 @@ func TestServerTooManyParams(t *testing.T) {
 
 	resp := testProcessRequest(t, srv, payload)
 	if resp[0] != statusError {
-		t.Fatal("too many params should return error")
+		t.Fatal("truncated extended parameter should return error")
 	}
 }
 
@@ -2208,5 +2380,203 @@ func TestRPCUnknownParamFieldID(t *testing.T) {
 	resp := testProcessRequest(t, srv, payload)
 	if resp[0] != statusError {
 		t.Fatal("unknown param field ID should return error")
+	}
+}
+
+func TestRPCRejectsNilAuthenticatedContext(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			defer func() {
+				if recover() != nil {
+					t.Error("invalid authentication context escaped as a panic")
+				}
+			}()
+			router := api.NewRouter()
+			router.InternalRequestContext = func(context.Context, string) (context.Context, error) { return nil, nil }
+			called := false
+			router.Handle("private", func(context.Context, *api.Request) error { called = true; return nil })
+			if err := router.Registry.Register("private", 7); err != nil {
+				t.Fatal(err)
+			}
+			var response bytes.Buffer
+			server := NewServer(router)
+			envelope := requestEnvelope{token: "token", body: encodeCallRequest(7, nil, nil)}
+			if stream {
+				server.processStream(t.Context(), &prefaceTestConn{writer: &response}, envelope)
+			} else if err := server.processCall(&response, envelope); err != nil {
+				t.Fatal(err)
+			}
+			frame, err := ReadFrame(&response, nil)
+			if err != nil || len(frame) == 0 || frame[0] != statusError || called {
+				t.Fatalf("invalid context admitted: called=%t frame=%x err=%v", called, frame, err)
+			}
+			if app, ok := stderrors.AsType[*luxerrors.AppError](decodeError(frame[1:])); !ok || app.Code != 401 {
+				t.Fatal("invalid authentication context did not reject the request")
+			}
+		})
+	}
+}
+
+func TestRPCAuthenticationPanicsAreIsolated(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, errorMethod := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%t/errorMethod=%t", stream, errorMethod), func(t *testing.T) {
+				defer func() {
+					if recover() != nil {
+						t.Error("authentication panic escaped the RPC boundary")
+					}
+				}()
+				router := api.NewRouter()
+				formatted := false
+				router.InternalRequestContext = func(context.Context, string) (context.Context, error) {
+					if errorMethod {
+						return nil, hostileReturnedError{}
+					}
+					panic(hostileHandlerPanic{formatted: &formatted})
+				}
+				var response bytes.Buffer
+				server := NewServer(router)
+				envelope := requestEnvelope{token: "token", body: []byte{0xff}}
+				if stream {
+					server.processStream(t.Context(), &prefaceTestConn{writer: &response}, envelope)
+				} else if err := server.processCall(&response, envelope); err != nil {
+					t.Fatal(err)
+				}
+				frame, err := ReadFrame(&response, nil)
+				if err != nil || len(frame) == 0 || frame[0] != statusError {
+					t.Fatalf("missing error: %x %v", frame, err)
+				}
+				app, ok := stderrors.AsType[*luxerrors.AppError](decodeError(frame[1:]))
+				if !ok || app.Code != 500 || app.Message != "error.internal" || formatted {
+					t.Fatalf("unsafe authentication result: %+v formatted=%t", app, formatted)
+				}
+			})
+		}
+	}
+}
+
+func TestRPCAuthenticationPanicKeepsConnectionUsable(t *testing.T) {
+	router := api.NewRouter()
+	router.InternalRequestContext = func(ctx context.Context, token string) (context.Context, error) {
+		switch token {
+		case "panic":
+			panic("private verifier detail")
+		case "error-method":
+			return nil, hostileReturnedError{}
+		}
+		return ctx, nil
+	}
+	router.Handle("private", func(_ context.Context, req *api.Request) error {
+		req.Buf.B = append(req.Buf.B, 42)
+		return nil
+	})
+	if err := router.Registry.Register("private", 7); err != nil {
+		t.Fatal(err)
+	}
+	client := NewClient(startTestRPCServer(t, NewServer(router)))
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var first net.Conn
+	for _, token := range []string{"panic", "valid", "error-method", "valid"} {
+		data, err := client.CallWithMaskContext(ctx, token, 7, nil, nil)
+		if token == "valid" {
+			if err != nil || !bytes.Equal(data, []byte{42}) {
+				t.Fatalf("recovery failed: %x %v", data, err)
+			}
+		} else if app, ok := stderrors.AsType[*luxerrors.AppError](err); !ok || app.Code != 500 || app.Message != "error.internal" {
+			t.Fatalf("unsafe authentication failure: %v", err)
+		}
+		if len(client.pool.conns) != 1 {
+			t.Fatal("connection was not returned")
+		}
+		conn := <-client.pool.conns
+		client.pool.conns <- conn
+		if first == nil {
+			first = conn
+		} else if first != conn {
+			t.Fatal("test reconnected instead of reusing connection")
+		}
+	}
+}
+
+func TestRPCUnaryIdentityPanicKeepsConnectionUsable(t *testing.T) {
+	router := api.NewRouter()
+	var extracted, handled atomic.Int32
+	router.IdentityExtractor = func(context.Context) any {
+		if extracted.Add(1) == 1 {
+			panic("private identity detail")
+		}
+		return int64(42)
+	}
+	router.Handle("private", func(_ context.Context, req *api.Request) error {
+		handled.Add(1)
+		if req.Buf.Identity != int64(42) {
+			return fmt.Errorf("identity lost")
+		}
+		req.Buf.B = append(req.Buf.B, 42)
+		return nil
+	})
+	if err := router.Registry.Register("private", 7); err != nil {
+		t.Fatal(err)
+	}
+	client := NewClient(startTestRPCServer(t, NewServer(router)))
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, err := client.CallWithMaskContext(ctx, "", 7, nil, nil)
+	if app, ok := stderrors.AsType[*luxerrors.AppError](err); !ok || app.Code != 500 || app.Message != "error.internal" {
+		t.Fatalf("unsafe identity failure: %v", err)
+	}
+	if handled.Load() != 0 || len(client.pool.conns) != 1 {
+		t.Fatal("identity failure entered handler or lost connection")
+	}
+	first, err := client.pool.GetContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.pool.Put(first)
+	data, err := client.CallWithMaskContext(ctx, "", 7, nil, nil)
+	if err != nil || !bytes.Equal(data, []byte{42}) || handled.Load() != 1 || extracted.Load() != 2 {
+		t.Fatalf("later call failed: %x %v", data, err)
+	}
+	second, err := client.pool.GetContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.pool.Put(second)
+	if first != second {
+		t.Fatal("later call reconnected")
+	}
+}
+
+func TestServerExtendedParameterValue(t *testing.T) {
+	router := api.NewRouter()
+	var received int64
+	router.Handle("wide", func(_ context.Context, req *api.Request) error {
+		value, err := req.ParamInt("p16")
+		if err != nil {
+			return err
+		}
+		received = value
+		return nil
+	})
+	if err := router.Registry.Register("wide", 1); err != nil {
+		t.Fatal(err)
+	}
+	params := make([]api.ParamMeta, 17)
+	for i := range params {
+		params[i] = api.ParamMeta{Name: fmt.Sprintf("p%d", i), Type: "Int", FieldID: i + 1}
+	}
+	if err := router.Registry.RegisterParams("wide", params); err != nil {
+		t.Fatal(err)
+	}
+	body, err := api.EncodeBinaryRequest(1, nil, map[string]any{"p16": int64(42)}, params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := testProcessRequest(t, NewServer(router), body)
+	if len(response) == 0 || response[0] != statusOK || received != 42 {
+		t.Fatalf("response=%x received=%d", response, received)
 	}
 }

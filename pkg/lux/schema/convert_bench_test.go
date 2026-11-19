@@ -141,7 +141,7 @@ func BenchmarkStructuredJSONInput(b *testing.B) {
 // Isolate completion/error propagation from the existing field decoder. This
 // is not a baseline for all converter changes or for an end-to-end HTTP request.
 func jsonWithoutCompletionCheck(dst, data []byte, model *Model) []byte {
-	return binaryToJSONFromDecoder(dst, codec.NewDecoder(data), model)
+	return binaryToJSONFromDecoder(dst, codec.NewDecoder(data), model, 1)
 }
 
 func BenchmarkJSONCompletionCheck(b *testing.B) {

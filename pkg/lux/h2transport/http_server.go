@@ -8,17 +8,14 @@ import (
 	"net"
 	"net/http"
 	"strings"
-
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 )
 
 // ConfigureHTTPServer installs HTTP/2 dispatch before the HTTP server starts.
-// HTTP/1.1 (including WebSocket upgrades) retains net/http ownership. Legacy
-// h2c Upgrade requests retain x/net handling; prior knowledge and TLS use Luxo.
+// HTTP/1.1 (including WebSocket upgrades) retains net/http ownership.
+// HTTP/2 prior knowledge and TLS use Luxo; obsolete h2c Upgrade is ignored.
 // The owner must shut down both servers: net/http does not drain hijacked peers.
 func (s *Server) ConfigureHTTPServer(server *http.Server) error {
-	if server == nil || server.TLSNextProto != nil {
+	if server == nil || server.TLSNextProto != nil || server.Protocols != nil {
 		return errors.New("HTTP/2 dispatch requires an unconfigured HTTP server")
 	}
 	config := server.TLSConfig
@@ -38,10 +35,9 @@ func (s *Server) ConfigureHTTPServer(server *http.Server) error {
 			_ = s.ServeConn(context.Background(), conn)
 		},
 	}
-	fallback := h2c.NewHandler(s.handler, &http2.Server{})
 	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "PRI" || r.RequestURI != "*" || r.Proto != "HTTP/2.0" {
-			fallback.ServeHTTP(w, r)
+			s.handler.ServeHTTP(w, r)
 			return
 		}
 		s.servePriorKnowledge(w, r)
@@ -50,6 +46,10 @@ func (s *Server) ConfigureHTTPServer(server *http.Server) error {
 }
 
 func (s *Server) servePriorKnowledge(w http.ResponseWriter, r *http.Request) {
+	if r.TLS != nil {
+		rejectUnnegotiatedTLS(w)
+		return
+	}
 	conn, buffered, err := http.NewResponseController(w).Hijack()
 	if err != nil {
 		http.Error(w, "HTTP/2 connection handoff unavailable", http.StatusInternalServerError)
@@ -59,6 +59,11 @@ func (s *Server) servePriorKnowledge(w http.ResponseWriter, r *http.Request) {
 	// every buffered byte (including the rest of the preface and initial frames).
 	reader := io.MultiReader(strings.NewReader("PRI * HTTP/2.0\r\n\r\n"), buffered.Reader)
 	_ = s.ServeConn(r.Context(), &prefacedConn{Conn: conn, reader: reader})
+}
+
+func rejectUnnegotiatedTLS(w http.ResponseWriter) {
+	w.Header().Set("Connection", "close")
+	http.Error(w, "HTTP/2 over TLS requires h2 ALPN negotiation", http.StatusBadRequest)
 }
 
 type prefacedConn struct {

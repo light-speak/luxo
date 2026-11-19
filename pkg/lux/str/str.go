@@ -1,6 +1,9 @@
 package str
 
 import (
+	"encoding/binary"
+	"errors"
+	"math/bits"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -99,39 +102,95 @@ func TrimSuffix(s, suffix string) string {
 	return strings.TrimSuffix(s, suffix)
 }
 
-// Repeat returns s repeated n times.
-func Repeat(s string, n int) string {
-	return strings.Repeat(s, n)
+var errNegativeRepeatCount = errors.New("repeat count must not be negative")
+var errRepeatLengthOverflow = errors.New("repeat result length overflows int")
+var errSubstringRange = errors.New("substring range is out of bounds")
+var errSubstringBoundary = errors.New("substring range splits a UTF-8 character")
+
+// Substring validates the existing byte-indexed range before returning a view.
+// Character-counting policy is separate; no successful result splits UTF-8.
+func Substring(s string, start, end int) (string, error) {
+	if start < 0 || end < start || end > len(s) {
+		return "", errSubstringRange
+	}
+	if start < len(s) && !utf8.RuneStart(s[start]) || end < len(s) && !utf8.RuneStart(s[end]) {
+		return "", errSubstringBoundary
+	}
+	return s[start:end], nil
 }
 
-// PadLeft pads s on the left with pad to reach length n. Single allocation.
+// SubstringFrom returns the suffix from a checked byte boundary.
+func SubstringFrom(s string, start int) (string, error) {
+	return Substring(s, start, len(s))
+}
+
+// Repeat rejects invalid counts and length overflow before allocating its result.
+func Repeat(s string, n int) (string, error) {
+	if n < 0 {
+		return "", errNegativeRepeatCount
+	}
+	if n == 0 || s == "" {
+		return "", nil
+	}
+	if n == 1 {
+		return s, nil
+	}
+	high, size := bits.Mul(uint(len(s)), uint(n))
+	if high != 0 || size > uint(^uint(0)>>1) {
+		return "", errRepeatLengthOverflow
+	}
+	return strings.Repeat(s, n), nil
+}
+
+// PadLeft pads s on the left up to byte length n, retaining complete UTF-8 characters.
 func PadLeft(s string, n int, pad string) string {
-	diff := n - len(s)
-	if diff <= 0 || pad == "" {
+	if n <= len(s) || pad == "" {
 		return s
 	}
-	var b strings.Builder
-	b.Grow(n)
-	for b.Len() < diff {
-		b.WriteString(pad)
-	}
-	prefix := b.String()[:diff]
-	return prefix + s
+	return padString(s, n, pad, true)
 }
 
-// PadRight pads s on the right with pad to reach length n. Single allocation.
+// PadRight pads s on the right up to byte length n, retaining complete UTF-8 characters.
 func PadRight(s string, n int, pad string) string {
-	diff := n - len(s)
-	if diff <= 0 || pad == "" {
+	if n <= len(s) || pad == "" {
 		return s
+	}
+	return padString(s, n, pad, false)
+}
+
+func padString(s string, n int, pad string, left bool) string {
+	// Single-byte patterns always end on a byte boundary.
+	if len(pad) > 1 {
+		// Only the final pattern can be partial; round its prefix down to a rune boundary.
+		remainder := (n - len(s)) % len(pad)
+		prefix := remainder
+		for prefix > 0 && !utf8.RuneStart(pad[prefix]) {
+			prefix--
+		}
+		n -= remainder - prefix
+		if n == len(s) {
+			return s
+		}
 	}
 	var b strings.Builder
 	b.Grow(n)
-	b.WriteString(s)
-	for b.Len() < n {
-		b.WriteString(pad)
+	if !left {
+		b.WriteString(s)
 	}
-	return b.String()[:n]
+	appendPadding(&b, pad, n-len(s))
+	if left {
+		b.WriteString(s)
+	}
+	return b.String()
+}
+
+func appendPadding(b *strings.Builder, pad string, size int) {
+	start := b.Len()
+	b.WriteString(pad[:min(len(pad), size)])
+	for written := b.Len() - start; written < size; written = b.Len() - start {
+		count := min(written, size-written)
+		b.WriteString(b.String()[start : start+count])
+	}
 }
 
 // Mask applies partial masking, preserving prefix and suffix characters.
@@ -191,13 +250,31 @@ func maskAll(s string) string {
 	return strings.Repeat("*", utf8.RuneCountInString(s))
 }
 
-// MaskEmail masks an email: "user@example.com" → "u***@example.com"
+// MaskEmail preserves the first UTF-8 rune of the local part and masks the rest.
+// It formats an email rather than validating its address syntax.
 func MaskEmail(s string) string {
 	at := strings.IndexByte(s, '@')
 	if at <= 1 {
 		return s
 	}
-	return s[:1] + strings.Repeat("*", at-1) + s[at:]
+	_, firstSize := utf8.DecodeRuneInString(s)
+	if firstSize == at {
+		return s
+	}
+	local := s[firstSize:at]
+	hidden := 0
+	// Skip full ASCII words; leave all other decoding to the standard library.
+	for len(local) >= 8 && binary.LittleEndian.Uint64([]byte(local))&0x8080808080808080 == 0 {
+		hidden += 8
+		local = local[8:]
+	}
+	hidden += utf8.RuneCountInString(local)
+	var b strings.Builder
+	b.Grow(len(s) - at + firstSize + hidden)
+	b.WriteString(s[:firstSize])
+	appendPadding(&b, "*", hidden)
+	b.WriteString(s[at:])
+	return b.String()
 }
 
 // Reverse returns s with its UTF-8 runes in reverse order.

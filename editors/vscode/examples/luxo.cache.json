@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "policies": {
+    "popularPosts": {
+      "mode": "ttl",
+      "ttl": "1m",
+      "scope": "private"
+    }
+  }
+}

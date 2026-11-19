@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
+	"github.com/light-speak/luxo/pkg/lux/luxolog"
 )
 
 // PreparedStreamHandler owns validated subscription inputs. It must not retain
@@ -21,6 +22,8 @@ type StreamPrepareFunc func(context.Context, *Request, any) (PreparedStreamHandl
 // PreparedStreamSource owns a ready remote subscription. Run starts forwarding
 // only after ACK. Close must release resources without requiring Run to start;
 // the router invokes it once, outside hub locks, including failed admission.
+// A panic is logged without its payload and does not interrupt other releases.
+// The application remains responsible for resources left by its failed cleanup.
 type PreparedStreamSource struct {
 	Run   PreparedStreamHandler
 	Close func()
@@ -62,36 +65,38 @@ func (rt *Router) HandleStreamForwarded(apiName string, prepare StreamForwardPre
 	rt.streamHandlers[apiName] = streamHandlerRoute{forwardPrepare: prepare}
 }
 
-func (rt *Router) prepareStreamHandler(ctx context.Context, req *Request, identity any) (prepared preparedStream, err error) {
+func (rt *Router) prepareStreamHandler(ctx context.Context, req *Request) (prepared preparedStream, identity any, err error) {
 	defer func() {
 		if recover() != nil {
 			// Do not format arbitrary panic values or expose them to clients.
-			prepared, err = preparedStream{}, luxerrors.InternalError
+			prepared, identity, err = preparedStream{}, nil, luxerrors.InternalError
 		}
 	}()
+	identity = rt.identityFromCtx(ctx)
 	route, registered := rt.streamHandlers[req.API]
 	if route.forwardPrepare != nil {
-		return prepareForwardedStream(ctx, req, identity, route.forwardPrepare)
+		prepared, err = prepareForwardedStream(ctx, req, identity, route.forwardPrepare)
+		return prepared, identity, err
 	}
 	if route.eventPrepare != nil {
 		bind, err := route.eventPrepare(ctx, req, identity)
-		return preparedStream{bind: bind}, err
+		return preparedStream{bind: bind}, identity, err
 	}
 	prepare := route.prepare
 	if prepare == nil {
 		if registered && route.handler == nil {
-			return preparedStream{}, fmt.Errorf("api: stream %q has no registered implementation", req.API)
+			return preparedStream{}, identity, fmt.Errorf("api: stream %q has no registered implementation", req.API)
 		}
-		return preparedStream{}, nil
+		return preparedStream{}, identity, nil
 	}
 	handler, err := prepare(ctx, req, identity)
 	if err != nil {
-		return preparedStream{}, err
+		return preparedStream{}, identity, err
 	}
 	if handler == nil {
-		return preparedStream{}, fmt.Errorf("api: stream %q preparation returned no handler", req.API)
+		return preparedStream{}, identity, fmt.Errorf("api: stream %q preparation returned no handler", req.API)
 	}
-	return preparedStream{run: handler}, nil
+	return preparedStream{run: handler}, identity, nil
 }
 
 func prepareForwardedStream(ctx context.Context, req *Request, identity any, prepare StreamForwardPrepareFunc) (preparedStream, error) {
@@ -104,7 +109,7 @@ func prepareForwardedStream(ctx context.Context, req *Request, identity any, pre
 	}
 	if err != nil {
 		if source.Close != nil {
-			source.Close()
+			releaseStreamSource(source.Close)
 		}
 		return preparedStream{}, err
 	}
@@ -123,4 +128,15 @@ func (rt *Router) streamInputValues(req *Request) map[string]any {
 		return nil
 	}
 	return binaryStreamParams(req)
+}
+
+// Cleanup is best-effort after ownership removal. Never retry a partially run
+// callback or let one failure skip other subscriptions' resource releases.
+func releaseStreamSource(release func()) {
+	defer func() {
+		if recover() != nil {
+			luxolog.Error("stream source cleanup panicked; resources may require application cleanup")
+		}
+	}()
+	release()
 }

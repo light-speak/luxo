@@ -6,6 +6,22 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertFailsWith
 
 class PreparedSelectionTest {
+    @Test
+    fun `Unicode DSL letters preserve wire field IDs`() {
+        val meta = APISchemaEntry(1, fields = mapOf("café" to SelectionFieldSchema(1),
+            "中文2" to SelectionFieldSchema(2, "Nested")),
+            types = mapOf("Nested" to mapOf("𐐀_name" to SelectionFieldSchema(3))))
+        val ascii = APISchemaEntry(1, fields = mapOf("cafe" to SelectionFieldSchema(1),
+            "nested" to SelectionFieldSchema(2, "Nested")),
+            types = mapOf("Nested" to mapOf("name" to SelectionFieldSchema(3))))
+        val text = "café,中文2{𐐀_name}"
+        val expected = encode(ascii, "cafe,nested{name}", null)
+        assertContentEquals(expected, encode(meta, text, null))
+        assertContentEquals(expected, encode(meta, text, PreparedSelection(text)))
+        for (invalid in listOf("2café", "café²", "e\u0301", "😀", "字\u200d", "\ud800")) {
+            assertFailsWith<LuxoError> { PreparedSelection(invalid) }
+        }
+    }
     private fun schema(id: Int) = snapshotAPISchema(mapOf("api" to APISchemaEntry(
         1, fields = mapOf("user" to SelectionFieldSchema(1, "User")),
         types = mapOf("User" to mapOf("id" to SelectionFieldSchema(id), "name" to SelectionFieldSchema(2))),

@@ -75,7 +75,88 @@ func (p *Parser) parseIdentOrConstruction(pos token.Position) ast.Expr {
 	if p.check(token.LBrace) && p.isTypeName(tok.Val) {
 		return p.parseObjectConstruction(pos, tok.Val)
 	}
+	if p.check(token.Lt) && p.constructorTypeCallAhead() {
+		return p.parseConstructorCall(pos, ident)
+	}
 	return ident
+}
+
+func (p *Parser) parseConstructorCall(pos token.Position, ident *ast.Ident) *ast.CallExpr {
+	p.expect(token.Lt)
+	arguments := make([]*ast.TypeRef, 0)
+	for !p.check(token.Gt) {
+		arguments = append(arguments, p.parseTypeRef())
+		if !p.match(token.Comma) {
+			break
+		}
+	}
+	p.expect(token.Gt)
+	call := p.parseCallArgs(pos, ident)
+	call.TypeArgs = arguments
+	return call
+}
+
+// Look ahead without creating AST nodes or diagnostics for ordinary comparisons.
+func (p *Parser) constructorTypeCallAhead() bool {
+	end, ok := p.scanConstructorTypeList(p.pos+1, token.Gt, true)
+	return ok && p.constructorToken(end) == token.LParen
+}
+
+func (p *Parser) constructorToken(index int) token.Type {
+	if index >= len(p.tokens) {
+		return token.EOF
+	}
+	return p.tokens[index].Type
+}
+
+func (p *Parser) scanConstructorTypeList(index int, closing token.Type, empty bool) (int, bool) {
+	if p.constructorToken(index) == closing {
+		return index + 1, empty
+	}
+	for {
+		end, ok := p.scanConstructorType(index)
+		if !ok {
+			return end, false
+		}
+		if p.constructorToken(end) == closing {
+			return end + 1, true
+		}
+		if p.constructorToken(end) != token.Comma {
+			return end, false
+		}
+		index = end + 1
+	}
+}
+
+func (p *Parser) scanConstructorType(index int) (int, bool) {
+	if p.constructorToken(index) == token.LParen {
+		return p.scanConstructorTypeList(index+1, token.RParen, false)
+	}
+	if p.constructorToken(index) == token.LBracket {
+		end, ok := p.scanConstructorType(index + 1)
+		if !ok || p.constructorToken(end) != token.RBracket {
+			return end, false
+		}
+		index = end + 1
+	} else {
+		probe := *p
+		probe.pos = index
+		if !probe.check(token.Ident) && !probe.isKeywordUsedAsIdent() {
+			return index, false
+		}
+		index++
+		if p.constructorToken(index) == token.Lt {
+			end, ok := p.scanConstructorTypeList(index+1, token.Gt, false)
+			if !ok {
+				return end, false
+			}
+			index = end
+		}
+	}
+	if p.constructorToken(index) == token.Question {
+		index++
+	}
+	return index, true
 }
 
 // parsePrefixUnary parses a unary prefix expression (!, -, throw, <-).
@@ -271,6 +352,7 @@ func (p *Parser) parseCallArgs(pos token.Position, fn ast.Expr) *ast.CallExpr {
 			p.expect(token.Colon)
 			// incomplete: `where: )` — no expression after colon
 			if p.check(token.RParen) {
+				p.error("expected expression for named argument %q", arg.Name)
 				break
 			}
 		}
@@ -383,49 +465,6 @@ func hasDirectiveBody(name string) bool {
 
 // parseConditionExpr parses an expression that stops before '{'.
 // Used in if/for conditions where '{' starts the block, not a lambda.
-// parseForCondition parses the condition/collection for a for loop.
-// Unlike parseExpr, it never treats { as trailing lambda — { starts the for body.
-func (p *Parser) parseForCondition() ast.Expr {
-	left := p.parsePrefixExpr()
-	if left == nil {
-		return nil
-	}
-	for !p.check(token.LBrace) && !p.isEOF() {
-		// only process infix operators that aren't {
-		switch {
-		case p.check(token.Dot):
-			p.advance()
-			field := p.expectIdent()
-			left = &ast.MemberExpr{Pos: left.GetPos(), Object: left, Field: field}
-		case p.check(token.SafeDot):
-			p.advance()
-			field := p.expectIdent()
-			left = &ast.MemberExpr{Pos: left.GetPos(), Object: left, Field: field, SafeCall: true}
-		case p.check(token.LParen):
-			left = p.parseCallArgs(left.GetPos(), left)
-		case p.isBinaryOp():
-			pos := p.current().Pos
-			op := p.current().Val
-			p.advance()
-			right := p.parseForCondition() // recurse without { being eaten
-			left = &ast.BinaryExpr{Pos: pos, Left: left, Op: op, Right: right}
-		case p.check(token.DotDot):
-			pos := p.current().Pos
-			p.advance()
-			right := p.parseForCondition()
-			left = &ast.RangeExpr{Pos: pos, Start: left, End: right}
-		case p.check(token.Elvis):
-			pos := p.current().Pos
-			p.advance()
-			right := p.parseForCondition()
-			left = &ast.ElvisExpr{Pos: pos, Left: left, Right: right}
-		default:
-			return left
-		}
-	}
-	return left
-}
-
 func (p *Parser) parseConditionExpr() ast.Expr {
 	old := p.noBraceLambda
 	p.noBraceLambda = true

@@ -421,8 +421,11 @@ func TestGenerateAutoUUIDDBImports(t *testing.T) {
 	if !strings.Contains(dbSrc, `"time"`) {
 		t.Errorf("missing time import in db.gen.go:\n%s", dbSrc)
 	}
-	if !strings.Contains(dbSrc, "uuid.Must(uuid.NewV7())") {
+	if !strings.Contains(dbSrc, "_autoIdRaw, err := uuid.NewV7()") || strings.Contains(dbSrc, "uuid.Must(") {
 		t.Errorf("missing uuid auto-fill:\n%s", dbSrc)
+	}
+	if !strings.Contains(dbSrc, "if err != nil {\n\t\treturn nil, err\n\t}") {
+		t.Error("UUID generation failure must propagate")
 	}
 }
 
@@ -1517,5 +1520,24 @@ func TestAppNeedsEvents(t *testing.T) {
 	r10 := &semantic.Result{Files: []*ast.File{{}}}
 	if appNeedsEvents(r10) {
 		t.Error("should not need events when empty")
+	}
+}
+
+func TestGenerationRejectsCrossFileInheritanceCycle(t *testing.T) {
+	first := &ast.ModelDecl{Name: "First", Parents: []string{"Second"}}
+	second := &ast.ModelDecl{Name: "Second", Parents: []string{"First"}}
+	for _, reverse := range []bool{false, true} {
+		files := []*ast.File{{Name: "first.luxo", Models: []*ast.ModelDecl{first}}, {Name: "second.luxo", Models: []*ast.ModelDecl{second}}}
+		if reverse {
+			files[0], files[1] = files[1], files[0]
+		}
+		result := semantic.Analyze(files)
+		generated, err := Generate(result, "generated", GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{"First": {}, "Second": {}}}})
+		if err == nil || generated != nil || !strings.Contains(err.Error(), "inheritance cycle") {
+			t.Fatalf("cyclic model generated output: %v", err)
+		}
+		if len(first.Parents) != 1 || first.Parents[0] != "Second" || len(second.Parents) != 1 || second.Parents[0] != "First" {
+			t.Fatal("diagnosis changed source inheritance")
+		}
 	}
 }

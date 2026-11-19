@@ -62,8 +62,8 @@ func TestNullableField(t *testing.T) {
 
 func TestListField(t *testing.T) {
 	result := analyze(t, `
-model Post { title: String }
-model User { posts: [Post] }
+model Post { id: Int title: String userId: Int }
+model User { id: Int posts: [Post] }
 `)
 	expectNoErrors(t, result)
 
@@ -80,6 +80,42 @@ func TestDuplicateField(t *testing.T) {
   name: String
 }`)
 	expectError(t, result, "duplicate field")
+}
+
+func TestDeclaredFieldsRejectDuplicatesWithoutOverwritingMetadata(t *testing.T) {
+	for _, declaration := range []string{"type Packet", "interface Packet", "model Packet @noTime", "type Packet<T>"} {
+		t.Run(declaration, func(t *testing.T) {
+			result := analyze(t, declaration+` {
+ value: Int? = null
+ value: String
+}`)
+			expectError(t, result, "duplicate field 'value'")
+			field := result.Types["Packet"].Fields["value"]
+			if field.Type.Name != "Int" || !field.Nullable || !field.HasDefault || field.Pos.Line != 2 {
+				t.Fatalf("duplicate field replaced the accepted metadata: %+v", field)
+			}
+			var located bool
+			for _, err := range result.Errors {
+				if strings.Contains(err.Message, "duplicate field") && err.Pos.Line == 3 {
+					located = true
+				}
+			}
+			if !located {
+				t.Fatal("duplicate field diagnostic lost the second declaration location")
+			}
+		})
+	}
+}
+
+func TestDeclaredFieldUniquenessKeepsInheritedAndDistinctNames(t *testing.T) {
+	for _, source := range []string{
+		`interface Base { value: Int } model Packet : Base @noTime { id: Int @id value: Int }`,
+		`type Packet { lower: Int upper: String }`,
+		`interface Packet { lower: Int upper: String }`,
+		`type Packet<T> { value: T values: [T] }`,
+	} {
+		expectNoErrors(t, analyze(t, source))
+	}
 }
 
 // ========== Computed Field Tests ==========
@@ -222,6 +258,7 @@ model User {
   name: String = "unknown"
   active: Boolean
 }
+
 `)
 	expectNoErrors(t, result)
 	user := result.Types["User"]
@@ -234,6 +271,48 @@ model User {
 	}
 	if !nameField.HasDefault {
 		t.Error("expected HasDefault to be true for field with default value")
+	}
+}
+
+func TestFieldDefaultsMustBeStaticAndTyped(t *testing.T) {
+	for _, kind := range []string{"model", "type"} {
+		for _, declaration := range []string{
+			`value: Int = "42"`, `value: String = 42`, `value: Float = 42`,
+			`value: Boolean = "false"`, `value: Duration = 42`, `value: Int = 42ms`,
+			`value: Int = null`, `value: String = null`, `value: [Int] = null`,
+			`value: State = Other.OPEN`, `value: State = State.MISSING`,
+			`value: State = "OPEN"`, `value: State = MISSING`,
+			`value: Int = value()`, `value: Int = 1 + 2`, `value: [Int] = [1]`,
+		} {
+			t.Run(kind+"/"+declaration, func(t *testing.T) {
+				result := analyze(t, `enum State { OPEN CLOSED }
+enum Other { OPEN }
+fn value(): Int { return 42 }
+`+kind+` Probe { `+declaration+` }`)
+				expectError(t, result, "default value for field 'value'")
+			})
+		}
+	}
+}
+
+func TestFieldDefaultTypeControls(t *testing.T) {
+	for _, kind := range []string{"model", "type"} {
+		result := analyze(t, `enum State { OPEN CLOSED }
+`+kind+` Probe {
+ integer: Int = -9223372036854775808
+ real: Float = -0.0
+ text: String = "value"
+ flag: Boolean = false
+ elapsed: Duration = -1d
+ state: State = State.OPEN
+ legacyState: State = OPEN
+ optional: Int? = null
+ present: Int? = 42
+ items: [Int]? = null
+ json: JSON = null
+ optionalJSON: JSON? = null
+}`)
+		expectNoErrors(t, result)
 	}
 }
 
@@ -336,8 +415,7 @@ type AuthResult {
 }
 
 func TestDuplicateModelFieldsResolveSkip(t *testing.T) {
-	// When a model name conflicts with a builtin, typ will be nil in resolveModelFields
-	// since declareType returns nil for duplicates. We need the continue path.
+	// Reject the source declaration without modifying the existing builtin metadata.
 	result := analyze(t, `
 model String { name: String }
 `)
@@ -357,6 +435,81 @@ func TestDuplicateTypeFieldsResolveSkip(t *testing.T) {
 type Boolean { flag: String }
 `)
 	expectError(t, result, "already declared")
+}
+
+func TestRejectedDeclarationsCannotModifyBuiltins(t *testing.T) {
+	for _, sample := range []struct{ source, builtin string }{
+		{`model Base @noTime { id: Int @id } model String : Base @noTime { poisoned: Int }`, "String"},
+		{`interface Int { poisoned: String }`, "Int"},
+		{`type Boolean { poisoned: String }`, "Boolean"},
+	} {
+		t.Run(sample.builtin, func(t *testing.T) {
+			result := analyze(t, sample.source)
+			expectError(t, result, "already declared")
+			typ := result.Types[sample.builtin]
+			if typ.Fields["poisoned"] != nil || len(typ.Parents) != 0 {
+				t.Fatalf("rejected declaration modified builtin %s: fields=%v parents=%v", sample.builtin, typ.Fields, typ.Parents)
+			}
+		})
+	}
+}
+
+func TestRejectedDuplicateCannotAddFieldsWithSamePosition(t *testing.T) {
+	for _, kind := range []string{"model", "interface", "type"} {
+		t.Run(kind, func(t *testing.T) {
+			first := parseFileWithName(t, kind+` Shared { keep: Int }`, "first.luxo")
+			duplicate := parseFileWithName(t, kind+` Shared { poisoned: String }`, "duplicate.luxo")
+			switch kind {
+			case "model":
+				duplicate.Models[0].Pos = first.Models[0].Pos
+			case "interface":
+				duplicate.Interfaces[0].Pos = first.Interfaces[0].Pos
+			case "type":
+				duplicate.Types[0].Pos = first.Types[0].Pos
+			}
+			result := Analyze([]*ast.File{first, duplicate})
+			expectError(t, result, "already declared")
+			fields := result.Types["Shared"].Fields
+			if fields["keep"] == nil || fields["poisoned"] != nil {
+				t.Fatalf("rejected %s with matching source position modified accepted fields: %v", kind, fields)
+			}
+		})
+	}
+}
+
+func TestRejectedModelCannotAddInheritance(t *testing.T) {
+	result := analyze(t, `
+model First @noTime { id: Int @id }
+model Other @noTime { id: Int @id }
+model Shared : First @noTime { keep: Int }
+model Shared : Other @noTime { poisoned: String }
+`)
+	expectError(t, result, "already declared")
+	typ := result.Types["Shared"]
+	if len(typ.Parents) != 1 || typ.Parents[0].Name != "First" || typ.Fields["poisoned"] != nil {
+		t.Fatalf("rejected model modified accepted inheritance or fields: %+v", typ)
+	}
+}
+
+func TestRejectedTypeCannotReplaceModuleOwnership(t *testing.T) {
+	for _, sample := range []struct{ first, duplicate string }{
+		{`model Shared @noTime { id: Int @id }`, `model Shared @noTime { id: Int @id }`},
+		{`interface Shared { keep: Int }`, `interface Shared { poisoned: String }`},
+		{`type Shared { keep: Int }`, `type Shared { poisoned: String }`},
+		{`enum Shared { FIRST }`, `enum Shared { OTHER }`},
+		{`sealed Shared { First }`, `sealed Shared { Other }`},
+	} {
+		t.Run(sample.first, func(t *testing.T) {
+			first := parseFileWithName(t, sample.first, "origin/first.luxo")
+			duplicate := parseFileWithName(t, sample.duplicate, "origin/duplicate.luxo")
+			a := New()
+			result := a.AnalyzeWithModules([]*ast.File{first, duplicate})
+			expectError(t, result, "already declared")
+			if owner := a.typeOwners.ownerOf("Shared"); owner != "first" {
+				t.Fatalf("rejected declaration changed the accepted module to %q", owner)
+			}
+		})
+	}
 }
 
 func TestResolveFieldsNilModelType(t *testing.T) {
@@ -570,9 +723,10 @@ extend NonExistent {
 
 func TestCustomFKField(t *testing.T) {
 	result := analyze(t, `
-model User { name: String }
+model User { id: Int name: String }
 model Post {
-  author: User(key: authorId)
+  id: Int
+  author: User @by(id, authorId)
   authorId: Int
 }
 `)
@@ -699,24 +853,132 @@ api test: Boolean {
 	expectNoErrors(t, result)
 }
 
-func TestVisibleRequiresNullable(t *testing.T) {
+func TestBangElvisRejectsNonBooleanCondition(t *testing.T) {
+	for _, kind := range []string{"Int", "String", "Boolean?", "[Boolean]"} {
+		t.Run(kind, func(t *testing.T) {
+			result := analyze(t, "fn guard(value: "+kind+"): Boolean { value !: throw error.Conflict return true }")
+			expectError(t, result, "Boolean")
+		})
+	}
+}
+
+func TestBangElvisGuardBoundary(t *testing.T) {
+	for _, body := range []string{
+		"true !: false return true",
+		"true !: 42 return true",
+		"return true !: throw error.Conflict",
+		"val result = true !: throw error.Conflict return result",
+		"if true !: throw error.Conflict { return true } return false",
+	} {
+		t.Run(body, func(t *testing.T) {
+			result := analyze(t, "fn guard(): Boolean { "+body+" }")
+			expectError(t, result, "!:")
+		})
+	}
+	expectNoErrors(t, analyze(t, "fn guard(value: Boolean): Boolean { value !: throw error.Conflict return true }"))
+}
+
+func TestBangElvisFailureDoesNotNarrowContinuingScope(t *testing.T) {
 	result := analyze(t, `
-model User {
-  name: String
-  salary: Float @visible { my.role == "admin" }
+error Rejected(detail: String) { code: 409 message: "error.rejected" }
+fn guard(value: String?, reject: Boolean): String {
+ reject !: throw Rejected(detail: value ?: throw error.NotFound)
+ return value
 }
 `)
-	expectError(t, result, "@visible requires nullable")
+	expectError(t, result, "return expects")
+}
+
+func TestBangElvisCannotSupplyImplicitReturn(t *testing.T) {
+	result := analyze(t, "fn guard(value: Boolean): Boolean { value !: throw error.Conflict }")
+	expectError(t, result, "only valid as a guard statement")
+}
+
+func TestThrowRejectsNonErrorValues(t *testing.T) {
+	for _, value := range []string{"42", "\"failure\"", "null", "true", "[1]"} {
+		for _, body := range []string{
+			"throw " + value,
+			"true !: throw " + value + " return true",
+			"return false ?: throw " + value,
+		} {
+			t.Run(body, func(t *testing.T) {
+				result := analyze(t, "fn guard(): Boolean { "+body+" }")
+				expectError(t, result, "throw requires")
+			})
+		}
+	}
+}
+
+func TestExpressionAssignmentStillRequiresWritableTarget(t *testing.T) {
+	for _, body := range []string{"read() = 1", "(1 + 2) = 3", "(true) = false"} {
+		t.Run(body, func(t *testing.T) {
+			result := analyze(t, "fn read(): Int { return 0 } fn write(): Int { "+body+" return 0 }")
+			expectError(t, result, "assignment target is not writable")
+		})
+	}
+}
+
+func TestNumericNegationRejectsInvalidTypes(t *testing.T) {
+	for _, kind := range []string{"String", "Boolean", "DateTime", "UUID", "JSON", "Bytes", "Int?", "Float?", "[Int]", "[Decimal]"} {
+		t.Run(kind, func(t *testing.T) {
+			expectError(t, analyze(t, "fn negative(value: "+kind+"): "+kind+" { return -value }"), "numeric negation requires")
+		})
+	}
+	for _, kind := range []string{"Int", "Float", "Decimal", "Duration"} {
+		expectNoErrors(t, analyze(t, "fn negative(value: "+kind+"): "+kind+" { return -value }"))
+	}
+}
+
+func TestThrowRejectsOrdinaryCallsAndMembers(t *testing.T) {
+	for _, source := range []string{
+		"fn Failure(): Int { return 42 } fn run(): Int { throw Failure() }",
+		"type Item { value: String } fn run(item: Item): Int { throw item.value }",
+		"type Item { NotFound: String } fn run(error: Item): Int { throw error.NotFound }",
+	} {
+		expectError(t, analyze(t, source), "throw requires")
+	}
+}
+
+func TestVisibleRequiresNullable(t *testing.T) {
+	for _, sample := range []struct{ name, source string }{
+		{"model", `model User { name: String salary: Float @visible { my.role == "admin" } }`},
+		{"type", `type Record { secret: String @visible(true) }`},
+		{"interface", `interface Record { secret: String @visible(true) }`},
+		{"generic", `type Box<T> { value: T @visible(true) }`},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			for _, duplicate := range []bool{false, true} {
+				source := sample.source
+				if duplicate {
+					source = strings.Replace(source, "@visible", "@visible(false) @visible", 1)
+				}
+				result := analyze(t, source)
+				count := 0
+				for _, failure := range result.Errors {
+					if strings.Contains(failure.Message, "@visible requires nullable") {
+						count++
+					}
+				}
+				if count != 1 {
+					t.Fatalf("duplicate=%t: want one nullable diagnostic, got %d: %v", duplicate, count, result.Errors)
+				}
+				if duplicate {
+					expectError(t, result, "duplicate @visible")
+				}
+			}
+		})
+	}
 }
 
 func TestVisibleNullableOk(t *testing.T) {
-	result := analyze(t, `
-model User {
-  name: String
-  salary: Float? @visible { my.role == "admin" }
-}
-`)
-	expectNoErrors(t, result)
+	for _, sample := range []struct{ name, source string }{
+		{"model", `model User { name: String salary: Float? @visible { my.role == "admin" } }`},
+		{"type", `type Record { secret: String? @visible(true) }`},
+		{"interface", `interface Record { secret: String? @visible(true) }`},
+		{"generic", `type Box<T> { value: T? @visible(true) }`},
+	} {
+		t.Run(sample.name, func(t *testing.T) { expectNoErrors(t, analyze(t, sample.source)) })
+	}
 }
 
 func TestUsedVarInCreateNamedArg(t *testing.T) {
@@ -737,4 +999,138 @@ api test(teamName: String): Team {
 			t.Errorf("slug used in create() named arg should NOT be flagged as unused: %s", w.Message)
 		}
 	}
+}
+
+func TestVisibleRequiresSingleExpression(t *testing.T) {
+	for _, directive := range []string{`@visible`, `@visible {}`, `@visible { val allowed = true }`, `@visible { true false }`} {
+		t.Run(directive, func(t *testing.T) {
+			expectError(t, analyze(t, `type Secret { value: String? `+directive+` }`), "@visible")
+		})
+	}
+}
+
+func TestVisibleRejectsDuplicateConditions(t *testing.T) {
+	for _, source := range []string{
+		`model Secret { id: Int @id value: String? @visible { true } @visible { false } }`,
+		`type Secret { value: String? @visible { true } @visible { false } }`,
+		`interface Secret { value: String? @visible { true } @visible { false } }`,
+		`model Secret { id: Int @id } extend Secret { value: String? @visible { true } @visible { false } }`,
+		`model Secret { id: Int @id value: String? @visible { false } @visible { true } }`,
+	} {
+		t.Run(source, func(t *testing.T) { expectError(t, analyze(t, source), "duplicate @visible") })
+	}
+}
+
+func TestVisiblePositionalCondition(t *testing.T) {
+	expectNoErrors(t, analyze(t, `type Secret { value: String? @visible(!true) }`))
+	for _, directive := range []string{`@visible(true) { false }`, `@visible(condition: true)`} {
+		expectError(t, analyze(t, `type Secret { value: String? `+directive+` }`), "@visible")
+	}
+}
+
+func TestVisibleRequiresBooleanCondition(t *testing.T) {
+	for _, condition := range []string{`1`, `"yes"`, `null`, `[true]`, `my.id + 1`, `missing`} {
+		t.Run(condition, func(t *testing.T) {
+			expectError(t, analyze(t, `type Secret { value: String? @visible(`+condition+`) }`), "@visible")
+		})
+	}
+	expectNoErrors(t, analyze(t, `model User @withAuth(stores: [id, enabled]) { id: Int @id enabled: Boolean } type Secret { value: String? @visible(my.enabled) }`))
+	expectError(t, analyze(t, `model User @withAuth(stores: [id, enabled]) { id: Int @id enabled: Boolean? } type Secret { value: String? @visible(my.enabled) }`), "@visible")
+}
+
+func TestVisibleConditionDeclarationBoundaries(t *testing.T) {
+	for _, source := range []string{
+		`model Secret { id: Int @id value: String? @visible(1) }`,
+		`type Secret { value: String? @visible(1) }`,
+		`interface Secret { value: String? @visible(1) }`,
+		`model Secret { id: Int @id } extend Secret { value: String? @visible(1) }`,
+	} {
+		t.Run(source, func(t *testing.T) { expectError(t, analyze(t, source), "@visible") })
+	}
+	expectNoErrors(t, analyze(t, `type Secret { value: String? @visible(my.role == "admin") }`))
+	expectNoErrors(t, analyze(t, `
+enum Role { ADMIN MEMBER }
+model User @withAuth(stores: [id, role]) { id: Int @id role: Role }
+type Secret { value: String? @visible(my.role == Role.ADMIN) }
+`))
+}
+
+func TestInheritanceCyclesAreDiagnostics(t *testing.T) {
+	for _, source := range []string{
+		`model Self : Self { value: Int }`,
+		`model A : B { a: Int } model B : A { b: Int }`,
+		`model A : B { a: Int } model B : C { b: Int } model C : A { c: Int }`,
+	} {
+		expectError(t, analyze(t, source), "inheritance cycle")
+	}
+	expectNoErrors(t, analyze(t, `model Base { id: Int }
+model Left : Base { left: String }
+model Right : Base { right: String }
+model Leaf : Left, Right { own: String }`))
+}
+
+func TestAuthMethodsRejectDeclaredFieldCollision(t *testing.T) {
+	for _, name := range []string{"createToken", "createRefreshToken", "refreshToken", "verify"} {
+		t.Run(name, func(t *testing.T) {
+			result := analyze(t, "model User @withAuth(stores: [id]) { id: Int @id\n"+name+": Int }")
+			expectError(t, result, "conflicts with @withAuth")
+			field := result.Types["User"].Fields[name]
+			if field == nil || field.IsMethod || field.Type.Kind != TypeInt {
+				t.Fatal("auth method overwrote the declared field")
+			}
+			ordinary := analyze(t, "model User { "+name+": Int }")
+			expectNoErrors(t, ordinary)
+		})
+	}
+}
+
+func TestStoredFieldsRejectUnmappedTypes(t *testing.T) {
+	for _, typ := range []string{"Detail", "Detail?", "[Detail]", "[Detail]?"} {
+		for _, owner := range []string{"model Record { id: Int @id detail: ", "extend Record { detail: "} {
+			expectError(t, analyze(t, "type Detail { level: Int }\n"+owner+typ+" }"), "has no database mapping")
+		}
+	}
+	expectNoErrors(t, analyze(t, `type Detail { level: Int }
+ event Changed(detail: Detail)
+ fn echo(value: Detail): Detail { return value }
+ api read(value: Detail): Detail { return echo(value) }`))
+}
+
+func TestComputedFieldsKeepIndependentDiagnostics(t *testing.T) {
+	result := analyze(t, `type Detail { level: Int }
+ model Record { id: Int @id val detail: Detail get @native }`)
+	expectError(t, result, "must declare exactly one aggregate")
+	for _, diagnostic := range result.Errors {
+		if strings.Contains(diagnostic.Message, "has no database mapping") {
+			t.Fatal("computed field incorrectly treated as stored", diagnostic)
+		}
+	}
+}
+
+func TestInheritedStorageRejectsUnmappedFields(t *testing.T) {
+	for _, declaration := range []string{"type", "interface"} {
+		source := "type Detail { level: Int }\n" + declaration + " Base { detail: Detail }\nmodel Record : Base { id: Int @id }"
+		expectError(t, analyze(t, source), "has no database mapping")
+	}
+	expectNoErrors(t, analyze(t, `type Base { label: String }
+ model Record : Base { id: Int @id }`))
+	expectNoErrors(t, analyze(t, `type Detail { level: Int }
+ type Base { detail: Detail }
+ model Record : Base { id: Int @id detail: String }`))
+}
+
+func TestStoredFieldsRejectAbstractDeclarations(t *testing.T) {
+	for _, declaration := range []string{"interface Detail { level: Int }", "sealed Detail { Value(level: Int) }"} {
+		for _, typ := range []string{"Detail", "Detail?", "[Detail]", "[Detail]?"} {
+			for _, owner := range []string{"model Record { id: Int @id detail: ", "extend Record { detail: "} {
+				expectError(t, analyze(t, declaration+"\n"+owner+typ+" }"), "has no database mapping")
+			}
+		}
+		expectNoErrors(t, analyze(t, declaration))
+	}
+}
+
+func TestExplicitRelationOverridesImplicitForeignKey(t *testing.T) {
+	input := analyze(t, `model User { id: Int name: String } model Post { id: Int userId: Int authorId: Int author: User @by(id, authorId) }`)
+	expectNoErrors(t, input)
 }

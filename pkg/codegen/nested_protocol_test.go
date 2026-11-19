@@ -20,7 +20,8 @@ func TestGeneratedNestedResponseProtocol(t *testing.T) {
 const nestedInputAssertions = `
 func BenchmarkPayloadNestedInput(b *testing.B) {
     for _, count := range []int{0, 1, 128} {
-        data := codec.AppendArrayHeader([]byte{0, 3}, count)
+        data, err := codec.AppendArrayHeader([]byte{0, 3}, count)
+        if err != nil { b.Fatal(err) }
         for range count { data = append(data, 0, 1, 84, 0) }
         data = append(data, 0)
         for _, before := range []bool{true, false} {
@@ -38,7 +39,8 @@ func BenchmarkPayloadNestedInput(b *testing.B) {
 }
 
 func TestNestedInputRejectsAllocationWithoutPayload(t *testing.T) {
-    raw := codec.AppendArrayHeader([]byte{0, 3}, 32)
+    raw, err := codec.AppendArrayHeader([]byte{0, 3}, 32)
+    if err != nil { t.Fatal(err) }
     raw = append(raw, 0)
     dec := codec.NewDecoder(raw)
     var value Parent
@@ -85,6 +87,26 @@ func TestNestedInputGrammar(t *testing.T) {
 `
 
 const nestedMalformedAssertions = `
+func TestGeneratedColumnarBoundaryIsolation(t *testing.T) {
+    valid := []byte{2, 0, 1, 84, 86, 0}
+    rows, err := ReadColumnarChild(valid)
+    if err != nil || len(rows) != 2 || rows[0].Id != 42 || rows[1].Id != 43 { t.Fatalf("valid control: %+v / %v", rows, err) }
+    for end := 0; end < len(valid); end++ {
+        if rows, err := ReadColumnarChild(valid[:end]); err == nil || rows != nil { t.Fatalf("truncated column returned success: end=%d rows=%+v err=%v", end, rows, err) }
+    }
+    for _, raw := range [][]byte{
+        {2,0,0},
+        {2,0,1,84,86,99,0,0,0},
+        {2,0,99,0,0,1,84,86,0},
+        {2,0,1,84,86,0,0},
+        {2,0,2,1,'a',3,'b',0},
+    } {
+        if rows, err := ReadColumnarChild(raw); err == nil || rows != nil { t.Fatalf("malformed column returned success: raw=%x rows=%+v err=%v", raw, rows, err) }
+    }
+    rows, err = ReadColumnarChild([]byte{0,0,0})
+    if err != nil || len(rows) != 0 { t.Fatalf("valid empty list: %+v / %v", rows, err) }
+}
+
 func TestGeneratedRejectsImpossiblyLargeArena(t *testing.T) {
     row := append(codec.AppendVarint(nil, 1<<20), 0)
     for _, input := range []bool{false, true} {
@@ -198,7 +220,7 @@ func nestedInputPayloadBaseline(t *testing.T, source string) string {
 		t.Fatal(err)
 	}
 	source = string(formatted)
-	start := strings.Index(source, "func (p *Parent) ReadLuxoInput(")
+	start := strings.Index(source, "func (p *Parent) readLuxoInputDepth(")
 	if start < 0 {
 		t.Fatal("generated input reader missing from benchmark reference")
 	}
@@ -207,7 +229,8 @@ func nestedInputPayloadBaseline(t *testing.T, source string) string {
 		t.Fatal("generated input reader has no complete function boundary")
 	}
 	end := start + endOffset + 3
-	body := strings.Replace(source[start:end], "ReadLuxoInput(", "readInputBeforePayload(", 1)
+	body := strings.Replace(source[start:end], "readLuxoInputDepth(", "readInputBeforePayload(", 1)
+	body = strings.Replace(body, ", depth int) {", ") {\nconst depth = 1", 1)
 	return strings.ReplaceAll(body, "dec.CheckElementBytes(_n, 2)", "dec.Err() == nil")
 }
 
@@ -222,21 +245,22 @@ func TestNestedInputPayloadBenchmarkReference(t *testing.T) {
 // Keep the generated mask/scalar work identical; replace only child framing.
 // This reference is generated solely inside the temporary test package.
 func nestedInlineBenchmarkBaseline(generated string) string {
-	start := strings.Index(generated, "func (p *Parent) WriteLuxo(")
+	start := strings.Index(generated, "func (p *Parent) writeLuxoDepth(")
 	if start < 0 {
-		start = strings.Index(generated, "func (p Parent) WriteLuxo(")
+		start = strings.Index(generated, "func (p Parent) writeLuxoDepth(")
 	}
 	end := start + strings.Index(generated[start:], "\n}\n") + 3
-	body := strings.Replace(generated[start:end], "WriteLuxo(", "writeInlineBenchmarkBaseline(", 1)
+	body := strings.Replace(generated[start:end], "writeLuxoDepth(", "writeInlineBenchmarkBaseline(", 1)
+	body = strings.Replace(body, ", depth int) error {", ") error {\nconst depth = 1", 1)
 	var result strings.Builder
 	for line := range strings.Lines(body) {
 		if strings.Contains(line, "buf.BeginMessage()") || strings.Contains(line, "buf.EndMessage(") {
 			continue
 		}
 		for _, field := range []struct{ name, mask string }{{"Children", "_childMask3"}, {"OptionalChildren", "_childMask4"}} {
-			for _, writer := range []string{"WriteColumnarChild", "WriteColumnarChildValues"} {
-				line = strings.ReplaceAll(line, writer+"(buf, p."+field.name+", "+field.mask+")",
-					"func() error { buf.B = codec.AppendArrayHeader(buf.B, len(p."+field.name+")); for i := range p."+field.name+" { if err := p."+field.name+"[i].WriteLuxo(buf, "+field.mask+"); err != nil { return err } }; return nil }()")
+			for _, writer := range []string{"writeColumnarChildDepth", "writeColumnarChildValuesDepth"} {
+				line = strings.ReplaceAll(line, writer+"(buf, p."+field.name+", "+field.mask+", depth+1)",
+					"func() error { encoded, err := codec.AppendArrayHeader(buf.B, len(p."+field.name+")); if err != nil { return err }; buf.B = encoded; for i := range p."+field.name+" { if err := p."+field.name+"[i].WriteLuxo(buf, "+field.mask+"); err != nil { return err } }; return nil }()")
 			}
 		}
 		result.WriteString(line)
@@ -245,14 +269,19 @@ func nestedInlineBenchmarkBaseline(generated string) string {
 }
 
 func nestedBufferedBenchmarkBaseline(generated string) string {
-	start := strings.Index(generated, "func (p *Parent) WriteLuxo(")
+	start := strings.Index(generated, "func (p *Parent) writeLuxoDepth(")
 	if start < 0 {
-		start = strings.Index(generated, "func (p Parent) WriteLuxo(")
+		start = strings.Index(generated, "func (p Parent) writeLuxoDepth(")
 	}
 	end := start + strings.Index(generated[start:], "\n}\n") + 3
-	body := strings.Replace(generated[start:end], "WriteLuxo(", "writeBufferedBenchmarkBaseline(", 1)
-	body = strings.ReplaceAll(body, "WriteColumnarChildValues(", "writeBufferedChildren(")
-	return strings.ReplaceAll(body, "WriteColumnarChild(", "writeBufferedChildren(")
+	body := strings.Replace(generated[start:end], "writeLuxoDepth(", "writeBufferedBenchmarkBaseline(", 1)
+	body = strings.Replace(body, ", depth int) error {", ") error {\nconst depth = 1", 1)
+	for _, field := range []struct{ name, mask string }{{"Children", "_childMask3"}, {"OptionalChildren", "_childMask4"}} {
+		for _, writer := range []string{"writeColumnarChildDepth", "writeColumnarChildValuesDepth"} {
+			body = strings.ReplaceAll(body, writer+"(buf, p."+field.name+", "+field.mask+", depth+1)", "writeBufferedChildren(buf, p."+field.name+", "+field.mask+")")
+		}
+	}
+	return body
 }
 
 const nestedProtocolAssertions = `package generated
@@ -394,6 +423,15 @@ func writeBufferedChildren(buf *api.ResponseBuf, items []Child, mask []byte) err
     if err != nil { return err }
     buf.B = append(buf.B, data...)
     return nil
+}
+
+func TestNestedBenchmarkReferenceFraming(t *testing.T) {
+ metadata,model:=nestedMetadata();mask,err:=schema.SelectToFieldMask([]*selection.Field{{Name:"children",Children:[]*selection.Field{{Name:"id"},{Name:"label"}}}},model,metadata);if err!=nil{t.Fatal(err)}
+ value:=Parent{Children:[]Child{{Id:1,Label:"東京"}}};var direct,buffered,inline api.ResponseBuf
+ if err:=value.WriteLuxo(&direct,mask);err!=nil{t.Fatal(err)}
+ if err:=value.writeBufferedBenchmarkBaseline(&buffered,mask);err!=nil{t.Fatal(err)}
+ if err:=value.writeInlineBenchmarkBaseline(&inline,mask);err!=nil{t.Fatal(err)}
+ if !bytes.Equal(direct.B,buffered.B)||bytes.Equal(direct.B,inline.B){t.Fatal("benchmark references lost their intended buffering/framing difference")}
 }
 
 func TestNestedWriterAllocations(t *testing.T) {

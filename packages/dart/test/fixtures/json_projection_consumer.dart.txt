@@ -1,6 +1,66 @@
 part of 'int64_consumer_test.dart';
 
 void verifyJSONProjection() {
+  test('nested inputs preserve Binary row bytes and JSON fields', () {
+    const input = CreateInput(child: ChildInput(name: 'nested'));
+    final encoder = sdk.LuxoEncoder();
+    input.writeLuxo(encoder);
+    expect(encoder.bytes(), [0, 1, 6, 1, 6, 110, 101, 115, 116, 101, 100, 0, 0]);
+    expect(input.toJson(), {'child': {'name': 'nested'}});
+  });
+  test('selected Bytes and nested objects retain their JSON projection', () {
+    final row = <String, Object?>{
+      'data': 'AAH/',
+      'child': {'name': 'nested'},
+    };
+    final value = Payload.fromJson(row);
+    expect(value.data.value, [0, 1, 255]);
+    expect(value.child.value.name.value, 'nested');
+    expect(value.toJson(), row);
+    expect(sdk.decodeLuxoJSON(sdk.encodeLuxoJSON(value)), row);
+    expect(value.metadata.isSelected, isFalse);
+    expect(value.chunks.isSelected, isFalse);
+  });
+  test('generated HTTP responses keep JSON128 independent from model64', () async {
+    var body = '';
+    final transport = sdk.HttpTransport(
+      'http://example.test/luxo',
+      client: MockClient((_) async => http.Response(body, 200)),
+    );
+    final client = LuxoClient(transport);
+    addTearDown(client.close);
+    final json128 = '${'[' * 128}null${']' * 128}';
+    body = '{"data":{"metadata":$json128}}';
+    expect((await client.createSnapshot()).metadata.value, isA<List>());
+    body = '{"data":[{"metadata":$json128}]}';
+    expect((await client.listPayloads()).single.metadata.value, isA<List>());
+    body =
+        '{"data":{"items":[{"metadata":$json128}],"total":1,"page":1,"pageSize":10}}';
+    expect(
+      (await client.listPayloadPage()).items.single.metadata.value,
+      isA<List>(),
+    );
+    body = '{"data":$json128}';
+    expect(await client.scalarJSON(), isA<List>());
+    for (final depth in [64, 65]) {
+      body =
+          '{"data":${'{"child":' * (depth - 1)}{"child":null}${'}' * (depth - 1)}}';
+      if (depth == 64) {
+        await client.projection();
+      } else {
+        await expectLater(
+          client.projection(),
+          throwsA(
+            isA<sdk.LuxoError>().having(
+              (error) => error.error,
+              'error',
+              'ParseError',
+            ),
+          ),
+        );
+      }
+    }
+  });
   test(
     'JSON model lists reject every fieldless record before delivery',
     _rejectFieldlessRows,

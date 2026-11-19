@@ -149,6 +149,10 @@ Connection auto-reconnect uses exponential backoff (1s → 2s → 4s → ... →
 It does not replay subscriptions: disconnect reports `NetworkError`, and callers
 must explicitly create a new subscription if they want to resume.
 
+`timeout` separately bounds connection setup, each response/subscription ACK and
+token renewal. A stalled handshake fails its waiters with `TimeoutError` and
+closes that socket; it is not a single deadline covering all these phases.
+
 ```ts
 import { WsTransport } from '@luxojs/client'
 
@@ -291,8 +295,9 @@ Exhaustion throws `RequestIDExhausted` without wrapping or replacing pending
 calls. Call parameters cannot override `$id` or `$api`.
 
 Missing, negative, negative-zero, boolean, quoted, fractional, exponent or
-overflowing JSON IDs and malformed Binary ID varints are ignored without
-consuming a pending call. JSON subscription acknowledgements require `ok: true`
+overflowing IDs in a valid JSON envelope cannot consume a pending call.
+Malformed Binary frame tags or ID varints instead retire the connection with
+`ParseError`; an ID cannot be trusted after a damaged Binary header. JSON subscription acknowledgements require `ok: true`
 unless they contain an error; successful Binary acknowledgements must have no
 trailing payload. These checks do not change business `Int`/`Duration` encoding.
 
@@ -327,8 +332,12 @@ rejects pending work even if the browser's close event arrives later.
 An unparseable JSON message (including an invalid root or malformed Unicode)
 closes its connection and fails all pending calls/setup and established streams
 with `ParseError`. IDs are never guessed from a damaged document. Reconnection
-does not replay subscriptions. A valid envelope with a bad business payload still
-fails only that subscription with `DecodeError`.
+does not replay subscriptions. Invalid Binary frame tags, missing/truncated IDs
+or UInt64 overflow use the same connection-wide `ParseError` cleanup. A successful
+Binary subscription ACK with trailing bytes and a valid ID fails only that
+subscription with `ParseError`; valid late or retired IDs are still ignored.
+A valid envelope with a bad business payload still fails only that subscription
+with `DecodeError`.
 
 All disconnect observers are notified even if one throws or closes the transport.
 A single callback failure is rethrown unchanged; multiple failures are preserved

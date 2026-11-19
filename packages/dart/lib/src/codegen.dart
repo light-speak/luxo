@@ -3,8 +3,10 @@ import 'dart:io';
 
 import 'types.dart';
 import 'json.dart';
+import 'identifier.dart';
 
 part 'codegen_enum.dart';
+part 'codegen_sealed.dart';
 part 'codegen_request.dart';
 part 'codegen_query.dart';
 
@@ -21,9 +23,14 @@ Future<void> generate({
   try {
     final base = Uri.parse(endpoint);
     final uri = base.replace(
-      queryParameters: {...base.queryParameters, r'$schema': ''},
+      queryParameters: {
+        ...base.queryParametersAll,
+        r'$schema': [''],
+      },
+      fragment: '',
     );
     final request = await client.getUrl(uri);
+    request.followRedirects = false;
     request.headers.set('X-Introspection-Key', key);
     final response = await request.close();
     if (response.statusCode != 200) {
@@ -40,7 +47,7 @@ Future<void> generate({
 
     final schema = LuxoSchema.fromJson(json);
     schema.validateIDs();
-    _validateEnums(schema);
+    _validateSchemaReferences(schema);
     final queries = generateQueryBuilders(schema);
 
     final dir = Directory(outDir);
@@ -76,7 +83,7 @@ String _luxoTypeToDart(String type) {
     case 'JSON':
       return 'Object';
     default:
-      return type; // model reference
+      return dartTypeIdentifier(type); // model reference
   }
 }
 
@@ -94,12 +101,12 @@ bool _isScalar(String type) => const {
   'JSON',
 }.contains(type);
 
-String _dartParamType(LuxoParam param, Map<String, TypeUsage> usages) {
+String _dartParamType(LuxoParam param, _TypeUsages usages) {
   final schemaType = param.typeName ?? param.type;
   final type = usages.containsKey(schemaType)
       ? _inputTypeName(schemaType, usages)
       : param.type == 'Enum' && param.typeName != null
-      ? param.typeName!
+      ? dartTypeIdentifier(param.typeName!)
       : _luxoTypeToDart(param.type);
   return param.isList ? _dartListType(param.type, type) : type;
 }
@@ -114,21 +121,36 @@ String _dartListType(String schemaType, String elementType) =>
 String _dartFieldType(
   LuxoField f,
   LuxoSchema schema, {
-  required Map<String, TypeUsage> usages,
+  required _TypeUsages usages,
   bool input = false,
 }) {
   final typeName = f.typeName ?? f.type;
   final structured =
-      schema.models.containsKey(typeName) || schema.types.containsKey(typeName);
+      schema.models.containsKey(typeName) ||
+      schema.types.containsKey(typeName) ||
+      schema.sealeds.containsKey(typeName);
   final base = structured && input
       ? _inputTypeName(typeName, usages)
       : f.type == 'Enum' && f.typeName != null
-      ? f.typeName!
+      ? dartTypeIdentifier(f.typeName!)
       : f.type == 'Model' || structured
-      ? typeName
+      ? dartTypeIdentifier(typeName)
       : _luxoTypeToDart(f.type);
   if (f.isList) return _dartListType(f.type, base);
   return base;
+}
+
+// JSON null is a value even when the containing Schema field is required.
+String _dartFieldValueType(
+  LuxoField field,
+  LuxoSchema schema, {
+  required _TypeUsages usages,
+  bool input = false,
+}) {
+  final base = _dartFieldType(field, schema, usages: usages, input: input);
+  return field.nullable || (field.type == 'JSON' && !field.isList)
+      ? '$base?'
+      : base;
 }
 
 bool _hasInputUsage(TypeUsage usage) =>
@@ -137,8 +159,61 @@ bool _hasInputUsage(TypeUsage usage) =>
 bool _hasOutputUsage(TypeUsage usage) =>
     usage == TypeUsage.output || usage == TypeUsage.inputOutput;
 
-String _inputTypeName(String name, Map<String, TypeUsage> usages) =>
-    usages[name] == TypeUsage.inputOutput ? '${name}Input' : name;
+// Only generation keeps this catalog; emitted codecs contain no name lookup.
+final class _TypeUsages {
+  final Map<String, TypeUsage> _states;
+  final Map<String, String> inputAliases;
+  _TypeUsages(this._states, this.inputAliases);
+  TypeUsage? operator [](String name) => _states[name];
+  bool containsKey(String name) => _states.containsKey(name);
+  Iterable<TypeUsage> get values => _states.values;
+}
+
+Map<String, String> _planInputAliases(
+  LuxoSchema schema,
+  Map<String, TypeUsage> states,
+) {
+  List<String>? collisions;
+  for (final entry in states.entries) {
+    if (entry.value != TypeUsage.inputOutput) continue;
+    final preferred = '${entry.key}Input';
+    if ((states[preferred] ?? TypeUsage.unused) != TypeUsage.unused ||
+        schema.enums.containsKey(preferred)) {
+      (collisions ??= []).add(entry.key);
+    }
+  }
+  if (collisions == null) return const {};
+  final reserved = <String>{...schema.enums.keys};
+  for (final entry in states.entries) {
+    if (entry.value != TypeUsage.unused) reserved.add(entry.key);
+    if (entry.value == TypeUsage.inputOutput) reserved.add('${entry.key}Input');
+  }
+  final aliases = <String, String>{};
+  collisions.sort();
+  for (final name in collisions) {
+    final fields =
+        schema.models[name]?.fields ??
+        schema.types[name]?.fields ??
+        const <LuxoField>[];
+    final members = {for (final field in fields) field.name};
+    final base = 'Luxo${name}Input';
+    var candidate = base;
+    var ordinal = 2;
+    while (reserved.contains(candidate) || members.contains(candidate)) {
+      candidate = '$base${ordinal++}';
+    }
+    reserved.add(candidate);
+    aliases[name] = candidate;
+  }
+  return aliases;
+}
+
+String _inputTypeName(String name, _TypeUsages usages) =>
+    dartTypeIdentifier(usages.inputAliases[name] ?? name) +
+    (usages.inputAliases.containsKey(name) ||
+            usages[name] != TypeUsage.inputOutput
+        ? ''
+        : 'Input');
 
 TypeUsage _mergeUsage(TypeUsage current, TypeUsage next) {
   if (current == TypeUsage.unused) return next;
@@ -146,14 +221,20 @@ TypeUsage _mergeUsage(TypeUsage current, TypeUsage next) {
   return TypeUsage.inputOutput;
 }
 
-Map<String, TypeUsage> _inferTypeUsages(LuxoSchema schema) {
+_TypeUsages _inferTypeUsages(LuxoSchema schema) {
   final fields = <String, List<LuxoField>>{
     for (final model in schema.models.values) model.name: model.fields,
     for (final type in schema.types.values) type.name: type.fields,
+    for (final owner in schema.sealeds.values)
+      owner.name: [
+        for (final variant in owner.variants)
+          ...variant.fields.map(_sealedField),
+      ],
   };
   final declared = <String, TypeUsage?>{
     for (final model in schema.models.values) model.name: model.usage,
     for (final type in schema.types.values) type.name: type.usage,
+    for (final owner in schema.sealeds.values) owner.name: owner.usage,
   };
   final usages = <String, TypeUsage>{
     for (final name in fields.keys) name: TypeUsage.unused,
@@ -188,11 +269,12 @@ Map<String, TypeUsage> _inferTypeUsages(LuxoSchema schema) {
       mark(entry.key, TypeUsage.output);
     }
   }
-  return usages;
+  return _TypeUsages(usages, _planInputAliases(schema, usages));
 }
 
 String _genTypes(LuxoSchema schema) {
   final usages = _inferTypeUsages(schema);
+  final generated = usages.values.any((usage) => usage != TypeUsage.unused);
   bool needsConvert(String name, List<LuxoField> fields) =>
       usages[name] != TypeUsage.unused &&
       fields.any((field) => field.type == 'Bytes' || field.type == 'JSON');
@@ -200,7 +282,13 @@ String _genTypes(LuxoSchema schema) {
       schema.models.values.any(
         (model) => needsConvert(model.name, model.fields),
       ) ||
-      schema.types.values.any((type) => needsConvert(type.name, type.fields));
+      schema.types.values.any((type) => needsConvert(type.name, type.fields)) ||
+      schema.sealeds.values.any(
+        (owner) => needsConvert(owner.name, [
+          for (final variant in owner.variants)
+            ...variant.fields.map(_sealedField),
+        ]),
+      );
   final b = StringBuffer();
   b.writeln('// Auto-generated by luxo_client. DO NOT EDIT.\n');
   if (convert) {
@@ -216,9 +304,12 @@ String _genTypes(LuxoSchema schema) {
       schema.types.values.any((type) => needsBytes(type.name, type.fields))) {
     b.writeln("import 'dart:typed_data';");
   }
-  if (schema.enums.isNotEmpty ||
-      usages.values.any((usage) => usage != TypeUsage.unused)) {
-    b.writeln("import 'package:luxo_client/luxo_client.dart';\n");
+  if (schema.enums.isNotEmpty || generated) {
+    b.writeln("import 'package:luxo_client/luxo_client.dart';");
+    if (generated) {
+      b.writeln(r"import 'package:luxo_client/src/json.dart' as $jsonCodec;");
+    }
+    b.writeln();
   }
   b.writeln("export 'package:luxo_client/src/types.dart' show Page;\n");
 
@@ -231,6 +322,7 @@ String _genTypes(LuxoSchema schema) {
     _writeDartDeclarations(b, m.name, m.fields, schema, usages);
   }
 
+  _writeDartSealeds(b, schema, usages);
   return b.toString();
 }
 
@@ -239,12 +331,19 @@ void _writeDartDeclarations(
   String name,
   List<LuxoField> fields,
   LuxoSchema schema,
-  Map<String, TypeUsage> usages,
+  _TypeUsages usages,
 ) {
   final usage = usages[name] ?? TypeUsage.unused;
   if (_hasOutputUsage(usage)) {
-    _writeDartDeclaration(b, name, fields, schema, usages, output: true);
-    _writeDartDecoders(b, name, fields, schema, usages);
+    _writeDartDeclaration(
+      b,
+      dartTypeIdentifier(name),
+      fields,
+      schema,
+      usages,
+      output: true,
+    );
+    _writeDartDecoders(b, dartTypeIdentifier(name), fields, schema, usages);
   }
   if (_hasInputUsage(usage)) {
     _writeDartDeclaration(
@@ -258,39 +357,79 @@ void _writeDartDeclarations(
   }
 }
 
+void _validateDartMembers(
+  String name,
+  List<LuxoField> fields, {
+  required bool output,
+}) {
+  const common = {
+    'toJson',
+    'fromJson',
+    'hashCode',
+    'runtimeType',
+    'toString',
+    'noSuchMethod',
+    r'_$json',
+    r'_$toJson',
+    r'$writeJSON',
+    r'_$writeJSON',
+  };
+  const inputMembers = {'writeLuxo', 'toLuxoParameters', r'_$writeLuxo'};
+  const outputMembers = {r'$fromJsonItem'};
+  final members = output ? outputMembers : inputMembers;
+  for (final field in fields) {
+    if (field.name == name ||
+        common.contains(field.name) ||
+        members.contains(field.name)) {
+      throw FormatException(
+        'generated Dart member conflicts with field: $name.${field.name}',
+      );
+    }
+  }
+}
+
 void _writeDartDeclaration(
   StringBuffer b,
   String name,
   List<LuxoField> fields,
   LuxoSchema schema,
-  Map<String, TypeUsage> usages, {
+  _TypeUsages usages, {
   required bool output,
 }) {
+  _validateDartMembers(name, fields, output: output);
   b.writeln(
-    'class $name implements ${output ? 'LuxoJSONEncodable' : 'LuxoBinaryEncodable, LuxoJSONParameters'} {',
+    'class $name implements ${output ? r'$jsonCodec.LuxoJSONWritable' : r'LuxoBinaryEncodable, LuxoJSONParameters, $jsonCodec.LuxoJSONWritable'} {',
   );
   for (final f in fields) {
-    final base = _dartFieldType(f, schema, usages: usages, input: !output);
-    final value = f.nullable ? '$base?' : base;
+    final value = _dartFieldValueType(
+      f,
+      schema,
+      usages: usages,
+      input: !output,
+    );
     final type = output ? 'Selected<$value>' : value;
-    b.writeln('  final $type ${f.name};');
+    b.writeln('  final $type ${_dartMember(f)};');
   }
   b.writeln();
   b.writeln('  const $name({');
   for (final f in fields) {
     if (output) {
-      final base = _dartFieldType(f, schema, usages: usages);
-      final value = f.nullable ? '$base?' : base;
-      b.writeln('    this.${f.name} = const Selected<$value>.unselected(),');
+      final value = _dartFieldValueType(f, schema, usages: usages);
+      b.writeln(
+        '    this.${_dartMember(f)} = const Selected<$value>.unselected(),',
+      );
     } else {
       b.writeln(
-        f.nullable ? '    this.${f.name},' : '    required this.${f.name},',
+        f.nullable
+            ? '    this.${_dartMember(f)},'
+            : '    required this.${_dartMember(f)},',
       );
     }
   }
   b.writeln('  });\n');
   _writeDartJSONFactory(b, name, fields, schema, usages, output: output);
   _writeDartJSONProjection(b, fields, schema, output: output);
+  _writeDartNativeJSONWriter(b, fields, schema, output: output);
   if (!output) {
     _writeDartJSONProjection(
       b,
@@ -309,18 +448,42 @@ void _writeDartJSONFactory(
   String name,
   List<LuxoField> fields,
   LuxoSchema schema,
-  Map<String, TypeUsage> usages, {
+  _TypeUsages usages, {
   required bool output,
 }) {
   if (output) {
     _writeDartSelectedJSONFactory(b, name, fields, schema, usages);
     return;
   }
-  b.writeln('  factory $name.fromJson(Map<String, dynamic> json) => $name(');
-  for (final f in fields) {
-    b.writeln('    ${f.name}: ${_jsonCast(f, schema, usages, input: true)},');
+  b.writeln(
+    '  factory $name.fromJson(Map<String, dynamic> json) => $name._\$json(json, 0);',
+  );
+  b.writeln(
+    '  factory $name._\$json(Map<String, dynamic> json, int \$depth) {',
+  );
+  _writeDartModelDepthGuard(b, '    ');
+  for (final (index, field) in fields.indexed) {
+    final read = _writeDartJSONRead(
+      b,
+      field,
+      schema,
+      usages,
+      index,
+      input: true,
+    );
+    b.writeln('    final \$field$index = $read;');
   }
-  b.writeln('  );');
+  b.writeln('    return $name(');
+  for (final (index, field) in fields.indexed) {
+    b.writeln('      ${_dartMember(field)}: \$field$index,');
+  }
+  b.writeln('    );\n  }');
+}
+
+void _writeDartModelDepthGuard(StringBuffer b, String indent) {
+  b.writeln(
+    "${indent}if (\$depth >= 64) throw const FormatException('Model nesting exceeds 64 levels');",
+  );
 }
 
 // '$' helper names cannot collide with DSL fields. List validation shares the
@@ -330,37 +493,118 @@ void _writeDartSelectedJSONFactory(
   String name,
   List<LuxoField> fields,
   LuxoSchema schema,
-  Map<String, TypeUsage> usages,
-) {
+  _TypeUsages usages, {
+  bool sealedPayload = false,
+}) {
   b.writeln(
-    '  factory $name.fromJson(Map<String, dynamic> json) => $name._\$json(json, false);',
+    '  factory $name.fromJson(Map<String, dynamic> json) => $name._\$json(json, false, 0);',
   );
   b.writeln(
-    '  static $name \$fromJsonItem(Map<String, dynamic> json) => $name._\$json(json, true);',
+    '  static $name \$fromJsonItem(Map<String, dynamic> json) => $name._\$json(json, true, 0);',
   );
   b.writeln(
-    '  factory $name._\$json(Map<String, dynamic> json, bool \$requireField) {',
+    '  factory $name._\$json(Map<String, dynamic> json, bool \$requireField, int \$depth) {',
   );
+  _writeDartModelDepthGuard(b, '    ');
+  if (sealedPayload) _writeSealedJSONKeys(b, fields);
   b.writeln('    var \$hasField = false;');
   for (final (index, field) in fields.indexed) {
-    final base = _dartFieldType(field, schema, usages: usages);
-    final value = field.nullable ? '$base?' : base;
+    final value = _dartFieldValueType(field, schema, usages: usages);
     b.writeln('    var \$field$index = const Selected<$value>.unselected();');
     b.writeln("    if (json.containsKey('${field.name}')) {");
     b.writeln('      \$hasField = true;');
-    b.writeln(
-      '      \$field$index = Selected<$value>.value(${_jsonCast(field, schema, usages, input: false)});',
+    final read = _writeDartJSONRead(
+      b,
+      field,
+      schema,
+      usages,
+      index,
+      input: false,
     );
+    b.writeln('      \$field$index = Selected<$value>.value($read);');
     b.writeln('    }');
   }
   b.writeln(
-    "    if (\$requireField && !\$hasField) throw const FormatException('$name list item requires at least one Schema field');",
+    "    if (\$requireField && !\$hasField) throw const FormatException('${wireIdentifier(name).replaceAll(r'$', r'\$')} list item requires at least one Schema field');",
   );
   b.writeln('    return $name(');
   for (final (index, field) in fields.indexed) {
-    b.writeln('      ${field.name}: \$field$index,');
+    b.writeln('      ${_dartMember(field)}: \$field$index,');
   }
   b.writeln('    );\n  }');
+}
+
+String _writeDartJSONRead(
+  StringBuffer b,
+  LuxoField field,
+  LuxoSchema schema,
+  _TypeUsages usages,
+  int index, {
+  required bool input,
+}) {
+  if (!field.isList || !_isNested(field, schema))
+    return _jsonCast(field, schema, usages, input: input);
+  final name = field.typeName ?? field.type;
+  final type = input ? _inputTypeName(name, usages) : dartTypeIdentifier(name);
+  final raw = '\$raw$index', items = '\$items$index';
+  final indent = input ? '    ' : '      ';
+  b.writeln(
+    "${indent}final $raw = json['${field.name}'] as List${field.nullable ? '?' : ''};",
+  );
+  b.writeln('${indent}final List<$type>${field.nullable ? '?' : ''} $items;');
+  if (field.nullable) {
+    b.writeln('${indent}if ($raw == null) {');
+    b.writeln('$indent  $items = null;');
+    b.writeln('$indent} else {');
+  }
+  final nestedIndent = field.nullable ? '$indent  ' : indent;
+  final args = input ? '\$depth + 1' : 'true, \$depth + 1';
+  _writeDartJSONItems(b, raw, items, type, args, nestedIndent);
+  if (field.nullable) b.writeln('$indent}');
+  return items;
+}
+
+void _writeDartJSONItems(
+  StringBuffer b,
+  String raw,
+  String items,
+  String type,
+  String args,
+  String indent,
+) {
+  _writeDartTypedItems(
+    b,
+    raw,
+    items,
+    type,
+    '$type._\$json($raw[\$index] as Map<String, dynamic>, $args)',
+    indent,
+  );
+}
+
+void _writeDartTypedItems(
+  StringBuffer b,
+  String raw,
+  String items,
+  String type,
+  String read,
+  String indent,
+) {
+  final values = '${items}Values';
+  b.writeln('${indent}List<$type>? $values;');
+  b.writeln(
+    '${indent}for (var \$index = 0; \$index < $raw.length; \$index++) {',
+  );
+  b.writeln('$indent  final \$item = $read;');
+  b.writeln('$indent  if ($values == null) {');
+  b.writeln(
+    '$indent    $values = List<$type>.filled($raw.length, \$item, growable: true);',
+  );
+  b.writeln('$indent  } else {');
+  b.writeln('$indent    $values[\$index] = \$item;');
+  b.writeln('$indent  }');
+  b.writeln('$indent}');
+  b.writeln('$indent$items = $values ?? <$type>[];');
 }
 
 void _writeDartJSONProjection(
@@ -372,15 +616,162 @@ void _writeDartJSONProjection(
 }) {
   final method = parameters ? 'toLuxoParameters' : 'toJson';
   b.writeln('  @override');
+  if (!parameters) {
+    b.writeln('  Map<String, Object?> toJson() => _\$toJson(0);');
+    b.writeln('  Map<String, Object?> _\$toJson(int \$depth) {');
+    _writeDartModelDepthGuard(b, '    ');
+    b.writeln('    final \$json = <String, Object?>{};');
+    for (final (index, field) in fields.indexed) {
+      final indent = output ? '      ' : '    ';
+      if (output) b.writeln('    if (${_dartMember(field)}.isSelected) {');
+      final value = output ? '${_dartMember(field)}.value' : _dartMember(field);
+      final read = _writeDartProjectionValue(
+        b,
+        field,
+        schema,
+        value,
+        index,
+        indent,
+      );
+      b.writeln("$indent\$json['${field.name}'] = $read;");
+      if (output) b.writeln('    }');
+    }
+    b.writeln('    return \$json;\n  }');
+    return;
+  }
   b.writeln('  Map<String, Object?> $method() => {');
   for (final f in fields) {
-    final fieldValue = output ? '${f.name}.value' : f.name;
-    final condition = output ? 'if (${f.name}.isSelected) ' : '';
+    final fieldValue = output ? '${_dartMember(f)}.value' : _dartMember(f);
+    final condition = output ? 'if (${_dartMember(f)}.isSelected) ' : '';
     b.writeln(
       "    $condition'${f.name}': ${_jsonWrite(f, schema, fieldValue, parameters: parameters)},",
     );
   }
   b.writeln('  };');
+}
+
+String _writeDartProjectionValue(
+  StringBuffer b,
+  LuxoField field,
+  LuxoSchema schema,
+  String value,
+  int index,
+  String indent,
+) {
+  if (!field.isList || !_isNested(field, schema))
+    return _jsonWrite(field, schema, value);
+  final raw = '\$raw$index', items = '\$items$index';
+  b.writeln('${indent}final $raw = $value;');
+  b.writeln(
+    '${indent}final List<Map<String, Object?>>${field.nullable ? '?' : ''} $items;',
+  );
+  if (field.nullable) {
+    b.writeln('${indent}if ($raw == null) {');
+    b.writeln('$indent  $items = null;');
+    b.writeln('$indent} else {');
+  }
+  _writeDartTypedItems(
+    b,
+    raw,
+    items,
+    'Map<String, Object?>',
+    '$raw[\$index]._\$toJson(\$depth + 1)',
+    field.nullable ? '$indent  ' : indent,
+  );
+  if (field.nullable) b.writeln('$indent}');
+  return items;
+}
+
+void _writeDartNativeJSONWriter(
+  StringBuffer b,
+  List<LuxoField> fields,
+  LuxoSchema schema, {
+  required bool output,
+}) {
+  b.writeln('  @override');
+  b.writeln(
+    '  void \$writeJSON(\$jsonCodec.LuxoJSONOutput \$out) => _\$writeJSON(\$out, 0);',
+  );
+  b.writeln(
+    '  void _\$writeJSON(\$jsonCodec.LuxoJSONOutput \$out, int \$depth) {',
+  );
+  _writeDartModelDepthGuard(b, '    ');
+  _writeDartJSONRaw(b, '{', '    ');
+  if (output && fields.length > 1) b.writeln('    var \$first = true;');
+  for (final (index, field) in fields.indexed) {
+    final indent = output ? '      ' : '    ';
+    if (output) {
+      b.writeln('    if (${_dartMember(field)}.isSelected) {');
+      if (index != 0) b.writeln("      if (!\$first) \$out.writeRaw(',');");
+      if (index + 1 < fields.length) b.writeln('      \$first = false;');
+    }
+    final prefix = !output && index != 0 ? ',' : '';
+    _writeDartJSONRaw(b, '$prefix${jsonEncode(field.name)}:', indent);
+    final value = output ? '${_dartMember(field)}.value' : _dartMember(field);
+    _writeDartNativeJSONValue(b, field, schema, value, indent);
+    if (output) b.writeln('    }');
+  }
+  _writeDartJSONRaw(b, '}', '    ');
+  b.writeln('  }');
+}
+
+void _writeDartJSONRaw(StringBuffer b, String value, String indent) {
+  final literal = jsonEncode(value).replaceAll(r'$', r'\$');
+  b.writeln('$indent\$out.writeRaw($literal);');
+}
+
+void _writeDartNativeJSONValue(
+  StringBuffer b,
+  LuxoField field,
+  LuxoSchema schema,
+  String value,
+  String indent,
+) {
+  if (field.nullable) {
+    b.writeln('${indent}if ($value == null) {');
+    _writeDartJSONRaw(b, 'null', '$indent  ');
+    b.writeln('$indent} else {');
+  }
+  final bodyIndent = field.nullable ? '$indent  ' : indent;
+  final nonNull = field.nullable ? '$value!' : value;
+  if (field.isList) {
+    _writeDartJSONRaw(b, '[', bodyIndent);
+    b.writeln(
+      '${bodyIndent}for (var \$index = 0; \$index < $nonNull.length; \$index++) {',
+    );
+    b.writeln("$bodyIndent  if (\$index != 0) \$out.writeRaw(',');");
+    _writeDartNativeJSONScalar(
+      b,
+      field,
+      schema,
+      '$nonNull[\$index]',
+      '$bodyIndent  ',
+    );
+    b.writeln('$bodyIndent}');
+    _writeDartJSONRaw(b, ']', bodyIndent);
+  } else {
+    _writeDartNativeJSONScalar(b, field, schema, nonNull, bodyIndent);
+  }
+  if (field.nullable) b.writeln('$indent}');
+}
+
+void _writeDartNativeJSONScalar(
+  StringBuffer b,
+  LuxoField field,
+  LuxoSchema schema,
+  String value,
+  String indent,
+) {
+  if (_isNested(field, schema)) {
+    b.writeln('$indent$value._\$writeJSON(\$out, \$depth + 1);');
+    return;
+  }
+  final encoded = field.type == 'Bytes'
+      ? 'base64Encode($value)'
+      : field.type == 'Enum' && field.typeName != null
+      ? '$value.rawValue'
+      : value;
+  b.writeln('$indent\$out.writeJSON($encoded);');
 }
 
 void _writeDartBinaryEncoder(
@@ -392,13 +783,18 @@ void _writeDartBinaryEncoder(
     (field) =>
         !field.isList && (field.type == 'String' || field.type == 'Enum'),
   );
-  final arenaTerms = arenaFields.map(
-    (field) => field.nullable
-        ? "(${field.name} == null ? 0 : luxoUtf8Length(${_enumWireValue(field.type, field.typeName, '${field.name}!')}))"
-        : 'luxoUtf8Length(${_enumWireValue(field.type, field.typeName, field.name)})',
-  );
+  final arenaTerms = arenaFields.map((field) {
+    final value = _dartBinaryFieldReference(field);
+    return field.nullable
+        ? "($value == null ? 0 : luxoUtf8Length(${_enumWireValue(field.type, field.typeName, '$value!')}))"
+        : 'luxoUtf8Length(${_enumWireValue(field.type, field.typeName, value)})';
+  });
   b.writeln('\n  @override');
-  b.writeln('  void writeLuxo(LuxoEncoder encoder) {');
+  b.writeln(
+    '  void writeLuxo(LuxoEncoder encoder) => _\$writeLuxo(encoder, 0);',
+  );
+  b.writeln('  void _\$writeLuxo(LuxoEncoder encoder, int \$depth) {');
+  _writeDartModelDepthGuard(b, '    ');
   b.writeln(
     '    encoder.writeVarint(${arenaTerms.isEmpty ? '0' : arenaTerms.join(' + ')});',
   );
@@ -409,17 +805,21 @@ void _writeDartBinaryEncoder(
   b.writeln('  }');
 }
 
+String _dartBinaryFieldReference(LuxoField field) =>
+    field.name == 'encoder' ? 'this.encoder' : _dartMember(field);
+
 void _writeDartBinaryField(StringBuffer b, LuxoField field, LuxoSchema schema) {
+  final value = _dartBinaryFieldReference(field);
   b.writeln('    encoder.writeVarint(${field.id});');
   if (!field.nullable) {
-    _writeDartBinaryValue(b, field, field.name, schema, '    ');
+    _writeDartBinaryValue(b, field, value, schema, '    ');
     return;
   }
-  b.writeln('    if (${field.name} == null) {');
+  b.writeln('    if ($value == null) {');
   b.writeln('      encoder.writeNull();');
   b.writeln('    } else {');
   b.writeln('      encoder.writePresent();');
-  _writeDartBinaryValue(b, field, '${field.name}!', schema, '      ');
+  _writeDartBinaryValue(b, field, '$value!', schema, '      ');
   b.writeln('    }');
 }
 
@@ -431,7 +831,7 @@ void _writeDartBinaryValue(
   String indent,
 ) {
   if (field.isList) {
-    b.writeln('${indent}encoder.writeVarint($value.length);');
+    b.writeln('${indent}encoder.writeArrayHeader($value.length);');
     b.writeln('${indent}for (final item in $value) {');
     _writeDartBinaryScalar(b, field, 'item', schema, '$indent  ');
     b.writeln('$indent}');
@@ -447,8 +847,14 @@ void _writeDartBinaryScalar(
   LuxoSchema schema,
   String indent,
 ) {
+  if (schema.sealeds.containsKey(field.typeName ?? field.type)) {
+    b.writeln(
+      '${indent}encoder.writeDelimited((\$child) => $value._\$writeLuxo(\$child, \$depth + 1));',
+    );
+    return;
+  }
   if (_isNested(field, schema)) {
-    b.writeln('${indent}$value.writeLuxo(encoder);');
+    b.writeln('${indent}$value._\$writeLuxo(encoder, \$depth + 1);');
     return;
   }
   switch (field.type) {
@@ -470,7 +876,7 @@ void _writeDartBinaryScalar(
       b.writeln('${indent}encoder.writeBytes($value);');
     case 'JSON':
       b.writeln(
-        '${indent}encoder.writeBytes(utf8.encode(encodeLuxoJSON($value)));',
+        '${indent}encoder.writeBytes(utf8.encode(encodeLuxoJSON($value, opaque: true)));',
       );
   }
 }
@@ -480,14 +886,16 @@ void _writeDartDecoders(
   String name,
   List<LuxoField> fields,
   LuxoSchema schema,
-  Map<String, TypeUsage> usages,
-) {
-  b.writeln('$name decode$name(LuxoDecoder dec) {');
+  _TypeUsages usages, {
+  bool rowOnly = false,
+}) {
+  b.writeln('$name decode$name(LuxoDecoder dec) => _\$decode$name(dec, 0);');
+  b.writeln('$name _\$decode$name(LuxoDecoder dec, int \$depth) {');
+  _writeDartModelDepthGuard(b, '  ');
   for (final f in fields) {
-    final base = _dartFieldType(f, schema, usages: usages);
-    final value = f.nullable ? '$base?' : base;
+    final value = _dartFieldValueType(f, schema, usages: usages);
     b.writeln(
-      '  Selected<$value> _${f.name} = const Selected<$value>.unselected();',
+      '  Selected<$value> _${_dartMember(f)} = const Selected<$value>.unselected();',
     );
   }
   b.writeln('  dec.skipArenaHeader();');
@@ -495,24 +903,50 @@ void _writeDartDecoders(
   b.writeln('    switch (dec.fieldID) {');
   for (final f in fields) {
     b.writeln(
-      '      case ${f.id}: _${f.name} = Selected.value(${_binaryRead(f)}); break;',
+      '      case ${f.id}: _${_dartMember(f)} = Selected.value(${_binaryRead(f, schema)}); break;',
     );
   }
   b.writeln(
-    "      default: throw FormatException('unknown $name field ID \${dec.fieldID}');",
+    "      default: throw FormatException('unknown ${wireIdentifier(name).replaceAll(r'$', r'\$')} field ID \${dec.fieldID}');",
   );
   b.writeln('    }');
   b.writeln('  }');
   b.writeln('  dec.checkComplete();');
   b.writeln('  return $name(');
   for (final f in fields) {
-    b.writeln('    ${f.name}: _${f.name},');
+    b.writeln('    ${_dartMember(f)}: _${_dartMember(f)},');
   }
   b.writeln('  );');
   b.writeln('}\n');
 
+  if (rowOnly) return;
+  _writeDartColumnarItem(b, name, fields, schema, usages);
   _writeColumnarDecoder(b, name, fields, schema, usages, false);
   _writeColumnarDecoder(b, name, fields, schema, usages, true);
+}
+
+void _writeDartColumnarItem(
+  StringBuffer b,
+  String name,
+  List<LuxoField> fields,
+  LuxoSchema schema,
+  _TypeUsages usages,
+) {
+  b.writeln('$name _\$columnar$name(int i, int \$depth,');
+  for (final field in fields) {
+    b.writeln(
+      '  ${_columnStorageType(field, schema, usages)}? _${_dartMember(field)},',
+    );
+  }
+  b.writeln(') {');
+  _writeDartModelDepthGuard(b, '  ');
+  b.writeln('  return $name(');
+  for (final field in fields) {
+    b.writeln(
+      '    ${_dartMember(field)}: ${_columnValue(field, schema, usages)},',
+    );
+  }
+  b.writeln('  );\n}\n');
 }
 
 String _jsonWrite(
@@ -530,9 +964,11 @@ String _jsonWrite(
   final value = field.nullable ? '$fieldValue!' : fieldValue;
   String encoded;
   if (_isNested(field, schema)) {
+    encoded = '$value._\$toJson(\$depth + 1)';
+  } else if (field.type == 'JSON' && !parameters) {
     encoded = field.isList
-        ? '$value.map((item) => item.toJson()).toList()'
-        : '$value.toJson()';
+        ? '\$jsonCodec.normalizeLuxoJSONList($value)'
+        : 'normalizeLuxoJSON($value)';
   } else if (field.type == 'Bytes') {
     encoded = field.isList
         ? '$value.map(base64Encode).toList()'
@@ -543,7 +979,7 @@ String _jsonWrite(
         : '$value.toBigInt()';
   } else if (field.type == 'Enum' && field.typeName != null) {
     encoded = field.isList
-        ? '${field.typeName}.\$rawList($value)'
+        ? '${dartTypeIdentifier(field.typeName!)}.\$rawList($value)'
         : '$value.rawValue';
   } else {
     encoded = value;
@@ -556,25 +992,28 @@ void _writeColumnarDecoder(
   String name,
   List<LuxoField> fields,
   LuxoSchema schema,
-  Map<String, TypeUsage> usages,
+  _TypeUsages usages,
   bool paginated,
 ) {
   final returnType = paginated ? 'Page<$name>' : 'List<$name>';
   final function = paginated ? 'decodePaginated$name' : 'decodeColumnar$name';
-  b.writeln('$returnType $function(Uint8List data) {');
+  b.writeln('$returnType $function(Uint8List data) => _\$$function(data, 0);');
+  b.writeln('$returnType _\$$function(Uint8List data, int \$depth) {');
   b.writeln('  final dec = ColumnarDecoder(data);');
   for (final f in fields) {
-    b.writeln('  ${_columnStorageType(f, schema, usages)}? _${f.name};');
+    b.writeln(
+      '  ${_columnStorageType(f, schema, usages)}? _${_dartMember(f)};',
+    );
   }
   b.writeln('  while (dec.nextColumn()) {');
   b.writeln('    switch (dec.fieldID) {');
   for (final f in fields) {
     b.writeln(
-      '      case ${f.id}: _${f.name} = ${_columnRead(f, schema)}; break;',
+      '      case ${f.id}: _${_dartMember(f)} = ${_columnRead(f, schema)}; break;',
     );
   }
   b.writeln(
-    "      default: throw FormatException('unknown $name column ID \${dec.fieldID}');",
+    "      default: throw FormatException('unknown ${wireIdentifier(name).replaceAll(r'$', r'\$')} column ID \${dec.fieldID}');",
   );
   b.writeln('    }');
   b.writeln('  }');
@@ -587,11 +1026,16 @@ void _writeColumnarDecoder(
   b.writeln(
     "  if (dec.error != null || dec.offset != data.length) throw FormatException(dec.error ?? 'trailing $context data');",
   );
-  b.writeln('  final items = List<$name>.generate(dec.count, (i) => $name(');
-  for (final f in fields) {
-    b.writeln('    ${f.name}: ${_columnValue(f, schema, usages)},');
-  }
-  b.writeln('  ));');
+  final args = fields.map((field) => '_${_dartMember(field)}').join(', ');
+  final suffix = args.isEmpty ? '' : ', $args';
+  b.writeln('  final items = dec.count == 0 ? <$name>[] : List<$name>.filled(');
+  b.writeln(
+    '    dec.count, _\$columnar$name(0, \$depth$suffix), growable: true,',
+  );
+  b.writeln('  );');
+  b.writeln('  for (var i = 1; i < dec.count; i++) {');
+  b.writeln('    items[i] = _\$columnar$name(i, \$depth$suffix);');
+  b.writeln('  }');
   if (paginated) {
     b.writeln(
       '  return Page(items: items, total: total, page: page, pageSize: pageSize);',
@@ -606,14 +1050,11 @@ bool _isNested(LuxoField f, LuxoSchema schema) {
   final name = f.typeName ?? f.type;
   return f.relation ||
       schema.models.containsKey(name) ||
-      schema.types.containsKey(name);
+      schema.types.containsKey(name) ||
+      schema.sealeds.containsKey(name);
 }
 
-String _columnStorageType(
-  LuxoField f,
-  LuxoSchema schema,
-  Map<String, TypeUsage> usages,
-) {
+String _columnStorageType(LuxoField f, LuxoSchema schema, _TypeUsages usages) {
   if (_isNested(f, schema) ||
       f.isList ||
       f.type == 'Bytes' ||
@@ -648,29 +1089,26 @@ String _columnRead(LuxoField f, LuxoSchema schema) {
   };
 }
 
-String _columnValue(
-  LuxoField f,
-  LuxoSchema schema,
-  Map<String, TypeUsage> usages,
-) {
-  final column = '_${f.name}';
-  final typeName = f.typeName ?? f.type;
-  final base = _dartFieldType(f, schema, usages: usages);
-  final valueType = f.nullable ? '$base?' : base;
+String _columnValue(LuxoField f, LuxoSchema schema, _TypeUsages usages) {
+  final column = '_${_dartMember(f)}';
+  final typeName = dartTypeIdentifier(f.typeName ?? f.type);
+  final valueType = _dartFieldValueType(f, schema, usages: usages);
   final absent = 'const Selected<$valueType>.unselected()';
   final element = f.nullable ? '$column[i]!' : '$column[i]';
   String value;
   if (_isNested(f, schema)) {
     if (f.isList) {
-      final decoded = 'decodeColumnar$typeName($element)';
+      final decoded = schema.sealeds.containsKey(f.typeName ?? f.type)
+          ? '_\$decodeSealedList$typeName($element, \$depth + 1)'
+          : '_\$decodeColumnar$typeName($element, \$depth + 1)';
       value = f.nullable ? '$column[i] == null ? null : $decoded' : decoded;
     } else {
-      final decoded = 'decode$typeName(LuxoDecoder($element))';
+      final decoded = '_\$decode$typeName(LuxoDecoder($element), \$depth + 1)';
       value = f.nullable ? '$column[i] == null ? null : $decoded' : decoded;
     }
   } else if (f.isList) {
     final decoded = f.type == 'Enum' && f.typeName != null
-        ? '${f.typeName}.\$readArray(LuxoDecoder($element), complete: true)'
+        ? '${dartTypeIdentifier(f.typeName!)}.\$readArray(LuxoDecoder($element), complete: true)'
         : _binaryScalarRead(
             f.type,
             'LuxoDecoder($element)',
@@ -679,10 +1117,10 @@ String _columnValue(
           );
     value = f.nullable ? '$column[i] == null ? null : $decoded' : decoded;
   } else if (f.type == 'Enum' && f.typeName != null) {
-    final decoded = '${f.typeName}.fromValue($element)';
+    final decoded = '${dartTypeIdentifier(f.typeName!)}.fromValue($element)';
     value = f.nullable ? '$column[i] == null ? null : $decoded' : decoded;
   } else if (f.type == 'JSON') {
-    final decoded = 'decodeLuxoJSON(utf8.decode($element)) as Object';
+    final decoded = 'decodeLuxoJSONBytes($element)';
     value = f.nullable ? '$column[i] == null ? null : $decoded' : decoded;
   } else {
     value = '$column[i]';
@@ -709,22 +1147,22 @@ String _binaryScalarRead(
       '$dec.$method${array ? 'Array' : ''}${checked ? 'Checked' : ''}()';
   if (type != 'JSON') return read;
   return array
-      ? '$read.map((v) => decodeLuxoJSON(utf8.decode(v))).toList()'
-      : 'decodeLuxoJSON(utf8.decode($read)) as Object';
+      ? '$read.map((v) => decodeLuxoJSONBytes(v)).toList()'
+      : 'decodeLuxoJSONBytes($read)';
 }
 
 String _jsonCast(
   LuxoField f,
   LuxoSchema schema,
-  Map<String, TypeUsage> usages, {
+  _TypeUsages usages, {
   required bool input,
 }) {
   final n = f.name;
   final q = f.nullable;
   if (f.type == 'Enum' && f.typeName != null) {
     final read = f.isList
-        ? '${f.typeName}.\$fromJSONList(json[\'$n\'])'
-        : '${f.typeName}.fromValue(luxoStringFromJSON(json[\'$n\']))';
+        ? '${dartTypeIdentifier(f.typeName!)}.\$fromJSONList(json[\'$n\'])'
+        : '${dartTypeIdentifier(f.typeName!)}.fromValue(luxoStringFromJSON(json[\'$n\']))';
     return q ? "json['$n'] == null ? null : $read" : read;
   }
   // Scalar array field ([T]) — JSON value is a List.
@@ -758,9 +1196,10 @@ String _jsonCast(
           ? "json['$n'] == null ? null : base64Decode(json['$n'] as String)"
           : "base64Decode(json['$n'] as String)";
     case 'JSON':
-      return q
-          ? "normalizeLuxoJSON(json['$n'])"
-          : "normalizeLuxoJSON(json['$n']) as Object";
+      final read = "normalizeLuxoJSON(json['$n'])";
+      return input && !q
+          ? "json.containsKey('$n') ? $read : (throw const FormatException('Missing required JSON field $n'))"
+          : read;
     case 'DateTime':
       return q
           ? "json['$n'] == null ? null : luxoDateTimeFromJSON(json['$n'])"
@@ -778,31 +1217,37 @@ String _jsonCast(
       final typeName =
           input &&
               (schema.models.containsKey(rawTypeName) ||
-                  schema.types.containsKey(rawTypeName))
+                  schema.types.containsKey(rawTypeName) ||
+                  schema.sealeds.containsKey(rawTypeName))
           ? _inputTypeName(rawTypeName, usages)
-          : rawTypeName;
-      if (f.isList) {
-        final read = input ? '$typeName.fromJson' : '$typeName.\$fromJsonItem';
-        final cast =
-            "(json['$n'] as List).map((e) => $read(e as Map<String, dynamic>)).toList()";
-        return q ? "json['$n'] != null ? $cast : null" : cast;
-      }
-      if (q)
-        return "json['$n'] != null ? $typeName.fromJson(json['$n'] as Map<String, dynamic>) : null";
-      return "$typeName.fromJson(json['$n'] as Map<String, dynamic>)";
+          : dartTypeIdentifier(rawTypeName);
+      final arguments = input ? '\$depth + 1' : 'false, \$depth + 1';
+      final read =
+          "$typeName._\$json(json['$n'] as Map<String, dynamic>, $arguments)";
+      if (q) return "json['$n'] != null ? $read : null";
+      return read;
   }
 }
 
-String _binaryRead(LuxoField f) {
+String _binaryRead(LuxoField f, LuxoSchema schema) {
+  if (schema.sealeds.containsKey(f.typeName ?? f.type)) {
+    final name = dartTypeIdentifier(f.typeName ?? f.type);
+    final read = f.isList
+        ? '_\$readSealedList$name(dec, \$depth + 1)'
+        : '_\$decode$name(LuxoDecoder(dec.readBytes()), \$depth + 1)';
+    return f.nullable
+        ? "dec.readCanonicalMarker('nullable') ? $read : null"
+        : read;
+  }
   final n = f.nullable;
   if (f.type == 'Enum' && f.typeName != null) {
     if (f.isList) {
-      final read = '${f.typeName}.\$readArray(dec)';
+      final read = '${dartTypeIdentifier(f.typeName!)}.\$readArray(dec)';
       return n ? 'dec.readBool() ? $read : null' : read;
     }
     return n
-        ? '${f.typeName}.\$readNullable(dec)'
-        : '${f.typeName}.fromValue(dec.readString())';
+        ? '${dartTypeIdentifier(f.typeName!)}.\$readNullable(dec)'
+        : '${dartTypeIdentifier(f.typeName!)}.fromValue(dec.readString())';
   }
   // Scalar array field ([T]) — inline [count][items...] in the row stream.
   if (f.isList && _isScalar(f.type)) {
@@ -824,8 +1269,8 @@ String _binaryRead(LuxoField f) {
     case 'Bytes':
       return n ? 'dec.readNullable(dec.readBytes)' : 'dec.readBytes()';
     case 'JSON':
-      final read = 'decodeLuxoJSON(utf8.decode(dec.readBytes())) as Object';
-      return n ? 'dec.readNullable(() => $read)' : read;
+      final read = 'decodeLuxoJSONBytes(dec.readBytes())';
+      return n ? "dec.readCanonicalMarker('nullable') ? $read : null" : read;
     // DateTime carries seconds/nanoseconds on the binary wire; decode to an
     // ISO 8601 string so the field type matches JSON mode (String).
     case 'DateTime':
@@ -836,11 +1281,13 @@ String _binaryRead(LuxoField f) {
       return n ? 'dec.readStringPtr()' : 'dec.readString()';
     default:
       // Response children have independent length-delimited boundaries.
-      final tn = f.typeName ?? f.type;
+      final tn = dartTypeIdentifier(f.typeName ?? f.type);
       final decoded = f.isList
-          ? 'decodeColumnar$tn(dec.readBytes())'
-          : 'decode$tn(LuxoDecoder(dec.readBytes()))';
-      return n ? 'dec.readNullable(() => $decoded)' : decoded;
+          ? '_\$decodeColumnar$tn(dec.readBytes(), \$depth + 1)'
+          : '_\$decode$tn(LuxoDecoder(dec.readBytes()), \$depth + 1)';
+      return n
+          ? "dec.readCanonicalMarker('nullable') ? $decoded : null"
+          : decoded;
   }
 }
 
@@ -852,6 +1299,38 @@ String _genSchemaMap(LuxoSchema schema) {
     for (final type in schema.types.values)
       type.name: LuxoModel(name: type.name, fields: type.fields),
     ...schema.models,
+    for (final owner in schema.sealeds.values)
+      owner.name: LuxoModel(
+        name: owner.name,
+        fields: [
+          for (final variant in owner.variants)
+            LuxoField(
+              id: variant.id,
+              name: variant.name,
+              type: 'Model',
+              typeName: '${owner.name}.${variant.name}',
+            ),
+        ],
+      ),
+    for (final owner in schema.sealeds.values)
+      '@sealed:${owner.name}': LuxoModel(
+        name: '@sealed:${owner.name}',
+        fields: [
+          for (final variant in owner.variants)
+            LuxoField(
+              id: variant.id,
+              name: variant.name,
+              type: 'Model',
+              typeName: '${owner.name}.${variant.name}',
+            ),
+        ],
+      ),
+    for (final owner in schema.sealeds.values)
+      for (final variant in owner.variants)
+        '${owner.name}.${variant.name}': LuxoModel(
+          name: '${owner.name}.${variant.name}',
+          fields: variant.fields.map(_sealedField).toList(),
+        ),
   };
   b.writeln(
     'final luxoSelectionTypes = <String, Map<String, SelectionFieldSchema>>{',
@@ -879,30 +1358,41 @@ String _genSchemaMap(LuxoSchema schema) {
     if (api.internal) continue;
     final returnFields = api.returnType == null
         ? const <LuxoField>[]
-        : (schema.models[api.returnType]?.fields ??
-              schema.types[api.returnType]?.fields ??
-              const <LuxoField>[]);
+        : (selectionTypes[api.returnType]?.fields ?? const <LuxoField>[]);
     final needsTypes =
+        selectionTypes.containsKey(api.returnType) ||
         returnFields.isNotEmpty ||
-        api.params.any((param) => param.type == 'Model');
-    b.write("  '${api.name}': APISchemaEntry(${api.id}");
-    if (api.params.isNotEmpty || returnFields.isNotEmpty) {
-      b.write(', [\n');
-      for (final p in api.params) {
-        b.writeln(
-          "    ParamSchema(${p.id}, '${p.name}', '${p.type}', ${p.isList}, ${p.nullable}${p.typeName == null ? '' : ", '${p.typeName}'"}),",
+        api.params.any(
+          (param) => param.type == 'Model' || param.type == 'Sealed',
         );
-      }
-      b.write('  ]');
+    b.write("  '${api.name}': APISchemaEntry(${api.id}");
+    b.write(', [\n');
+    for (final p in api.params) {
+      b.writeln(
+        "    ParamSchema(${p.id}, '${p.name}', '${p.type}', ${p.isList}, ${p.nullable}${p.typeName == null ? '' : ", '${p.typeName}'"}),",
+      );
     }
+    b.write('  ]');
     if (returnFields.isNotEmpty) {
       b.write(", luxoSelectionTypes['${api.returnType}']!");
-    } else if (needsTypes) {
+    } else {
       b.write(', const {}');
     }
     if (needsTypes) {
       b.write(', luxoSelectionTypes');
+    } else {
+      b.write(', const {}');
     }
+    final modelType = schema.sealeds.containsKey(api.returnType)
+        ? "'@sealed:${api.returnType}'"
+        : selectionTypes.containsKey(api.returnType)
+        ? "'${api.returnType}'"
+        : 'null';
+    b.write(
+      ', JSONResponseSchema(modelType: $modelType, '
+      '${needsTypes ? 'types: luxoSelectionTypes, ' : ''}'
+      'isList: ${api.returnList}, paginated: ${api.paginated})',
+    );
     b.writeln('),');
   }
   b.writeln('};');
@@ -949,7 +1439,7 @@ void _writeClientImports(
   StringBuffer b,
   LuxoSchema schema,
   List<LuxoAPI> apis,
-  Map<String, TypeUsage> usages,
+  _TypeUsages usages,
 ) {
   final types = apis.any(
     (api) =>
@@ -962,11 +1452,13 @@ void _writeClientImports(
         ),
   );
   b.writeln('// Auto-generated by luxo_client. DO NOT EDIT.\n');
-  if (apis.isNotEmpty) b.writeln("import 'dart:typed_data';");
+  if (apis.isNotEmpty) {
+    b.writeln(r"import 'dart:async' as $async;");
+    b.writeln("import 'dart:typed_data';");
+  }
   if (apis.any(
     (api) =>
         api.returnType == 'Bytes' ||
-        api.returnType == 'JSON' ||
         api.params.any((param) => param.type == 'JSON'),
   )) {
     b.writeln("import 'dart:convert';");
@@ -974,6 +1466,12 @@ void _writeClientImports(
   b.writeln("import 'package:luxo_client/luxo_client.dart';");
   if (types) b.writeln("import 'types.dart';");
   b.writeln("import 'schema.dart';");
+}
+
+bool _apiNeedsSelection(LuxoAPI api, LuxoSchema schema) {
+  final owner = schema.sealeds[api.returnType];
+  if (owner != null && owner.variants.isEmpty) return false;
+  return api.paginated || !_isScalar(_responseType(api, schema));
 }
 
 String _responseType(LuxoAPI api, LuxoSchema schema) {
@@ -985,20 +1483,34 @@ void _genMethod(
   StringBuffer b,
   LuxoAPI api,
   LuxoSchema schema,
-  Map<String, TypeUsage> usages,
+  _TypeUsages usages,
 ) {
   final type = _responseType(api, schema);
   final ret = _returnType(api, type);
   if (api.stream) {
-    _genStreamMethod(b, api, type, ret, usages);
+    _genStreamMethod(
+      b,
+      api,
+      type,
+      ret,
+      usages,
+      sealedReturn: schema.sealeds.containsKey(api.returnType),
+      selection: _apiNeedsSelection(api, schema),
+    );
     return;
   }
 
-  final dec = _decoder(api, type);
-  final selection = api.paginated || !_isScalar(type);
+  final dec = _decoder(
+    api,
+    type,
+    sealedReturn: schema.sealeds.containsKey(api.returnType),
+  );
+  final selection = _apiNeedsSelection(api, schema);
   final declarations = _unaryDeclarations(api, usages, selection: selection);
   final args = declarations.isEmpty ? '' : '{${declarations.join(', ')}}';
-  b.writeln("  Future<$ret> ${api.name}($args) async {");
+  b.writeln(
+    "  \$async.Future<$ret> ${dartSourceIdentifier(api.name)}($args) async {",
+  );
   if (selection) {
     b.writeln(r'    final sel = select ?? $selectionPlan?.text;');
   }
@@ -1012,7 +1524,7 @@ const _paginationNames = ['page', 'pageSize'];
 
 List<String> _unaryDeclarations(
   LuxoAPI api,
-  Map<String, TypeUsage> usages, {
+  _TypeUsages usages, {
   required bool selection,
 }) {
   // If API has explicit params, always use them (no guessing by name prefix).
@@ -1027,12 +1539,6 @@ List<String> _unaryDeclarations(
         ),
       )
       .toList();
-  if (api.paginated) {
-    for (final name in _paginationNames) {
-      if (!api.params.any((param) => param.name == name))
-        result.add('LuxoInt64? $name');
-    }
-  }
   if (selection) {
     result.add('String? select');
     result.add(r'PreparedSelection? $selectionPlan');
@@ -1051,12 +1557,6 @@ void _writeUnaryParams(StringBuffer b, LuxoAPI api, {required bool selection}) {
       forcedOptional: api.paginated && _paginationNames.contains(param.name),
     );
   }
-  if (api.paginated) {
-    for (final name in _paginationNames) {
-      if (!api.params.any((param) => param.name == name))
-        b.writeln("      if ($name != null) '$name': $name,");
-    }
-  }
   if (selection) {
     b.writeln("      if (sel != null) r'\$select': sel,");
   }
@@ -1071,11 +1571,13 @@ void _genStreamMethod(
   LuxoAPI api,
   String type,
   String returnType,
-  Map<String, TypeUsage> usages,
-) {
+  _TypeUsages usages, {
+  required bool sealedReturn,
+  required bool selection,
+}) {
   final methodName =
-      'subscribe${api.name[0].toUpperCase()}${api.name.substring(1)}';
-  final structuredReturn = !_isScalar(type);
+      'subscribe${dartSourceIdentifier(api.name[0].toUpperCase() + api.name.substring(1))}';
+  final structuredReturn = selection;
   final declarations = api.params
       .map((param) => _dartParamDeclaration(param, usages))
       .toList();
@@ -1087,33 +1589,33 @@ void _genStreamMethod(
   declarations.add('void Function(LuxoError)? onError');
   declarations.add('void Function()? onDone');
   b.writeln(
-    '  Future<void Function()> $methodName({${declarations.join(', ')}}) {',
+    '  \$async.Future<void Function()> $methodName({${declarations.join(', ')}}) {',
   );
   b.writeln(
     "    return transport.subscribe('${api.name}', const {}, onData, request: ${_requestCall(api, selection: structuredReturn, stream: true)},",
   );
   b.writeln(
-    '      decoder: ${_decoder(api, type)}, onError: onError, onDone: onDone);',
+    '      decoder: ${_decoder(api, type, sealedReturn: sealedReturn)}, onError: onError, onDone: onDone);',
   );
   b.writeln('  }\n');
 }
 
 String _dartParamDeclaration(
   LuxoParam param,
-  Map<String, TypeUsage> usages, {
+  _TypeUsages usages, {
   bool forcedOptional = false,
 }) {
   final type = _dartParamType(param, usages);
   if (param.nullable && param.hasDefault) {
-    return 'LuxoOptional<$type> ${param.name} = const LuxoOptional<$type>.absent()';
+    return 'LuxoOptional<$type> ${dartSourceIdentifier(param.name)} = const LuxoOptional<$type>.absent()';
   }
   if (forcedOptional || param.hasDefault) {
-    return '$type? ${param.name}';
+    return '$type? ${dartSourceIdentifier(param.name)}';
   }
   if (param.nullable) {
-    return 'required $type? ${param.name}';
+    return 'required $type? ${dartSourceIdentifier(param.name)}';
   }
-  return 'required $type ${param.name}';
+  return 'required $type ${dartSourceIdentifier(param.name)}';
 }
 
 void _writeDartParamEntry(
@@ -1125,7 +1627,7 @@ void _writeDartParamEntry(
     if (param.type != 'Enum' || param.typeName == null) return expression;
     if (param.isList) {
       final method = nullable ? '\$nullableRawList' : '\$rawList';
-      return '${param.typeName}.$method($expression)';
+      return '${dartTypeIdentifier(param.typeName!)}.$method($expression)';
     }
     final checked = nullable ? '$expression?' : expression;
     return '$checked.rawValue';
@@ -1133,33 +1635,38 @@ void _writeDartParamEntry(
 
   if (param.nullable && param.hasDefault) {
     b.writeln(
-      "      if (${param.name}.isPresent) '${param.name}': ${value('${param.name}.value', true)},",
+      "      if (${dartSourceIdentifier(param.name)}.isPresent) '${param.name}': ${value('${dartSourceIdentifier(param.name)}.value', true)},",
     );
     return;
   }
   if (forcedOptional || param.hasDefault) {
     b.writeln(
-      "      if (${param.name} != null) '${param.name}': ${value(param.name, false)},",
+      "      if (${dartSourceIdentifier(param.name)} != null) '${param.name}': ${value(dartSourceIdentifier(param.name), false)},",
     );
     return;
   }
-  b.writeln("      '${param.name}': ${value(param.name, param.nullable)},");
+  b.writeln(
+    "      '${param.name}': ${value(dartSourceIdentifier(param.name), param.nullable)},",
+  );
 }
 
 String _returnType(LuxoAPI api, String type) {
   final t = type == 'Enum' && api.returnType != 'Enum'
-      ? api.returnType!
+      ? dartTypeIdentifier(api.returnType!)
       : _luxoTypeToDart(type);
   final result = api.paginated
       ? 'Page<$t>'
       : api.returnList
       ? _dartListType(type, t)
       : t;
-  return api.returnNullable ? '$result?' : result;
+  final nullable =
+      api.returnNullable ||
+      (type == 'JSON' && !api.returnList && !api.paginated);
+  return nullable ? '$result?' : result;
 }
 
 /// Generates a decoder lambda that handles both JSON (Map/int/etc) and binary (Uint8List).
-String _decoder(LuxoAPI api, String type) {
+String _decoder(LuxoAPI api, String type, {bool sealedReturn = false}) {
   if (api.returnNullable) {
     return '''(d) {
       if (d is Uint8List) {
@@ -1171,15 +1678,21 @@ String _decoder(LuxoAPI api, String type) {
       } else if (d == null) {
         return null;
       }
-      return ${_decodeExpression(api, type, 'd')};
+      return ${_decodeExpression(api, type, 'd', sealedReturn: sealedReturn)};
     }''';
   }
-  return '(d) => ${_decodeExpression(api, type, 'd')}';
+  return '(d) => ${_decodeExpression(api, type, 'd', sealedReturn: sealedReturn)}';
 }
 
-String _decodeExpression(LuxoAPI api, String t, String value) {
+String _decodeExpression(
+  LuxoAPI api,
+  String t,
+  String value, {
+  bool sealedReturn = false,
+}) {
+  final sourceType = dartTypeIdentifier(t);
   if (t == 'Enum' && api.returnType != 'Enum') {
-    final name = api.returnType!;
+    final name = dartTypeIdentifier(api.returnType!);
     final binary = api.returnList
         ? '$name.\$readArray(LuxoDecoder($value), complete: true)'
         : '$name.fromValue(LuxoDecoder($value).readStringChecked())';
@@ -1199,12 +1712,15 @@ String _decodeExpression(LuxoAPI api, String t, String value) {
     return '$value is Uint8List ? $binaryRead : $jsonRead';
   }
   if (api.paginated) {
-    return "$value is Uint8List ? decodePaginated$t($value) : Page.fromJson($value as Map<String, dynamic>, $t.\$fromJsonItem)";
+    return "$value is Uint8List ? decodePaginated$sourceType($value) : Page.fromJson($value as Map<String, dynamic>, $sourceType.\$fromJsonItem)";
+  }
+  if (api.returnList && sealedReturn) {
+    return "$value is Uint8List ? decodeSealedList$sourceType($value) : ($value as List).map((e) => $sourceType.fromJson(e as Map<String, dynamic>)).toList()";
   }
   if (api.returnList) {
-    return "$value is Uint8List ? decodeColumnar$t($value) : ($value as List).map((e) => $t.\$fromJsonItem(e as Map<String, dynamic>)).toList()";
+    return "$value is Uint8List ? decodeColumnar$sourceType($value) : ($value as List).map((e) => $sourceType.\$fromJsonItem(e as Map<String, dynamic>)).toList()";
   }
-  return "$value is Uint8List ? decode$t(LuxoDecoder($value)) : $t.fromJson($value as Map<String, dynamic>)";
+  return "$value is Uint8List ? decode$sourceType(LuxoDecoder($value)) : $sourceType.fromJson($value as Map<String, dynamic>)";
 }
 
 String _jsonScalarResponse(String type, String value, {required bool array}) {
@@ -1223,7 +1739,7 @@ String _jsonScalarResponse(String type, String value, {required bool array}) {
     'Float' => 'luxoDoubleFromJSON($value)',
     'Bytes' => 'base64Decode($value as String)',
     'Int' || 'Duration' => 'luxoInt64FromJSON($value)',
-    'JSON' => 'normalizeLuxoJSON($value) as Object',
+    'JSON' => 'normalizeLuxoJSON($value)',
     'DateTime' => 'luxoDateTimeFromJSON($value)',
     'String' || 'UUID' || 'Decimal' || 'Enum' => 'luxoStringFromJSON($value)',
     _ => '$value as $dartType',

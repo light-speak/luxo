@@ -42,8 +42,9 @@ void main() {
       );
       fixture.message('-9223372036854775808'.toJS);
       fixture.message(Uint8List.fromList([1, 2, 255]).buffer.toJS);
-      fixture.closeFromServer();
+      fixture.closeFromServer(4001);
       await done;
+      expect(socket.closeCode, 4001);
     },
   );
 
@@ -125,5 +126,7 @@ class SocketFixture {
   void message(JSAny data) => _target.dispatchEvent(
     web.MessageEvent('message', web.MessageEventInit(data: data)),
   );
-  void closeFromServer() => _target.dispatchEvent(web.Event('close'));
+  void closeFromServer([int code = 1000]) => _target.dispatchEvent(
+    web.CloseEvent('close', web.CloseEventInit(code: code)),
+  );
 }

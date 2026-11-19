@@ -7,6 +7,47 @@ import (
 	"testing"
 )
 
+func FuzzAppendArrayHeader(f *testing.F) {
+	for _, count := range []int{-1, 0, 1, 127, 128, MaxArrayElements, MaxArrayElements + 1} {
+		f.Add(count)
+	}
+	f.Fuzz(func(t *testing.T, count int) {
+		prefix := []byte{42}
+		data, err := AppendArrayHeader(prefix, count)
+		if count < 0 || count > MaxArrayElements {
+			if err != ErrInvalidArrayCount || !bytes.Equal(data, prefix) {
+				t.Fatal("invalid count changed destination", count, data, err)
+			}
+			return
+		}
+		value, n := ReadArrayHeader(data, 1)
+		if err != nil || value != count || n != len(data)-1 || data[0] != 42 {
+			t.Fatal("valid count failed round trip", count, value, n, err)
+		}
+	})
+}
+
+func FuzzWireReadOffsets(f *testing.F) {
+	for _, off := range []int{-1, math.MinInt, math.MaxInt, math.MaxInt - 7, 0, 8, 16} {
+		f.Add(make([]byte, 16), off)
+	}
+	f.Fuzz(func(t *testing.T, data []byte, off int) {
+		_, integer := ReadVarint(data, off)
+		_, floating := ReadFixed64(data, off)
+		_, nullable := ReadNullable(data, off)
+		_, text := ReadString(data, off)
+		for _, consumed := range []int{integer, floating, nullable, text} {
+			if off < 0 || off >= len(data) {
+				if consumed != 0 {
+					t.Fatalf("invalid offset %d consumed %d", off, consumed)
+				}
+			} else if consumed > len(data)-off {
+				t.Fatalf("read past payload: offset=%d consumed=%d length=%d", off, consumed, len(data))
+			}
+		}
+	})
+}
+
 func FuzzNullableRootEnvelope(f *testing.F) {
 	for _, data := range [][]byte{nil, {0}, {1}, {2}, {0, 0}, {1, 0}, {1, 84}} {
 		f.Add(data)

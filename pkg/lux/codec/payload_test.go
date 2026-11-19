@@ -45,7 +45,7 @@ func TestElementPayloadPreflight(t *testing.T) {
 					t.Fatalf("column consumed short payload: end=%d offset=%d err=%v", end, r.off, r.err)
 				}
 				if tc.array != nil {
-					array := append(AppendArrayHeader([]byte{42}, count), data[1:end]...)
+					array := append(AppendVarint([]byte{42}, uint64(count)), data[1:end]...)
 					d := Decoder{buf: array, off: 1}
 					if tc.array(&d) != 0 || d.off != 2 || d.err == nil || !strings.Contains(d.err.Error(), "insufficient element bytes") {
 						t.Fatalf("array consumed short payload: end=%d offset=%d err=%v", end, d.off, d.err)
@@ -66,7 +66,7 @@ func TestElementPayloadValidCounts(t *testing.T) {
 				t.Fatalf("%s column changed: count=%d got=%d offset=%d err=%v", tc.name, count, got, r.off, r.err)
 			}
 			if tc.array != nil {
-				array := append(AppendArrayHeader([]byte{42}, count), payload...)
+				array := append(AppendVarint([]byte{42}, uint64(count)), payload...)
 				array = append(array, 99)
 				d := Decoder{buf: array, off: 1}
 				if got := tc.array(&d); got != count || d.err != nil || d.off != len(array)-1 {
@@ -107,7 +107,7 @@ func TestElementPreflightDoesNotAllocate(t *testing.T) {
 		}
 		if tc.array != nil {
 			var array Decoder
-			data := AppendArrayHeader(nil, 128)
+			data := AppendVarint(nil, uint64(128))
 			allocs = testing.AllocsPerRun(100, func() {
 				array = Decoder{buf: data}
 				if tc.array(&array) != 0 || array.err == nil {

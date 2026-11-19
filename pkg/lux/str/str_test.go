@@ -1,6 +1,16 @@
 package str
 
-import "testing"
+import (
+	"hash/maphash"
+	"math"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"unicode/utf8"
+	"unsafe"
+)
 
 func TestToSnakeCase(t *testing.T) {
 	tests := []struct{ in, want string }{
@@ -105,9 +115,62 @@ func TestTrimPrefixSuffix(t *testing.T) {
 	}
 }
 
+func TestSubstringBounds(t *testing.T) {
+	for _, sample := range []struct {
+		name, value string
+		start, end  int
+		want        string
+		err         error
+	}{
+		{"empty", "", 0, 0, "", nil},
+		{"ascii", "abcd", 1, 3, "bc", nil},
+		{"end", "abcd", 4, 4, "", nil},
+		{"full", "中文", 0, 6, "中文", nil},
+		{"unicode-boundaries", "中😀a", 3, 7, "😀", nil},
+		{"negative", "abcd", -1, 2, "", errSubstringRange},
+		{"reversed", "abcd", 2, 1, "", errSubstringRange},
+		{"long-end", "abcd", 0, 5, "", errSubstringRange},
+		{"long-start", "abcd", 5, 5, "", errSubstringRange},
+		{"negative-end", "abcd", 0, -1, "", errSubstringRange},
+		{"split-start", "中😀a", 1, 7, "", errSubstringBoundary},
+		{"split-end", "中😀a", 0, 4, "", errSubstringBoundary},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			got, err := Substring(sample.value, sample.start, sample.end)
+			if got != sample.want || err != sample.err {
+				t.Fatalf("Substring(%q,%d,%d)=%q,%v", sample.value, sample.start, sample.end, got, err)
+			}
+		})
+	}
+	if got, err := SubstringFrom("中文", 3); got != "文" || err != nil {
+		t.Fatal(got, err)
+	}
+	if got, err := SubstringFrom("中文", 1); got != "" || err != errSubstringBoundary {
+		t.Fatal(got, err)
+	}
+}
+
 func TestRepeat(t *testing.T) {
-	if Repeat("ab", 3) != "ababab" {
-		t.Error("repeat")
+	for _, sample := range []struct {
+		name, value, want string
+		count             int
+		invalid           bool
+	}{
+		{"zero", "ab", "", 0, false}, {"one", "ab", "ab", 1, false},
+		{"many", "ab", "ababab", 3, false}, {"unicode", "中", "中中", 2, false},
+		{"empty-huge", "", "", math.MaxInt, false},
+		{"negative", "ab", "", -1, true}, {"empty-negative", "", "", -1, true},
+		{"minimum", "ab", "", math.MinInt, true},
+		{"multiply-overflow", "ab", "", math.MaxInt, true},
+		{"word-overflow", "abc", "", math.MaxInt, true},
+		{"signed-overflow", "abc", "", math.MaxInt/3 + 1, true},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			value, err := Repeat(sample.value, sample.count)
+			if (err != nil) != sample.invalid || value != sample.want {
+				t.Fatalf("got %q, %v; want %q, invalid=%t", value, err, sample.want, sample.invalid)
+			}
+		})
 	}
 }
 
@@ -175,11 +238,39 @@ func TestMaskPattern(t *testing.T) {
 }
 
 func TestMaskEmail(t *testing.T) {
-	if got := MaskEmail("user@example.com"); got != "u***@example.com" {
-		t.Errorf("email mask = %q", got)
+	for _, sample := range []struct{ value, want string }{
+		{"user@example.com", "u***@example.com"}, {"a@b.com", "a@b.com"},
+		{"张三@example.com", "张*@example.com"}, {"张@example.com", "张@example.com"},
+		{"😀用户@example.com", "😀**@example.com"}, {"a中@example.com", "a*@example.com"},
+		{"éa@example.com", "é*@example.com"}, {"e\u0301x@example.com", "e**@example.com"},
+		{"张三@例子.公司", "张*@例子.公司"}, {"ab@", "a*@"},
+		{"abcdefg@example.com", "a******@example.com"},
+		{"abcdefghi@example.com", "a********@example.com"},
+		{"abcdefghijklmnop中@example.com", "a****************@example.com"},
+		{"", ""}, {"@example.com", "@example.com"}, {"no-at-sign", "no-at-sign"},
+	} {
+		t.Run(sample.value, func(t *testing.T) {
+			got := MaskEmail(sample.value)
+			if got != sample.want || !utf8.ValidString(got) {
+				t.Fatalf("MaskEmail(%q) = %q; want valid UTF-8 %q", sample.value, got, sample.want)
+			}
+		})
 	}
-	if got := MaskEmail("a@b.com"); got != "a@b.com" {
-		t.Errorf("short email should not mask = %q", got)
+}
+
+func BenchmarkMaskEmail(b *testing.B) {
+	for _, sample := range []struct{ name, value string }{
+		{"ascii", "user@example.com"}, {"unicode", "张三丰@example.com"},
+		{"single-ascii", "a@example.com"}, {"single-unicode", "张@example.com"},
+		{"long-ascii", strings.Repeat("a", 1024) + "@example.com"},
+		{"long-unicode", strings.Repeat("中", 1024) + "@example.com"},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				maskPatternSink = MaskEmail(sample.value)
+			}
+		})
 	}
 }
 
@@ -249,5 +340,364 @@ func TestMatches(t *testing.T) {
 	// Second call should hit cache
 	if !Matches("^[a-z]+$", "world") {
 		t.Error("cached regex should match")
+	}
+}
+
+func TestRegexCacheRetainsLargePatternWithinWorkBudget(t *testing.T) {
+	cache := newRegexMatcherCache()
+	value := strings.Repeat("x", 5000)
+	pattern := "^" + value + "$"
+	if !cache.matches(pattern, value) || cachedRegexEntry(cache, pattern) == nil {
+		t.Fatal("a single large pattern within the set budget was unnecessarily recompiled")
+	}
+}
+
+func TestRegexCacheUsesSpareBudgetForShortPatterns(t *testing.T) {
+	cache := newRegexMatcherCache()
+	set := &cache.sets[0]
+	for index := range 32 {
+		value := "short-" + strconv.Itoa(index)
+		if !set.matchMiss("^"+value+"$", value) {
+			t.Fatal(index)
+		}
+	}
+	count := 0
+	for index := range regexCacheWays {
+		if set.entries[index].Load() != nil {
+			count++
+		}
+	}
+	if count != 32 {
+		t.Fatalf("retained %d short patterns, want 32 within the same work budget", count)
+	}
+}
+
+func TestRegexCacheRetentionIsBounded(t *testing.T) {
+	cache := newRegexMatcherCache()
+	for index := range 2 * regexCacheSets * regexCacheWays {
+		pattern := "^bounded-regex-" + strconv.Itoa(index) + "$"
+		if !cache.matches(pattern, "bounded-regex-"+strconv.Itoa(index)) {
+			t.Fatal("valid pattern stopped matching", index)
+		}
+	}
+	count := 0
+	for set := range cache.sets {
+		for way := range regexCacheWays {
+			if cache.sets[set].entries[way].Load() != nil {
+				count++
+			}
+		}
+	}
+	if count > regexCacheSets*regexCacheWays {
+		t.Fatalf("regex cache retained %d patterns; limit is %d", count, regexCacheSets*regexCacheWays)
+	}
+}
+
+func TestRegexCacheEvictsByTotalWork(t *testing.T) {
+	cache := newRegexMatcherCache()
+	set := &cache.sets[0]
+	for index := range 12 {
+		value := strings.Repeat("x", 6000) + strconv.Itoa(index)
+		if !set.matchMiss("^"+value+"$", value) {
+			t.Fatal(index)
+		}
+		total, count := 0, 0
+		for way := range regexCacheWays {
+			if entry := set.entries[way].Load(); entry != nil {
+				total += entry.work
+				count++
+			}
+		}
+		if total > regexCacheSetWork || set.work != total || count > 5 {
+			t.Fatalf("cache budget exceeded: work=%d recorded=%d entries=%d", total, set.work, count)
+		}
+	}
+}
+
+func TestRegexCacheOwnsRetainedPattern(t *testing.T) {
+	const expression = "^owned-regex-[0-9]+$"
+	body := strings.Repeat("body", 1<<18) + expression
+	pattern := body[len(body)-len(expression):]
+	if !Matches(pattern, "owned-regex-42") {
+		t.Fatal("valid pattern did not match")
+	}
+	cached := cachedRegexEntry(regexCache, pattern)
+	if cached == nil {
+		t.Fatal("pattern was not cached")
+	}
+	if unsafe.StringData(cached.pattern) == unsafe.StringData(pattern) || unsafe.StringData(cached.value.String()) == unsafe.StringData(pattern) {
+		t.Fatal("cached pattern retains the original request body")
+	}
+}
+
+func cachedRegexEntry(cache *regexMatcherCache, pattern string) *regexCacheEntry {
+	set := &cache.sets[maphash.String(cache.seed, pattern)&(regexCacheSets-1)]
+	for index := range regexCacheWays {
+		if entry := set.entries[index].Load(); entry != nil && entry.pattern == pattern {
+			return entry
+		}
+	}
+	return nil
+}
+
+func TestRegexAdmissionPreservesMatching(t *testing.T) {
+	if regexCachePatternWork(strings.Repeat("x", regexCachePatternSize+1)) != 0 {
+		t.Fatal("oversized pattern was admitted to the cache")
+	}
+	for _, sample := range []struct {
+		pattern, value string
+		cached         bool
+	}{
+		{"", "anything", true},
+		{`^\d{1,12}$`, "42", true},
+		{`^\p{L}+$`, "中文AbC", true},
+		{`^\pL+$`, "中文", true},
+		{`^\P{L}+$`, "42", true},
+		{`a{0}`, "", true},
+		{`a{2,}`, "aaa", true},
+		{`a{1000}`, strings.Repeat("a", 1000), true},
+		{`a{1000}b{1000}`, strings.Repeat("a", 1000) + strings.Repeat("b", 1000), false},
+		{strings.Repeat(`\pL`, 17), "中文abc中文abc中文abc中", false},
+		{"^" + strings.Repeat("x", 5000) + "$", strings.Repeat("x", 5000), true},
+		{"^" + strings.Repeat("x", regexCachePatternSize+1) + "$", strings.Repeat("x", regexCachePatternSize+1), false},
+		{`\{literal\}`, "{literal}", true},
+		{`{literal}`, "{literal}", false},
+		{"[invalid", "x", false},
+		{"a{", "x", false},
+		{`\p{`, "x", false},
+		{"a{99999999999999999999}", "x", false},
+	} {
+		cache := newRegexMatcherCache()
+		want, _ := regexp.MatchString(sample.pattern, sample.value)
+		if got := cache.matches(sample.pattern, sample.value); got != want {
+			t.Fatalf("pattern %q: got %v, want %v", sample.pattern, got, want)
+		}
+		if got := cachedRegexEntry(cache, sample.pattern) != nil; got != sample.cached {
+			t.Fatalf("pattern %q: cached=%v, want %v", sample.pattern, got, sample.cached)
+		}
+	}
+}
+
+func TestRegexCacheCollisionReplacementKeepsResults(t *testing.T) {
+	cache := newRegexMatcherCache()
+	buckets := make(map[uint64][]string)
+	var colliding []string
+	for index := 0; index <= regexCacheSets*regexCacheWays; index++ {
+		pattern := "^collision-" + strconv.Itoa(index) + "$"
+		bucket := maphash.String(cache.seed, pattern) & (regexCacheSets - 1)
+		buckets[bucket] = append(buckets[bucket], pattern)
+		if len(buckets[bucket]) > regexCacheWays {
+			colliding = buckets[bucket]
+			break
+		}
+	}
+	if len(colliding) != regexCacheWays+1 {
+		t.Fatal("failed to construct the guaranteed cache collision")
+	}
+	for range 3 {
+		for _, pattern := range colliding {
+			value := pattern[1 : len(pattern)-1]
+			if !cache.matches(pattern, value) || cache.matches(pattern, "different") {
+				t.Fatal("cache replacement changed the expression", pattern)
+			}
+		}
+	}
+}
+
+func TestRegexCacheConcurrentPublicationAndReplacement(t *testing.T) {
+	cache := newRegexMatcherCache()
+	var group sync.WaitGroup
+	failures := make(chan string, 16)
+	for worker := range 16 {
+		group.Go(func() {
+			for index := range 128 {
+				value := "worker-" + strconv.Itoa(worker) + "-" + strconv.Itoa(index)
+				pattern := "^" + value + "$"
+				if !cache.matches(pattern, value) || cache.matches(pattern, "different") {
+					failures <- pattern
+					return
+				}
+			}
+		})
+	}
+	group.Wait()
+	close(failures)
+	for pattern := range failures {
+		t.Error("concurrent cache returned a different expression", pattern)
+	}
+}
+
+func TestRegexCacheConcurrentMissesDeduplicate(t *testing.T) {
+	cache := newRegexMatcherCache()
+	set := &cache.sets[0]
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	for range 16 {
+		group.Go(func() {
+			<-start
+			if !set.matchMiss(`^shared-miss$`, "shared-miss") {
+				t.Error("concurrent miss stopped matching")
+			}
+		})
+	}
+	close(start)
+	group.Wait()
+	count := 0
+	for index := range regexCacheWays {
+		if set.entries[index].Load() != nil {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("same pattern occupies %d cache ways, want 1", count)
+	}
+}
+
+func TestPadExtremeNegativeWidths(t *testing.T) {
+	for _, operation := range []struct {
+		name string
+		call func(string, int, string) string
+	}{{"left", PadLeft}, {"right", PadRight}} {
+		t.Run(operation.name, func(t *testing.T) {
+			for _, width := range []int{math.MinInt, math.MinInt + 1, -1, 0} {
+				t.Run(strconv.Itoa(width), func(t *testing.T) {
+					defer func() {
+						if failure := recover(); failure != nil {
+							t.Errorf("negative padding width caused panic: %v", failure)
+						}
+					}()
+					if got := operation.call("abc", width, "0"); got != "abc" {
+						t.Errorf("negative padding changed text: %q", got)
+					}
+				})
+			}
+		})
+	}
+}
+
+var paddingBenchmarkSink string
+
+func BenchmarkPaddingBounds(b *testing.B) {
+	for _, operation := range []struct {
+		name string
+		call func(string, int, string) string
+	}{{"left", PadLeft}, {"right", PadRight}} {
+		b.Run(operation.name, func(b *testing.B) {
+			for _, sample := range []struct {
+				name, text, pad string
+				width           int
+			}{{"short", "42", "0", 8}, {"long", "42", "01", 4096},
+				{"unchanged", "already-wide", "0", 3}, {"empty-pad", "a", "", 8}} {
+				b.Run(sample.name, func(b *testing.B) {
+					b.ReportAllocs()
+					for range b.N {
+						paddingBenchmarkSink = operation.call(sample.text, sample.width, sample.pad)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestPaddingPatternBoundaries(t *testing.T) {
+	for _, text := range []string{"", "a", "abc", "中文"} {
+		for _, padding := range []string{"0", "ab", "0123456", "中", "中文"} {
+			for width := 0; width <= 257; width++ {
+				missing := max(0, width-len(text))
+				prefix := strings.Repeat(padding, (missing+len(padding)-1)/len(padding))[:missing]
+				// Complete UTF-8 patterns are controls; malformed boundaries have separate probes.
+				if !utf8.ValidString(prefix) {
+					continue
+				}
+				if got, want := PadLeft(text, width, padding), prefix+text; got != want {
+					t.Fatalf("left text=%q width=%d padding=%q: %q != %q", text, width, padding, got, want)
+				}
+				if got, want := PadRight(text, width, padding), text+prefix; got != want {
+					t.Fatalf("right text=%q width=%d padding=%q: %q != %q", text, width, padding, got, want)
+				}
+			}
+		}
+	}
+}
+
+var substringValueBenchmarkSink string
+var substringErrorBenchmarkSink error
+
+func BenchmarkSubstring(b *testing.B) {
+	for _, sample := range []struct {
+		name, value string
+		start, end  int
+		invalid     bool
+	}{
+		{"ASCII", "abcdefgh", 1, 7, false},
+		{"Empty", "", 0, 0, false},
+		{"Unicode", "中😀ab", 3, 7, false},
+		{"Long", strings.Repeat("中", 1024), 300, 2700, false},
+		{"InvalidRange", "abcd", -1, 2, true},
+		{"InvalidBoundary", "中文", 1, 3, true},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			if _, err := Substring(sample.value, sample.start, sample.end); (err != nil) != sample.invalid {
+				b.Fatal("unexpected substring validity", err)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				substringValueBenchmarkSink, substringErrorBenchmarkSink = Substring(sample.value, sample.start, sample.end)
+			}
+		})
+	}
+}
+
+func TestPaddingRetainsCompleteUTF8Prefix(t *testing.T) {
+	for _, operation := range []struct {
+		name string
+		call func(string, int, string) string
+		left bool
+	}{{"left", PadLeft, true}, {"right", PadRight, false}} {
+		for _, sample := range []struct {
+			text, padding, prefix string
+			width                 int
+		}{
+			{"a", "中", "", 2},
+			{"a", "中", "", 3},
+			{"a", "中", "中", 4},
+			{"a", "中", "中", 5},
+			{"文", "a中", "a", 5},
+			{"文", "a中", "a中a", 9},
+			{"", "😀", "😀", 7},
+			{"", "😀a", "😀a", 8},
+			{"中文", "a😀中", "a😀中a", 17},
+		} {
+			t.Run(operation.name+"/"+sample.padding+"/"+strconv.Itoa(sample.width), func(t *testing.T) {
+				want := sample.text + sample.prefix
+				if operation.left {
+					want = sample.prefix + sample.text
+				}
+				got := operation.call(sample.text, sample.width, sample.padding)
+				if got != want || !utf8.ValidString(got) || len(got) > sample.width {
+					t.Fatalf("padding(%q, %d, %q) = %q, want %q", sample.text, sample.width, sample.padding, got, want)
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkPaddingUTF8(b *testing.B) {
+	for _, sample := range []struct {
+		name, text, padding string
+		width               int
+	}{
+		{"short-complete", "a", "中", 7},
+		{"short-partial", "a", "中", 6},
+		{"long-complete", "a", "中", 4096},
+		{"long-partial", "a", "😀a", 4096},
+		{"unfit", "a", "中", 2},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				paddingBenchmarkSink = PadRight(sample.text, sample.width, sample.padding)
+			}
+		})
 	}
 }

@@ -73,8 +73,8 @@ func (g *GeneratorContext) resolveEndpoint(parent string, field *ast.FieldDecl, 
 	keyType := g.externalModelIDTypeName(parent)
 	fkField := modelFieldByName(model, fk)
 	return resolveEndpoint{
-		model: model, modelName: model.Name, tableName: modelTableName(model.Name),
-		fkField: fk, fkColumn: str.ToSnakeCase(fk), svcName: "svc:resolve:" + model.Name + ":" + fk,
+		model: model, modelName: model.Name, tableName: g.sqlTable(model.Name),
+		fkField: fk, fkColumn: g.sqlColumn(fk), svcName: "svc:resolve:" + model.Name + ":" + fk,
 		scanFn: "scan" + model.Name, keyType: keyType, keyGoType: mapBaseType(keyType),
 		fkNullable: fkField != nil && fkField.Type != nil && fkField.Type.Nullable,
 	}
@@ -89,8 +89,9 @@ func (g *GeneratorContext) generateResolveHandler(b *strings.Builder, ep resolve
 	b.WriteString("\t\tshape, err := req.ParamInt(\"shape\")\n\t\tif err != nil { return err }\n")
 	b.WriteString("\t\tif shape < 0 || shape > 3 { return fmt.Errorf(\"resolver: invalid result shape %d\", shape) }\n")
 	fmt.Fprintf(b, "\t\tfields := select%sSQLColumns(req.Select)\n", ep.modelName)
-	generateRequiredSQLField(b, ep.fkColumn)
+	g.generateRequiredSQLField(b, ep.fkColumn)
 	fmt.Fprintf(b, "\t\tconds := []lux.Condition{lux.New%sField(%q).In(keys...)}\n", ep.keyType, ep.fkColumn)
+	g.generateSoftDeleteCondition(b, isSoftDelete(ep.model), "\t\t")
 	fmt.Fprintf(b, "\t\tquery, args := lux.BuildSelectSQL(%q, fields, conds, nil, 0, 0)\n", ep.tableName)
 	fmt.Fprintf(b, "\t\trows, err := app.DB.QueryRows(ctx, %s, query, args...)\n", ep.scanFn)
 	b.WriteString("\t\tif err != nil { return err }\n")
@@ -115,13 +116,14 @@ func generateResolveGroupWriter(b *strings.Builder, ep resolveEndpoint) {
 	} else {
 		b.WriteString("\t\tgrouped[fk] = append(grouped[fk], row)\n")
 	}
-	b.WriteString("\t}\n\treq.Buf.B = codec.AppendVarint(req.Buf.B, uint64(len(keys)))\n")
+	b.WriteString("\t}\n")
+	writeBinaryAppend(b, "\t", "req.Buf.B", "codec.AppendArrayHeader(req.Buf.B, len(keys))", "return err")
 	b.WriteString("\tfor _, key := range keys {\n\t\titems := grouped[key]\n")
 	b.WriteString("\t\tif shape&1 == 0 {\n")
 	b.WriteString("\t\t\tif len(items) > 1 { return fmt.Errorf(\"resolver: multiple rows for single relation\") }\n")
 	b.WriteString("\t\t\tif len(items) == 0 {\n\t\t\t\tif shape&2 == 0 { return fmt.Errorf(\"resolver: required relation missing\") }\n")
 	b.WriteString("\t\t\t\treq.Buf.B = codec.AppendNull(req.Buf.B)\n\t\t\t\tcontinue\n\t\t\t}\n\t\t}\n")
-	b.WriteString("\t\ttmp.Reset()\n\t\tif shape&1 != 0 {\n")
+	b.WriteString("\t\ttmp.Reset()\n\t\ttmp.Identity = req.Buf.Identity\n\t\tif shape&1 != 0 {\n")
 	fmt.Fprintf(b, "\t\t\tif err := WriteColumnar%s(tmp, items, req.FieldMask); err != nil { return err }\n", ep.modelName)
 	b.WriteString("\t\t} else {\n\t\t\tif err := items[0].WriteLuxo(tmp, req.FieldMask); err != nil { return err }\n\t\t}\n")
 	b.WriteString("\t\tif shape&2 != 0 { req.Buf.B = codec.AppendPresent(req.Buf.B) }\n")
@@ -136,7 +138,7 @@ func (g *GeneratorContext) registerResolveEndpoints(b *strings.Builder, endpoint
 		fmt.Fprintf(b, "\trouter.HandleInternal(%q, handleResolve%sBy%s(app))\n", ep.svcName, ep.modelName, str.Capitalize(ep.fkField))
 		if id := g.apiID(ep.svcName); id > 0 {
 			writeRegistryRoute(b, ep.svcName, id)
-			fmt.Fprintf(b, "\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: 1, Name: \"keys\", Type: %q, IsList: true}, {FieldID: 2, Name: \"shape\", Type: \"Int\"}}); err != nil { return err }\n", ep.svcName, ep.keyType)
+			fmt.Fprintf(b, "\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{{FieldID: %d, Name: \"keys\", Type: %q, IsList: true}, {FieldID: %d, Name: \"shape\", Type: \"Int\"}}); err != nil { return err }\n", ep.svcName, g.apiParamID(ep.svcName, "keys"), ep.keyType, g.apiParamID(ep.svcName, "shape"))
 		}
 	}
 	b.WriteString("\treturn nil\n}\n\n")

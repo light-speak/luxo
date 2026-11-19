@@ -1437,7 +1437,7 @@ func memberMethodDescription(word string) string {
 		// @withAuth injected methods
 		"createToken":        "`.createToken(expires?: Duration): String` — Generate access token\n\n生成访问令牌",
 		"createRefreshToken": "`.createRefreshToken(): String` — Generate refresh token when enabled\n\n启用刷新时签发刷新令牌",
-		"verify":             "`.verify(plain: String): Boolean` — Verify password against @hash field\n\n校验 @hash 字段的密码",
+		"verify":             "`.verify(plain: String): Boolean` — Verify the single @hash field\n\n仅校验唯一的 @hash 字段",
 		"refreshToken":       "`.refreshToken(token: String): String` — Exchange refresh for access token\n\n使用刷新令牌换取访问令牌",
 		// Identity methods
 		"load": "`.load(fields...): Identity` — Lazy load user fields from database\n\n从数据库懒加载用户字段",
@@ -1711,7 +1711,7 @@ func findMyLoadFieldDefinition(doc *Document, fieldName string) *token.Position 
 	// fall back to semantic result for cross-file resolution
 	if doc.Result != nil {
 		if typ, ok := doc.Result.Types[modelName]; ok {
-			if fi, ok := typ.Fields[fieldName]; ok && fi.Pos.File != "" {
+			if fi := typ.LookupField(fieldName); fi != nil && fi.Pos.File != "" {
 				return &fi.Pos
 			}
 		}
@@ -1819,20 +1819,36 @@ func findEnclosingApiReturnModelName(doc *Document, pos Position) string {
 	return ""
 }
 
-// findWithAuthModelName finds the model name that has the @withAuth directive
-// by searching the current file's AST model declarations.
+// Prefer the explicit default across the analyzed project, matching semantic
+// identity selection. Without one, retain the first declared subject fallback.
 func findWithAuthModelName(doc *Document) string {
 	if doc.File == nil {
 		return ""
 	}
-	for _, m := range doc.File.Models {
-		for _, d := range m.Directives {
-			if d.Name == "withAuth" {
-				return m.Name
+	files := []*ast.File{doc.File}
+	if doc.Result != nil && len(doc.Result.Files) != 0 {
+		files = doc.Result.Files
+	}
+	var fallback string
+	for _, file := range files {
+		for _, model := range file.Models {
+			for _, directive := range model.Directives {
+				if directive.Name != "withAuth" {
+					continue
+				}
+				if fallback == "" {
+					fallback = model.Name
+				}
+				for _, arg := range directive.Args {
+					literal, ok := arg.Value.(*ast.Literal)
+					if arg.Name == "default" && ok && literal.Kind == token.True {
+						return model.Name
+					}
+				}
 			}
 		}
 	}
-	return ""
+	return fallback
 }
 
 // findCRUDBareFieldDefinition resolves a bare field name (without "it." prefix) inside a CRUD call
@@ -2746,10 +2762,7 @@ func inferPlural(name string) string {
 }
 
 func capitalize(s string) string {
-	if s == "" {
-		return s
-	}
-	return strings.ToUpper(s[:1]) + s[1:]
+	return str.Capitalize(s)
 }
 
 func isBuiltinType(name string) bool {

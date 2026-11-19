@@ -25,36 +25,78 @@ var fixtureServer []byte
 
 func main() {
 	out := flag.String("out", "", "existing empty directory under the core repository's .tmp")
+	modelDepth := flag.Bool("model-depth", false, "generate the isolated recursive DTO HTTP/WS fixture; requires -out")
 	run := flag.Bool("run", false, "run a consumer command against an owned temporary Go service")
 	sql := flag.Bool("sql", false, "generate the TLS H2 / PostgreSQL selection fixture; requires -out")
+	precision := flag.Bool("sql-precision", false, "generate the isolated PostgreSQL scalar precision fixture; requires -out")
+	relations := flag.Bool("sql-relations", false, "generate the PostgreSQL relationship/pagination fixture; requires -out")
 	gateway := flag.Bool("gateway", false, "run the consumer through a generated gateway and a separate TCP RPC service")
 	futureEnum := flag.Bool("future-enum", false, "generate a newer enum revision for old-SDK interoperability tests; requires -out")
 	enumUpgrade := flag.Bool("enum-upgrade", false, "run an old-Schema consumer against a newer enum service; requires -run")
 	flag.Parse()
-	var err error
-	if *sql && (*run || *gateway || *futureEnum || *enumUpgrade || *out == "") {
-		err = fmt.Errorf("-sql requires -out and cannot be combined with run/gateway/enum options")
-	} else if *sql {
-		err = generateSQLFixture(*out)
-	} else if *enumUpgrade && (!*run || *futureEnum) {
-		err = fmt.Errorf("-enum-upgrade requires -run and cannot be combined with -future-enum")
-	} else if *futureEnum && (*run || *out == "") {
-		err = fmt.Errorf("-future-enum requires -out and cannot be combined with -run")
-	} else if *run && *out != "" {
-		err = fmt.Errorf("-run and -out cannot be combined")
-	} else if *gateway && !*run {
-		err = fmt.Errorf("-gateway requires -run")
-	} else if *enumUpgrade {
-		err = runEnumUpgradeCommand(flag.Args(), *gateway)
-	} else if *run {
-		err = runFixtureCommand(flag.Args(), *gateway)
-	} else {
-		err = generateFixtureRevision(*out, *futureEnum)
+	if *relations {
+		if err := generateRelationshipSQLMode(*out, flag.Args(), *run, *sql, *precision, *gateway, *futureEnum, *enumUpgrade, *modelDepth); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
-	if err != nil {
+	if *precision {
+		if err := generatePrecisionMode(*out, *run, *sql, *gateway, *futureEnum, *enumUpgrade, *modelDepth); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *modelDepth {
+		if err := generateModelDepthMode(*out, *run, *sql, *gateway, *futureEnum, *enumUpgrade); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	mode := fixtureMode{out: *out, run: *run, sql: *sql, gateway: *gateway, futureEnum: *futureEnum, enumUpgrade: *enumUpgrade}
+	if err := mode.execute(flag.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+type fixtureMode struct {
+	out                                        string
+	run, sql, gateway, futureEnum, enumUpgrade bool
+}
+
+func (mode fixtureMode) execute(arguments []string) error {
+	switch {
+	case mode.sql && (mode.run || mode.gateway || mode.futureEnum || mode.enumUpgrade || mode.out == ""):
+		return fmt.Errorf("-sql requires -out and cannot be combined with run/gateway/enum options")
+	case mode.sql:
+		return generateSQLFixture(mode.out)
+	case mode.enumUpgrade && (!mode.run || mode.futureEnum):
+		return fmt.Errorf("-enum-upgrade requires -run and cannot be combined with -future-enum")
+	case mode.futureEnum && (mode.run || mode.out == ""):
+		return fmt.Errorf("-future-enum requires -out and cannot be combined with -run")
+	case mode.run && mode.out != "":
+		return fmt.Errorf("-run and -out cannot be combined")
+	case mode.gateway && !mode.run:
+		return fmt.Errorf("-gateway requires -run")
+	case mode.enumUpgrade:
+		return runEnumUpgradeCommand(arguments, mode.gateway)
+	case mode.run:
+		return runFixtureCommand(arguments, mode.gateway)
+	default:
+		return generateFixtureRevision(mode.out, mode.futureEnum)
+	}
+}
+
+func generateModelDepthMode(out string, modes ...bool) error {
+	for _, enabled := range modes {
+		if enabled {
+			return fmt.Errorf("-model-depth only accepts -out")
+		}
+	}
+	return generateModelDepthFixture(out)
 }
 
 func generateFixture(out string) error {

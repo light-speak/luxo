@@ -60,6 +60,14 @@ func (r enumReferences) expr(expr ast.Expr) {
 	}
 }
 
+func (r enumReferences) body(block *ast.Block) {
+	ast.Walk(block, ast.Visitor{Expr: r.expr, Stmt: func(statement ast.Stmt) {
+		if declaration, ok := statement.(*ast.ValStmt); ok {
+			r.typeRef(declaration.Type)
+		}
+	}})
+}
+
 func (r enumReferences) params(params []*ast.ParamDecl) {
 	for _, param := range params {
 		r.typeRef(param.Type)
@@ -80,14 +88,14 @@ func (r enumReferences) directives(directives []*ast.Directive) {
 		for _, arg := range directive.Args {
 			ast.WalkExpr(arg.Value, r.expr)
 		}
-		ast.WalkExprs(directive.Body, r.expr)
+		r.body(directive.Body)
 	}
 }
 
 func (r enumReferences) function(fn *ast.FnDecl) {
 	r.params(fn.Params)
 	r.typeRef(fn.ReturnType)
-	ast.WalkExprs(fn.Body, r.expr)
+	r.body(fn.Body)
 	r.directives(fn.Directives)
 }
 
@@ -109,7 +117,7 @@ func (r enumReferences) file(file *ast.File) {
 	for _, api := range file.APIs {
 		r.params(api.Params)
 		r.typeRef(api.ReturnType)
-		ast.WalkExprs(api.Body, r.expr)
+		r.body(api.Body)
 		r.directives(api.Directives)
 	}
 	for _, fn := range file.Functions {
@@ -137,10 +145,10 @@ func (r enumReferences) otherDeclarations(file *ast.File) {
 		}
 	}
 	for _, listener := range file.Listeners {
-		ast.WalkExprs(listener.Body, r.expr)
+		r.body(listener.Body)
 	}
 	for _, middleware := range file.Middlewares {
-		ast.WalkExprs(middleware.Body, r.expr)
+		r.body(middleware.Body)
 		r.directives(middleware.Directives)
 	}
 	for _, global := range file.Globals {

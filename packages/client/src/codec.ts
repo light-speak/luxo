@@ -14,8 +14,9 @@
 import { writeWireInt64 } from './int64'
 import { formatDateTime, parseDateTime } from './datetime'
 import { writeWireUint64 } from './uint64'
-import { MAX_ARENA_SIZE, MAX_COLUMNAR_RECORDS, WireReader, decodeUTF8 } from './wire-reader'
-import { decodeLuxoJSON } from './json'
+import { MAX_ARRAY_ELEMENTS, MAX_ARENA_SIZE, MAX_COLUMNAR_RECORDS, WireReader, decodeUTF8 } from './wire-reader'
+import { decodeBoundedLuxoJSON, encodeBoundedLuxoJSON } from './json'
+import { assertJSONResourceSource } from './json-resource'
 import { assertUnicode } from './unicode'
 import { MAX_SELECTION_FIELD_ID } from './schema'
 
@@ -27,6 +28,14 @@ function encodeUTF8(value: string): Uint8Array {
 }
 
 const INITIAL_BUF_SIZE = 1024
+
+function checkedArrayCount(count: number): number {
+  if (!Number.isSafeInteger(count) || count < 0 || count > MAX_ARRAY_ELEMENTS) {
+    throw new RangeError('array count must be between 0 and 1000000')
+  }
+  return count
+}
+
 
 // --- UUID helpers ---
 // On the wire a UUID is a fixed 16-byte value (no length prefix). In JS it is
@@ -68,7 +77,32 @@ export function decodeBase64(value: string): Uint8Array {
 
 /** Decode a JSON value from its raw binary payload. */
 export function decodeJSONValue(value: Uint8Array): unknown {
-  return decodeLuxoJSON(decodeUTF8(value))
+  return decodeBoundedLuxoJSON(decodeUTF8(value))
+}
+
+/** Validate a discarded JSON value without materializing its objects or numbers. */
+export function validateJSONValue(value: Uint8Array): void {
+  assertJSONResourceSource(decodeUTF8(value))
+}
+
+/** Validate a typed JSON array; each element owns an independent JSON budget. */
+export function validateJSONArray(value: Uint8Array): void {
+  new JSONArrayResourceReader(value).validate()
+}
+
+class JSONArrayResourceReader extends WireReader {
+  validate(): void {
+    const count = this.readArrayCount()
+    for (let i = 0; i < count; i++) {
+      const length = this.readLength('bytes')
+      if (length < 0) break
+      const end = this.wireOffset + length
+      validateJSONValue(this.wireBytes.subarray(this.wireOffset, end))
+      this.wireOffset = end
+    }
+    if (this.error !== null) throw new Error(this.error)
+    if (this.wireOffset !== this.wireBytes.length) throw new Error('unexpected trailing response bytes')
+  }
 }
 
 /** Decode a single hex digit, or -1 if not a hex char. */
@@ -180,6 +214,33 @@ export class Encoder {
     this.writeBytes(encodeUTF8(v))
   }
 
+  /** Write length-prefixed JSON null, distinct from a nullable presence marker. */
+  writeJSONNull(): void {
+    this.grow(5)
+    this.buf[this.pos++] = 4
+    this.view.setUint32(this.pos, 0x6c6c756e, true)
+    this.pos += 4
+  }
+
+  /** Write strict JSON directly when its UTF-8 length must fit a one-byte prefix. */
+  writeJSON(value: unknown): void {
+    if (value === null) {
+      this.writeJSONNull()
+      return
+    }
+    const text = encodeBoundedLuxoJSON(value)
+    // Each UTF-16 code unit needs at most three UTF-8 bytes. At most 42
+    // units fit a one-byte length without a second scan or moving the payload.
+    if (text.length > 42 || this.buf.length - this.pos < 1 + text.length * 3) {
+      this.writeBytes(textEncoder.encode(text))
+      return
+    }
+    const prefix = this.pos++
+    const { written } = textEncoder.encodeInto(text, this.buf.subarray(this.pos))
+    this.buf[prefix] = written
+    this.pos += written
+  }
+
   /** Write boolean as varint 0 or 1 */
   writeBool(v: boolean): void {
     this.grow(1)
@@ -244,6 +305,10 @@ export class Encoder {
     this.pos += 16
   }
 
+  writeArrayHeader(count: number): void {
+    this.writeVarint(checkedArrayCount(count))
+  }
+
   // --- Field writers (fieldID + value) ---
 
   writeFieldInt(fieldID: number, v: bigint): void {
@@ -281,22 +346,25 @@ export class Encoder {
   // Array count is a plain varint (not zigzag); each item is encoded per element type.
 
   writeFieldIntArray(fieldID: number, v: bigint[]): void {
+    const count = checkedArrayCount(v.length)
     this.writeVarint(fieldID)
-    this.writeVarint(v.length)
+    this.writeVarint(count)
     for (const item of v) this.writeSvarint(item)
   }
 
   writeFieldFloatArray(fieldID: number, v: number[]): void {
+    const count = checkedArrayCount(v.length)
     this.writeVarint(fieldID)
-    this.writeVarint(v.length)
+    this.writeVarint(count)
     for (const item of v) this.writeFixed64(item)
   }
 
   writeFieldStringArray(fieldID: number, v: string[]): void {
+    const count = checkedArrayCount(v.length)
     const start = this.pos
     try {
       this.writeVarint(fieldID)
-      this.writeVarint(v.length)
+      this.writeVarint(count)
       for (const item of v) this.writeString(item)
     } catch (error) {
       this.pos = start
@@ -305,20 +373,23 @@ export class Encoder {
   }
 
   writeFieldBoolArray(fieldID: number, v: boolean[]): void {
+    const count = checkedArrayCount(v.length)
     this.writeVarint(fieldID)
-    this.writeVarint(v.length)
+    this.writeVarint(count)
     for (const item of v) this.writeBool(item)
   }
 
   writeFieldUUIDArray(fieldID: number, v: (string | Uint8Array)[]): void {
+    const count = checkedArrayCount(v.length)
     this.writeVarint(fieldID)
-    this.writeVarint(v.length)
+    this.writeVarint(count)
     for (const item of v) this.writeUUID(item)
   }
 
   writeFieldBytesArray(fieldID: number, v: Uint8Array[]): void {
+    const count = checkedArrayCount(v.length)
     this.writeVarint(fieldID)
-    this.writeVarint(v.length)
+    this.writeVarint(count)
     for (const item of v) this.writeBytes(item)
   }
 
@@ -375,6 +446,16 @@ export class Decoder extends WireReader {
   /** Skip the arena header (totalStringLen varint) that prefixes each model's binary data. */
   skipArenaHeader(): void {
     this.readBoundedUnsigned(MAX_ARENA_SIZE, 'arena size')
+  }
+
+  /** Read a stable sealed variant ID without accepting an unbounded metadata tag. */
+  readVariantTag(): number {
+    return this.readBoundedUnsigned(65535, 'sealed tag')
+  }
+
+  /** Read the bounded element count used by generated framed object lists. */
+  readListCount(): number {
+    return this.readArrayCount()
   }
 
   /** Read next field ID. EOF without an end marker is a protocol error. */

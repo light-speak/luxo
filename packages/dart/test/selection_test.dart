@@ -25,6 +25,37 @@ List<int> encode(APISchemaEntry meta, String text, [PreparedSelection? plan]) {
 }
 
 void main() {
+  test('Unicode DSL letters preserve prepared and dynamic wire IDs', () {
+    final meta = APISchemaEntry(
+      1,
+      [],
+      {
+        'café': SelectionFieldSchema(1),
+        '中文2': SelectionFieldSchema(2, 'Nested'),
+      },
+      {
+        'Nested': {'𐐀_name': SelectionFieldSchema(3)},
+      },
+    );
+    const text = 'café,中文2{𐐀_name}';
+    final ascii = APISchemaEntry(
+      1,
+      [],
+      {
+        'cafe': SelectionFieldSchema(1),
+        'nested': SelectionFieldSchema(2, 'Nested'),
+      },
+      {
+        'Nested': {'name': SelectionFieldSchema(3)},
+      },
+    );
+    final expected = encode(ascii, 'cafe,nested{name}');
+    expect(encode(meta, text), expected);
+    expect(encode(meta, text, PreparedSelection(text)), expected);
+    for (final invalid in ['2café', 'café²', 'e\u0301', '😀', '字\u200d']) {
+      expect(() => PreparedSelection(invalid), throwsA(isA<LuxoError>()));
+    }
+  });
   test('rejects trailing separators in dynamic and prepared selections', () {
     for (final text in [
       'user,',

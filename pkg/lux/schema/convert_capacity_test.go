@@ -43,7 +43,7 @@ func TestGrowJSONRowsPreservesPrefixAndReusesCapacity(t *testing.T) {
 	if err == nil || !bytes.Equal(got, dst) || &got[0] != &dst[0] {
 		t.Fatalf("overflow mutated the original prefix: %q, %v", got, err)
 	}
-	got, err = appendJSONRows(dst, math.MaxInt, columns)
+	got, err = appendJSONRows(dst, math.MaxInt, columns, 1)
 	if err == nil || !bytes.Equal(got, dst) {
 		t.Fatalf("row append ignored capacity failure: %q, %v", got, err)
 	}

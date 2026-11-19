@@ -8,12 +8,29 @@ class APISchemaEntry {
   final List<ParamSchema> params;
   final Map<String, SelectionFieldSchema> fields;
   final Map<String, Map<String, SelectionFieldSchema>> types;
+  final JSONResponseSchema? response;
   const APISchemaEntry(
     this.id, [
     this.params = const [],
     this.fields = const {},
     this.types = const {},
+    this.response,
   ]);
+}
+
+/// Static response shape; generic JSON roots and model objects have separate budgets.
+final class JSONResponseSchema {
+  final String? modelType;
+  final Map<String, Map<String, SelectionFieldSchema>> types;
+  final bool isList;
+  final bool paginated;
+
+  const JSONResponseSchema({
+    this.modelType,
+    this.types = const {},
+    this.isList = false,
+    this.paginated = false,
+  });
 }
 
 class SelectionFieldSchema {

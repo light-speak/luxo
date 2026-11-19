@@ -15,6 +15,50 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
+func FuzzBinaryRequestReuseAfterFailure(f *testing.F) {
+	registry := NewAPIRegistry()
+	if err := registry.Register("update", 1); err != nil {
+		f.Fatal(err)
+	}
+	meta := []ParamMeta{{Name: "value", Type: "Int", FieldID: 1, Nullable: true}}
+	if err := registry.RegisterParams("update", meta); err != nil {
+		f.Fatal(err)
+	}
+	initial, err := EncodeBinaryRequest(1, nil, map[string]any{"value": nil}, meta)
+	if err != nil {
+		f.Fatal(err)
+	}
+	for _, seed := range [][]byte{nil, {1}, {1, 0, 1}, {1, 0, 0}, initial} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, body []byte) {
+		if len(body) > 4096 {
+			return
+		}
+		var reused Request
+		if err := registry.ParseBinaryRequestInto(initial, &reused); err != nil {
+			t.Fatal(err)
+		}
+		if !reused.HasParam("value") || !reused.ParamIsNull("value") {
+			t.Fatal("initial explicit null missing")
+		}
+		original := bytes.Clone(body)
+		_ = registry.ParseBinaryRequestInto(body, &reused)
+		if !bytes.Equal(body, original) {
+			t.Fatal("parser modified borrowed bytes")
+		}
+		if err := registry.ParseBinaryRequestInto([]byte{1, 0, 0}, &reused); err != nil {
+			t.Fatal(err)
+		}
+		if reused.API != "update" || reused.HasParam("value") || reused.ParamIsNull("value") || reused.paramSlots[0] != nil {
+			t.Fatal("previous request state survived missing parameter")
+		}
+		if !bytes.Equal(reused.BinaryRequest(), []byte{1, 0, 0}) || len(reused.Filters) != 0 || len(reused.Sorters) != 0 {
+			t.Fatal("previous canonical body or query survived reuse")
+		}
+	})
+}
+
 func FuzzDecodeFieldMask(f *testing.F) {
 	s := schema.New()
 	model := &schema.Model{Name: "Record", Fields: []schema.Field{

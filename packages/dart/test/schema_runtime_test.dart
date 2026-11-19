@@ -15,7 +15,18 @@ void main() {
     final types = {'Input': fields};
     final params = [const ParamSchema(1, 'value', 'Int', true, true)];
     final source = {
-      'read': APISchemaEntry(1, params, fields, types),
+      'read': APISchemaEntry(
+        1,
+        params,
+        fields,
+        types,
+        JSONResponseSchema(
+          modelType: 'Input',
+          types: types,
+          isList: true,
+          paginated: true,
+        ),
+      ),
       'other': APISchemaEntry(2, params, fields, types),
     };
     final snapshot = snapshotAPISchema(source);
@@ -23,6 +34,10 @@ void main() {
     expect(identical(read.fields, snapshot['other']!.fields), isTrue);
     expect(identical(read.types, snapshot['other']!.types), isTrue);
     expect(identical(read.fields, read.types['Input']), isTrue);
+    expect(identical(read.types, read.response!.types), isTrue);
+    expect(read.response!.modelType, 'Input');
+    expect(read.response!.isList, isTrue);
+    expect(read.response!.paginated, isTrue);
     expect(identical(read.fields, fields), isFalse);
     expect(read.fields['value']!.isList, isTrue);
     expect(read.fields['value']!.nullable, isTrue);
@@ -35,6 +50,19 @@ void main() {
     expect(() => read.fields.clear(), throwsUnsupportedError);
     expect(() => read.params.clear(), throwsUnsupportedError);
     expect(() => snapshot.clear(), throwsUnsupportedError);
+    expect(() => read.response!.types.clear(), throwsUnsupportedError);
+    expect(
+      () => snapshotAPISchema({
+        'read': const APISchemaEntry(
+          1,
+          [],
+          {},
+          {},
+          JSONResponseSchema(modelType: 'Missing'),
+        ),
+      }),
+      throwsFormatException,
+    );
     final updated = snapshotAPISchema(source);
     expect(updated['read']!.fields['value']!.fieldID, 2);
     expect(updated['read']!.params, isEmpty);
@@ -52,6 +80,39 @@ void main() {
   });
 
   for (final socket in [false, true]) {
+    test(
+      'rejects duplicate parameter names with distinct IDs, socket=$socket',
+      () {
+        final Transport transport = socket
+            ? WsTransport('ws://localhost/luxo')
+            : HttpTransport('http://localhost/luxo');
+        addTearDown(transport.close);
+        for (final name in ['value', '__proto__', '用户']) {
+          final params = [
+            ParamSchema(1, name, 'Int'),
+            ParamSchema(2, name, 'Int'),
+          ];
+          expect(
+            () => transport.setSchema({'read': APISchemaEntry(1, params)}),
+            throwsA(
+              isA<FormatException>().having(
+                (e) => e.message,
+                'message',
+                contains('duplicate name'),
+              ),
+            ),
+          );
+          expect(
+            () => transport.setSchema({
+              'read': APISchemaEntry(1, params.take(1).toList()),
+              'other': APISchemaEntry(2, params.take(1).toList()),
+            }),
+            returnsNormally,
+          );
+        }
+      },
+    );
+
     test('runtime IDs and namespaces, socket=$socket', () {
       final Transport transport = socket
           ? WsTransport('ws://localhost/luxo')
@@ -104,6 +165,15 @@ void main() {
           'read': APISchemaEntry(9, [_ThrowingParam()]),
         }),
         throwsStateError,
+      );
+      expect(
+        () => transport.setSchema({
+          'read': const APISchemaEntry(9, [
+            ParamSchema(1, 'value', 'Int'),
+            ParamSchema(2, 'value', 'Int'),
+          ]),
+        }),
+        throwsA(isA<FormatException>()),
       );
       final result = await transport.call<Object>(
         'read',

@@ -216,6 +216,47 @@ func TestCacheKeyFramesParameterNamesAndValues(t *testing.T) {
 	}
 }
 
+func TestResponseCacheRejectsLegacyKeyCollisions(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		left, right map[string]json.RawMessage
+	}{
+		{"delimiter", map[string]json.RawMessage{"a": []byte(`"x;b=y"`)}, map[string]json.RawMessage{"a": []byte(`"x"`), "b": []byte(`"y"`)}},
+		{"list", map[string]json.RawMessage{"ids": []byte(`[1]`)}, map[string]json.RawMessage{"ids": []byte(`[2]`)}},
+		{"type", map[string]json.RawMessage{"value": []byte(`true`)}, map[string]json.RawMessage{"value": []byte(`"T"`)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			first := &Request{API: "probe", Params: tc.left}
+			second := &Request{API: "probe", Params: tc.right}
+			if testCacheKey(t, first) == testCacheKey(t, second) {
+				t.Fatal("different parameter material produced the same response cache key")
+			}
+			backend := cache.NewMemory()
+			t.Cleanup(func() { _ = backend.Close() })
+			calls := 0
+			cached := bindResponseCache(testCacheRoute(t, backend, "test", "probe"), withAnonymousTestCache(func(_ context.Context, req *Request) error {
+				calls++
+				req.Buf.B = codec.AppendSvarint(req.Buf.B, int64(calls))
+				return nil
+			}))
+			for range 2 {
+				for i, params := range []map[string]json.RawMessage{tc.left, tc.right} {
+					req := &Request{API: "probe", Params: params, Buf: &ResponseBuf{}}
+					if err := cached(t.Context(), req); err != nil {
+						t.Fatal(err)
+					}
+					if want := codec.AppendSvarint(nil, int64(i+1)); !bytes.Equal(req.Buf.B, want) {
+						t.Fatalf("cached response = %x, want %x", req.Buf.B, want)
+					}
+				}
+			}
+			if calls != 2 {
+				t.Fatalf("origin calls = %d, want one for each parameter set", calls)
+			}
+		})
+	}
+}
+
 func TestCacheRejectsBinarySlotsWithoutCanonicalBody(t *testing.T) {
 	for _, binaryMode := range []bool{false, true} {
 		req := &Request{API: "cached", BinaryMode: binaryMode, Buf: &ResponseBuf{}, responseCache: testCacheRoute(t, cache.Nop{}, "test", "cached")}

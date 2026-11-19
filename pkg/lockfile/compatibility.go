@@ -35,6 +35,7 @@ func (lf *LockFile) BreakingChanges(files []*ast.File) []BreakingChange {
 	var changes []BreakingChange
 	changes = append(changes, compareFields("model", lf.Models, contracts.models, false)...)
 	changes = append(changes, compareFields("type", lf.Types, contracts.types, false)...)
+	changes = append(changes, compareSealedContracts(lf.Types, contracts)...)
 	changes = append(changes, compareFields("event", lf.Events, contracts.events, true)...)
 	changes = append(changes, lf.compareAPIs(files, contracts.apis)...)
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
@@ -42,10 +43,12 @@ func (lf *LockFile) BreakingChanges(files []*ast.File) []BreakingChange {
 }
 
 type wireContracts struct {
-	models map[string]map[string]string
-	types  map[string]map[string]string
-	events map[string]map[string]string
-	apis   map[string]apiContract
+	models   map[string]map[string]string
+	types    map[string]map[string]string
+	events   map[string]map[string]string
+	apis     map[string]apiContract
+	kinds    map[string]string
+	defaults map[string]map[string]bool
 }
 
 type apiContract struct {
@@ -81,6 +84,7 @@ func collectContracts(files []*ast.File) wireContracts {
 		for _, declaration := range file.Types {
 			contracts.types[declaration.Name] = fieldTypes(declaration.Fields)
 		}
+		collectSealedContracts(&contracts, file.Sealeds)
 		for _, event := range file.Events {
 			params := make(map[string]string, len(event.Params))
 			for _, param := range event.Params {

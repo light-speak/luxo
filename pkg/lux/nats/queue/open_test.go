@@ -44,13 +44,25 @@ func TestStreamName(t *testing.T) {
 		want  string
 	}{
 		{"tasks", "luxo_q_tasks"},
-		{"email.send", "luxo_q_email_send"},
-		{"a.b.c", "luxo_q_a_b_c"},
+		{"email.send", "luxo_q_email_dsend"},
+		{"a.b.c", "luxo_q_a_db_dc"},
 	}
 	for _, tt := range tests {
 		got := streamName(tt.input)
 		if got != tt.want {
 			t.Errorf("streamName(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestStreamNamesDoNotAlias(t *testing.T) {
+	names := []string{"email.send", "email_send", "email__send", "email_dsend"}
+	seen := make(map[string]string)
+	for _, name := range names {
+		encoded := streamName(name)
+		if previous, ok := seen[encoded]; ok {
+			t.Fatalf("queues %q and %q share stream %q", previous, name, encoded)
+		}
+		seen[encoded] = name
 	}
 }

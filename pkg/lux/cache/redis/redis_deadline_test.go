@@ -168,3 +168,48 @@ func readRedisTestCommand(reader *bufio.Reader) (string, error) {
 	}
 	return command, nil
 }
+
+func TestRedisSecureURLStartsTLSWithoutPlaintextFallback(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	var headers [][]byte
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+			header := make([]byte, 5)
+			n, _ := io.ReadFull(conn, header)
+			headers = append(headers, header[:n])
+			_ = conn.Close()
+		}
+	}()
+	t.Cleanup(func() { _ = listener.Close(); <-done })
+	cache, err := newRedisFromURL("rediss://"+listener.Addr().String(), WithTimeout(250*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := cache.Ping(ctx); err == nil {
+		t.Fatal("plaintext-only peer accepted as TLS")
+	}
+	_ = listener.Close()
+	<-done
+	if len(headers) == 0 {
+		t.Fatal("TLS connection did not reach peer")
+	}
+	for _, header := range headers {
+		if len(header) != 5 || header[0] != 0x16 || header[1] != 3 {
+			t.Fatalf("expected TLS handshake before Redis commands, got %x", header)
+		}
+	}
+}

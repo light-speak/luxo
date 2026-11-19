@@ -98,16 +98,14 @@ func generateAuthMethods(b *strings.Builder, m *ast.ModelDecl, enums map[string]
 		writer.enums = enums
 		writer.objectPrefix = "Auth"
 	}
-	recv := strings.ToLower(m.Name[:1])
+	recv := "value"
 	fields := authStoreFields(m)
 	writeAuthClaims(b, m, fields, recv, writer)
 	writeAuthIssuers(b, m.Name, recv)
 	fmt.Fprintf(b, "\nfunc (%s *%s) RefreshToken(oldToken string) (string, error) {\n", recv, m.Name)
 	b.WriteString("\tcfg, err := auth.LoadConfig()\n")
 	b.WriteString("\tif err != nil { return \"\", err }\n")
-	b.WriteString("\tdata, err := auth.VerifyRefresh(cfg, oldToken)\n")
-	b.WriteString("\tif err != nil { return \"\", err }\n")
-	b.WriteString("\treturn auth.Sign(cfg, data.AppendJSON)\n}\n")
+	fmt.Fprintf(b, "\treturn auth.RefreshForSubject(cfg, %q, oldToken)\n}\n", m.Name)
 	if len(writers) == 0 {
 		writer.writeObjects(b)
 	}
@@ -115,14 +113,14 @@ func generateAuthMethods(b *strings.Builder, m *ast.ModelDecl, enums map[string]
 
 func writeAuthIssuers(b *strings.Builder, model, recv string) {
 	for _, method := range []struct{ name, params, sign, extra string }{
-		{"CreateToken", "", "Sign", ""},
-		{"CreateTokenWithExpiry", "expires time.Duration", "SignWithExpiry", ", expires"},
-		{"CreateRefreshToken", "", "SignRefresh", ""},
+		{"CreateToken", "", "SignForSubject", ""},
+		{"CreateTokenWithExpiry", "expires time.Duration", "SignForSubjectWithExpiry", ", expires"},
+		{"CreateRefreshToken", "", "SignRefreshForSubject", ""},
 	} {
 		fmt.Fprintf(b, "\nfunc (%s *%s) %s(%s) (string, error) {\n", recv, model, method.name, method.params)
 		b.WriteString("\tcfg, err := auth.LoadConfig()\n")
 		b.WriteString("\tif err != nil { return \"\", err }\n")
-		fmt.Fprintf(b, "\treturn auth.%s(cfg, %s.AppendClaimsJSON%s)\n}\n", method.sign, recv, method.extra)
+		fmt.Fprintf(b, "\treturn auth.%s(cfg, %q, %s.AppendClaimsJSON%s)\n}\n", method.sign, model, recv, method.extra)
 	}
 }
 

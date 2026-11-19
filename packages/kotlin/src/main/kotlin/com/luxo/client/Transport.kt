@@ -1,14 +1,21 @@
 package com.luxo.client
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
 import java.util.Base64
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.nanoseconds
 
 /** Transport mode: JSON for debugging, BINARY for production. */
 enum class TransportMode { JSON, BINARY }
@@ -37,7 +44,20 @@ data class APISchemaEntry(
     val params: List<ParamSchema> = emptyList(),
     val fields: Map<String, SelectionFieldSchema> = emptyMap(),
     val types: Map<String, Map<String, SelectionFieldSchema>> = emptyMap(),
+    val responseType: SelectionFieldSchema? = null,
 ) {
+    /** Retain independently compiled clients' original constructor and default bridge. */
+    internal constructor(id: Int, params: List<ParamSchema> = emptyList(),
+        fields: Map<String, SelectionFieldSchema> = emptyMap(),
+        types: Map<String, Map<String, SelectionFieldSchema>> = emptyMap()) : this(id, params, fields, types, null)
+
+    /** The JVM name also preserves the old compiler-generated copy$default entry. */
+    @JvmName("copy")
+    internal fun legacyCopy(id: Int = this.id, params: List<ParamSchema> = this.params,
+        fields: Map<String, SelectionFieldSchema> = this.fields,
+        types: Map<String, Map<String, SelectionFieldSchema>> = this.types): APISchemaEntry =
+        APISchemaEntry(id, params, fields, types, responseType)
+
     // Built once with the schema, not on the request path.
     internal val paramsByName = params.associateBy { it.name }
     internal var selectionSnapshot = false
@@ -62,27 +82,40 @@ data class ParamSchema(
 )
 
 /** Convert supported Kotlin values to their lossless JSON representation. */
-internal fun luxoJsonValue(value: Any?): JsonElement = when (value) {
+internal fun luxoJsonValue(value: Any?): JsonElement = luxoJsonValue(value, 0, Int.MAX_VALUE)
+
+internal fun luxoGenericJSONValue(value: Any?): JsonElement = luxoJsonValue(value, 0, 128)
+
+private fun luxoJsonValue(value: Any?, depth: Int, maxDepth: Int): JsonElement = when (value) {
     null -> JsonNull
-    is JsonElement -> value
+    is JsonElement -> value.also { if (maxDepth == 128) requireJSONValueUnicode(it, depth) }
     is String -> JsonPrimitive(value)
     is Boolean -> JsonPrimitive(value)
     is Number -> JsonPrimitive(value)
     is ByteArray -> JsonPrimitive(Base64.getEncoder().encodeToString(value))
     is Map<*, *> -> buildJsonObject {
+        requireJSONContainerBudget(maxDepth - depth)
         for ((key, item) in value) {
             require(key is String) { "JSON object keys must be strings" }
-            put(key, luxoJsonValue(item))
+            put(key, luxoJsonValue(item, depth + 1, maxDepth))
         }
     }
-    is Iterable<*> -> buildJsonArray { value.forEach { add(luxoJsonValue(it)) } }
-    is Array<*> -> buildJsonArray { value.forEach { add(luxoJsonValue(it)) } }
-	is LuxoBinaryEncodable -> value.toLuxoJson()
+    is Iterable<*> -> buildJsonArray {
+        requireJSONContainerBudget(maxDepth - depth)
+        value.forEach { add(luxoJsonValue(it, depth + 1, maxDepth)) }
+    }
+    is Array<*> -> buildJsonArray {
+        requireJSONContainerBudget(maxDepth - depth)
+        value.forEach { add(luxoJsonValue(it, depth + 1, maxDepth)) }
+    }
+	is LuxoBinaryEncodable -> luxoJsonValue(value.toLuxoJson(), depth, maxDepth)
     else -> throw LuxoError("ConfigError", 0, "unsupported JSON value: ${value::class.qualifiedName}")
 }
 
 /** Canonical Luxo binary request, error, and WebSocket frame codec. */
 internal object LuxoBinaryProtocol {
+    fun missingResponse(statusCode: Int = 0) = LuxoError("ParseError", statusCode, "missing binary response data")
+
     const val CALL_REQUEST = 0x01
     const val CALL_SUCCESS = 0x02
     const val CALL_ERROR = 0x03
@@ -103,7 +136,7 @@ internal object LuxoBinaryProtocol {
             val value = params[param.name]
             enc.writeVarint(param.fieldID.toLong())
             if (param.nullable) {
-                if (value == null) {
+                if (value == null || (param.type == "JSON" && !param.isList && value === JsonNull)) {
                     enc.writeBool(false)
                     continue
                 }
@@ -170,13 +203,13 @@ internal object LuxoBinaryProtocol {
                 when (field.toInt()) {
                     1 -> {
                         val value = dec.readInt()
-                        require(value in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) { "error code exceeds signed 32-bit range" }
+                        require(value in 400L..599L) { "invalid error status" }
                         code = value.toInt()
                     }
                     2 -> name = dec.readString()
                     3 -> message = dec.readString()
                     4 -> traceId = dec.readString()
-                    5 -> data = decodeLuxoJSON(dec.readString())
+                    5 -> data = decodeBoundedLuxoJSON(dec.readString())
                     6 -> cause = dec.readString()
                 }
             }
@@ -291,7 +324,7 @@ internal object LuxoBinaryProtocol {
             "String", "Enum", "Decimal" -> enc.writeString(value as String)
             "Boolean" -> enc.writeBool(value as Boolean)
             "Bytes" -> enc.writeBytes(value as ByteArray)
-            "JSON" -> enc.writeBytes(encodeLuxoJSON(luxoJsonValue(value)).toByteArray(Charsets.UTF_8))
+            "JSON" -> enc.writeBytes(encodeBoundedLuxoJSON(luxoGenericJSONValue(value)).toByteArray(Charsets.UTF_8))
 			"Model" -> writeStructuredParam(enc, param, value)
             else -> throw LuxoError("ConfigError", 0, "unsupported binary param type: ${param.type}")
         }
@@ -300,7 +333,7 @@ internal object LuxoBinaryProtocol {
     private fun encodeListParam(enc: LuxoEncoder, param: ParamSchema, value: Any) {
         val items = value as? List<*>
             ?: throw LuxoError("ConfigError", 0, "parameter ${param.name} must be a list")
-        enc.writeVarint(items.size.toLong())
+        enc.writeArrayHeader(items.size)
         when (param.type) {
             "Int", "Duration" -> items.forEach { enc.writeSvarint(requireLuxoInt64(it)) }
             "Float" -> items.forEach { enc.writeFixed64((it as Number).toDouble()) }
@@ -313,7 +346,7 @@ internal object LuxoBinaryProtocol {
             "Boolean" -> items.forEach { enc.writeBool(it as Boolean) }
             "Bytes" -> items.forEach { enc.writeBytes(it as ByteArray) }
             "JSON" -> items.forEach {
-                enc.writeBytes(encodeLuxoJSON(luxoJsonValue(it)).toByteArray(Charsets.UTF_8))
+                enc.writeBytes(encodeBoundedLuxoJSON(luxoGenericJSONValue(it)).toByteArray(Charsets.UTF_8))
             }
 			"Model" -> items.forEach { writeStructuredParam(enc, param, it) }
             else -> throw LuxoError("ConfigError", 0, "unsupported binary list param type: ${param.type}")
@@ -377,7 +410,7 @@ internal class HttpProtocolHeaders private constructor(base: Headers) {
     val binary: Headers = base.newBuilder().set("Content-Type", BINARY_MEDIA_TYPE.toString())
         .set("X-Luxo-Mode", "binary").build()
 
-    constructor(headers: Map<String, String>, token: String?) : this(Headers.Builder().apply {
+    internal constructor(headers: Map<String, String>, token: String?) : this(Headers.Builder().apply {
         for ((name, value) in headers) set(name, value)
         if (token != null) set("Authorization", "Bearer $token")
     }.build())
@@ -388,6 +421,18 @@ internal class HttpProtocolHeaders private constructor(base: Headers) {
     companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val BINARY_MEDIA_TYPE = "application/x-luxo".toMediaType()
+    }
+}
+
+/** Only the calling coroutine owns this reference; intercepted request bodies stay immutable. */
+private class HTTPRequestBodySlot(body: RequestBody) {
+    var value: RequestBody = body
+        private set
+
+    fun release() { value = retiredBody }
+
+    companion object {
+        private val retiredBody = HTTPRequestBody(ByteArray(0), HttpProtocolHeaders.BINARY_MEDIA_TYPE)
     }
 }
 
@@ -409,15 +454,17 @@ class OkHttpTransport(
 
     init {
         require(maxResponseBytes > 0) { "maxResponseBytes must be positive" }
+        require(timeoutSeconds >= 0) { "timeoutSeconds must not be negative" }
         require(maxConcurrentRequests > 0) { "maxConcurrentRequests must be positive" }
     }
+    private val requestTimeoutMillis = TimeUnit.SECONDS.toMillis(timeoutSeconds)
     private val capacity = HTTPRequestCapacity(maxConcurrentRequests)
 
     // Preserve OkHttp URL normalization and call-time failures; reuse its immutable value.
     private val endpointURL by lazy { Request.Builder().url(endpoint).build().url }
 
-    private val client: OkHttpClient = client ?: defaultHTTPClient(timeoutSeconds, maxConcurrentRequests)
-    @Volatile private var currentHeaders = HttpProtocolHeaders(headers, token)
+    private val client: OkHttpClient = client?.let(::directHTTPClient) ?: defaultHTTPClient(timeoutSeconds, maxConcurrentRequests)
+    private val currentHeaders = AtomicReference(HttpProtocolHeaders(headers, token))
     @Volatile private var currentMode: TransportMode = mode
     @Volatile private var currentSchema: Map<String, APISchemaEntry> = snapshotAPISchema(schema)
 
@@ -427,73 +474,130 @@ class OkHttpTransport(
      */
     override fun setSchema(schema: Map<String, APISchemaEntry>) { currentSchema = snapshotAPISchema(schema) }
     override fun setMode(mode: TransportMode) { currentMode = mode }
-    override fun setToken(token: String) { currentHeaders = currentHeaders.withToken(token) }
+    override fun setToken(token: String) {
+        while (true) {
+            val previous = currentHeaders.get()
+            if (currentHeaders.compareAndSet(previous, previous.withToken(token))) return
+        }
+    }
 
     override suspend fun call(api: String, params: Map<String, Any?>): Any {
-        return if (currentMode == TransportMode.BINARY) callBinary(api, params) else callJSON(api, params)
+        val started = if (requestTimeoutMillis == 0L) 0L else System.nanoTime()
+        val mode = currentMode
+        val headers = currentHeaders.get()
+        val meta = currentSchema[api]
+        val body = if (mode == TransportMode.BINARY) encodeBinaryRequest(api, params, null)
+            else encodeJSONRequest(meta, api, params)
+        return dispatchPrepared(body, mode, headers, started, meta)
     }
 
-    override suspend fun call(api: String, request: GeneratedRequest): Any =
-        if (currentMode == TransportMode.BINARY) callBinary(api, emptyMap(), generated = request)
-        else callJSON(api, request.toJSONParameters())
+    override suspend fun call(api: String, request: GeneratedRequest): Any {
+        val started = if (requestTimeoutMillis == 0L) 0L else System.nanoTime()
+        val mode = currentMode
+        if (mode == TransportMode.BINARY) {
+            val headers = currentHeaders.get()
+            return dispatchPrepared(encodeBinaryRequest(api, emptyMap(), request), mode, headers, started, null)
+        }
+        val meta = currentSchema[api]
+        val body = encodeGeneratedJSONRequest(api, request, meta)
+        return dispatchPrepared(body, mode, currentHeaders.get(), started, meta)
+    }
 
-    private suspend fun callJSON(api: String, params: Map<String, Any?>, isRetry: Boolean = false): JsonElement {
+    private suspend inline fun dispatchPrepared(body: RequestBody, mode: TransportMode, headers: HttpProtocolHeaders, started: Long, schema: APISchemaEntry?): Any {
+        val slot = HTTPRequestBodySlot(body)
+        return if (requestTimeoutMillis == 0L) sendPrepared(slot, mode, headers, schema)
+            else withinRequestDeadline(slot, mode, headers, started, schema)
+    }
+
+    private suspend fun withinRequestDeadline(body: HTTPRequestBodySlot, mode: TransportMode, headers: HttpProtocolHeaders, started: Long, schema: APISchemaEntry?): Any {
+        try {
+            // Charge synchronous encoding to the same monotonic deadline without retaining its inputs.
+            val remaining = requestTimeoutMillis.milliseconds - (System.nanoTime() - started).nanoseconds
+            // Preserve callback exceptions without coroutine stack-recovery copies.
+            // Cancellation must still cross the timeout boundary normally.
+            val outcome = withTimeoutOrNull(remaining) {
+                try { Result.success(sendPrepared(body, mode, headers, schema)) }
+                catch (error: CancellationException) { throw error }
+                catch (error: Exception) { Result.failure<Any>(error) }
+            } ?: throw LuxoError("TimeoutError", 0, "request timed out after ${requestTimeoutMillis}ms")
+            return outcome.getOrThrow()
+        } finally { body.release() }
+    }
+
+    private suspend fun sendPrepared(body: HTTPRequestBodySlot, mode: TransportMode, headers: HttpProtocolHeaders, schema: APISchemaEntry?): Any =
+        if (mode == TransportMode.BINARY) callBinary(body, headers) else callJSON(body, headers, schema)
+
+    private suspend fun callJSON(body: HTTPRequestBodySlot, headers: HttpProtocolHeaders, schema: APISchemaEntry?, isRetry: Boolean = false): JsonElement {
+        try {
+            val response = client.awaitFullResponse(
+                Request.Builder().url(endpointURL).post(body.value).headers(headers.json).build(),
+                capacity, maxResponseBytes,
+            )
+            val json = try {
+                decodeHTTPJSON(response.body, schema)
+            } catch (e: Exception) {
+                throw LuxoError("ParseError", response.code, "invalid JSON response: ${e.message}")
+            }
+            val decoded = decodeLuxoJsonError(json, response.code)
+            if (response.code == 200 && decoded == null) {
+                return json["data"] ?: throw LuxoError("ParseError", response.code, "missing JSON response data")
+            }
+            val error = decoded ?: LuxoError("ParseError", response.code, "missing JSON error envelope")
+            if (currentHeaders.get() !== headers) throw error
+            val newToken = refreshFor(response.code, error, isRetry)?.invoke()
+            if (newToken != null) {
+                currentCoroutineContext().ensureActive()
+                val renewed = headers.withToken(newToken)
+                if (!currentHeaders.compareAndSet(headers, renewed)) throw error
+                return callJSON(body, renewed, schema, isRetry = true)
+            }
+            throw error
+        } finally { body.release() }
+    }
+
+    private suspend fun callBinary(body: HTTPRequestBodySlot, headers: HttpProtocolHeaders, isRetry: Boolean = false): ByteArray {
+        try {
+            val response = client.awaitFullResponse(
+                Request.Builder().url(endpointURL).post(body.value).headers(headers.binary).build(),
+                capacity, maxResponseBytes,
+            )
+            if (response.code == 200) {
+                if (response.body.isEmpty()) throw LuxoBinaryProtocol.missingResponse(response.code)
+                return response.body
+            }
+            val error = LuxoBinaryProtocol.decodeError(response.body, response.code)
+            if (currentHeaders.get() !== headers) throw error
+            val newToken = refreshFor(response.code, error, isRetry)?.invoke()
+            if (newToken != null) {
+                currentCoroutineContext().ensureActive()
+                val renewed = headers.withToken(newToken)
+                if (!currentHeaders.compareAndSet(headers, renewed)) throw error
+                return callBinary(body, renewed, isRetry = true)
+            }
+            throw error
+        } finally { body.release() }
+    }
+
+    private fun encodeGeneratedJSONRequest(api: String, request: GeneratedRequest, meta: APISchemaEntry?): RequestBody {
+        return encodeJSONRequest(meta, api, request.toJSONParameters())
+    }
+
+    private fun encodeJSONRequest(meta: APISchemaEntry?, api: String, params: Map<String, Any?>): RequestBody {
         val body = buildJsonObject {
+            putLuxoParams(params, meta)
             put("\$api", JsonPrimitive(api))
-            putLuxoParams(params, currentSchema[api])
         }
-
-        val request = Request.Builder()
-            .url(endpointURL)
-            .post(encodeLuxoJSON(body).toRequestBody(HttpProtocolHeaders.JSON_MEDIA_TYPE))
-            .headers(currentHeaders.json)
-            .build()
-
-        val response = client.awaitFullResponse(request, capacity) {
-            HTTPResponseBytes(it.code, readBoundedHTTPBody(it, maxResponseBytes))
-        }
-        val json = try {
-            decodeHTTPJSON(response.body)
-        } catch (e: Exception) {
-            throw LuxoError("ParseError", response.code, "invalid JSON response: ${e.message}")
-        }
-        val decoded = decodeLuxoJsonError(json, response.code)
-        if (response.code == 200 && decoded == null) {
-            return json["data"] ?: throw LuxoError("ParseError", response.code, "missing JSON response data")
-        }
-        val error = decoded ?: LuxoError("ParseError", response.code, "missing JSON error envelope")
-        val newToken = refreshFor(response.code, error, isRetry)?.invoke()
-        if (newToken != null) {
-            setToken(newToken)
-            return callJSON(api, params, isRetry = true)
-        }
-        throw error
+        return HTTPRequestBody(encodeLuxoJSON(body).toByteArray(Charsets.UTF_8), HttpProtocolHeaders.JSON_MEDIA_TYPE)
     }
 
-    private suspend fun callBinary(api: String, params: Map<String, Any?>, isRetry: Boolean = false, generated: GeneratedRequest? = null): ByteArray {
+    private fun encodeBinaryRequest(api: String, params: Map<String, Any?>, generated: GeneratedRequest?): RequestBody {
         val meta = currentSchema[api]
             ?: throw LuxoError("ConfigError", 0, "no schema for API \"$api\" — binary mode requires schema")
 
         val body = if (generated == null) LuxoBinaryProtocol.encodeRequest(meta, params)
             else LuxoBinaryProtocol.encodeRequest(meta, generated)
 
-        val request = Request.Builder()
-            .url(endpointURL)
-            .post(body.toRequestBody(HttpProtocolHeaders.BINARY_MEDIA_TYPE))
-            .headers(currentHeaders.binary)
-            .build()
-
-        val response = client.awaitFullResponse(request, capacity) {
-            HTTPResponseBytes(it.code, readBoundedHTTPBody(it, maxResponseBytes))
-        }
-        if (response.code == 200) return response.body
-        val error = LuxoBinaryProtocol.decodeError(response.body, response.code)
-        val newToken = refreshFor(response.code, error, isRetry)?.invoke()
-        if (newToken != null) {
-            setToken(newToken)
-            return callBinary(api, params, isRetry = true, generated = generated)
-        }
-        throw error
+        return HTTPRequestBody(body, HttpProtocolHeaders.BINARY_MEDIA_TYPE)
     }
 
     private fun refreshFor(status: Int, error: LuxoError, isRetry: Boolean): (suspend () -> String?)? =
@@ -503,7 +607,7 @@ class OkHttpTransport(
 /** Internal response wrapper carrying HTTP status code. */
 private data class HTTPResponseBytes(val code: Int, val body: ByteArray)
 
-private suspend inline fun <T> OkHttpClient.awaitFullResponse(request: Request, capacity: HTTPRequestCapacity, crossinline read: (Response) -> T): T =
+private suspend fun OkHttpClient.awaitFullResponse(request: Request, capacity: HTTPRequestCapacity, limit: Int): HTTPResponseBytes =
     suspendCancellableCoroutine { cont ->
         if (!capacity.acquire()) {
             cont.resumeWithException(LuxoError("NetworkError", 503, "HTTP request capacity exceeded"))
@@ -511,22 +615,32 @@ private suspend inline fun <T> OkHttpClient.awaitFullResponse(request: Request, 
         }
         try {
             val call = newCall(request)
-            cont.invokeOnCancellation { call.cancel() }
-            call.enqueue(object : Callback {
+            val callback = object : Callback, (Throwable?) -> Unit {
+                @Volatile var activeCall: Call? = null
+                override fun invoke(cause: Throwable?) { activeCall?.cancel() }
                 override fun onFailure(call: Call, e: IOException) {
+                    activeCall = null
                     capacity.release()
                     cont.resumeWithException(LuxoError("NetworkError", 0, e.message ?: "network error"))
                 }
                 override fun onResponse(call: Call, response: Response) {
                     val result = try {
-                        Result.success(response.use { read(it) })
+                        Result.success(response.use { HTTPResponseBytes(it.code, readBoundedHTTPBody(it, limit)) })
                     } catch (error: Exception) {
                         call.cancel()
                         Result.failure(error as? LuxoError ?: LuxoError("NetworkError", 0, error.message ?: "response body failed"))
-                    } finally { capacity.release() }
+                    } finally { activeCall = null; capacity.release() }
                     cont.resumeWith(result)
                 }
-            })
+            }
+            callback.activeCall = call
+            try {
+                cont.invokeOnCancellation(callback)
+                call.enqueue(callback)
+            } catch (error: Exception) {
+                callback.activeCall = null
+                throw error
+            }
         } catch (error: Exception) {
             capacity.release()
             cont.resumeWithException(LuxoError("NetworkError", 0, error.message ?: "request failed"))

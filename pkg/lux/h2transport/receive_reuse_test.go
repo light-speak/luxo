@@ -6,13 +6,13 @@ func TestReceiveBufferReuseOwnership(t *testing.T) {
 	r, _ := newRequestReceiver(2, 4096, 8192)
 	a := &receivedRequest{}
 	r.streams[1] = a
-	if !r.appendBody(a, []byte("first")) {
+	if !r.appendBody(a, []byte("first"), false) {
 		t.Fatal("append")
 	}
 	address := &a.body[0]
 	b := &receivedRequest{}
 	r.streams[3] = b
-	if !r.appendBody(b, []byte("second")) || &b.body[0] == address {
+	if !r.appendBody(b, []byte("second"), false) || &b.body[0] == address {
 		t.Fatal("reused live body")
 	}
 	r.release(1)
@@ -20,7 +20,7 @@ func TestReceiveBufferReuseOwnership(t *testing.T) {
 		t.Fatal("release did not transfer ownership")
 	}
 	c := &receivedRequest{}
-	if !r.appendBody(c, []byte("new")) || &c.body[0] != address || string(c.body) != "new" {
+	if !r.appendBody(c, []byte("new"), false) || &c.body[0] != address || string(c.body) != "new" {
 		t.Fatal("released storage not reused")
 	}
 	if string(b.body) != "second" || r.buffered != 2048 || r.spare != nil {
@@ -39,7 +39,7 @@ func TestReceiveSpareBoundAndPressure(t *testing.T) {
 	r.spare = make([]byte, 0, 1024)
 	r.limit, r.maxBody = 2048, 2048
 	a := &receivedRequest{}
-	if !r.appendBody(a, make([]byte, 2048)) || r.spare != nil || r.buffered != 2048 {
+	if !r.appendBody(a, make([]byte, 2048), false) || r.spare != nil || r.buffered != 2048 {
 		t.Fatal("idle storage prevented valid allocation")
 	}
 	r.spare = make([]byte, 0, 1024)

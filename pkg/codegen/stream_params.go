@@ -36,7 +36,7 @@ func writePreparedStreamAuth(b *strings.Builder, si streamInfo) {
 		return
 	}
 	fmt.Fprintf(b, "func authorizeStream%s(req *api.Request, rawIdentity any) error {\n", str.Capitalize(si.apiName))
-	b.WriteString("\tidentity, ok := rawIdentity.(api.IdentityClaims)\n\tif !ok || identity.ID() == 0 { return errors.Unauthorized }\n")
+	b.WriteString("\tvar identity auth.Claims\n\tswitch value := rawIdentity.(type) {\n\tcase auth.Claims: identity = value\n\tcase *auth.Claims: if value == nil { return errors.Unauthorized }; identity = *value\n\tdefault: return errors.Unauthorized\n\t}\n\t_ = identity\n")
 	if si.auth != nil {
 		writeAuthorizationCheck(b, "\t", si.auth)
 	}
@@ -45,26 +45,32 @@ func writePreparedStreamAuth(b *strings.Builder, si streamInfo) {
 
 // Subscription values outlive the borrowed Request. Scalar readers already own
 // strings and typed slices; raw JSON and Binary byte payloads require a copy.
-func writeStreamParameterSnapshot(b *strings.Builder, si streamInfo, enums map[string]bool) {
+func writeStreamParameterSnapshot(b *strings.Builder, si streamInfo, enums map[string]bool, modelSets ...map[string]*ast.ModelDecl) {
+	defaultGenerator().writeStreamParameterSnapshot(b, si, enums, modelSets...)
+}
+
+func (g *GeneratorContext) writeStreamParameterSnapshot(b *strings.Builder, si streamInfo, enums map[string]bool, modelSets ...map[string]*ast.ModelDecl) {
+	models := firstModelSet(modelSets)
 	name := str.Capitalize(si.apiName) + "StreamParams"
 	fmt.Fprintf(b, "// %s owns validated subscription parameters.\ntype %s struct {\n", name, name)
 	for _, param := range si.params {
-		fmt.Fprintf(b, "\t%s %s\n", str.Capitalize(param.Name), resolveGoType(param.Type))
+		fmt.Fprintf(b, "\t%s %s\n", str.Capitalize(param.Name), nativeGoType(param.Type, models))
 	}
 	b.WriteString("}\n\n")
 	fmt.Fprintf(b, "func (snapshot *%s) readRequest(req *api.Request) error {\n", name)
+	bindings := g.parameterBindings(si.params, nil, models, enums, name)
 	for _, param := range si.params {
-		writeCallableParamExtraction(b, param, enums, "\t")
-		writeStreamParamOwnership(b, param.Type, param.Name, enums, "\t")
+		writeCallableParamBinding(b, param, bindings.name(param.Name), enums, "\t", models)
+		writeStreamParamOwnership(b, param.Type, bindings.name(param.Name), enums, "\t", models)
 	}
 	fmt.Fprintf(b, "\t*snapshot = %s{\n", name)
 	for _, param := range si.params {
-		fmt.Fprintf(b, "\t\t%s: %s,\n", str.Capitalize(param.Name), param.Name)
+		fmt.Fprintf(b, "\t\t%s: %s,\n", str.Capitalize(param.Name), bindings.name(param.Name))
 	}
 	b.WriteString("\t}\n\treturn nil\n}\n\n")
 }
 
-func writeStreamParamOwnership(b *strings.Builder, ref *ast.TypeRef, value string, enums map[string]bool, indent string) {
+func writeStreamParamOwnership(b *strings.Builder, ref *ast.TypeRef, value string, enums map[string]bool, indent string, modelSets ...map[string]*ast.ModelDecl) {
 	if ref.Name == "JSON" {
 		writeStreamOwnedValue(b, ref, value, enums, indent)
 		return
@@ -74,7 +80,11 @@ func writeStreamParamOwnership(b *strings.Builder, ref *ast.TypeRef, value strin
 	}
 	// JSON object readers already create independent fields, including Bytes.
 	fmt.Fprintf(b, "%sif req.Params == nil {\n", indent)
-	writeStreamOwnedValue(b, ref, value, enums, indent+"\t")
+	if ref.IsList && firstModelSet(modelSets)[ref.Name] != nil {
+		fmt.Fprintf(b, "%s\tfor _, item := range %s { ownStreamInput%s(item) }\n", indent, value, ref.Name)
+	} else {
+		writeStreamOwnedValue(b, ref, value, enums, indent+"\t")
+	}
 	fmt.Fprintf(b, "%s}\n", indent)
 }
 
@@ -102,48 +112,93 @@ func writeStreamOwnedValue(b *strings.Builder, ref *ast.TypeRef, value string, e
 	fmt.Fprintf(b, "%sownStreamInput%s(&%s)\n", indent, ref.Name, value)
 }
 
-func writeStreamInputOwners(b *strings.Builder, result *semantic.Result, streams []streamInfo, enums map[string]bool) {
-	objects := make(map[string][]*ast.FieldDecl)
+type streamInputOwnerPlan struct {
+	models  map[string]*ast.ModelDecl
+	objects map[string][]*ast.FieldDecl
+	names   []string
+	seen    map[string]bool
+}
+
+func collectStreamInputOwners(result *semantic.Result, streams []streamInfo) streamInputOwnerPlan {
+	var plan streamInputOwnerPlan
+	if len(streams) == 0 {
+		return plan
+	}
+	plan.objects = make(map[string][]*ast.FieldDecl)
 	for _, file := range result.Files {
 		for _, model := range file.Models {
-			objects[model.Name] = model.Fields
+			plan.objects[model.Name] = model.Fields
 		}
 		for _, typ := range file.Types {
-			objects[typ.Name] = typ.Fields
+			plan.objects[typ.Name] = typ.Fields
 		}
 	}
 	var pending []string
-	for _, si := range streams {
-		for _, param := range si.params {
-			if _, ok := objects[param.Type.Name]; ok {
+	for _, stream := range streams {
+		for _, param := range stream.params {
+			if _, found := plan.objects[param.Type.Name]; found {
 				pending = append(pending, param.Type.Name)
 			}
 		}
 	}
-	seen := make(map[string]bool)
+	if len(pending) == 0 {
+		return plan
+	}
+	plan.models, _ = collectInferredAPIs(result)
+	plan.seen = make(map[string]bool)
 	for len(pending) > 0 {
 		name := pending[0]
 		pending = pending[1:]
-		if seen[name] {
+		if plan.seen[name] {
 			continue
 		}
-		seen[name] = true
-		fmt.Fprintf(b, "func ownStreamInput%s(value *%s) {\n", name, name)
-		for _, field := range objects[name] {
-			if field.Type == nil || hasDirective(field.Directives, "hidden") || hasDirective(field.Directives, "internal") {
+		plan.seen[name] = true
+		plan.names = append(plan.names, name)
+		for _, field := range plan.objects[name] {
+			if !streamOwnedField(field) {
 				continue
 			}
-			writeStreamInputFieldOwnership(b, field, objects, enums, &pending)
+			if _, nested := plan.objects[field.Type.Name]; nested {
+				pending = append(pending, field.Type.Name)
+			}
+		}
+	}
+	return plan
+}
+
+func streamOwnedField(field *ast.FieldDecl) bool {
+	return field.Type != nil && !hasDirective(field.Directives, "hidden") && !hasDirective(field.Directives, "internal")
+}
+
+func writeStreamInputOwners(b *strings.Builder, result *semantic.Result, streams []streamInfo, enums map[string]bool) {
+	plan := collectStreamInputOwners(result, streams)
+	writePlannedStreamInputOwners(b, &plan, enums)
+}
+
+func writePlannedStreamInputOwners(b *strings.Builder, plan *streamInputOwnerPlan, enums map[string]bool) {
+	if plan == nil {
+		return
+	}
+	for _, name := range plan.names {
+		fmt.Fprintf(b, "func ownStreamInput%s(value *%s) {\n", name, name)
+		for _, field := range plan.objects[name] {
+			if streamOwnedField(field) {
+				writeStreamInputFieldOwnership(b, field, plan.objects, enums, plan.models)
+			}
 		}
 		b.WriteString("}\n\n")
 	}
 }
 
-func writeStreamInputFieldOwnership(b *strings.Builder, field *ast.FieldDecl, objects map[string][]*ast.FieldDecl, enums map[string]bool, pending *[]string) {
+func writeStreamInputFieldOwnership(b *strings.Builder, field *ast.FieldDecl, objects map[string][]*ast.FieldDecl, enums map[string]bool, modelSets ...map[string]*ast.ModelDecl) {
 	ref := field.Type
 	value := "value." + str.Capitalize(field.Name)
 	if _, nested := objects[ref.Name]; nested {
-		*pending = append(*pending, ref.Name)
+		if ref.IsList && len(modelSets) > 0 && modelSets[0][ref.Name] != nil {
+			// Generated input readers already own the list and model storage.
+			fmt.Fprintf(b, "\tfor _, item := range %s { ownStreamInput%s(item) }\n", value, ref.Name)
+			return
+		}
 		if !ref.IsList {
 			fmt.Fprintf(b, "\tif %s != nil { ownStreamInput%s(%s) }\n", value, ref.Name, value)
 			return

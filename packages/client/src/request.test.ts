@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Encoder } from './codec'
-import { GeneratedRequest, requestJSON } from './request'
+import { GeneratedRequest, requestJSON, JSONRequestWriter, staticJSONParameters, generatedJSONParameters } from './request'
+import { prepareSelection } from './selection'
 import type { RequestEncoder, RequestValues } from './request'
 import { FetchTransport, encodeBinaryBody, encodeStaticRequestBody } from './transport'
 import type { APISchema } from './transport'
@@ -15,6 +16,80 @@ class GetUserRequest extends GeneratedRequest {
   }
   toJSONParameters(): Record<string, unknown> { return { id: this.id } }
 }
+
+it('preserves sealed static and legacy JSON controls and direct scalar writing', () => {
+  const writer = new JSONRequestWriter()
+  writer.writeValue('text'); writer.writeBytes(Uint8Array.of(1, 2))
+  expect(writer.toString()).toBe('"text""AQI="')
+  expect(() => writer.writeBytes(null as unknown as Uint8Array)).toThrow(/Bytes/)
+  const codec: RequestEncoder<RequestValues> = { apiID: 1, initialCapacity: () => 8, writeParameters() {},
+    writeJSONParameters(out) { out.writeRaw(',"value":{"Pending":{}}') } }
+  const controls = { $filters: [{ field: 'id', op: 'eq' as const, value: 1 }], $sorters: [{ field: 'id', order: 'asc' as const }] }
+  for (const $select of ['Pending', prepareSelection('Pending')]) {
+    const parameters = { ...controls, $select }
+    const legacy = new class extends GeneratedRequest {
+      readonly apiID = 1
+      writeParameters() {}
+      toJSONParameters(): Record<string, unknown> { throw Error('static case was projected') }
+      writeJSONParameters(out: JSONRequestWriter) { codec.writeJSONParameters!(out, parameters) }
+      override get selection() { return $select }
+      override get filters() { return controls.$filters }
+      override get sorters() { return controls.$sorters }
+    }()
+    expect(generatedJSONParameters(legacy)).toBe(staticJSONParameters(codec, parameters))
+    expect(generatedJSONParameters(legacy)).toContain('"$select":"Pending"')
+    expect(generatedJSONParameters(legacy)).toContain('"$filters"')
+    expect(generatedJSONParameters(legacy)).toContain('"$sorters"')
+  }
+  expect(staticJSONParameters({ apiID: 1, initialCapacity: () => 8, writeParameters() {} })).toBeUndefined()
+  expect(generatedJSONParameters(new GetUserRequest(1n))).toBeUndefined()
+})
+
+it('writes generated sealed JSON without projecting or serializing business cases', async () => {
+  type Input = { readonly $case:'Success'; readonly value:bigint; toJSON(): never }
+  type Values = RequestValues & { value:Input }
+  const input:Input = { $case:'Success', value:7n, toJSON() { throw Error('business value serialized') } }
+  const values:Values = Object.freeze({ value:input })
+  const codec:RequestEncoder<Values> = {
+    apiID:1, initialCapacity:()=>32, writeParameters() { throw Error('binary requested') },
+    writeJSONParameters(writer, actual) {
+      expect(actual).toBe(values)
+      writer.writeRaw(',"value":{"Success":{"value":')
+      writer.writeInt64(actual!.value.value)
+      writer.writeRaw('}}')
+    },
+  }
+  const writer = new JSONRequestWriter()
+  writer.writeJSON({ safe: [] })
+  expect(writer.toString()).toBe('{"safe":[]}')
+  const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response('{"data":null}'))
+  const transport=new FetchTransport('http://test.invalid')
+  transport.setSchema({ echo:{ id:1, params:[{fieldID:1,name:'value',type:'Sealed',typeName:'Outcome'}],
+    types:{ '@sealed:Outcome':{Success:{fieldID:1,type:'Model',typeName:'Outcome.Success'}},
+      'Outcome.Success':{value:{fieldID:1,type:'Int'}} } } })
+  try {
+    await expect(transport.callGenerated('echo',codec,values)).resolves.toBeNull()
+    expect(fetchMock.mock.lastCall?.[1]?.body).toBe('{"$api":"echo","value":{"Success":{"value":7}}}')
+  } finally { fetchMock.mockRestore() }
+})
+
+it('retains the JSON plan while a static writer replaces Schema', async () => {
+  const transport = new FetchTransport('http://test.invalid')
+  transport.setSchema({ echo: { id: 1, params: [{ fieldID: 1, name: 'value', type: 'Sealed', typeName: 'Outcome' }], types: { '@sealed:Outcome': { Success: { fieldID: 1, type: 'Model', typeName: 'Outcome.Success' } }, 'Outcome.Success': {} } } })
+  const codec: RequestEncoder<RequestValues> = {
+    apiID: 1, initialCapacity: () => 8, writeParameters() {},
+    writeJSONParameters(writer) {
+      transport.setSchema({ echo: { id: 1, params: [{ fieldID: 1, name: 'value', type: 'JSON' }] } })
+      writer.writeRaw(',"value":{"Future":{}}')
+    },
+  }
+  const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{"data":true}'))
+  try {
+    await expect(transport.callGenerated('echo', codec)).rejects.toThrow(/unknown/)
+    expect(fetchMock).not.toHaveBeenCalled()
+    await expect(transport.call('echo', { value: { Future: {} } })).resolves.toBe(true)
+  } finally { fetchMock.mockRestore() }
+})
 
 describe('static encoder with original parameters', () => {
   type Values = RequestValues & { id: bigint }

@@ -15,6 +15,9 @@ func (c *compiler) queryAliasModel(name string) string {
 }
 
 func (c *compiler) queryRootModel(name string) string {
+	if _, local := c.vars[name]; local {
+		return c.queryAliasModel(name)
+	}
 	if c.models[name] != nil {
 		return name
 	}
@@ -23,7 +26,7 @@ func (c *compiler) queryRootModel(name string) string {
 
 func (c *compiler) compileQueryAlias(name, model string, links []chainLink) string {
 	var b strings.Builder
-	b.WriteString(name)
+	b.WriteString(c.bindings.name(name))
 	for i, link := range links {
 		if c.compileTerminalMethod(&b, model, link) {
 			return b.String()

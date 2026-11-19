@@ -49,6 +49,8 @@ type Symbol struct {
 	Module  string // which module this belongs to
 	Mutable bool   // true for var, false for val
 	Used    bool   // true if referenced after declaration
+	// An RPC-only declaration keeps its boundary even if an API shares its name.
+	serviceFunction bool
 }
 
 // Scope represents a lexical scope with symbols.
@@ -84,15 +86,26 @@ func (s *Scope) Define(sym *Symbol) bool {
 }
 
 // Lookup looks up a symbol by name, walking up the scope chain.
+// Successful lookup marks the resolved symbol as used.
 func (s *Scope) Lookup(name string) *Symbol {
-	if sym, ok := s.symbols[name]; ok {
+	sym := s.LookupReadOnly(name)
+	if sym != nil {
 		sym.Used = true
-		return sym
 	}
-	if s.parent != nil {
-		return s.parent.Lookup(name)
+	return sym
+}
+
+// LookupReadOnly resolves a name through its scope chain without marking usage.
+func (s *Scope) LookupReadOnly(name string) *Symbol {
+	for {
+		if sym, ok := s.symbols[name]; ok {
+			return sym
+		}
+		if s.parent == nil {
+			return nil
+		}
+		s = s.parent
 	}
-	return nil
 }
 
 // LookupLocal looks up a symbol in this scope only, not parents.

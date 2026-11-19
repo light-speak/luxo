@@ -12,17 +12,22 @@ import (
 type errorDataGenerator struct {
 	objectPrefix string
 	objects      map[string][]*ast.FieldDecl
+	models       map[string]bool
 	enums        map[string]bool
 	queued       map[string]bool
 	queue        []string
+	imports      generatedImports
+	owner        *GeneratorContext
 }
 
 func newErrorDataGenerator(result *semantic.Result, generator *GeneratorContext) *errorDataGenerator {
 	g := &errorDataGenerator{
 		objectPrefix: "Error",
 		objects:      make(map[string][]*ast.FieldDecl),
+		models:       make(map[string]bool),
 		enums:        generator.allEnums(collectEnums(result)),
 		queued:       make(map[string]bool),
+		owner:        generator,
 	}
 	for _, file := range result.Files {
 		for _, model := range file.Models {
@@ -31,17 +36,27 @@ func newErrorDataGenerator(result *semantic.Result, generator *GeneratorContext)
 				fields = append(append([]*ast.FieldDecl{}, fields...), softDeleteField())
 			}
 			g.objects[model.Name] = fields
+			g.models[model.Name] = true
 		}
 		for _, item := range file.Types {
 			g.objects[item.Name] = item.Fields
 		}
 		for _, item := range file.Extends {
+			g.models[item.Name] = true
 			if _, exists := g.objects[item.Name]; !exists {
 				g.objects[item.Name] = generator.extendStubModel(item).Fields
 			}
 		}
 	}
 	return g
+}
+
+// Model lists retain the same pointer element ABI as generated business calls.
+func errorDataGoType(ref *ast.TypeRef, models map[string]bool) string {
+	if ref != nil && ref.IsList && models[ref.Name] {
+		return "[]*" + ref.Name
+	}
+	return resolveGoType(ref)
 }
 
 func (g *errorDataGenerator) writeData(b *strings.Builder, e *ast.ErrorDecl) {
@@ -51,7 +66,7 @@ func (g *errorDataGenerator) writeData(b *strings.Builder, e *ast.ErrorDecl) {
 	name := e.Name + "ErrorData"
 	fmt.Fprintf(b, "type %s struct {\n", name)
 	for i, field := range e.Fields {
-		fmt.Fprintf(b, "\tfield%d %s\n", i, resolveGoType(field.Type))
+		fmt.Fprintf(b, "\tfield%d %s\n", i, errorDataGoType(field.Type, g.models))
 	}
 	b.WriteString("}\n\n")
 	fmt.Fprintf(b, "func (data *%s) AppendJSON(dst []byte) ([]byte, error) {\n", name)
@@ -72,7 +87,7 @@ func (g *errorDataGenerator) writeData(b *strings.Builder, e *ast.ErrorDecl) {
 	for i, field := range e.Fields {
 		fmt.Fprintf(b, "func (data *%s) appendField%d(w *errors.DataWriter, text bool) {\n", name, i)
 		b.WriteString("\tif w.Err() != nil { return }\n")
-		g.writeValue(b, field.Type, fmt.Sprintf("data.field%d", i), false, true, "\t")
+		g.writeValue(b, field.Type, fmt.Sprintf("data.field%d", i), field.Type.IsList && g.models[field.Type.Name], true, "\t")
 		b.WriteString("}\n\n")
 	}
 }
@@ -87,17 +102,30 @@ func writeErrorFieldName(b *strings.Builder, name string, index int, indent stri
 
 func (g *errorDataGenerator) writeValue(b *strings.Builder, ref *ast.TypeRef, value string, pointer, text bool, indent string) {
 	if ref.IsList {
-		fmt.Fprintf(b, "%sif %s == nil { w.Token(\"null\"); return }\n", indent, value)
+		empty := "[]"
+		if ref.Nullable {
+			empty = "null"
+		}
+		fmt.Fprintf(b, "%sif %s == nil { w.Token(%q); return }\n", indent, value, empty)
 		fmt.Fprintf(b, "%sw.Token(\"[\")\n%sfor i := range %s {\n%s\tif i > 0 { w.Token(\",\") }\n", indent, indent, value, indent)
 		base := *ref
 		base.IsList, base.Nullable = false, false
 		fmt.Fprintf(b, "%s\tif w.Err() != nil { return }\n", indent)
-		g.writeScalar(b, &base, value+"[i]", false, indent+"\t")
+		element := value + "[i]"
+		if pointer && g.models[ref.Name] {
+			fmt.Fprintf(b, "%s\tif %s == nil { w.Reject(%q); return }\n", indent, element, "model list element is nil")
+			element = "(*" + element + ")"
+		}
+		g.writeScalar(b, &base, element, false, indent+"\t")
 		fmt.Fprintf(b, "%s}\n%sw.Token(\"]\")\n", indent, indent)
 		return
 	}
 	if ref.Nullable || pointer {
-		fmt.Fprintf(b, "%sif %s == nil { w.Token(\"null\"); return }\n", indent, value)
+		if ref.Nullable {
+			fmt.Fprintf(b, "%sif %s == nil { w.Token(\"null\"); return }\n", indent, value)
+		} else {
+			fmt.Fprintf(b, "%sif %s == nil { w.Reject(%q); return }\n", indent, value, "required object is nil")
+		}
 		value = "(*" + value + ")"
 	}
 	g.writeScalar(b, ref, value, text, indent)
@@ -110,7 +138,7 @@ func (g *errorDataGenerator) writeScalar(b *strings.Builder, ref *ast.TypeRef, v
 		g.writeString(b, value, text, indent)
 		return
 	}
-	if _, ok := g.objects[ref.Name]; ok {
+	if _, ok := g.objects[ref.Name]; ok || g.owner.sealedDeclaration(ref.Name) != nil {
 		if !g.queued[ref.Name] {
 			g.queued[ref.Name] = true
 			g.queue = append(g.queue, ref.Name)
@@ -126,8 +154,12 @@ func (g *errorDataGenerator) writeScalar(b *strings.Builder, ref *ast.TypeRef, v
 	case "String":
 		g.writeString(b, value, text, indent)
 		return
-	case "UUID", "Decimal":
+	case "UUID":
 		g.writeString(b, value+".String()", text, indent)
+		return
+	case "Decimal":
+		g.imports |= generatedPackageBit("lux")
+		g.writeString(b, "lux.FormatDecimal("+value+")", text, indent)
 		return
 	}
 	if method == "" {
@@ -148,6 +180,10 @@ func (g *errorDataGenerator) writeString(b *strings.Builder, value string, text 
 func (g *errorDataGenerator) writeObjects(b *strings.Builder) {
 	for next := 0; next < len(g.queue); next++ {
 		name := g.queue[next]
+		if declaration := g.owner.sealedDeclaration(name); declaration != nil {
+			g.writeSealedObject(b, declaration)
+			continue
+		}
 		fmt.Fprintf(b, "func append%s%sJSON(w *errors.DataWriter, value *%s) {\n", g.objectPrefix, name, name)
 		b.WriteString("\tif value == nil { w.Token(\"null\"); return }\n\tif !w.Enter() { return }\n\tw.Token(\"{\")\n")
 		index := 0

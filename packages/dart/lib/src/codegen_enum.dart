@@ -3,18 +3,36 @@ part of 'codegen.dart';
 String _enumWireValue(String type, String? name, String value) =>
     type == 'Enum' && name != null ? '$value.rawValue' : value;
 
-void _validateEnums(LuxoSchema schema) {
+void _validateSchemaReferences(LuxoSchema schema) {
   _validateEnumDeclarations(schema);
-  for (final model in schema.models.values) {
-    _validateEnumFields(schema, model.name, model.fields);
+  _validateSealedDeclarations(schema);
+  for (final entry in schema.models.entries) {
+    final model = entry.value;
+    _validateDeclarationName(entry.key, model.name);
+    if (schema.types.containsKey(entry.key) ||
+        schema.enums.containsKey(entry.key) ||
+        schema.sealeds.containsKey(entry.key)) {
+      throw FormatException('duplicate type ${entry.key}');
+    }
+    _validateFieldReferences(schema, model.name, model.fields);
   }
-  for (final type in schema.types.values) {
-    _validateEnumFields(schema, type.name, type.fields);
+  for (final entry in schema.types.entries) {
+    final type = entry.value;
+    _validateDeclarationName(entry.key, type.name);
+    if (schema.enums.containsKey(entry.key) ||
+        schema.sealeds.containsKey(entry.key)) {
+      throw FormatException('duplicate type ${entry.key}');
+    }
+    _validateFieldReferences(schema, type.name, type.fields);
   }
-  for (final api in schema.apis.values) {
+  for (final entry in schema.apis.entries) {
+    final api = entry.value;
+    _validateDeclarationName(entry.key, api.name, internal: api.internal);
     _validateReturnType(schema, api);
+    final names = <String>{};
     for (final param in api.params) {
-      _validateEnumReference(
+      _validateMemberName(param.name, names);
+      _validateTypeReference(
         schema,
         param.type,
         param.typeName,
@@ -24,29 +42,54 @@ void _validateEnums(LuxoSchema schema) {
   }
 }
 
+void _validateDeclarationName(
+  String key,
+  String name, {
+  bool internal = false,
+}) {
+  if (name.isEmpty)
+    throw const FormatException('declaration name must not be empty');
+  if (!internal && !isDSLIdentifier(name))
+    throw FormatException('invalid declaration identifier: $name');
+  if (key != name) {
+    throw FormatException('declaration name $name does not match key $key');
+  }
+}
+
+void _validateMemberName(String name, Set<String> names) {
+  if (name.isEmpty)
+    throw const FormatException('member name must not be empty');
+  if (!isDSLIdentifier(name))
+    throw FormatException('invalid member identifier: $name');
+  if (!names.add(name)) throw FormatException('duplicate name $name');
+}
+
 void _validateReturnType(LuxoSchema schema, LuxoAPI api) {
   final type = api.returnType;
   if (type == 'Enum') {
     throw FormatException('API ${api.name} requires a named enum return type');
   }
-  if (type != null &&
-      !_isScalar(type) &&
-      !schema.enums.containsKey(type) &&
-      !schema.models.containsKey(type) &&
-      !schema.types.containsKey(type)) {
+  if (type == null ||
+      (!_isScalar(type) &&
+          !schema.enums.containsKey(type) &&
+          !schema.models.containsKey(type) &&
+          !schema.types.containsKey(type) &&
+          !schema.sealeds.containsKey(type))) {
     throw FormatException(
       'API ${api.name} has an undeclared return type $type',
     );
   }
 }
 
-void _validateEnumFields(
+void _validateFieldReferences(
   LuxoSchema schema,
   String owner,
   List<LuxoField> fields,
 ) {
+  final names = <String>{};
   for (final field in fields) {
-    _validateEnumReference(
+    _validateMemberName(field.name, names);
+    _validateTypeReference(
       schema,
       field.type,
       field.typeName,
@@ -55,14 +98,32 @@ void _validateEnumFields(
   }
 }
 
-void _validateEnumReference(
+void _validateTypeReference(
   LuxoSchema schema,
   String type,
   String? name,
   String path,
 ) {
+  if (type == 'Sealed' && !schema.sealeds.containsKey(name)) {
+    throw FormatException('$path requires a declared sealed type');
+  }
   if (type == 'Enum' && !schema.enums.containsKey(name)) {
     throw FormatException('$path requires a declared enum type');
+  }
+  if (type == 'Model' &&
+      !schema.models.containsKey(name) &&
+      !schema.types.containsKey(name)) {
+    throw FormatException('$path requires a declared model or type');
+  }
+  if (type != 'Model' &&
+      type != 'Enum' &&
+      type != 'Sealed' &&
+      !_isScalar(type) &&
+      !schema.models.containsKey(type) &&
+      !schema.types.containsKey(type) &&
+      !schema.enums.containsKey(type) &&
+      !schema.sealeds.containsKey(type)) {
+    throw FormatException('$path has an undeclared type $type');
   }
 }
 
@@ -71,18 +132,18 @@ void _validateEnumDeclarations(LuxoSchema schema) {
     ...schema.models.keys,
     ...schema.types.keys,
     ...schema.enums.keys,
+    ...schema.sealeds.keys,
   };
   for (final entry in schema.enums.entries) {
     final declaration = entry.value;
     final name = declaration.name;
-    if (entry.key != name) {
-      throw FormatException(
-        'enum key ${entry.key} does not match its name $name',
-      );
-    }
-    if (declaration.values.isEmpty ||
-        declaration.values.toSet().length != declaration.values.length) {
+    _validateDeclarationName(entry.key, name);
+    if (declaration.values.toSet().length != declaration.values.length) {
       throw FormatException('enum $name requires distinct members');
+    }
+    for (final member in declaration.values) {
+      if (!isDSLIdentifier(member))
+        throw FormatException('invalid enum identifier: $member');
     }
     for (final suffix in ['Known', 'Unknown']) {
       if (!names.add('$name$suffix')) {
@@ -102,7 +163,7 @@ void _writeEnums(StringBuffer b, LuxoSchema schema) {
 }
 
 void _writeEnumBase(StringBuffer b, LuxoEnum declaration) {
-  final name = declaration.name;
+  final name = dartTypeIdentifier(declaration.name);
   b.writeln('sealed class $name {');
   b.writeln('  const $name();');
   b.writeln('  String get rawValue;');
@@ -146,7 +207,23 @@ void _writeEnumListHelpers(StringBuffer b, String name) {
 }
 
 void _writeEnumVariants(StringBuffer b, LuxoEnum declaration) {
-  final name = declaration.name;
+  final name = dartTypeIdentifier(declaration.name);
+  if (declaration.values.isEmpty) {
+    b.writeln('abstract final class ${name}Known implements $name {');
+    b.writeln('  static const List<${name}Known> values = [];\n}\n');
+  } else {
+    _writeKnownEnum(b, declaration, name);
+  }
+  b.writeln('final class ${name}Unknown extends $name {');
+  b.writeln('  const ${name}Unknown._(this.rawValue);');
+  b.writeln('  @override\n  final String rawValue;');
+  b.writeln(
+    '  @override\n  bool operator ==(Object other) => other is ${name}Unknown && other.rawValue == rawValue;',
+  );
+  b.writeln('  @override\n  int get hashCode => rawValue.hashCode;\n}\n');
+}
+
+void _writeKnownEnum(StringBuffer b, LuxoEnum declaration, String name) {
   b.writeln('enum ${name}Known implements $name {');
   b.writeln(
     declaration.values
@@ -159,21 +236,15 @@ void _writeEnumVariants(StringBuffer b, LuxoEnum declaration) {
   );
   b.writeln('  const ${name}Known(this.rawValue);');
   b.writeln('  @override\n  final String rawValue;\n}\n');
-  b.writeln('final class ${name}Unknown extends $name {');
-  b.writeln('  const ${name}Unknown._(this.rawValue);');
-  b.writeln('  @override\n  final String rawValue;');
-  b.writeln(
-    '  @override\n  bool operator ==(Object other) => other is ${name}Unknown && other.rawValue == rawValue;',
-  );
-  b.writeln('  @override\n  int get hashCode => rawValue.hashCode;\n}\n');
 }
 
 String _enumMember(String member, String name) {
+  member = dartSourceIdentifier(member);
   // '$' is unavailable in DSL names and prevents escaping from colliding.
   if (member.startsWith('_')) return 'value\$$member';
   if (_enumReserved.contains(member) || member == '${name}Known')
     return '$member\$';
-  return member;
+  return dartSourceIdentifier(member);
 }
 
 const _enumReserved = {

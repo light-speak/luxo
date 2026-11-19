@@ -222,7 +222,7 @@ func gatewayNestedSchema(t testing.TB, list bool, fieldName string) (*schema.Sch
 	field.Module, field.ForeignKey = "child", "value"
 	proxyTestRequire(t, s.RegisterModel(parent))
 	proxyTestRequire(t, s.RegisterAPI(&schema.API{ID: 1000, Name: "extensionFixture", Module: "parent", ReturnType: parent.Name, ReturnList: list}))
-	proxyTestRequire(t, s.RegisterAPI(&schema.API{ID: 1001, Name: "svc:resolve:Precision:value", Params: []schema.Param{{ID: 1, Name: "keys", Type: schema.FieldInt, IsList: true}, {ID: 2, Name: "shape", Type: schema.FieldInt}}}))
+	proxyTestRequire(t, s.RegisterAPI(&schema.API{ID: 1001, Name: "svc:resolve:Precision:value", Internal: true, Module: "child", Params: []schema.Param{{ID: 1, Name: "keys", Type: schema.FieldInt, IsList: true}, {ID: 2, Name: "shape", Type: schema.FieldInt}}}))
 	child := s.Types["Precision"].AsModel()
 	var childMask []byte
 	for _, name := range []string{"value", "duration", "label"} {

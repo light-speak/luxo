@@ -2,6 +2,27 @@ import { measure } from './measure.bench'
 
 type Client = typeof import('./index')
 
+/** Compare selections with independently built clients that both support Unicode. */
+export function measureSelection(before: Pick<Client, 'prepareSelection' | 'encodeBinaryBody'>, after: Pick<Client, 'prepareSelection' | 'encodeBinaryBody'>): void {
+  for (const [name, parent, child] of [
+    ['ascii', 'value', 'nested_value2'],
+    ['bmp', 'café', '中文2'],
+    ['supplementary', 'a𐐀2', '𐐀_child9'],
+  ]) {
+    const text = `${parent}{${child}}`
+    const meta = { id: 1, fields: { [parent!]: { fieldID: 1, typeName: 'Nested' } },
+      types: { Nested: { [child!]: { fieldID: 2 } } } }
+    const params = { $select: text }
+    const oldBytes = before.encodeBinaryBody(meta, params)
+    const newBytes = after.encodeBinaryBody(meta, params)
+    if (oldBytes.length !== newBytes.length || oldBytes.some((byte, i) => byte !== newBytes[i])) {
+      throw new Error(`selection/${name}: wire differs`)
+    }
+    measure(`selection/prepare/${name}`, () => before.prepareSelection(text), () => after.prepareSelection(text))
+    measure(`selection/binary/${name}`, () => before.encodeBinaryBody(meta, params), () => after.encodeBinaryBody(meta, params))
+  }
+}
+
 /** Compare complete, independently built packages; fixtures are outside timing. */
 export function measureUnicode(before: Client, after: Client): void {
   const texts: [string, string][] = [

@@ -25,6 +25,28 @@ func mutationInputModel() *ast.ModelDecl {
 	}}
 }
 
+func TestMutationInputApplyRequiresSaveModel(t *testing.T) {
+	field := mutationInputModel().Fields[1]
+	if !fallibleSave(field) {
+		t.Fatal("existing beforeSave fixture lost its fallible call")
+	}
+	defer func() {
+		failure := recover()
+		if failure == nil {
+			t.Fatal("missing save model context was accepted")
+		}
+		internal, ok := failure.(*InternalCompilerError)
+		if !ok {
+			panic(failure)
+		}
+		if internal.Detail != "missing save model name" {
+			t.Fatalf("unexpected internal error context: %v", internal)
+		}
+	}()
+	var source strings.Builder
+	generateMutationInputApply(&source, mutationInputField{field: field}, "SetName", "")
+}
+
 func TestGeneratedMutationInputOrder(t *testing.T) {
 	var source strings.Builder
 	source.WriteString(mutationInputFixture)
@@ -32,7 +54,7 @@ func TestGeneratedMutationInputOrder(t *testing.T) {
 	generateEnum(&source, &ast.EnumDecl{Name: "State", Values: []string{"OPEN", "CLOSED"}})
 	model := mutationInputModel()
 	generateCreateHandler(&source, model, "createRecord", enums, false, nil)
-	generateUpdateHandler(&source, model, "updateRecord", "int64", enums, false, nil)
+	defaultGenerator().generateUpdateHandler(&source, model, "updateRecord", "int64", enums, false, nil)
 	generatePreviousCreateHandler(&source, model, "previousCreateRecord", enums, false, nil)
 	generatePreviousUpdateHandler(&source, model, "previousUpdateRecord", "int64", enums, false, nil)
 	runGeneratedProtocolPackage(t, source.String(), mutationInputAssertions+mutationInputBenchmarks)
@@ -52,7 +74,7 @@ func TestGeneratedMutationHash(t *testing.T) {
 	source.WriteString(`package generated
 import("fmt";"github.com/light-speak/luxo/pkg/lux/api";luxocrypto "github.com/light-speak/luxo/pkg/lux/crypto")
 type capture struct{value string;set bool}
-func(c *capture)Set(value string){c.value=value;c.set=true}
+func(c *capture)setPrepared(value string){c.value=value;c.set=true}
 func hashInput(req *api.Request,builder *capture)error{
 `)
 	field := &ast.FieldDecl{Name: "password", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "hash"}}}
@@ -84,11 +106,16 @@ type App struct{Record *recordClient}
 type mutationProbe struct{effects []string;values map[string]any;missing bool}
 var activeProbe *mutationProbe
 func recordHook(value string)string{activeProbe.effects=append(activeProbe.effects,"hook");return strings.TrimSpace(value)}
+// This ordering fixture supplies the fallible helper boundary; formal generation is tested separately.
+func prepareSave6RecordNameBody(value string)(string,error){return recordHook(value),nil}
+func prepareSave6RecordNoteBody(value string)(string,error){return recordHook(value),nil}
 type recordClient struct{db *mutationProbe}
 func(c *recordClient)Create()*recordBuilder{c.db.effects=append(c.db.effects,"create");return &recordBuilder{c.db}}
 func(c *recordClient)Find(context.Context,int64)(*Record,error){c.db.effects=append(c.db.effects,"find");if c.db.missing{return nil,nil};return &Record{},nil}
 func newRecordUpdateBuilder(db *mutationProbe,_ string,_ int64)*recordBuilder{db.effects=append(db.effects,"update");return &recordBuilder{db}}
 type recordBuilder struct{db *mutationProbe}
+func(b *recordBuilder)setPreparedName(v string){b.SetName(v)}
+func(b *recordBuilder)setPreparedNote(v *string){b.SetNote(v)}
 func(b *recordBuilder)SetName(v string){b.db.values["name"]=v}
 func(b *recordBuilder)SetScore(v int64){b.db.values["score"]=v}
 func(b *recordBuilder)SetNote(v *string){b.db.values["note"]=v}
@@ -275,3 +302,50 @@ func BenchmarkMutationInput(b *testing.B){
     }
 }
 `
+
+func TestGeneratedSavePreparationOwnsNullableValues(t *testing.T) {
+	runGeneratedFixture(t, `
+model Record @noTime {
+ id: Int @id
+ amount: Int @beforeSave { it += 2 it *= 3 }
+ optional: Int? @beforeSave { it += 2 it *= 3 }
+ text: String @beforeSave { it.trim() }
+ timestamp: DateTime @beforeSave { it += 1s }
+}
+`, `package generated
+import("testing";"time")
+func TestPreparation(t *testing.T){
+ if got,err:=prepareSave6RecordAmount(4);err!=nil||got!=18{t.Fatal(got,err)}
+ input:=int64(4);got,err:=prepareSave6RecordOptional(&input)
+ if err!=nil||got==nil||*got!=18||input!=4||got==&input{t.Fatal(got,input,err)}
+ if got,err:=prepareSave6RecordOptional(nil);err!=nil||got!=nil{t.Fatal("null changed",got,err)}
+ if got:=prepareSave6RecordText(" value ");got!="value"{t.Fatal(got)}
+ original:=int64(4)
+ create:=(&RecordClient{}).Create().SetOptional(&original)
+ stored,ok:=create.Vals[0].(*int64);if !ok||stored==nil||*stored!=18||original!=4||stored==&original{t.Fatal(create.Vals,original)}
+ update:=newRecordUpdateBuilder(nil,"records",1).SetOptional(&original)
+ updated,ok:=update.Sets[0].Val.(*int64);if !ok||updated==nil||*updated!=18||original!=4||updated==&original{t.Fatal(update.Sets,original)}
+ batch:=(&RecordClient{}).CreateMany().Add(RecordCreateInput{Optional:&original})
+ original=99
+ if batch.rows[0].Optional==nil||*batch.rows[0].Optional!=18||*stored!=18||*updated!=18{t.Fatal("caller mutation reached prepared values")}
+ empty:=(&RecordClient{}).Create().SetOptional(nil)
+ if null,ok:=empty.Vals[0].(*int64);!ok||null!=nil{t.Fatal(empty.Vals)}
+ instant:=time.Unix(42,123);if got,err:=prepareSave6RecordTimestamp(instant);err!=nil||!got.Equal(instant.Add(time.Second)){t.Fatal(got,err)}
+}
+`, StableIDs{ModelFields: map[string]map[string]int{"Record": {"id": 1, "amount": 2, "optional": 3, "text": 4, "timestamp": 5}}})
+}
+
+func TestSavePreparationNamesDoNotMergeModelAndField(t *testing.T) {
+	if savePreparationName("A", "bC") == savePreparationName("AB", "c") {
+		t.Fatal("distinct model/field pairs share a generated function name")
+	}
+}
+
+func TestSavePreparationInternalFieldImports(t *testing.T) {
+	field := &ast.FieldDecl{Name: "recordedAt", Type: &ast.TypeRef{Name: "DateTime"}, Directives: []*ast.Directive{{Name: "internal"}, {Name: "beforeSave"}}}
+	var needs dbImportNeeds
+	scanDBFieldImports(field, &needs)
+	if !needs.time {
+		t.Fatal("internal save preparation signature is missing time import")
+	}
+}

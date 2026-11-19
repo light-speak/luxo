@@ -226,6 +226,54 @@ func writeMigration(t *testing.T, dir, name, up, down string) {
 	}
 }
 
+func TestIntegrationMigrationOrdinalsAfterThreeDigits(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := t.Context()
+	names := []string{"20261113_998_create.sql", "20261113_999_insert.sql", "20261113_1000_alter.sql"}
+	writeMigration(t, dir, names[0], "CREATE TABLE test_users (id bigint PRIMARY KEY);", "DROP TABLE test_users;")
+	writeMigration(t, dir, names[1], "INSERT INTO test_users VALUES (1);", "DELETE FROM test_users WHERE id=1;")
+	writeMigration(t, dir, names[2], "ALTER TABLE test_users ADD COLUMN marker bigint DEFAULT 9; INSERT INTO test_users (id) VALUES (2);", "DELETE FROM test_users WHERE id=2; ALTER TABLE test_users DROP COLUMN marker;")
+	assertMigrationOrdinalStatus(t, runner, names, false)
+	dry, sql, err := runner.DryRun(ctx)
+	if err != nil || strings.Join(dry, "|") != strings.Join(names, "|") || len(sql) != len(names) {
+		t.Fatalf("dry-run order: %v %v %v", dry, sql, err)
+	}
+	up, err := runner.Up(ctx)
+	if err != nil || strings.Join(up, "|") != strings.Join(names, "|") {
+		t.Fatalf("execution order: %v %v", up, err)
+	}
+	assertMigrationOrdinalStatus(t, runner, names, true)
+	writeMigration(t, dir, "20261113_1001_failure.sql", "INSERT INTO test_users (id) VALUES (3); SELECT luxo_missing_function();", "DELETE FROM test_users WHERE id=3;")
+	if up, err := runner.Up(ctx); err == nil || len(up) != 0 {
+		t.Fatalf("failed migration committed: %v %v", up, err)
+	}
+	var count, sum int64
+	if err := runner.db.(*PGDB).pool.QueryRow(ctx, "SELECT count(*), sum(marker) FROM test_users").Scan(&count, &sum); err != nil || count != 2 || sum != 18 {
+		t.Fatalf("failed SQL changed rows: %d %d %v", count, sum, err)
+	}
+	down, err := runner.Down(ctx, 1)
+	if err != nil || len(down) != 1 || down[0] != names[2] {
+		t.Fatalf("first rollback order: %v %v", down, err)
+	}
+	down, err = runner.Down(ctx, 2)
+	if err != nil || strings.Join(down, "|") != names[1]+"|"+names[0] {
+		t.Fatalf("remaining rollback order: %v %v", down, err)
+	}
+}
+
+func assertMigrationOrdinalStatus(t *testing.T, runner *Runner, names []string, applied bool) {
+	t.Helper()
+	status, err := runner.Status(t.Context())
+	if err != nil || len(status) != len(names) {
+		t.Fatalf("migration status: %v %v", status, err)
+	}
+	for i, item := range status {
+		if item.Name != names[i] || item.Applied != applied {
+			t.Fatalf("migration status order: %v, applied=%v", status, applied)
+		}
+	}
+}
+
 func TestIntegrationInitCreatesTable(t *testing.T) {
 	runner, _ := setupTestRunner(t)
 	ctx := context.Background()

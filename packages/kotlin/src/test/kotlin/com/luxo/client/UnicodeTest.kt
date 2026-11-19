@@ -10,6 +10,163 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import kotlin.test.*
 
 class UnicodeTest {
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    @Test
+    fun `JSON writers retain parsed numbers and complete raw fragments exactly`() {
+        for (raw in listOf("-0", "1.00", "-1.2300", "1e+03", "1e-003", "1E9", "1e400", "1e-9999",
+            "9223372036854775807", "-9223372036854775808", "18446744073709551616", "9007199254740993",
+            "0.123456789012345678901234567890", "true", "false", "null", "\"raw text\"", "[]", "{}")) {
+            val values = if (raw == "null") listOf(JsonNull) else listOf(decodeLuxoJSON(raw), JsonUnquotedLiteral(raw))
+            for (value in values) {
+                for (encode in listOf(::encodeLuxoJSON, ::encodeBoundedLuxoJSON)) {
+                    assertEquals(raw, encode(value), raw)
+                    assertEquals("{\"value\":$raw}", encode(buildJsonObject { put("value", value) }), raw)
+                    assertEquals("[$raw]", encode(JsonArray(listOf(value))), raw)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `JSON writers preserve every BMP string escape and supplementary boundaries`() {
+        for (code in 0..65535) {
+            if (code in 0xd800..0xdfff) continue
+            val value = JsonPrimitive(code.toChar().toString())
+            // JsonElement text is the existing wire compatibility oracle.
+            val expected = value.toString()
+            assertEquals(expected, encodeLuxoJSON(value), "code=$code")
+            assertEquals(expected, encodeBoundedLuxoJSON(value), "code=$code")
+        }
+        for (code in listOf(0x10000, 0x20000, 0x10ffff)) {
+            val text = String(Character.toChars(code))
+            val value = buildJsonObject { put(text, buildJsonArray { add(text); add(true); add(JsonNull) }) }
+            assertEquals(value.toString(), encodeLuxoJSON(value))
+            assertEquals(value.toString(), encodeBoundedLuxoJSON(value))
+        }
+    }
+
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    @Test
+    fun `numeric siblings never bypass later raw Unicode or container checks`() {
+        for (raw in listOf("", "01", "+1", "1e", "1 2", "1,\"injected\":true", "true,false", "NaN",
+            "Infinity", "{\"v\":\"\\ud800\"}", "[0", "{}[]")) {
+            val bad = JsonUnquotedLiteral(raw)
+            for (encode in listOf(::encodeLuxoJSON, ::encodeBoundedLuxoJSON)) {
+                for (value in listOf(bad, JsonArray(listOf(JsonPrimitive(0), bad)),
+                    buildJsonObject { put("first", 0); put("bad", bad) })) {
+                    assertFails("raw=$raw") { encode(value) }
+                }
+            }
+        }
+        for (text in listOf("\uD800", "\uDC00", "valid\uD800tail")) {
+            for (encode in listOf(::encodeLuxoJSON, ::encodeBoundedLuxoJSON)) {
+                assertFails { encode(JsonPrimitive(text)) }
+                assertFails { encode(buildJsonObject { put("first", 0); put(text, text) }) }
+                assertFails { encode(JsonArray(listOf(JsonPrimitive(0), JsonPrimitive(text)))) }
+            }
+        }
+        for (objects in listOf(false, true)) for (depth in 127..129) {
+            var nested: JsonElement = JsonNull
+            repeat(depth - 1) { nested = if (objects) buildJsonObject { put("v", nested) } else JsonArray(listOf(nested)) }
+            val value = if (objects) buildJsonObject { put("first", 0); put("nested", nested) }
+                else JsonArray(listOf(JsonPrimitive(0), nested))
+            if (depth <= 128) assertEquals(value.toString(), encodeBoundedLuxoJSON(value))
+            else assertFailsWith<IllegalArgumentException> { encodeBoundedLuxoJSON(value) }
+        }
+    }
+
+    @Test
+    fun `generic JSON counts empty containers but not scalar leaves`() {
+        for (objects in listOf(false, true)) for (depth in 127..129) {
+            for (leaf in listOf("0", "[]", "{}", "1e400")) {
+                val containers = depth - if (leaf == "[]" || leaf == "{}") 1 else 0
+                val raw = (if (objects) "{\"v\":" else "[").repeat(containers) + leaf +
+                    (if (objects) "}" else "]").repeat(containers)
+                val value = Json.parseToJsonElement(raw)
+                if (depth <= 128) assertSame(value, decodeLuxoJsonValue(value))
+                else assertFailsWith<IllegalArgumentException>("depth=$depth leaf=$leaf") {
+                    decodeLuxoJsonValue(value)
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `binary error JSON rejects deep source even when duplicate keys overwrite it`() {
+        for (depth in 128..129) {
+            val nested = "[".repeat(depth - 1) + "0" + "]".repeat(depth - 1)
+            val raw = "{\"v\":$nested,\"v\":0}"
+            val encoder = LuxoEncoder().apply {
+                writeFieldInt(1, 400); writeFieldString(2, "Rejected"); writeFieldString(3, "no")
+                writeFieldString(5, raw); writeEnd()
+            }
+            assertEquals(if (depth == 128) "Rejected" else "ParseError",
+                LuxoBinaryProtocol.decodeError(encoder.bytes(), 502).error)
+        }
+    }
+
+    @Test
+    fun `binary JSON parameters have an independent container budget per list item`() {
+        for (list in listOf(false, true)) for (depth in 128..129) {
+            val value = Json.parseToJsonElement("[".repeat(depth) + "0" + "]".repeat(depth))
+            val meta = APISchemaEntry(id = 1, params = listOf(ParamSchema(1, "value", "JSON", isList = list)))
+            val params = mapOf("value" to if (list) listOf(value) else value)
+            if (depth == 128) assertTrue(LuxoBinaryProtocol.encodeRequest(meta, params).isNotEmpty())
+            else assertFailsWith<IllegalArgumentException> { LuxoBinaryProtocol.encodeRequest(meta, params) }
+        }
+    }
+
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    @Test
+    fun `bounded JSON validates source fragments before parsing or writing`() {
+        for (objects in listOf(false, true)) for (depth in 127..129) for (leaf in listOf("0", "[]", "{}", "1e400")) {
+            val count = depth - if (leaf == "[]" || leaf == "{}") 1 else 0
+            val raw = (if (objects) "{\"v\":" else "[").repeat(count) + leaf +
+                (if (objects) "}" else "]").repeat(count)
+            val value = Json.parseToJsonElement(raw)
+            if (depth <= 128) {
+                assertEquals(value, decodeBoundedLuxoJSON(raw))
+                assertEquals(raw, encodeBoundedLuxoJSON(value))
+                assertEquals(raw, encodeBoundedLuxoJSON(JsonUnquotedLiteral(raw)))
+            } else {
+                assertFailsWith<IllegalArgumentException> { decodeBoundedLuxoJSON(raw) }
+                assertFailsWith<IllegalArgumentException> { encodeBoundedLuxoJSON(value) }
+                assertFailsWith<IllegalArgumentException> { decodeLuxoJsonValue(JsonUnquotedLiteral(raw)) }
+                assertFailsWith<IllegalArgumentException> { encodeBoundedLuxoJSON(JsonUnquotedLiteral(raw)) }
+            }
+        }
+        val fragment = JsonUnquotedLiteral("[".repeat(128) + "0" + "]".repeat(128))
+        for (outer in listOf(JsonArray(listOf(fragment)), buildJsonObject { put("v", fragment) })) {
+            assertFailsWith<IllegalArgumentException> { encodeBoundedLuxoJSON(outer) }
+            assertFailsWith<IllegalArgumentException> { decodeLuxoJsonValue(outer) }
+        }
+        val quoted = JsonPrimitive("[{}]\\\"".repeat(200)).toString()
+        assertEquals(Json.parseToJsonElement(quoted), decodeBoundedLuxoJSON(quoted))
+        for (bad in listOf("[0,]", "{\"v\":0,}", "[", "true false", "\"\\ud800\"")) {
+            assertFailsWith<IllegalArgumentException> { decodeBoundedLuxoJSON(bad) }
+        }
+        assertFailsWith<IllegalArgumentException> { decodeBoundedLuxoJSON("[".repeat(4000) + "0" + "]".repeat(4000)) }
+    }
+
+    @Test
+    fun `typed JSON parameters reset budgets inside models and stop recursive host collections`() {
+        val fields = mapOf("value" to SelectionFieldSchema(1, type = "JSON"),
+            "values" to SelectionFieldSchema(2, type = "JSON", isList = true))
+        val meta = APISchemaEntry(1, listOf(ParamSchema(1, "input", "Model", typeName = "Packet")),
+            types = mapOf("Packet" to fields))
+        for (depth in 128..129) {
+            val value = Json.parseToJsonElement("[".repeat(depth) + "0" + "]".repeat(depth))
+            val params = mapOf("input" to mapOf("value" to value, "values" to listOf(value)))
+            if (depth == 128) buildJsonObject { putLuxoParams(params, meta) }
+            else assertFailsWith<IllegalArgumentException> { buildJsonObject { putLuxoParams(params, meta) } }
+        }
+        for (kind in 0..2) {
+            var value: Any = 0
+            repeat(4000) { value = when (kind) { 0 -> listOf(value); 1 -> arrayOf(value); else -> mapOf("v" to value) } }
+            assertFailsWith<IllegalArgumentException> { luxoGenericJSONValue(value) }
+        }
+    }
+
     private val malformed = listOf("\uD800", "\uDBFF", "\uDC00", "\uDFFF", "\uD800x", "\uDC00\uD800")
     private val valid = listOf("", "ascii", "東京", "\uD800\uDC00", "\uDBFF\uDFFF", "\uFFFD",
         "\u0000\uFEFF", "\uD7FF\uE000\uFFFF", "\\uD800", "e\u0301")

@@ -17,6 +17,8 @@ type eventWireCodec struct {
 	fields        []*ast.ParamDecl
 	ids           map[string]int
 	objectFields  bool
+	objectValues  bool
+	generator     *GeneratorContext
 }
 
 func (c eventWireCodec) write(b *strings.Builder, enums, objects map[string]bool) {
@@ -36,10 +38,14 @@ func (c eventWireCodec) write(b *strings.Builder, enums, objects map[string]bool
 		if field.Type == nil || c.ids[field.Name] == 0 {
 			continue
 		}
-		if c.objectFields && objects[field.Type.Name] && !field.Type.IsList && !field.Type.Nullable {
+		if c.objectFields && !c.objectValues && objects[field.Type.Name] && !field.Type.IsList && !field.Type.Nullable {
 			fmt.Fprintf(b, "\tif e.%s == nil { return nil, fmt.Errorf(%q) }\n", str.Capitalize(field.Name), "event: nil required field "+c.name+"."+field.Name)
 		}
-		writeEventMarshalField(b, c.ids[field.Name], field, enums[field.Type.Name], objects[field.Type.Name])
+		method := "marshalEventSnapshot"
+		if c.generator != nil {
+			method = c.generator.valueDepthMethod(field.Type.Name, method)
+		}
+		writeEventMarshalField(b, c.ids[field.Name], field, enums[field.Type.Name], objects[field.Type.Name], method)
 	}
 	b.WriteString("\tenc.WriteEnd()\n\treturn enc.Bytes(), nil\n}\n\n")
 	c.writeReader(b, enums, objects)
@@ -63,7 +69,11 @@ func (c eventWireCodec) writeReader(b *strings.Builder, enums, objects map[strin
 		if field.Type == nil || c.ids[field.Name] == 0 {
 			continue
 		}
-		writeEventUnmarshalField(b, c.ids[field.Name], field, enums[field.Type.Name], objects[field.Type.Name], c.objectFields)
+		method := "unmarshalEventSnapshot"
+		if c.generator != nil {
+			method = c.generator.valueDepthMethod(field.Type.Name, method)
+		}
+		writeEventUnmarshalField(b, c.ids[field.Name], field, enums[field.Type.Name], objects[field.Type.Name], c.objectFields && !c.objectValues, method)
 		if c.required(field) {
 			fmt.Fprintf(b, "\t\t\tseen%s = true\n", str.Capitalize(field.Name))
 		}
@@ -90,10 +100,17 @@ func (c eventWireCodec) required(field *ast.ParamDecl) bool {
 }
 
 func (g *GeneratorContext) generateEventObjectCodec(b *strings.Builder, name string, fields []*ast.FieldDecl, enums, objects map[string]bool) {
+	if g.valueTypes != nil && g.valueTypes.events[name] {
+		return
+	}
+	g.writeEventObjectCodec(b, name, fields, enums, objects)
+}
+
+func (g *GeneratorContext) writeEventObjectCodec(b *strings.Builder, name string, fields []*ast.FieldDecl, enums, objects map[string]bool) {
 	params := make([]*ast.ParamDecl, 0, len(fields))
 	for _, field := range fields {
 		params = append(params, &ast.ParamDecl{Name: field.Name, Type: field.Type})
 	}
-	c := eventWireCodec{name: name, marshalName: "marshalEventSnapshot", unmarshalName: "unmarshalEventSnapshot", fields: params, ids: g.ids.ModelFields[name], objectFields: true}
+	c := eventWireCodec{name: name, marshalName: g.valueDepthMethod(name, "marshalEventSnapshot"), unmarshalName: g.valueDepthMethod(name, "unmarshalEventSnapshot"), fields: params, ids: g.ids.ModelFields[name], objectFields: true, generator: g}
 	c.write(b, enums, objects)
 }

@@ -12,6 +12,22 @@ type textBenchmark struct {
 	read  func(*Decoder, *ColumnarReader, []byte, *int) int
 }
 
+func BenchmarkReadStringTextBoundary(b *testing.B) {
+	for _, size := range []int{0, 1, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 64} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			value := strings.Repeat("a", size)
+			data := AppendBytes(nil, []byte(value))
+			b.ReportAllocs()
+			for b.Loop() {
+				got, n := ReadString(data, 0)
+				if got != value || n != len(data) {
+					b.Fatal("string content or consumed length changed")
+				}
+			}
+		})
+	}
+}
+
 func textBenchmarks(before bool) []textBenchmark {
 	if before {
 		return []textBenchmark{

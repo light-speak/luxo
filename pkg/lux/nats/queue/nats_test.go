@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -31,6 +32,22 @@ func TestNATSQueueConnectFail(t *testing.T) {
 	}
 }
 
+func TestNATSNegativeConfigurationPrecedesConnection(t *testing.T) {
+	for _, cfg := range []Config{{MaxRetries: -1}, {RetryDelay: -1}, {Concurrency: -1}} {
+		value, err := NewNATSQueue("nats://127.0.0.1:1", cfg)
+		if value != nil {
+			_ = value.Close()
+		}
+		if value != nil || err == nil || !strings.Contains(err.Error(), "negative") {
+			t.Errorf("negative configuration reached connection setup: %+v, %v", cfg, err)
+		}
+		value, err = NewNATSQueueFromConn(nil, cfg)
+		if value != nil || err == nil || !strings.Contains(err.Error(), "negative") {
+			t.Errorf("negative configuration was ignored for borrowed connection: %+v, %v", cfg, err)
+		}
+	}
+}
+
 func TestNATSQueueFromNilConn(t *testing.T) {
 	if queue, err := NewNATSQueueFromConn(nil, DefaultConfig()); err == nil || queue != nil {
 		t.Fatal("nil connection must return an error without a queue")
@@ -49,8 +66,14 @@ func TestNATSQueueCloseReportsClosedOwnedConnection(t *testing.T) {
 	if !q.closed || len(q.consumers) != 0 {
 		t.Fatal("drain failure left the queue open")
 	}
-	if err := q.Close(); err != nil {
-		t.Fatalf("repeated close must not retry connection cleanup: %v", err)
+	results := make(chan error, 8)
+	for range 8 {
+		go func() { results <- q.Close() }()
+	}
+	for range 8 {
+		if err := <-results; !errors.Is(err, nats.ErrConnectionClosed) {
+			t.Fatalf("repeated close lost the original failure: %v", err)
+		}
 	}
 }
 
@@ -252,3 +275,142 @@ var errAlwaysFail = &alwaysFailError{}
 type alwaysFailError struct{}
 
 func (e *alwaysFailError) Error() string { return "always fail" }
+
+func TestNATSQueueNamesRemainIsolated(t *testing.T) {
+	q, js, ctx, prefix := queueNamingFixture(t)
+	for _, suffix := range []string{".send", "_send", "__send", "_dsend"} {
+		name := prefix + suffix
+		cleanupQueueStream(t, js, streamName(name))
+		if err := q.Publish(ctx, name, []byte(name)); err != nil {
+			t.Fatal(err)
+		}
+		// A fresh instance must reopen the same stream without changing it.
+		reopened, err := NewNATSQueueFromConn(q.conn, DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := reopened.Publish(ctx, name, []byte(name)); err != nil {
+			t.Fatal(err)
+		}
+		if err := reopened.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, suffix := range []string{".send", "_send", "__send", "_dsend"} {
+		name := prefix + suffix
+		stream, err := js.Stream(ctx, streamName(name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := stream.Info(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(info.Config.Subjects) != 1 || info.Config.Subjects[0] != name || info.State.Msgs != 2 {
+			t.Fatalf("queue %s lost isolation: %+v", name, info)
+		}
+		message, err := stream.GetMsg(ctx, 1)
+		if err != nil || string(message.Data) != name {
+			t.Fatalf("wrong payload: %v %v", message, err)
+		}
+	}
+}
+
+func TestNATSQueueNeverOverwritesConflictingStream(t *testing.T) {
+	for _, operation := range []string{"publish", "subscribe"} {
+		t.Run(operation, func(t *testing.T) {
+			q, js, ctx, name := queueNamingFixture(t)
+			streamID := streamName(name)
+			cleanupQueueStream(t, js, streamID)
+			original := name + ".original"
+			stream, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: streamID, Subjects: []string{original}, Retention: jetstream.WorkQueuePolicy, Discard: jetstream.DiscardNew})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := js.Publish(ctx, original, []byte("keep")); err != nil {
+				t.Fatal(err)
+			}
+			if operation == "publish" {
+				err = q.Publish(ctx, name, []byte("wrong"))
+			} else {
+				err = q.Subscribe(name, func(context.Context, []byte) error { return nil })
+			}
+			if err == nil {
+				t.Error("conflicting stream must fail explicitly")
+			}
+			info, err := stream.Info(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(info.Config.Subjects) != 1 || info.Config.Subjects[0] != original || info.State.Msgs != 1 {
+				t.Fatalf("existing stream changed: %+v", info)
+			}
+			message, err := stream.GetMsg(ctx, 1)
+			if err != nil || string(message.Data) != "keep" {
+				t.Fatalf("existing task changed: %v %v", message, err)
+			}
+		})
+	}
+}
+
+func queueNamingFixture(t *testing.T) (*NATSQueue, jetstream.JetStream, context.Context, string) {
+	t.Helper()
+	q, err := NewNATSQueue(natsTestURL(t), DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := q.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	js, err := jetstream.New(q.conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	t.Cleanup(cancel)
+	return q, js, ctx, "nameaudit" + strconv.FormatInt(time.Now().UnixNano(), 10)
+}
+
+func cleanupQueueStream(t *testing.T, js jetstream.JetStream, name string) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := js.DeleteStream(ctx, name); err != nil && !errors.Is(err, jetstream.ErrStreamNotFound) {
+			t.Error(err)
+		}
+	})
+}
+
+func TestNATSQueuePreservesLegacyBacklog(t *testing.T) {
+	q, js, ctx, prefix := queueNamingFixture(t)
+	name := prefix + ".send"
+	legacyID := "luxo_q_" + strings.ReplaceAll(name, ".", "_")
+	cleanupQueueStream(t, js, legacyID)
+	stream, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: legacyID, Subjects: []string{name}, Retention: jetstream.WorkQueuePolicy, Discard: jetstream.DiscardNew})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := js.Publish(ctx, name, []byte("legacy-task")); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Publish(ctx, name, []byte("new-task")); err == nil {
+		t.Fatal("legacy subject overlap must be reported")
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.State.Msgs != 1 || len(info.Config.Subjects) != 1 || info.Config.Subjects[0] != name {
+		t.Fatalf("legacy stream changed: %+v", info)
+	}
+	message, err := stream.GetMsg(ctx, 1)
+	if err != nil || string(message.Data) != "legacy-task" {
+		t.Fatalf("lost legacy task: %v %v", message, err)
+	}
+	if _, err := js.Stream(ctx, streamName(name)); !errors.Is(err, jetstream.ErrStreamNotFound) {
+		t.Fatalf("unexpected replacement stream: %v", err)
+	}
+}

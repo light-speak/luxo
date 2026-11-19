@@ -44,11 +44,14 @@ func initiateHandshake(ctx context.Context, conn net.Conn, timeout time.Duration
 	if stop != nil {
 		stop()
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
 	if err != nil {
+		if contextErr := contextErrorAfterIO(ctx, err); contextErr != nil {
+			return contextErr
+		}
 		return err
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
 	}
 	return conn.SetDeadline(time.Time{})
 }

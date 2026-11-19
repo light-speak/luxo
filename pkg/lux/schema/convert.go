@@ -22,11 +22,15 @@ var errJSONSizeOverflow = errors.New("schema: JSON list size overflows int")
 // Returns the JSON bytes appended to dst.
 // Schema is optional for flat values, but required for present nested values.
 func BinaryToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) ([]byte, error) {
+	return binaryToJSON(dst, data, model, 1, schemas...)
+}
+
+func binaryToJSON(dst []byte, data []byte, model *Model, depth int, schemas ...*Schema) ([]byte, error) {
 	dec := codec.NewDecoder(data)
-	start := len(dst)
-	dst = binaryToJSONFromDecoder(dst, dec, model, schemas...)
+	original := dst
+	dst = binaryToJSONFromDecoder(dst, dec, model, depth, schemas...)
 	if err := dec.Finish(); err != nil {
-		return dst[:start], err
+		return original, err
 	}
 	return dst, nil
 }
@@ -34,7 +38,11 @@ func BinaryToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) ([]
 // binaryToJSONFromDecoder reads fields from a decoder and produces JSON.
 // Used by top-level and independently framed nested model decoding.
 // Skips the arena header (totalStringLen varint) that WriteLuxo prepends.
-func binaryToJSONFromDecoder(dst []byte, dec *codec.Decoder, model *Model, schemas ...*Schema) []byte {
+func binaryToJSONFromDecoder(dst []byte, dec *codec.Decoder, model *Model, depth int, schemas ...*Schema) []byte {
+	if depth > codec.MaxModelDepth {
+		dec.Fail(codec.ErrModelDepth)
+		return dst
+	}
 	// Skip arena header — Binary→JSON doesn't use arena allocation
 	dec.SkipArenaHeader()
 	dst = append(dst, '{')
@@ -52,13 +60,21 @@ func binaryToJSONFromDecoder(dst []byte, dec *codec.Decoder, model *Model, schem
 		dst = append(dst, f.JSONPrefix...)
 
 		// Read one child frame; missing metadata must not fabricate null or [].
-		if f.Relation {
+		if f.Type == FieldSealed {
+			var nested *Schema
+			if len(schemas) > 0 {
+				nested = schemas[0]
+			}
+			var err error
+			dst, err = appendSealedFieldJSON(dst, dec, f, depth, nested)
+			dec.Fail(err)
+		} else if f.Relation {
 			var nestedSchema *Schema
 			if len(schemas) > 0 {
 				nestedSchema = schemas[0]
 			}
 			var err error
-			dst, err = appendNestedModelJSON(dst, dec, f, nestedSchema)
+			dst, err = appendNestedModelJSON(dst, dec, f, depth, nestedSchema)
 			if err != nil {
 				dec.Fail(err)
 			}
@@ -73,18 +89,18 @@ func binaryToJSONFromDecoder(dst []byte, dec *codec.Decoder, model *Model, schem
 // appendNestedModelJSON reads one length-delimited child response. Nested
 // objects contain row bytes; nested lists contain columnar bytes. Nullable
 // children use one outer presence flag, including nullable relation lists.
-func appendNestedModelJSON(dst []byte, dec *codec.Decoder, f *Field, s *Schema) ([]byte, error) {
+func appendNestedModelJSON(dst []byte, dec *codec.Decoder, f *Field, depth int, s *Schema) ([]byte, error) {
 	if f.Nullable && !dec.ReadBool() {
 		return append(dst, "null"...), dec.Err()
 	}
-	return appendNestedColumnBlobJSON(dst, dec.ReadBytes(), f, s)
+	return appendNestedColumnBlobJSON(dst, dec.ReadBytes(), f, depth, s)
 }
 
 // BinaryListToJSON converts a columnar-encoded list of models to JSON.
 // Columnar format: [count][fieldID][val0..valN][fieldID][val0..valN]...[0x00]
 // Optional schema enables federation blob column expansion.
 func BinaryListToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) ([]byte, error) {
-	return columnarToJSON(dst, data, model, schemas...)
+	return columnarToJSON(dst, data, model, 1, schemas...)
 }
 
 // typedColumn holds a decoded column's values in typed slices (no map[string]any).
@@ -108,23 +124,26 @@ type typedColumn struct {
 
 // columnarToJSON decodes columnar binary to JSON array.
 // Uses typed column slices instead of map[string]any per record — zero map allocation.
-func columnarToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) ([]byte, error) {
-	r, columns, err := readJSONColumns(data, model)
+func columnarToJSON(dst []byte, data []byte, model *Model, depth int, schemas ...*Schema) ([]byte, error) {
+	r, columns, err := readJSONColumns(data, model, depth)
 	if err != nil {
 		return dst, err
 	}
 	if r.Offset() != len(data) {
 		return dst, fmt.Errorf("schema: trailing columnar data")
 	}
-	return appendJSONRows(dst, r.Count(), columns, schemas...)
+	return appendJSONRows(dst, r.Count(), columns, depth, schemas...)
 }
 
 // readJSONColumns is shared by ordinary lists and paginated lists. It validates
 // the decoder before any typed column is indexed by the JSON writer.
-func readJSONColumns(data []byte, model *Model) (*codec.ColumnarReader, []typedColumn, error) {
+func readJSONColumns(data []byte, model *Model, depth int) (*codec.ColumnarReader, []typedColumn, error) {
 	r := codec.NewColumnarReader(data)
 	if err := r.Err(); err != nil {
 		return r, nil, err
+	}
+	if r.Count() > 0 && depth > codec.MaxModelDepth {
+		return r, nil, codec.ErrModelDepth
 	}
 	var columns []typedColumn
 	if r.Count() > 0 {
@@ -152,8 +171,8 @@ func readJSONColumns(data []byte, model *Model) (*codec.ColumnarReader, []typedC
 	return r, columns, nil
 }
 
-func appendJSONRows(dst []byte, count int, columns []typedColumn, schemas ...*Schema) ([]byte, error) {
-	start := len(dst)
+func appendJSONRows(dst []byte, count int, columns []typedColumn, depth int, schemas ...*Schema) ([]byte, error) {
+	original := dst
 	// Batch rows amortize estimation; single rows can hit worse size classes.
 	if count > 1 {
 		var err error
@@ -175,9 +194,9 @@ func appendJSONRows(dst []byte, count int, columns []typedColumn, schemas ...*Sc
 			col := &columns[ci]
 			dst = append(dst, col.field.JSONPrefix...)
 			var err error
-			dst, err = appendColumnValueJSON(dst, col, i, schemas...)
+			dst, err = appendColumnValueJSON(dst, col, i, depth, schemas...)
 			if err != nil {
-				return dst[:start], err
+				return original, err
 			}
 		}
 		dst = append(dst, '}')
@@ -209,7 +228,7 @@ func jsonRowsMinimumSize(count int, columns []typedColumn, limit int) (int, erro
 		field := columns[i].field
 		// Blob contents are validated during output, not column framing.
 		// Do not reserve a whole batch before those values are known valid.
-		if field.IsList || field.Type == FieldJSON || field.Type == FieldModel {
+		if field.IsList || field.Type == FieldJSON || field.Type == FieldModel || field.Type == FieldSealed {
 			return 0, nil
 		}
 		prefix := len(field.JSONPrefix)
@@ -276,7 +295,7 @@ func readColumn(r *codec.ColumnarReader, f *Field, col *typedColumn) {
 		} else {
 			col.uuids = r.ReadColumnUUID()
 		}
-	case FieldModel:
+	case FieldModel, FieldSealed:
 		if f.Nullable {
 			col.blobPtrs = r.ReadColumnBytesPtr()
 		} else {
@@ -292,7 +311,7 @@ func readColumn(r *codec.ColumnarReader, f *Field, col *typedColumn) {
 }
 
 // appendColumnValueJSON appends the JSON value for record i from a typed column.
-func appendColumnValueJSON(dst []byte, col *typedColumn, i int, schemas ...*Schema) ([]byte, error) {
+func appendColumnValueJSON(dst []byte, col *typedColumn, i, depth int, schemas ...*Schema) ([]byte, error) {
 	f := col.field
 	switch {
 	case col.ints != nil:
@@ -344,12 +363,12 @@ func appendColumnValueJSON(dst []byte, col *typedColumn, i int, schemas ...*Sche
 		}
 		return appendUUIDString(dst, *col.uuidPtrs[i]), nil
 	case col.blobs != nil:
-		return appendColumnBlobValueJSON(dst, col.blobs[i], f, schemas...)
+		return appendColumnBlobValueJSON(dst, col.blobs[i], f, depth, schemas...)
 	case col.blobPtrs != nil:
 		if col.blobPtrs[i] == nil {
 			return append(dst, "null"...), nil
 		}
-		return appendColumnBlobValueJSON(dst, *col.blobPtrs[i], f, schemas...)
+		return appendColumnBlobValueJSON(dst, *col.blobPtrs[i], f, depth, schemas...)
 	default:
 		return append(dst, "null"...), nil
 	}
@@ -357,14 +376,23 @@ func appendColumnValueJSON(dst []byte, col *typedColumn, i int, schemas ...*Sche
 
 // appendColumnBlobValueJSON decodes a Bytes-column cell: either a scalar array field
 // ([count][items...]) or a federation extend blob (nested model / list binary).
-func appendColumnBlobValueJSON(dst, blob []byte, f *Field, schemas ...*Schema) ([]byte, error) {
+func appendColumnBlobValueJSON(dst, blob []byte, f *Field, depth int, schemas ...*Schema) ([]byte, error) {
+	if f.Type == FieldSealed {
+		if len(schemas) == 0 || schemas[0] == nil {
+			return dst, fmt.Errorf("schema: sealed field %q requires schema", f.Name)
+		}
+		if f.IsList {
+			return schemas[0].sealedListToJSON(dst, blob, f.TypeName, depth+1)
+		}
+		return schemas[0].sealedToJSON(dst, blob, f.TypeName, depth+1)
+	}
 	// Scalar array field: each cell is an inline [count][items...] array.
 	if f.IsList && f.Type != FieldModel {
 		dec := codec.NewDecoder(blob)
-		start := len(dst)
+		original := dst
 		dst = appendArrayFieldJSON(dst, dec, f)
 		if err := dec.Finish(); err != nil {
-			return dst[:start], err
+			return original, err
 		}
 		return dst, nil
 	}
@@ -374,10 +402,10 @@ func appendColumnBlobValueJSON(dst, blob []byte, f *Field, schemas ...*Schema) (
 		}
 		return appendBase64JSON(dst, blob), nil
 	}
-	return appendNestedColumnBlobJSON(dst, blob, f, schemas...)
+	return appendNestedColumnBlobJSON(dst, blob, f, depth, schemas...)
 }
 
-func appendNestedColumnBlobJSON(dst, blob []byte, f *Field, schemas ...*Schema) ([]byte, error) {
+func appendNestedColumnBlobJSON(dst, blob []byte, f *Field, depth int, schemas ...*Schema) ([]byte, error) {
 	if len(schemas) == 0 || schemas[0] == nil {
 		return dst, fmt.Errorf("schema: nested type %q for field %q requires schema", f.TypeName, f.Name)
 	}
@@ -386,9 +414,9 @@ func appendNestedColumnBlobJSON(dst, blob []byte, f *Field, schemas ...*Schema) 
 		return dst, fmt.Errorf("schema: nested type %q for field %q is not registered", f.TypeName, f.Name)
 	}
 	if f.IsList {
-		return BinaryListToJSON(dst, blob, nested, schemas[0])
+		return columnarToJSON(dst, blob, nested, depth+1, schemas[0])
 	}
-	return BinaryToJSON(dst, blob, nested, schemas[0])
+	return binaryToJSON(dst, blob, nested, depth+1, schemas[0])
 }
 
 func appendRawJSON(dst, raw []byte) ([]byte, error) {
@@ -416,7 +444,7 @@ func appendBase64JSON(dst, blob []byte) []byte {
 // Binary format: [columnar data: count+columns+0x00][total svarint][page svarint][pageSize svarint]
 // JSON format: {"items":[...],"total":N,"page":N,"pageSize":N}
 func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model, schemas ...*Schema) ([]byte, error) {
-	r, columns, err := readJSONColumns(data, model)
+	r, columns, err := readJSONColumns(data, model, 1)
 	if err != nil {
 		return dst, err
 	}
@@ -425,11 +453,11 @@ func BinaryPaginatedListToJSON(dst []byte, data []byte, model *Model, schemas ..
 	if err := metadata.Finish(); err != nil {
 		return dst, err
 	}
-	start := len(dst)
+	original := dst
 	dst = append(dst, `{"items":`...)
-	dst, err = appendJSONRows(dst, r.Count(), columns, schemas...)
+	dst, err = appendJSONRows(dst, r.Count(), columns, 1, schemas...)
 	if err != nil {
-		return dst[:start], err
+		return original, err
 	}
 	dst = append(dst, `,"total":`...)
 	dst = strconv.AppendInt(dst, total, 10)
@@ -691,11 +719,11 @@ func BinaryScalarToJSON(dst []byte, data []byte, typeName string) ([]byte, error
 	if len(data) == 0 && typeName == "" {
 		return append(dst, "null"...), nil
 	}
-	start := len(dst)
+	original := dst
 	dec := codec.NewDecoder(data)
 	dst = appendScalarValueJSON(dst, dec, typeName)
 	if err := dec.Finish(); err != nil {
-		return dst[:start], err
+		return original, err
 	}
 	return dst, nil
 }
@@ -703,7 +731,7 @@ func BinaryScalarToJSON(dst []byte, data []byte, typeName string) ([]byte, error
 // BinaryScalarListToJSON converts a canonical count-prefixed list of scalar
 // values. Enum callers pass String because enums share the string wire type.
 func BinaryScalarListToJSON(dst []byte, data []byte, typeName string) ([]byte, error) {
-	start := len(dst)
+	original := dst
 	dec := codec.NewDecoder(data)
 	count := dec.ReadArrayLength()
 	dst = append(dst, '[')
@@ -714,7 +742,7 @@ func BinaryScalarListToJSON(dst []byte, data []byte, typeName string) ([]byte, e
 		dst = appendScalarValueJSON(dst, dec, typeName)
 	}
 	if err := dec.Finish(); err != nil {
-		return dst[:start], err
+		return original, err
 	}
 	return append(dst, ']'), nil
 }

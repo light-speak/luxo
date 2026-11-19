@@ -8,6 +8,8 @@ import 'dart:io';
 import 'package:luxo_client/src/codegen.dart';
 import 'package:test/test.dart';
 
+enum _ConsumerScenario { complete, enumUpgrade, renewal, decimals }
+
 void main() {
   test(
     'fixture cleanup is restricted to owned direct children',
@@ -30,6 +32,16 @@ void main() {
   test(
     'gateway is closed when the Dart consumer fails',
     _verifyConsumerFailure,
+  );
+  test(
+    'generated WS renewal through gateway runs on Dart VM, JS and Wasm',
+    () => _verifyConsumer(true, scenario: _ConsumerScenario.renewal),
+    timeout: const Timeout(Duration(minutes: 5)),
+  );
+  test(
+    'generated Decimal arrays preserve compact exponents through gateway on VM, JS and Wasm',
+    () => _verifyConsumer(true, scenario: _ConsumerScenario.decimals),
+    timeout: const Timeout(Duration(minutes: 5)),
   );
 }
 
@@ -84,7 +96,10 @@ Future<void> _verifyConsumerFailure() async {
   }
 }
 
-Future<void> _verifyConsumer(bool gateway) async {
+Future<void> _verifyConsumer(
+  bool gateway, {
+  _ConsumerScenario scenario = _ConsumerScenario.complete,
+}) async {
   await _withBuiltFixture((core, binary) async {
     final root = Directory('.tmp')..createSync(recursive: true);
     final generated = root.createTempSync('go-interop-');
@@ -95,7 +110,7 @@ Future<void> _verifyConsumer(bool gateway) async {
           key: 'sdk-interop',
           outDir: generated.path,
         );
-        _writeConsumer(core, generated, endpoint);
+        _writeConsumer(core, generated, endpoint, scenario: scenario);
         await _verifyPlatforms(generated);
       });
     } finally {
@@ -143,7 +158,12 @@ Future<void> _verifyEnumUpgradeConsumer(bool gateway) async {
       final oldTypes = types.readAsStringSync();
       await _withBuiltFixture((_, nextBinary) async {
         await _withDeployment(nextBinary, gateway, (endpoint) async {
-          _writeConsumer(core, generated, endpoint, enumUpgrade: true);
+          _writeConsumer(
+            core,
+            generated,
+            endpoint,
+            scenario: _ConsumerScenario.enumUpgrade,
+          );
           await _verifyPlatforms(generated);
         });
       }, futureEnum: true);
@@ -213,7 +233,7 @@ void _writeConsumer(
   Directory core,
   Directory output,
   String endpoint, {
-  bool enumUpgrade = false,
+  _ConsumerScenario scenario = _ConsumerScenario.complete,
 }) {
   final fixture = jsonDecode(
     File('${core.path}/pkg/lux/codec/testdata/protocol-v1.json')
@@ -236,7 +256,12 @@ void _writeConsumer(
   File('${output.path}/consumer_test.dart').writeAsStringSync(
     "import 'interop_cases.dart' as cases;\n"
     'void main() {\n'
-    '${enumUpgrade ? '  cases.registerEnumUpgradeTests();' : '  cases.registerSuccessAndStreamTests();\n  cases.registerErrorTests();'}\n'
+    '${switch (scenario) {
+      _ConsumerScenario.renewal => '  cases.registerGeneratedWSRenewalTests();',
+      _ConsumerScenario.enumUpgrade => '  cases.registerEnumUpgradeTests();',
+      _ConsumerScenario.decimals => '  cases.registerGeneratedDecimalTests();',
+      _ConsumerScenario.complete => '  cases.registerSuccessAndStreamTests();\n  cases.registerErrorTests();',
+    }}\n'
     '}\n',
   );
 }

@@ -78,11 +78,43 @@ func TestEventPayloadRejectsExtendProjection(t *testing.T) {
 func TestEventSnapshotRejectsUnsupportedNestedWireTypes(t *testing.T) {
 	for _, declaration := range []string{
 		"interface Nested { id: Int }",
-		"sealed Nested { Success(value: Int) }",
 	} {
 		result := analyze(t, declaration+"\ntype Snapshot { value: Nested }\nevent Changed(payload: Snapshot)")
 		expectError(t, result, "event payload 'Changed.payload.value' has unsupported wire type 'Nested'")
 	}
+}
+
+func TestEventSnapshotsAcceptClosedSealedPayloads(t *testing.T) {
+	for _, payload := range []string{"Outcome", "Outcome?", "[Outcome]", "Box<Outcome>"} {
+		t.Run(payload, func(t *testing.T) {
+			result := analyze(t, `type Box<T> { value: T }
+sealed Outcome { Success(value: Int) Nested(value: Outcome?) Pending }
+event Changed(payload: `+payload+`)
+`)
+			expectNoErrors(t, result)
+		})
+	}
+}
+
+func TestEventSealedPayloadsCannotHideDatabaseModels(t *testing.T) {
+	for _, payload := range []string{"Outcome", "Box<Outcome>"} {
+		t.Run(payload, func(t *testing.T) {
+			result := analyze(t, `model User { id: Int }
+type Box<T> { value: T }
+sealed Outcome { Value(user: Box<User>) Pending }
+event Changed(payload: `+payload+`)
+`)
+			expectError(t, result, "cannot reference database model 'User'")
+		})
+	}
+}
+
+func TestEventSealedPayloadRejectsUnsupportedFields(t *testing.T) {
+	result := analyze(t, `interface Contract { id: Int }
+sealed Outcome { Value(value: Contract) Pending }
+event Changed(payload: Outcome)
+`)
+	expectError(t, result, "has unsupported wire type 'Contract'")
 }
 
 func TestEventPayloadAcceptsExplicitSnapshots(t *testing.T) {
@@ -155,5 +187,81 @@ func BenchmarkEventSnapshotContract(b *testing.B) {
 				b.Fatal(a.errors)
 			}
 		})
+	}
+}
+
+func TestEmitRejectsInvalidArguments(t *testing.T) {
+	for _, sample := range []struct{ name, call string }{
+		{"unknown event", "emit Missing(value: 1)"},
+		{"unknown field", "emit Changed(other: 1)"},
+		{"missing field", "emit Changed()"},
+		{"wrong type", "emit Changed(value: \"bad\")"},
+		{"null", "emit Changed(value: null)"},
+		{"duplicate", "emit Changed(value: 1, value: 2)"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			result := analyze(t, "event Changed(value: Int)\nfn send() { "+sample.call+" }")
+			if len(result.Errors) == 0 {
+				t.Fatal("invalid event emission accepted")
+			}
+		})
+	}
+}
+
+func TestEventRejectsInvalidDefault(t *testing.T) {
+	result := analyze(t, `event Changed(value: Int = "bad")`)
+	if len(result.Errors) == 0 {
+		t.Fatal("event default with wrong type accepted")
+	}
+}
+
+func TestRejectsDuplicateEventDeclarations(t *testing.T) {
+	t.Run("same file", func(t *testing.T) {
+		result := analyze(t, `event Changed(value: Int)
+event Changed(value: String)`)
+		expectError(t, result, "event 'Changed' already declared")
+	})
+	t.Run("cross module", func(t *testing.T) {
+		first := parseFileWithName(t, `event Changed(value: Int)`, "origin/first.luxo")
+		second := parseFileWithName(t, `event Changed(value: String)`, "origin/second.luxo")
+		expectError(t, analyzeModules(t, []*ast.File{first, second}), "event 'Changed' already declared")
+	})
+}
+
+func TestCrossModuleEventEmissionRemainsValid(t *testing.T) {
+	declaration := parseFileWithName(t, `event Changed(value: Int)`, "origin/first.luxo")
+	caller := parseFileWithName(t, `fn send() { emit Changed(value: 1) }`, "origin/second.luxo")
+	expectNoErrors(t, analyzeModules(t, []*ast.File{declaration, caller}))
+}
+
+func TestListenerRejectsInvalidContracts(t *testing.T) {
+	for _, sample := range []struct{ name, source string }{
+		{"unknown", `on Missing {}`},
+		{"native body", `event Changed(value: Int)
+on Changed @native { val value = it.value }`},
+		{"missing body", `event Changed(value: Int)
+on Changed`},
+		{"duplicate binding", `event Changed(value: Int)
+on Changed { value, value -> }`},
+		{"value return", `event Changed(value: Int)
+on Changed { return 1 }`},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			if result := analyze(t, sample.source); len(result.Errors) == 0 {
+				t.Fatal("invalid listener accepted")
+			}
+		})
+	}
+}
+
+func TestListenerRequiresSinglePayloadBinding(t *testing.T) {
+	for _, binding := range []string{"first, second", "first, first", "first, second, third"} {
+		t.Run(binding, func(t *testing.T) {
+			result := analyze(t, "event Changed(value: Int, name: String)\non Changed { "+binding+" -> }")
+			expectError(t, result, "listener accepts at most one payload binding")
+		})
+	}
+	for _, body := range []string{"val value = it.value", "payload -> val value = payload.value", "ctx -> val value = ctx.value"} {
+		expectNoErrors(t, analyze(t, "event Changed(value: Int, name: String)\non Changed { "+body+" }"))
 	}
 }

@@ -8,12 +8,17 @@ import org.jetbrains.kotlin.config.messageCollector
 import org.jetbrains.kotlin.config.MessageCollectorAccess
 import org.jetbrains.kotlin.ir.IrElement
 import org.jetbrains.kotlin.ir.declarations.IrFile
+import org.jetbrains.kotlin.ir.declarations.IrClass
+import org.jetbrains.kotlin.ir.declarations.IrDeclarationOrigin
 import org.jetbrains.kotlin.ir.declarations.IrVariable
 import org.jetbrains.kotlin.ir.expressions.IrCall
 import org.jetbrains.kotlin.ir.expressions.IrConst
 import org.jetbrains.kotlin.ir.expressions.IrExpression
 import org.jetbrains.kotlin.ir.expressions.IrGetValue
 import org.jetbrains.kotlin.ir.expressions.IrTypeOperatorCall
+import org.jetbrains.kotlin.ir.expressions.IrTypeOperator
+import org.jetbrains.kotlin.ir.expressions.IrContainerExpression
+import org.jetbrains.kotlin.ir.expressions.IrWhen
 import org.jetbrains.kotlin.ir.expressions.IrFunctionAccessExpression
 import org.jetbrains.kotlin.ir.expressions.IrReturn
 import org.jetbrains.kotlin.ir.expressions.IrSetField
@@ -23,8 +28,11 @@ import org.jetbrains.kotlin.ir.expressions.IrStringConcatenation
 import org.jetbrains.kotlin.ir.expressions.IrVararg
 import org.jetbrains.kotlin.ir.expressions.IrSpreadElement
 import org.jetbrains.kotlin.ir.expressions.IrFunctionReference
+import org.jetbrains.kotlin.ir.expressions.IrPropertyReference
 import org.jetbrains.kotlin.ir.declarations.IrParameterKind
 import org.jetbrains.kotlin.ir.symbols.IrValueSymbol
+import org.jetbrains.kotlin.ir.symbols.IrClassSymbol
+import org.jetbrains.kotlin.ir.symbols.IrTypeParameterSymbol
 import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.IrSimpleType
 import org.jetbrains.kotlin.ir.types.IrTypeProjection
@@ -46,6 +54,8 @@ internal class SelectionCalls(private val context: IrPluginContext, private val 
     private val escaped = mutableSetOf<IrCall>()
     private val bindings = mutableMapOf<IrValueSymbol, Source>()
     private val boundCallbacks = mutableSetOf<IrCall>()
+    private var nullChecks: MutableList<Source>? = null
+    private var modelClasses: MutableMap<IrClassSymbol, Boolean>? = null
     private var unresolvedAlias = false
 
     fun rewrite(file: IrFile) {
@@ -55,9 +65,13 @@ internal class SelectionCalls(private val context: IrPluginContext, private val 
                 if (element is IrFunctionReference && element.symbol.owner.getAnnotation(apiMarker) != null) reject(file, element)
                 element.acceptChildren(this, data)
                 if (element is IrCall) collect(element)
+                if (element is IrTypeOperatorCall) collectSealedCheck(element)
                 checkEscape(element)
             }
         }, Unit)
+        nullChecks?.forEach { origin ->
+            if (!hasSelectedChild(origin)) escaped.add(origin.call)
+        }
         for ((call, paths) in calls) {
             val parameter = call.symbol.owner.parameters.singleOrNull { it.name.asString() == "select" }
             if (parameter == null) { reject(file, call); continue }
@@ -80,7 +94,7 @@ internal class SelectionCalls(private val context: IrPluginContext, private val 
     private fun bindCallback(call: IrCall) {
         val function = call.symbol.owner
         val isAPI = function.getAnnotation(apiMarker) != null
-        val origin = if (isAPI) Source(call, emptyList()) else {
+        val origin = if (isAPI) null else {
             if (!isCollectionCallback(call)) return
             source(extensionReceiver(call)) ?: return
         }
@@ -89,7 +103,7 @@ internal class SelectionCalls(private val context: IrPluginContext, private val 
         } ?: return
         val expression = call.arguments[callback.indexInParameters] as? IrFunctionExpression ?: return
         val parameter = expression.function.parameters.singleOrNull { it.kind == IrParameterKind.Regular } ?: return
-        bindings[parameter.symbol] = origin
+        bindings[parameter.symbol] = origin ?: Source(call, emptyList(), structured(parameter.type))
         boundCallbacks.add(call)
     }
 
@@ -109,9 +123,12 @@ internal class SelectionCalls(private val context: IrPluginContext, private val 
         when (element) {
             is IrFunctionAccessExpression -> {
                 if (element is IrCall && (element.symbol.owner.getAnnotation(fieldMarker) != null ||
-                        isUnwrap(element) || element in boundCallbacks)) return
-                element.arguments.filterNotNull().forEach(::escape)
+                        isUnwrap(element) || element in boundCallbacks || pageProperty(element) != null ||
+                        collectNullCheck(element) || collectSealedMetadata(element))) return
+                escapeArguments(element.arguments)
             }
+            is IrFunctionReference -> escapeArguments(element.arguments)
+            is IrPropertyReference -> escapeArguments(element.arguments)
             is IrReturn -> escape(element.value)
             is IrSetField -> escape(element.value)
             is IrSetValue -> escape(element.value)
@@ -126,19 +143,69 @@ internal class SelectionCalls(private val context: IrPluginContext, private val 
         }
     }
 
+    private fun escapeArguments(arguments: List<IrExpression?>) {
+        arguments.filterNotNull().forEach(::escape)
+    }
+
+    // Valid equality built-ins have two argument slots; their List receiver is a JVM Collection.
+    private fun collectNullCheck(call: IrCall): Boolean {
+        if (call.symbol != context.irBuiltIns.eqeqSymbol && call.symbol != context.irBuiltIns.eqeqeqSymbol) return false
+        if (call.arguments.none { it is IrConst && it.value == null }) return false
+        for (argument in call.arguments) {
+            val origin = source(argument) ?: continue
+            if (addSealedLeaves(origin, argument?.type)) continue
+            if (origin.isStructured) {
+                (nullChecks ?: mutableListOf<Source>().also { nullChecks = it }).add(origin)
+            }
+        }
+        return true
+    }
+
+    // Each preserved root call is registered before this post-pass; calls are never removed.
+    // Paths are JVM Collections, while List.indices is IntRange, which is not a Collection.
+    private fun hasSelectedChild(origin: Source): Boolean = calls[origin.call]?.any { path ->
+        path.size > origin.path.size && origin.path.indices.all { path[it] == origin.path[it] }
+    } == true
+
+    // Standard bound symbols return their owner or throw. Standard external Kotlin class stubs
+    // have named class/package parents, so their fully qualified name is available.
+    private fun pageProperty(call: IrCall): String? {
+        val property = call.symbol.owner.correspondingPropertySymbol?.owner ?: return null
+        val name = property.name.asString()
+        if (name != "items" && name != "total" && name != "page" && name != "pageSize") return null
+        val owner = property.parent as? IrClass ?: return null
+        if (owner.origin != IrDeclarationOrigin.IR_EXTERNAL_DECLARATION_STUB ||
+            owner.fqNameWhenAvailable?.asString() != "com.luxo.client.Page") return null
+        return name
+    }
+
     private fun escape(value: IrExpression) {
         val origin = source(value) ?: return
-        if (origin.path.isEmpty() || structured(value.type)) escaped.add(origin.call)
+        // Casts can erase the expression's type; provenance retains its shape.
+        if (origin.path.isEmpty() || origin.isStructured) escaped.add(origin.call)
     }
 
     private fun structured(type: IrType, depth: Int = 0): Boolean {
         if (depth > 64) return true
-        if (type.classOrNull?.owner?.declarations?.any {
-            it is org.jetbrains.kotlin.ir.declarations.IrProperty && it.getter?.getAnnotation(fieldMarker) != null
-        } == true) return true
-        return (type as? IrSimpleType)?.arguments?.any {
-            it is IrTypeProjection && structured(it.type, depth + 1)
-        } == true
+        val owner = type.classOrNull
+        if (owner == context.irBuiltIns.anyClass) return true
+        if (owner != null && modelClass(owner)) return true
+        val simple = type as? IrSimpleType ?: return true
+        if (simple.classifier is IrTypeParameterSymbol) return true
+        // The arguments List is always a JVM Collection for the inlined any check.
+        return simple.arguments.any { it !is IrTypeProjection || structured(it.type, depth + 1) }
+    }
+
+    // IrClass.declarations is a List, so the inlined any receiver is a JVM Collection.
+    private fun modelClass(symbol: IrClassSymbol): Boolean {
+        // Declarations stay immutable during this file's selection pass.
+        val cache = modelClasses ?: mutableMapOf<IrClassSymbol, Boolean>().also { modelClasses = it }
+        return cache.getOrPut(symbol) {
+            SelectionSealed.cases(symbol.owner.thisReceiver?.type ?: return@getOrPut true)?.isNotEmpty() == true ||
+                SelectionSealed.caseName(symbol) != null || symbol.owner.declarations.any {
+                it is org.jetbrains.kotlin.ir.declarations.IrProperty && it.getter?.getAnnotation(fieldMarker) != null
+            }
+        }
     }
 
     private fun isUnwrap(call: IrCall): Boolean =
@@ -148,7 +215,7 @@ internal class SelectionCalls(private val context: IrPluginContext, private val 
     private fun collect(call: IrCall) {
         if (call.symbol.owner.getAnnotation(apiMarker) != null) calls.getOrPut(call) { linkedSetOf() }
         val source = source(call) ?: return
-        if (source.path.isNotEmpty()) calls.getOrPut(source.call) { linkedSetOf() }.add(source.path)
+        if (source.path.isNotEmpty() && !source.isStructured) calls.getOrPut(source.call) { linkedSetOf() }.add(source.path)
     }
 
     private fun source(expression: IrExpression?, depth: Int = 0): Source? {
@@ -160,22 +227,100 @@ internal class SelectionCalls(private val context: IrPluginContext, private val 
                 if (variable.isVar) return null
                 source(variable.initializer, depth + 1)
             }
-            is IrTypeOperatorCall -> source(expression.argument, depth + 1)
+            is IrTypeOperatorCall -> {
+                val origin = source(expression.argument, depth + 1) ?: return null
+                val case = if (expression.operator in setOf(IrTypeOperator.CAST, IrTypeOperator.SAFE_CAST, IrTypeOperator.IMPLICIT_CAST))
+                    expression.typeOperand.classOrNull else null
+                appendCase(origin, case)
+            }
+            is IrContainerExpression -> source(expression.statements.lastOrNull() as? IrExpression, depth + 1)
+            is IrWhen -> conditionalSource(expression, depth)
             is IrCall -> callSource(expression, depth)
             else -> null
         }
     }
 
+    private fun conditionalSource(expression: IrWhen, depth: Int): Source? {
+        var found: Source? = null
+        var unresolved = false
+        for (branch in expression.branches) {
+            val candidate = source(branch.result, depth + 1)
+            if (candidate == null || (!candidate.isStructured && candidate.path.isNotEmpty())) {
+                if (!nullOrNever(branch.result)) unresolved = true
+            } else if (found == null) {
+                found = candidate
+            } else if (found != candidate) {
+                escaped.add(found.call)
+                escaped.add(candidate.call)
+                unresolved = true
+            }
+        }
+        if (unresolved && found != null) {
+            escaped.add(found.call)
+            return null
+        }
+        return found
+    }
+
+    private fun nullOrNever(expression: IrExpression): Boolean {
+        var current = expression
+        repeat(128) {
+            if (current.type == context.irBuiltIns.nothingType) return true
+            current = when (val value = current) {
+                is IrTypeOperatorCall -> value.argument
+                is IrContainerExpression -> value.statements.lastOrNull() as? IrExpression ?: return false
+                else -> return value is IrConst && value.value == null
+            }
+        }
+        return false
+    }
+
     private fun callSource(call: IrCall, depth: Int): Source? {
         if (call.symbol.owner.getAnnotation(apiMarker) != null) {
             if (call.symbol.owner.parameters.any { it.name.asString() == "onData" }) return null
-            return Source(call, emptyList())
+            return Source(call, emptyList(), structured(call.symbol.owner.returnType))
         }
-        if (isUnwrap(call)) return source(call.dispatchReceiver, depth + 1)
+        if (isUnwrap(call) || pageProperty(call) == "items") return source(call.dispatchReceiver, depth + 1)
         val field = call.symbol.owner.getAnnotation(fieldMarker) ?: return null
         val name = (field.arguments.singleOrNull() as? IrConst)?.value as? String ?: return null
         val receiver = source(call.dispatchReceiver, depth + 1) ?: return null
-        return Source(receiver.call, receiver.path + name)
+        val owner = call.symbol.owner.parent as? IrClass
+        val origin = appendCase(receiver, owner?.symbol)
+        return Source(origin.call, origin.path + name, structured(call.type))
+    }
+
+    private fun appendCase(origin: Source, symbol: IrClassSymbol?): Source {
+        val name = SelectionSealed.caseName(symbol) ?: return origin
+        if (origin.caseType == symbol) return origin
+        return origin.copy(path = origin.path + name, isStructured = true, caseType = symbol)
+    }
+
+    private fun addSealedLeaves(origin: Source, type: IrType?): Boolean {
+        val names = type?.let { SelectionSealed.cases(it) } ?: return false
+        if (names.isEmpty()) return false
+        val paths = calls.getOrPut(origin.call) { linkedSetOf() }
+        names.forEach { paths.add(origin.path + it) }
+        return true
+    }
+
+    private fun collectSealedCheck(expression: IrTypeOperatorCall) {
+        if (expression.operator != IrTypeOperator.INSTANCEOF && expression.operator != IrTypeOperator.NOT_INSTANCEOF) return
+        val origin = source(expression.argument) ?: return
+        addSealedLeaves(origin, expression.argument.type)
+    }
+
+    private fun collectSealedMetadata(call: IrCall): Boolean {
+        val receiver = call.dispatchReceiver ?: extensionReceiver(call) ?: return false
+        val function = call.symbol.owner
+        val property = function.correspondingPropertySymbol?.owner
+        val owner = property?.parent as? IrClass
+        val size = property?.name?.asString() == "size" && owner?.fqNameWhenAvailable?.asString() in
+            setOf("kotlin.collections.Collection", "kotlin.collections.List", "kotlin.Array")
+        val empty = function.fqNameWhenAvailable?.asString() in
+            setOf("kotlin.collections.isEmpty", "kotlin.collections.Collection.isEmpty", "kotlin.collections.List.isEmpty")
+        if (!size && !empty) return false
+        val origin = source(receiver) ?: return false
+        return addSealedLeaves(origin, receiver.type)
     }
 
     private fun render(paths: List<List<String>>): String = paths.filter { it.isNotEmpty() }
@@ -184,5 +329,5 @@ internal class SelectionCalls(private val context: IrPluginContext, private val 
             if (children.isEmpty()) name else "$name{$children}"
         }
 
-    private data class Source(val call: IrCall, val path: List<String>)
+    private data class Source(val call: IrCall, val path: List<String>, val isStructured: Boolean, val caseType: IrClassSymbol? = null)
 }

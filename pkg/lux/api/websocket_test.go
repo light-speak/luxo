@@ -1591,3 +1591,80 @@ func TestWSAllowAllOrigins(t *testing.T) {
 	}
 	conn.Close(websocket.StatusNormalClosure, "")
 }
+
+func TestWSFullOriginPolicy(t *testing.T) {
+	for _, configuration := range []struct {
+		name    string
+		origins []string
+	}{
+		{"default", nil}, {"explicit_null", []string{"*", "null"}},
+		{"exact", []string{"https://app.example"}}, {"invalid", []string{"bad"}},
+	} {
+		t.Run(configuration.name, func(t *testing.T) {
+			router := testWSRouter()
+			router.SetDevMode(true)
+			router.WSOrigins = configuration.origins
+			server := httptest.NewServer(router)
+			t.Cleanup(server.Close)
+			for _, origin := range []string{"", "https://app.example:443", "http://app.example", "null", "https://app.example/path", server.URL} {
+				headers := make(http.Header)
+				if origin != "" {
+					headers.Set("Origin", origin)
+				}
+				allowed := origin == "" || origin == "https://app.example:443" ||
+					configuration.name != "exact" && (origin == "http://app.example" || origin == server.URL) ||
+					configuration.name == "explicit_null" && origin == "null"
+				allowed = allowed && configuration.name != "invalid"
+				ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+				conn, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &websocket.DialOptions{HTTPHeader: headers})
+				if conn != nil {
+					conn.CloseNow()
+				}
+				cancel()
+				if (err == nil) != allowed || !allowed && response == nil {
+					t.Fatal(origin, allowed, err, response)
+				}
+			}
+		})
+	}
+}
+
+func TestWSUnaryResponseIdentity(t *testing.T) {
+	type identityKey struct{}
+	rt := testWSRouter()
+	rt.IdentityExtractor = func(ctx context.Context) any { return ctx.Value(identityKey{}) }
+	original := rt.handlers["getUser"].call
+	rt.Handle("getUser", func(ctx context.Context, req *Request) error {
+		if req.Buf.Identity != "verified" {
+			return fmt.Errorf("response identity missing")
+		}
+		return original(ctx, req)
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rt.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), identityKey{}, "verified")))
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"$id":1,"$api":"getUser","id":42,"$select":"id"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_, response, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(response, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Data) == 0 {
+		t.Fatalf("response identity was not propagated: %s", response)
+	}
+}

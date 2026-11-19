@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import 'codec.dart';
 import 'error.dart';
+import 'identifier.dart';
 import 'schema.dart';
 import 'schema_ids.dart' show isSelectionSnapshot;
 
@@ -86,12 +87,10 @@ class _SelectionParser {
 
   String _readIdentifier() {
     final start = offset;
-    if (offset >= input.length || !_identifierStart(input.codeUnitAt(offset))) {
-      return '';
-    }
-    offset++;
-    while (offset < input.length && _identifierPart(input.codeUnitAt(offset))) {
-      offset++;
+    while (offset < input.length) {
+      final width = identifierWidth(input, offset, first: offset == start);
+      if (width == 0) break;
+      offset += width;
     }
     return input.substring(start, offset);
   }
@@ -103,12 +102,6 @@ class _SelectionParser {
   Never _fail(String message) =>
       throw LuxoError('ConfigError', 0, '$message at position $offset');
 }
-
-bool _identifierStart(int code) =>
-    code == 95 || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
-
-bool _identifierPart(int code) =>
-    _identifierStart(code) || (code >= 48 && code <= 57);
 
 Uint8List _encodeSelectionNode(
   List<_SelectedField> selected,

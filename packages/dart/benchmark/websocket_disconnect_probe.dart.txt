@@ -35,6 +35,8 @@ Future<void> main() async {
 void _compareDispatch(TransportMode mode) {
   final before = _BeforeTransport('ws://unused', autoReconnect: false);
   final after = WsTransport('ws://unused', autoReconnect: false);
+  final socket = _ProbeSocket();
+  after._ws = socket;
   var oldCount = 0;
   var newCount = 0;
   before._subscriptions[1] = _BeforeSubscription('echo', mode, {}, (_) => oldCount++, null);
@@ -50,7 +52,7 @@ void _compareDispatch(TransportMode mode) {
   }
   int newRun() {
     for (var i = 0; i < 5000; i++) {
-      if (mode == TransportMode.json) after._handleJsonResponse(json);
+      if (mode == TransportMode.json) after._handleJsonResponse(json, socket);
       else after._handleBinaryResponse(binary);
     }
     return newCount;

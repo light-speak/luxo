@@ -14,6 +14,36 @@ import (
 
 // --- Mock implementations ---
 
+func BenchmarkNATSSubscriptionLifecycleMock(b *testing.B) {
+	handler := func(context.Context, []byte) error { return nil }
+	b.ReportAllocs()
+	for b.Loop() {
+		client := newMockJSClient()
+		q := newTestNATSQueue(client, testConfig())
+		if err := q.Subscribe("tasks", handler); err != nil {
+			b.Fatal(err)
+		}
+		if err := q.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestNATSSubscribeRejectsNilHandlerBeforeNetwork(t *testing.T) {
+	client := newMockJSClient()
+	q := newTestNATSQueue(client, testConfig())
+	defer q.Close()
+	if err := q.Subscribe("tasks", nil); err == nil {
+		t.Error("nil handler registered")
+	}
+	if client.createStreamN.Load() != 0 || len(q.consumers) != 0 {
+		t.Fatal("invalid subscription created broker resources")
+	}
+	if err := q.Subscribe("tasks", func(context.Context, []byte) error { return nil }); err != nil {
+		t.Fatalf("invalid subscription blocked valid registration: %v", err)
+	}
+}
+
 // mockJSClient implements jsClient for testing.
 type mockJSClient struct {
 	mu              sync.Mutex
@@ -21,7 +51,7 @@ type mockJSClient struct {
 	published       []publishedMsg
 	publishErr      error
 	createStreamErr error
-	createStreamN   atomic.Int32 // number of CreateOrUpdateStream calls
+	createStreamN   atomic.Int32 // number of CreateStream calls
 }
 
 type publishedMsg struct {
@@ -35,7 +65,9 @@ func newMockJSClient() *mockJSClient {
 	}
 }
 
-func (m *mockJSClient) CreateOrUpdateStream(_ context.Context, cfg jetstream.StreamConfig) (jsStream, error) {
+func (m *mockJSClient) Flush(time.Duration) error { return nil }
+
+func (m *mockJSClient) CreateStream(_ context.Context, cfg jetstream.StreamConfig) (jsStream, error) {
 	m.createStreamN.Add(1)
 	if m.createStreamErr != nil {
 		return nil, m.createStreamErr
@@ -83,28 +115,39 @@ func (s *mockStream) CreateOrUpdateConsumer(_ context.Context, cfg jetstream.Con
 
 // mockConsumer implements jsConsumer.
 type mockConsumer struct {
-	consumeErr error
-	handler    jetstream.MessageHandler
-	ctx        *mockConsumeContext
+	consumeErr   error
+	handler      jetstream.MessageHandler
+	ctx          *mockConsumeContext
+	beforeReturn func()
 }
 
-func (c *mockConsumer) Consume(handler jetstream.MessageHandler, _ ...jetstream.PullConsumeOpt) (consumeContext, error) {
+func (c *mockConsumer) Consume(handler jetstream.MessageHandler, _ *deliveryRenewal) (consumeContext, error) {
 	if c.consumeErr != nil {
 		return nil, c.consumeErr
 	}
 	c.handler = handler
-	c.ctx = &mockConsumeContext{}
+	c.ctx = &mockConsumeContext{done: make(chan struct{})}
+	if c.beforeReturn != nil {
+		c.beforeReturn()
+	}
 	return c.ctx, nil
 }
 
 // mockConsumeContext implements consumeContext.
 type mockConsumeContext struct {
 	stopped atomic.Bool
+	done    chan struct{}
 }
 
+func (c *mockConsumeContext) Start(int) {}
+
 func (c *mockConsumeContext) Stop() {
-	c.stopped.Store(true)
+	if !c.stopped.Swap(true) {
+		close(c.done)
+	}
 }
+
+func (c *mockConsumeContext) Done() <-chan struct{} { return c.done }
 
 // mockMsg implements jetstream.Msg for testing message handling.
 type mockMsg struct {
@@ -241,10 +284,10 @@ func TestNATSPublishStreamCaching(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// CreateOrUpdateStream called once for Publish (ensureStream caches),
+	// CreateStream called once for Publish (ensureStream caches),
 	// but the second call skips it.
 	if got := mock.createStreamN.Load(); got != 1 {
-		t.Errorf("CreateOrUpdateStream called %d times, want 1", got)
+		t.Errorf("CreateStream called %d times, want 1", got)
 	}
 
 	mock.mu.Lock()
@@ -533,6 +576,28 @@ func TestNATSCloseStopsConsumers(t *testing.T) {
 	}
 }
 
+func TestNATSSubscribeStopsConsumerWhenCloseWinsRegistration(t *testing.T) {
+	js := newMockJSClient()
+	q := newTestNATSQueue(js, Config{})
+	defer q.Close()
+	consumer := &mockConsumer{beforeReturn: func() {
+		if err := q.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	js.streams[streamName("tasks")] = &mockStream{consumer: consumer}
+	err := q.Subscribe("tasks", func(context.Context, []byte) error { return nil })
+	if err == nil {
+		t.Error("subscription succeeded after queue closed")
+	}
+	if !consumer.ctx.stopped.Load() {
+		t.Error("consumer created during close was not stopped")
+	}
+	if len(q.consumers) != 0 {
+		t.Error("closed queue retained a consumer")
+	}
+}
+
 func TestNATSCloseIdempotent(t *testing.T) {
 	mock := newMockJSClient()
 	q := newTestNATSQueue(mock, testConfig())
@@ -589,7 +654,7 @@ func TestNATSPublishDLQStreamCreateError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Now make CreateOrUpdateStream fail for DLQ.
+	// Now make CreateStream fail for DLQ.
 	mock.createStreamErr = fmt.Errorf("dlq stream fail")
 
 	mock.mu.Lock()
@@ -677,8 +742,8 @@ func TestNATSStreamNameSanitization(t *testing.T) {
 		want  string
 	}{
 		{"simple", "luxo_q_simple"},
-		{"with.dots", "luxo_q_with_dots"},
-		{"a.b.c.d", "luxo_q_a_b_c_d"},
+		{"with.dots", "luxo_q_with_ddots"},
+		{"a.b.c.d", "luxo_q_a_db_dc_dd"},
 		{"nodots", "luxo_q_nodots"},
 		{"", "luxo_q_"},
 	}
@@ -687,5 +752,86 @@ func TestNATSStreamNameSanitization(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("streamName(%q) = %q, want %q", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestNATSRejectsDuplicateSubscription(t *testing.T) {
+	js := newMockJSClient()
+	q := newTestNATSQueue(js, testConfig())
+	defer q.Close()
+	handler := func(context.Context, []byte) error { return nil }
+	if err := q.Subscribe("tasks", handler); err != nil {
+		t.Fatal(err)
+	}
+	before := js.createStreamN.Load()
+	if err := q.Subscribe("tasks", handler); err == nil {
+		t.Fatal("duplicate subscription accepted")
+	}
+	if js.createStreamN.Load() != before {
+		t.Fatal("duplicate subscription reached broker")
+	}
+	if len(q.consumers) != 1 {
+		t.Fatal("duplicate subscription added workers")
+	}
+}
+
+func TestNATSConcurrentSubscriptionReservesNameOnce(t *testing.T) {
+	js := newMockJSClient()
+	q := newTestNATSQueue(js, testConfig())
+	defer q.Close()
+	start := make(chan struct{})
+	results := make(chan error, 32)
+	for range 32 {
+		go func() { <-start; results <- q.Subscribe("tasks", func(context.Context, []byte) error { return nil }) }()
+	}
+	close(start)
+	success := 0
+	for range 32 {
+		if <-results == nil {
+			success++
+		}
+	}
+	if success != 1 || js.createStreamN.Load() != 1 || len(q.consumers) != 1 {
+		t.Fatalf("success=%d streams=%d consumers=%d", success, js.createStreamN.Load(), len(q.consumers))
+	}
+}
+
+func TestNATSFailedSubscriptionReleasesName(t *testing.T) {
+	for _, stage := range []string{"stream", "consumer", "iterator"} {
+		t.Run(stage, func(t *testing.T) {
+			js := newMockJSClient()
+			stream := &mockStream{consumer: &mockConsumer{}}
+			js.streams[streamName("tasks")] = stream
+			failure := fmt.Errorf("failed %s", stage)
+			switch stage {
+			case "stream":
+				js.createStreamErr = failure
+			case "consumer":
+				stream.createConsumerErr = failure
+			case "iterator":
+				stream.consumer.consumeErr = failure
+			}
+			q := newTestNATSQueue(js, testConfig())
+			defer q.Close()
+			handler := func(context.Context, []byte) error { return nil }
+			if err := q.Subscribe("tasks", handler); err == nil {
+				t.Fatal("failure swallowed")
+			}
+			if len(q.subscriptions) != 0 {
+				t.Fatal("failed registration retained name")
+			}
+			js.createStreamErr = nil
+			stream.createConsumerErr = nil
+			stream.consumer.consumeErr = nil
+			if err := q.Subscribe("tasks", handler); err != nil {
+				t.Fatal("retry failed", err)
+			}
+			if err := q.Subscribe("other", handler); err != nil {
+				t.Fatal("independent queue failed", err)
+			}
+			if len(q.consumers) != 2 {
+				t.Fatal("incorrect worker registrations")
+			}
+		})
 	}
 }

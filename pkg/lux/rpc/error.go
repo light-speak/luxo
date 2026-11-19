@@ -14,9 +14,8 @@ func decodeError(data []byte) error {
 	if err != nil {
 		return err
 	}
-	// Only 32-bit hosts can narrow the signed wire value to a host int.
-	if int64(int(fields.code)) != fields.code {
-		return fmt.Errorf("rpc: error code exceeds host int range")
+	if fields.code < 400 || fields.code > 599 {
+		return fmt.Errorf("rpc: error status code must be between 400 and 599")
 	}
 	if !utf8.Valid(fields.name) || !utf8.Valid(fields.message) {
 		return fmt.Errorf("rpc: error envelope contains invalid UTF-8")
@@ -28,7 +27,7 @@ func decodeError(data []byte) error {
 	}
 	// Copy only validated text; each string owns its storage independently.
 	value := &luxerrors.AppError{Code: int(fields.code), Name: string(fields.name), Message: string(fields.message)}
-	if fields.code >= 500 || fields.internal {
+	if fields.internal {
 		value.Cause = fmt.Errorf("rpc error %d %s: %s", fields.code, value.Name, value.Message)
 		value.Message = "error.internal"
 		value.Internal = true

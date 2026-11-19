@@ -20,6 +20,7 @@ func BenchmarkRawJSONArrayPool(b *testing.B) {
 		{"unicode72KB", `["` + strings.Repeat("中文", 12000) + `"]`},
 		{"escaped128", `["` + strings.Repeat(`\uD800\uDC00`, 128) + `"]`},
 		{"nested100", `[` + strings.Repeat(`[`, 100) + `0` + strings.Repeat(`]`, 100) + `]`},
+		{"nested128", `[` + strings.Repeat(`[`, 128) + `0` + strings.Repeat(`]`, 128) + `]`},
 		{"list128", `[` + strings.Repeat(`{"name":"café","id":42},`, 127) + `{"name":"café","id":42}]`},
 	} {
 		benchmarkRawJSONArrayPoolCase(b, sample.name, []byte(sample.raw))

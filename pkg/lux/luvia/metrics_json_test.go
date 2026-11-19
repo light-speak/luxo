@@ -83,7 +83,7 @@ func TestStaticMetricsJSON(t *testing.T) {
 
 func TestStaticTraceJSON(t *testing.T) {
 	mc := &MetricsCollector{}
-	body, err := mc.encodeTraces([]api.TraceRecord{{APIName: "read", StatusCode: 500, Duration: 1500 * time.Microsecond, Timestamp: time.Unix(0, 123).UTC(), Spans: "quoted\"text", Selection: "id"}})
+	body, err := mc.encodeTraces([]api.TraceRecord{{TraceID: "trace", APIName: "read", StatusCode: 500, Duration: 1500 * time.Microsecond, Timestamp: time.Unix(0, 123).UTC(), Spans: "quoted\"text", Selection: "id"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,9 @@ func TestStaticObservabilityJSONRejectsInvalidText(t *testing.T) {
 		t.Fatal("invalid key accepted")
 	}
 	mc.apiKey = "valid"
-	if body, err := mc.encodeTraces([]api.TraceRecord{{Spans: string([]byte{0xff})}}); err == nil || body != nil {
+	badTrace := observationTestTrace("trace")
+	badTrace.Spans = string([]byte{0xff})
+	if body, err := mc.encodeTraces([]api.TraceRecord{badTrace}); err == nil || body != nil {
 		t.Fatal("invalid span accepted")
 	}
 }
@@ -192,7 +194,7 @@ func BenchmarkMetricsEncodingComparison(b *testing.B) {
 				}
 			}
 		})
-		b.Run(strconv.Itoa(count)+"/current", func(b *testing.B) {
+		b.Run(strconv.Itoa(count)+"/static-reference", func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				if _, err := mc.encodeMetrics(buckets); err != nil {
@@ -313,7 +315,9 @@ func TestTraceJSONCapacity(t *testing.T) {
 		t.Fatal(got)
 	}
 	for _, text := range []string{strings.Repeat("中", 1024), strings.Repeat("\x00\n\"\\", 1024)} {
-		records := []api.TraceRecord{{Spans: text}}
+		record := observationTestTrace("trace")
+		record.Spans = text
+		records := []api.TraceRecord{record}
 		capacity := traceJSONCapacity(records)
 		mc := &MetricsCollector{}
 		body, err := mc.encodeTraces(records)
@@ -343,7 +347,7 @@ func BenchmarkTraceEncodingComparison(b *testing.B) {
 				}
 			}
 		})
-		b.Run(strconv.FormatBool(large)+"/current", func(b *testing.B) {
+		b.Run(strconv.FormatBool(large)+"/static-reference", func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				if _, err := mc.encodeTraces(records); err != nil {

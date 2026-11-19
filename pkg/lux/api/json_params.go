@@ -126,7 +126,7 @@ func encodeJSONDocuments(enc *codec.Encoder, meta ParamMeta, documents []json.Ra
 	if len(documents) > codec.MaxArrayElements {
 		return fmt.Errorf("param %s: array size exceeds limit %d", meta.Name, codec.MaxArrayElements)
 	}
-	enc.WriteArrayHeader(len(documents))
+	enc.WriteVarint(uint64(len(documents))) // Validated above before writing any elements.
 	for index, document := range documents {
 		if !jsonutil.ValidUTF8JSON(document) {
 			return fmt.Errorf("param %s[%d]: invalid JSON", meta.Name, index)
@@ -153,6 +153,9 @@ func encodeRawJSONArray(enc *codec.Encoder, meta ParamMeta, raw []byte) error {
 		if err != nil {
 			return fmt.Errorf("param %s[%d]: invalid JSON: %w", meta.Name, len(values), err)
 		}
+		if !jsonutil.WithinJSONDepth(value) {
+			return fmt.Errorf("param %s[%d]: JSON nesting exceeds %d levels", meta.Name, len(values), jsonutil.MaxJSONDepth)
+		}
 		if len(values) == codec.MaxArrayElements {
 			return fmt.Errorf("param %s: array size exceeds limit %d", meta.Name, codec.MaxArrayElements)
 		}
@@ -166,7 +169,7 @@ func encodeRawJSONArray(enc *codec.Encoder, meta ParamMeta, raw []byte) error {
 	if !bytes.Equal(bytes.Trim(raw[dec.InputOffset():], " \t\r\n"), []byte("]")) {
 		return fmt.Errorf("param %s: unexpected data after JSON array", meta.Name)
 	}
-	enc.WriteArrayHeader(len(values))
+	enc.WriteVarint(uint64(len(values))) // The parsing loop already enforced MaxArrayElements.
 	for _, value := range values {
 		enc.WriteBytes(value)
 	}

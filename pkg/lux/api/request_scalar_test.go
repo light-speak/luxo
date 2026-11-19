@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 )
 
 func TestRequiredJSONParamsRejectNull(t *testing.T) {
@@ -69,10 +70,14 @@ func TestDirectJSONStringParamsRejectInvalidUnicode(t *testing.T) {
 func TestJSONRequestMetadataRejectsNull(t *testing.T) {
 	for _, body := range []string{
 		`{"$api":null}`, `{"$api":"test","$select":null}`,
-		`{"$api":"test","page":null}`, `{"$api":"test","pageSize":null}`,
 	} {
 		if req, err := ParseRequest(makeReq(body)); err == nil || req != nil {
 			t.Errorf("accepted null metadata %s: %v / %v", body, req, err)
+		}
+	}
+	for _, body := range []string{`{"$api":"test","page":null}`, `{"$api":"test","pageSize":null}`} {
+		if req, err := parsePaginatedRequest(body); err == nil || req != nil {
+			t.Errorf("accepted null pagination %s: %v / %v", body, req, err)
 		}
 	}
 }
@@ -84,7 +89,7 @@ func TestJSONRequestMetadataRetainsValues(t *testing.T) {
 		`{"$api":"test","$select":"id, owner { name }","page":` + pageToken + `,"pageSize":0}`,
 		`{"$api":"\u0074est","$select":"\u0069d, owner { name }","page": ` + pageToken + ` ,"pageSize": 0 }`,
 	} {
-		req, err := ParseRequest(makeReq(body))
+		req, err := parsePaginatedRequest(body)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -95,13 +100,46 @@ func TestJSONRequestMetadataRetainsValues(t *testing.T) {
 		}
 	}
 	for _, body := range []string{`{"$api":"test"}`, `{"$api":"test","page":-1,"pageSize":-1}`} {
-		req, err := ParseRequest(makeReq(body))
+		req, err := parsePaginatedRequest(body)
 		if err != nil || req.Page != 1 || req.PageSize != defaultPageSize {
 			t.Fatalf("pagination defaults changed: %+v / %v", req, err)
 		}
 	}
 	overflow := strconv.FormatUint(uint64(maxPage)+1, 10)
-	if req, err := ParseRequest(makeReq(`{"$api":"test","page":` + overflow + `}`)); err == nil || req != nil {
+	if req, err := parsePaginatedRequest(`{"$api":"test","page":` + overflow + `}`); err == nil || req != nil {
 		t.Errorf("accepted overflowing native page: %v / %v", req, err)
+	}
+}
+
+func TestJSONPaginationValidationRequiresDeclaredContract(t *testing.T) {
+	for _, local := range []bool{false, true} {
+		s := schema.New()
+		if err := s.RegisterAPI(&schema.API{ID: 1, Name: "read", Paginated: true, DefaultPageSize: 25,
+			Params: []schema.Param{
+				{ID: 1, Name: "page", Type: schema.FieldInt, HasDefault: true},
+				{ID: 2, Name: "pageSize", Type: schema.FieldInt, HasDefault: true},
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		registry := NewAPIRegistry()
+		if err := registry.RegisterSchemaAPIs(s); err != nil {
+			t.Fatal(err)
+		}
+		prepare := registry.prepareJSONRequest
+		if local {
+			prepare = registry.prepareLocalJSONRequest
+		}
+		for _, key := range []string{"page", "pageSize"} {
+			for _, value := range []string{"null", "true", `"3"`, "1.5", "9223372036854775808", "[]"} {
+				req, err := ParseRequest(makeReq(`{"$api":"read","` + key + `":` + value + `}`))
+				if err != nil {
+					t.Fatal("schema-independent envelope rejected a parameter", err)
+				}
+				if err := prepare(req); err == nil || req.BinaryRequest() != nil || string(req.Params[key]) != value {
+					t.Fatalf("local=%v invalid %s=%s: %v / %+v", local, key, value, err, req)
+				}
+			}
+		}
 	}
 }

@@ -107,20 +107,22 @@ func TestValidateResolvedFields(t *testing.T) {
 
 func TestResolveParamsPreservePrimaryKeyBytes(t *testing.T) {
 	keys := BinaryKeys{count: 2, values: codec.AppendSvarint(codec.AppendSvarint(nil, -9223372036854775808), 9223372036854775807)}
-	for shape := 0; shape < 4; shape++ {
-		dec := codec.NewDecoder(keys.EncodeResolveParams(shape))
-		if !dec.NextField() || dec.FieldID() != 1 {
-			t.Fatal("missing keys")
-		}
-		values := dec.ReadIntArray()
-		if len(values) != 2 || values[0] != -9223372036854775808 || values[1] != 9223372036854775807 {
-			t.Fatal("key bytes changed")
-		}
-		if !dec.NextField() || dec.FieldID() != 2 || dec.ReadInt() != int64(shape) {
-			t.Fatal("missing result shape")
-		}
-		if dec.NextField() || dec.Finish() != nil {
-			t.Fatal("invalid parameter boundary")
+	for _, ids := range [][2]int{{1, 2}, {7, 11}, {codec.MaxParameterID, 129}} {
+		for shape := 0; shape < 4; shape++ {
+			dec := codec.NewDecoder(keys.EncodeResolveParams(shape, ids[0], ids[1]))
+			if !dec.NextField() || dec.FieldID() != ids[0] {
+				t.Fatal("missing keys")
+			}
+			values := dec.ReadIntArray()
+			if len(values) != 2 || values[0] != -9223372036854775808 || values[1] != 9223372036854775807 {
+				t.Fatal("key bytes changed")
+			}
+			if !dec.NextField() || dec.FieldID() != ids[1] || dec.ReadInt() != int64(shape) {
+				t.Fatal("missing result shape")
+			}
+			if dec.NextField() || dec.Finish() != nil {
+				t.Fatal("invalid parameter boundary")
+			}
 		}
 	}
 }

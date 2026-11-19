@@ -2,6 +2,110 @@ package codegen
 
 import "testing"
 
+func TestGeneratedWhenDatabaseContext(t *testing.T) {
+	runGeneratedFixture(t, whenDatabaseSource, whenDatabaseAssertions+typedGroupRequestHelper,
+		StableIDs{ModelFields: map[string]map[string]int{"Probe": {"id": 1, "title": 2, "ignored": 3}}})
+}
+
+const whenDatabaseSource = `
+model Probe @noTime { id: Int @id title: String ignored: String }
+api statement(enabled: Boolean, id: Int): Int {
+ var result = 42
+ when { enabled -> { val row = Probe.find(id: id) result = row.id } else -> {} }
+ return result
+}
+api value(enabled: Boolean, id: Int): Int {
+ return when { enabled -> { Probe.find(id: id).id } else -> { 42 } }
+}
+api nested(enabled: Boolean, id: Int): Int {
+ var result = 42
+ when { enabled -> { when { true -> { result = Probe.find(id: id).id } else -> {} } } else -> {} }
+ return result
+}
+api received(enabled: Boolean, id: Int): Int {
+ val channel: Channel<Int> = Channel(1)
+ if enabled { channel <- id }
+ return when { <-channel -> { key -> Probe.find(id: key).id } else -> 42 }
+}
+api transactional(enabled: Boolean, id: Int): Int {
+ var result = 42
+ transaction { when { enabled -> { result = Probe.find(id: id).id } else -> {} } }
+ return result
+}
+api branch(enabled: Boolean, id: Int): Probe {
+ val row = when { enabled -> { Probe.find(id: id) } else -> { Probe.find(id: 2) } }
+ return row
+}
+`
+
+const whenDatabaseAssertions = `package generated
+import("bytes";"context";"encoding/json";"fmt";"net/http/httptest";"strings";"testing"
+"github.com/light-speak/luxo/internal/testutil";"github.com/light-speak/luxo/pkg/lux"
+"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/pg"
+"github.com/testcontainers/testcontainers-go";"github.com/testcontainers/testcontainers-go/modules/postgres")
+
+type whenQueryTrace struct{statements []string}
+func(*whenQueryTrace)DatabaseTraceDetails()bool{return true}
+func(s *whenQueryTrace)StartDatabaseQuery(ctx context.Context,meta lux.DatabaseTraceMeta)context.Context{
+ if meta.Operation=="SELECT"{s.statements=append(s.statements,meta.Statement)};return ctx
+}
+func(*whenQueryTrace)FinishDatabaseQuery(context.Context,lux.DatabaseTraceResult){}
+func(*whenQueryTrace)StartDatabaseAcquire(ctx context.Context,_ lux.DatabasePoolTraceMeta)context.Context{return ctx}
+func(*whenQueryTrace)FinishDatabaseAcquire(context.Context,error){}
+
+func TestWhenDatabaseHTTP(t *testing.T){
+ container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+ testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
+ connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+ db,err:=pg.NewDB(t.Context(),connection);if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
+ if _,err:=pg.Exec(t.Context(),db,"CREATE TABLE probes(id bigint PRIMARY KEY,title text NOT NULL,ignored text NOT NULL); INSERT INTO probes VALUES(1,'one','private'),(2,'two','private')");err!=nil{t.Fatal(err)}
+ router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+ if err:=RegisterHandlers(router,NewFromDB(db));err!=nil{t.Fatal(err)}
+ for _,binary:=range []bool{false,true}{
+  for _,name:=range []string{"statement","value","nested","received","transactional","branch"}{
+   for _,sample:=range []struct{enabled bool;id,want int64;status,queries int}{
+    {true,1,1,200,1},{false,99,42,200,0},{true,99,0,404,1},
+   }{t.Run(fmt.Sprintf("%s/%v/%v/%d",name,binary,sample.enabled,sample.id),func(t *testing.T){
+    if name=="branch"&&!sample.enabled{sample.want,sample.queries=2,1}
+    response,trace:=whenQueryResponse(t,router,name,binary,sample.enabled,sample.id)
+    if response.Code!=sample.status||len(trace.statements)!=sample.queries{t.Fatalf("status=%d want=%d queries=%v body=%s",response.Code,sample.status,trace.statements,response.Body.String())}
+    for _,statement:=range trace.statements{if strings.Contains(statement,"ignored"){t.Fatalf("unselected field queried: %s",statement)}}
+    if sample.status==200{assertWhenQueryValue(t,response,binary,name=="branch",sample.want)}
+   })}
+  }
+ }
+ if _,err:=pg.Exec(t.Context(),db,"DROP TABLE probes");err!=nil{t.Fatal(err)}
+ for _,binary:=range []bool{false,true}{for _,name:=range []string{"statement","value","nested","received","transactional","branch"}{
+  t.Run(fmt.Sprintf("database-error/%s/%v",name,binary),func(t *testing.T){
+   response,trace:=whenQueryResponse(t,router,name,binary,true,1)
+   if response.Code!=500||len(trace.statements)!=1{t.Fatalf("database failure lost: %d %s %v",response.Code,response.Body.String(),trace.statements)}
+  })
+ }}
+}
+
+func whenQueryResponse(t *testing.T,router *api.Router,name string,binary,enabled bool,id int64)(*httptest.ResponseRecorder,*whenQueryTrace){
+ t.Helper();fields,mask:="",[]byte(nil);if name=="branch"{fields,mask="id,title",[]byte{3}}
+ body:=groupedRequestBody(t,router,name,fields,mask,binary,map[string]any{"enabled":enabled,"id":id})
+ trace:=&whenQueryTrace{};ctx:=lux.WithDatabaseTraceSink(t.Context(),trace)
+ request:=httptest.NewRequest("POST","/",bytes.NewReader(body)).WithContext(ctx)
+ if binary{request.Header.Set("X-Luxo-Mode","binary")}else{request.Header.Set("Content-Type","application/json")}
+ response:=httptest.NewRecorder();router.ServeHTTP(response,request);return response,trace
+}
+
+func assertWhenQueryValue(t *testing.T,response *httptest.ResponseRecorder,binary,object bool,want int64){
+ t.Helper();var got int64
+ if binary{
+  dec:=codec.NewDecoder(response.Body.Bytes())
+  if object{var row Probe;row.ReadLuxo(dec);got=row.Id;if row.Title==""||row.Ignored!=""{t.Fatalf("bad projection: %+v",row)}}else{got=dec.ReadInt()}
+  if err:=dec.Finish();err!=nil{t.Fatal(err)}
+ }else if object{
+  var envelope struct{Data Probe};if err:=json.Unmarshal(response.Body.Bytes(),&envelope);err!=nil{t.Fatal(err)};got=envelope.Data.Id
+  if envelope.Data.Title==""||bytes.Contains(response.Body.Bytes(),[]byte("ignored")){t.Fatal(response.Body.String())}
+ }else{var envelope struct{Data int64};if err:=json.Unmarshal(response.Body.Bytes(),&envelope);err!=nil{t.Fatal(err)};got=envelope.Data}
+ if got!=want{t.Fatalf("got=%d want=%d body=%s",got,want,response.Body.String())}
+}
+`
+
 func TestGeneratedFindMissingContract(t *testing.T) {
 	runGeneratedFixture(t, `
 model Probe @noTime {
@@ -61,10 +165,11 @@ api findInsideTransaction(id: Int): Int {
 
 const generatedFindAssertions = `package generated
 import("bytes";"encoding/json";"fmt";"net/http/httptest";"testing"
+"github.com/light-speak/luxo/internal/testutil"
 "github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/pg"
 "github.com/testcontainers/testcontainers-go";"github.com/testcontainers/testcontainers-go/modules/postgres")
 func TestFindMissingHTTP(t *testing.T){
- container,err:=postgres.Run(t.Context(),"postgres:17-alpine",postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+ container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
  testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
  connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
  db,err:=pg.NewDB(t.Context(),connection);if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)

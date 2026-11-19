@@ -1,9 +1,37 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
+import { encodeLuxoJSON, jsonNumber } from './json'
 import {
   Encoder, Decoder, ColumnarDecoder, fieldMaskSet, fieldMaskHas,
   formatUUID, parseUUID, decodeScalarArray, unixSecondsToISO,
 } from './codec'
+
+describe('decoder byte view boundaries', () => {
+  it('reads fixed values relative to the view, not the backing buffer', () => {
+    const bytes = new Uint8Array(24).fill(255)
+    new DataView(bytes.buffer).setFloat64(8, 1.25, true)
+    const decoder = new Decoder(bytes.subarray(8, 16))
+    expect(decoder.readFloat()).toBe(1.25)
+    expect(decoder.error).toBeNull()
+  })
+
+  it('cannot complete truncated values with bytes outside the view', () => {
+    const samples = [
+      { bytes: [128, 1], read: (decoder: Decoder) => decoder.readInt() },
+      { bytes: [2, 65, 66], read: (decoder: Decoder) => decoder.readString() },
+      { bytes: [2, 65, 66], read: (decoder: Decoder) => decoder.readBytes() },
+      { bytes: [0, 0, 0, 0, 0, 0, 244, 63], read: (decoder: Decoder) => decoder.readFloat() },
+    ]
+    for (const sample of samples) {
+      const backing = Uint8Array.from([255, ...sample.bytes, 255])
+      for (let length = 0; length < sample.bytes.length; length++) {
+        const decoder = new Decoder(backing.subarray(1, 1 + length))
+        expect(() => sample.read(decoder)).not.toThrow()
+        expect(decoder.error).not.toBeNull()
+      }
+    }
+  })
+})
 
 describe('encoder buffer ownership transfer', () => {
   it('writes typed delimited values without a capturing callback and rolls back failures', () => {
@@ -100,6 +128,92 @@ describe('structured response boundaries', () => {
 })
 
 describe('Encoder', () => {
+  it.each([0, 1, 16, 64, 1024])('writes JSON values with strict wire and ownership at capacity %s', (capacity) => {
+    const values: unknown[] = [null, false, 0, -0, '', 'null', '中文😀', 9007199254740993n,
+      jsonNumber('123456789012345678901234567890.123456789'),
+      { id: 9007199254740993n, text: '中文' }, { text: 'a'.repeat(4096) },
+      { text: '中文'.repeat(12288) }, { text: '\\"\n'.repeat(128) },
+      ...[39, 40, 41].flatMap(length => ['a'.repeat(length), '汉'.repeat(length), '😀'.repeat(length)])]
+    const encoder = new Encoder(capacity)
+    const reference = new Encoder(capacity)
+    for (const value of values) {
+      encoder.writeJSON(value)
+      reference.writeBytes(new TextEncoder().encode(encodeLuxoJSON(value)))
+    }
+    expect(encoder.bytes()).toEqual(reference.bytes())
+    const taken = encoder.takeBytes()
+    encoder.writeJSON({ text: 'independent' })
+    const snapshot = encoder.bytes()
+    taken.fill(255)
+    encoder.reset()
+    encoder.writeJSON(null)
+    const decoder = new Decoder(snapshot)
+    expect(decoder.readString()).toBe('{"text":"independent"}')
+    expect(decoder.error).toBeNull()
+  })
+
+  it('writes short JSON without a temporary UTF-8 array and serializes only once', () => {
+    const encoder = new Encoder(1024)
+    const encode = vi.spyOn(TextEncoder.prototype, 'encode')
+    const serialize = vi.spyOn(JSON, 'stringify')
+    let utf8Calls: number, jsonCalls: number
+    try {
+      encoder.writeJSON({ id: 9007199254740993n, text: '中文' })
+      utf8Calls = encode.mock.calls.length
+      jsonCalls = serialize.mock.calls.length
+    } finally {
+      encode.mockRestore()
+      serialize.mockRestore()
+    }
+    expect(utf8Calls).toBe(0)
+    expect(jsonCalls).toBe(1)
+    expect(new Decoder(encoder.bytes()).readString()).toBe('{"id":9007199254740993,"text":"中文"}')
+  })
+
+  it('rejects invalid JSON before changing the encoded prefix', () => {
+    const cycle: unknown[] = []
+    cycle.push(cycle)
+    for (const value of [undefined, NaN, Infinity, -Infinity, cycle, { text: '\ud800' }, { '\udfff': 'invalid' }]) {
+      const encoder = new Encoder(1)
+      encoder.writeVarint(7)
+      expect(() => encoder.writeJSON(value)).toThrow()
+      expect(encoder.bytes()).toEqual(Uint8Array.of(7))
+      encoder.writeJSON(null)
+      expect(encoder.bytes()).toEqual(Uint8Array.from([7, 4, 110, 117, 108, 108]))
+    }
+  })
+
+  it.each([0, 1, 4, 5, 64])('writes JSON null directly with initial capacity %s', (capacity) => {
+    const enc = new Encoder(capacity)
+    enc.writeJSONNull()
+    enc.writeVarint(7)
+    enc.writeJSONNull()
+    const bytes = enc.bytes()
+    expect(bytes).toEqual(Uint8Array.from([4, 110, 117, 108, 108, 7, 4, 110, 117, 108, 108]))
+    const decoder = new Decoder(bytes)
+    expect(decoder.readString()).toBe('null')
+    expect(decoder.nextField()).toBe(true)
+    expect(decoder.fieldID).toBe(7)
+    expect(decoder.readString()).toBe('null')
+    expect(decoder.error).toBeNull()
+  })
+
+  it('keeps JSON null writes independent after taking or copying the buffer', () => {
+    const enc = new Encoder(5)
+    enc.writeJSONNull()
+    const taken = enc.takeBytes()
+    enc.writeJSONNull()
+    const copied = enc.bytes()
+    taken.fill(255)
+    enc.reset()
+    enc.writeVarint(7)
+    enc.writeJSONNull()
+    expect(copied).toEqual(Uint8Array.from([4, 110, 117, 108, 108]))
+    expect(enc.bytes()).toEqual(Uint8Array.from([7, 4, 110, 117, 108, 108]))
+    copied.fill(255)
+    expect(enc.bytes()).toEqual(Uint8Array.from([7, 4, 110, 117, 108, 108]))
+  })
+
   it('preserves Float boundaries after small-buffer and large-buffer growth', () => {
     const enc = new Encoder(1)
     enc.writeVarint(42)

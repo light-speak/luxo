@@ -34,6 +34,35 @@ func TestGenerateNativeFileNoNative(t *testing.T) {
 	}
 }
 
+func TestNativeInterfaceSignatureSharing(t *testing.T) {
+	integer := &luxoast.TypeRef{Name: "Int"}
+	parameter := &luxoast.ParamDecl{Name: "value", Type: integer}
+	for _, sample := range []struct {
+		name  string
+		left  nativeAPI
+		right nativeAPI
+		want  int
+	}{
+		{"void", nativeAPI{Name: "read"}, nativeAPI{Name: "read"}, 1},
+		{"same", nativeAPI{Name: "read", Params: []*luxoast.ParamDecl{parameter}, ReturnType: integer}, nativeAPI{Name: "read", Params: []*luxoast.ParamDecl{parameter}, ReturnType: &luxoast.TypeRef{Name: "Result", TypeArgs: []*luxoast.TypeRef{integer}}}, 1},
+		{"arity", nativeAPI{Name: "read"}, nativeAPI{Name: "read", Params: []*luxoast.ParamDecl{parameter}}, 2},
+		{"spread", nativeAPI{Name: "read", Params: []*luxoast.ParamDecl{parameter}}, nativeAPI{Name: "read", Params: []*luxoast.ParamDecl{{Name: "value", Type: integer, Spread: true}}}, 2},
+		{"type", nativeAPI{Name: "read", Params: []*luxoast.ParamDecl{parameter}}, nativeAPI{Name: "read", Params: []*luxoast.ParamDecl{{Name: "value", Type: &luxoast.TypeRef{Name: "String"}}}}, 2},
+		{"return", nativeAPI{Name: "read", ReturnType: integer}, nativeAPI{Name: "read"}, 2},
+		{"case", nativeAPI{Name: "read"}, nativeAPI{Name: "Read"}, 2},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			input := &semantic.Result{Files: []*luxoast.File{{
+				APIs:      []*luxoast.ApiDecl{mkNativeAPI(sample.left.Name, sample.left.Params, sample.left.ReturnType)},
+				Functions: []*luxoast.FnDecl{{Name: sample.right.Name, Params: sample.right.Params, ReturnType: sample.right.ReturnType, Directives: []*luxoast.Directive{{Name: "native"}}}},
+			}}}
+			if source := GenerateNativeFile(input, "generated"); strings.Count(string(source), "\tRead(") != sample.want {
+				t.Fatalf("incompatible or differently named declarations were merged:\n%s", source)
+			}
+		})
+	}
+}
+
 func TestNativeSignatureImports(t *testing.T) {
 	for _, test := range []struct{ name, path string }{
 		{"UUID", "github.com/google/uuid"}, {"Decimal", "github.com/shopspring/decimal"},

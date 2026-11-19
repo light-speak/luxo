@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -19,6 +20,8 @@ import (
 )
 
 const (
+	// TraceIDFailureHeader reports missing correlation data without failing work.
+	TraceIDFailureHeader = "X-Luxo-Trace-ID-Failed"
 	// DebugTraceRequestHeader opts a request into detailed development tracing.
 	DebugTraceRequestHeader = "X-Luxo-Debug-Trace"
 	// DebugTraceResponseHeader carries a base64url-encoded Luxo trace envelope.
@@ -129,7 +132,13 @@ func TraceMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		traceID := r.Header.Get("X-Request-Id")
 		if traceID == "" {
-			traceID = uuid.Must(uuid.NewV7()).String()
+			id, err := uuid.NewV7()
+			if err != nil {
+				w.Header().Set(TraceIDFailureHeader, "1")
+				next.ServeHTTP(w, r)
+				return
+			}
+			traceID = id.String()
 		}
 		ctx := context.WithValue(r.Context(), traceKey{}, traceID)
 		w.Header().Set("X-Trace-Id", traceID)
@@ -149,6 +158,7 @@ func debugTraceRequested(value string) bool {
 }
 
 // WithDebugTrace attaches a new detailed trace session to ctx.
+// An empty ID is retained only as a marked diagnostic failure.
 func WithDebugTrace(ctx context.Context, traceID string) (context.Context, *DebugTraceSession) {
 	return withTraceSession(ctx, traceID, false, true, true)
 }
@@ -172,6 +182,7 @@ func withTraceSession(ctx context.Context, traceID string, sampled, exposeHeader
 	trace := &DebugTraceSession{
 		traceID: traceID, started: time.Now(), spans: make([]DebugSpan, 0, 12),
 		headSampled: sampled, exposeHeaders: exposeHeaders, databaseDetails: databaseDetails,
+		encodingFailed: traceID == "",
 	}
 	if TraceID(ctx) == "" {
 		ctx = context.WithValue(ctx, traceKey{}, traceID)
@@ -495,9 +506,9 @@ func decodeDebugSpan(data []byte) (DebugSpan, error) {
 		case 7:
 			span.Duration = time.Duration(dec.ReadInt())
 		case 8:
-			span.ID = uint32(dec.ReadInt())
+			span.ID = checkedDebugSpanID(dec, dec.ReadInt())
 		case 9:
-			span.ParentID = uint32(dec.ReadInt())
+			span.ParentID = checkedDebugSpanID(dec, dec.ReadInt())
 		case 10:
 			span.FieldPath = dec.ReadString()
 		case 11:
@@ -520,6 +531,16 @@ func decodeDebugSpan(data []byte) (DebugSpan, error) {
 		span.FieldPath = span.Field
 	}
 	return span, nil
+}
+
+var errDebugSpanIDRange = errors.New("debug span ID exceeds uint32 range")
+
+func checkedDebugSpanID(dec *codec.Decoder, id int64) uint32 {
+	if uint64(id) > uint64(^uint32(0)) {
+		dec.Fail(errDebugSpanIDRange)
+		return 0
+	}
+	return uint32(id)
 }
 
 func decodeDatabaseDebugSpanField(span *DebugSpan, dec *codec.Decoder) {
@@ -696,7 +717,9 @@ func (w *debugResponseWriter) Write(data []byte) (int, error) {
 	if w.writeErr != nil {
 		return 0, w.writeErr
 	}
-	return w.target.Write(data)
+	n, err := w.target.Write(data)
+	w.writeErr = err
+	return n, err
 }
 
 func (w *debugResponseWriter) flush(trace *DebugTraceSession) {

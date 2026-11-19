@@ -11,11 +11,94 @@ import (
 	"strings"
 )
 
+// MaxJSONDepth counts object/array containers from an independent JSON root.
+const MaxJSONDepth = 128
+
+var errJSONDepth = fmt.Errorf("JSON nesting exceeds %d levels", MaxJSONDepth)
+
+// CheckJSONDepth checks only a previously validated value's container budget.
+// Nil represents an absent previous value. It neither copies nor decodes data.
+func CheckJSONDepth(raw []byte) error {
+	if len(raw) >= 2*(MaxJSONDepth+1) && !WithinJSONDepth(raw) {
+		return errJSONDepth
+	}
+	return nil
+}
+
+// CloneJSONValue owns a JSON field after the enclosing strict reader validated
+// syntax and Unicode. Its independent container budget does not include that
+// enclosing model, list, or protocol envelope.
+func CloneJSONValue(raw []byte) (json.RawMessage, error) {
+	if WithinJSONDepth(raw) {
+		return bytes.Clone(raw), nil
+	}
+	return nil, errJSONDepth
+}
+
 // ValidUTF8JSON checks one complete JSON value, including UTF-8 and paired
 // surrogate escapes, without decoding numbers or changing duplicate-name
-// semantics. Empty input is not JSON null.
+// semantics. Empty input is not JSON null. Containers are limited to MaxJSONDepth.
 func ValidUTF8JSON(raw []byte) bool {
-	return jsontext.Value(raw).IsValid(jsontext.AllowDuplicateNames(true))
+	return WithinJSONDepth(raw) && jsontext.Value(raw).IsValid(jsontext.AllowDuplicateNames(true))
+}
+
+// WithinJSONDepth checks only the container budget; callers must also validate
+// syntax and Unicode. It is useful after jsontext has already read a value.
+// Scalars consume no depth, and container-like text inside strings is ignored.
+func WithinJSONDepth(raw []byte) bool {
+	// Every valid container needs two delimiters. Ordinary small values need no
+	// extra scan; deeply malformed input is still rejected by the syntax reader.
+	if len(raw) < 2*(MaxJSONDepth+1) {
+		return true
+	}
+	// A syntactically valid string root has no containers, regardless of length.
+	if raw[0] == '"' {
+		return true
+	}
+	// Raw openings overestimate actual containers because quoted text may also
+	// contain brackets. Each real closing reduces the maximum possible depth.
+	potential := bytes.Count(raw, []byte{'['}) + bytes.Count(raw, []byte{'{'})
+	if potential <= MaxJSONDepth {
+		return true
+	}
+	depth := 0
+	for index := 0; index < len(raw); index++ {
+		switch raw[index] {
+		case '"':
+			index = jsonStringEnd(raw, index)
+		case '[', '{':
+			depth++
+			if depth > MaxJSONDepth {
+				return false
+			}
+		case ']', '}':
+			depth--
+			potential--
+			if potential <= MaxJSONDepth {
+				return true
+			}
+		}
+	}
+	return true
+}
+
+func jsonStringEnd(raw []byte, start int) int {
+	for index := start + 1; index < len(raw); {
+		next := bytes.IndexByte(raw[index:], '"')
+		if next < 0 {
+			return len(raw)
+		}
+		end := index + next
+		escapes := 0
+		for back := end - 1; back > start && raw[back] == '\\'; back-- {
+			escapes++
+		}
+		if escapes%2 == 0 {
+			return end
+		}
+		index = end + 1
+	}
+	return len(raw)
 }
 
 // ParseFloat64 converts one JSON numeric token, rejecting overflow and nonzero

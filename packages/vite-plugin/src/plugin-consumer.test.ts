@@ -22,13 +22,19 @@ const repositoryRoot = resolve(packageRoot, '../..')
 const temporaryRoot = join(repositoryRoot, '.tmp')
 let consumerRoot = packageRoot
 const schema: LuxoSchema = {
-  models: { Metric: { name: 'Metric', fields: [
+  models: { Owner: { name: 'Owner', fields: [
+    { id: 1, name: 'id', type: 'Int' },
+    { id: 2, name: 'name', type: 'String' },
+  ] }, Metric: { name: 'Metric', fields: [
     { id: 1, name: 'id', type: 'Int' },
     { id: 2, name: 'label', type: 'String' },
+    { id: 3, name: 'owner', type: 'Model', typeName: 'Owner', relation: true },
   ] } },
   apis: { getMetric: { id: 1, name: 'getMetric', module: 'metrics', returnType: 'Metric',
     params: [{ id: 1, name: 'id', type: 'Int' }],
-  } },
+  }, liveMetrics: { id: 2, name: 'liveMetrics', module: 'metrics', returnType: 'Metric', stream: true,
+    params: [{ id: 1, name: 'id', type: 'Int' }],
+  }, allMetrics: { id: 3, name: 'allMetrics', module: 'metrics', returnType: 'Metric', returnList: true } },
 }
 
 beforeAll(async () => {
@@ -52,12 +58,12 @@ function preparePackedConsumer(): void {
   }
   // Reuse installed peers/tooling; only the plugin under test comes from this
   // archive. Client archive consumption is covered by the React package suite.
-  for (const name of ['@babel/parser', '@babel/traverse', '@babel/types', 'typescript', 'vite']) {
+  for (const name of ['@babel/parser', '@babel/traverse', '@babel/types', 'magic-string', 'typescript', 'vite']) {
     dependencies[name] = `link:${dirname(require.resolve(`${name}/package.json`))}`
   }
-  // Bind the archive's Babel imports to the same installed versions as the
+  // Bind the archive's build dependencies to the same installed versions as the
   // build. Offline registry metadata need not contain those cached releases.
-  const overrides = Object.fromEntries(['@babel/parser', '@babel/traverse', '@babel/types'].map(name => [name, dependencies[name]]))
+  const overrides = Object.fromEntries(['@babel/parser', '@babel/traverse', '@babel/types', 'magic-string'].map(name => [name, dependencies[name]]))
   writeFileSync(join(consumerRoot, 'package.json'), JSON.stringify({
     private: true, devDependencies: dependencies,
   }))
@@ -213,7 +219,7 @@ try {
       setPayload(bytes)
       await assert.rejects(plugin.buildStart(), AggregateError)
       assert.deepEqual(files.map(file => readFileSync(join(outDir, file), 'utf8')), before)
-      assert.equal(plugin.transform('async function f() { const m = await client.getMetric({id: 1n}); console.log(m.label) }', join(directory, 'src/view.ts')), null)
+      assert.equal(await plugin.transform('async function f() { const m = await client.getMetric({id: 1n}); console.log(m.label) }', join(directory, 'src/view.ts')), null)
     }
     setPayload(valid)
     if (source === 'network') {
@@ -240,10 +246,21 @@ try {
 const consumerSource = `
 import { LuxoClient } from './luxo/client.js'
 import type { Metric } from './luxo/types.js'
+import type { StreamObserver } from '@luxojs/client'
 
 export async function selectMetric(client: LuxoClient): Promise<bigint> {
   const metric = (await client.getMetric({ id: 9223372036854775807n })) satisfies Metric
   return metric.id
+}
+
+export async function selectFilteredOwners(client: LuxoClient): Promise<string[]> {
+  const metrics = await client.allMetrics()
+  return metrics.filter(metric => metric.label === 'keep').map(metric => metric.owner!.name!)
+}
+
+export async function selectFoundOwner(client: LuxoClient): Promise<string | undefined> {
+  const metrics = await client.allMetrics()
+  return metrics.find(metric => metric.label === 'keep')?.owner?.name
 }
 
 export async function selectLabel(client: LuxoClient): Promise<string> {
@@ -251,13 +268,54 @@ export async function selectLabel(client: LuxoClient): Promise<string> {
   return metric.label
 }
 
+export async function selectNested(client: LuxoClient): Promise<string> {
+  const metric = await client.getMetric(await (async () => {
+    const previous = await client.getMetric({ id: 9223372036854775807n })
+    return { id: previous.id! }
+  })())
+  return metric.label!
+}
+
 export async function selectExplicit(client: LuxoClient): Promise<bigint> {
   const metric = await client.getMetric({ id: 9223372036854775807n, $select: 'id, label' })
   return metric.id
 }
 
+export async function selectSpread(client: LuxoClient, signal: AbortSignal): Promise<string> {
+  const args = [{ id: 9223372036854775807n }, { signal }] as const
+  const metric = await client.getMetric(...args)
+  return metric.label!
+}
+
+export async function selectLeadingEmptySpread(client: LuxoClient, signal: AbortSignal): Promise<bigint> {
+  const empty = [] as const
+  const args = [{ id: 9223372036854775807n }, { signal }] as const
+  const metric = await client.getMetric(...empty, ...args)
+  return metric.id!
+}
+
+export async function selectManualSpread(client: LuxoClient, signal: AbortSignal): Promise<bigint> {
+  const args = [{ id: 9223372036854775807n, $select: 'id' }, { signal }] as const
+  const metric = await client.getMetric(...args)
+  return metric.id!
+}
+
+export async function watchOwner(client: LuxoClient, receive: (name: string) => void, observer: StreamObserver): Promise<() => void> {
+  const params = [{ id: 9223372036854775807n }] as const
+  return client.subscribeLiveMetrics(...params, metric => receive(metric.owner!.name!), observer)
+}
+
 export function createClient(endpoint: string): LuxoClient {
   return LuxoClient.create(endpoint)
+}
+
+export async function ordinaryMetric(): Promise<string> {
+  const local = { async getMetric(params: { id: bigint }) {
+    if (Object.keys(params).length !== 1) throw new Error('Ordinary request was changed')
+    return { id: params.id, label: 'local' }
+  } }
+  const metric = await local.getMetric({ id: 2n })
+  return metric.label
 }
 `
 
@@ -286,7 +344,8 @@ await build({
 })
 assert.match(readFileSync(join(directory, 'src/luxo/types.ts'), 'utf8'), /id.*bigint/)
 const location = join(directory, 'out', filename)
-const { selectMetric, selectLabel, selectExplicit, createClient } = commonjs ? require(location) : await import(pathToFileURL(location).href)
+const { selectMetric, selectLabel, selectFilteredOwners, selectFoundOwner, selectNested, selectExplicit, selectSpread, selectLeadingEmptySpread, selectManualSpread, watchOwner, createClient, ordinaryMetric } = commonjs ? require(location) : await import(pathToFileURL(location).href)
+assert.equal(await ordinaryMetric(), 'local')
 const value = 9223372036854775807n
 const selectionIdentities = new Map()
 for (const [call, selection, response, expected] of [
@@ -310,6 +369,7 @@ for (const [call, selection, response, expected] of [
 }
 const { createServer } = await import('node:http')
 const { decodeLuxoJSON } = await import('@luxojs/client')
+const { Encoder, encodeBinaryBody } = await import('@luxojs/client')
 const selections = []
 const server = createServer(async (request, response) => {
   const parts = []
@@ -317,6 +377,10 @@ const server = createServer(async (request, response) => {
   const body = decodeLuxoJSON(Buffer.concat(parts).toString())
   selections.push(body.$select)
   response.setHeader('content-type', 'application/json')
+  if (body.$select === 'label,owner{name}' || body.$select === 'owner{name},label') {
+    response.end('{"data":[{"label":"keep","owner":{"name":"selected"}},{"label":"drop","owner":{"name":"excluded"}}]}')
+    return
+  }
   response.end(body.$select === 'label' ? '{"data":{"label":"network"}}' : '{"data":{"id":9223372036854775807}}')
 })
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -325,11 +389,64 @@ client.setMode('json')
 try {
   assert.equal(await selectMetric(client), value)
   assert.equal(await selectLabel(client), 'network')
-  assert.deepEqual(selections, ['id', 'label'])
+  assert.equal(await selectNested(client), 'network')
+  const signal = new AbortController().signal
+  assert.equal(await selectSpread(client, signal), 'network')
+  assert.equal(await selectLeadingEmptySpread(client, signal), value)
+  assert.equal(await selectManualSpread(client, signal), value)
+  assert.deepEqual(await selectFilteredOwners(client), ['selected'])
+  assert.equal(await selectFoundOwner(client), 'selected')
+  assert.deepEqual(selections, ['id', 'label', 'id', 'label', 'label', 'id', 'id', 'label,owner{name}', 'owner{name},label'])
 } finally {
   client.close()
   server.closeAllConnections()
   await new Promise(resolve => server.close(resolve))
+}
+const actualWebSocket = globalThis.WebSocket
+for (const mode of ['json', 'binary']) {
+  const received = [], errors = []
+  let completed = 0
+  const nested = new Encoder()
+  nested.writeVarint(5); nested.writeFieldString(2, 'owner'); nested.writeEnd()
+  const body = new Encoder()
+  body.writeVarint(0); body.writeFieldBytes(3, nested.bytes()); body.writeEnd()
+  const frame = (type, payload = []) => Uint8Array.from([type, 1, ...payload]).buffer
+  class FixtureSocket {
+    static OPEN = 1
+    readyState = 0
+    constructor() { queueMicrotask(() => { this.readyState = 1; this.onopen?.() }) }
+    close() { this.readyState = 3; this.onclose?.({ code: 1000 }) }
+    send(data) {
+      if (typeof data === 'string') {
+        const request = decodeLuxoJSON(data)
+        if ('$unsub' in request) return
+        assert.equal(request.$sub, 'liveMetrics')
+        assert.equal(request.$select, 'owner{name}')
+        assert.equal(request.id, value)
+      } else {
+        if (new Uint8Array(data)[0] === 0x11) return
+        const expected = encodeBinaryBody(streamClient.constructor.schema.liveMetrics, { id: value, $select: 'owner{name}' })
+        assert.deepEqual(new Uint8Array(data), new Uint8Array([0x10, 1, ...expected]))
+      }
+      queueMicrotask(() => {
+        this.onmessage?.({ data: mode === 'json' ? '{"$sub":1,"ok":true}' : frame(0x13) })
+        this.onmessage?.({ data: mode === 'json' ? '{"$stream":1,"data":{"owner":{"name":"owner"}}}' : frame(0x12, body.bytes()) })
+        this.onmessage?.({ data: mode === 'json' ? '{"$end":1,"ok":true}' : frame(0x15) })
+      })
+    }
+  }
+  globalThis.WebSocket = FixtureSocket
+  const streamClient = createClient('ws://fixture.invalid/luvia')
+  streamClient.setMode(mode)
+  try {
+    const cancel = await watchOwner(streamClient, name => received.push(name), {
+      onError(error) { errors.push(error) }, onComplete() { completed++ },
+    })
+    cancel()
+    assert.deepEqual(received, ['owner'])
+    assert.deepEqual(errors, [])
+    assert.equal(completed, 1)
+  } finally { streamClient.close(); globalThis.WebSocket = actualWebSocket }
 }
 console.log('selection and int64 verified')
 `

@@ -84,17 +84,19 @@ func TestExpressionTypeTags(t *testing.T) {
 	expression.SetNullable(true)
 	expression.SetListType(true)
 	expression.SetModelType(true)
-	if expression.GetTypeTag() != "User" || !expression.IsNullable() || !expression.IsListType() || !expression.IsModelType() {
+	expression.SetEnumType(true)
+	if expression.GetTypeTag() != "User" || !expression.IsNullable() || !expression.IsListType() || !expression.IsModelType() || !expression.IsEnumType() {
 		t.Fatal("type metadata was not retained independently")
 	}
 	expression.SetNullable(false)
-	if expression.IsNullable() || expression.GetTypeTag() != "User" || !expression.IsListType() || !expression.IsModelType() {
+	if expression.IsNullable() || expression.GetTypeTag() != "User" || !expression.IsListType() || !expression.IsModelType() || !expression.IsEnumType() {
 		t.Fatal("clearing nullable changed unrelated metadata")
 	}
 	expression.SetListType(false)
 	expression.SetModelType(false)
+	expression.SetEnumType(false)
 	expression.SetTypeTag("")
-	if expression.GetTypeTag() != "" || expression.IsNullable() || expression.IsListType() || expression.IsModelType() {
+	if expression.GetTypeTag() != "" || expression.IsNullable() || expression.IsListType() || expression.IsModelType() || expression.IsEnumType() {
 		t.Fatal("type metadata was not reset")
 	}
 }
@@ -147,5 +149,20 @@ func TestWalkStatementShapes(t *testing.T) {
 	WalkExprs(block, func(Expr) { count++ })
 	if count != 4 {
 		t.Fatalf("statement values visited %d times, want 4", count)
+	}
+}
+
+func TestSingleExpressionDirective(t *testing.T) {
+	expression := &Ident{Name: "condition"}
+	body := &Block{Stmts: []Stmt{&ExprStmt{Expr: expression}}}
+	for _, directive := range []*Directive{{Body: body}, {Args: []*NamedArg{{Value: expression}}}} {
+		if directive.SingleExpression() != expression {
+			t.Fatal("condition changed")
+		}
+	}
+	for _, directive := range []*Directive{nil, {}, {Body: &Block{}}, {Body: body, Args: []*NamedArg{{Value: expression}}}, {Args: []*NamedArg{{Name: "condition", Value: expression}}}, {Args: []*NamedArg{nil}}, {Args: []*NamedArg{{Value: expression}, {Value: expression}}}, {Body: &Block{Stmts: []Stmt{&ReturnStmt{Value: expression}}}}, {Body: &Block{Stmts: []Stmt{&ExprStmt{}}}}, {Body: &Block{Stmts: []Stmt{&ExprStmt{Expr: expression}, &ExprStmt{Expr: expression}}}}} {
+		if directive.SingleExpression() != nil {
+			t.Fatal("ambiguous directive accepted")
+		}
 	}
 }

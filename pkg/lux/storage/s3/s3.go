@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/lux/storage"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/minio/minio-go/v7/pkg/s3utils"
 )
 
 // Config uses the portable storage configuration without a runtime conversion.
@@ -30,6 +32,7 @@ type s3Client interface {
 // S3Storage implements Storage using any S3-compatible backend
 // (AWS S3, MinIO, Cloudflare R2, Aliyun OSS, etc.).
 type S3Storage struct {
+	transport *http.Transport
 	client    s3Client
 	bucket    string
 	region    string // region for bucket creation
@@ -41,19 +44,29 @@ func NewS3Storage(cfg Config) (*S3Storage, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if err := s3utils.CheckValidBucketName(cfg.Bucket); err != nil {
+		return nil, err
+	}
 
 	endpoint := cfg.Endpoint
+	secure := cfg.UseSSL || endpoint == "" || strings.HasPrefix(endpoint, "https://")
 	if endpoint == "" {
 		endpoint = "s3.amazonaws.com"
 	}
+	// Default AWS and explicit HTTPS endpoints must never use plaintext.
 	// Strip protocol prefix if present
 	endpoint = strings.TrimPrefix(endpoint, "https://")
 	endpoint = strings.TrimPrefix(endpoint, "http://")
 
+	transport, err := minio.DefaultTransport(secure)
+	if err != nil {
+		return nil, fmt.Errorf("storage: init s3 transport: %w", err)
+	}
 	client, err := minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
-		Secure: cfg.UseSSL,
-		Region: cfg.Region,
+		Transport: transport,
+		Creds:     credentials.NewStaticV4(cfg.AccessKey, cfg.SecretKey, ""),
+		Secure:    secure,
+		Region:    cfg.Region,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("storage: init s3 client: %w", err)
@@ -62,6 +75,7 @@ func NewS3Storage(cfg Config) (*S3Storage, error) {
 	publicURL := strings.TrimRight(cfg.PublicURL, "/")
 
 	return &S3Storage{
+		transport: transport,
 		client:    client,
 		bucket:    cfg.Bucket,
 		region:    cfg.Region,
@@ -107,11 +121,21 @@ func (s *S3Storage) URL(_ context.Context, bucket, key string) (string, error) {
 	if bucket == "" {
 		bucket = s.bucket
 	}
+	// The constructor validates the default; validate explicit alternatives before
+	// formatting a path. Otherwise a bucket could become a query or another path.
+	if bucket != s.bucket || bucket == "" {
+		if err := s3utils.CheckValidBucketName(bucket); err != nil {
+			return "", err
+		}
+	}
 	return s.buildURL(bucket, key), nil
 }
 
-// Close releases resources. For S3, this is a no-op.
+// Close releases idle connections owned by this storage instance.
 func (s *S3Storage) Close() error {
+	if s.transport != nil {
+		s.transport.CloseIdleConnections()
+	}
 	return nil
 }
 
@@ -136,6 +160,8 @@ func (s *S3Storage) EnsureBucket(ctx context.Context, bucket string) error {
 // When publicURL is set and bucket differs from the default, the bucket is
 // included in the path so that multi-bucket setups resolve correctly.
 func (s *S3Storage) buildURL(bucket, key string) string {
+	// Escape path data without cleaning separators or changing the object key.
+	key = (&url.URL{Path: key}).EscapedPath()
 	if s.publicURL != "" {
 		if bucket != "" && bucket != s.bucket {
 			return s.publicURL + "/" + bucket + "/" + key

@@ -113,6 +113,54 @@ void main() {
     expect(int.parse((await client.get(countURL)).body), before + 1);
   });
 
+  test(
+    'H2 redirects do not replay requests or change the connection',
+    () async {
+      final beforeH1 = (await client.get(endpoint.resolve('/http1-count')))
+          .body;
+      final beforeTarget = (await client.get(
+        endpoint.resolve('/redirect-target-count'),
+      )).body;
+      String? connection;
+      for (final binary in [false, true]) {
+        for (final status in [301, 302, 303, 307, 308]) {
+          for (final target in ['/redirect-target', http1.toString()]) {
+            final url = endpoint
+                .resolve('/redirect')
+                .replace(
+                  queryParameters: {'status': '$status', 'target': target},
+                );
+            final response = await client.post(
+              url,
+              headers: {
+                'X-Project-Key': 'test-only-key',
+                'Content-Type': binary
+                    ? 'application/octet-stream'
+                    : 'application/json',
+              },
+              body: binary ? [1, 2, 3] : '{"value":"private-input"}',
+            );
+            expect(response.statusCode, status);
+            connection ??= response.headers['x-test-connection'];
+            expect(response.headers['x-test-connection'], connection);
+          }
+        }
+      }
+      expect(
+        (await client.get(endpoint.resolve('/http1-count'))).body,
+        beforeH1,
+      );
+      expect(
+        (await client.get(endpoint.resolve('/redirect-target-count'))).body,
+        beforeTarget,
+      );
+      final next = await client.post(endpoint, body: [7, 8]);
+      expect(next.statusCode, 200);
+      expect(next.bodyBytes, [7, 8]);
+      expect(next.headers['x-test-connection'], connection);
+    },
+  );
+
   test('slow TLS handshake times out and closes the socket', () async {
     final raw = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
     final disconnected = Completer<void>();
@@ -146,6 +194,55 @@ void main() {
       await raw.close();
     }
   });
+
+  for (final closeClient in [false, true]) {
+    test('interrupt unfinished TLS handshake by close=$closeClient', () async {
+      final raw = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+      final connected = Completer<void>();
+      final disconnected = Completer<void>();
+      final sockets = <Socket>[];
+      final listener = raw.listen((socket) {
+        sockets.add(socket);
+        socket.listen(
+          (_) {},
+          onDone: () {
+            socket.destroy();
+            if (!disconnected.isCompleted) disconnected.complete();
+          },
+        );
+        connected.complete();
+      });
+      final slow = LuxoHttp2Client(Uri.parse('https://127.0.0.1:${raw.port}'));
+      final abort = Completer<void>();
+      try {
+        final failed = expectLater(
+          slow.send(
+            http.AbortableRequest(
+              'POST',
+              slow.endpoint,
+              abortTrigger: abort.future,
+            ),
+          ),
+          throwsA(isA<http.RequestAbortedException>()),
+        );
+        await connected.future.timeout(const Duration(seconds: 2));
+        if (closeClient) {
+          slow.close();
+        } else {
+          abort.complete();
+        }
+        await failed.timeout(const Duration(seconds: 2));
+        await disconnected.future.timeout(const Duration(seconds: 2));
+      } finally {
+        slow.close();
+        for (final socket in sockets) {
+          socket.destroy();
+        }
+        await listener.cancel();
+        await raw.close();
+      }
+    });
+  }
 
   test('TLS H2 preserves bytes, concurrent calls and HTTP errors', () async {
     final responses = await Future.wait([
@@ -211,6 +308,28 @@ void main() {
     );
     expect((await client.post(endpoint, body: [7])).bodyBytes, [7]);
   });
+
+  test(
+    'header encoding failures release capacity for subsequent calls',
+    () async {
+      for (var index = 0; index < 3; index++) {
+        final request = http.Request('POST', endpoint)
+          ..headers['x-invalid'] = '\u{1f600}';
+        await expectLater(
+          client.send(request),
+          throwsA(
+            isA<http.ClientException>().having(
+              (error) => error.message,
+              'encoding failure',
+              isNot(contains('capacity')),
+            ),
+          ),
+        );
+      }
+      expect((await client.post(endpoint, body: [7])).bodyBytes, [7]);
+    },
+  );
+
   test('oversized unfinished response cancels only its stream', () async {
     final initial = await client.post(endpoint, body: [1]);
     final abort = Completer<void>();

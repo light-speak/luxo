@@ -1,10 +1,15 @@
 package luvia
 
 import (
+	"errors"
+	"strings"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/datetime"
 )
+
+var errInvalidObservation = errors.New("studio: invalid observation fields")
 
 // observationJSON writes only the fixed control-plane schema. Text and numbers
 // reuse the runtime's strict scalar encoders, never reflection or round trips.
@@ -25,8 +30,26 @@ func (w *observationJSON) number(prefix string, value float64) {
 	if w.err != nil {
 		return
 	}
+	if value < 0 {
+		w.err = errInvalidObservation
+		return
+	}
 	w.buf.AppendString(prefix)
 	w.err = w.buf.AppendFloat(value)
+}
+
+func (w *observationJSON) timestamp(prefix string, value time.Time) {
+	if w.err != nil {
+		return
+	}
+	if value.IsZero() || !datetime.ValidSeconds(value.Unix()) {
+		w.err = errInvalidObservation
+		return
+	}
+	w.buf.AppendString(prefix)
+	w.buf.AppendString(`"`)
+	w.buf.B = value.UTC().AppendFormat(w.buf.B, time.RFC3339Nano)
+	w.buf.AppendString(`"`)
 }
 
 func (w *observationJSON) integer(prefix string, value int64) {
@@ -53,60 +76,29 @@ func (mc *MetricsCollector) observationHeader(w *observationJSON, operation stri
 	w.text(`,"nodeType":`, mc.nodeType)
 }
 
-func (mc *MetricsCollector) encodeMetrics(buckets map[metricBucketKey]*metricBucket) ([]byte, error) {
-	return mc.encodeMetricBatch(buckets, false)
-}
-
-func (mc *MetricsCollector) encodePendingMetrics(buckets map[metricBucketKey]*metricBucket) ([]byte, error) {
-	body, err := mc.encodeMetricBatch(buckets, true)
-	if err != nil {
-		var measurements uint64
-		for _, b := range buckets {
-			measurements += uint64(max(0, b.totalCount))
-		}
-		mc.addInvalidMetrics(uint64(len(buckets)), measurements)
-		clear(buckets)
+func (mc *MetricsCollector) discardMetricBuckets(buckets map[metricBucketKey]*metricBucket) {
+	var measurements uint64
+	for _, bucket := range buckets {
+		measurements += uint64(max(0, bucket.totalCount))
 	}
-	return body, err
-}
-
-func (mc *MetricsCollector) encodeMetricBatch(buckets map[metricBucketKey]*metricBucket, isolate bool) ([]byte, error) {
-	var w observationJSON
-	mc.observationHeader(&w, "ingestMetrics")
-	if w.err != nil {
-		return nil, w.err
-	}
-	w.buf.AppendString(`,"buckets":[`)
-	first := true
-	var dropped, measurements uint64
-	for key, bucket := range buckets {
-		start := len(w.buf.B)
-		if !first {
-			w.buf.AppendString(",")
-		}
-		appendMetricBucket(&w, bucket)
-		if w.err != nil && isolate {
-			w.buf.B, w.err = w.buf.B[:start], nil
-			delete(buckets, key)
-			dropped++
-			measurements += uint64(max(0, bucket.totalCount))
-			continue
-		}
-		first = false
-	}
-	if dropped != 0 {
-		mc.addInvalidMetrics(dropped, measurements)
-	}
-	return w.finish("]}")
+	mc.addInvalidMetrics(uint64(len(buckets)), measurements)
+	clear(buckets)
 }
 
 func appendMetricBucket(w *observationJSON, b *metricBucket) {
+	if w.err != nil {
+		return
+	}
+	if strings.TrimSpace(b.apiName) == "" || b.totalCount < 0 || b.errCount < 0 || b.errCount > b.totalCount {
+		w.err = errInvalidObservation
+		return
+	}
 	avg := 0.0
 	if b.totalCount > 0 {
 		avg = b.totalMs / float64(b.totalCount)
 	}
 	w.text(`{"apiName":`, b.apiName)
-	w.text(`,"timestamp":`, b.timestamp.Format(time.RFC3339))
+	w.timestamp(`,"timestamp":`, b.timestamp)
 	w.integer(`,"totalCount":`, b.totalCount)
 	w.integer(`,"errCount":`, b.errCount)
 	w.number(`,"avgMs":`, avg)
@@ -117,53 +109,14 @@ func appendMetricBucket(w *observationJSON, b *metricBucket) {
 	w.buf.AppendString("}")
 }
 
-func (mc *MetricsCollector) encodeTraces(records []api.TraceRecord) ([]byte, error) {
-	body, _, err := mc.encodeTraceBatch(records, false)
-	return body, err
-}
-
-func (mc *MetricsCollector) encodePendingTraces(records []api.TraceRecord) ([]byte, []api.TraceRecord, error) {
-	body, valid, err := mc.encodeTraceBatch(records, true)
-	if err != nil {
-		mc.addInvalidTraces(uint64(len(records)))
-		clear(records)
-		return nil, nil, err
-	}
-	return body, valid, nil
-}
-
-func (mc *MetricsCollector) encodeTraceBatch(records []api.TraceRecord, isolate bool) ([]byte, []api.TraceRecord, error) {
-	var w observationJSON
-	mc.observationHeader(&w, "ingestTraces")
-	if w.err != nil {
-		return nil, nil, w.err
-	}
-	w.buf.AppendString(`,"traces":[`)
-	n := 0
-	for i := range records {
-		start := len(w.buf.B)
-		if n > 0 {
-			w.buf.AppendString(",")
-		}
-		appendTraceRecord(&w, &records[i])
-		if w.err != nil && isolate {
-			w.buf.B, w.err = w.buf.B[:start], nil
-			continue
-		}
-		if isolate && n != i {
-			records[n] = records[i]
-		}
-		n++
-	}
-	if isolate && n < len(records) {
-		mc.addInvalidTraces(uint64(len(records) - n))
-		clear(records[n:])
-	}
-	body, err := w.finish("]}")
-	return body, records[:n], err
-}
-
 func appendTraceRecord(w *observationJSON, r *api.TraceRecord) {
+	if w.err != nil {
+		return
+	}
+	if strings.TrimSpace(r.TraceID) == "" || strings.TrimSpace(r.APIName) == "" || r.Duration < 0 {
+		w.err = errInvalidObservation
+		return
+	}
 	status := "OK"
 	if r.StatusCode >= 400 {
 		status = "ERROR"
@@ -173,7 +126,7 @@ func appendTraceRecord(w *observationJSON, r *api.TraceRecord) {
 	w.number(`,"duration":`, float64(r.Duration.Microseconds())/1000)
 	w.text(`,"status":`, status)
 	w.integer(`,"statusCode":`, int64(r.StatusCode))
-	w.text(`,"timestamp":`, r.Timestamp.Format(time.RFC3339Nano))
+	w.timestamp(`,"timestamp":`, r.Timestamp)
 	if r.ClientName != "" {
 		w.text(`,"clientName":`, r.ClientName)
 	}
