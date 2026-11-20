@@ -317,6 +317,17 @@ func (b *CreateBase[T]) Set(col string, val any) {
 	b.Vals = append(b.Vals, val)
 }
 
+// SetCreateSlot assigns a generated field in first-set order. The builder's
+// private slot starts at zero and records the one-based position in Vals.
+func SetCreateSlot[T any](b *CreateBase[T], slot *int, col string, val any) {
+	if *slot != 0 {
+		b.Vals[*slot-1] = val
+		return
+	}
+	b.Set(col, val)
+	*slot = len(b.Cols)
+}
+
 // Exec inserts the record and returns it via RETURNING *.
 func (b *CreateBase[T]) Exec(ctx context.Context) (*T, error) {
 	return InsertReturning(ctx, b.Db, b.Scan, b.Table, b.Cols, b.Vals)
@@ -339,6 +350,18 @@ type UpdateBase[T any, ID comparable] struct {
 // Set appends a column=value pair. Called by generated Set methods.
 func (b *UpdateBase[T, ID]) Set(col string, val any) {
 	b.Sets = append(b.Sets, lux.SetField{Col: col, Val: val})
+}
+
+// SetUpdateSlot assigns a generated field in first-set order. The builder's
+// private slot starts at zero and records the one-based position in Sets.
+func SetUpdateSlot(sets *[]lux.SetField, slot *int, col string, val any) {
+	field := lux.SetField{Col: col, Val: val}
+	if index := *slot; index != 0 {
+		(*sets)[index-1] = field
+		return
+	}
+	*sets = append(*sets, field)
+	*slot = len(*sets)
 }
 
 // Exec updates the record and returns it via RETURNING *.

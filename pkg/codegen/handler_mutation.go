@@ -207,19 +207,10 @@ func (g *GeneratorContext) generateMutationSetter(b *strings.Builder, model, kin
 		fmt.Fprintf(b, "\treturn b.setPrepared%s(v)\n}\n\n", name)
 		fmt.Fprintf(b, "func (b *%s) setPrepared%s(v %s) *%s {\n", builder, name, typ, builder)
 	}
-	slot := "b._setSlot" + name
-	fmt.Fprintf(b, "\tif %s != 0 {\n", slot)
 	if kind == "Create" {
-		fmt.Fprintf(b, "\t\tb.Vals[%s-1] = v\n", slot)
+		fmt.Fprintf(b, "\tpg.SetCreateSlot(&b.CreateBase, &b._setSlot%s, %q, v)\n", name, g.sqlColumn(field.Name))
 	} else {
-		fmt.Fprintf(b, "\t\tb.Sets[%s-1] = lux.SetField{Col: %q, Val: v}\n", slot, g.sqlColumn(field.Name))
-	}
-	b.WriteString("\t\treturn b\n\t}\n")
-	fmt.Fprintf(b, "\tb.Set(%q, v)\n", g.sqlColumn(field.Name))
-	if kind == "Create" {
-		fmt.Fprintf(b, "\t%s = len(b.Cols)\n", slot)
-	} else {
-		fmt.Fprintf(b, "\t%s = len(b.Sets)\n", slot)
+		fmt.Fprintf(b, "\tpg.SetUpdateSlot(&b.Sets, &b._setSlot%s, %q, v)\n", name, g.sqlColumn(field.Name))
 	}
 	b.WriteString("\treturn b\n}\n\n")
 }

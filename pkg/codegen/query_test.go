@@ -252,7 +252,7 @@ func TestGenerateCreateBuilder(t *testing.T) {
 		"func (b *UserCreateBuilder) SetId(v int64) *UserCreateBuilder",
 		"func (b *UserCreateBuilder) SetName(v string) *UserCreateBuilder",
 		"func (b *UserCreateBuilder) SetEmail(v string) *UserCreateBuilder",
-		`b.Set("\"name\"", v)`,
+		`pg.SetCreateSlot(&b.CreateBase, &b._setSlotName, "\"name\"", v)`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(got, check) {
@@ -328,7 +328,7 @@ func TestGenerateUpdateBuilder(t *testing.T) {
 		"pg.UpdateBase[User, int64]",
 		"func (b *UserUpdateBuilder) SetName(v string) *UserUpdateBuilder",
 		"func (b *UserUpdateBuilder) SetEmail(v string) *UserUpdateBuilder",
-		`b.Set("\"name\"", v)`,
+		`pg.SetUpdateSlot(&b.Sets, &b._setSlotName, "\"name\"", v)`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(got, check) {

@@ -655,9 +655,14 @@ func TestCreateBaseAndUpdateBase(t *testing.T) {
 		Scan:  scanUser,
 	}
 	id := uuid.Must(uuid.NewV7())
+	var createNameSlot int
 	cb.Set("id", id)
-	cb.Set("name", "create-base")
+	SetCreateSlot(cb, &createNameSlot, "name", "first-name")
 	cb.Set("email", "cb@test.com")
+	SetCreateSlot(cb, &createNameSlot, "name", "create-base")
+	if createNameSlot != 2 || !slices.Equal(cb.Cols, []string{"id", "name", "email"}) {
+		t.Fatalf("create slot %d, columns %v", createNameSlot, cb.Cols)
+	}
 
 	user, err := cb.Exec(ctx)
 	if err != nil {
@@ -674,14 +679,20 @@ func TestCreateBaseAndUpdateBase(t *testing.T) {
 		ID:    id,
 		Scan:  scanUser,
 	}
-	ub.Set("name", "update-base")
+	var updateNameSlot int
+	ub.Set("email", "updated@test.com")
+	SetUpdateSlot(&ub.Sets, &updateNameSlot, "name", "first-update")
+	SetUpdateSlot(&ub.Sets, &updateNameSlot, "name", "update-base")
+	if updateNameSlot != 2 || len(ub.Sets) != 2 || ub.Sets[1].Col != "name" {
+		t.Fatalf("update slot %d, assignments %v", updateNameSlot, ub.Sets)
+	}
 
 	updated, err := ub.Exec(ctx)
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if updated.Name != "update-base" {
-		t.Errorf("name = %q", updated.Name)
+	if updated.Name != "update-base" || updated.Email != "updated@test.com" {
+		t.Errorf("name = %q, email = %q", updated.Name, updated.Email)
 	}
 }
 
