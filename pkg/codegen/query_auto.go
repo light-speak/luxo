@@ -67,7 +67,7 @@ func (g *GeneratorContext) writeAutomaticSet(b *strings.Builder, model string, f
 func (g *GeneratorContext) generatePreparedQueryUpdate(b *strings.Builder, model string, fields []*ast.FieldDecl, directives ...[]*ast.Directive) {
 	field := automaticUpdateField(fields, directives...)
 	if field == nil {
-		fmt.Fprintf(b, "func (q *%sQuery) updatePrepared(ctx context.Context, sets ...lux.SetField) (int64,error) { return (*pg.Query[%s])(q).Update(ctx,sets...) }\n", model, model)
+		fmt.Fprintf(b, "func (q *%sQuery) updatePrepared(ctx context.Context, sets ...lux.SetField) (int64,error) {\n\treturn (*pg.Query[%s])(q).Update(ctx,sets...)\n}\n", model, model)
 		return
 	}
 	fmt.Fprintf(b, "func (q *%sQuery) updatePrepared(ctx context.Context, sets ...lux.SetField) (int64,error) {\n", model)

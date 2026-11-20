@@ -9,6 +9,7 @@ import (
 )
 
 // A defined query type preserves the adapter layout without promoting raw writes.
+// Multiline wrappers let the Go printer skip sizing each body for a single line.
 func (g *GeneratorContext) generateQueryFacade(b *strings.Builder, name string, fields []*ast.FieldDecl, writable bool, directives ...[]*ast.Directive) {
 	fmt.Fprintf(b, "type %sQuery pg.Query[%s]\n\n", name, name)
 	for _, method := range []struct{ name, params, args string }{
@@ -17,12 +18,12 @@ func (g *GeneratorContext) generateQueryFacade(b *strings.Builder, name string, 
 		{"OrderBy", "values ...string", "values..."},
 		{"Limit", "value int", "value"}, {"Offset", "value int", "value"},
 	} {
-		fmt.Fprintf(b, "func (q *%sQuery) %s(%s) *%sQuery { (*pg.Query[%s])(q).%s(%s); return q }\n", name, method.name, method.params, name, name, method.name, method.args)
+		fmt.Fprintf(b, "func (q *%sQuery) %s(%s) *%sQuery {\n\t(*pg.Query[%s])(q).%s(%s)\n\treturn q\n}\n", name, method.name, method.params, name, name, method.name, method.args)
 	}
 	generateQueryReadMethods(b, name, fields)
 	if writable {
 		for _, method := range []string{"Delete", "SoftDelete"} {
-			fmt.Fprintf(b, "func (q *%sQuery) %s(ctx context.Context) (int64,error) { return (*pg.Query[%s])(q).%s(ctx) }\n", name, method, name, method)
+			fmt.Fprintf(b, "func (q *%sQuery) %s(ctx context.Context) (int64,error) {\n\treturn (*pg.Query[%s])(q).%s(ctx)\n}\n", name, method, name, method)
 		}
 		g.generatePreparedQueryUpdate(b, name, fields, directives...)
 	}
@@ -34,7 +35,7 @@ func generateQueryReadMethods(b *strings.Builder, name string, fields []*ast.Fie
 		{"First", "(*" + name + ",error)"}, {"FirstRequired", "(*" + name + ",error)"},
 		{"Count", "(int64,error)"}, {"Exists", "(bool,error)"},
 	} {
-		fmt.Fprintf(b, "func (q *%sQuery) %s(ctx context.Context) %s { return (*pg.Query[%s])(q).%s(ctx) }\n", name, method.name, method.result, name, method.name)
+		fmt.Fprintf(b, "func (q *%sQuery) %s(ctx context.Context) %s {\n\treturn (*pg.Query[%s])(q).%s(ctx)\n}\n", name, method.name, method.result, name, method.name)
 	}
 	for _, method := range []string{"Sum", "Min", "Max", "Avg", "SumFloat", "MinFloat", "MaxFloat"} {
 		result := "int64"
@@ -51,17 +52,17 @@ func generateQueryReadMethods(b *strings.Builder, name string, fields []*ast.Fie
 			break
 		}
 	}
-	fmt.Fprintf(b, "func (q *%sQuery) AggregateBatch(ctx context.Context, specs ...lux.AggregateSpec) ([]int64,error) { return (*pg.Query[%s])(q).AggregateBatch(ctx,specs...) }\n", name, name)
-	fmt.Fprintf(b, "func (q *%sQuery) AggregateBatchTo(ctx context.Context, targets []pg.AggregateDestination, specs ...lux.AggregateSpec) error { return (*pg.Query[%s])(q).AggregateBatchTo(ctx,targets,specs...) }\n", name, name)
+	fmt.Fprintf(b, "func (q *%sQuery) AggregateBatch(ctx context.Context, specs ...lux.AggregateSpec) ([]int64,error) {\n\treturn (*pg.Query[%s])(q).AggregateBatch(ctx,specs...)\n}\n", name, name)
+	fmt.Fprintf(b, "func (q *%sQuery) AggregateBatchTo(ctx context.Context, targets []pg.AggregateDestination, specs ...lux.AggregateSpec) error {\n\treturn (*pg.Query[%s])(q).AggregateBatchTo(ctx,targets,specs...)\n}\n", name, name)
 	result := "R"
 	if name == result {
 		result = "_GroupResult"
 	}
-	fmt.Fprintf(b, "func (q *%[1]sQuery) GroupBy[%[2]s any](ctx context.Context, groups []string, columns []lux.GroupAgg, scan func(pg.Rows)(%[2]s,error), having ...lux.Condition) ([]%[2]s,error) { return (*pg.Query[%[1]s])(q).GroupBy(ctx,groups,columns,scan,having...) }\n\n", name, result)
+	fmt.Fprintf(b, "func (q *%[1]sQuery) GroupBy[%[2]s any](ctx context.Context, groups []string, columns []lux.GroupAgg, scan func(pg.Rows)(%[2]s,error), having ...lux.Condition) ([]%[2]s,error) {\n\treturn (*pg.Query[%[1]s])(q).GroupBy(ctx,groups,columns,scan,having...)\n}\n\n", name, result)
 }
 
 func generateQueryAggregateMethod(b *strings.Builder, name, method, result string) {
-	fmt.Fprintf(b, "func (q *%sQuery) %s(ctx context.Context, column string) (%s,error) { return (*pg.Query[%s])(q).%s(ctx,column) }\n", name, method, result, name, method)
+	fmt.Fprintf(b, "func (q *%sQuery) %s(ctx context.Context, column string) (%s,error) {\n\treturn (*pg.Query[%s])(q).%s(ctx,column)\n}\n", name, method, result, name, method)
 }
 
 // Bulk updates reuse the existing typed setter state and preparation rules.
@@ -72,7 +73,7 @@ func generateQueryUpdateBuilder(b *strings.Builder, name string, fields []*ast.F
 	setters := mutationSetterFields(fields, primary, true, directives)
 	for _, field := range setters {
 		method := str.Capitalize(field.Name)
-		fmt.Fprintf(b, "func (b *%sQueryUpdateBuilder) Set%s(value %s) *%sQueryUpdateBuilder { b.state.Set%s(value); return b }\n", name, method, resolveGoType(field.Type), name, method)
+		fmt.Fprintf(b, "func (b *%sQueryUpdateBuilder) Set%s(value %s) *%sQueryUpdateBuilder {\n\tb.state.Set%s(value)\n\treturn b\n}\n", name, method, resolveGoType(field.Type), name, method)
 	}
 	fmt.Fprintf(b, "func (b *%sQueryUpdateBuilder) Exec(ctx context.Context) (int64,error) {\n", name)
 	if hasFallibleSave(setters) {

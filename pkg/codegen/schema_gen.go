@@ -324,6 +324,7 @@ func (g *GeneratorContext) writeModelRegistration(b *strings.Builder, m *ast.Mod
 	g.writeComputedSources(b, m, modelRelations, moduleName)
 	fmt.Fprintf(b, "\t\tFields: []schema.Field{\n")
 	relations := relationMap(modelRelations)
+	primaryKey := primaryKeyFieldName(m)
 
 	for _, f := range m.Fields {
 		if f.Type == nil {
@@ -343,8 +344,14 @@ func (g *GeneratorContext) writeModelRegistration(b *strings.Builder, m *ast.Mod
 		// Scalar fields: write type info for Binary↔JSON
 		if !isRelation {
 			fieldType := g.schemaFieldKindName(f.Type.Name, enums)
-			fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q, Nullable: %v, IsList: %v, Computed: %v, PrimaryKey: %v",
-				fieldID, f.Name, fieldType, f.Type.Name, f.Type.Nullable, f.Type.IsList, f.Computed != nil, f.Name == primaryKeyFieldName(m))
+			fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q", fieldID, f.Name, fieldType, f.Type.Name)
+			writeSchemaFieldShape(b, f.Type)
+			if f.Computed != nil {
+				b.WriteString(", Computed: true")
+			}
+			if f.Name == primaryKey {
+				b.WriteString(", PrimaryKey: true")
+			}
 			writeInlineFieldMetadata(b, f)
 			b.WriteString("},\n")
 			continue
@@ -391,14 +398,27 @@ func (g *GeneratorContext) writeTypeRegistration(b *strings.Builder, t *ast.Type
 			// blob as a scalar string array.
 			fieldType = "FieldModel"
 		}
-		fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q, Nullable: %v, IsList: %v, Relation: %v",
-			fieldID, f.Name, fieldType, f.Type.Name, f.Type.Nullable, f.Type.IsList, relation)
+		fmt.Fprintf(b, "\t\t\t{ID: %d, Name: %q, Type: schema.%s, TypeName: %q", fieldID, f.Name, fieldType, f.Type.Name)
+		writeSchemaFieldShape(b, f.Type)
+		if relation {
+			b.WriteString(", Relation: true")
+		}
 		writeInlineFieldMetadata(b, f)
 		b.WriteString("},\n")
 	}
 
 	fmt.Fprintf(b, "\t\t},\n")
 	fmt.Fprintf(b, "\t}); err != nil { return err }\n")
+}
+
+// Zero-valued flags are implicit in the generated field literal.
+func writeSchemaFieldShape(b *strings.Builder, typ *ast.TypeRef) {
+	if typ.Nullable {
+		b.WriteString(", Nullable: true")
+	}
+	if typ.IsList {
+		b.WriteString(", IsList: true")
+	}
 }
 
 func writeEnumRegistration(b *strings.Builder, enumDecl *ast.EnumDecl, moduleName string) {

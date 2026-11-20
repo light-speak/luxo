@@ -1526,11 +1526,13 @@ func TestWriteModelRegistration_ExtendRelation(t *testing.T) {
 
 func TestWriteModelRegistrationPreservesScalarTypeNameAndListShape(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
-		"Task": {"status": 1, "tags": 2},
+		"Task": {"status": 1, "tags": 2, "key": 3, "note": 4},
 	}}})
 	model := &ast.ModelDecl{Name: "Task", Fields: []*ast.FieldDecl{
 		{Name: "status", Type: &ast.TypeRef{Name: "TaskStatus"}},
 		{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}},
+		{Name: "key", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}},
+		{Name: "note", Type: &ast.TypeRef{Name: "String", Nullable: true}},
 	}}
 
 	var output strings.Builder
@@ -1538,10 +1540,17 @@ func TestWriteModelRegistrationPreservesScalarTypeNameAndListShape(t *testing.T)
 	code := output.String()
 	for _, expected := range []string{
 		`Name: "status", Type: schema.FieldEnum, TypeName: "TaskStatus"`,
-		`Name: "tags", Type: schema.FieldString, TypeName: "String", Nullable: false, IsList: true`,
+		`Name: "tags", Type: schema.FieldString, TypeName: "String", IsList: true`,
+		`Name: "key", Type: schema.FieldInt, TypeName: "Int", PrimaryKey: true`,
+		`Name: "note", Type: schema.FieldString, TypeName: "String", Nullable: true`,
 	} {
 		if !strings.Contains(code, expected) {
 			t.Errorf("generated runtime schema missing %q:\n%s", expected, code)
+		}
+	}
+	for _, inactive := range []string{"Nullable: false", "IsList: false", "Computed: false", "PrimaryKey: false"} {
+		if strings.Contains(code, inactive) {
+			t.Errorf("generated runtime schema explicitly sets the zero value %q:\n%s", inactive, code)
 		}
 	}
 }
