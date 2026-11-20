@@ -30,16 +30,17 @@ type connectionReader struct {
 	conn        net.Conn
 	server      *Server
 	ready       sync.Cond
-	mode        connectionReadMode
 	buffers     [2][]byte
-	bufferCount int
 	workers     sync.WaitGroup
 	closeOnce   sync.Once
 	mu          sync.Mutex
+	mode        connectionReadMode
 	busy        bool
 	queued      bool
-	pending     incomingRequest
+	bufferCount uint8
 	header      [4]byte // The read token protects the header and input.
+	pending     incomingRequest
+	observation socketObservation
 	input       frameInput
 }
 
@@ -58,10 +59,15 @@ func newConnectionReader(s *Server, conn net.Conn) *connectionReader {
 }
 
 func (r *connectionReader) serve() {
-	r.workers.Add(1)
+	defer r.closeObservation()
+	r.startPeer()
 	defer r.workers.Wait()
-	go r.background()
 	r.run()
+}
+
+func (r *connectionReader) startPeer() {
+	r.workers.Add(1)
+	go r.background()
 }
 
 func (r *connectionReader) close() {
@@ -92,7 +98,7 @@ func (r *connectionReader) takeBufferLocked() []byte {
 // The dispatcher holds mu; buffers are published only after business returns.
 func (r *connectionReader) recycleLocked(payload []byte) {
 	payload = retainReadFrame(payload)
-	if payload != nil && r.bufferCount < len(r.buffers) {
+	if payload != nil && int(r.bufferCount) < len(r.buffers) {
 		r.buffers[r.bufferCount] = payload
 		r.bufferCount++
 	}
@@ -145,12 +151,13 @@ func (r *connectionReader) readRequests(buffer []byte) bool {
 		envelope, err := decodeRequestEnvelope(payload)
 		request := incomingRequest{payload: payload, envelope: envelope, err: err}
 		stream := err == nil && envelope.kind == requestKindStream
+		readAhead := r.hasBufferedInput()
 		dispatch, ok := r.claim(request, stream)
 		if !ok {
 			return false
 		}
 		if dispatch {
-			r.ready.Signal()
+			r.observePeer(readAhead)
 			return r.dispatch(request)
 		}
 		if stream {
@@ -183,20 +190,22 @@ func (r *connectionReader) claim(request incomingRequest, stream bool) (bool, bo
 }
 
 func (r *connectionReader) dispatch(request incomingRequest) bool {
+	writer := r.responseWriter()
 	for {
 		if r.ctx.Err() != nil {
 			return false
 		}
 		if request.err != nil {
-			if err := WriteFrame(r.conn, encodeError(400, "BadRequest", request.err.Error())); err != nil {
+			if err := WriteFrame(writer, encodeError(400, "BadRequest", request.err.Error())); err != nil {
 				return false
 			}
 		} else if request.envelope.kind == requestKindStream {
 			r.server.processStream(r.ctx, r.conn, request.envelope)
 			return false
-		} else if err := r.server.processCallContext(r.ctx, r.conn, request.envelope); err != nil {
+		} else if err := r.server.processCallContext(r.ctx, writer, request.envelope); err != nil {
 			return false
 		}
+		r.noteExchange()
 		r.mu.Lock()
 		r.recycleLocked(request.payload)
 		if !r.queued {

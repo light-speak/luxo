@@ -40,8 +40,9 @@ type Server struct {
 	sem                    chan struct{} // connection semaphore
 	connMu                 sync.Mutex
 	connections            map[net.Conn]struct{}
+	readObservers          socketObserverPool
+	readObserversStarted   bool
 	closing                bool
-	closeOnce              sync.Once
 }
 
 // NewServer exports public and internal handlers after registration is complete.
@@ -165,20 +166,26 @@ func (s *Server) retryAccept(err error, delay *time.Duration) (bool, error) {
 
 // Close stops accepting new connections and waits for active ones to finish.
 func (s *Server) Close() {
-	s.closeOnce.Do(func() {
-		s.cancel()
-		close(s.done)
-		s.connMu.Lock()
-		s.closing = true
-		if s.listener != nil {
-			s.listener.Close()
-		}
-		for conn := range s.connections {
-			conn.Close()
-		}
-		s.connMu.Unlock()
-	})
+	s.stopAccepting()
 	s.wg.Wait()
+	s.closeReadObservers()
+}
+
+func (s *Server) stopAccepting() {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.closing {
+		return
+	}
+	s.closing = true
+	s.cancel()
+	close(s.done)
+	if s.listener != nil {
+		s.listener.Close()
+	}
+	for conn := range s.connections {
+		conn.Close()
+	}
 }
 
 func (s *Server) handleConn(conn net.Conn) {
