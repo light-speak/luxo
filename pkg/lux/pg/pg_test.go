@@ -1111,6 +1111,25 @@ func TestBuildAggregateBatchSQLSkipsNilConditions(t *testing.T) {
 	}
 }
 
+func TestBuildAggregateBatchSQLPreservesPlaceholderOrderAcrossSets(t *testing.T) {
+	query, args, err := buildAggregateBatchSQL("tasks",
+		[]lux.Condition{nil, lux.NewIntField("project_id").In(1, 2)},
+		[]lux.AggregateSpec{
+			{Function: lux.AggregateCount},
+			{Function: lux.AggregateSum, Column: "quantity", Conditions: []lux.Condition{lux.NewIntField("priority").Between(10, 20)}},
+			{Function: lux.AggregateMin, Column: "priority", Conditions: []lux.Condition{nil, nil}},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "SELECT COUNT(*), COALESCE(SUM(quantity) FILTER (WHERE priority BETWEEN $3 AND $4), 0), COALESCE(MIN(priority), 0) FROM tasks WHERE project_id IN ($1, $2)"
+	wantArgs := []any{int64(1), int64(2), int64(10), int64(20)}
+	if query != want || !slices.Equal(args, wantArgs) {
+		t.Fatalf("aggregate batch = %q, %v", query, args)
+	}
+}
+
 func TestQueryAggregateBatch(t *testing.T) {
 	db := testDB(t)
 	ctx := context.Background()
