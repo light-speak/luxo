@@ -210,7 +210,7 @@ func (g *GeneratorContext) Generate(result *semantic.Result, packageName string,
 	if err != nil {
 		return nil, err
 	}
-	if err := prepareGeneratedSymbols(generated.Files, g.needsUnicodeGoExports(result)); err != nil {
+	if err := prepareGeneratedSources(generated.Files, g.needsUnicodeGoExports(result), true); err != nil {
 		return nil, err
 	}
 	return generated, nil

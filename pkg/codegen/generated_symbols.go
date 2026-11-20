@@ -36,6 +36,12 @@ func validateGeneratedSymbols(files map[string][]byte) error {
 // Comment/semicolon gating and list comma rules keep the renamed output parseable.
 // Retain formatting errors for inputs outside that normal producer contract.
 func prepareGeneratedSymbols(files map[string][]byte, exportUnicode bool) error {
+	return prepareGeneratedSources(files, exportUnicode, false)
+}
+
+// Source reuse requires exclusive ownership of every buffer. Generate owns its
+// temporary package and publishes it only after every file passes validation.
+func prepareGeneratedSources(files map[string][]byte, exportUnicode, reuseSource bool) error {
 	symbols := generatedSymbols{positions: token.NewFileSet(), names: make(map[generatedSymbolKey]generatedSymbol)}
 	const mode = parser.SkipObjectResolution | parser.ParseComments
 	names := slices.Sorted(maps.Keys(files))
@@ -54,7 +60,7 @@ func prepareGeneratedSymbols(files map[string][]byte, exportUnicode bool) error 
 				return err
 			}
 		}
-		formatted, err := formatParsedGeneratedFile(symbols.positions, file, len(source))
+		formatted, err := formatParsedGeneratedFile(symbols.positions, file, source, reuseSource)
 		if err != nil {
 			return fmt.Errorf("format %s: %w", name, err)
 		}
@@ -66,9 +72,14 @@ func prepareGeneratedSymbols(files map[string][]byte, exportUnicode bool) error 
 	return nil
 }
 
-func formatParsedGeneratedFile(positions *token.FileSet, file *goast.File, sourceSize int) ([]byte, error) {
+func formatParsedGeneratedFile(positions *token.FileSet, file *goast.File, source []byte, reuseSource bool) ([]byte, error) {
 	var output bytes.Buffer
-	output.Grow(sourceSize)
+	// ParseFile has copied the token text. Reuse a source allocation at least
+	// as large as the zero-value buffer's minimum allocation in Go 1.27.
+	if reuseSource && cap(source) >= 64 {
+		output = *bytes.NewBuffer(source[:0])
+	}
+	output.Grow(len(source))
 	var err error
 	goast.SortImports(positions, file)
 	if hasNoncanonicalNumberSpelling(file) {

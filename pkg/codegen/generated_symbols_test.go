@@ -160,6 +160,44 @@ func TestGeneratedSymbolSyntaxErrorsPropagate(t *testing.T) {
 	}
 }
 
+func TestGeneratedSymbolPreparationPreservesBorrowedSourcesOnError(t *testing.T) {
+	const source = "package generated\ntype Before struct { Value int }\n"
+	first := append(make([]byte, 0, 256), source...)
+	files := map[string][]byte{"a.gen.go": first, "z.gen.go": []byte("package generated {")}
+	if err := prepareGeneratedSymbols(files, false); err == nil || !strings.Contains(err.Error(), "z.gen.go") {
+		t.Fatal("expected a syntax error in the second source", err)
+	}
+	if string(first) != source || string(files["a.gen.go"]) != source {
+		t.Fatal("failed preparation changed the earlier source")
+	}
+}
+
+func TestGeneratedSymbolPreparationReusesOwnedSource(t *testing.T) {
+	const source = `// 保留业务说明。
+package generated
+import (_ "time"; _ "fmt")
+type 计数 struct { 数值 int }
+func read(v 计数) int { return v.数值 + 0Xff }
+const wire = "计数.数值"
+`
+	const name = "symbols.gen.go"
+	borrowed := map[string][]byte{name: []byte(source)}
+	if err := prepareGeneratedSymbols(borrowed, true); err != nil {
+		t.Fatal(err)
+	}
+	buf := append(make([]byte, 0, 512), source...)
+	owned := map[string][]byte{name: buf}
+	if err := prepareGeneratedSources(owned, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(owned[name], borrowed[name]) {
+		t.Fatalf("reused source changed formatted output:\ngot:\n%s\nwant:\n%s", owned[name], borrowed[name])
+	}
+	if &owned[name][0] != &buf[0] {
+		t.Fatal("formatting discarded sufficient owned source capacity")
+	}
+}
+
 func TestGeneratedSymbolScopeControls(t *testing.T) {
 	const source = `package generated
 import _ "fmt"
