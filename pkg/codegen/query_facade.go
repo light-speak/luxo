@@ -9,6 +9,7 @@ import (
 )
 
 // A defined query type preserves the adapter layout without promoting raw writes.
+// The embedded PostgreSQL reader supplies the shared read terminals.
 // Multiline wrappers let the Go printer skip sizing each body for a single line.
 func (g *GeneratorContext) generateQueryFacade(b *strings.Builder, name string, fields []*ast.FieldDecl, writable bool, directives ...[]*ast.Directive) {
 	fmt.Fprintf(b, "type %sQuery pg.Query[%s]\n\n", name, name)
@@ -20,7 +21,7 @@ func (g *GeneratorContext) generateQueryFacade(b *strings.Builder, name string, 
 	} {
 		fmt.Fprintf(b, "func (q *%sQuery) %s(%s) *%sQuery {\n\t(*pg.Query[%s])(q).%s(%s)\n\treturn q\n}\n", name, method.name, method.params, name, name, method.name, method.args)
 	}
-	generateQueryReadMethods(b, name, fields)
+	generateDecimalQueryMethods(b, name, fields)
 	if writable {
 		for _, method := range []string{"Delete", "SoftDelete"} {
 			fmt.Fprintf(b, "func (q *%sQuery) %s(ctx context.Context) (int64,error) {\n\treturn (*pg.Query[%s])(q).%s(ctx)\n}\n", name, method, name, method)
@@ -29,40 +30,15 @@ func (g *GeneratorContext) generateQueryFacade(b *strings.Builder, name string, 
 	}
 }
 
-func generateQueryReadMethods(b *strings.Builder, name string, fields []*ast.FieldDecl) {
-	for _, method := range []struct{ name, result string }{
-		{"All", "([]*" + name + ",error)"}, {"AllWithCount", "([]*" + name + ",int64,error)"},
-		{"First", "(*" + name + ",error)"}, {"FirstRequired", "(*" + name + ",error)"},
-		{"Count", "(int64,error)"}, {"Exists", "(bool,error)"},
-	} {
-		fmt.Fprintf(b, "func (q *%sQuery) %s(ctx context.Context) %s {\n\treturn (*pg.Query[%s])(q).%s(ctx)\n}\n", name, method.name, method.result, name, method.name)
-	}
-	for _, method := range []string{"Sum", "Min", "Max", "Avg", "SumFloat", "MinFloat", "MaxFloat"} {
-		result := "int64"
-		if method == "Avg" || strings.HasSuffix(method, "Float") {
-			result = "float64"
-		}
-		generateQueryAggregateMethod(b, name, method, result)
-	}
+func generateDecimalQueryMethods(b *strings.Builder, name string, fields []*ast.FieldDecl) {
 	for _, field := range fields {
 		if field.Type != nil && field.Type.Name == "Decimal" {
 			for _, method := range []string{"SumDecimal", "AvgDecimal", "MinDecimal", "MaxDecimal"} {
-				generateQueryAggregateMethod(b, name, method, "decimal.Decimal")
+				fmt.Fprintf(b, "func (q *%sQuery) %s(ctx context.Context, column string) (decimal.Decimal,error) {\n\treturn (*pg.Query[%s])(q).%s(ctx,column)\n}\n", name, method, name, method)
 			}
-			break
+			return
 		}
 	}
-	fmt.Fprintf(b, "func (q *%sQuery) AggregateBatch(ctx context.Context, specs ...lux.AggregateSpec) ([]int64,error) {\n\treturn (*pg.Query[%s])(q).AggregateBatch(ctx,specs...)\n}\n", name, name)
-	fmt.Fprintf(b, "func (q *%sQuery) AggregateBatchTo(ctx context.Context, targets []pg.AggregateDestination, specs ...lux.AggregateSpec) error {\n\treturn (*pg.Query[%s])(q).AggregateBatchTo(ctx,targets,specs...)\n}\n", name, name)
-	result := "R"
-	if name == result {
-		result = "_GroupResult"
-	}
-	fmt.Fprintf(b, "func (q *%[1]sQuery) GroupBy[%[2]s any](ctx context.Context, groups []string, columns []lux.GroupAgg, scan func(pg.Rows)(%[2]s,error), having ...lux.Condition) ([]%[2]s,error) {\n\treturn (*pg.Query[%[1]s])(q).GroupBy(ctx,groups,columns,scan,having...)\n}\n\n", name, result)
-}
-
-func generateQueryAggregateMethod(b *strings.Builder, name, method, result string) {
-	fmt.Fprintf(b, "func (q *%sQuery) %s(ctx context.Context, column string) (%s,error) {\n\treturn (*pg.Query[%s])(q).%s(ctx,column)\n}\n", name, method, result, name, method)
 }
 
 // Bulk updates reuse the existing typed setter state and preparation rules.

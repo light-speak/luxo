@@ -53,7 +53,7 @@ func (d *AggregateDestination) finish() error {
 
 // AggregateBatchTo reads mixed numeric aggregates in one statement without
 // rounding integer/decimal columns through a common floating-point container.
-func (q *Query[T]) AggregateBatchTo(ctx context.Context, targets []AggregateDestination, specs ...lux.AggregateSpec) error {
+func (q *queryReader[T]) AggregateBatchTo(ctx context.Context, targets []AggregateDestination, specs ...lux.AggregateSpec) error {
 	if len(targets) != len(specs) {
 		return errInvalidScanValue
 	}

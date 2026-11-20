@@ -1318,17 +1318,46 @@ func TestTypedQueryUpdate(t *testing.T){
 
 func TestGeneratedReadOnlyQueryHasNoMutationMethods(t *testing.T) {
 	var source strings.Builder
+	source.WriteString(`package generated
+import (
+ "github.com/light-speak/luxo/pkg/lux"
+ "github.com/light-speak/luxo/pkg/lux/pg"
+)
+type External struct{}
+type R struct{}
+`)
 	defaultGenerator().generateQueryFacade(&source, "External", nil, false)
-	for _, forbidden := range []string{" Update(", " updatePrepared(", " Delete(", " SoftDelete("} {
-		if strings.Contains(source.String(), forbidden) {
-			t.Fatalf("read-only facade exposes %s", forbidden)
-		}
+	defaultGenerator().generateQueryFacade(&source, "R", nil, false)
+	if strings.Contains(source.String(), "func (q *ExternalQuery) All(") {
+		t.Fatal("generated query repeats a shared read method")
 	}
-	for _, expected := range []string{"type ExternalQuery pg.Query[External]", " All(", " GroupBy[R any]", " AggregateBatchTo("} {
-		if !strings.Contains(source.String(), expected) {
-			t.Fatalf("missing %s", expected)
-		}
-	}
+	runGeneratedProtocolPackage(t, source.String(), `package generated
+import (
+ "context"
+ "reflect"
+ "testing"
+ "github.com/light-speak/luxo/pkg/lux"
+ "github.com/light-speak/luxo/pkg/lux/pg"
+)
+var _ interface {
+ All(context.Context) ([]*External,error)
+ FirstRequired(context.Context) (*External,error)
+ AggregateBatchTo(context.Context, []pg.AggregateDestination, ...lux.AggregateSpec) error
+ Where(...lux.Condition) *ExternalQuery
+} = (*ExternalQuery)(nil)
+func compileGroup(q *RQuery) ([]int,error) {
+ return q.GroupBy(context.Background(),nil,nil,func(pg.Rows)(int,error){return 0,nil})
+}
+func TestReadOnlyMethodSet(t *testing.T) {
+ raw := pg.NewQuery[External](nil,"external",nil,nil)
+ query := (*ExternalQuery)(raw)
+ if (*pg.Query[External])(query) != raw { t.Fatal("query conversion changed identity") }
+ typ := reflect.TypeOf(query)
+ for _, forbidden := range []string{"Update", "Delete", "SoftDelete", "SumDecimal"} {
+  if _,found := typ.MethodByName(forbidden);found { t.Fatal("read-only facade exposes",forbidden) }
+ }
+}
+`)
 }
 
 func TestGeneratedHashedBuilderPreparation(t *testing.T) {

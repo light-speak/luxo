@@ -14,6 +14,12 @@ import (
 // Query is a generic chainable query builder for PostgreSQL.
 // Holds *pg.DB directly — zero interface, zero any.
 type Query[T any] struct {
+	queryReader[T]
+}
+
+// queryReader promotes read terminals to nominal generated query types. The
+// raw PostgreSQL mutation and chaining methods belong to Query itself.
+type queryReader[T any] struct {
 	db      *DB
 	table   string
 	fields  []string
@@ -26,7 +32,7 @@ type Query[T any] struct {
 
 // NewQuery creates a Query for the given table.
 func NewQuery[T any](db *DB, table string, scan ScanFunc[T], conds []lux.Condition) *Query[T] {
-	return &Query[T]{db: db, table: table, scan: scan, conds: conds}
+	return &Query[T]{queryReader: queryReader[T]{db: db, table: table, scan: scan, conds: conds}}
 }
 
 // Where appends additional conditions to the query (chainable).
@@ -42,7 +48,7 @@ func (q *Query[T]) Select(fields ...string) *Query[T] {
 }
 
 // All returns all matching records.
-func (q *Query[T]) All(ctx context.Context) ([]*T, error) {
+func (q *queryReader[T]) All(ctx context.Context) ([]*T, error) {
 	query, args := lux.BuildSelectSQL(q.table, q.fields, q.conds, q.orderBy, q.limit, q.offset)
 	return q.db.QueryRows(ctx, q.scan, query, args...)
 }
@@ -50,7 +56,7 @@ func (q *Query[T]) All(ctx context.Context) ([]*T, error) {
 // AllWithCount returns matching records and total count.
 // Pool queries run concurrently. A transaction owns one connection and must
 // finish reading its rows before executing the count on that same connection.
-func (q *Query[T]) AllWithCount(ctx context.Context) ([]*T, int64, error) {
+func (q *queryReader[T]) AllWithCount(ctx context.Context) ([]*T, int64, error) {
 	selectSQL, selectArgs := lux.BuildSelectSQL(q.table, q.fields, q.conds, q.orderBy, q.limit, q.offset)
 	countSQL, countArgs := lux.BuildCountSQL(q.table, q.conds)
 	switch q.db.conn.(type) {
@@ -62,7 +68,7 @@ func (q *Query[T]) AllWithCount(ctx context.Context) ([]*T, int64, error) {
 	return q.allWithCountFromPool(ctx, selectSQL, selectArgs, countSQL, countArgs)
 }
 
-func (q *Query[T]) allWithCountFromPool(ctx context.Context, selectSQL string, selectArgs []any, countSQL string, countArgs []any) ([]*T, int64, error) {
+func (q *queryReader[T]) allWithCountFromPool(ctx context.Context, selectSQL string, selectArgs []any, countSQL string, countArgs []any) ([]*T, int64, error) {
 	type countResult struct {
 		n   int64
 		err error
@@ -86,7 +92,7 @@ func (q *Query[T]) allWithCountFromPool(ctx context.Context, selectSQL string, s
 	return results, cr.n, nil
 }
 
-func (q *Query[T]) allWithCountInTransaction(ctx context.Context, selectSQL string, selectArgs []any, countSQL string, countArgs []any) ([]*T, int64, error) {
+func (q *queryReader[T]) allWithCountInTransaction(ctx context.Context, selectSQL string, selectArgs []any, countSQL string, countArgs []any) ([]*T, int64, error) {
 	results, err := q.db.QueryRows(ctx, q.scan, selectSQL, selectArgs...)
 	if err != nil {
 		return nil, 0, err
@@ -99,7 +105,7 @@ func (q *Query[T]) allWithCountInTransaction(ctx context.Context, selectSQL stri
 }
 
 // First returns the first matching record, or nil.
-func (q *Query[T]) First(ctx context.Context) (*T, error) {
+func (q *queryReader[T]) First(ctx context.Context) (*T, error) {
 	q.limit = 1
 	query, args := lux.BuildSelectSQL(q.table, q.fields, q.conds, q.orderBy, q.limit, q.offset)
 	return q.db.QueryRow(ctx, q.scan, query, args...)
@@ -107,7 +113,7 @@ func (q *Query[T]) First(ctx context.Context) (*T, error) {
 
 // FirstRequired returns the first record, reporting NotFound only for a
 // successful empty query. Database and scanner errors retain their identity.
-func (q *Query[T]) FirstRequired(ctx context.Context) (*T, error) {
+func (q *queryReader[T]) FirstRequired(ctx context.Context) (*T, error) {
 	value, err := q.First(ctx)
 	if err != nil {
 		return nil, err
@@ -119,14 +125,14 @@ func (q *Query[T]) FirstRequired(ctx context.Context) (*T, error) {
 }
 
 // Count returns the number of matching records.
-func (q *Query[T]) Count(ctx context.Context) (int64, error) {
+func (q *queryReader[T]) Count(ctx context.Context) (int64, error) {
 	query, args := lux.BuildCountSQL(q.table, q.conds)
 	return q.db.QueryScalar[int64](ctx, query, args...)
 }
 
 // AggregateBatch executes compatible scalar aggregates in one database
 // statement. Query conditions are shared; each spec may add its own filter.
-func (q *Query[T]) AggregateBatch(ctx context.Context, specs ...lux.AggregateSpec) ([]int64, error) {
+func (q *queryReader[T]) AggregateBatch(ctx context.Context, specs ...lux.AggregateSpec) ([]int64, error) {
 	query, args, err := buildAggregateBatchSQL(q.table, q.conds, specs)
 	if err != nil {
 		return nil, err
@@ -218,31 +224,31 @@ func aggregateConditionsSQL(conditions []lux.Condition, argOffset int) (string, 
 }
 
 // Sum returns an Int sum and reports overflow or a non-integral result.
-func (q *Query[T]) Sum(ctx context.Context, col string) (int64, error) {
+func (q *queryReader[T]) Sum(ctx context.Context, col string) (int64, error) {
 	query, args := lux.BuildAggregateSQL(q.table, "SUM", col, q.conds)
 	return q.db.QueryScalar[int64](ctx, query, args...)
 }
 
 // Avg returns a finite floating-point average without integer truncation.
-func (q *Query[T]) Avg(ctx context.Context, col string) (float64, error) {
+func (q *queryReader[T]) Avg(ctx context.Context, col string) (float64, error) {
 	return q.floatAggregate(ctx, "AVG", col)
 }
 
 // Max returns the maximum of an Int column without floating-point conversion.
-func (q *Query[T]) Max(ctx context.Context, col string) (int64, error) {
+func (q *queryReader[T]) Max(ctx context.Context, col string) (int64, error) {
 	query, args := lux.BuildAggregateSQL(q.table, "MAX", col, q.conds)
 	return q.db.QueryScalar[int64](ctx, query, args...)
 }
 
 // Min returns the minimum of an Int column without floating-point conversion.
-func (q *Query[T]) Min(ctx context.Context, col string) (int64, error) {
+func (q *queryReader[T]) Min(ctx context.Context, col string) (int64, error) {
 	query, args := lux.BuildAggregateSQL(q.table, "MIN", col, q.conds)
 	return q.db.QueryScalar[int64](ctx, query, args...)
 }
 
 // Exists returns true if any matching record exists.
 // Uses SELECT EXISTS(SELECT 1 ... LIMIT 1) — short-circuits on first match.
-func (q *Query[T]) Exists(ctx context.Context) (bool, error) {
+func (q *queryReader[T]) Exists(ctx context.Context) (bool, error) {
 	query, args := lux.BuildExistsSQL(q.table, q.conds)
 	return q.db.QueryScalar[bool](ctx, query, args...)
 }
@@ -267,7 +273,7 @@ func (q *Query[T]) Offset(n int) *Query[T] {
 
 // GroupBy reads an explicit projection with a concrete result scanner.
 // The query retains its current pool or transaction connection.
-func (q *Query[T]) GroupBy[R any](ctx context.Context, groupCols []string, columns []lux.GroupAgg, scan func(Rows) (R, error), having ...lux.Condition) ([]R, error) {
+func (q *queryReader[T]) GroupBy[R any](ctx context.Context, groupCols []string, columns []lux.GroupAgg, scan func(Rows) (R, error), having ...lux.Condition) ([]R, error) {
 	query, args := lux.BuildGroupBySQL(q.table, groupCols, columns, q.conds, q.orderBy, q.limit, q.offset, having...)
 	return queryValues(ctx, q.db, scan, query, args...)
 }

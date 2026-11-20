@@ -8,7 +8,7 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-func (q *Query[T]) floatAggregate(ctx context.Context, operation, col string) (float64, error) {
+func (q *queryReader[T]) floatAggregate(ctx context.Context, operation, col string) (float64, error) {
 	query, args := lux.BuildAggregateSQL(q.table, operation, col, q.conds)
 	value, err := q.db.QueryScalar[float64](ctx, query, args...)
 	if err != nil {
@@ -30,17 +30,17 @@ func (q *Query[T]) decimalAggregate(ctx context.Context, operation, col string) 
 }
 
 // SumFloat sums a Float column without narrowing to Int.
-func (q *Query[T]) SumFloat(ctx context.Context, col string) (float64, error) {
+func (q *queryReader[T]) SumFloat(ctx context.Context, col string) (float64, error) {
 	return q.floatAggregate(ctx, "SUM", col)
 }
 
 // MinFloat returns the minimum of a Float column.
-func (q *Query[T]) MinFloat(ctx context.Context, col string) (float64, error) {
+func (q *queryReader[T]) MinFloat(ctx context.Context, col string) (float64, error) {
 	return q.floatAggregate(ctx, "MIN", col)
 }
 
 // MaxFloat returns the maximum of a Float column.
-func (q *Query[T]) MaxFloat(ctx context.Context, col string) (float64, error) {
+func (q *queryReader[T]) MaxFloat(ctx context.Context, col string) (float64, error) {
 	return q.floatAggregate(ctx, "MAX", col)
 }
 
