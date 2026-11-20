@@ -50,6 +50,23 @@ func TestJWTDurationArithmeticBoundaries(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAcceptsMixedDurationUnitOrder(t *testing.T) {
+	ResetConfig()
+	t.Cleanup(ResetConfig)
+	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("JWT_EXPIRES", "12h1d")
+	t.Setenv("JWT_REFRESH", "true")
+	t.Setenv("JWT_REFRESH_EXPIRES", "30m1w15s0.5d")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Expires != 36*time.Hour || cfg.RefreshExpires != 180*time.Hour+30*time.Minute+15*time.Second {
+		t.Fatalf("access expiry=%v, refresh expiry=%v", cfg.Expires, cfg.RefreshExpires)
+	}
+}
+
 func BenchmarkJWTDurationConfig(b *testing.B) {
 	for _, input := range []string{"7d", "1d12h", "0.5d", "30m"} {
 		b.Run(input, func(b *testing.B) {

@@ -236,10 +236,12 @@ func TestLoadConfigRejectsInvalidSecuritySettings(t *testing.T) {
 	}{
 		{name: "empty secret", key: "JWT_SECRET", value: ""},
 		{name: "non-positive expiry", key: "JWT_EXPIRES", value: "0s"},
+		{name: "negative mixed expiry", key: "JWT_EXPIRES", value: "-1h1d"},
 		{name: "overflow expiry", key: "JWT_EXPIRES", value: "100000d100000d100000d"},
 		{name: "malformed expiry", key: "JWT_EXPIRES", value: "1..2d"},
 		{name: "invalid refresh flag", key: "JWT_REFRESH", value: "yes"},
 		{name: "non-positive refresh expiry", key: "JWT_REFRESH_EXPIRES", value: "-1s"},
+		{name: "negative mixed refresh expiry", key: "JWT_REFRESH_EXPIRES", value: "-1d48h"},
 		{name: "overflow refresh expiry", key: "JWT_REFRESH_EXPIRES", value: "106752d"},
 		{name: "malformed refresh expiry", key: "JWT_REFRESH_EXPIRES", value: "1.2.3w"},
 	}
@@ -270,6 +272,7 @@ func TestParseDuration(t *testing.T) {
 		{"7d", 7 * 24 * time.Hour, false},
 		{"2w", 2 * 7 * 24 * time.Hour, false},
 		{"1d12h", 36 * time.Hour, false},
+		{"2*24h+12h", 60 * time.Hour, false},
 		{"30m", 30 * time.Minute, false},
 		{"168h", 168 * time.Hour, false},
 		{"500ms", 500 * time.Millisecond, false},

@@ -65,16 +65,9 @@ func loadConfigFromEnv() (*Config, error) {
 		return nil, fmt.Errorf("JWT_SECRET is not set")
 	}
 
-	expires := 7 * 24 * time.Hour // default 7d
-	if v, ok := env.Get("JWT_EXPIRES"); ok {
-		d, err := parseDuration(v)
-		if err != nil || d <= 0 {
-			if err == nil {
-				err = fmt.Errorf("duration must be positive")
-			}
-			return nil, fmt.Errorf("invalid JWT_EXPIRES: %w", err)
-		}
-		expires = d
+	expires, err := jwtExpiryFromEnv("JWT_EXPIRES", 7*24*time.Hour)
+	if err != nil {
+		return nil, err
 	}
 
 	refreshEnabled := false
@@ -88,16 +81,9 @@ func loadConfigFromEnv() (*Config, error) {
 		}
 	}
 
-	refreshExpires := 30 * 24 * time.Hour // default 30d
-	if v, ok := env.Get("JWT_REFRESH_EXPIRES"); ok {
-		d, err := parseDuration(v)
-		if err != nil || d <= 0 {
-			if err == nil {
-				err = fmt.Errorf("duration must be positive")
-			}
-			return nil, fmt.Errorf("invalid JWT_REFRESH_EXPIRES: %w", err)
-		}
-		refreshExpires = d
+	refreshExpires, err := jwtExpiryFromEnv("JWT_REFRESH_EXPIRES", 30*24*time.Hour)
+	if err != nil {
+		return nil, err
 	}
 
 	return &Config{
@@ -106,6 +92,21 @@ func loadConfigFromEnv() (*Config, error) {
 		RefreshEnabled: refreshEnabled,
 		RefreshExpires: refreshExpires,
 	}, nil
+}
+
+func jwtExpiryFromEnv(key string, fallback time.Duration) (time.Duration, error) {
+	raw, ok := env.Get(key)
+	if !ok {
+		return fallback, nil
+	}
+	duration, err := parseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	if duration <= 0 || strings.HasPrefix(strings.TrimSpace(raw), "-") {
+		return 0, fmt.Errorf("invalid %s: duration must be positive", key)
+	}
+	return duration, nil
 }
 
 // Sign creates a JWT token with the given claims data.
@@ -303,35 +304,54 @@ func base64Decode(s string) ([]byte, error) {
 // parseDuration extends time.ParseDuration with support for "d" (days) and "w" (weeks).
 // Examples: "7d" → 168h, "2w" → 336h, "1d12h" → 36h, "30m" → 30m.
 func parseDuration(s string) (time.Duration, error) {
-	// Replace "d" and "w" with hour equivalents before parsing
-	var result string
-	i := 0
-	for i < len(s) {
-		j := i
-		// Scan digits
-		for j < len(s) && (s[j] >= '0' && s[j] <= '9' || s[j] == '.') {
-			j++
+	s = strings.TrimSuffix(s, "+")
+	unit := strings.IndexAny(s, "dw")
+	if unit >= 0 {
+		if unit == len(s)-1 {
+			if number, err := strconv.ParseFloat(s[:unit], 64); err == nil {
+				scale := 24 * time.Hour
+				if s[unit] == 'w' {
+					scale *= 7
+				}
+				return scaleDuration(number, scale, s)
+			}
 		}
-		if j < len(s) && s[j] == 'd' {
-			// Convert days to hours
-			result += s[i:j] + "*24h+"
-			i = j + 1
-		} else if j < len(s) && s[j] == 'w' {
-			// Convert weeks to hours
-			result += s[i:j] + "*168h+"
-			i = j + 1
-		} else {
-			result += string(s[i])
-			i++
-		}
+		return parseExtendedDuration(s)
 	}
-	result = strings.TrimSuffix(result, "+")
+	if strings.Contains(s, "*") {
+		return parseDurationWithMultiplier(s)
+	}
+	return time.ParseDuration(s)
+}
 
-	// If simple substitution (e.g. "7*24h"), evaluate manually
-	if strings.Contains(result, "*") {
-		return parseDurationWithMultiplier(result)
+func parseExtendedDuration(s string) (time.Duration, error) {
+	var normalized strings.Builder
+	start, numberStart := 0, 0
+	for i := 0; i < len(s); i++ {
+		unit := s[i]
+		if unit != 'd' && unit != 'w' {
+			if (unit < '0' || unit > '9') && unit != '.' {
+				numberStart = i + 1
+			}
+			continue
+		}
+		// Ordinary Go duration units end in h, m, or s. Separate that
+		// preceding duration from the number being scaled.
+		if numberStart > start && strings.IndexByte("hms", s[numberStart-1]) >= 0 {
+			normalized.WriteString(s[start:numberStart])
+			normalized.WriteByte('+')
+			start = numberStart
+		}
+		normalized.WriteString(s[start:i])
+		if unit == 'd' {
+			normalized.WriteString("*24h+")
+		} else {
+			normalized.WriteString("*168h+")
+		}
+		start, numberStart = i+1, i+1
 	}
-	return time.ParseDuration(result)
+	normalized.WriteString(s[start:])
+	return parseDurationWithMultiplier(strings.TrimSuffix(normalized.String(), "+"))
 }
 
 func parseDurationWithMultiplier(s string) (time.Duration, error) {
@@ -353,12 +373,10 @@ func parseDurationWithMultiplier(s string) (time.Duration, error) {
 			if err != nil {
 				return 0, fmt.Errorf("invalid duration %q: %w", s, err)
 			}
-			product := num * float64(d)
-			// The positive bound is exclusive: float64(MaxInt64) rounds to 2^63.
-			if math.IsNaN(product) || math.IsInf(product, 0) || product >= 0x1p63 || product < -0x1p63 {
-				return 0, fmt.Errorf("duration %q overflows", s)
+			duration, err = scaleDuration(num, d, s)
+			if err != nil {
+				return 0, err
 			}
-			duration = time.Duration(product)
 		} else {
 			d, err := time.ParseDuration(part)
 			if err != nil {
@@ -372,4 +390,13 @@ func parseDurationWithMultiplier(s string) (time.Duration, error) {
 		total += duration
 	}
 	return total, nil
+}
+
+func scaleDuration(number float64, unit time.Duration, input string) (time.Duration, error) {
+	product := number * float64(unit)
+	// The positive bound is exclusive: float64(MaxInt64) rounds to 2^63.
+	if math.IsNaN(product) || math.IsInf(product, 0) || product >= 0x1p63 || product < -0x1p63 {
+		return 0, fmt.Errorf("duration %q overflows", input)
+	}
+	return time.Duration(product), nil
 }
