@@ -18,7 +18,15 @@ func ToSnakeCase(s string) string {
 	var b strings.Builder
 	b.Grow(len(s) + 4)
 	for i, r := range runes {
-		if unicode.IsUpper(r) && i > 0 {
+		upper := r >= 'A' && r <= 'Z'
+		lower := r
+		if upper {
+			lower += 'a' - 'A'
+		} else if r >= utf8.RuneSelf {
+			upper = unicode.IsUpper(r)
+			lower = unicode.ToLower(r)
+		}
+		if upper && i > 0 {
 			prev := runes[i-1]
 			// Insert _ before: lowercase→Upper, or Upper→Upper when next is lowercase (end of acronym)
 			if unicode.IsLower(prev) {
@@ -27,7 +35,11 @@ func ToSnakeCase(s string) string {
 				b.WriteByte('_')
 			}
 		}
-		b.WriteRune(unicode.ToLower(r))
+		if lower < utf8.RuneSelf {
+			b.WriteByte(byte(lower))
+		} else {
+			b.WriteRune(lower)
+		}
 	}
 	return b.String()
 }
@@ -217,6 +229,9 @@ func MaskPattern(s, pattern string) string {
 			return maskAll(s)
 		}
 	}
+	if len(s) != len(pattern) && len(s) <= shortMaskInput {
+		return maskShortUTF8(s, pattern)
+	}
 	if utf8.RuneCountInString(s) != len(pattern) {
 		return maskAll(s)
 	}
@@ -244,6 +259,30 @@ func MaskPattern(s, pattern string) string {
 		position++
 	}
 	return b.String()
+}
+
+const shortMaskInput = 32
+
+func maskShortUTF8(s, pattern string) string {
+	// A malformed input byte may expand into a three-byte replacement rune.
+	var storage [3 * shortMaskInput]byte
+	masked := storage[:0]
+	position := 0
+	for _, r := range s {
+		if position == len(pattern) {
+			return maskAll(s)
+		}
+		if pattern[position] == '#' {
+			masked = utf8.AppendRune(masked, r)
+		} else {
+			masked = append(masked, '*')
+		}
+		position++
+	}
+	if position != len(pattern) {
+		return maskAll(s)
+	}
+	return string(masked)
 }
 
 func maskAll(s string) string {

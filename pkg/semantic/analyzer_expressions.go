@@ -142,11 +142,8 @@ func (a *Analyzer) setExprResolvedType(expr ast.Expr, resolved *ResolvedType) {
 	if expr == nil || resolved == nil {
 		return
 	}
-	expr.SetTypeTag(resolved.Name)
-	expr.SetNullable(resolved.Nullable)
-	expr.SetListType(resolved.IsList)
-	expr.SetModelType(resolved.Kind == TypeModel || resolved.Kind == TypeQueryBuilder)
-	expr.SetEnumType(resolved.Kind == TypeEnum)
+	expr.SetTypeMetadata(resolved.Name, resolved.Nullable, resolved.IsList,
+		resolved.Kind == TypeModel || resolved.Kind == TypeQueryBuilder, resolved.Kind == TypeEnum)
 	// Result is a transient error ABI; only its unwrapped value reaches codegen.
 	if len(resolved.TypeArgs) > 0 && resolved.Name != "Result" {
 		if a.genericExprTypes == nil {
@@ -1312,25 +1309,30 @@ func newCRUDScope(parent *Scope, model *ResolvedType) *Scope {
 	scope := &Scope{parent: parent, symbols: make(map[string]*Symbol, count)}
 	// Each query owns its symbols because lookup records usage.
 	symbols := make([]Symbol, count)
-	symbols = defineFieldsInScope(scope, model, symbols)
+	symbols = defineFieldsInScope(scope, model, symbols, false)
 	for _, ancestor := range model.Parents {
-		symbols = defineFieldsInScope(scope, ancestor, symbols)
+		symbols = defineFieldsInScope(scope, ancestor, symbols, true)
 	}
-	// Inject 'it' after the fields to preserve same-name field precedence.
-	symbols[0] = Symbol{Name: "it", Kind: SymVariable, Type: model}
-	scope.Define(&symbols[0])
+	if scope.symbols["it"] == nil {
+		// Inject 'it' after the fields to preserve same-name field precedence.
+		symbols[0] = Symbol{Name: "it", Kind: SymVariable, Type: model}
+		scope.symbols["it"] = &symbols[0]
+	}
 	return scope
 }
 
-func defineFieldsInScope(scope *Scope, typ *ResolvedType, symbols []Symbol) []Symbol {
+func defineFieldsInScope(scope *Scope, typ *ResolvedType, symbols []Symbol, inherited bool) []Symbol {
 	index := 0
 	for fieldName, field := range typ.Fields {
+		if inherited && scope.symbols[fieldName] != nil {
+			continue
+		}
 		symbols[index] = Symbol{
 			Name: fieldName,
 			Kind: SymField,
 			Type: field.Type,
 		}
-		scope.Define(&symbols[index])
+		scope.symbols[fieldName] = &symbols[index]
 		index++
 	}
 	return symbols[index:]

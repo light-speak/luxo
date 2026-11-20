@@ -69,19 +69,20 @@ func NewScope() *Scope {
 
 // Child creates a child scope.
 func (s *Scope) Child() *Scope {
-	return &Scope{
-		parent:  s,
-		symbols: make(map[string]*Symbol),
-	}
+	return &Scope{parent: s}
 }
 
 // Define adds a symbol to this scope. Returns false if already defined.
 func (s *Scope) Define(sym *Symbol) bool {
-	if _, exists := s.symbols[sym.Name]; exists {
+	if s.symbols == nil {
+		s.symbols = make(map[string]*Symbol)
+	} else if _, exists := s.symbols[sym.Name]; exists {
 		return false
 	}
 	s.symbols[sym.Name] = sym
-	delete(s.narrowed, sym.Name)
+	if s.narrowed != nil {
+		delete(s.narrowed, sym.Name)
+	}
 	return true
 }
 
@@ -98,7 +99,7 @@ func (s *Scope) Lookup(name string) *Symbol {
 // LookupReadOnly resolves a name through its scope chain without marking usage.
 func (s *Scope) LookupReadOnly(name string) *Symbol {
 	for {
-		if sym, ok := s.symbols[name]; ok {
+		if sym := s.symbols[name]; sym != nil {
 			return sym
 		}
 		if s.parent == nil {

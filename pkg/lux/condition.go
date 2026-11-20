@@ -278,14 +278,16 @@ type cmpCond struct {
 }
 
 func (c *cmpCond) ToSQL(argOffset int) (string, []any) {
-	// c.col + " " + c.op + " $" + itoa — no fmt.Sprintf
 	var buf [32]byte
-	b := append(buf[:0], c.col...)
+	return string(c.appendSQL(buf[:0], argOffset)), []any{c.val}
+}
+
+func (c *cmpCond) appendSQL(b []byte, argOffset int) []byte {
+	b = append(b, c.col...)
 	b = append(b, ' ')
 	b = append(b, c.op...)
 	b = append(b, " $"...)
-	b = strconv.AppendInt(b, int64(argOffset), 10)
-	return string(b), []any{c.val}
+	return strconv.AppendInt(b, int64(argOffset), 10)
 }
 
 // inCond is an IN condition: col IN ($N, $N+1, ...).

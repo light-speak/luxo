@@ -10,6 +10,20 @@ import (
 
 // ========== Scope & Lookup Tests ==========
 
+func TestScopeAllSymbolsListsOnlyLocalBindings(t *testing.T) {
+	parent := NewScope()
+	parent.Define(&Symbol{Name: "parent", Kind: SymVariable})
+	child := parent.Child()
+	if got := child.AllSymbols(); len(got) != 0 {
+		t.Fatalf("empty child lists parent symbols: %v", got)
+	}
+	local := &Symbol{Name: "local", Kind: SymVariable}
+	child.Define(local)
+	if got := child.AllSymbols(); len(got) != 1 || got[0] != local {
+		t.Fatalf("child symbols = %v, want local binding", got)
+	}
+}
+
 func TestBareBuiltinValuesAreRejected(t *testing.T) {
 	for _, name := range []string{
 		"task", "cache", "storage", "mail", "services", "error", "request",

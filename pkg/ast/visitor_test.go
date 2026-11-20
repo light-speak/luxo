@@ -101,6 +101,20 @@ func TestExpressionTypeTags(t *testing.T) {
 	}
 }
 
+func TestSetTypeMetadataPreservesFlowTags(t *testing.T) {
+	node := &Ident{TypeTagged: TypeTagged{NarrowedTag: true, ResultValueNullable: true}}
+	var expr Expr = node
+	expr.SetTypeMetadata("Account", true, true, true, false)
+	if expr.GetTypeTag() != "Account" || !expr.IsNullable() || !expr.IsListType() || !expr.IsModelType() || expr.IsEnumType() {
+		t.Fatalf("wrong inferred type metadata: %+v", node.TypeTagged)
+	}
+	expr.SetTypeMetadata("Role", false, false, false, true)
+	if expr.GetTypeTag() != "Role" || expr.IsNullable() || expr.IsListType() || expr.IsModelType() || !expr.IsEnumType() ||
+		!node.NarrowedTag || !node.ResultValueNullable {
+		t.Fatalf("updating inferred type changed unrelated flow tags: %+v", node.TypeTagged)
+	}
+}
+
 func TestWalkExpressionShapes(t *testing.T) {
 	leaf := &Ident{Name: "leaf"}
 	body := &Block{Stmts: []Stmt{&ExprStmt{Expr: leaf}}}

@@ -230,7 +230,7 @@ func injectIdentityStores(identityType, typ *ResolvedType, directives []*ast.Dir
 
 // checkUnusedVariables warns about variables declared but never used.
 func (a *Analyzer) checkUnusedVariables(scope *Scope) {
-	for _, sym := range scope.AllSymbols() {
+	for _, sym := range scope.symbols {
 		if sym.Kind != SymVariable {
 			continue
 		}
@@ -575,17 +575,14 @@ func (a *Analyzer) resolveQueryMethod(method string, receiver *ResolvedType, mem
 	if receiver.Kind == TypeQueryBuilder {
 		modelType = receiver.ModelType
 	}
-	qb := &ResolvedType{
-		Kind:      TypeQueryBuilder,
-		Name:      modelType.Name + "QueryBuilder",
-		Fields:    modelType.Fields,
-		ModelType: modelType,
-	}
-
 	switch method {
 	case "where", "groupBy", "orderBy", "limit", "offset", "select":
-		// chaining methods — return a query builder
-		return qb
+		return &ResolvedType{
+			Kind:      TypeQueryBuilder,
+			Name:      modelType.Name + "QueryBuilder",
+			Fields:    modelType.Fields,
+			ModelType: modelType,
+		}
 	case "sum", "avg", "min", "max":
 		// The call's selected field determines its result type.
 		return nil

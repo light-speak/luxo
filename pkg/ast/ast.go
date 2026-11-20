@@ -247,6 +247,7 @@ type Expr interface {
 	SetModelType(bool)
 	IsEnumType() bool
 	SetEnumType(bool)
+	SetTypeMetadata(name string, nullable, list, model, enum bool)
 }
 
 // TypeTagged provides type tag storage for all Expr nodes via embedding.
@@ -271,6 +272,15 @@ func (t *TypeTagged) IsModelType() bool   { return t.ModelTypeTag }
 func (t *TypeTagged) SetModelType(v bool) { t.ModelTypeTag = v }
 func (t *TypeTagged) IsEnumType() bool    { return t.EnumTypeTag }
 func (t *TypeTagged) SetEnumType(v bool)  { t.EnumTypeTag = v }
+
+// SetTypeMetadata stores the inferred type while preserving flow-specific tags.
+func (t *TypeTagged) SetTypeMetadata(name string, nullable, list, model, enum bool) {
+	t.TypeTag = name
+	t.NullableTag = nullable
+	t.ListTypeTag = list
+	t.ModelTypeTag = model
+	t.EnumTypeTag = enum
+}
 
 // Literal: 42, 3.14, "hello", true, false, null, 7d
 type Literal struct {

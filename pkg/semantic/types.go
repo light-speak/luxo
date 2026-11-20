@@ -128,43 +128,7 @@ func BuiltinTypes() map[string]*ResolvedType {
 	floatType := &ResolvedType{Kind: TypeFloat, Name: "Float", Fields: map[string]*FieldInfo{}}
 	boolType := &ResolvedType{Kind: TypeBool, Name: "Boolean", Fields: map[string]*FieldInfo{}}
 
-	stringType := &ResolvedType{Kind: TypeString, Name: "String", Fields: map[string]*FieldInfo{
-		// properties
-		"length":  {Name: "length", Type: intType},
-		"isEmpty": {Name: "isEmpty", Type: boolType},
-		"size":    {Name: "size", Type: intType},
-		// transform — return String (self-ref resolved below)
-		"lowercase": {Name: "lowercase", Type: nil, IsMethod: true},
-		"uppercase": {Name: "uppercase", Type: nil, IsMethod: true},
-		"trim":      {Name: "trim", Type: nil, IsMethod: true},
-		"trimStart": {Name: "trimStart", Type: nil, IsMethod: true},
-		"trimEnd":   {Name: "trimEnd", Type: nil, IsMethod: true},
-		"reversed":  {Name: "reversed", Type: nil, IsMethod: true},
-		// Method counts and parameter types are checked by the String call validator.
-		"contains":   {Name: "contains", Type: boolType, IsMethod: true},
-		"startsWith": {Name: "startsWith", Type: boolType, IsMethod: true},
-		"endsWith":   {Name: "endsWith", Type: boolType, IsMethod: true},
-		"matches":    {Name: "matches", Type: boolType, IsMethod: true},
-		"replace":    {Name: "replace", Type: nil, IsMethod: true},
-		"replaceAll": {Name: "replaceAll", Type: nil, IsMethod: true},
-		"split":      {Name: "split", Type: nil, IsMethod: true},
-		"substring":  {Name: "substring", Type: nil, IsMethod: true},
-		"repeat":     {Name: "repeat", Type: nil, IsMethod: true},
-		"padStart":   {Name: "padStart", Type: nil, IsMethod: true},
-		"padEnd":     {Name: "padEnd", Type: nil, IsMethod: true},
-		"toInt":      {Name: "toInt", Type: &ResolvedType{Kind: TypeGeneric, Name: "Result", TypeArgs: []*ResolvedType{intType}}, IsMethod: true},
-		"toFloat":    {Name: "toFloat", Type: &ResolvedType{Kind: TypeGeneric, Name: "Result", TypeArgs: []*ResolvedType{floatType}}, IsMethod: true},
-	}}
-	// self-reference for string methods that return String
-	stringReturnMethods := []string{
-		"lowercase", "uppercase", "trim", "trimStart", "trimEnd", "reversed",
-		"replace", "replaceAll", "substring", "repeat", "padStart", "padEnd",
-	}
-	for _, m := range stringReturnMethods {
-		stringType.Fields[m].Type = stringType
-	}
-	// split returns a typed String list.
-	stringType.Fields["split"].Type = &ResolvedType{Kind: TypeString, Name: "String", IsList: true}
+	stringType := newStringType(intType, floatType, boolType)
 
 	identityType := newIdentityType()
 
@@ -194,6 +158,44 @@ func BuiltinTypes() map[string]*ResolvedType {
 		}},
 		"Identity": identityType,
 	}
+}
+
+func newStringType(intType, floatType, boolType *ResolvedType) *ResolvedType {
+	stringType := &ResolvedType{Kind: TypeString, Name: "String"}
+	// Method records belong to this compilation and remain independently mutable.
+	fields := [...]FieldInfo{
+		// properties
+		{Name: "length", Type: intType},
+		{Name: "isEmpty", Type: boolType},
+		{Name: "size", Type: intType},
+		// transform — return String
+		{Name: "lowercase", Type: stringType, IsMethod: true},
+		{Name: "uppercase", Type: stringType, IsMethod: true},
+		{Name: "trim", Type: stringType, IsMethod: true},
+		{Name: "trimStart", Type: stringType, IsMethod: true},
+		{Name: "trimEnd", Type: stringType, IsMethod: true},
+		{Name: "reversed", Type: stringType, IsMethod: true},
+		// Method counts and parameter types are checked by the String call validator.
+		{Name: "contains", Type: boolType, IsMethod: true},
+		{Name: "startsWith", Type: boolType, IsMethod: true},
+		{Name: "endsWith", Type: boolType, IsMethod: true},
+		{Name: "matches", Type: boolType, IsMethod: true},
+		{Name: "replace", Type: stringType, IsMethod: true},
+		{Name: "replaceAll", Type: stringType, IsMethod: true},
+		{Name: "split", Type: &ResolvedType{Kind: TypeString, Name: "String", IsList: true}, IsMethod: true},
+		{Name: "substring", Type: stringType, IsMethod: true},
+		{Name: "repeat", Type: stringType, IsMethod: true},
+		{Name: "padStart", Type: stringType, IsMethod: true},
+		{Name: "padEnd", Type: stringType, IsMethod: true},
+		{Name: "toInt", Type: &ResolvedType{Kind: TypeGeneric, Name: "Result", TypeArgs: []*ResolvedType{intType}}, IsMethod: true},
+		{Name: "toFloat", Type: &ResolvedType{Kind: TypeGeneric, Name: "Result", TypeArgs: []*ResolvedType{floatType}}, IsMethod: true},
+	}
+	stringType.Fields = make(map[string]*FieldInfo, len(fields))
+	for index := range fields {
+		field := &fields[index]
+		stringType.Fields[field.Name] = field
+	}
+	return stringType
 }
 
 // IsNonNullBoolean excludes nullable values and Boolean collections.

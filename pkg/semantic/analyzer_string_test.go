@@ -128,3 +128,11 @@ func TestStringBuiltinMethodsHaveSignatures(t *testing.T) {
 		}
 	}
 }
+
+func TestStringBuiltinsKeepSeparateFieldRecords(t *testing.T) {
+	first, second := BuiltinTypes()["String"], BuiltinTypes()["String"]
+	first.Fields["lowercase"].Type = nil
+	if second.Fields["lowercase"].Type != second || first.Fields["uppercase"].Type != first {
+		t.Fatal("editing a method type changed a separate field record")
+	}
+}

@@ -158,9 +158,16 @@ func appendWhere(b *strings.Builder, argIdx int, args []any, conds []Condition) 
 		return argIdx, args
 	}
 	b.WriteString(" WHERE ")
+	var scratch [32]byte
 	for i, c := range conds {
 		if i > 0 {
 			b.WriteString(" AND ")
+		}
+		if comparison, ok := c.(*cmpCond); ok {
+			b.Write(comparison.appendSQL(scratch[:0], argIdx))
+			args = append(args, comparison.val)
+			argIdx++
+			continue
 		}
 		frag, cArgs := c.ToSQL(argIdx)
 		b.WriteString(frag)

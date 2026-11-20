@@ -19,7 +19,9 @@ type typeDeclarationKey struct {
 func (a *Analyzer) declareSourceType(name string, kind TypeKind, pos token.Position, doc, module string, source typeDeclarationKey) *ResolvedType {
 	typ := a.declareType(name, kind, pos, doc)
 	if typ != nil {
-		a.typeOwners.register(name, module)
+		if module != "" {
+			a.typeOwners.register(name, module)
+		}
 		return typ
 	}
 	if source != (typeDeclarationKey{}) {
@@ -140,8 +142,12 @@ func (a *Analyzer) fileModule(filename string) string {
 func (a *Analyzer) collectExtendVisibility() {
 	for _, file := range a.files {
 		modName := a.fileModule(file.Name)
-		if modName == "" {
+		if modName == "" || len(file.Extends) == 0 {
 			continue
+		}
+		if a.extendVisible == nil {
+			a.extendVisible = make(map[string]map[string]bool)
+			a.extendFieldVisible = make(map[string]map[string]map[string]bool)
 		}
 		for _, ext := range file.Extends {
 			if a.extendVisible[modName] == nil {

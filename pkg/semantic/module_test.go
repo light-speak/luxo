@@ -137,6 +137,15 @@ func TestFileToModule_NoOrigin(t *testing.T) {
 
 // ========== Cross-Module Visibility Tests ==========
 
+func TestDeclarationsWithoutModulesLeaveVisibilityIndexesEmpty(t *testing.T) {
+	file := parseFileWithName(t, "model Entry { id: Int }", "entry.luxo")
+	analyzer := newAnalyzer()
+	analyzer.collectDeclarations(file)
+	if analyzer.typeOwners.owners != nil || analyzer.extendVisible != nil || analyzer.extendFieldVisible != nil {
+		t.Fatal("unscoped declarations allocated module visibility indexes")
+	}
+}
+
 func TestModuleCrossModuleTypeWithoutExtend(t *testing.T) {
 	// user.luxo defines model User and enum Role
 	userFile := parseFileWithName(t, `

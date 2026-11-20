@@ -103,6 +103,22 @@ func TestBuildCountWithCondition(t *testing.T) {
 	}
 }
 
+func TestBuildCountWithMixedConditionsKeepsArgumentOrder(t *testing.T) {
+	conds := []Condition{
+		NewBoolField("active").IsTrue(),
+		NewStringField("status").In("new", "pending"),
+		NewIntField("account_identifier_with_a_long_name").Eq(42),
+	}
+	sql, args := BuildCountSQL("users", conds)
+	want := "SELECT COUNT(*) FROM users WHERE active = $1 AND status IN ($2, $3) AND account_identifier_with_a_long_name = $4"
+	if sql != want {
+		t.Errorf("SQL = %q, want %q", sql, want)
+	}
+	if len(args) != 4 || args[0] != true || args[1] != "new" || args[2] != "pending" || args[3] != int64(42) {
+		t.Errorf("args = %v", args)
+	}
+}
+
 func TestBuildDelete(t *testing.T) {
 	conds := []Condition{NewIntField("id").Eq(42)}
 	sql, args := BuildDeleteSQL("users", conds)

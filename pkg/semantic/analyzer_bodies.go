@@ -24,17 +24,7 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 	for _, api := range file.APIs {
 		a.checkAuthPermissionConditions(api.Directives)
 		if api.Body != nil {
-			scope := a.scope.Child()
-			// add params to scope
-			for _, p := range api.Params {
-				pType := a.resolveTypeRef(p.Type, api.Pos)
-				scope.Define(&Symbol{
-					Name: p.Name,
-					Kind: SymParam,
-					Type: pType,
-					Pos:  api.Pos,
-				})
-			}
+			scope := a.callableScope(api.Params, api.Pos)
 			a.injectAuthenticatedIdentity(scope, api.Directives)
 			// @stream(EventName): inject `it` with event's field types
 			a.injectStreamIt(api, scope, file)
@@ -51,16 +41,7 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 	for _, fn := range file.Functions {
 		a.checkAuthPermissionConditions(fn.Directives)
 		if fn.Body != nil {
-			scope := a.scope.Child()
-			for _, p := range fn.Params {
-				pType := a.resolveTypeRef(p.Type, fn.Pos)
-				scope.Define(&Symbol{
-					Name: p.Name,
-					Kind: SymParam,
-					Type: pType,
-					Pos:  fn.Pos,
-				})
-			}
+			scope := a.callableScope(fn.Params, fn.Pos)
 			if hasNamedDirective(fn.Directives, "service") {
 				a.injectAuthenticatedIdentity(scope, fn.Directives)
 			}
@@ -80,6 +61,17 @@ func (a *Analyzer) checkBodies(file *ast.File) {
 	for _, on := range file.Listeners {
 		a.checkListener(on)
 	}
+}
+
+func (a *Analyzer) callableScope(params []*ast.ParamDecl, pos token.Position) *Scope {
+	scope := a.scope.Child()
+	// Parameters become reachable and expire together with the body scope.
+	symbols := make([]Symbol, len(params))
+	for index, param := range params {
+		symbols[index] = Symbol{Name: param.Name, Kind: SymParam, Type: a.resolveTypeRef(param.Type, pos), Pos: pos}
+		scope.Define(&symbols[index])
+	}
+	return scope
 }
 
 func (a *Analyzer) checkListener(listener *ast.OnDecl) {

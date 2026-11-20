@@ -112,11 +112,9 @@ func newAnalyzer() *Analyzer {
 		index++
 	}
 	return &Analyzer{
-		scope:              scope,
-		types:              types,
-		typeOwners:         newTypeOwnership(),
-		extendVisible:      make(map[string]map[string]bool),
-		extendFieldVisible: make(map[string]map[string]map[string]bool),
+		scope:      scope,
+		types:      types,
+		typeOwners: newTypeOwnership(),
 	}
 }
 
