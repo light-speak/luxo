@@ -210,7 +210,7 @@ func readFrame(r io.Reader, buf []byte, hdr *[4]byte) ([]byte, error) {
 	}
 	size := binary.BigEndian.Uint32(hdr[:])
 	if size > maxFrameSize {
-		return nil, fmt.Errorf("rpc: frame too large: %d bytes (max %d)", size, maxFrameSize)
+		return nil, oversizedReadFrame(size)
 	}
 	if int(size) > cap(buf) {
 		buf = make([]byte, size)
@@ -221,6 +221,44 @@ func readFrame(r io.Reader, buf []byte, hdr *[4]byte) ([]byte, error) {
 		return nil, err
 	}
 	return buf, nil
+}
+
+func oversizedReadFrame(size uint32) error {
+	return fmt.Errorf("rpc: frame too large: %d bytes (max %d)", size, maxFrameSize)
+}
+
+// frameInput batches a small header and payload into one socket read.
+// The buffered bytes and deferred error belong to the current reader.
+type frameInput struct {
+	source     io.Reader
+	window     [32]byte
+	start, end uint8
+	pending    error
+}
+
+func (input *frameInput) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if input.start == input.end {
+		if input.pending != nil {
+			err := input.pending
+			input.pending = nil
+			return 0, err
+		}
+		if len(p) >= len(input.window) {
+			return input.source.Read(p)
+		}
+		n, err := input.source.Read(input.window[:])
+		if n == 0 {
+			return 0, err
+		}
+		input.start, input.end = 0, uint8(n)
+		input.pending = err
+	}
+	n := copy(p, input.window[input.start:input.end])
+	input.start += uint8(n)
+	return n, nil
 }
 
 // Bound per-connection idle retention without lowering the accepted frame size.

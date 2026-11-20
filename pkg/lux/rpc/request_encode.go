@@ -26,8 +26,15 @@ func (r callRequest) prepare(conn net.Conn) ([]byte, error) {
 	if ok {
 		dst = tracked.requestBuf
 	}
-	if cap(dst) < size+4 {
-		dst = make([]byte, 4, size+4)
+	frameSize := size + 4
+	if cap(dst) < frameSize {
+		capacity := frameSize
+		// Expose spare capacity in the small Go allocation classes for
+		// response reads. Keep shorter frames eligible for tiny allocation.
+		if capacity >= 16 && capacity < len(frameInput{}.window) {
+			capacity = (capacity + 7) &^ 7
+		}
+		dst = make([]byte, 4, capacity)
 	} else {
 		dst = dst[:4]
 		clear(dst)

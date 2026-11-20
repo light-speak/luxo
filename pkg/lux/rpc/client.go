@@ -153,6 +153,7 @@ func (c *Client) SubscribeContext(ctx context.Context, bearerToken string, apiID
 	if err != nil {
 		return nil, fmt.Errorf("rpc: dial %s: %w", c.pool.addr, err)
 	}
+	conn = streamResponseConn(conn)
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
 			conn.Close()
@@ -333,8 +334,12 @@ func (c *Client) exchangeRequest(ctx context.Context, payload []byte, request *c
 		return nil, fmt.Errorf("rpc: write: %w", err)
 	}
 
-	// The completed write leaves its prefix available for the response header.
-	resp, err := readFrame(conn, nil, (*[4]byte)(payload))
+	scratch := payload[:4]
+	if request != nil {
+		// Only frames prepared by this exchange have an owned request body.
+		scratch = payload[:cap(payload)]
+	}
+	resp, err := readClientFrame(conn, scratch)
 	if err != nil {
 		closeConnection()
 		if contextErr := contextErrorAfterIO(ctx, err); contextErr != nil {

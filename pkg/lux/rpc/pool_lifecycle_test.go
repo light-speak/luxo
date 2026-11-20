@@ -143,6 +143,20 @@ func TestClientExchangeCompletedResponseRacingCancellation(t *testing.T) {
 	})
 }
 
+func TestClientExchangePreservesPreparedRequestBody(t *testing.T) {
+	client, _ := traceLocalClient(t, false)
+	body := []byte{21, 42, 84}
+	frame := append(make([]byte, 4), body...)
+	for range 2 {
+		if _, err := client.exchange(context.Background(), frame); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(frame[4:], body) {
+			t.Fatalf("prepared request body changed: %x", frame[4:])
+		}
+	}
+}
+
 func TestPoolIdleBorrowReturnAllocations(t *testing.T) {
 	pool := NewPool("unused", 1)
 	conn := &poolLifecycleConn{}

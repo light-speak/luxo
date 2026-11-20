@@ -183,16 +183,14 @@ func (a *Analyzer) resolveModelFields(file *ast.File) {
 			continue
 		}
 		if typ.Fields == nil {
-			typ.Fields = make(map[string]*FieldInfo)
+			typ.Fields = make(map[string]*FieldInfo, len(m.Fields))
 		}
-		for _, f := range m.Fields {
-			fi := a.resolveFieldDecl(f)
-			a.validateStoredField(m.Name, f, fi)
-			if fi != nil {
-				if !a.registerDeclaredField(typ, fi, "model", "模型") {
-					continue
-				}
-			}
+		fields := make([]FieldInfo, len(m.Fields))
+		for index, field := range m.Fields {
+			resolved := &fields[index]
+			a.fillFieldDecl(field, resolved)
+			a.validateStoredField(m.Name, field, resolved)
+			a.registerDeclaredField(typ, resolved, "model", "模型")
 		}
 		a.validatePrimaryKeyFields(m)
 		a.checkDirectives(m.Directives, OnModel)
@@ -1455,7 +1453,13 @@ func upperFirstIdentifier(value string) string {
 }
 
 func (a *Analyzer) resolveFieldDecl(f *ast.FieldDecl) *FieldInfo {
-	fi := &FieldInfo{
+	fi := new(FieldInfo)
+	a.fillFieldDecl(f, fi)
+	return fi
+}
+
+func (a *Analyzer) fillFieldDecl(f *ast.FieldDecl, fi *FieldInfo) {
+	*fi = FieldInfo{
 		Name:     f.Name,
 		Pos:      f.Pos,
 		Doc:      f.Doc,
@@ -1477,7 +1481,6 @@ func (a *Analyzer) resolveFieldDecl(f *ast.FieldDecl) *FieldInfo {
 	}
 
 	a.checkFieldDirectives(f)
-	return fi
 }
 
 func (a *Analyzer) validateFieldDefault(field *ast.FieldDecl, expected *ResolvedType) {
@@ -1521,8 +1524,10 @@ func (a *Analyzer) resolveTypeRefInContext(ref *ast.TypeRef, pos token.Position,
 		return result
 	}
 
-	if parameter := a.resolveTypeParameter(ref, pos); parameter != nil {
-		return parameter
+	if len(a.typeParameters) != 0 {
+		if parameter := a.resolveTypeParameter(ref, pos); parameter != nil {
+			return parameter
+		}
 	}
 	typ := a.resolveNamedType(ref, pos, context)
 	if typ == nil {
@@ -1541,11 +1546,13 @@ func (a *Analyzer) resolveTypeRefInContext(ref *ast.TypeRef, pos token.Position,
 		EnumValues: typ.EnumValues,
 	}
 
-	// Generic args
-	for _, arg := range ref.TypeArgs {
-		result.TypeArgs = append(result.TypeArgs, a.resolveTypeRefInContext(arg, pos, context&^allowNativeResult))
+	if len(ref.TypeArgs) != 0 {
+		result.TypeArgs = make([]*ResolvedType, len(ref.TypeArgs))
+		for index, arg := range ref.TypeArgs {
+			result.TypeArgs[index] = a.resolveTypeRefInContext(arg, pos, context&^allowNativeResult)
+		}
+		a.registerGenericInstance(result, ref, pos)
 	}
-	a.registerGenericInstance(result, ref, pos)
 
 	return result
 }

@@ -804,11 +804,11 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 
 	// load accepts key values, not query predicates. Model fields must never
 	// shadow caller parameters, and there is no query scope to allocate here.
+	isCRUD := isCRUDIdent(e) && !declaredFunction
 	callScope := scope
 	if !isModelLoadCall(e) && !declaredFunction {
-		callScope = a.injectCRUDScope(e, scope)
+		callScope = a.injectCRUDScope(e, scope, callNeedsModelFields(e.Args, isCRUD))
 	}
-	isCRUD := isCRUDIdent(e) && !declaredFunction
 
 	argTypes := make([]*ResolvedType, len(e.Args))
 	a.checkCallArguments(e, scope, callScope, callType, isCRUD, argTypes)
@@ -826,6 +826,20 @@ func (a *Analyzer) checkCallExpr(e *ast.CallExpr, scope *Scope) *ResolvedType {
 		}
 	}
 	return a.inferCheckedCallReturnType(e, callType)
+}
+
+// Named CRUD values use caller bindings. Only predicates, modifiers, and
+// positional arguments can read injected model fields.
+func callNeedsModelFields(args []*ast.NamedArg, crud bool) bool {
+	if !crud {
+		return len(args) != 0
+	}
+	for _, arg := range args {
+		if arg.Name == "" || arg.Name == "where" || isQueryModifierArg(arg.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Analyzer) checkCallArguments(e *ast.CallExpr, scope, callScope *Scope, callType *ResolvedType, isCRUD bool, argTypes []*ResolvedType) {
@@ -1195,7 +1209,7 @@ func (a *Analyzer) isMyMethodCall(e *ast.CallExpr) bool {
 
 // injectCRUDScope creates a child scope with model fields injected for CRUD operations.
 // Handles both function-style find(User, where: ...) and chain-style User.find(where: ...).
-func (a *Analyzer) injectCRUDScope(e *ast.CallExpr, scope *Scope) *Scope {
+func (a *Analyzer) injectCRUDScope(e *ast.CallExpr, scope *Scope, needsFields bool) *Scope {
 	var modelType *ResolvedType
 
 	// function-style: find(User, where: ...)
@@ -1214,18 +1228,11 @@ func (a *Analyzer) injectCRUDScope(e *ast.CallExpr, scope *Scope) *Scope {
 		return scope
 	}
 	a.recordCacheModelRead(e, modelType)
-
-	callScope := scope.Child()
-	a.defineFieldsInScope(callScope, modelType)
-	for _, parent := range modelType.Parents {
-		a.defineFieldsInScope(callScope, parent)
+	if !needsFields {
+		return scope
 	}
-	// inject 'it' as a reference to the model type for disambiguation
-	callScope.Define(&Symbol{
-		Name: "it",
-		Kind: SymVariable,
-		Type: modelType,
-	})
+
+	callScope := newCRUDScope(scope, modelType)
 	// warn about ambiguous identifiers: field name shadows an outer scope symbol
 	a.warnAmbiguousCRUDFields(e, callScope, scope)
 	return callScope
@@ -1297,15 +1304,36 @@ func itMemberField(expr ast.Expr) string {
 	return m.Field
 }
 
-// defineFieldsInScope defines all fields from a type into the given scope.
-func (a *Analyzer) defineFieldsInScope(scope *Scope, typ *ResolvedType) {
+func newCRUDScope(parent *Scope, model *ResolvedType) *Scope {
+	count := len(model.Fields) + 1
+	for _, ancestor := range model.Parents {
+		count += len(ancestor.Fields)
+	}
+	scope := &Scope{parent: parent, symbols: make(map[string]*Symbol, count)}
+	// Each query owns its symbols because lookup records usage.
+	symbols := make([]Symbol, count)
+	symbols = defineFieldsInScope(scope, model, symbols)
+	for _, ancestor := range model.Parents {
+		symbols = defineFieldsInScope(scope, ancestor, symbols)
+	}
+	// Inject 'it' after the fields to preserve same-name field precedence.
+	symbols[0] = Symbol{Name: "it", Kind: SymVariable, Type: model}
+	scope.Define(&symbols[0])
+	return scope
+}
+
+func defineFieldsInScope(scope *Scope, typ *ResolvedType, symbols []Symbol) []Symbol {
+	index := 0
 	for fieldName, field := range typ.Fields {
-		scope.Define(&Symbol{
+		symbols[index] = Symbol{
 			Name: fieldName,
 			Kind: SymField,
 			Type: field.Type,
-		})
+		}
+		scope.Define(&symbols[index])
+		index++
 	}
+	return symbols[index:]
 }
 
 // inferCallReturnType infers the return type of a call expression.

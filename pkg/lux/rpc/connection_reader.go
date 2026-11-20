@@ -12,6 +12,14 @@ type incomingRequest struct {
 	err      error
 }
 
+type connectionReadMode uint8
+
+const (
+	connectionReadWaiting connectionReadMode = iota
+	connectionReadFrames
+	connectionReadProbe
+)
+
 // Two connection-scoped workers share one read token. The worker receiving a
 // request dispatches it directly while its peer observes further input/EOF.
 // A busy dispatcher permits one queued frame; a second queued frame closes the
@@ -21,7 +29,8 @@ type connectionReader struct {
 	cancel      context.CancelFunc
 	conn        net.Conn
 	server      *Server
-	ready       chan bool
+	ready       sync.Cond
+	mode        connectionReadMode
 	buffers     [2][]byte
 	bufferCount int
 	workers     sync.WaitGroup
@@ -30,7 +39,8 @@ type connectionReader struct {
 	busy        bool
 	queued      bool
 	pending     incomingRequest
-	headers     [2][4]byte // Each worker owns its header for its entire lifetime.
+	header      [4]byte // The read token protects the header and input.
+	input       frameInput
 }
 
 func (s *Server) serveConnection(conn net.Conn) {
@@ -41,32 +51,35 @@ func newConnectionReader(s *Server, conn net.Conn) *connectionReader {
 	ctx, cancel := context.WithCancel(s.ctx)
 	r := &connectionReader{
 		ctx: ctx, cancel: cancel, conn: conn, server: s,
-		ready: make(chan bool, 1),
+		mode: connectionReadFrames, input: frameInput{source: conn},
 	}
+	r.ready.L = &r.mu
 	return r
 }
 
 func (r *connectionReader) serve() {
-	r.ready <- false
 	r.workers.Add(1)
 	defer r.workers.Wait()
 	go r.background()
-	r.run(&r.headers[0])
+	r.run()
 }
 
 func (r *connectionReader) close() {
-	r.cancel()
-	r.closeOnce.Do(func() { r.conn.Close() })
+	r.closeOnce.Do(func() {
+		r.cancel()
+		r.mu.Lock()
+		r.ready.Broadcast()
+		r.mu.Unlock()
+		r.conn.Close()
+	})
 }
 
 func (r *connectionReader) background() {
 	defer r.workers.Done()
-	r.run(&r.headers[1])
+	r.run()
 }
 
-func (r *connectionReader) readBuffer() []byte {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func (r *connectionReader) takeBufferLocked() []byte {
 	if r.bufferCount == 0 {
 		return nil
 	}
@@ -85,56 +98,72 @@ func (r *connectionReader) recycleLocked(payload []byte) {
 	}
 }
 
-func (r *connectionReader) run(header *[4]byte) {
+func (r *connectionReader) run() {
 	defer r.close()
 	for {
-		select {
-		case <-r.ctx.Done():
+		mode, buffer := r.waitForRead()
+		if mode == connectionReadWaiting {
 			return
-		case probe := <-r.ready:
-			if r.ctx.Err() != nil {
-				return
-			}
-			if probe {
-				r.probe(header)
-				return
-			}
-			if !r.readRequests(header) {
-				return
-			}
+		}
+		if mode == connectionReadProbe {
+			r.probe()
+			return
+		}
+		if !r.readRequests(buffer) {
+			return
 		}
 	}
 }
 
-func (r *connectionReader) probe(header *[4]byte) {
-	r.conn.Read(header[:1])
+func (r *connectionReader) waitForRead() (connectionReadMode, []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for r.mode == connectionReadWaiting && r.ctx.Err() == nil {
+		r.ready.Wait()
+	}
+	if r.ctx.Err() != nil {
+		return connectionReadWaiting, nil
+	}
+	mode := r.mode
+	r.mode = connectionReadWaiting
+	if mode == connectionReadFrames {
+		return mode, r.takeBufferLocked()
+	}
+	return mode, nil
 }
 
-func (r *connectionReader) readRequests(header *[4]byte) bool {
+func (r *connectionReader) probe() {
+	r.input.Read(r.header[:1])
+}
+
+func (r *connectionReader) readRequests(buffer []byte) bool {
 	for {
-		payload, err := readFrame(r.conn, r.readBuffer(), header)
+		payload, err := readFrame(&r.input, buffer, &r.header)
 		if err != nil {
 			return false
 		}
 		envelope, err := decodeRequestEnvelope(payload)
 		request := incomingRequest{payload: payload, envelope: envelope, err: err}
-		dispatch, ok := r.claim(request)
+		stream := err == nil && envelope.kind == requestKindStream
+		dispatch, ok := r.claim(request, stream)
 		if !ok {
 			return false
 		}
-		stream := err == nil && envelope.kind == requestKindStream
 		if dispatch {
-			r.ready <- stream
+			r.ready.Signal()
 			return r.dispatch(request)
 		}
 		if stream {
-			r.probe(header)
+			r.probe()
 			return false
 		}
+		r.mu.Lock()
+		buffer = r.takeBufferLocked()
+		r.mu.Unlock()
 	}
 }
 
-func (r *connectionReader) claim(request incomingRequest) (bool, bool) {
+func (r *connectionReader) claim(request incomingRequest, stream bool) (bool, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.ctx.Err() != nil || r.queued {
@@ -146,6 +175,10 @@ func (r *connectionReader) claim(request incomingRequest) (bool, bool) {
 		return false, true
 	}
 	r.busy = true
+	r.mode = connectionReadFrames
+	if stream {
+		r.mode = connectionReadProbe
+	}
 	return true, true
 }
 

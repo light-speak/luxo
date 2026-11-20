@@ -188,35 +188,25 @@ type parser struct {
 
 // parseList parses: selection (',' selection)*
 func (p *parser) parseList() ([]*Field, error) {
-	p.skipSpaces()
-	if p.pos >= len(p.input) {
-		return nil, nil
-	}
-
 	var fields []*Field
-	f, err := p.parseField()
+	field, err := p.parseField()
 	if err != nil {
 		return nil, err
 	}
-	if f == nil {
+	if field == nil {
 		return nil, nil
 	}
-	fields = append(fields, f)
-
-	for {
-		p.skipSpaces()
-		if p.pos >= len(p.input) || p.input[p.pos] != ',' {
-			break
-		}
-		p.pos++ // skip ','
-		f, err := p.parseField()
+	fields = append(fields, field)
+	for p.pos < len(p.input) && p.input[p.pos] == ',' {
+		p.pos++
+		field, err := p.parseField()
 		if err != nil {
 			return nil, err
 		}
-		if f == nil {
+		if field == nil {
 			return nil, fmt.Errorf("expected field name after ',' at position %d", p.pos)
 		}
-		fields = append(fields, f)
+		fields = append(fields, field)
 	}
 
 	return fields, nil
@@ -245,11 +235,11 @@ func (p *parser) parseField() (*Field, error) {
 		if len(children) == 0 {
 			return nil, fmt.Errorf("empty selection block for '%s' at position %d", name, p.pos)
 		}
-		p.skipSpaces()
 		if p.pos >= len(p.input) || p.input[p.pos] != '}' {
 			return nil, fmt.Errorf("expected '}' for '%s' at position %d", name, p.pos)
 		}
 		p.pos++ // skip '}'
+		p.skipSpaces()
 		f.Children = children
 	}
 
@@ -259,6 +249,31 @@ func (p *parser) parseField() (*Field, error) {
 // readIdent preserves the DSL's Unicode letters and ASCII digits without normalizing names.
 func (p *parser) readIdent() (string, error) {
 	start := p.pos
+	if start >= len(p.input) {
+		return "", nil
+	}
+	first := p.input[start]
+	if first >= utf8.RuneSelf {
+		return p.readUnicodeIdent(start)
+	}
+	if !isIdentStart(first) {
+		return "", nil
+	}
+	for offset, c := range []byte(p.input[start+1:]) {
+		if isIdentStart(c) || c-'0' <= 9 {
+			continue
+		}
+		p.pos = start + offset + 1
+		if c >= utf8.RuneSelf {
+			return p.readUnicodeIdent(start)
+		}
+		return p.input[start:p.pos], nil
+	}
+	p.pos = len(p.input)
+	return p.input[start:], nil
+}
+
+func (p *parser) readUnicodeIdent(start int) (string, error) {
 	for p.pos < len(p.input) {
 		c := p.input[p.pos]
 		if c < utf8.RuneSelf {
@@ -287,5 +302,5 @@ func (p *parser) skipSpaces() {
 }
 
 func isIdentStart(c byte) bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+	return (c|0x20)-'a' <= 'z'-'a' || c == '_'
 }
