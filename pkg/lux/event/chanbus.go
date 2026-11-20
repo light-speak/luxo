@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/light-speak/luxo/internal/diagnostics"
@@ -25,15 +26,16 @@ var (
 // Zero external dependencies — used in embedded (single-process) mode.
 // Payloads use static owned snapshots — no serialization round trip.
 type ChanBus struct {
-	mu       sync.RWMutex
-	subs     map[string][]Handler
-	bufSize  int
-	channels map[string]chan Snapshot
-	done     chan struct{}
-	once     sync.Once
-	wg       sync.WaitGroup
-	reports  diagnostics.Events
-	closeErr error
+	handlerMu sync.RWMutex // Dispatch and registration do not touch the publisher lock.
+	subs      map[string][]Handler
+	bufSize   int
+	channels  map[string]chan Snapshot
+	closed    atomic.Bool
+	once      sync.Once
+	wg        sync.WaitGroup
+	mu        sync.RWMutex // Publisher access to channels and their shutdown.
+	reports   diagnostics.Events
+	closeErr  error
 }
 
 // NewChanBus creates a channel-based event bus.
@@ -46,7 +48,6 @@ func NewChanBus(bufSize int) *ChanBus {
 		subs:     make(map[string][]Handler),
 		bufSize:  bufSize,
 		channels: make(map[string]chan Snapshot),
-		done:     make(chan struct{}),
 	}
 }
 
@@ -59,11 +60,9 @@ func (b *ChanBus) Emit(ctx context.Context, name string, payload any) error {
 		return err
 	}
 	b.mu.RLock()
-	select {
-	case <-b.done:
+	if b.closed.Load() {
 		b.mu.RUnlock()
 		return ErrBusClosed
-	default:
 	}
 
 	ch, ok := b.channels[name]
@@ -87,25 +86,29 @@ func (b *ChanBus) On(name string, handler Handler) error {
 	if handler == nil {
 		return ErrHandlerRequired
 	}
-	b.mu.Lock()
+	b.handlerMu.Lock()
 	// Check if bus is closed
-	select {
-	case <-b.done:
-		b.mu.Unlock()
+	if b.closed.Load() {
+		b.handlerMu.Unlock()
 		return ErrBusClosed
-	default:
 	}
 	b.subs[name] = append(b.subs[name], handler)
 
 	if _, ok := b.channels[name]; !ok {
-		ch := make(chan Snapshot, b.bufSize)
-		b.channels[name] = ch
-		// Start dispatcher for this event
-		b.wg.Add(1)
-		go b.dispatch(name, ch)
+		b.startDispatcher(name)
 	}
-	b.mu.Unlock()
+	b.handlerMu.Unlock()
 	return nil
+}
+
+// startDispatcher runs with handlerMu held to serialize with Close.
+func (b *ChanBus) startDispatcher(name string) {
+	ch := make(chan Snapshot, b.bufSize)
+	b.mu.Lock()
+	b.channels[name] = ch
+	b.wg.Add(1)
+	go b.dispatch(name, ch)
+	b.mu.Unlock()
 }
 
 // OnQueue registers a queue handler. In single-process mode (ChanBus),
@@ -141,9 +144,9 @@ func (b *ChanBus) dispatchFrom(name string, ch <-chan Snapshot, state dispatchSt
 	b.dispatchListeners(name, &state)
 	state = dispatchState{}
 	for payload := range ch {
-		b.mu.RLock()
+		b.handlerMu.RLock()
 		handlers := b.subs[name]
-		b.mu.RUnlock()
+		b.handlerMu.RUnlock()
 		state = dispatchState{payload: payload, handlers: handlers}
 		b.dispatchListeners(name, &state)
 		state = dispatchState{}
@@ -183,12 +186,15 @@ func InvokeHandler(h Handler, ctx context.Context, payload any) (err error) {
 // Waits for all accepted events and in-flight handlers before returning.
 func (b *ChanBus) Close() error {
 	b.once.Do(func() {
-		close(b.done)
+		b.closed.Store(true)
+		// Finish admitted subscriptions before closing their channels.
+		b.handlerMu.Lock()
 		b.mu.Lock()
 		for _, ch := range b.channels {
 			close(ch)
 		}
 		b.mu.Unlock()
+		b.handlerMu.Unlock()
 		b.wg.Wait()
 		b.closeErr = b.reports.Drain(2 * time.Second)
 	})

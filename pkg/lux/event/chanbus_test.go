@@ -64,6 +64,48 @@ func TestChanBusEmitOn(t *testing.T) {
 	}
 }
 
+func TestChanBusListenerAddedDuringDispatchReceivesQueuedEvent(t *testing.T) {
+	bus := NewChanBus(2)
+	waiting, release := context.WithCancel(t.Context())
+	defer bus.Close()
+	defer release()
+	started := make(chan struct{})
+	if err := bus.On("audit", func(_ context.Context, value any) error {
+		if value == 1 {
+			close(started)
+			<-waiting.Done()
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Emit(t.Context(), "audit", immutablePayload(1)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first listener did not start")
+	}
+	if err := bus.Emit(t.Context(), "audit", immutablePayload(2)); err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan int, 2)
+	if err := bus.On("audit", func(_ context.Context, value any) error {
+		received <- value.(int)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if err := bus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(received) != 1 || <-received != 2 {
+		t.Fatal("new listener did not receive exactly the queued event")
+	}
+}
+
 func TestChanBusGoexitDoesNotDiscardAcceptedEvents(t *testing.T) {
 	bus := NewChanBus(2)
 	started := make(chan struct{})
@@ -239,7 +281,14 @@ func TestChanBusCloseWaitsForInFlightEmit(t *testing.T) {
 		bus.Close()
 		close(closed)
 	}()
-	<-bus.done
+	deadline := time.Now().Add(time.Second)
+	for !bus.closed.Load() {
+		if time.Now().After(deadline) {
+			bus.mu.RUnlock()
+			t.Fatal("Close did not publish the closed state")
+		}
+		runtime.Gosched()
+	}
 	owned, err := immutablePayload("accepted").SnapshotEvent()
 	if err != nil {
 		t.Fatal(err)
