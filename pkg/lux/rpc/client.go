@@ -333,8 +333,8 @@ func (c *Client) exchangeRequest(ctx context.Context, payload []byte, request *c
 		return nil, fmt.Errorf("rpc: write: %w", err)
 	}
 
-	// Read response frame
-	resp, err := ReadFrame(conn, nil)
+	// The completed write leaves its prefix available for the response header.
+	resp, err := readFrame(conn, nil, (*[4]byte)(payload))
 	if err != nil {
 		closeConnection()
 		if contextErr := contextErrorAfterIO(ctx, err); contextErr != nil {

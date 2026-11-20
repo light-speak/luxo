@@ -201,6 +201,10 @@ func writeStatusFrame(w io.Writer, status byte, payload []byte) error {
 // slices. The caller owns the buffer and controls its reuse lifetime.
 func ReadFrame(r io.Reader, buf []byte) ([]byte, error) {
 	var hdr [4]byte
+	return readFrame(r, buf, &hdr)
+}
+
+func readFrame(r io.Reader, buf []byte, hdr *[4]byte) ([]byte, error) {
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}

@@ -30,6 +30,7 @@ type connectionReader struct {
 	busy        bool
 	queued      bool
 	pending     incomingRequest
+	headers     [2][4]byte // Each worker owns its header for its entire lifetime.
 }
 
 func (s *Server) serveConnection(conn net.Conn) {
@@ -50,7 +51,7 @@ func (r *connectionReader) serve() {
 	r.workers.Add(1)
 	defer r.workers.Wait()
 	go r.background()
-	r.run()
+	r.run(&r.headers[0])
 }
 
 func (r *connectionReader) close() {
@@ -60,7 +61,7 @@ func (r *connectionReader) close() {
 
 func (r *connectionReader) background() {
 	defer r.workers.Done()
-	r.run()
+	r.run(&r.headers[1])
 }
 
 func (r *connectionReader) readBuffer() []byte {
@@ -84,7 +85,7 @@ func (r *connectionReader) recycleLocked(payload []byte) {
 	}
 }
 
-func (r *connectionReader) run() {
+func (r *connectionReader) run(header *[4]byte) {
 	defer r.close()
 	for {
 		select {
@@ -95,24 +96,23 @@ func (r *connectionReader) run() {
 				return
 			}
 			if probe {
-				r.probe()
+				r.probe(header)
 				return
 			}
-			if !r.readRequests() {
+			if !r.readRequests(header) {
 				return
 			}
 		}
 	}
 }
 
-func (r *connectionReader) probe() {
-	var probe [1]byte
-	r.conn.Read(probe[:])
+func (r *connectionReader) probe(header *[4]byte) {
+	r.conn.Read(header[:1])
 }
 
-func (r *connectionReader) readRequests() bool {
+func (r *connectionReader) readRequests(header *[4]byte) bool {
 	for {
-		payload, err := ReadFrame(r.conn, r.readBuffer())
+		payload, err := readFrame(r.conn, r.readBuffer(), header)
 		if err != nil {
 			return false
 		}
@@ -128,7 +128,7 @@ func (r *connectionReader) readRequests() bool {
 			return r.dispatch(request)
 		}
 		if stream {
-			r.probe()
+			r.probe(header)
 			return false
 		}
 	}

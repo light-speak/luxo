@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -39,6 +41,21 @@ func TestReadFrameCapacityStillRejectsBadFrames(t *testing.T) {
 		if got, err := ReadFrame(bytes.NewReader(header[:]), storage); err == nil || got != nil {
 			t.Fatalf("accepted incomplete/oversized frame: %x, %v", got, err)
 		}
+	}
+}
+
+func TestReusedFrameHeaderRejectsTruncatedFollowingFrame(t *testing.T) {
+	wire := bytes.NewReader([]byte{0, 0, 0, 3, 'o', 'n', 'e', 0, 0, 0})
+	var header [4]byte
+	first, err := readFrame(wire, nil, &header)
+	if err != nil || string(first) != "one" {
+		t.Fatalf("first frame = %q, %v", first, err)
+	}
+	if frame, err := readFrame(wire, nil, &header); frame != nil || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated frame = %q, %v", frame, err)
+	}
+	if string(first) != "one" {
+		t.Fatalf("later read changed the first payload to %q", first)
 	}
 }
 
