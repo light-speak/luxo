@@ -495,7 +495,7 @@ func (match *closestSpelling) consider(candidate string) {
 	if lengthDelta >= match.distance || lengthDelta <= -match.distance {
 		return
 	}
-	if distance := editDistance(match.target, candidate); distance < match.distance {
+	if distance := spellingDistanceBelow(match.target, candidate, match.distance); distance < match.distance {
 		match.distance = distance
 		match.name = candidate
 	}
@@ -628,37 +628,30 @@ func (a *Analyzer) resolveQueryMethod(method string, receiver *ResolvedType, mem
 	}
 }
 
-func editDistance(a, b string) int {
-	m, n := len(a), len(b)
-	if m == 0 {
-		return n
+// Spelling suggestions consider fewer than three edits. Search only paths
+// that can improve the current distance, preserving byte-wise comparisons.
+func spellingDistanceBelow(left, right string, limit int) int {
+	delta := len(left) - len(right)
+	if delta >= limit || -delta >= limit {
+		return limit
 	}
-	if n == 0 {
-		return m
+	for len(left) != 0 && len(right) != 0 && left[0] == right[0] {
+		left, right = left[1:], right[1:]
 	}
-	// Two-row DP: O(n) space instead of O(m*n).
-	// Typical identifiers fit on the stack; longer names remain unrestricted.
-	var rows [2][64]int
-	prev, curr := rows[0][:], rows[1][:]
-	if n >= len(rows[0]) {
-		prev = make([]int, n+1)
-		curr = make([]int, n+1)
+	if len(left) == 0 || len(right) == 0 {
+		return len(left) + len(right)
 	}
-	for j := 0; j <= n; j++ {
-		prev[j] = j
+	if limit == 1 {
+		return limit
 	}
-	for i := 1; i <= m; i++ {
-		curr[0] = i
-		for j := 1; j <= n; j++ {
-			cost := 0
-			if a[i-1] != b[j-1] {
-				cost = 1
-			}
-			curr[j] = min(curr[j-1]+1, min(prev[j]+1, prev[j-1]+cost))
-		}
-		prev, curr = curr, prev
+	best := spellingDistanceBelow(left[1:], right[1:], limit-1)
+	if best > 0 {
+		best = spellingDistanceBelow(left[1:], right, best)
 	}
-	return prev[n]
+	if best > 0 {
+		best = spellingDistanceBelow(left, right[1:], best)
+	}
+	return 1 + best
 }
 
 func isBuiltinOp(name string) bool {

@@ -117,7 +117,7 @@ func (l *Loader[K, V]) loadBatched(ctx context.Context, requestScope *Scope, key
 			var zero V
 			return zero, b.err
 		}
-		return b.values[index], nil
+		return b.requests[index].value, nil
 	case <-ctx.Done():
 		var zero V
 		err := ctx.Err()
@@ -239,27 +239,30 @@ func (b *batch[K, V]) complete(results map[K]V, err error) {
 	b.err = err
 	if err == nil {
 		// Snapshot values in caller order before waking waiters.
-		b.values = make([]V, len(b.requestedKeys))
-		for i, key := range b.requestedKeys {
-			b.values[i] = results[key]
+		for i := range b.requests {
+			request := &b.requests[i]
+			request.value = results[request.key]
 		}
 	}
 	close(b.done)
 }
 
+type loadRequest[K comparable, V any] struct {
+	key   K
+	value V
+}
+
 // batch collects load requests within a window.
 type batch[K comparable, V any] struct {
-	ctx           context.Context
-	timer         *time.Timer
-	run           func()
-	requestedKeys []K
-	values        []V
-	done          chan struct{}
-	err           error
-	fields        []*selection.Field
-	hasRequest    bool
-	selectsAll    bool
-	once          sync.Once
+	ctx        context.Context
+	timer      *time.Timer
+	run        func()
+	requests   []loadRequest[K, V]
+	done       chan struct{}
+	err        error
+	fields     []*selection.Field
+	selectsAll bool
+	once       sync.Once
 }
 
 func newBatch[K comparable, V any](ctx context.Context) *batch[K, V] {
@@ -269,11 +272,10 @@ func newBatch[K comparable, V any](ctx context.Context) *batch[K, V] {
 }
 
 func (b *batch[K, V]) add(key K, fields []*selection.Field) int {
-	index := len(b.requestedKeys)
-	b.requestedKeys = append(b.requestedKeys, key)
-	if !b.hasRequest {
+	index := len(b.requests)
+	b.requests = append(b.requests, loadRequest[K, V]{key: key})
+	if index == 0 {
 		b.done = make(chan struct{})
-		b.hasRequest = true
 		b.selectsAll = fields == nil
 		if fields != nil {
 			b.fields = fields
@@ -308,13 +310,14 @@ func sameSelection(left, right []*selection.Field) bool {
 }
 
 func (b *batch[K, V]) size() int {
-	return len(b.requestedKeys)
+	return len(b.requests)
 }
 
 func (b *batch[K, V]) keys() []K {
-	seen := make(map[K]bool, len(b.requestedKeys))
+	seen := make(map[K]bool, len(b.requests))
 	var keys []K
-	for _, key := range b.requestedKeys {
+	for i := range b.requests {
+		key := b.requests[i].key
 		if !seen[key] {
 			seen[key] = true
 			keys = append(keys, key)
@@ -324,7 +327,7 @@ func (b *batch[K, V]) keys() []K {
 }
 
 func (b *batch[K, V]) mergedSelection() []*selection.Field {
-	if b.selectsAll || !b.hasRequest {
+	if b.selectsAll || len(b.requests) == 0 {
 		return nil
 	}
 	return b.fields

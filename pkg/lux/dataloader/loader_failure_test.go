@@ -395,6 +395,8 @@ func TestBatchedLoadsPreserveMissingAndDuplicateKeys(t *testing.T) {
 			if len(keys) != 3 {
 				return nil, errors.New("batch did not deduplicate its keys")
 			}
+			// Backends can reuse their key slice without changing caller ordering.
+			clear(keys)
 			return rows, nil
 		}, Config{Wait: time.Hour, MaxBatch: 4})
 		results := make(chan result, 4)

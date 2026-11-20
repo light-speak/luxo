@@ -381,7 +381,7 @@ func BenchmarkEditDistance(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				if editDistance(left, right) != 1 {
+				if spellingDistanceBelow(left, right, 3) != 1 {
 					b.Fatal("incorrect edit distance")
 				}
 			}

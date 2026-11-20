@@ -288,7 +288,7 @@ func TestEditDistance(t *testing.T) {
 		{"abc", "xyz", 3},
 	}
 	for _, tt := range tests {
-		d := editDistance(tt.a, tt.b)
+		d := spellingDistanceBelow(tt.a, tt.b, 3)
 		if d != tt.expected {
 			t.Errorf("editDistance(%q, %q) = %d, expected %d", tt.a, tt.b, d, tt.expected)
 		}
@@ -296,13 +296,13 @@ func TestEditDistance(t *testing.T) {
 }
 
 func TestEditDistanceEmptyStrings(t *testing.T) {
-	if d := editDistance("", "abc"); d != 3 {
+	if d := spellingDistanceBelow("", "abc", 3); d != 3 {
 		t.Errorf("editDistance('', 'abc') = %d, want 3", d)
 	}
-	if d := editDistance("abc", ""); d != 3 {
+	if d := spellingDistanceBelow("abc", "", 3); d != 3 {
 		t.Errorf("editDistance('abc', '') = %d, want 3", d)
 	}
-	if d := editDistance("", ""); d != 0 {
+	if d := spellingDistanceBelow("", "", 3); d != 0 {
 		t.Errorf("editDistance('', '') = %d, want 0", d)
 	}
 }
@@ -350,7 +350,7 @@ func TestFindClosestStringMatchesDistanceReference(t *testing.T) {
 			for count := 0; count <= len(candidates); count++ {
 				if count > 0 {
 					candidate := candidates[count-1]
-					if d := editDistance(target, candidate); d < distance {
+					if d := referenceEditDistance(target, candidate); d < distance {
 						want, distance = candidate, d
 					}
 				}
@@ -362,16 +362,16 @@ func TestFindClosestStringMatchesDistanceReference(t *testing.T) {
 	}
 }
 
-func TestEditDistanceBufferBoundary(t *testing.T) {
+func TestEditDistanceIdentifierLengths(t *testing.T) {
 	for _, size := range []int{1, 63, 64, 65, 128} {
 		left := strings.Repeat("a", size)
 		right := strings.Repeat("a", size-1) + "b"
 		for _, pair := range [][2]string{{left, right}, {right, left}} {
-			if got := editDistance(pair[0], pair[1]); got != 1 {
+			if got := spellingDistanceBelow(pair[0], pair[1], 3); got != 1 {
 				t.Fatalf("length %d: distance = %d, want 1", size, got)
 			}
 		}
-		if got := editDistance(left, left+"xyz"); got != 3 {
+		if got := spellingDistanceBelow(left, left+"xyz", 3); got != 3 {
 			t.Fatalf("length %d: insertion distance = %d, want 3", size, got)
 		}
 	}
@@ -380,7 +380,7 @@ func TestEditDistanceBufferBoundary(t *testing.T) {
 func TestEditDistanceShortNamesDoNotAllocate(t *testing.T) {
 	var distance int
 	allocations := testing.AllocsPerRun(100, func() {
-		distance = editDistance("UserProfile", "UserProfiel")
+		distance = spellingDistanceBelow("UserProfile", "UserProfiel", 3)
 	})
 	if distance != 2 || allocations != 0 {
 		t.Fatalf("distance = %d, allocations = %g; want 2 and 0", distance, allocations)
@@ -388,31 +388,39 @@ func TestEditDistanceShortNamesDoNotAllocate(t *testing.T) {
 }
 
 func TestEditDistanceMatchesMatrix(t *testing.T) {
-	words := []string{"", "a", "b", "aa", "ab", "ba", "bb", "aba", "aab", "baa", "abcd", "dcba"}
+	words := []string{"", "a", "b", "aa", "ab", "ba", "bb", "aba", "aab", "baa", "abcd", "dcba",
+		"UserProfile", "UserProfiel", "é", "É", "用户", "用戶", "\x00", "\xff"}
 	for _, left := range words {
 		for _, right := range words {
-			width := len(right) + 1
-			matrix := make([]int, (len(left)+1)*width)
-			for i := 0; i <= len(left); i++ {
-				matrix[i*width] = i
-			}
-			for j := 0; j <= len(right); j++ {
-				matrix[j] = j
-			}
-			for i := 1; i <= len(left); i++ {
-				for j := 1; j <= len(right); j++ {
-					cost := 0
-					if left[i-1] != right[j-1] {
-						cost = 1
-					}
-					matrix[i*width+j] = min(matrix[(i-1)*width+j]+1, matrix[i*width+j-1]+1, matrix[(i-1)*width+j-1]+cost)
+			exact := referenceEditDistance(left, right)
+			for limit := 1; limit <= 3; limit++ {
+				if got, want := spellingDistanceBelow(left, right, limit), min(exact, limit); got != want {
+					t.Fatalf("%q/%q with limit %d: got %d, want %d", left, right, limit, got, want)
 				}
-			}
-			if got, want := editDistance(left, right), matrix[len(matrix)-1]; got != want {
-				t.Fatalf("%q/%q: got %d, want %d", left, right, got, want)
 			}
 		}
 	}
+}
+
+func referenceEditDistance(left, right string) int {
+	width := len(right) + 1
+	matrix := make([]int, (len(left)+1)*width)
+	for i := 0; i <= len(left); i++ {
+		matrix[i*width] = i
+	}
+	for j := 0; j <= len(right); j++ {
+		matrix[j] = j
+	}
+	for i := 1; i <= len(left); i++ {
+		for j := 1; j <= len(right); j++ {
+			cost := 0
+			if left[i-1] != right[j-1] {
+				cost = 1
+			}
+			matrix[i*width+j] = min(matrix[(i-1)*width+j]+1, matrix[i*width+j-1]+1, matrix[(i-1)*width+j-1]+cost)
+		}
+	}
+	return matrix[len(matrix)-1]
 }
 
 func TestDefineDuplicate(t *testing.T) {

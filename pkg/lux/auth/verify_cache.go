@@ -2,6 +2,7 @@ package auth
 
 import (
 	"fmt"
+	"hash/maphash"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,7 @@ type verifyShard struct {
 }
 
 var verifyCache [verifyCacheShards]verifyShard
+var verifyShardSeed = maphash.MakeSeed()
 
 func init() {
 	for i := range verifyCache {
@@ -41,16 +43,10 @@ func init() {
 	}
 }
 
-// verifyShardIndex picks a shard from the token's signature tail — the
-// highest-entropy part — via FNV-1a over at most the last 32 bytes.
+// Shard by the high-entropy signature tail with a process-local seed.
 func verifyShardIndex(token string) int {
-	start := max(len(token)-32, 0)
-	h := uint32(2166136261)
-	for i := start; i < len(token); i++ {
-		h ^= uint32(token[i])
-		h *= 16777619
-	}
-	return int(h % verifyCacheShards)
+	tail := token[max(0, len(token)-32):]
+	return int(maphash.String(verifyShardSeed, tail) % verifyCacheShards)
 }
 
 // VerifyCached is Verify with a bounded verification cache. Use it on
