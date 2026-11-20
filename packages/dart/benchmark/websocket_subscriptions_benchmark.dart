@@ -135,7 +135,9 @@ File _writeProbe(Directory directory, String kind, String? before) {
   final clockWeb = File('benchmark/clock_web.dart').absolute.uri;
   final probe = File('benchmark/websocket_${kind}_probe.dart.txt')
       .readAsStringSync();
-  final baseline = before == null ? '' : _snapshotBaseline(before);
+  final baseline = before == null
+      ? ''
+      : composeWebSocketBaseline(File(before).readAsStringSync());
   final lifecycle = File('benchmark/websocket_lifecycle_support.dart.txt')
       .readAsStringSync();
   final support = before == null
@@ -148,8 +150,7 @@ File _writeProbe(Directory directory, String kind, String? before) {
   );
 }
 
-String _snapshotBaseline(String path) {
-  final source = File(path).readAsStringSync();
+String composeWebSocketBaseline(String source) {
   final start = source.indexOf('class _Subscription {');
   final interfaceStart = source.indexOf('abstract class Transport {');
   final interfaceEnd = source.indexOf('\nvoid _writeRequest(', interfaceStart);
@@ -161,13 +162,21 @@ String _snapshotBaseline(String path) {
         'abstract class Transport',
         'abstract class _LegacyTransport',
       );
+  // Older transports used a private helper before the WebSocket class.
+  final schemaHelper = RegExp(
+    r'^Map<String, APISchemaEntry> _snapshotSchema\([\s\S]*?^}',
+    multiLine: true,
+  ).firstMatch(source)?.group(0);
   final implementation = source
       .substring(start)
       .replaceAll(RegExp(r'\b_Subscription\b'), '_BeforeSubscription')
       .replaceAll(RegExp(r'\bWsTransport\b'), '_BeforeTransport')
       .replaceAll('implements Transport', 'implements _LegacyTransport')
       .replaceAll(RegExp(r'\b_writeSequence\b'), '_writeBeforeSequence');
-  return '$contract\n$implementation';
+  return '${schemaHelper ?? ''}\n$contract\n$implementation'.replaceAll(
+    RegExp(r'\b_snapshotSchema\b'),
+    '_snapshotBeforeSchema',
+  );
 }
 
 String _webRunner(

@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:luxo_client/src/codegen.dart';
 import 'package:test/test.dart';
 
+import '../benchmark/websocket_subscriptions_benchmark.dart' as websocket_probe;
 import 'support/stream_decode_server.dart';
 import 'select_fixture.dart';
 
@@ -1671,6 +1672,42 @@ void main() {
       expect(result.exitCode, 0, reason: '${result.stdout}\n${result.stderr}');
     });
   }
+  test('WebSocket benchmark preserves the frozen schema helper', () {
+    const helper = '''
+Map<String, APISchemaEntry> _snapshotSchema(Map<String, APISchemaEntry> schema) {
+  return Map.unmodifiable(schema);
+}
+''';
+    const contract = '''
+abstract class Transport {}
+void _writeRequest() {}
+class _Subscription {}
+''';
+    const implementation = '''
+class WsTransport implements Transport {
+  void setSchema(Map<String, APISchemaEntry> schema) => _snapshotSchema(schema);
+}
+''';
+    final baseline = websocket_probe.composeWebSocketBaseline(
+      helper + contract + implementation,
+    );
+    expect(
+      baseline,
+      contains(
+        helper.trim().replaceAll('_snapshotSchema', '_snapshotBeforeSchema'),
+      ),
+    );
+    expect(baseline, contains('=> _snapshotBeforeSchema(schema);'));
+    expect(
+      baseline,
+      contains('class _BeforeTransport implements _LegacyTransport'),
+    );
+    expect(baseline, isNot(contains('_writeRequest')));
+    expect(
+      websocket_probe.composeWebSocketBaseline(contract),
+      isNot(contains('_snapshotBeforeSchema')),
+    );
+  });
   for (final missing in ['page', 'pageSize']) {
     test('reject missing stable pagination parameter $missing', () async {
       await _rejectSchema(
