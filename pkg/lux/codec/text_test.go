@@ -3,6 +3,7 @@ package codec
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -78,6 +79,57 @@ func TestStringReadersPreserveValidUTF8(t *testing.T) {
 		for _, tc := range textReaderCases() {
 			checkTextReader(t, tc, []byte(value), true)
 		}
+	}
+}
+
+func TestColumnarStringsOwnMixedValues(t *testing.T) {
+	mixed := make([]string, 32)
+	for index := range mixed {
+		mixed[index] = fmt.Sprintf("field value %04d", index)
+	}
+	mixed[16] = ""
+	mixed[17] = "x"
+	mixed[18] = strings.Repeat("東京", 15)
+	long := strings.Repeat("é", 65)
+	mixed[19] = long
+	for _, sample := range []struct {
+		name   string
+		values []string
+	}{
+		{"mixed", mixed},
+		{"large", slices.Repeat([]string{long}, 16)},
+		{"single packable", append([]string{strings.Repeat("b", 24), long}, make([]string, 14)...)},
+		{"unfavorable padding", append([]string{strings.Repeat("a", 24), strings.Repeat("b", 24), "eight123", long}, make([]string, 12)...)},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			var data []byte
+			for _, value := range sample.values {
+				data = AppendBytes(data, []byte(value))
+			}
+			reader := ColumnarReader{buf: data, count: len(sample.values)}
+			values := reader.ReadColumnString()
+			if reader.Err() != nil || reader.Offset() != len(data) {
+				t.Fatalf("string column ended at offset %d of %d, err %v", reader.Offset(), len(data), reader.Err())
+			}
+			clear(data)
+			if !slices.Equal(values, sample.values) {
+				t.Fatal("string column lost values after overwriting its input")
+			}
+		})
+	}
+}
+
+func TestColumnarStringsRejectInvalidTrailingValue(t *testing.T) {
+	const validRows = 32
+	var data []byte
+	for range validRows {
+		data = AppendBytes(data, []byte("valid text"))
+	}
+	badOffset := len(data)
+	data = AppendBytes(data, []byte{0xff})
+	reader := ColumnarReader{buf: data, count: validRows + 1}
+	if values := reader.ReadColumnString(); values != nil || reader.Err() == nil || reader.Offset() != badOffset {
+		t.Fatalf("invalid column returned %d values at offset %d, err %v", len(values), reader.Offset(), reader.Err())
 	}
 }
 

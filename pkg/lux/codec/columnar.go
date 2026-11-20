@@ -479,22 +479,107 @@ func (r *ColumnarReader) ReadColumnFloat() []float64 {
 	return result
 }
 
-// ReadColumnString reads count string values.
+const (
+	columnStringBlockRows      = 16
+	columnStringBlockBytes     = 256
+	minPackedColumnStringBytes = 8
+)
+
+// ReadColumnString reads count string values into independently owned storage.
 func (r *ColumnarReader) ReadColumnString() []string {
 	if !r.checkElements(1) {
 		return nil
 	}
+	// Pack dense columns of small strings while keeping the direct path for
+	// short columns and payloads dominated by empty or tiny strings.
+	if r.count >= columnStringBlockRows && r.count <= (len(r.buf)-r.off)/(minPackedColumnStringBytes+1) {
+		return r.readPackedColumnStrings(make([]string, r.count))
+	}
 	result := make([]string, 0, r.count)
 	for i := 0; i < r.count; i++ {
-		v, n := ReadString(r.buf, r.off)
+		value, n := ReadString(r.buf, r.off)
 		if n == 0 {
 			r.err = fmt.Errorf("codec: truncated string column at record %d", i)
 			return nil
 		}
 		r.off += n
-		result = append(result, v)
+		result = append(result, value)
 	}
 	return result
+}
+
+func (r *ColumnarReader) readPackedColumnStrings(result []string) []string {
+	var text [columnStringBlockBytes]byte
+	var entries [columnStringBlockRows]columnStringSpan
+	pending := entries[:0]
+	size := 0
+	for index := range result {
+		raw, n := readStringBytes(r.buf, r.off)
+		if n == 0 {
+			r.err = fmt.Errorf("codec: truncated string column at record %d", index)
+			return nil
+		}
+		r.off += n
+		if len(raw) < minPackedColumnStringBytes || len(raw) > columnStringBlockBytes/2 {
+			result[index] = string(raw)
+			continue
+		}
+		if len(pending) == cap(pending) || len(raw) > len(text)-size {
+			storeColumnStringSpans(result, pending, text[:size])
+			pending = pending[:0]
+			size = 0
+		}
+		size += copy(text[size:], raw)
+		pending = append(pending, columnStringSpan{index: index, end: size})
+	}
+	storeColumnStringSpans(result, pending, text[:size])
+	return result
+}
+
+type columnStringSpan struct {
+	index int
+	end   int
+}
+
+func storeColumnStringSpans(result []string, spans []columnStringSpan, text []byte) {
+	if len(spans) == 0 {
+		return
+	}
+	start := 0
+	if len(spans) == 1 || !canPackColumnStringSpans(spans, len(text)) {
+		for _, span := range spans {
+			result[span.index] = string(text[start:span.end])
+			start = span.end
+		}
+		return
+	}
+	owned := string(text)
+	for _, span := range spans {
+		result[span.index] = owned[start:span.end]
+		start = span.end
+	}
+}
+
+// Every 16-byte multiple through the maximum block size fits a Go small-object
+// size class. Count only guaranteed per-string padding above the tiny allocator
+// limit so a shared block does not cost more than individual copies.
+func canPackColumnStringSpans(spans []columnStringSpan, size int) bool {
+	padding := -size & 15
+	if padding == 0 {
+		return true
+	}
+	start := 0
+	for _, span := range spans {
+		length := span.end - start
+		if length >= 16 {
+			padding -= -length & 7
+			if padding <= 0 {
+				return true
+			}
+		}
+		start = span.end
+	}
+	return false
 }
 
 // ReadColumnBool reads count boolean values.
