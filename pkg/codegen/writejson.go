@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
@@ -334,10 +335,10 @@ func isArenaField(f *ast.FieldDecl, enums map[string]bool) bool {
 // Emits: var _arenaLen int; _arenaLen += len(...); ...
 // Always writes a totalStringLen prefix; returns whether any arena fields exist.
 func writeArenaLenCalc(b *strings.Builder, m *ast.ModelDecl, recv string, enums map[string]bool, masked bool, indent string) bool {
-	return defaultGenerator().writeArenaLenCalc(b, m, recv, enums, masked, indent)
+	return defaultGenerator().writeArenaLenCalc(b, m, recv, enums, masked, indent, false)
 }
 
-func (g *GeneratorContext) writeArenaLenCalc(b *strings.Builder, m *ast.ModelDecl, recv string, enums map[string]bool, masked bool, indent string) bool {
+func (g *GeneratorContext) writeArenaLenCalc(b *strings.Builder, m *ast.ModelDecl, recv string, enums map[string]bool, masked bool, indent string, compact bool) bool {
 	var arenaFields []struct {
 		goField  string
 		nullable bool
@@ -385,12 +386,13 @@ func (g *GeneratorContext) writeArenaLenCalc(b *strings.Builder, m *ast.ModelDec
 		}
 
 		if masked {
+			condition := rowFieldSelected(af.fieldID, compact)
 			if af.nullable {
-				fmt.Fprintf(b, "%sif codec.FieldMaskHas(mask, %d) && %s != nil { _arenaLen += %s }\n",
-					indent, af.fieldID, af.goField, ptrLenExpr)
+				fmt.Fprintf(b, "%sif %s && %s != nil { _arenaLen += %s }\n",
+					indent, condition, af.goField, ptrLenExpr)
 			} else {
-				fmt.Fprintf(b, "%sif codec.FieldMaskHas(mask, %d) { _arenaLen += %s }\n",
-					indent, af.fieldID, lenExpr)
+				fmt.Fprintf(b, "%sif %s { _arenaLen += %s }\n",
+					indent, condition, lenExpr)
 			}
 		} else {
 			if af.nullable {
@@ -400,7 +402,7 @@ func (g *GeneratorContext) writeArenaLenCalc(b *strings.Builder, m *ast.ModelDec
 			}
 		}
 	}
-	fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, uint64(_arenaLen))\n", indent)
+	fmt.Fprintf(b, "%sbuf.WriteLuxoVarint(uint64(_arenaLen))\n", indent)
 	return true
 }
 
@@ -430,21 +432,27 @@ func (g *writeJSONContext) generateWriteLuxo(b *strings.Builder, m *ast.ModelDec
 
 	// Output directives must also run for SELECT *, so those models use the
 	// directive-aware path even when the field mask is empty.
-	if !hasOutputDirectives(m) {
+	hasRelations := g.hasWriteRelation(m, enums)
+	compact := !hasRelations && g.useByteRowProjection(m)
+	if !hasOutputDirectives(m) && !compact {
 		fmt.Fprintf(b, "\tif len(mask) == 0 {\n")
-		g.writeArenaLenCalc(b, m, recv, enums, false, "\t\t")
+		g.writeArenaLenCalc(b, m, recv, enums, false, "\t\t", false)
 		g.generateWriteLuxoAllFields(b, m, recv, enums)
 		fmt.Fprintf(b, "\t\tbuf.B = append(buf.B, 0x00)\n")
 		fmt.Fprintf(b, "\t\treturn nil\n")
 		fmt.Fprintf(b, "\t}\n")
 	}
-	if g.hasWriteRelation(m, enums) {
+	if hasRelations {
 		b.WriteString("\tselectionMask := mask\n")
 	}
-	b.WriteString("\tmask = codec.SelectionMaskFields(mask)\n")
+	if compact {
+		b.WriteString("_fieldBits := byte(0xff)\nif len(mask) != 0 {\nmask = codec.SelectionMaskFields(mask)\nif len(mask) != 0 {_fieldBits = mask[0]}\n}\n")
+	} else {
+		b.WriteString("\tmask = codec.SelectionMaskFields(mask)\n")
+	}
 
 	// Slow path: arena len with mask checks, then field encoding
-	g.writeArenaLenCalc(b, m, recv, enums, true, "\t")
+	g.writeArenaLenCalc(b, m, recv, enums, true, "\t", compact)
 
 	for _, f := range m.Fields {
 		if f.Type == nil {
@@ -461,7 +469,7 @@ func (g *writeJSONContext) generateWriteLuxo(b *strings.Builder, m *ast.ModelDec
 		if isRelationField(f, enums) {
 			fmt.Fprintf(b, "\tif len(selectionMask) > 0 && codec.FieldMaskHas(mask, %d) {\n", fieldID)
 		} else {
-			fmt.Fprintf(b, "\tif codec.FieldMaskHas(mask, %d) {\n", fieldID)
+			fmt.Fprintf(b, "\tif %s {\n", rowFieldSelected(fieldID, compact))
 		}
 
 		// @visible: conditional field visibility based on identity
@@ -469,10 +477,9 @@ func (g *writeJSONContext) generateWriteLuxo(b *strings.Builder, m *ast.ModelDec
 
 		goField := recv + "." + str.Capitalize(f.Name)
 		baseType := f.Type.Name
-		fid := fmt.Sprintf("%d", fieldID)
 
 		if isRelationField(f, enums) {
-			g.writeNestedRowField(b, f, fid, goField, "selectionMask", "\t\t", nestedModelTarget(f.Type.Name, modelSets), g.isModelReference(f.Type.Name))
+			g.writeNestedRowField(b, f, fieldID, goField, "selectionMask", "\t\t", nestedModelTarget(f.Type.Name, modelSets), g.isModelReference(f.Type.Name))
 		} else {
 			// @transform: apply value transformation before writing
 			goField = g.writeFieldTransform(b, f, goField, "		")
@@ -481,7 +488,7 @@ func (g *writeJSONContext) generateWriteLuxo(b *strings.Builder, m *ast.ModelDec
 			goField = writeMaskDirective(b, f, goField, baseType)
 
 			// All fields write directly to buf.B — zero intermediate buffer
-			writeModelFieldEncoding(b, f, fid, goField, enums, "\t\t")
+			writeModelFieldEncoding(b, f, fieldID, goField, enums, "\t\t")
 		}
 		if hasVisible {
 			b.WriteString("\t }\n")
@@ -492,6 +499,31 @@ func (g *writeJSONContext) generateWriteLuxo(b *strings.Builder, m *ast.ModelDec
 	fmt.Fprintf(b, "\tbuf.B = append(buf.B, 0x00)\n")
 	fmt.Fprintf(b, "\treturn nil\n")
 	fmt.Fprintf(b, "}\n\n")
+}
+
+// Share the mask byte across fields. A single field keeps its direct all-fields path.
+func (g *GeneratorContext) useByteRowProjection(m *ast.ModelDecl) bool {
+	fieldCount := 0
+	for _, field := range m.Fields {
+		if field.Type == nil || hasDirective(field.Directives, "hidden") || hasDirective(field.Directives, "internal") {
+			continue
+		}
+		id := g.modelFieldID(m.Name, field.Name)
+		if id > 8 {
+			return false
+		}
+		if id > 0 {
+			fieldCount++
+		}
+	}
+	return fieldCount > 1
+}
+
+func rowFieldSelected(id int, compact bool) string {
+	if compact {
+		return fmt.Sprintf("_fieldBits&%d != 0", 1<<(id-1))
+	}
+	return fmt.Sprintf("codec.FieldMaskHas(mask, %d)", id)
 }
 
 func writeModelDepthGuard(b *strings.Builder, failure string) {
@@ -553,16 +585,17 @@ func (g *GeneratorContext) withCodecDepthNames(result *semantic.Result, declarat
 	return &copy
 }
 
-func (g *GeneratorContext) writeNestedRowField(b *strings.Builder, f *ast.FieldDecl, fid, goField, selectionMask, indent string, targetIsModel bool, pointerLists ...bool) {
+func (g *GeneratorContext) writeNestedRowField(b *strings.Builder, f *ast.FieldDecl, fieldID int, goField, selectionMask, indent string, targetIsModel bool, pointerLists ...bool) {
+	fid := strconv.Itoa(fieldID)
 	childMask := "nil"
 	if selectionMask != "" {
 		childMask = "_childMask" + fid
 		fmt.Fprintf(b, "%s%s, _ := codec.SelectionMaskNested(%s, %s)\n", indent, childMask, selectionMask, fid)
 	}
-	fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
+	writeBinaryFieldID(b, indent, fieldID)
 	if f.Type.Nullable {
-		fmt.Fprintf(b, "%sif %s == nil { buf.B = codec.AppendNull(buf.B) } else {\n", indent, goField)
-		fmt.Fprintf(b, "%sbuf.B = codec.AppendPresent(buf.B)\n", indent)
+		fmt.Fprintf(b, "%sif %s == nil { buf.WriteLuxoNull() } else {\n", indent, goField)
+		fmt.Fprintf(b, "%sbuf.WriteLuxoPresent()\n", indent)
 	}
 	sealed := g.sealedDeclaration(f.Type.Name) != nil
 	if sealed && !f.Type.IsList && !f.Type.Nullable {
@@ -623,33 +656,33 @@ func (g *GeneratorContext) hasWriteRelation(model *ast.ModelDecl, enums map[stri
 // writeModelFieldEncoding writes the binary encoding for a single model field.
 // Handles enums, all scalar types (Int/Float/String/Boolean/DateTime/Duration/UUID/Decimal/Bytes/JSON),
 // both nullable and non-nullable variants.
-func writeModelFieldEncoding(b *strings.Builder, f *ast.FieldDecl, fid, goField string, enums map[string]bool, indent string) {
+func writeModelFieldEncoding(b *strings.Builder, f *ast.FieldDecl, fieldID int, goField string, enums map[string]bool, indent string) {
 	// Scalar array field ([String], [Int], [UUID], ...). Relation lists are
 	// excluded by the caller via isRelationField.
 	if f.Type.IsList {
-		writeListScalarField(b, f, fid, goField, enums, indent)
+		writeListScalarField(b, f, fieldID, goField, enums, indent)
 		return
 	}
 	if enums[f.Type.Name] {
 		if f.Type.Nullable {
-			fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
+			writeBinaryFieldID(b, indent, fieldID)
 			fmt.Fprintf(b, "%sif %s != nil {\n", indent, goField)
-			fmt.Fprintf(b, "%s\tbuf.B = codec.AppendPresent(buf.B)\n", indent)
-			writeBinaryAppend(b, indent+"\t", "buf.B", enumAppendExpression(f.Type.Name, "buf.B", "*"+goField), "return err")
+			fmt.Fprintf(b, "%s\tbuf.WriteLuxoPresent()\n", indent)
+			writeBufferedBinaryAppend(b, indent+"\t", enumAppendExpression(f.Type.Name, "buf.B", "*"+goField))
 			fmt.Fprintf(b, "%s} else {\n", indent)
-			fmt.Fprintf(b, "%s\tbuf.B = codec.AppendNull(buf.B)\n", indent)
+			fmt.Fprintf(b, "%s\tbuf.WriteLuxoNull()\n", indent)
 			fmt.Fprintf(b, "%s}\n", indent)
 		} else {
-			fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
-			writeBinaryAppend(b, indent, "buf.B", enumAppendExpression(f.Type.Name, "buf.B", goField), "return err")
+			writeBinaryFieldID(b, indent, fieldID)
+			writeBufferedBinaryAppend(b, indent, enumAppendExpression(f.Type.Name, "buf.B", goField))
 		}
 		return
 	}
-	writeScalarEncoding(b, f.Type.Name, f.Type.Nullable, fid, goField, indent)
+	writeScalarEncoding(b, f.Type.Name, f.Type.Nullable, fieldID, goField, indent)
 }
 
 // writeScalarEncoding writes binary encoding for a scalar type, handling nullable.
-func writeScalarEncoding(b *strings.Builder, typeName string, nullable bool, fid, goField, indent string) {
+func writeScalarEncoding(b *strings.Builder, typeName string, nullable bool, fieldID int, goField, indent string) {
 	value := goField
 	if nullable {
 		value = "*" + value
@@ -661,9 +694,9 @@ func writeScalarEncoding(b *strings.Builder, typeName string, nullable bool, fid
 	if !ok {
 		return
 	}
-	fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
+	writeBinaryFieldID(b, indent, fieldID)
 	if !nullable {
-		writeBinaryAppend(b, indent, "buf.B", expression, "return err")
+		writeBufferedBinaryAppend(b, indent, expression)
 		return
 	}
 	condition := goField + " != nil"
@@ -671,10 +704,10 @@ func writeScalarEncoding(b *strings.Builder, typeName string, nullable bool, fid
 		condition = "!(" + nullableNullCondition(&ast.TypeRef{Name: typeName}, goField) + ")"
 	}
 	fmt.Fprintf(b, "%sif %s {\n", indent, condition)
-	fmt.Fprintf(b, "%s\tbuf.B = codec.AppendPresent(buf.B)\n", indent)
-	writeBinaryAppend(b, indent+"\t", "buf.B", expression, "return err")
+	fmt.Fprintf(b, "%s\tbuf.WriteLuxoPresent()\n", indent)
+	writeBufferedBinaryAppend(b, indent+"\t", expression)
 	fmt.Fprintf(b, "%s} else {\n", indent)
-	fmt.Fprintf(b, "%s\tbuf.B = codec.AppendNull(buf.B)\n", indent)
+	fmt.Fprintf(b, "%s\tbuf.WriteLuxoNull()\n", indent)
 	fmt.Fprintf(b, "%s}\n", indent)
 }
 
@@ -700,9 +733,8 @@ func (g *GeneratorContext) generateWriteLuxoAllFields(b *strings.Builder, m *ast
 			continue
 		}
 		goField := recv + "." + str.Capitalize(f.Name)
-		fid := fmt.Sprintf("%d", fieldID)
 
-		writeModelFieldEncoding(b, f, fid, goField, enums, "\t\t")
+		writeModelFieldEncoding(b, f, fieldID, goField, enums, "\t\t")
 	}
 }
 
@@ -738,7 +770,7 @@ func (g *writeJSONContext) generateTypeWriteLuxo(b *strings.Builder, m *ast.Mode
 		b.WriteString("\tselectionMask := mask\n")
 	}
 	b.WriteString("\tmask = codec.SelectionMaskFields(mask)\n")
-	g.writeArenaLenCalc(b, m, recv, enums, true, "\t")
+	g.writeArenaLenCalc(b, m, recv, enums, true, "\t", false)
 
 	for _, f := range m.Fields {
 		if f.Type == nil || hasDirective(f.Directives, "hidden") || hasDirective(f.Directives, "internal") {
@@ -749,7 +781,6 @@ func (g *writeJSONContext) generateTypeWriteLuxo(b *strings.Builder, m *ast.Mode
 			continue
 		}
 		goField := recv + "." + str.Capitalize(f.Name)
-		fid := fmt.Sprintf("%d", fieldID)
 		fmt.Fprintf(b, "\tif codec.FieldMaskHas(mask, %d) {\n", fieldID)
 		indent := "\t\t"
 		visibleExpr := g.writeVisibleConditionAt(b, f, enums, indent)
@@ -761,9 +792,9 @@ func (g *writeJSONContext) generateTypeWriteLuxo(b *strings.Builder, m *ast.Mode
 		goField = writeMaskDirectiveAt(b, f, goField, f.Type.Name, indent)
 
 		if isRelationField(f, enums) {
-			g.writeNestedRowField(b, f, fid, goField, "selectionMask", indent, modelNames[f.Type.Name], g.isModelReference(f.Type.Name))
+			g.writeNestedRowField(b, f, fieldID, goField, "selectionMask", indent, modelNames[f.Type.Name], g.isModelReference(f.Type.Name))
 		} else {
-			writeModelFieldEncoding(b, f, fid, goField, enums, indent)
+			writeModelFieldEncoding(b, f, fieldID, goField, enums, indent)
 		}
 		if visibleExpr != "" {
 			fmt.Fprintf(b, "\t\t}\n")
@@ -779,11 +810,11 @@ func (g *writeJSONContext) generateTypeWriteLuxo(b *strings.Builder, m *ast.Mode
 // writeListScalarField writes a list of scalar values (count + items) for
 // WriteLuxo, per the protocol array encoding: [varint count][items...].
 // Shared by model and type declarations; indent positions the emitted code.
-func writeListScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField string, enums map[string]bool, indent string) {
-	fmt.Fprintf(b, "%sbuf.B = codec.AppendVarint(buf.B, %s)\n", indent, fid)
+func writeListScalarField(b *strings.Builder, f *ast.FieldDecl, fieldID int, goField string, enums map[string]bool, indent string) {
+	writeBinaryFieldID(b, indent, fieldID)
 	if f.Type.Nullable {
-		fmt.Fprintf(b, "%sif %s == nil {\n%s\tbuf.B = codec.AppendNull(buf.B)\n%s} else {\n", indent, goField, indent, indent)
-		fmt.Fprintf(b, "%s\tbuf.B = codec.AppendPresent(buf.B)\n", indent)
+		fmt.Fprintf(b, "%sif %s == nil {\n%s\tbuf.WriteLuxoNull()\n%s} else {\n", indent, goField, indent, indent)
+		fmt.Fprintf(b, "%s\tbuf.WriteLuxoPresent()\n", indent)
 		writeScalarArrayItems(b, f.Type.Name, enums[f.Type.Name], goField, indent+"\t")
 		fmt.Fprintf(b, "%s}\n", indent)
 		return
@@ -792,10 +823,10 @@ func writeListScalarField(b *strings.Builder, f *ast.FieldDecl, fid, goField str
 }
 
 func writeScalarArrayItems(b *strings.Builder, elemType string, isEnum bool, goField, indent string) {
-	writeBinaryAppend(b, indent, "buf.B", fmt.Sprintf("codec.AppendArrayHeader(buf.B, len(%s))", goField), "return err")
+	writeBufferedBinaryAppend(b, indent, fmt.Sprintf("codec.AppendArrayHeader(buf.B, len(%s))", goField))
 	if expression := scalarArrayItemEncoding(elemType, isEnum, "buf.B"); expression != "" {
 		fmt.Fprintf(b, "%sfor _, v := range %s {\n", indent, goField)
-		writeBinaryAppend(b, indent+"\t", "buf.B", expression, "return err")
+		writeBufferedBinaryAppend(b, indent+"\t", expression)
 		fmt.Fprintf(b, "%s}\n", indent)
 	} else {
 		fmt.Fprintf(b, "%sfor i := range %s {\n", indent, goField)

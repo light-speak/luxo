@@ -183,13 +183,13 @@ func TestGeneratedJSONInputFile(t *testing.T) {
 			g := generatorWithModelFieldIDs(map[string]map[string]int{
 				"Record": {"value": 1}, "Input": {"value": 1}, "External": {"id": 1, "value": 2},
 			})
-			var source strings.Builder
-			source.Write(g.generateWriteJSONFile(result(&ast.File{
+			input := result(&ast.File{
 				Models: []*ast.ModelDecl{model}, Types: []*ast.TypeDecl{decl}, Extends: []*ast.ExtendDecl{ext},
-			}), "generated", nil))
-			generateModel(&source, model, nil)
-			generateTypeStruct(&source, decl, nil)
-			g.generateExtendStub(&source, ext)
+			})
+			generated := &GenerateResult{Files: map[string][]byte{
+				"model.gen.go":     g.generateModelFile(input, "generated", nil),
+				"writejson.gen.go": g.generateWriteJSONFile(input, "generated", nil),
+			}}
 			value := map[string]string{"Int": "42", "String": `"hello"`, "JSON": `{"n":123456789012345678901234567890}`}[kind]
 			assertions := fmt.Sprintf(`package generated
 import "testing"
@@ -201,7 +201,7 @@ func TestReadJSONInput(t *testing.T) {
 }
 
 `, `{"value":`+value+`}`)
-			runGeneratedProtocolPackage(t, source.String(), assertions)
+			runGeneratedCompilation(t, generated, assertions)
 		})
 	}
 }

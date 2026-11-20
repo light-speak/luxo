@@ -21,6 +21,32 @@ var (
 	errExpectedBase64  = errors.New("expected a base64 JSON string")
 )
 
+// ReadField assigns a present JSON token only after it has been parsed.
+// A nil token represents an absent field.
+func ReadField[T any](raw []byte, output *T, parse func([]byte) (T, error)) error {
+	if raw == nil {
+		return nil
+	}
+	value, err := parse(raw)
+	if err == nil {
+		*output = value
+	}
+	return err
+}
+
+// ReadOptionalField accepts a missing token or the literal null and otherwise
+// uses the same parser as a non-nullable field. The caller supplies exact tokens.
+func ReadOptionalField[T any](raw []byte, output **T, parse func([]byte) (T, error)) error {
+	if raw == nil || string(raw) == "null" {
+		return nil
+	}
+	value, err := parse(raw)
+	if err == nil {
+		*output = &value
+	}
+	return err
+}
+
 // ParseInt64 reads one non-null JSON integer without reflection or rounding.
 func ParseInt64(raw []byte) (int64, error) {
 	// JSON tokens normally have no boundary whitespace. Only the slow case

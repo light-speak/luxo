@@ -14,7 +14,7 @@ func TestWriteObjectArrayItemsPropagatesEncodingError(t *testing.T) {
 	var output strings.Builder
 	writeScalarArrayItems(&output, "Snapshot", false, "items", "\t")
 	for _, want := range []string{
-		"codec.AppendArrayHeader(buf.B, len(items))",
+		"buf.WriteLuxoArrayHeader(len(items))",
 		"for i := range items",
 		"items[i].WriteLuxo(buf, nil)",
 		"return err",
@@ -25,44 +25,52 @@ func TestWriteObjectArrayItemsPropagatesEncodingError(t *testing.T) {
 	}
 }
 
+func TestBufferedBinaryAppendKeepsDirectAssignment(t *testing.T) {
+	var output strings.Builder
+	writeBufferedBinaryAppend(&output, "\t", "codec.AppendVarint(buf.B, 128)")
+	if got := output.String(); got != "\tbuf.B = codec.AppendVarint(buf.B, 128)\n" {
+		t.Fatalf("unsigned varint append changed: %q", got)
+	}
+}
+
 func TestWriteScalarEncodingPreservesOutput(t *testing.T) {
 	for _, scalar := range []struct{ name, call, value, pointer string }{
-		{"Int", "AppendSvarint", "item.Value", "*item.Value"},
-		{"Float", "AppendFixed64", "item.Value", "*item.Value"},
-		{"String", "AppendString", "item.Value", "*item.Value"},
-		{"Boolean", "AppendBool", "item.Value", "*item.Value"},
-		{"DateTime", "AppendDateTime", "item.Value", "*item.Value"},
-		{"Duration", "AppendSvarint", "int64(item.Value)", "int64(*item.Value)"},
-		{"UUID", "AppendUUID", "[16]byte(item.Value)", "[16]byte(*item.Value)"},
-		{"Decimal", "AppendString", "lux.FormatDecimal(item.Value)", "lux.FormatDecimal(*item.Value)"},
-		{"Bytes", "AppendBytes", "item.Value", "*item.Value"},
-		{"JSON", "AppendJSON", "item.Value", "*item.Value"},
+		{"Int", "Int", "item.Value", "*item.Value"},
+		{"Float", "Float", "item.Value", "*item.Value"},
+		{"String", "String", "item.Value", "*item.Value"},
+		{"Boolean", "Bool", "item.Value", "*item.Value"},
+		{"DateTime", "DateTime", "item.Value", "*item.Value"},
+		{"Duration", "Int", "int64(item.Value)", "int64(*item.Value)"},
+		{"UUID", "UUID", "[16]byte(item.Value)", "[16]byte(*item.Value)"},
+		{"Decimal", "String", "lux.FormatDecimal(item.Value)", "lux.FormatDecimal(*item.Value)"},
+		{"Bytes", "Bytes", "item.Value", "*item.Value"},
+		{"JSON", "JSON", "item.Value", "*item.Value"},
 	} {
 		for _, nullable := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/nullable=%t", scalar.name, nullable), func(t *testing.T) {
 				value, indent := scalar.value, "\t"
-				want := "prefix\n\tbuf.B = codec.AppendVarint(buf.B, 7)\n"
+				want := "prefix\n\tbuf.AppendByte(7)\n"
 				if nullable {
 					value, indent = scalar.pointer, "\t\t"
 					condition := "item.Value != nil"
 					if scalar.name == "JSON" {
 						condition = "!(item.Value == nil || codec.IsJSONNull(*item.Value))"
 					}
-					want += "\tif " + condition + " {\n\t\tbuf.B = codec.AppendPresent(buf.B)\n"
+					want += "\tif " + condition + " {\n\t\tbuf.WriteLuxoPresent()\n"
 				}
-				call := fmt.Sprintf("codec.%s(buf.B, %s)", scalar.call, value)
+				call := fmt.Sprintf("buf.WriteLuxo%s(%s)", scalar.call, value)
 				switch scalar.name {
 				case "Float", "String", "DateTime", "Decimal", "JSON":
-					want += indent + "if encoded, err := " + call + "; err != nil { return err } else { buf.B = encoded }\n"
+					want += indent + "if err := " + call + "; err != nil { return err }\n"
 				default:
-					want += indent + "buf.B = " + call + "\n"
+					want += indent + call + "\n"
 				}
 				if nullable {
-					want += "\t} else {\n\t\tbuf.B = codec.AppendNull(buf.B)\n\t}\n"
+					want += "\t} else {\n\t\tbuf.WriteLuxoNull()\n\t}\n"
 				}
 				var output strings.Builder
 				output.WriteString("prefix\n")
-				writeScalarEncoding(&output, scalar.name, nullable, "7", "item.Value", "\t")
+				writeScalarEncoding(&output, scalar.name, nullable, 7, "item.Value", "\t")
 				if output.String() != want {
 					t.Fatalf("encoding changed:\ngot %q\nwant %q", output.String(), want)
 				}
@@ -75,7 +83,7 @@ func TestWriteScalarEncodingLeavesUnsupportedTypeUnchanged(t *testing.T) {
 	for _, nullable := range []bool{false, true} {
 		var output strings.Builder
 		output.WriteString("prefix")
-		writeScalarEncoding(&output, "NestedModel", nullable, "7", "item.Value", "\t")
+		writeScalarEncoding(&output, "NestedModel", nullable, 7, "item.Value", "\t")
 		if output.String() != "prefix" {
 			t.Fatal("non-scalar dispatch emitted a partial scalar")
 		}
@@ -172,13 +180,13 @@ func TestGenerateWriteLuxoWithFieldIDs(t *testing.T) {
 	if !strings.Contains(code, "func (u *User) WriteLuxo(buf *api.ResponseBuf, mask []byte)") {
 		t.Errorf("WriteLuxo method missing:\n%s", code)
 	}
-	// All-fields fast path
-	if !strings.Contains(code, "if len(mask) == 0") {
-		t.Errorf("fast path missing:\n%s", code)
+	// Empty masks select all fields in the compact model.
+	if !strings.Contains(code, "_fieldBits := byte(0xff)") {
+		t.Errorf("all-fields default missing:\n%s", code)
 	}
-	// Masked slow path
-	if !strings.Contains(code, "FieldMaskHas(mask,") {
-		t.Errorf("FieldMaskHas missing:\n%s", code)
+	// Registered field IDs select individual bits.
+	if !strings.Contains(code, "_fieldBits&1 != 0") {
+		t.Errorf("field selection missing:\n%s", code)
 	}
 	// Terminator
 	if !strings.Contains(code, "buf.B = append(buf.B, 0x00)") {
@@ -209,7 +217,7 @@ func TestGenerateWriteLuxoDateTimeField(t *testing.T) {
 	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
-	if !strings.Contains(code, "codec.AppendDateTime(") || strings.Contains(code, ".Unix()") {
+	if !strings.Contains(code, "buf.WriteLuxoDateTime(") || strings.Contains(code, ".Unix()") {
 		t.Errorf("DateTime must preserve nanoseconds:\n%s", code)
 	}
 	if !strings.Contains(code, "int64(") {
@@ -246,10 +254,10 @@ func TestGenerateWriteLuxoNullableFields(t *testing.T) {
 	code := string(src)
 
 	// Nullable should have AppendPresent/AppendNull pattern
-	if !strings.Contains(code, "AppendPresent") {
+	if !strings.Contains(code, "WriteLuxoPresent") {
 		t.Errorf("nullable field should have AppendPresent:\n%s", code)
 	}
-	if !strings.Contains(code, "AppendNull") {
+	if !strings.Contains(code, "WriteLuxoNull") {
 		t.Errorf("nullable field should have AppendNull:\n%s", code)
 	}
 }
@@ -442,7 +450,7 @@ func TestWriteColumnarMaskedStringField(t *testing.T) {
 	field := &ast.FieldDecl{Name: "secret", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "mask"}}}
 	writeDirectColumn(&b, directColumn{field: field, id: 3, stringValue: true}, nil, true)
 	code := b.String()
-	if !strings.Contains(code, "str.Mask(items[_row].Secret, 3, 4)") || !strings.Contains(code, "codec.AppendString(buf.B, v)") {
+	if !strings.Contains(code, "str.Mask(items[_row].Secret, 3, 4)") || !strings.Contains(code, "buf.WriteLuxoString(v)") {
 		t.Fatalf("masked columnar field is incomplete:\n%s", code)
 	}
 }
@@ -458,7 +466,7 @@ func TestWriteColumnarMaskedStringFieldWithPattern(t *testing.T) {
 	}
 	writeDirectColumn(&b, directColumn{field: field, id: 3, stringValue: true}, nil, true)
 	code := b.String()
-	if !strings.Contains(code, `str.MaskPattern(items[_row].Phone, "###****####")`) || !strings.Contains(code, "codec.AppendString(buf.B, v)") {
+	if !strings.Contains(code, `str.MaskPattern(items[_row].Phone, "###****####")`) || !strings.Contains(code, "buf.WriteLuxoString(v)") {
 		t.Fatalf("pattern-masked columnar field is incomplete:\n%s", code)
 	}
 }
@@ -512,7 +520,7 @@ func TestGenerateWriteColumnarAppliesTransformBeforeMask(t *testing.T) {
 	if !strings.Contains(code, "str.Mask(strings.ToUpper(items[_row].Name), 3, 4)") {
 		t.Fatalf("columnar writer must transform before masking:\n%s", code)
 	}
-	if !strings.Contains(code, "buf.B = codec.AppendVarint(buf.B, 1)") || !strings.Contains(code, "_arenaSize += len(v)") {
+	if !strings.Contains(code, "buf.AppendByte(1)") || !strings.Contains(code, "_arenaSize += len(v)") {
 		t.Fatalf("transformed values must stay columnar:\n%s", code)
 	}
 }
@@ -532,10 +540,10 @@ func TestGenerateWriteColumnarNullableTransform(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{model}}}}
 	code := string(generator.generateWriteJSONFile(result, "app", nil))
 
-	if !strings.Contains(code, "if items[_row].Nickname == nil { buf.B = codec.AppendNull(buf.B); continue }") || !strings.Contains(code, "v := strings.TrimSpace(*items[_row].Nickname)") {
+	if !strings.Contains(code, "if items[_row].Nickname == nil { buf.WriteLuxoNull(); continue }") || !strings.Contains(code, "v := strings.TrimSpace(*items[_row].Nickname)") {
 		t.Fatalf("nullable transform must preserve nulls:\n%s", code)
 	}
-	if !strings.Contains(code, "buf.B = codec.AppendPresent(buf.B)") {
+	if !strings.Contains(code, "buf.WriteLuxoPresent()") {
 		t.Fatalf("nullable transform must use the nullable column encoding:\n%s", code)
 	}
 	if !strings.Contains(code, "if u.Nickname != nil { nicknameTransformedValue := strings.TrimSpace(*u.Nickname)") {
@@ -565,10 +573,10 @@ func TestGenerateWriteColumnarHonorsVisible(t *testing.T) {
 	if !strings.Contains(code, condition) {
 		t.Fatalf("columnar writer must omit invisible columns:\n%s", code)
 	}
-	if strings.Index(code, condition) > strings.Index(code, "buf.B = codec.AppendVarint(buf.B, 1)") {
+	if strings.Index(code, condition) > strings.Index(code, "buf.AppendByte(1)") {
 		t.Fatal("visibility was checked after writing the column")
 	}
-	if !strings.Contains(code, "if items[_row].Salary == nil { buf.B = codec.AppendNull(buf.B); continue }") || !strings.Contains(code, "codec.AppendFixed64(buf.B, v)") {
+	if !strings.Contains(code, "if items[_row].Salary == nil { buf.WriteLuxoNull(); continue }") || !strings.Contains(code, "buf.WriteLuxoFloat(*items[_row].Salary)") {
 		t.Fatalf("visible nullable field must preserve nullable column encoding:\n%s", code)
 	}
 }
@@ -929,10 +937,10 @@ func TestGenerateTypeWriteLuxo(t *testing.T) {
 	if strings.Contains(out, "*AuthPayload") {
 		t.Errorf("should NOT use pointer receiver: %s", out)
 	}
-	if !strings.Contains(out, "AppendString") {
+	if !strings.Contains(out, "WriteLuxoString") {
 		t.Errorf("should write String field: %s", out)
 	}
-	if !strings.Contains(out, "AppendSvarint") {
+	if !strings.Contains(out, "WriteLuxoInt") {
 		t.Errorf("should write Int field: %s", out)
 	}
 }
@@ -959,13 +967,13 @@ func TestGenerateTypeWriteColumnar(t *testing.T) {
 	if !strings.Contains(out, "func WriteColumnarServiceSummary(buf *api.ResponseBuf, items []ServiceSummary, mask []byte)") {
 		t.Errorf("should take value slice: %s", out)
 	}
-	if !strings.Contains(out, "v := items[_row].ServiceName") || !strings.Contains(out, "codec.AppendString(buf.B, v)") {
+	if !strings.Contains(out, "v := items[_row].ServiceName") || !strings.Contains(out, "buf.WriteLuxoString(v)") {
 		t.Errorf("should write serviceName column: %s", out)
 	}
-	if !strings.Contains(out, "var v int64 = items[_row].ApiCount") {
+	if !strings.Contains(out, "buf.WriteLuxoInt(items[_row].ApiCount)") {
 		t.Errorf("should write apiCount column: %s", out)
 	}
-	if !strings.Contains(out, "if items[_row].Version == nil { buf.B = codec.AppendNull(buf.B); continue }") {
+	if !strings.Contains(out, "if items[_row].Version == nil { buf.WriteLuxoNull(); continue }") {
 		t.Errorf("should write nullable version column: %s", out)
 	}
 	if !strings.Contains(out, "values := items[_row].Tags") || !strings.Contains(out, "buf.EndMessage(_frame)") {
@@ -1087,10 +1095,10 @@ func TestGenerateTypeWriteColumnarNestedNullable(t *testing.T) {
 	field := &ast.FieldDecl{Name: "child", Type: &ast.TypeRef{Name: "Child", Nullable: true}}
 	writeDirectColumn(&b, directColumn{field: field, id: 4, relation: true}, nil, false)
 	code := b.String()
-	if !strings.Contains(code, "if items[_row].Child == nil { buf.B = codec.AppendNull(buf.B); continue }") || !strings.Contains(code, "items[_row].Child.writeLuxoDepth(buf, _childMask4, depth+1)") {
+	if !strings.Contains(code, "if items[_row].Child == nil { buf.WriteLuxoNull(); continue }") || !strings.Contains(code, "items[_row].Child.writeLuxoDepth(buf, _childMask4, depth+1)") {
 		t.Fatalf("nullable nested type must preserve null cells:\n%s", code)
 	}
-	if !strings.Contains(code, "buf.B = codec.AppendPresent(buf.B)") || !strings.Contains(code, "buf.EndMessage(_frame)") {
+	if !strings.Contains(code, "buf.WriteLuxoPresent()") || !strings.Contains(code, "buf.EndMessage(_frame)") {
 		t.Fatalf("nullable nested type must use canonical nullable column encoding:\n%s", code)
 	}
 }
@@ -1132,7 +1140,7 @@ func TestGenerateModelBinaryWritersIncludeRelations(t *testing.T) {
 	if !strings.Contains(columnarCode, "mask = codec.SelectionMaskFields(mask)") {
 		t.Fatalf("columnar writer must decode the recursive selection node:\n%s", columnarCode)
 	}
-	if !strings.Contains(columnarCode, "if items[_row].Child == nil { buf.B = codec.AppendNull(buf.B); continue }") || !strings.Contains(columnarCode, "buf.EndMessage(_frame)") {
+	if !strings.Contains(columnarCode, "if items[_row].Child == nil { buf.WriteLuxoNull(); continue }") || !strings.Contains(columnarCode, "buf.EndMessage(_frame)") {
 		t.Fatalf("nullable model relation must use nullable byte cells:\n%s", columnarCode)
 	}
 	if !strings.Contains(columnarCode, "func WriteColumnarParentValues(") {
@@ -1162,13 +1170,13 @@ func TestWriteColumnarArrayFieldAllScalarTypes(t *testing.T) {
 	}
 	code := b.String()
 	checks := []string{
-		"codec.AppendFixed64(buf.B, v)",
-		"codec.AppendBool(buf.B, v)",
-		"codec.AppendDateTime(buf.B, v)",
-		"codec.AppendSvarint(buf.B, int64(v))",
-		"codec.AppendString(buf.B, lux.FormatDecimal(v))",
-		"codec.AppendBytes(buf.B, v)",
-		"codec.AppendJSON(buf.B, v)",
+		"buf.WriteLuxoFloat(v)",
+		"buf.WriteLuxoBool(v)",
+		"buf.WriteLuxoDateTime(v)",
+		"buf.WriteLuxoInt(int64(v))",
+		"buf.WriteLuxoString(lux.FormatDecimal(v))",
+		"buf.WriteLuxoBytes(v)",
+		"buf.WriteLuxoJSON(v)",
 	}
 	for _, check := range checks {
 		if !strings.Contains(code, check) {
@@ -1208,16 +1216,16 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 	code := string(src)
 
 	// WriteLuxo checks
-	if !strings.Contains(code, "AppendUUID") {
+	if !strings.Contains(code, "WriteLuxoUUID") {
 		t.Errorf("UUID should use AppendUUID (16-byte fixed, per protocol):\n%s", code)
 	}
 	if !strings.Contains(code, "lux.FormatDecimal(") {
 		t.Errorf("Decimal should use bounded exact formatting:\n%s", code)
 	}
-	if !strings.Contains(code, "AppendBytes") {
+	if !strings.Contains(code, "WriteLuxoBytes") {
 		t.Errorf("Bytes should use AppendBytes:\n%s", code)
 	}
-	if !strings.Contains(code, "AppendJSON") || !strings.Contains(code, "ReadJSON()") || !strings.Contains(code, "ReadNullableJSON()") {
+	if !strings.Contains(code, "WriteLuxoJSON") || !strings.Contains(code, "ReadJSON()") || !strings.Contains(code, "ReadNullableJSON()") {
 		t.Errorf("JSON should use validated raw-value readers and writers:\n%s", code)
 	}
 
@@ -1239,16 +1247,16 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 	}
 
 	// WriteColumnar checks
-	if !strings.Contains(code, "codec.AppendUUID(buf.B, [16]byte(v))") {
+	if !strings.Contains(code, "buf.WriteLuxoUUID([16]byte(items[_row].Uuid))") {
 		t.Errorf("UUID columnar should use 16-byte fixed encoding:\n%s", code)
 	}
-	if !strings.Contains(code, "if items[_row].OptUuid == nil { buf.B = codec.AppendNull(buf.B); continue }") {
+	if !strings.Contains(code, "if items[_row].OptUuid == nil { buf.WriteLuxoNull(); continue }") {
 		t.Errorf("nullable UUID columnar should preserve null cells:\n%s", code)
 	}
 	if !strings.Contains(code, "v := lux.FormatDecimal(items[_row].Price)") {
 		t.Errorf("Decimal columnar should encode a string:\n%s", code)
 	}
-	if !strings.Contains(code, "v := items[_row].Data") {
+	if !strings.Contains(code, "buf.WriteLuxoBytes(items[_row].Data)") {
 		t.Errorf("Bytes columnar should encode bytes directly:\n%s", code)
 	}
 }
@@ -1280,9 +1288,9 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 
 	checks := []string{
 		// WriteLuxo: array header + per-type item append
-		"codec.AppendArrayHeader(buf.B, len(t.Tags))",
-		"codec.AppendUUID(buf.B, [16]byte(v))", // [UUID]
-		"Role(v).AppendLuxo(buf.B)",            // [Role] enum
+		"buf.WriteLuxoArrayHeader(len(t.Tags))",
+		"buf.WriteLuxoUUID([16]byte(v))", // [UUID]
+		"Role(v).AppendLuxo(buf.B)",      // [Role] enum
 		// ReadLuxo: array readers + conversions
 		"dec.ReadStringArray()",
 		"dec.ReadIntArray()",
@@ -1294,7 +1302,7 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 		"_frame := buf.BeginMessage()",
 		"buf.EndMessage(_frame)",
 		"values := items[_row].Tags",
-		"if encoded, err := codec.AppendArrayHeader(buf.B, len(values)); err != nil { return err }",
+		"if err := buf.WriteLuxoArrayHeader(len(values)); err != nil { return err }",
 	}
 	for _, c := range checks {
 		if !strings.Contains(code, c) {
@@ -1326,7 +1334,7 @@ func TestGenerateNestedModelListSeparatesResponseAndInput(t *testing.T) {
 	if !strings.Contains(code, "_n := dec.ReadArrayLength()") {
 		t.Fatalf("nested input list must retain its canonical unsigned array header:\n%s", code)
 	}
-	if strings.Contains(code, "codec.AppendSvarint(buf.B, int64(len(u.Posts)))") {
+	if strings.Contains(code, "buf.WriteLuxoInt(int64(len(u.Posts)))") {
 		t.Fatalf("nested model list must not zigzag-encode its length:\n%s", code)
 	}
 }
@@ -1373,7 +1381,7 @@ func TestWriteLuxoArenaHeader(t *testing.T) {
 		t.Errorf("should not include len for Int field:\n%s", code)
 	}
 	// Should write arena len to buf
-	if !strings.Contains(code, "AppendVarint(buf.B, uint64(_arenaLen))") {
+	if !strings.Contains(code, "WriteLuxoVarint(uint64(_arenaLen))") {
 		t.Errorf("should write _arenaLen as varint:\n%s", code)
 	}
 }
@@ -1911,11 +1919,11 @@ func TestWriteLuxoArenaHeaderMaskedPath(t *testing.T) {
 	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
-	// Masked path should check FieldMaskHas for arena len
-	if !strings.Contains(code, "FieldMaskHas(mask, 2) { _arenaLen += len(u.Name)") {
+	// Arena length uses the same selected bits as the row writer.
+	if !strings.Contains(code, "_fieldBits&2 != 0 { _arenaLen += len(u.Name)") {
 		t.Errorf("masked path should check mask for name arena len:\n%s", code)
 	}
-	if !strings.Contains(code, "FieldMaskHas(mask, 3) && u.Bio != nil") {
+	if !strings.Contains(code, "_fieldBits&4 != 0 && u.Bio != nil") {
 		t.Errorf("masked path should check mask + nil for nullable arena len:\n%s", code)
 	}
 }

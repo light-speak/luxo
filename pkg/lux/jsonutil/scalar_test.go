@@ -10,6 +10,50 @@ import (
 	"time"
 )
 
+func TestReadFieldsPublishOnlyParsedTokens(t *testing.T) {
+	value := int64(42)
+	if err := ReadField(nil, &value, ParseInt64); err != nil || value != 42 {
+		t.Fatalf("missing field: %d, %v", value, err)
+	}
+	if err := ReadField([]byte("invalid"), &value, ParseInt64); err == nil || value != 42 {
+		t.Fatalf("malformed field: %d, %v", value, err)
+	}
+	if err := ReadField([]byte("17"), &value, ParseInt64); err != nil || value != 17 {
+		t.Fatalf("valid field: %d, %v", value, err)
+	}
+	var optional *int64
+	for _, raw := range [][]byte{nil, []byte("null")} {
+		if err := ReadOptionalField(raw, &optional, ParseInt64); err != nil || optional != nil {
+			t.Fatalf("absent optional field: %v, %v", optional, err)
+		}
+	}
+	if err := ReadOptionalField([]byte("19"), &optional, ParseInt64); err != nil || optional == nil || *optional != 19 {
+		t.Fatalf("valid optional field: %v, %v", optional, err)
+	}
+	if err := ReadOptionalField([]byte("invalid"), &optional, ParseInt64); err == nil || *optional != 19 {
+		t.Fatalf("malformed optional field: %v, %v", optional, err)
+	}
+}
+
+func TestParseArrayBoundedPreservesTokenAndLimitErrors(t *testing.T) {
+	values, err := ParseArrayBounded([]byte("[1,2]"), 2, ParseInt64)
+	if err != nil || !slices.Equal(values, []int64{1, 2}) {
+		t.Fatalf("valid list: %v, %v", values, err)
+	}
+	values, err = ParseArrayBounded([]byte("[]"), 0, ParseInt64)
+	if err != nil || values == nil || len(values) != 0 {
+		t.Fatalf("empty list: %v, %v", values, err)
+	}
+	values, err = ParseArrayBounded([]byte("[1,2]"), 1, ParseInt64)
+	if err == nil || err.Error() != "array size exceeds limit 1" || values != nil {
+		t.Fatalf("oversized list: %v, %v", values, err)
+	}
+	values, err = ParseArrayBounded([]byte("[1,!]"), 1, ParseInt64)
+	if err == nil || strings.Contains(err.Error(), "exceeds limit") || values != nil {
+		t.Fatalf("malformed list: %v, %v", values, err)
+	}
+}
+
 func TestParseFloat64ArrayLimit(t *testing.T) {
 	value, err := ParseFloat64ArrayLimit([]byte(`[1.5,-0,5e-324,1.7976931348623157e308,0e-9999]`), 5)
 	if err != nil || len(value) != 5 || value[0] != 1.5 || !math.Signbit(value[1]) || value[2] != math.SmallestNonzeroFloat64 || value[3] != math.MaxFloat64 || value[4] != 0 {

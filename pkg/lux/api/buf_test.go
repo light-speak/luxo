@@ -19,6 +19,58 @@ func TestResponseBufRejectsNonFiniteFloat(t *testing.T) {
 	}
 }
 
+func TestResponseBufWritesLuxoValues(t *testing.T) {
+	buf := ResponseBuf{B: []byte("prefix")}
+	encoder := codec.NewEncoder([]byte("prefix"))
+	stamp := time.Unix(1700000000, 123456789)
+	id := [16]byte{1, 2, 3}
+	buf.WriteLuxoVarint(300)
+	encoder.WriteVarint(300)
+	buf.WriteLuxoInt(-17)
+	encoder.WriteInt(-17)
+	buf.WriteLuxoBool(true)
+	encoder.WriteBool(true)
+	buf.WriteLuxoUUID(id)
+	encoder.WriteUUID(id)
+	buf.WriteLuxoBytes([]byte{0xff, 0x00})
+	encoder.WriteBytes([]byte{0xff, 0x00})
+	buf.WriteLuxoNull()
+	encoder.WriteNull()
+	buf.WriteLuxoPresent()
+	encoder.WritePresent()
+	raw := []byte(`{"v":12345678901234567890}`)
+	if err := errors.Join(
+		buf.WriteLuxoFloat(1.5), encoder.WriteFloat(1.5),
+		buf.WriteLuxoString("東京"), encoder.WriteString("東京"),
+		buf.WriteLuxoDateTime(stamp), encoder.WriteDateTime(stamp),
+		buf.WriteLuxoArrayHeader(3), encoder.WriteArrayHeader(3),
+		buf.WriteLuxoJSON(raw), encoder.WriteJSON(raw),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf.B, encoder.Bytes()) {
+		t.Fatalf("buffer %x, encoder %x", buf.B, encoder.Bytes())
+	}
+}
+
+func TestResponseBufLuxoFailuresPreservePrefix(t *testing.T) {
+	for _, test := range []struct {
+		write func(*ResponseBuf) error
+		cause error
+	}{
+		{func(b *ResponseBuf) error { return b.WriteLuxoFloat(math.NaN()) }, codec.ErrNonFiniteFloat},
+		{func(b *ResponseBuf) error { return b.WriteLuxoString("\xff") }, codec.ErrInvalidUTF8},
+		{func(b *ResponseBuf) error { return b.WriteLuxoJSON([]byte("invalid")) }, codec.ErrInvalidJSON},
+		{func(b *ResponseBuf) error { return b.WriteLuxoDateTime(time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)) }, codec.ErrInvalidDateTime},
+		{func(b *ResponseBuf) error { return b.WriteLuxoArrayHeader(codec.MaxArrayElements + 1) }, codec.ErrInvalidArrayCount},
+	} {
+		buf := ResponseBuf{B: []byte("prefix")}
+		if err := test.write(&buf); !errors.Is(err, test.cause) || string(buf.B) != "prefix" {
+			t.Fatalf("buffer %q, error %v, want %v", buf.B, err, test.cause)
+		}
+	}
+}
+
 func TestResponseBufReset(t *testing.T) {
 	storage := make([]byte, 0, 64)
 	buf := ResponseBuf{B: storage}

@@ -273,7 +273,7 @@ func TestFormalEntrypointsPreserveExplicitIdentifiers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(generated.Files["writejson.gen.go"]), "AppendVarint(buf.B, 42)") {
+	if !strings.Contains(string(generated.Files["writejson.gen.go"]), "AppendByte(42)") {
 		t.Fatal("explicit sparse field ID disappeared")
 	}
 	data, err := BuildSchemaJSON(input, nil, config)

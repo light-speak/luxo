@@ -1,7 +1,6 @@
 package codegen
 
 import (
-	"bytes"
 	"fmt"
 	goast "go/ast"
 	"go/format"
@@ -73,13 +72,12 @@ func prepareGeneratedSources(files map[string][]byte, exportUnicode, reuseSource
 }
 
 func formatParsedGeneratedFile(positions *token.FileSet, file *goast.File, source []byte, reuseSource bool) ([]byte, error) {
-	var output bytes.Buffer
-	// ParseFile has copied the token text. Reuse a source allocation at least
-	// as large as the zero-value buffer's minimum allocation in Go 1.27.
-	if reuseSource && cap(source) >= 64 {
-		output = *bytes.NewBuffer(source[:0])
+	var output formattedSource
+	// ParseFile has copied the token text. Reuse the generator's own storage.
+	if reuseSource {
+		output = source[:0]
 	}
-	output.Grow(len(source))
+	output = slices.Grow(output, len(source))
 	var err error
 	goast.SortImports(positions, file)
 	if hasNoncanonicalNumberSpelling(file) {
@@ -91,7 +89,16 @@ func formatParsedGeneratedFile(positions *token.FileSet, file *goast.File, sourc
 		printerConfig := printer.Config{Mode: printer.UseSpaces | printer.TabIndent, Tabwidth: 8}
 		err = printerConfig.Fprint(&output, positions, file)
 	}
-	return output.Bytes(), err
+	return output, err
+}
+
+// Formatting can add enough whitespace to exceed the raw source's capacity.
+// A slice appends into that storage and uses Go's slice growth when it fills.
+type formattedSource []byte
+
+func (s *formattedSource) Write(p []byte) (int, error) {
+	*s = append(*s, p...)
+	return len(p), nil
 }
 
 func hasNoncanonicalNumberSpelling(file *goast.File) bool {

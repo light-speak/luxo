@@ -82,3 +82,59 @@ func (r *ResponseBuf) AppendTime(t time.Time, layout string) {
 	r.B = t.AppendFormat(r.B, layout)
 	r.B = append(r.B, '"')
 }
+
+// WriteLuxoInt appends a binary Int without a field header.
+func (r *ResponseBuf) WriteLuxoInt(value int64) { r.B = codec.AppendSvarint(r.B, value) }
+
+// WriteLuxoBool appends a binary Bool without a field header.
+func (r *ResponseBuf) WriteLuxoBool(value bool) { r.B = codec.AppendBool(r.B, value) }
+
+// WriteLuxoUUID appends a binary UUID without a field header.
+func (r *ResponseBuf) WriteLuxoUUID(value [16]byte) { r.B = codec.AppendUUID(r.B, value) }
+
+// WriteLuxoBytes appends a binary Bytes without a field header.
+func (r *ResponseBuf) WriteLuxoBytes(value []byte) { r.B = codec.AppendBytes(r.B, value) }
+
+// WriteLuxoVarint appends a binary Varint without a field header.
+func (r *ResponseBuf) WriteLuxoVarint(value uint64) { r.B = codec.AppendVarint(r.B, value) }
+
+// WriteLuxoNull appends the binary null marker.
+func (r *ResponseBuf) WriteLuxoNull() { r.B = codec.AppendNull(r.B) }
+
+// WriteLuxoPresent appends the binary present marker.
+func (r *ResponseBuf) WriteLuxoPresent() { r.B = codec.AppendPresent(r.B) }
+
+// WriteLuxoFloat appends a validated binary Float without a field header.
+func (r *ResponseBuf) WriteLuxoFloat(value float64) error {
+	var err error
+	r.B, err = codec.AppendFixed64(r.B, value)
+	return err
+}
+
+// WriteLuxoString appends a validated binary String without a field header.
+func (r *ResponseBuf) WriteLuxoString(value string) error {
+	var err error
+	r.B, err = codec.AppendString(r.B, value)
+	return err
+}
+
+// WriteLuxoDateTime appends a validated binary DateTime without a field header.
+func (r *ResponseBuf) WriteLuxoDateTime(value time.Time) error {
+	var err error
+	r.B, err = codec.AppendDateTime(r.B, value)
+	return err
+}
+
+// WriteLuxoJSON appends a validated binary JSON without a field header.
+func (r *ResponseBuf) WriteLuxoJSON(value []byte) error {
+	var err error
+	r.B, err = codec.AppendJSON(r.B, value)
+	return err
+}
+
+// WriteLuxoArrayHeader appends a validated binary ArrayHeader without a field header.
+func (r *ResponseBuf) WriteLuxoArrayHeader(value int) error {
+	var err error
+	r.B, err = codec.AppendArrayHeader(r.B, value)
+	return err
+}

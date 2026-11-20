@@ -63,6 +63,17 @@ func (g *GeneratorContext) writeJSONInputField(b *strings.Builder, model string,
 	if identity {
 		fmt.Fprintf(b, "\tif fields[%d] == nil { return fmt.Errorf(%q) }\n", index, model+"."+field.Name+": missing identity field")
 	}
+	if !field.Type.IsList && (identity || g.instanceSaves[model] == nil && !hasObjectDefault(field)) {
+		if reader := directJSONInputReader(field.Type.Name, enums[field.Type.Name]); reader != "" {
+			method := "ReadField"
+			if field.Type.Nullable {
+				method = "ReadOptionalField"
+			}
+			fmt.Fprintf(b, "\tif err := jsonutil.%s(fields[%d], &out.%s, jsonutil.%s); err != nil { return fmt.Errorf(%q, err) }\n",
+				method, index, str.Capitalize(field.Name), reader, model+"."+field.Name+": %w")
+			return
+		}
+	}
 	fmt.Fprintf(b, "\tif raw := fields[%d]; raw != nil {\n", index)
 	if plan := g.instanceSaves[model]; plan != nil && !identity {
 		if slot, ok := plan.index[field.Name]; ok {
@@ -93,8 +104,12 @@ func (g *GeneratorContext) writeJSONInputField(b *strings.Builder, model string,
 }
 
 func (g *GeneratorContext) writeJSONInputValue(b *strings.Builder, field *ast.FieldDecl, enums map[string]bool, identity bool) {
-	if reader := directJSONInputReader(field.Type.Name, enums[field.Type.Name]); !field.Type.IsList && reader != "" {
-		fmt.Fprintf(b, "\t\tvalue, err := jsonutil.%s(raw)\n", reader)
+	if reader := directJSONInputReader(field.Type.Name, enums[field.Type.Name]); reader != "" {
+		if field.Type.IsList {
+			fmt.Fprintf(b, "\t\tvalue, err := jsonutil.ParseArrayBounded(raw, codec.MaxArrayElements, jsonutil.%s)\n", reader)
+		} else {
+			fmt.Fprintf(b, "\t\tvalue, err := jsonutil.%s(raw)\n", reader)
+		}
 		return
 	}
 	goType := mapBaseType(field.Type.Name)
@@ -111,10 +126,7 @@ func (g *GeneratorContext) writeJSONInputValue(b *strings.Builder, field *ast.Fi
 }
 
 func (g *GeneratorContext) writeJSONInputList(b *strings.Builder, name string, isEnum bool, modes ...bool) {
-	b.WriteString("\t\t\tcount := 0\n")
-	fmt.Fprintf(b, "\t\t\treturn jsonutil.ParseArray(raw, func(item []byte) (%s, error) {\n", mapBaseType(name))
-	fmt.Fprintf(b, "\t\t\t\tif count >= codec.MaxArrayElements { var zero %s; return zero, fmt.Errorf(\"array size exceeds limit %%d\", codec.MaxArrayElements) }\n", mapBaseType(name))
-	b.WriteString("\t\t\t\tcount++\n")
+	fmt.Fprintf(b, "\t\t\treturn jsonutil.ParseArrayBounded(raw, codec.MaxArrayElements, func(item []byte) (%s, error) {\n", mapBaseType(name))
 	g.writeJSONInputScalar(b, name, isEnum, "item", "\t\t\t\t", modes...)
 	b.WriteString("\t\t\t})\n")
 }
@@ -136,6 +148,9 @@ func directJSONInputReader(name string, isEnum bool) string {
 		return "ParseDateTime"
 	case "Bytes":
 		return "ParseBase64"
+	case "JSON":
+		// The strict object reader already checked syntax; the field owns its depth budget.
+		return "CloneJSONValue"
 	}
 	return ""
 }
@@ -148,9 +163,6 @@ func (g *GeneratorContext) writeJSONInputScalar(b *strings.Builder, name string,
 	switch {
 	case name == "Duration":
 		fmt.Fprintf(b, "%svalue, err := jsonutil.ParseInt64(%s); return time.Duration(value), err\n", indent, raw)
-	case name == "JSON":
-		// The strict reader already checked syntax; this field owns its depth budget.
-		fmt.Fprintf(b, "%sreturn jsonutil.CloneJSONValue(%s)\n", indent, raw)
 	case isEnum || name == "UUID" || name == "Decimal":
 		writeJSONInputTextConversion(b, name, isEnum, raw, indent)
 	default:

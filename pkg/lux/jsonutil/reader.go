@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"encoding/json/jsontext"
 	"errors"
+	"fmt"
 	"sync"
 )
 
@@ -31,6 +32,25 @@ func ParseArray[T any](raw []byte, parse func([]byte) (T, error)) ([]T, error) {
 			var zero T
 			return zero, err
 		}
+		return parse(value)
+	})
+}
+
+// ParseArrayBounded parses at most limit array items. It validates each JSON
+// token before checking the limit and returns no partial list on failure.
+func ParseArrayBounded[T any](raw []byte, limit int, parse func([]byte) (T, error)) ([]T, error) {
+	count := 0
+	return parseArrayReader(raw, func(reader *Reader) (T, error) {
+		value, err := reader.ReadValue()
+		if err != nil {
+			var zero T
+			return zero, err
+		}
+		if count >= limit {
+			var zero T
+			return zero, fmt.Errorf("array size exceeds limit %d", limit)
+		}
+		count++
 		return parse(value)
 	})
 }

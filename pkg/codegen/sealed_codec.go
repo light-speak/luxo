@@ -114,17 +114,19 @@ func (g *GeneratorContext) writeSealedPayloadWriter(b *strings.Builder, owner *a
 		field, value := sealedField(parameter), "v.F"+strconv.Itoa(id)
 		fmt.Fprintf(b, "if codec.FieldMaskHas(mask,%d){\n", id)
 		if isRelationField(field, enums) {
-			g.writeSealedNestedOutput(b, field, strconv.Itoa(id), value)
+			g.writeSealedNestedOutput(b, field, id, value)
 		} else {
-			writeModelFieldEncoding(b, field, strconv.Itoa(id), value, enums, "\t")
+			writeModelFieldEncoding(b, field, id, value, enums, "\t")
 		}
 		b.WriteString("}\n")
 	}
 	b.WriteString("buf.B=append(buf.B,0);return nil\n}\n")
 }
 
-func (g *GeneratorContext) writeSealedNestedOutput(b *strings.Builder, field *ast.FieldDecl, id, value string) {
-	fmt.Fprintf(b, "childMask%s,_:=codec.SelectionMaskNested(selectionMask,%s);buf.B=codec.AppendVarint(buf.B,%s)\n", id, id, id)
+func (g *GeneratorContext) writeSealedNestedOutput(b *strings.Builder, field *ast.FieldDecl, fieldID int, value string) {
+	id := strconv.Itoa(fieldID)
+	fmt.Fprintf(b, "childMask%s,_:=codec.SelectionMaskNested(selectionMask,%s)\n", id, id)
+	writeBinaryFieldID(b, "", fieldID)
 	if field.Type.Nullable {
 		fmt.Fprintf(b, "if %s==nil{buf.B=codec.AppendNull(buf.B)}else{buf.B=codec.AppendPresent(buf.B)\n", value)
 	}

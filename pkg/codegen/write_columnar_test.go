@@ -37,6 +37,51 @@ func TestGeneratedColumnarRequiresReturnedField(t *testing.T) {
 	}
 }
 
+func TestGeneratedMultiByteFieldHeaders(t *testing.T) {
+	runGeneratedFixture(t, `type Packet { first: Int middle: Int last: Int }`, `package generated
+import (
+	"bytes"
+	"testing"
+
+	"github.com/light-speak/luxo/internal/testutil"
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/codec"
+)
+
+func TestFieldHeaders(t *testing.T) {
+	items := []Packet{{First: 11, Middle: 12, Last: 13}, {First: 21, Middle: 22, Last: 23}}
+	for _, subset := range []bool{false, true} {
+		fields := []int{127, 128, 65535}
+		first, second := []int64{11, 12, 13}, []int64{21, 22, 23}
+		var mask []byte
+		if subset {
+			fields, first, second = fields[2:], first[2:], second[2:]
+			mask = testutil.Bytes(t)(codec.FieldMaskSet(nil, fields[0]))
+			mask = testutil.Bytes(t)(codec.AppendSelectionMask(nil, mask, nil))
+		}
+		row := []byte{0}
+		columnar := []byte{2, 0}
+		for i, field := range fields {
+			row = codec.AppendVarint(row, uint64(field))
+			row = codec.AppendSvarint(row, first[i])
+			columnar = codec.AppendVarint(columnar, uint64(field))
+			columnar = codec.AppendSvarint(columnar, first[i])
+			columnar = codec.AppendSvarint(columnar, second[i])
+		}
+		row, columnar = append(row, 0), append(columnar, 0)
+		var buf api.ResponseBuf
+		if err := items[0].WriteLuxo(&buf, mask); err != nil || !bytes.Equal(buf.B, row) {
+			t.Fatalf("row subset=%t: got %x, want %x, error %v", subset, buf.B, row, err)
+		}
+		buf.Reset()
+		if err := WriteColumnarPacket(&buf, items, mask); err != nil || !bytes.Equal(buf.B, columnar) {
+			t.Fatalf("columnar subset=%t: got %x, want %x, error %v", subset, buf.B, columnar, err)
+		}
+	}
+}
+`, StableIDs{ModelFields: map[string]map[string]int{"Packet": {"first": 127, "middle": 128, "last": 65535}}})
+}
+
 const columnarProjectionAssertions = `package generated
 import (
 "github.com/light-speak/luxo/internal/testutil"

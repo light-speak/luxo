@@ -97,7 +97,7 @@ func TestGeneratorsKeepStableIDsIsolatedConcurrently(t *testing.T) {
 				errs <- err
 				return
 			}
-			want := fmt.Sprintf("AppendVarint(buf.B, %d)", fieldID)
+			want := fmt.Sprintf("AppendByte(%d)", fieldID)
 			if !strings.Contains(string(generated.Files["writejson.gen.go"]), want) {
 				errs <- fmt.Errorf("field ID %d missing from generated writer", fieldID)
 			}
