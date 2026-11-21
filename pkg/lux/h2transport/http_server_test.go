@@ -127,9 +127,17 @@ func TestHTTPServerIgnoresObsoleteHTTP2Upgrade(t *testing.T) {
 }
 
 func TestHTTPServerProtocolDispatch(t *testing.T) {
+	type contextKey int
+	const (
+		baseKey contextKey = iota
+		connKey
+	)
 	for _, secure := range []bool{false, true} {
 		t.Run(map[bool]string{false: "cleartext", true: "tls"}[secure], func(t *testing.T) {
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Context().Value(baseKey) != "listener" || r.Context().Value(connKey) != "connection" {
+					t.Errorf("%s did not inherit the configured HTTP server context", r.Proto)
+				}
 				if r.ProtoMajor == 2 {
 					if _, ok := w.(*response); !ok {
 						t.Error("HTTP/2 bypassed Luxo transport")
@@ -142,6 +150,12 @@ func TestHTTPServerProtocolDispatch(t *testing.T) {
 				t.Fatal(err)
 			}
 			httpServer := httptest.NewUnstartedServer(handler)
+			httpServer.Config.BaseContext = func(net.Listener) context.Context {
+				return context.WithValue(context.Background(), baseKey, "listener")
+			}
+			httpServer.Config.ConnContext = func(ctx context.Context, _ net.Conn) context.Context {
+				return context.WithValue(ctx, connKey, "connection")
+			}
 			if err := s.ConfigureHTTPServer(httpServer.Config); err != nil {
 				t.Fatal(err)
 			}
