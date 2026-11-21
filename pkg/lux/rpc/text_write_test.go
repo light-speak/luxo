@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,6 +36,9 @@ func TestRPCInvalidTraceIDDoesNotContaminateNextFrame(t *testing.T) {
 			body, snapshot, err := client.callTracedPayload(ctx, []byte{1, 0, 0, 1, 0, 0})
 			if err == nil || body != nil || snapshot.TraceID != "" || snapshot.Spans != nil {
 				t.Fatalf("invalid trace escaped: %x %+v %v", body, snapshot, err)
+			}
+			if errors.Unwrap(err) == nil || !strings.HasPrefix(err.Error(), "rpc: decode traced response:") || len(client.pool.conns) != 1 {
+				t.Fatalf("bounded trace failure lost its cause or connection: %v", err)
 			}
 			body, snapshot, err = client.callTracedPayload(ctx, []byte{1, 0, 0, 1, 0, 0})
 			if err != nil || string(body) != "business" || snapshot.TraceID != "next" {
