@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -321,5 +322,72 @@ func TestRouterOptionsEnvironmentPreservesExplicitOverrides(t *testing.T) {
 	r := NewRouterWithOptions(options)
 	if r.logSampleEvery != 10 {
 		t.Fatal("explicit sampling override lost")
+	}
+}
+
+type interruptedRequestLogWriter struct {
+	entered  chan struct{}
+	release  chan struct{}
+	panics   bool
+	firstErr error
+}
+
+func (w *interruptedRequestLogWriter) Write([]byte) (int, error) {
+	if err := w.firstErr; err != nil {
+		w.firstErr = nil
+		return 0, err
+	}
+	close(w.entered)
+	<-w.release
+	if w.panics {
+		panic("private native log writer failure")
+	}
+	runtime.Goexit()
+	return 0, nil
+}
+
+func TestAsyncRequestLogsAbnormalWriterPreservesFirstError(t *testing.T) {
+	writer := &interruptedRequestLogWriter{
+		entered: make(chan struct{}), release: make(chan struct{}), firstErr: io.ErrClosedPipe,
+	}
+	logs := newAsyncRequestLogs(writer, 2)
+	logs.submit(logBuffer("first failure"))
+	logs.submit(logBuffer("writer exits"))
+	<-writer.entered
+	close(writer.release)
+	if err := logs.close(t.Context()); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("shutdown replaced the original writer error: %v", err)
+	}
+	if logs.failures.Load() != 2 || len(logs.queue) != 0 {
+		t.Fatal("did not account for both writer failures")
+	}
+}
+
+func TestAsyncRequestLogsAbnormalWriterDrainsAndStops(t *testing.T) {
+	for _, mode := range []string{"panic", "goexit"} {
+		t.Run(mode, func(t *testing.T) {
+			writer := &interruptedRequestLogWriter{entered: make(chan struct{}), release: make(chan struct{}), panics: mode == "panic"}
+			logs := &asyncRequestLogs{writer: writer, queue: make(chan *[]byte, 2), done: make(chan struct{})}
+			escaped := make(chan any, 1)
+			go func() {
+				defer func() { escaped <- recover() }()
+				logs.run()
+			}()
+			logs.submit(logBuffer("in progress"))
+			<-writer.entered
+			logs.submit(logBuffer("pending"))
+			close(writer.release)
+
+			if got := <-escaped; got != nil {
+				t.Error("writer panic escaped the logging worker")
+			}
+			logs.submit(logBuffer("late record"))
+			if err := logs.close(t.Context()); !errors.Is(err, errRequestLogWriterAborted) {
+				t.Errorf("close did not report abnormal writer: %v", err)
+			}
+			if logs.failures.Load() != 1 || logs.dropped.Load() != 2 || len(logs.queue) != 0 {
+				t.Fatalf("worker retained records: failures=%d dropped=%d queued=%d", logs.failures.Load(), logs.dropped.Load(), len(logs.queue))
+			}
+		})
 	}
 }
