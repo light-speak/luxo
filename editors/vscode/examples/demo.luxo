@@ -713,7 +713,8 @@ override api createUser(input: RegisterInput): User {
 // @cache — 缓存 / Caching
 // ============================================
 
-api getPopularPosts(): [Post] @cache(ttl: 60) {
+// See the adjacent luxo.cache.json for this explicit TTL-only policy.
+api getPopularPosts(): [Post] @cache(policy: "popularPosts") {
   val posts = Post.where(status == PostStatus.PUBLISHED).all()
   posts.sortBy { it.likes }
 }
@@ -1291,5 +1292,6 @@ api placeOrder(productId: Int, qty: Int): Order @auth(User) {
 // model Article {
 // title:   String
 // content: String
-// val readTime: Int get @cache(ttl: 5m) { content.length / 200 }
+// Response caching is only valid on APIs, not computed fields.
+// val readTime: Int get { content.length / 200 }
 // }

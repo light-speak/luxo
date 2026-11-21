@@ -1,0 +1,126 @@
+import { LuxoClient } from './client.js'
+import { decodeJSONTextValues, decodeTextValues, decodeColumnarTextValues, decodePaginatedTextValues, decodeEnum$State } from './types.js'
+import type { State } from './types.js'
+import { Encoder, Decoder, UnknownEnumValue } from '@luxojs/client'
+import { responseTransport } from './response-transport.js'
+
+// @ts-expect-error Unrecognized text must not masquerade as a known member.
+const invalid: State = 'FUTURE'
+// @ts-expect-error Unknown members of different enum types remain distinct.
+const wrongEnum: State = new UnknownEnumValue('Role', 'FUTURE')
+void invalid; void wrongEnum
+
+function check(value: unknown, raw: string | null | undefined): void {
+  if (raw === null || raw === undefined || raw === 'ok') {
+    if (value !== raw) throw new Error('known/null/unselected enum changed')
+  } else if (!(value instanceof UnknownEnumValue) || value.enumName !== 'State' || value.rawValue !== raw || value.kind !== 'unknown') {
+    throw new Error('unrecognized enum was lost or asserted to be known')
+  }
+}
+
+function list(values: unknown, expected: string[]): void {
+  if (!Array.isArray(values) || values.length !== expected.length) throw new Error('enum list shape changed')
+  for (let i = 0; i < expected.length; i++) check(values[i], expected[i])
+}
+
+function scalar(raw: string): Uint8Array {
+  const encoder = new Encoder()
+  encoder.writeString(raw)
+  return encoder.bytes()
+}
+
+function array(values: string[]): Uint8Array {
+  const encoder = new Encoder()
+  encoder.writeVarint(values.length)
+  for (const value of values) encoder.writeString(value)
+  return encoder.bytes()
+}
+
+function row(raw: string | null, values: string[], nested = false): Uint8Array {
+  const encoder = new Encoder()
+  encoder.writeVarint(0)
+  encoder.writeVarint(5)
+  encoder.writeBool(raw !== null)
+  if (raw !== null) encoder.writeString(raw)
+  encoder.writeFieldStringArray(6, values)
+  encoder.writeVarint(9)
+  encoder.writeBool(false)
+  if (nested) {
+    encoder.writeVarint(7)
+    encoder.writeBool(true)
+    encoder.writeBytes(row(raw, values))
+    encoder.writeVarint(8)
+    encoder.writeBytes(columnar(raw, values))
+  }
+  encoder.writeEnd()
+  return encoder.bytes()
+}
+
+function columnar(raw: string | null, values: string[], page = false): Uint8Array {
+  const encoder = new Encoder()
+  encoder.writeVarint(2)
+  encoder.writeVarint(0)
+  encoder.writeVarint(5)
+  for (let i = 0; i < 2; i++) {
+    encoder.writeBool(raw !== null)
+    if (raw !== null) encoder.writeString(raw)
+  }
+  encoder.writeVarint(6)
+  for (let i = 0; i < 2; i++) encoder.writeBytes(array(values))
+  encoder.writeVarint(9)
+  encoder.writeBool(false)
+  encoder.writeBool(true)
+  encoder.writeBytes(array(values))
+  encoder.writeEnd()
+  if (page) for (const metadata of [2n, 1n, 20n]) encoder.writeSvarint(metadata)
+  return encoder.bytes()
+}
+
+function verifyModels(): void {
+  const values = ['ok', 'FUTURE', '未来', '']
+  for (const raw of [null, ...values]) {
+    const json = { state: raw, states: values, optionalStates: null }
+    for (const decoded of [decodeJSONTextValues(json), decodeTextValues(new Decoder(row(raw, values)))]) {
+      check(decoded.state, raw); list(decoded.states, values)
+      if (decoded.optionalStates !== null) throw new Error('nullable enum list changed')
+    }
+    const nestedJSON = decodeJSONTextValues({ child: json, children: [json] })
+    const nestedBinary = decodeTextValues(new Decoder(row(raw, values, true)))
+    for (const nested of [nestedJSON, nestedBinary]) {
+      check(nested.child?.state, raw); check(nested.children?.[0].state, raw)
+      list(nested.child?.states, values)
+    }
+    const page = decodePaginatedTextValues(columnar(raw, values, true))
+    if (page.total !== 2n) throw new Error('page metadata changed')
+    for (const rows of [decodeColumnarTextValues(columnar(raw, values)), page.items]) {
+      for (const item of rows) { check(item.state, raw); list(item.states, values) }
+      if (rows[0].optionalStates !== null) throw new Error('columnar null list changed')
+      list(rows[1].optionalStates, values)
+    }
+  }
+  check(decodeJSONTextValues({}).state, undefined)
+  for (const raw of values) check(decodeEnum$State(raw), raw)
+}
+
+async function verifyCalls(): Promise<void> {
+  let response: unknown
+  const transport = responseTransport(() => response)
+  const client = new LuxoClient(transport), values = ['ok', 'FUTURE', '未来', '']
+  for (const binary of [false, true]) {
+    for (const value of values) {
+      response = binary ? scalar(value) : value
+      check(await client.getEnum(), value)
+      let delivered = 0
+      const cancel = await client.subscribeLiveEnum(data => { delivered++; check(data, value) })
+      cancel()
+      if (delivered !== 1) throw new Error('unknown stream member was dropped')
+    }
+    response = binary ? array(values) : values
+    list(await client.getEnumList(), values)
+    const cancel = await client.subscribeLiveEnumList(data => list(data, values))
+    cancel()
+  }
+}
+
+verifyModels()
+void verifyCalls().catch(error => { throw error })

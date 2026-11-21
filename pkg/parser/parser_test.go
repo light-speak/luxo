@@ -1,8 +1,11 @@
 package parser
 
 import (
+	"os"
+	"strings"
 	"testing"
 
+	"github.com/light-speak/luxo/internal/testutil"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/token"
@@ -21,6 +24,19 @@ func parse(t *testing.T, input string) *ast.File {
 		t.Fatalf("parser errors: %v", parseErrors)
 	}
 	return file
+}
+
+func TestCompilerCorporaParseIndependently(t *testing.T) {
+	t.Run("historical-benchmark-v1", func(t *testing.T) {
+		parse(t, testutil.CompilerDemoV1())
+	})
+	t.Run("current-editor-example", func(t *testing.T) {
+		data, err := os.ReadFile("../../editors/vscode/examples/demo.luxo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		parse(t, string(data))
+	})
 }
 
 func TestParseModel(t *testing.T) {
@@ -487,14 +503,53 @@ func TestParseMiddleware(t *testing.T) {
 func TestParseForeignKey(t *testing.T) {
 	input := `model Post : Base {
   authorId: Int
-  author: User(key: authorId)
+  author: User @by(id, authorId)
 }`
 	file := parse(t, input)
 	m := file.Models[0]
 
 	f := m.Fields[1]
-	if f.Type.FKField != "authorId" {
-		t.Errorf("expected FK 'authorId', got %q", f.Type.FKField)
+	if len(f.Directives) != 1 || f.Directives[0].Name != "by" {
+		t.Fatalf("expected explicit @by directive, got %+v", f.Directives)
+	}
+	args := f.Directives[0].Args
+	if len(args) != 2 || args[0].Value.(*ast.Ident).Name != "id" || args[1].Value.(*ast.Ident).Name != "authorId" {
+		t.Errorf("expected remote id and local authorId, got %+v", args)
+	}
+}
+
+func TestRejectParenthesizedTypeReferences(t *testing.T) {
+	cases := map[string]string{
+		"model":      "model Post { author: User(key: authorId) }",
+		"nullable":   "model Post { author: User(key: authorId)? }",
+		"list":       "model Post { authors: [User(key: authorId)] }",
+		"extend":     "extend Post { author: User(key: authorId) }",
+		"type":       "type Snapshot { author: User(key: authorId) }",
+		"parameter":  "api lookup(user: User(key: authorId)): Int { return 1 }",
+		"return":     "api lookup(): User(key: authorId) @native",
+		"event":      "event Saved(user: User(key: authorId))",
+		"generic":    "fn lookup(): Page<User(key: authorId)> @native",
+		"empty":      "model Post { author: User() }",
+		"other-name": "model Post { author: User(other: authorId) }",
+		"conflict":   "model Post { author: User(key: authorId) @by(id, userId) }",
+	}
+	for name, source := range cases {
+		t.Run(name, func(t *testing.T) {
+			tokens, lexErrors := lexer.New(source+"\nmodel Recovered { id: Int }", "key.luxo").Tokenize()
+			if len(lexErrors) != 0 {
+				t.Fatal(lexErrors)
+			}
+			file, errors := New(tokens).Parse("key.luxo")
+			if len(errors) != 1 || !strings.Contains(errors[0].Message, "use @by") {
+				t.Fatalf("expected one actionable type diagnostic, got %v", errors)
+			}
+			if errors[0].Pos.Line != 1 || errors[0].Pos.Col != strings.Index(source, "User(")+len("User")+1 {
+				t.Errorf("diagnostic is not at the invalid type suffix: %v", errors[0])
+			}
+			if len(file.Models) != 1 || file.Models[0].Name != "Recovered" {
+				t.Fatalf("declaration recovery failed: %+v", file.Models)
+			}
+		})
 	}
 }
 
@@ -642,6 +697,29 @@ func TestParseErrorInternal(t *testing.T) {
 	}
 	if !e.Internal {
 		t.Error("expected internal to be true")
+	}
+}
+
+func TestParseErrorRejectsInvalidAttributeValues(t *testing.T) {
+	for _, attribute := range []string{
+		`internal: "true"`, `internal: 1`, `internal: null`, `internal: tru`,
+		`code: 999999999999999999999999999999999999`,
+		`internl:`, `internal: true internal: false`, `code: 400 code: 500`,
+		`message: "one" message: "two"`,
+	} {
+		t.Run(attribute, func(t *testing.T) {
+			_, errs := parseWithErrors(t, `error Invalid { `+attribute+` }`)
+			if len(errs) == 0 {
+				t.Fatal("invalid error attribute accepted")
+			}
+		})
+	}
+}
+
+func TestParseErrorExplicitPublic(t *testing.T) {
+	file := parse(t, `error Public { code: 422 message: "public" internal: false }`)
+	if file.Errors[0].Internal || file.Errors[0].Code != 422 {
+		t.Fatal("explicit public error attributes changed")
 	}
 }
 
@@ -1252,5 +1330,71 @@ func TestParseBangElvisInForCondition(t *testing.T) {
 	file := parse(t, input)
 	if len(file.APIs) != 1 {
 		t.Fatal("expected 1 API")
+	}
+}
+
+func TestStandaloneLambdaValuesRejected(t *testing.T) {
+	for _, body := range []string{
+		`val callback = { x -> x } return 1`,
+		`return { x -> x }`,
+		`val callbacks = [{ x -> x }] return 1`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			tokens, errs := lexer.New(`fn run(): Int { `+body+` }`, "lambda.luxo").Tokenize()
+			if len(errs) != 0 {
+				t.Fatal(errs)
+			}
+			_, diagnostics := New(tokens).Parse("lambda.luxo")
+			if len(diagnostics) == 0 {
+				t.Fatal("standalone lambda value was accepted")
+			}
+		})
+	}
+}
+
+func TestIdentityNamespaceCannotBeShadowed(t *testing.T) {
+	for _, source := range []string{
+		`fn run(my: Int): Int { return my }`,
+		`api run(my: Int): Int { return my }`,
+		`fn run(): Int { val my = 1 return my }`,
+		`api run(): Int { val my = 1 return my }`,
+	} {
+		t.Run(source, func(t *testing.T) {
+			tokens, errs := lexer.New(source, "identity.luxo").Tokenize()
+			if len(errs) != 0 {
+				t.Fatal(errs)
+			}
+			_, diagnostics := New(tokens).Parse("identity.luxo")
+			if len(diagnostics) == 0 {
+				t.Fatal("reserved identity namespace accepted as a binding")
+			}
+		})
+	}
+}
+
+func TestParseRejectsUnrepresentableListElements(t *testing.T) {
+	for _, element := range []string{"[Int]", "Int?", "(Post, Video)"} {
+		for _, source := range []string{
+			"api values(input: [" + element + "]): Int",
+			"model Sample { value: [" + element + "] }",
+			"fn values(): [" + element + "] @native",
+		} {
+			t.Run(source, func(t *testing.T) {
+				_, diagnostics := parseWithErrors(t, source)
+				if len(diagnostics) == 0 {
+					t.Fatal("list element metadata was silently discarded")
+				}
+			})
+		}
+	}
+}
+
+func TestParsePreservesSupportedListShapes(t *testing.T) {
+	for _, name := range []string{"Int", "User", "Page<User>"} {
+		file := parse(t, "api values(input: ["+name+"]?): ["+name+"]")
+		api := file.APIs[0]
+		if !api.Params[0].Type.IsList || !api.Params[0].Type.Nullable || !api.ReturnType.IsList || api.ReturnType.Nullable {
+			t.Fatal("list nullability changed")
+		}
 	}
 }

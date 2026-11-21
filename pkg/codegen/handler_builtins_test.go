@@ -52,7 +52,7 @@ func TestScanBodyForBuiltins_TemplateLiteralLog(t *testing.T) {
 }
 
 func TestScanBodyForBuiltins_NonStringLog(t *testing.T) {
-	// obj.i where obj is an identifier (not string literal) → hasLog = false
+	// Identifiers support the same self-returning log properties as literals.
 	block := &ast.Block{
 		Stmts: []ast.Stmt{
 			&ast.ExprStmt{
@@ -67,8 +67,8 @@ func TestScanBodyForBuiltins_NonStringLog(t *testing.T) {
 	var f handlerFeatures
 	scanBodyForBuiltins(block, &f)
 
-	if f.hasLog {
-		t.Error("identifier .i should NOT set hasLog")
+	if !f.hasLog {
+		t.Error("identifier .i must set hasLog")
 	}
 }
 

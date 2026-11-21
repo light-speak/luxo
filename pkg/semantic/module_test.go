@@ -31,6 +31,31 @@ func analyzeModules(t *testing.T, files []*ast.File) *Result {
 	return AnalyzeModules(files)
 }
 
+func TestCommonGlobalsDoNotDependOnServiceFileOrder(t *testing.T) {
+	for _, commonFirst := range []bool{false, true} {
+		common := parseFileWithName(t, `val BASE_VALUE = 40 val COMMON_NAME = "luxo"`, "origin/common/config.luxo")
+		alpha := parseFileWithName(t, `val ALPHA_VALUE = BASE_VALUE + 2 api alphaValue(): Int { return ALPHA_VALUE } api alphaLabel(): String { return COMMON_NAME }`, "origin/alpha/main.luxo")
+		files := []*ast.File{alpha, common}
+		if commonFirst {
+			files = []*ast.File{common, alpha}
+		}
+		result := analyzeModules(t, files)
+		expectNoErrors(t, result)
+		if result.Files[0].Name != files[0].Name {
+			t.Fatal("analysis reordered caller-owned source files")
+		}
+	}
+}
+
+func TestCommonGlobalErrorsAreReportedOnce(t *testing.T) {
+	common := parseFileWithName(t, `var SHARED = 1`, "origin/common/config.luxo")
+	alpha := parseFileWithName(t, `api alphaValue(): Int { return SHARED }`, "origin/alpha/main.luxo")
+	result := analyzeModules(t, []*ast.File{alpha, common})
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Message, "global 'var' is not allowed") {
+		t.Fatalf("common declaration was checked twice or lost its error: %v", result.Errors)
+	}
+}
+
 func TestComputedAggregateRejectsCrossModuleRelation(t *testing.T) {
 	user := parseFileWithName(t, `
 extend Post {
@@ -111,6 +136,15 @@ func TestFileToModule_NoOrigin(t *testing.T) {
 }
 
 // ========== Cross-Module Visibility Tests ==========
+
+func TestDeclarationsWithoutModulesLeaveVisibilityIndexesEmpty(t *testing.T) {
+	file := parseFileWithName(t, "model Entry { id: Int }", "entry.luxo")
+	analyzer := newAnalyzer()
+	analyzer.collectDeclarations(file)
+	if analyzer.typeOwners.owners != nil || analyzer.extendVisible != nil || analyzer.extendFieldVisible != nil {
+		t.Fatal("unscoped declarations allocated module visibility indexes")
+	}
+}
 
 func TestModuleCrossModuleTypeWithoutExtend(t *testing.T) {
 	// user.luxo defines model User and enum Role
@@ -737,4 +771,40 @@ api getUser(id: Int): User {
 			t.Errorf("same-module find should be allowed: %s", e.Message)
 		}
 	}
+}
+
+func TestInheritedStorageValidationAcrossModules(t *testing.T) {
+	for _, reversed := range []bool{false, true} {
+		common := parseFileWithName(t, `type Detail { level: Int }
+ type Base { detail: Detail }`, "origin/common/types.luxo")
+		model := parseFileWithName(t, `model Record : Base { id: Int @id }`, "origin/record/main.luxo")
+		files := []*ast.File{common, model}
+		if reversed {
+			files[0], files[1] = files[1], files[0]
+		}
+		expectError(t, analyzeModules(t, files), "has no database mapping")
+	}
+}
+
+func TestCrossModuleLoadUsesInheritedPrimaryKey(t *testing.T) {
+	owner := parseFileWithName(t, `model Base @noTime { key: UUID @id } model Product : Base @noTime { name: String }`, "origin/catalog/model.luxo")
+	for _, sample := range []struct {
+		keyType string
+		valid   bool
+	}{{"UUID", true}, {"Int", false}} {
+		consumer := parseFileWithName(t, "extend Product { name: String } api lookup(key: "+sample.keyType+"): Product? { return Product.load(key) }", "origin/client/api.luxo")
+		result := analyzeModules(t, []*ast.File{owner, consumer})
+		if sample.valid {
+			expectNoErrors(t, result)
+		} else {
+			expectError(t, result, "load key expects 'UUID', got 'Int'")
+		}
+	}
+}
+
+func TestFederationUsesInheritedPrimaryKey(t *testing.T) {
+	owner := parseFileWithName(t, `model Base @noTime { key: String @id } model Product : Base @noTime { name: String }`, "origin/catalog/model.luxo")
+	consumer := parseFileWithName(t, `model Review @noTime { id: Int @id productKey: String }
+extend Product { reviews: [Review] @by(productKey) }`, "origin/review/model.luxo")
+	expectNoErrors(t, analyzeModules(t, []*ast.File{owner, consumer}))
 }

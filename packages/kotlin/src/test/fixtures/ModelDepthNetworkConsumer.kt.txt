@@ -1,0 +1,179 @@
+package probe
+
+import com.luxo.client.*
+import kotlinx.coroutines.*
+import kotlinx.serialization.json.*
+import okhttp3.*
+import java.io.File
+import java.security.KeyStore
+import java.security.cert.CertificateFactory
+import java.util.concurrent.atomic.AtomicInteger
+import javax.net.ssl.*
+
+private const val allFields = "value,child,children,payload"
+private var assertions = 0
+private val phases = mutableListOf<JsonObject>()
+private fun payload(depth: Int): JsonElement = Json.parseToJsonElement("[".repeat(depth) + "0" + "]".repeat(depth))
+private fun inputNode(depth: Int, lists: Boolean, jsonDepth: Int, nullLists: Boolean = false): DepthNodeInput = DepthNodeInput(
+    value = 1L, child = if (depth > 1 && !lists) inputBranch(depth - 1, lists, jsonDepth, nullLists) else null,
+    children = if (depth > 1 && lists) listOf(inputBranch(depth - 1, lists, jsonDepth, nullLists)) else if (nullLists) null else emptyList(),
+    payload = payload(if (depth == 1) jsonDepth else 0))
+private fun inputBranch(depth: Int, lists: Boolean, jsonDepth: Int, nullLists: Boolean): DepthBranchInput = DepthBranchInput(
+    value = 1L, child = if (depth > 1 && !lists) inputNode(depth - 1, lists, jsonDepth, nullLists) else null,
+    children = if (depth > 1 && lists) listOf(inputNode(depth - 1, lists, jsonDepth, nullLists)) else if (nullLists) null else emptyList(),
+    payload = payload(if (depth == 1) jsonDepth else 0))
+private fun checkPayload(value: JsonElement?, depth: Int) {
+    var current = requireNotNull(value)
+    var layers = 0
+    while (current is JsonArray) { check(current.size == 1); current = current.single(); layers++ }
+    check(layers == depth && current == JsonPrimitive(0))
+}
+private fun nodeDepth(value: DepthNode, jsonDepth: Int): Int {
+    check(value.value.value() == 1L)
+    val children = value.children.value().orEmpty()
+    val descendants = listOfNotNull(value.child.value()?.let { branchDepth(it, jsonDepth) }) + children.map { branchDepth(it, jsonDepth) }
+    checkPayload(value.payload.value(), if (descendants.isEmpty()) jsonDepth else 0)
+    return 1 + (descendants.maxOrNull() ?: 0)
+}
+private fun branchDepth(value: DepthBranch, jsonDepth: Int): Int {
+    check(value.value.value() == 1L)
+    val descendants = listOfNotNull(value.child.value()?.let { nodeDepth(it, jsonDepth) }) + value.children.value().orEmpty().map { nodeDepth(it, jsonDepth) }
+    checkPayload(value.payload.value(), if (descendants.isEmpty()) jsonDepth else 0)
+    return 1 + (descendants.maxOrNull() ?: 0)
+}
+private fun verifyTree(value: DepthNode, depth: Int, jsonDepth: Int) { check(nodeDepth(value, jsonDepth) == depth); assertions++ }
+private suspend fun expectLimit(limit: Int, action: suspend () -> Unit) {
+    val failure = try { action(); null } catch (failure: Exception) { failure }
+    check(failure is IllegalArgumentException && failure.message.orEmpty().contains(limit.toString())) { "expected local limit $limit, got $failure" }
+    assertions++
+}
+private suspend fun expectServerRejection(action: suspend () -> Unit) {
+    val failure = try { action(); null } catch (failure: Exception) { failure }
+    check(failure is LuxoError && failure.code == 500) { "expected generated server serialization rejection, got $failure" }
+    assertions++
+}
+private fun tlsClient(certificate: File, protocols: List<Protocol>): OkHttpClient {
+    val cert = certificate.inputStream().use { CertificateFactory.getInstance("X.509").generateCertificate(it) }
+    val store = KeyStore.getInstance(KeyStore.getDefaultType()).apply { load(null); setCertificateEntry("owned-go-fixture", cert) }
+    val factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply { init(store) }
+    val trust = factory.trustManagers.single() as X509TrustManager
+    val context = SSLContext.getInstance("TLS").apply { init(null, arrayOf(trust), null) }
+    return OkHttpClient.Builder().sslSocketFactory(context.socketFactory, trust).protocols(protocols).build()
+}
+private fun stats(client: OkHttpClient, endpoint: String): JsonObject = client.newCall(Request.Builder().url(endpoint.substringBeforeLast('/') + "/stats").build()).execute().use {
+    check(it.code == 200); Json.parseToJsonElement(requireNotNull(it.body).string()).jsonObject
+}
+private fun callCount(stats: JsonObject, api: String): Long = stats.getValue("invoked").jsonObject[api]?.jsonPrimitive?.long ?: 0L
+private suspend fun active(client: OkHttpClient, endpoint: String, expected: Long) = withTimeout(5000) {
+    while (stats(client, endpoint).getValue("active").jsonPrimitive.long != expected) delay(10)
+}
+private suspend fun calls(client: LuxoClient, observer: OkHttpClient, endpoint: String, hostile: LuxoClient? = null) {
+    for (depth in listOf(1, 63, 64)) for (lists in listOf(false, true)) {
+        val generic = if (depth == 64) 128 else 0
+        verifyTree(client.depthOne(depth.toLong(), lists, generic.toLong(), select = allFields), depth, generic)
+        val values = client.depthMany(depth.toLong(), lists, generic.toLong(), select = allFields)
+        check(values.size == 2); values.forEach { verifyTree(it, depth, generic) }
+        verifyTree(client.depthEcho(inputNode(depth, lists, generic), select = allFields), depth, generic)
+        val echoes = client.depthEchoMany(listOf(inputNode(depth, lists, generic), inputNode(depth, lists, generic)), select = allFields)
+        check(echoes.size == 2); echoes.forEach { verifyTree(it, depth, generic) }
+    }
+    for (lists in listOf(false, true)) {
+        if (hostile == null) {
+            expectLimit(64) { client.depthOne(65L, lists, 0L, select = allFields) }
+            expectLimit(64) { client.depthMany(65L, lists, 0L, select = allFields) }
+        } else {
+            expectServerRejection { client.depthOne(65L, lists, 0L, select = allFields) }
+            expectServerRejection { client.depthMany(65L, lists, 0L, select = allFields) }
+            expectLimit(64) { hostile.depthOne(65L, lists, 0L, select = allFields) }
+            expectLimit(64) { hostile.depthMany(65L, lists, 0L, select = allFields) }
+            verifyTree(hostile.depthOne(1L, lists, 0L, select = allFields), 1, 0)
+        }
+        val before = stats(observer, endpoint)
+        expectLimit(64) { client.depthEcho(inputNode(65, lists, 0), select = allFields) }
+        expectLimit(128) { client.depthEcho(inputNode(64, lists, 129), select = allFields) }
+        expectLimit(64) { client.depthEchoMany(listOf(inputNode(1, lists, 0), inputNode(65, lists, 0)), select = allFields) }
+        val after = stats(observer, endpoint)
+        check(callCount(before, "depthEcho") == callCount(after, "depthEcho"))
+        check(callCount(before, "depthEchoMany") == callCount(after, "depthEchoMany"))
+        verifyTree(client.depthEcho(inputNode(64, false, 128, nullLists = true), select = allFields), 64, 128)
+    }
+    val fork = DepthNodeInput(value = 1L, child = inputBranch(63, false, 128, false),
+        children = listOf(inputBranch(63, true, 128, false)), payload = payload(0))
+    verifyTree(client.depthEcho(fork, select = allFields), 64, 128)
+}
+private suspend fun streams(client: LuxoClient, observer: OkHttpClient, endpoint: String, many: Boolean) {
+    val good = CompletableDeferred<Unit>()
+    val goodErrors = AtomicInteger(); val goodCompleted = AtomicInteger()
+    val goodObserver = StreamObserver(onError = { goodErrors.incrementAndGet(); good.completeExceptionally(it) }, onComplete = { goodCompleted.incrementAndGet() })
+    val stopGood = if (many) client.subscribeDepthWatchMany(64L, true, 128L, select = allFields, observer = goodObserver) {
+        check(it.size == 2); it.forEach { value -> check(nodeDepth(value, 128) == 64) }; good.complete(Unit)
+    } else client.subscribeDepthWatch(64L, true, 128L, select = allFields, observer = goodObserver) {
+        check(nodeDepth(it, 128) == 64); good.complete(Unit)
+    }
+    try {
+        withTimeout(5000) { good.await() }; active(observer, endpoint, 1)
+        val rejected = CompletableDeferred<LuxoError>(); val delivered = AtomicInteger(); val errors = AtomicInteger(); val completed = AtomicInteger()
+        val failureObserver = StreamObserver(onError = { errors.incrementAndGet(); rejected.complete(it) }, onComplete = { completed.incrementAndGet() })
+        val stopBad = if (many) client.subscribeDepthWatchMany(65L, true, 0L, select = allFields, observer = failureObserver) { delivered.incrementAndGet() }
+            else client.subscribeDepthWatch(65L, true, 0L, select = allFields, observer = failureObserver) { delivered.incrementAndGet() }
+        try {
+            val failure = withTimeout(5000) { rejected.await() }
+            check(failure.error == "DecodeError" && failure.message.contains("64"))
+            active(observer, endpoint, 1)
+            check(errors.get() == 1 && delivered.get() == 0 && completed.get() == 0)
+            check(goodErrors.get() == 0 && goodCompleted.get() == 0)
+            verifyTree(client.depthOne(1L, false, 0L, select = allFields), 1, 0)
+            assertions++
+        } finally { stopBad() }
+    } finally { stopGood(); active(observer, endpoint, 0) }
+}
+private fun recordPhase(before: JsonObject, after: JsonObject, protocol: String, mode: TransportMode) {
+    val extra = if (protocol == "ws") 2L else 0L
+    val expected = mapOf("depthOne" to 8L + extra, "depthMany" to 8L, "depthEcho" to 9L, "depthEchoMany" to 6L)
+    for ((api, count) in expected) check(callCount(after, api) - callCount(before, api) == count) { "unexpected $api calls in $protocol/$mode" }
+    for (key in listOf("h1", "h2", "ws")) {
+        val count = after.getValue(key).jsonPrimitive.long - before.getValue(key).jsonPrimitive.long
+        check(count == if (key == protocol) if (protocol == "ws") 1L else 31L else 0L) { "unexpected $key traffic in $protocol/$mode: $count" }
+    }
+    check(after.getValue("active").jsonPrimitive.long == 0L)
+    phases += buildJsonObject { put("protocol", protocol); put("mode", mode.name); put("before", before); put("after", after) }
+}
+fun main(args: Array<String>) = runBlocking {
+    val endpoint = args[0]; val certificate = File(args[1])
+    for (protocols in listOf(listOf(Protocol.HTTP_1_1), listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))) {
+        val http = tlsClient(certificate, protocols)
+        try {
+            for (mode in TransportMode.entries) {
+                val before = stats(http, endpoint)
+                val client = LuxoClient(OkHttpTransport(endpoint, client = http, mode = mode))
+                val hostile = if (mode == TransportMode.JSON) LuxoClient(OkHttpTransport(
+                    endpoint.substringBeforeLast('/') + "/hostile", client = http, mode = mode)) else null
+                calls(client, http, endpoint, hostile)
+                recordPhase(before, stats(http, endpoint), if (protocols.first() == Protocol.HTTP_1_1) "h1" else "h2", mode)
+            }
+        } finally { http.dispatcher.executorService.shutdownNow(); http.connectionPool.evictAll() }
+    }
+    val http = tlsClient(certificate, listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+    try {
+        for (mode in TransportMode.entries) {
+            val before = stats(http, endpoint)
+            val ws = LuxoWebSocket(endpoint.replace("https://", "wss://") + "/ws", http, autoReconnect = false, timeoutMillis = 5000)
+            val hostile = if (mode == TransportMode.JSON) LuxoWebSocket(
+                endpoint.replace("https://", "wss://").substringBeforeLast('/') + "/hostile/ws",
+                http, autoReconnect = false, timeoutMillis = 5000) else null
+            try {
+                ws.setMode(mode)
+                val client = LuxoClient(ws)
+                calls(client, http, endpoint, hostile?.let { LuxoClient(it) })
+                streams(client, http, endpoint, false)
+                streams(client, http, endpoint, true)
+            } finally { hostile?.close(); ws.close() }
+            withTimeout(5000) {
+                while (stats(http, endpoint).getValue("hostile").jsonObject.getValue("active").jsonPrimitive.long != 0L) delay(10)
+            }
+            recordPhase(before, stats(http, endpoint), "ws", mode)
+        }
+        active(http, endpoint, 0)
+        println(buildJsonObject { put("assertions", assertions); put("phases", JsonArray(phases)); put("server", stats(http, endpoint)) })
+    } finally { http.dispatcher.executorService.shutdownNow(); http.connectionPool.evictAll() }
+}

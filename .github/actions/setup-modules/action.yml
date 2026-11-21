@@ -1,0 +1,7 @@
+name: Configure repository modules
+description: Bind unpublished candidate modules locally without changing their manifests
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: sh scripts/setup-modules.sh .

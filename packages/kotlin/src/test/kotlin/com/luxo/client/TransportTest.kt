@@ -11,6 +11,35 @@ import kotlin.test.assertTrue
 import kotlin.test.assertFailsWith
 
 class TransportProtocolTest {
+    @Test
+    fun `nullable JSON parameters canonicalize JsonNull without changing omission or literal values`() {
+        val meta = APISchemaEntry(7, listOf(ParamSchema(1, "value", "JSON", nullable = true)))
+        for (value in listOf(null, JsonNull)) {
+            assertTrue(byteArrayOf(7, 0, 1, 0, 0).contentEquals(
+                LuxoBinaryProtocol.encodeRequest(meta, mapOf("value" to value))))
+        }
+        assertTrue(byteArrayOf(7, 0, 0).contentEquals(LuxoBinaryProtocol.encodeRequest(meta, emptyMap())))
+        val text = kotlinx.serialization.json.JsonPrimitive("null")
+        assertTrue(byteArrayOf(7, 0, 1, 1, 6, 34, 110, 117, 108, 108, 34, 0).contentEquals(
+            LuxoBinaryProtocol.encodeRequest(meta, mapOf("value" to text))))
+        assertFailsWith<LuxoError> {
+            LuxoBinaryProtocol.encodeRequest(APISchemaEntry(7, listOf(ParamSchema(1, "value", "JSON"))), mapOf("value" to null))
+        }
+        val list = APISchemaEntry(7, listOf(ParamSchema(1, "value", "JSON", isList = true, nullable = true)))
+        assertTrue(byteArrayOf(7, 0, 1, 1, 1, 4, 110, 117, 108, 108, 0).contentEquals(
+            LuxoBinaryProtocol.encodeRequest(list, mapOf("value" to listOf(JsonNull)))))
+    }
+
+    @Test
+    fun `binary request rejects out-of-range selected metadata`() {
+        for (id in listOf(0, -1, 65536, Int.MAX_VALUE)) {
+            val meta = APISchemaEntry(id = 1, fields = mapOf("value" to SelectionFieldSchema(id)))
+            assertFailsWith<IllegalArgumentException> {
+                LuxoBinaryProtocol.encodeRequest(meta, mapOf("\$select" to "value"))
+            }
+        }
+    }
+
 	private data class TestInput(val value: String) : LuxoBinaryEncodable {
 		override fun writeLuxo(encoder: LuxoEncoder) {
 			encoder.writeVarint(value.toByteArray().size.toLong())

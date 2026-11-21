@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -19,15 +18,14 @@ import (
 	"github.com/light-speak/luxo/pkg/lux/auth"
 	"github.com/light-speak/luxo/pkg/lux/env"
 	"github.com/light-speak/luxo/pkg/lux/i18n"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"golang.org/x/net/http/httpguts"
 )
 
 // Gateway is the Luvia API gateway.
 type Gateway struct {
 	Router          *api.Router
 	modules         []string
-	server          *http.Server
+	server          gatewayHTTPRuntime
 	metrics         *MetricsCollector
 	registrar       *GatewayRegistrar
 	dependencyStats lux.RuntimeDependencyStatsProvider
@@ -35,9 +33,21 @@ type Gateway struct {
 
 // New creates a new Luvia gateway.
 func New() *Gateway {
-	router := api.NewRouter()
+	return newGateway(api.NewRouter())
+}
+
+// NewWithOptions creates a gateway with explicitly owned runtime dependencies.
+func NewWithOptions(options api.RouterOptions) *Gateway {
+	return newGateway(api.NewRouterWithOptions(options))
+}
+
+func newGateway(router *api.Router) *Gateway {
 	router.IdentityExtractor = func(ctx context.Context) any {
-		return Identity(ctx)
+		// An anonymous identity must not become a non-nil interface holding a nil pointer.
+		if identity := Identity(ctx); identity != nil {
+			return identity
+		}
+		return nil
 	}
 	router.InternalRequestContext = internalRequestContext
 	return &Gateway{
@@ -54,7 +64,7 @@ func internalRequestContext(ctx context.Context, bearerToken string) (context.Co
 	if err != nil {
 		return nil, err
 	}
-	ctx = context.WithValue(ctx, identityKey, &Claims{data: data})
+	ctx = context.WithValue(ctx, identityKey, &data)
 	return context.WithValue(ctx, bearerTokenCtxKey{}, bearerToken), nil
 }
 
@@ -73,9 +83,23 @@ func (g *Gateway) SetRuntimeDependencyStatsProvider(provider lux.RuntimeDependen
 // If APP_TLS_CERT and APP_TLS_KEY are set, uses HTTP/2 with TLS.
 // Handles SIGTERM/SIGINT for graceful shutdown — drains active connections.
 func (g *Gateway) Serve(version string) error {
-	if err := g.Router.Validate(); err != nil {
-		return err
-	}
+	// Register before startup so signals received while initializing are retained.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(quit)
+	return g.serve(version, quit)
+}
+
+func (g *Gateway) serve(version string, quit <-chan os.Signal) (serveResult error) {
+	// Logs are best-effort diagnostics, but drain failures remain visible to the
+	// process owner. This also releases the worker when startup fails.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := g.Router.CloseRequestLogs(ctx); err != nil {
+			serveResult = errors.Join(serveResult, fmt.Errorf("request log shutdown: %w", err))
+		}
+	}()
 	shutdownTimeout, err := positiveDurationEnv("GRACEFUL_TIMEOUT", 30*time.Second)
 	if err != nil {
 		return err
@@ -86,7 +110,21 @@ func (g *Gateway) Serve(version string) error {
 	if err := validateJWTConfig(); err != nil {
 		return err
 	}
-	mux, port := g.buildMux(version)
+	if os.Getenv("LUXO_STUDIO_URL") != "" && os.Getenv("LUXO_API_KEY") != "" {
+		if _, err := studioURLFromEnv(); err != nil {
+			return err
+		}
+		if _, err := studioProjectIDFromEnv(); err != nil {
+			return err
+		}
+	}
+	mux, port, err := g.buildMux(version)
+	if err != nil {
+		return err
+	}
+	if err := g.Router.Prepare(); err != nil {
+		return err
+	}
 	addr := ":" + port
 
 	// Start metrics collection + gateway registration if Studio is configured
@@ -100,7 +138,7 @@ func (g *Gateway) Serve(version string) error {
 	certFile := envOr("APP_TLS_CERT", "")
 	keyFile := envOr("APP_TLS_KEY", "")
 
-	server, serveErr, err := startGatewayServer(addr, mux, certFile, keyFile)
+	server, serveErr, err := startGatewayServerWithBodyLimits(addr, mux, certFile, keyFile, g.Router.BodyLimits())
 	if err != nil {
 		return err
 	}
@@ -111,7 +149,7 @@ func (g *Gateway) Serve(version string) error {
 	}
 
 	g.server = server
-	return g.waitForShutdown(serveErr, shutdownTimeout)
+	return g.waitForShutdown(quit, serveErr, shutdownTimeout)
 }
 
 func validateDeploymentMode() error {
@@ -141,8 +179,16 @@ func (g *Gateway) closeIntegrations() {
 	}
 }
 
-func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string) (*http.Server, <-chan error, error) {
+func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string) (*gatewayHTTPServer, <-chan error, error) {
+	return startGatewayServerWithBodyLimits(addr, mux, certFile, keyFile, api.BodyLimits{RequestBytes: api.MaxRequestBodySize, ResponseBytes: api.DefaultResponseBodySize})
+}
+
+func startGatewayServerWithBodyLimits(addr string, mux http.Handler, certFile, keyFile string, body api.BodyLimits) (*gatewayHTTPServer, <-chan error, error) {
 	timeouts, err := serverTimeoutsFromEnv()
+	if err != nil {
+		return nil, nil, err
+	}
+	h2, err := newGatewayHTTPTransport(mux, timeouts, body)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -151,11 +197,18 @@ func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string)
 		return nil, nil, fmt.Errorf("listen %s: %w", addr, err)
 	}
 	server := &http.Server{
-		Addr:         addr,
-		Handler:      h2c.NewHandler(mux, &http2.Server{}),
+		Addr:         listener.Addr().String(),
+		Handler:      mux,
 		ReadTimeout:  timeouts.read,
 		WriteTimeout: timeouts.write,
 		IdleTimeout:  timeouts.idle,
+	}
+	if h2 == nil {
+		protocols := new(http.Protocols)
+		protocols.SetHTTP1(true)
+		protocols.SetHTTP2(true)
+		protocols.SetUnencryptedHTTP2(true)
+		server.Protocols = protocols
 	}
 	if certFile != "" && keyFile != "" {
 		certificate, loadErr := tls.LoadX509KeyPair(certFile, keyFile)
@@ -164,16 +217,9 @@ func startGatewayServer(addr string, mux http.Handler, certFile, keyFile string)
 			return nil, nil, fmt.Errorf("load TLS certificate: %w", loadErr)
 		}
 		server.Handler = mux
-		server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
-		if configureErr := http2.ConfigureServer(server, &http2.Server{}); configureErr != nil {
-			listener.Close()
-			return nil, nil, fmt.Errorf("configure HTTP/2: %w", configureErr)
-		}
-		listener = tls.NewListener(listener, server.TLSConfig)
+		server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
 	}
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- server.Serve(listener) }()
-	return server, serveErr, nil
+	return startConfiguredGatewayServer(listener, server, h2, certFile != "" && keyFile != "")
 }
 
 type serverTimeouts struct {
@@ -211,10 +257,7 @@ func positiveDurationEnv(name string, fallback time.Duration) (time.Duration, er
 }
 
 // waitForShutdown blocks until SIGTERM, SIGINT, or a server failure, then gracefully shuts down.
-func (g *Gateway) waitForShutdown(serveErr <-chan error, timeout time.Duration) error {
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(quit)
+func (g *Gateway) waitForShutdown(quit <-chan os.Signal, serveErr <-chan error, timeout time.Duration) error {
 	var sig os.Signal
 	select {
 	case err := <-serveErr:
@@ -241,7 +284,11 @@ func (g *Gateway) waitForShutdown(serveErr <-chan error, timeout time.Duration) 
 
 // buildMux creates the HTTP mux with all routes and middleware.
 // Returns the mux and the port string. Extracted for testability.
-func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
+func (g *Gateway) buildMux(version string) (*http.ServeMux, string, error) {
+	policy, err := configureWebSocketOrigins(g.Router, envOr("CORS_ORIGIN", "*"))
+	if err != nil {
+		return nil, "", fmt.Errorf("CORS_ORIGIN: %w", err)
+	}
 	g.Router.Version = version
 	port := envOr("APP_PORT", "4000")
 	mode := envOr("DEPLOY_MODE", "embedded")
@@ -272,7 +319,6 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 		g.Router.SetDevMode(true)
 	}
 	g.Router.SetDebugTraceKey(envOr("LUXO_API_KEY", ""))
-	configureWebSocketOrigins(g.Router, envOr("CORS_ORIGIN", "*"))
 
 	// Schema introspection key
 	if key := envOr("INTROSPECTION_KEY", ""); key != "" {
@@ -288,47 +334,57 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string) {
 			handler = AuthMiddleware(jwtCfg, handler)
 		}
 	}
-	handler = corsMiddleware(handler)
+	handler = corsMiddleware(handler, policy)
 	mux.Handle("/luvia", handler)
 
-	return mux, port
+	return mux, port, nil
 }
 
-func configureWebSocketOrigins(router *api.Router, configured string) {
-	configured = strings.TrimSpace(configured)
-	if configured == "*" {
-		router.WSAllowAllOrigins = true
-		router.WSOrigins = nil
-		return
+func configureWebSocketOrigins(router *api.Router, configured string) (*api.OriginPolicy, error) {
+	policy, err := api.ParseOriginPolicy(configured)
+	if err != nil {
+		return nil, err
 	}
-	origin, err := url.Parse(configured)
-	if err != nil || origin.Scheme == "" || origin.Host == "" || origin.User != nil {
-		return
-	}
-	router.WSAllowAllOrigins = false
-	router.WSOrigins = []string{origin.Host}
+	router.SetOriginPolicy(policy)
+	return policy, nil
 }
+
+const corsRequestHeaders = "Content-Type, Authorization, X-Luxo-Mode, X-Request-Id, X-Luxo-Client, X-Luxo-Client-Version, " +
+	api.DebugTraceRequestHeader + ", " + api.DebugTraceKeyHeader + ", " + api.DebugTraceEnvelopeHeader
+
+const corsResponseHeaders = "Content-Encoding, X-Luxo-Mode, X-Trace-Id, " +
+	api.TraceIDFailureHeader + ", " + api.DebugTraceResponseHeader + ", Server-Timing"
 
 // corsMiddleware handles CORS preflight, response headers, and security headers (XSS, CSP, etc.).
 // Configurable via CORS_ORIGIN env var (default: "*").
-func corsMiddleware(next http.Handler) http.Handler {
-	origin := envOr("CORS_ORIGIN", "*")
+func corsMiddleware(next http.Handler, policy *api.OriginPolicy) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// CORS
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Luxo-Mode, X-Request-Id")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-
 		// Security headers — XSS, clickjacking, MIME sniffing protection
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
 		w.Header().Set("Content-Security-Policy", "default-src 'none'")
+		if !httpguts.HeaderValuesContainsToken(w.Header().Values("Vary"), "Origin") {
+			w.Header().Add("Vary", "Origin")
+		}
+		origin, allowed := policy.Match(r)
+		if !allowed {
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+			return
+		}
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		}
 
 		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", corsRequestHeaders)
+			w.Header().Set("Access-Control-Max-Age", "86400")
 			w.WriteHeader(http.StatusNoContent)
 			return
+		}
+		if r.Header.Get("Origin") != "" {
+			w.Header().Set("Access-Control-Expose-Headers", corsResponseHeaders)
 		}
 		next.ServeHTTP(w, r)
 	})

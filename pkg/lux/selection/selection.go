@@ -3,6 +3,8 @@ package selection
 import (
 	"fmt"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/light-speak/luxo/pkg/lux/str"
 )
@@ -36,6 +38,27 @@ func writeSelection(builder *strings.Builder, fields []*Field) {
 type Field struct {
 	Name     string
 	Children []*Field // nil = leaf field
+}
+
+// At borrows a selected subtree without copying it. Nil retains the all-fields
+// contract; an absent path returns an explicit empty selection.
+func At(fields []*Field, path ...string) []*Field {
+	for _, name := range path {
+		if fields == nil {
+			return nil
+		}
+		found := false
+		for _, field := range fields {
+			if field != nil && field.Name == name {
+				fields, found = field.Children, true
+				break
+			}
+		}
+		if !found {
+			return []*Field{}
+		}
+	}
+	return fields
 }
 
 // EnsureField returns fields with name selected. It preserves nil because nil
@@ -143,7 +166,7 @@ func SQLColumnsOr(fields []*Field, fallback []string) []string {
 //
 //	selection_list = selection (',' selection)*
 //	selection      = IDENT ('{' selection_list '}')?
-//	IDENT          = [a-zA-Z_][a-zA-Z0-9_]*
+//	IDENT          = (UnicodeLetter | _) (UnicodeLetter | _ | ASCIIDigit)*
 //
 // Example: "name,email,posts{title,comments{content}}"
 func Parse(input string) ([]*Field, error) {
@@ -165,35 +188,25 @@ type parser struct {
 
 // parseList parses: selection (',' selection)*
 func (p *parser) parseList() ([]*Field, error) {
-	p.skipSpaces()
-	if p.pos >= len(p.input) {
-		return nil, nil
-	}
-
 	var fields []*Field
-	f, err := p.parseField()
+	field, err := p.parseField()
 	if err != nil {
 		return nil, err
 	}
-	if f == nil {
+	if field == nil {
 		return nil, nil
 	}
-	fields = append(fields, f)
-
-	for {
-		p.skipSpaces()
-		if p.pos >= len(p.input) || p.input[p.pos] != ',' {
-			break
-		}
-		p.pos++ // skip ','
-		f, err := p.parseField()
+	fields = append(fields, field)
+	for p.pos < len(p.input) && p.input[p.pos] == ',' {
+		p.pos++
+		field, err := p.parseField()
 		if err != nil {
 			return nil, err
 		}
-		if f == nil {
+		if field == nil {
 			return nil, fmt.Errorf("expected field name after ',' at position %d", p.pos)
 		}
-		fields = append(fields, f)
+		fields = append(fields, field)
 	}
 
 	return fields, nil
@@ -202,7 +215,10 @@ func (p *parser) parseList() ([]*Field, error) {
 // parseField parses: IDENT ('{' selection_list '}')?
 func (p *parser) parseField() (*Field, error) {
 	p.skipSpaces()
-	name := p.readIdent()
+	name, err := p.readIdent()
+	if err != nil {
+		return nil, err
+	}
 	if name == "" {
 		return nil, nil
 	}
@@ -219,32 +235,64 @@ func (p *parser) parseField() (*Field, error) {
 		if len(children) == 0 {
 			return nil, fmt.Errorf("empty selection block for '%s' at position %d", name, p.pos)
 		}
-		p.skipSpaces()
 		if p.pos >= len(p.input) || p.input[p.pos] != '}' {
 			return nil, fmt.Errorf("expected '}' for '%s' at position %d", name, p.pos)
 		}
 		p.pos++ // skip '}'
+		p.skipSpaces()
 		f.Children = children
 	}
 
 	return f, nil
 }
 
-// readIdent reads [a-zA-Z_][a-zA-Z0-9_]*
-func (p *parser) readIdent() string {
+// readIdent preserves the DSL's Unicode letters and ASCII digits without normalizing names.
+func (p *parser) readIdent() (string, error) {
 	start := p.pos
-	if p.pos >= len(p.input) {
-		return ""
+	if start >= len(p.input) {
+		return "", nil
 	}
-	c := p.input[p.pos]
-	if !isIdentStart(c) {
-		return ""
+	first := p.input[start]
+	if first >= utf8.RuneSelf {
+		return p.readUnicodeIdent(start)
 	}
-	p.pos++
-	for p.pos < len(p.input) && isIdentPart(p.input[p.pos]) {
-		p.pos++
+	if !isIdentStart(first) {
+		return "", nil
 	}
-	return p.input[start:p.pos]
+	for offset, c := range []byte(p.input[start+1:]) {
+		if isIdentStart(c) || c-'0' <= 9 {
+			continue
+		}
+		p.pos = start + offset + 1
+		if c >= utf8.RuneSelf {
+			return p.readUnicodeIdent(start)
+		}
+		return p.input[start:p.pos], nil
+	}
+	p.pos = len(p.input)
+	return p.input[start:], nil
+}
+
+func (p *parser) readUnicodeIdent(start int) (string, error) {
+	for p.pos < len(p.input) {
+		c := p.input[p.pos]
+		if c < utf8.RuneSelf {
+			if !isIdentStart(c) && !(p.pos > start && c >= '0' && c <= '9') {
+				break
+			}
+			p.pos++
+			continue
+		}
+		r, width := utf8.DecodeRuneInString(p.input[p.pos:])
+		if r == utf8.RuneError && width == 1 {
+			return "", fmt.Errorf("invalid UTF-8 at position %d", p.pos)
+		}
+		if !unicode.IsLetter(r) {
+			break
+		}
+		p.pos += width
+	}
+	return p.input[start:p.pos], nil
 }
 
 func (p *parser) skipSpaces() {
@@ -254,9 +302,5 @@ func (p *parser) skipSpaces() {
 }
 
 func isIdentStart(c byte) bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
-}
-
-func isIdentPart(c byte) bool {
-	return isIdentStart(c) || (c >= '0' && c <= '9')
+	return (c|0x20)-'a' <= 'z'-'a' || c == '_'
 }

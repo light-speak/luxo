@@ -8,12 +8,100 @@ import (
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux"
-	"github.com/light-speak/luxo/pkg/lux/pg"
+	"github.com/light-speak/luxo/pkg/lux/dialect/pg"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
 func pgDialect() lux.Dialect { return pg.Dialect{} }
+
+func TestGenerateRejectsInvalidFieldDefaults(t *testing.T) {
+	for _, kind := range []string{"model", "type"} {
+		for _, field := range []string{`value: Int = "42"`, `value: Int = null`, `value: State = State.MISSING`, `value: Int = 1 + 2`} {
+			source := `enum State { OPEN CLOSED }
+` + kind + ` Probe { ` + field + ` }`
+			input := analyzePermissionFixture(t, source)
+			output, err := Generate(input, "generated", GeneratorConfig{Driver: DriverPG})
+			if err == nil || output != nil || !strings.Contains(err.Error(), "default value for field 'value'") {
+				t.Fatal("invalid field default escaped formal generation", source, output, err)
+			}
+		}
+	}
+}
+
+func TestJSONMigrationColumnTypes(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{{
+		Name: "Document",
+		Fields: []*ast.FieldDecl{
+			{Name: "data", Type: &ast.TypeRef{Name: "JSON"}},
+			{Name: "entries", Type: &ast.TypeRef{Name: "JSON", IsList: true}},
+		},
+	}}}}}
+	desired, err := ComputeState(result, nil, pgDialect())
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := desired.Models["Document"]
+	if model.Columns["data"].Type != "JSONB" || model.Columns["entries"].Type != "JSONB[]" {
+		t.Fatalf("JSON storage types: %+v", model.Columns)
+	}
+	current := &SchemaState{Models: map[string]*ModelState{}}
+	up, _, migrationSQLFailure1 := GenerateMigrationSQL(mustMigrationDiff(t, current, desired, nil), desired, pgDialect())
+	if migrationSQLFailure1 != nil {
+		t.Fatal(migrationSQLFailure1)
+	}
+	for _, column := range []string{"\"data\" JSONB NOT NULL", "\"entries\" JSONB[]"} {
+		if !strings.Contains(up, column) {
+			t.Fatalf("missing %q in migration:\n%s", column, up)
+		}
+	}
+	current.Models["Document"] = &ModelState{Table: model.Table, Columns: map[string]*ColumnState{
+		"data": {Type: "TEXT"}, "entries": {Type: "TEXT[]", Nullable: true},
+	}}
+	up, _, migrationSQLFailure2 := GenerateMigrationSQL(mustMigrationDiff(t, current, desired, nil), desired, pgDialect())
+	if migrationSQLFailure2 != nil {
+		t.Fatal(migrationSQLFailure2)
+	}
+	for _, conversion := range []string{"TYPE JSONB USING \"data\"::JSONB", "TYPE JSONB[] USING \"entries\"::JSONB[]"} {
+		if !strings.Contains(up, conversion) {
+			t.Fatalf("missing %q in migration:\n%s", conversion, up)
+		}
+	}
+}
+
+func TestInheritedMigrationColumns(t *testing.T) {
+	base := &ast.ModelDecl{Name: "Base", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}}}}
+	child := &ast.ModelDecl{Name: "Child", Parents: []string{"Base"}, Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}}}
+	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{base, child}}}}
+	state, err := ComputeState(result, nil, pgDialect())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := state.Models["Child"].Columns["id"]
+	if id == nil || !id.PK || state.Models["Child"].Columns["name"] == nil {
+		t.Fatal("child table is missing inherited column metadata")
+	}
+	if state.Models["Child"].Table == state.Models["Base"].Table || len(child.Fields) != 1 {
+		t.Fatal("child table identity or original declaration changed")
+	}
+}
+
+func TestQualifiedEnumDefaultColumnState(t *testing.T) {
+	for _, value := range []ast.Expr{
+		&ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "ADMIN"},
+		&ast.Ident{Name: "ADMIN"},
+	} {
+		column, err := buildColumnState(&ast.FieldDecl{
+			Name: "role", Type: &ast.TypeRef{Name: "Role"}, Default: value,
+		}, pgDialect())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if column == nil || column.Default != "'ADMIN'" {
+			t.Fatalf("enum default for %T = %#v", value, column)
+		}
+	}
+}
 
 func mkPos() token.Position {
 	return token.Position{File: "test.luxo", Line: 1, Col: 1}
@@ -26,6 +114,19 @@ func TestLoadStateNotFound(t *testing.T) {
 	}
 	if len(s.Models) != 0 {
 		t.Error("should be empty")
+	}
+}
+
+func TestMarshalStatePreservesEncodingAndValidation(t *testing.T) {
+	data, err := MarshalState(&SchemaState{Models: map[string]*ModelState{}})
+	if err != nil || string(data) != "{\n  \"models\": {}\n}\n" {
+		t.Fatalf("empty state encoding: %q %v", data, err)
+	}
+	for _, invalid := range []*SchemaState{nil, {Models: map[string]*ModelState{"User": nil}}, {Models: map[string]*ModelState{"User": {Columns: map[string]*ColumnState{"id": nil}}}}} {
+		data, err := MarshalState(invalid)
+		if err == nil || data != nil {
+			t.Fatalf("malformed state encoded: %q %v", data, err)
+		}
 	}
 }
 
@@ -54,16 +155,27 @@ func TestSaveAndLoadState(t *testing.T) {
 	if loaded.Models["User"].Columns["id"].Type != "SERIAL" {
 		t.Error("column type mismatch")
 	}
+	for _, invalid := range []*SchemaState{nil, {Models: map[string]*ModelState{"User": nil}}, {Models: map[string]*ModelState{"User": {Columns: map[string]*ColumnState{"id": nil}}}}} {
+		if err := SaveState(path, invalid); err == nil {
+			t.Error("saving a malformed state must fail before overwriting the file")
+		}
+		preserved, err := LoadState(path)
+		if err != nil || preserved == nil || preserved.Models["User"] == nil || preserved.Models["User"].Table != "users" {
+			t.Fatalf("rejected save changed the previous state: %v, %v", preserved, err)
+		}
+	}
 }
 
 func TestLoadStateInvalidJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".state.json")
-	os.WriteFile(path, []byte("bad"), 0644)
-
-	_, err := LoadState(path)
-	if err == nil {
-		t.Fatal("should error on invalid JSON")
+	for _, input := range []string{"bad", "null", `{"models":{"User":null}}`, `{"models":{"User":{"table":"users","columns":{"id":null}}}}`} {
+		if err := os.WriteFile(path, []byte(input), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if state, err := LoadState(path); err == nil || state != nil {
+			t.Errorf("invalid state %s returned %v, %v", input, state, err)
+		}
 	}
 }
 
@@ -84,7 +196,11 @@ func TestComputeState(t *testing.T) {
 		}},
 	}
 
-	s := ComputeState(result, nil, pgDialect())
+	s, err := ComputeState(result, nil, pgDialect())
+
+	if err != nil {
+		t.Fatal(err)
+	}
 	ms := s.Models["User"]
 	if ms == nil {
 		t.Fatal("User model missing")
@@ -114,7 +230,7 @@ func TestDiffCreateTable(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
+	ops := mustMigrationDiff(t, current, desired, nil)
 	if len(ops) != 1 || ops[0].Kind != CreateTable {
 		t.Errorf("expected CreateTable, got %v", ops)
 	}
@@ -126,7 +242,7 @@ func TestDiffDropTable(t *testing.T) {
 	}}
 	desired := &SchemaState{Models: map[string]*ModelState{}}
 
-	ops := Diff(current, desired, nil)
+	ops := mustMigrationDiff(t, current, desired, nil)
 	if len(ops) != 1 || ops[0].Kind != DropTable {
 		t.Errorf("expected DropTable, got %v", ops)
 	}
@@ -145,7 +261,7 @@ func TestDiffAddColumn(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
+	ops := mustMigrationDiff(t, current, desired, nil)
 	found := false
 	for _, op := range ops {
 		if op.Kind == AddColumn && op.Column == "name" {
@@ -170,7 +286,7 @@ func TestDiffDropColumn(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
+	ops := mustMigrationDiff(t, current, desired, nil)
 	found := false
 	for _, op := range ops {
 		if op.Kind == DropColumn && op.Column == "old" {
@@ -194,7 +310,7 @@ func TestDiffAlterColumn(t *testing.T) {
 		}},
 	}}
 
-	ops := Diff(current, desired, nil)
+	ops := mustMigrationDiff(t, current, desired, nil)
 	found := false
 	for _, op := range ops {
 		if op.Kind == AlterColumn && op.Column == "name" {
@@ -212,7 +328,7 @@ func TestDiffNoChanges(t *testing.T) {
 			"id": {Type: "SERIAL"},
 		}},
 	}}
-	ops := Diff(s, s, nil)
+	ops := mustMigrationDiff(t, s, s, nil)
 	if len(ops) != 0 {
 		t.Errorf("expected no changes, got %d ops", len(ops))
 	}
@@ -226,7 +342,7 @@ func TestDiffIndexes(t *testing.T) {
 		"User": {Table: "users", Columns: map[string]*ColumnState{}, Indexes: []lux.IndexInfo{{Name: "idx_users_email", Kind: lux.BTreeIndex, Columns: []string{"email"}}}},
 	}}
 
-	ops := Diff(current, desired, nil)
+	ops := mustMigrationDiff(t, current, desired, nil)
 	addIdx, dropIdx := false, false
 	for _, op := range ops {
 		if op.Kind == AddIndex && op.Index.Name == "idx_users_email" {
@@ -255,12 +371,15 @@ func TestGenerateMigrationSQL(t *testing.T) {
 		{Kind: CreateTable, Model: "User", Table: "users"},
 	}
 
-	up, down := GenerateMigrationSQL(ops, desired, pgDialect())
+	up, down, migrationSQLFailure3 := GenerateMigrationSQL(ops, desired, pgDialect())
+	if migrationSQLFailure3 != nil {
+		t.Fatal(migrationSQLFailure3)
+	}
 
-	if !strings.Contains(up, "CREATE TABLE users") {
+	if !strings.Contains(up, "CREATE TABLE \"users\"") {
 		t.Errorf("up missing CREATE TABLE:\n%s", up)
 	}
-	if !strings.Contains(down, "DROP TABLE IF EXISTS users") {
+	if !strings.Contains(down, "DROP TABLE IF EXISTS \"users\"") {
 		t.Errorf("down missing DROP TABLE:\n%s", down)
 	}
 }
@@ -269,7 +388,10 @@ func TestGenerateMigrationSQLDrop(t *testing.T) {
 	ops := []DiffOp{
 		{Kind: DropTable, Model: "Old", Table: "olds"},
 	}
-	up, _ := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}}, pgDialect())
+	up, _, migrationSQLFailure4 := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}}, pgDialect())
+	if migrationSQLFailure4 != nil {
+		t.Fatal(migrationSQLFailure4)
+	}
 
 	if !strings.Contains(up, "-- DROP TABLE") {
 		t.Error("DROP TABLE should be commented out")
@@ -282,9 +404,12 @@ func TestGenerateMigrationSQLAlter(t *testing.T) {
 			OldColumn: &ColumnState{Type: "VARCHAR(50)", Nullable: false, Unique: false},
 			NewColumn: &ColumnState{Type: "TEXT", Nullable: true, Unique: true}},
 	}
-	up, _ := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}}, pgDialect())
+	up, _, migrationSQLFailure5 := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}}, pgDialect())
+	if migrationSQLFailure5 != nil {
+		t.Fatal(migrationSQLFailure5)
+	}
 
-	if !strings.Contains(up, "ALTER COLUMN name TYPE TEXT") {
+	if !strings.Contains(up, "ALTER COLUMN \"name\" TYPE TEXT") {
 		t.Errorf("should alter type:\n%s", up)
 	}
 	if !strings.Contains(up, "DROP NOT NULL") {
@@ -345,9 +470,12 @@ func TestBuildColumnStateWithDefault(t *testing.T) {
 	f := &ast.FieldDecl{
 		Name:    "status",
 		Type:    &ast.TypeRef{Name: "String"},
-		Default: &ast.Literal{Value: "active"},
+		Default: &ast.Literal{Kind: token.String, Value: "active"},
 	}
-	cs := buildColumnState(f, d)
+	cs, err := buildColumnState(f, d)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cs == nil {
 		t.Fatal("should not be nil")
 	}
@@ -359,9 +487,12 @@ func TestBuildColumnStateWithDefault(t *testing.T) {
 	f = &ast.FieldDecl{
 		Name:    "active",
 		Type:    &ast.TypeRef{Name: "Boolean"},
-		Default: &ast.Literal{Value: "true"},
+		Default: &ast.Literal{Kind: token.True, Value: "true"},
 	}
-	cs = buildColumnState(f, d)
+	cs, err = buildColumnState(f, d)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cs.Default != "TRUE" {
 		t.Errorf("Boolean true default = %q, want TRUE", cs.Default)
 	}
@@ -370,9 +501,12 @@ func TestBuildColumnStateWithDefault(t *testing.T) {
 	f = &ast.FieldDecl{
 		Name:    "visible",
 		Type:    &ast.TypeRef{Name: "Boolean"},
-		Default: &ast.Literal{Value: "false"},
+		Default: &ast.Literal{Kind: token.False, Value: "false"},
 	}
-	cs = buildColumnState(f, d)
+	cs, err = buildColumnState(f, d)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cs.Default != "FALSE" {
 		t.Errorf("Boolean false default = %q, want FALSE", cs.Default)
 	}
@@ -381,9 +515,12 @@ func TestBuildColumnStateWithDefault(t *testing.T) {
 	f = &ast.FieldDecl{
 		Name:    "count",
 		Type:    &ast.TypeRef{Name: "Int"},
-		Default: &ast.Literal{Value: "0"},
+		Default: &ast.Literal{Kind: token.Int, Value: "0"},
 	}
-	cs = buildColumnState(f, d)
+	cs, err = buildColumnState(f, d)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cs.Default != "0" {
 		t.Errorf("Int default = %q, want 0", cs.Default)
 	}
@@ -392,10 +529,13 @@ func TestBuildColumnStateWithDefault(t *testing.T) {
 	f = &ast.FieldDecl{
 		Name:    "score",
 		Type:    &ast.TypeRef{Name: "Float"},
-		Default: &ast.Literal{Value: "3.14"},
+		Default: &ast.Literal{Kind: token.Float, Value: "3.14"},
 	}
-	cs = buildColumnState(f, d)
-	if cs.Default != "3.14" {
+	cs, err = buildColumnState(f, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cs.Default != "'3.14'::DOUBLE PRECISION" {
 		t.Errorf("Float default = %q, want 3.14", cs.Default)
 	}
 }
@@ -407,7 +547,10 @@ func TestBuildColumnStateEnumDefault(t *testing.T) {
 		Type:    &ast.TypeRef{Name: "Role"},
 		Default: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "USER"},
 	}
-	cs := buildColumnState(f, d)
+	cs, err := buildColumnState(f, d)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cs == nil {
 		t.Fatal("should not be nil")
 	}
@@ -419,16 +562,36 @@ func TestBuildColumnStateEnumDefault(t *testing.T) {
 func TestBuildColumnStateNilType(t *testing.T) {
 	d := pgDialect()
 	f := &ast.FieldDecl{Name: "x", Type: nil}
-	cs := buildColumnState(f, d)
+	cs, err := buildColumnState(f, d)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cs != nil {
 		t.Error("nil type should return nil")
+	}
+}
+
+func TestBuildColumnStateQualifiedEnumDefault(t *testing.T) {
+	field := &ast.FieldDecl{
+		Name: "role", Type: &ast.TypeRef{Name: "Role"},
+		Default: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "USER"},
+	}
+	column, err := buildColumnState(field, pgDialect())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if column == nil || column.Default != "'USER'" {
+		t.Fatalf("qualified enum default: %+v", column)
 	}
 }
 
 func TestBuildColumnStateListType(t *testing.T) {
 	d := pgDialect()
 	f := &ast.FieldDecl{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}}
-	cs := buildColumnState(f, d)
+	cs, err := buildColumnState(f, d)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cs == nil {
 		t.Fatal("scalar array field should build an array column")
 	}
@@ -440,7 +603,10 @@ func TestBuildColumnStateListType(t *testing.T) {
 func TestBuildColumnStateListTypeUUID(t *testing.T) {
 	d := pgDialect()
 	f := &ast.FieldDecl{Name: "ids", Type: &ast.TypeRef{Name: "UUID", IsList: true, Nullable: true}}
-	cs := buildColumnState(f, d)
+	cs, err := buildColumnState(f, d)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cs == nil || cs.Type != "UUID[]" {
 		t.Fatalf("[UUID] should map to UUID[], got %v", cs)
 	}
@@ -452,37 +618,15 @@ func TestBuildColumnStateListTypeUUID(t *testing.T) {
 func TestBuildColumnStateNullable(t *testing.T) {
 	d := pgDialect()
 	f := &ast.FieldDecl{Name: "bio", Type: &ast.TypeRef{Name: "String", Nullable: true}}
-	cs := buildColumnState(f, d)
+	cs, err := buildColumnState(f, d)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cs == nil {
 		t.Fatal("should not be nil")
 	}
 	if !cs.Nullable {
 		t.Error("should be nullable")
-	}
-}
-
-// ===== defaultSQL =====
-
-func TestDefaultSQL(t *testing.T) {
-	tests := []struct {
-		luxoType string
-		value    string
-		want     string
-	}{
-		{"String", "hello", "'hello'"},
-		{"Boolean", "true", "TRUE"},
-		{"Boolean", "false", "FALSE"},
-		{"Int", "42", "42"},
-		{"Float", "3.14", "3.14"},
-		{"DateTime", "NOW()", "NOW()"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.luxoType+"_"+tt.value, func(t *testing.T) {
-			got := defaultSQL(tt.luxoType, tt.value)
-			if got != tt.want {
-				t.Errorf("defaultSQL(%q, %q) = %q, want %q", tt.luxoType, tt.value, got, tt.want)
-			}
-		})
 	}
 }
 
@@ -539,7 +683,7 @@ func TestCollectIndexesFieldLevel(t *testing.T) {
 			{Name: "createdAt", Type: &ast.TypeRef{Name: "DateTime"}, Directives: []*ast.Directive{{Name: "brin"}}},
 		},
 	}
-	indexes := collectIndexes(m, "users")
+	indexes := collectIndexes(m, "users", pgDialect())
 	if len(indexes) != 3 {
 		t.Fatalf("got %d indexes, want 3", len(indexes))
 	}
@@ -575,7 +719,7 @@ func TestCollectIndexesComposite(t *testing.T) {
 			{Name: "lastName", Type: &ast.TypeRef{Name: "String"}},
 		},
 	}
-	indexes := collectIndexes(m, "users")
+	indexes := collectIndexes(m, "users", pgDialect())
 	if len(indexes) != 1 {
 		t.Fatalf("got %d indexes, want 1", len(indexes))
 	}
@@ -598,7 +742,7 @@ func TestCollectIndexesSkipsComputed(t *testing.T) {
 			{Name: "computed", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{}, Directives: []*ast.Directive{{Name: "index"}}},
 		},
 	}
-	indexes := collectIndexes(m, "users")
+	indexes := collectIndexes(m, "users", pgDialect())
 	if len(indexes) != 1 {
 		t.Fatalf("got %d indexes, want 1 (should skip computed)", len(indexes))
 	}
@@ -891,7 +1035,10 @@ func TestGenerateMigrationSQLDefaultChange(t *testing.T) {
 			OldColumn: &ColumnState{Type: "BIGINT"},
 			NewColumn: &ColumnState{Type: "BIGINT", Default: "0"}},
 	}
-	up, down := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}}, pgDialect())
+	up, down, migrationSQLFailure6 := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}}, pgDialect())
+	if migrationSQLFailure6 != nil {
+		t.Fatal(migrationSQLFailure6)
+	}
 
 	if !strings.Contains(up, "SET DEFAULT 0") {
 		t.Errorf("UP should SET DEFAULT:\n%s", up)
@@ -907,7 +1054,10 @@ func TestGenerateMigrationSQLDropDefault(t *testing.T) {
 			OldColumn: &ColumnState{Type: "BIGINT", Default: "0"},
 			NewColumn: &ColumnState{Type: "BIGINT"}},
 	}
-	up, down := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}}, pgDialect())
+	up, down, migrationSQLFailure7 := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}}, pgDialect())
+	if migrationSQLFailure7 != nil {
+		t.Fatal(migrationSQLFailure7)
+	}
 
 	if !strings.Contains(up, "DROP DEFAULT") {
 		t.Errorf("UP should DROP DEFAULT:\n%s", up)
@@ -925,7 +1075,10 @@ func TestGenerateMigrationSQLSetNotNull(t *testing.T) {
 			OldColumn: &ColumnState{Type: "TEXT", Nullable: true},
 			NewColumn: &ColumnState{Type: "TEXT", Nullable: false}},
 	}
-	up, down := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}}, pgDialect())
+	up, down, migrationSQLFailure8 := GenerateMigrationSQL(ops, &SchemaState{Models: map[string]*ModelState{}}, pgDialect())
+	if migrationSQLFailure8 != nil {
+		t.Fatal(migrationSQLFailure8)
+	}
 
 	if !strings.Contains(up, "SET NOT NULL") {
 		t.Errorf("UP should SET NOT NULL:\n%s", up)

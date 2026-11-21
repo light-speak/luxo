@@ -34,6 +34,7 @@ func (p *Parser) parseModel() *ast.ModelDecl {
 	model.Directives = p.parseDirectives()
 
 	// fields
+	var parsed parsedList[*ast.FieldDecl]
 	p.expect(token.LBrace)
 	for !p.check(token.RBrace) && !p.isEOF() {
 		p.consumeDoc()
@@ -52,7 +53,7 @@ func (p *Parser) parseModel() *ast.ModelDecl {
 
 		// computed field: val postCount: Int get { ... }
 		if p.check(token.Val) {
-			model.Fields = append(model.Fields, p.parseComputedField())
+			parsed.add(p.parseComputedField())
 			continue
 		}
 
@@ -62,9 +63,10 @@ func (p *Parser) parseModel() *ast.ModelDecl {
 			continue
 		}
 
-		model.Fields = append(model.Fields, p.parseField())
+		parsed.add(p.parseField())
 	}
 	p.expect(token.RBrace)
+	model.Fields = parsed.values()
 	return model
 }
 
@@ -79,18 +81,20 @@ func (p *Parser) parseInterface() *ast.InterfaceDecl {
 		Name: p.expectIdent(),
 	}
 
+	var parsed parsedList[*ast.FieldDecl]
 	p.expect(token.LBrace)
 	for !p.check(token.RBrace) && !p.isEOF() {
 		p.consumeDoc()
 		if p.check(token.Fn) {
 			iface.Methods = append(iface.Methods, p.parseFn())
 		} else if p.check(token.Val) {
-			iface.Fields = append(iface.Fields, p.parseComputedField())
+			parsed.add(p.parseComputedField())
 		} else {
-			iface.Fields = append(iface.Fields, p.parseField())
+			parsed.add(p.parseField())
 		}
 	}
 	p.expect(token.RBrace)
+	iface.Fields = parsed.values()
 	return iface
 }
 
@@ -105,11 +109,13 @@ func (p *Parser) parseEnum() *ast.EnumDecl {
 		Name: p.expectIdent(),
 	}
 
+	var parsed parsedList[string]
 	p.expect(token.LBrace)
 	for !p.check(token.RBrace) && !p.isEOF() {
-		enum.Values = append(enum.Values, p.expectIdent())
+		parsed.add(p.expectIdent())
 	}
 	p.expect(token.RBrace)
+	enum.Values = parsed.values()
 	return enum
 }
 
@@ -130,11 +136,7 @@ func (p *Parser) parseSealed() *ast.SealedDecl {
 			Name: p.expectIdent(),
 		}
 		if p.match(token.LParen) {
-			for !p.check(token.RParen) && !p.isEOF() {
-				variant.Fields = append(variant.Fields, p.parseParam())
-				p.match(token.Comma)
-			}
-			p.expect(token.RParen)
+			variant.Fields = p.parseParameterList()
 		}
 		sealed.Variants = append(sealed.Variants, variant)
 	}
@@ -165,15 +167,17 @@ func (p *Parser) parseType() *ast.TypeDecl {
 	}
 
 	// fields
+	var parsed parsedList[*ast.FieldDecl]
 	p.expect(token.LBrace)
 	for !p.check(token.RBrace) && !p.isEOF() {
 		p.consumeDoc()
 		if p.check(token.RBrace) || p.isEOF() {
 			break
 		}
-		td.Fields = append(td.Fields, p.parseField())
+		parsed.add(p.parseField())
 	}
 	p.expect(token.RBrace)
+	td.Fields = parsed.values()
 	return td
 }
 
@@ -202,11 +206,7 @@ func (p *Parser) parseAPI() *ast.ApiDecl {
 	// params (optional — inferred APIs can omit)
 	if p.check(token.LParen) {
 		p.advance()
-		for !p.check(token.RParen) && !p.isEOF() {
-			api.Params = append(api.Params, p.parseParam())
-			p.match(token.Comma)
-		}
-		p.expect(token.RParen)
+		api.Params = p.parseParameterList()
 	}
 
 	// return type (optional — inferred APIs can omit)
@@ -237,11 +237,7 @@ func (p *Parser) parseFn() *ast.FnDecl {
 	}
 
 	p.expect(token.LParen)
-	for !p.check(token.RParen) && !p.isEOF() {
-		fn.Params = append(fn.Params, p.parseParam())
-		p.match(token.Comma)
-	}
-	p.expect(token.RParen)
+	fn.Params = p.parseParameterList()
 
 	if p.match(token.Colon) {
 		fn.ReturnType = p.parseTypeRef()
@@ -269,35 +265,64 @@ func (p *Parser) parseError() *ast.ErrorDecl {
 
 	// params
 	if p.match(token.LParen) {
-		for !p.check(token.RParen) && !p.isEOF() {
-			errDecl.Fields = append(errDecl.Fields, p.parseParam())
-			p.match(token.Comma)
-		}
-		p.expect(token.RParen)
+		errDecl.Fields = p.parseParameterList()
 	}
 
 	// body: { code: 404, message: error.not_found, internal: true }
 	p.expect(token.LBrace)
+	var seen uint8
 	for !p.check(token.RBrace) && !p.isEOF() {
-		key := p.expectIdent()
-		p.expect(token.Colon)
-		switch key {
-		case "code":
-			code, _ := strconv.Atoi(p.expect(token.Int).Val)
-			errDecl.Code = code
-		case "message":
-			if p.check(token.String) {
-				errDecl.Message = p.advance().Val
-			} else {
-				errDecl.Message = p.parseQualifiedName()
-			}
-		case "internal":
-			errDecl.Internal = p.current().Type == token.True
-			p.advance()
-		}
+		p.parseErrorAttribute(errDecl, &seen)
 	}
 	p.expect(token.RBrace)
 	return errDecl
+}
+
+func (p *Parser) parseErrorAttribute(decl *ast.ErrorDecl, seen *uint8) {
+	pos := p.current().Pos
+	key := p.expectIdent()
+	bit := errorAttributeBit(key)
+	if bit == 0 || *seen&bit != 0 {
+		p.errors = append(p.errors, Error{Pos: pos, Message: "unknown or duplicate error attribute: " + key})
+		panic(bailout{})
+	}
+	*seen |= bit
+	p.expect(token.Colon)
+	switch key {
+	case "code":
+		value := p.expect(token.Int)
+		code, err := strconv.Atoi(value.Val)
+		if err != nil {
+			p.errors = append(p.errors, Error{Pos: value.Pos, Message: "error code is out of range"})
+			return
+		}
+		decl.Code = code
+	case "message":
+		if p.check(token.String) {
+			decl.Message = p.advance().Val
+		} else {
+			decl.Message = p.parseQualifiedName()
+		}
+	case "internal":
+		if !p.check(token.True) && !p.check(token.False) {
+			p.error("internal must be true or false")
+			panic(bailout{})
+		}
+		decl.Internal = p.advance().Type == token.True
+	}
+}
+
+func errorAttributeBit(key string) uint8 {
+	switch key {
+	case "code":
+		return 1
+	case "message":
+		return 2
+	case "internal":
+		return 4
+	default:
+		return 0
+	}
 }
 
 func (p *Parser) parseExtend() *ast.ExtendDecl {
@@ -309,11 +334,13 @@ func (p *Parser) parseExtend() *ast.ExtendDecl {
 		Name: p.expectIdent(),
 	}
 
+	var parsed parsedList[*ast.FieldDecl]
 	p.expect(token.LBrace)
 	for !p.check(token.RBrace) && !p.isEOF() {
-		ext.Fields = append(ext.Fields, p.parseField())
+		parsed.add(p.parseField())
 	}
 	p.expect(token.RBrace)
+	ext.Fields = parsed.values()
 	return ext
 }
 
@@ -326,30 +353,17 @@ func (p *Parser) parseUseDispatch(file *ast.File) {
 
 	name := p.expectIdentOrKeyword()
 
-	// If next token is '.', this is a dotted module import: use common.{ Base }
-	if p.check(token.Dot) {
-		use := &ast.UseDecl{Pos: pos, Module: name}
-		p.expect(token.Dot)
+	// A dot introduces a module import. A brace without a dot is a
+	// destructured import. Both forms have the same name list.
+	if p.match(token.Dot) || p.check(token.LBrace) {
 		p.expect(token.LBrace)
+		var names parsedList[string]
 		for !p.check(token.RBrace) && !p.isEOF() {
-			use.Names = append(use.Names, p.expectIdent())
+			names.add(p.expectIdent())
 			p.match(token.Comma)
 		}
 		p.expect(token.RBrace)
-		file.Uses = append(file.Uses, use)
-		return
-	}
-
-	// If next token is '{', this is a destructured import: use model { Base }
-	if p.check(token.LBrace) {
-		use := &ast.UseDecl{Pos: pos, Module: name}
-		p.expect(token.LBrace)
-		for !p.check(token.RBrace) && !p.isEOF() {
-			use.Names = append(use.Names, p.expectIdent())
-			p.match(token.Comma)
-		}
-		p.expect(token.RBrace)
-		file.Uses = append(file.Uses, use)
+		file.Uses = append(file.Uses, &ast.UseDecl{Pos: pos, Module: name, Names: names.values()})
 		return
 	}
 
@@ -384,13 +398,14 @@ func (p *Parser) parseMiddleware() *ast.MiddlewareDecl {
 func (p *Parser) parseEmitStmt() *ast.EmitStmt {
 	pos := p.current().Pos
 	p.expect(token.Emit)
+	var parts parsedArguments
 	stmt := &ast.EmitStmt{
 		Pos:       pos,
 		EventName: p.expectIdent(),
 	}
 	if p.match(token.LParen) {
 		for !p.check(token.RParen) && !p.isEOF() {
-			arg := &ast.NamedArg{}
+			arg := ast.NamedArg{}
 			name := p.expectIdent()
 			p.expect(token.Colon)
 			arg.Name = name
@@ -401,11 +416,12 @@ func (p *Parser) parseEmitStmt() *ast.EmitStmt {
 				continue
 			}
 			arg.Value = val
-			stmt.Args = append(stmt.Args, arg)
+			parts.add(arg)
 			p.match(token.Comma)
 		}
 		p.expect(token.RParen)
 	}
+	stmt.Args = parts.pointers()
 	return stmt
 }
 
@@ -418,11 +434,7 @@ func (p *Parser) parseEvent() *ast.EventDecl {
 		Name: p.expectIdent(),
 	}
 	if p.match(token.LParen) {
-		for !p.check(token.RParen) && !p.isEOF() {
-			event.Params = append(event.Params, p.parseParam())
-			p.match(token.Comma)
-		}
-		p.expect(token.RParen)
+		event.Params = p.parseParameterList()
 	}
 	return event
 }
@@ -458,20 +470,9 @@ func (p *Parser) parseOn() *ast.OnDecl {
 func (p *Parser) parseOnBlock() ([]string, *ast.Block) {
 	pos := p.current().Pos
 	p.expect(token.LBrace)
-	block := &ast.Block{Pos: pos}
-
 	// detect lambda-style params: ident (,ident)* ->
 	params := p.tryParseLambdaParams()
-
-	for !p.check(token.RBrace) && !p.isEOF() {
-		stmt := p.parseStmt()
-		if stmt != nil {
-			block.Stmts = append(block.Stmts, stmt)
-		}
-	}
-	block.EndPos = p.current().Pos
-	p.expect(token.RBrace)
-	return params, block
+	return params, p.parseBlockBody(pos)
 }
 
 // tryParseLambdaParams attempts to parse ident (,ident)* -> at the current position.
@@ -513,11 +514,7 @@ func (p *Parser) parseScope() *ast.ScopeDecl {
 
 	// Optional parameters: scope recent(days: Int) { ... }
 	if p.match(token.LParen) {
-		for !p.check(token.RParen) && !p.isEOF() {
-			scope.Params = append(scope.Params, p.parseParam())
-			p.match(token.Comma)
-		}
-		p.expect(token.RParen)
+		scope.Params = p.parseParameterList()
 	}
 
 	// Parse scope expression: = expr
@@ -614,6 +611,7 @@ func (p *Parser) parseTypeRef() *ast.TypeRef {
 	// List type: [Post], [Role] through UserRole
 	if p.match(token.LBracket) {
 		inner := p.parseTypeRef()
+		p.validateListElement(inner)
 		p.expect(token.RBracket)
 		ref := &ast.TypeRef{
 			Pos:      pos,
@@ -644,14 +642,9 @@ func (p *Parser) parseTypeRef() *ast.TypeRef {
 		p.expect(token.Gt)
 	}
 
-	// Custom FK: User(key: authorId)
-	if p.match(token.LParen) {
-		if p.check(token.Ident) && p.current().Val == "key" {
-			p.advance()
-			p.expect(token.Colon)
-			ref.FKField = p.expectIdent()
-		}
-		p.expect(token.RParen)
+	if p.check(token.LParen) {
+		p.error("parenthesized type suffixes are unsupported; use @by(remoteField, localField) for model relations")
+		panic(bailout{})
 	}
 
 	// Nullable: String?
@@ -662,27 +655,38 @@ func (p *Parser) parseTypeRef() *ast.TypeRef {
 	return ref
 }
 
+func (p *Parser) validateListElement(inner *ast.TypeRef) {
+	if inner.IsList || inner.Nullable || len(inner.Tuple) != 0 {
+		p.errors = append(p.errors, Error{
+			Pos:     inner.Pos,
+			Message: "list elements must be non-null, non-list named types / 列表元素必须是非空、非列表的具名类型",
+		})
+	}
+}
+
 func (p *Parser) parseTupleType(pos token.Position) *ast.TypeRef {
 	p.expect(token.LParen)
+	var items parsedList[*ast.TypeRef]
 	ref := &ast.TypeRef{Pos: pos}
 	for {
-		ref.Tuple = append(ref.Tuple, p.parseTypeRef())
+		items.add(p.parseTypeRef())
 		if !p.match(token.Comma) {
 			break
 		}
 	}
 	p.expect(token.RParen)
+	ref.Tuple = items.values()
 	return ref
 }
 
 // ========== Directives ==========
 
 func (p *Parser) parseDirectives() []*ast.Directive {
-	var directives []*ast.Directive
+	var directives parsedList[*ast.Directive]
 	for p.check(token.At) {
-		directives = append(directives, p.parseDirective())
+		directives.add(p.parseDirective())
 	}
-	return directives
+	return directives.values()
 }
 
 func (p *Parser) parseDirective() *ast.Directive {
@@ -696,8 +700,9 @@ func (p *Parser) parseDirective() *ast.Directive {
 
 	// args: (ttl: 60, max: 100)
 	if p.match(token.LParen) {
+		var args parsedArguments
 		for !p.check(token.RParen) && !p.isEOF() {
-			arg := &ast.NamedArg{}
+			arg := ast.NamedArg{}
 			// check if named: key: value
 			if p.check(token.Ident) && p.peekType() == token.Colon {
 				arg.Name = p.expectIdent()
@@ -709,10 +714,11 @@ func (p *Parser) parseDirective() *ast.Directive {
 			} else {
 				arg.Value = p.parseExpr(precNone)
 			}
-			dir.Args = append(dir.Args, arg)
+			args.add(arg)
 			p.match(token.Comma)
 		}
 		p.expect(token.RParen)
+		dir.Args = args.pointers()
 	}
 
 	// body: @transform { ... }, @beforeSave { ... }, @visible(expr) { ... }
@@ -722,4 +728,14 @@ func (p *Parser) parseDirective() *ast.Directive {
 	}
 
 	return dir
+}
+
+func (p *Parser) parseParameterList() []*ast.ParamDecl {
+	var params parsedList[*ast.ParamDecl]
+	for !p.check(token.RParen) && !p.isEOF() {
+		params.add(p.parseParam())
+		p.match(token.Comma)
+	}
+	p.expect(token.RParen)
+	return params.values()
 }

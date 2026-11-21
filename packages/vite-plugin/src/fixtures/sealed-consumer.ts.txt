@@ -1,0 +1,80 @@
+import { FetchTransport } from '@luxojs/client'
+import { LuxoClient } from './client.js'
+import type { Outcome, OutcomeInput, EmptyOutcomeInput } from './types.js'
+
+function check(value: boolean, message: string): void {
+  if (!value) throw new Error(message)
+}
+
+function exhaustive(value: Outcome<true>): string {
+  switch (value.$case) {
+    case 'Success': return String(value.value)
+    case 'Failure': return String(value.reason)
+    case 'Pending': return 'pending'
+    case 'Nested': return 'nested'
+  }
+  const unreachable: never = value
+  return unreachable
+}
+void exhaustive
+// @ts-expect-error Unknown cases cannot enter the closed input union.
+const unknown: OutcomeInput = { $case: 'Future' }
+// @ts-expect-error An empty sum has no present constructor or value.
+const impossible: EmptyOutcomeInput = { $case: 'Future' }
+void unknown; void impossible
+
+async function verifySealedClient(): Promise<void> {
+  for (const mode of ['json', 'binary'] as const) {
+    const client = new LuxoClient(new FetchTransport('http://sealed.fixture.invalid', { mode }))
+    try {
+      const input: OutcomeInput & { toJSON(): never } = {
+        $case: 'Success', value: 7n,
+        toJSON() { throw new Error('business sum converted through JSON') },
+      }
+      const success = await client.echo({ value: input })
+      if (success.$case === 'Success') check(success.value === 7n, 'success payload is loaded')
+      else throw new Error('expected success')
+
+      const failure = await client.echo({ value: { $case: 'Failure' } })
+      if (failure.$case === 'Failure') check(failure.reason === 'failed', 'server default is loaded')
+      else throw new Error('expected failure')
+
+      const pending = await client.echo({ value: { $case: 'Pending' } })
+      check(pending.$case === 'Pending', 'empty case is retained')
+
+      const defaults = await client.echo({ value: { $case: 'Nested' } })
+      if (defaults.$case === 'Nested') {
+        check(defaults.child === null, 'nullable default child is loaded')
+        check(defaults.history === null, 'nullable default list is loaded')
+      } else throw new Error('expected nested defaults')
+
+      const nested = await client.echo({ value: {
+        $case: 'Nested', child: { $case: 'Success', value: 7n }, history: [{ $case: 'Pending' }],
+      } })
+      if (nested.$case === 'Nested') {
+        const child = nested.child
+        if (child?.$case === 'Success') check(child.value === 7n, 'nested child payload is loaded')
+        else throw new Error('expected nested success')
+        check(nested.history?.length === 1, 'sealed list count is loaded')
+        check(nested.history?.[0]?.$case === 'Pending', 'sealed list tag is loaded')
+      } else throw new Error('expected nested present')
+
+      const tagOnly = await client.echo({ value: { $case: 'Success', value: 7n }, $select: 'Success' })
+      if (tagOnly.$case === 'Success') check(tagOnly.value === undefined, 'tag-only does not load a default payload')
+      else throw new Error('expected tag-only success')
+
+      check(await client.echoEmpty({ value: null }) === null, 'empty sum nullable null')
+      check((await client.echoEmptyList({ values: [] })).length === 0, 'empty sum list')
+      for (const flag of [true, false]) {
+        const first = await client.echo({ value: { $case: 'Success', value: 7n } })
+        const second = await client.echo({ value: { $case: 'Success', value: 7n } })
+        const choice = flag ? first : second
+        if (choice.$case === 'Success') check(choice.value === 7n, 'both conditional call origins load the selected payload')
+        else throw new Error('expected conditional success')
+      }
+    } finally { client.close() }
+    console.log(`sealed typed client ${mode} passed`)
+  }
+}
+
+void verifySealedClient().finally(() => { globalThis.fetch = originalFetch }).catch(error => { throw error })

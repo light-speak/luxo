@@ -5,16 +5,55 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+// The right operand is a type reference, not a value in the lexical scope.
+func (a *Analyzer) checkTypeTestExpr(expr *ast.BinaryExpr, left *ResolvedType, scope *Scope) *ResolvedType {
+	if left != nil && (left.Kind == TypeQueryBuilder || a.isBareTypeTestSubject(expr.Left, scope)) {
+		a.addError(expr.Left.GetPos(), "expected a value before 'is' / 'is' 左侧需要一个值")
+	}
+	target, ok := expr.Right.(*ast.Ident)
+	if !ok {
+		a.addError(expr.Pos, "expected a type after 'is' / 'is' 右侧需要类型名")
+		return a.types["Boolean"]
+	}
+	if a.types[target.Name] == nil {
+		a.addErrorWithSuggestion(target.Pos, target.Name, "unknown type after 'is': '%s' / 'is' 右侧类型 '%s' 未定义", target.Name, target.Name)
+		return a.types["Boolean"]
+	}
+	resolved := a.resolveNamedType(&ast.TypeRef{Name: target.Name}, target.Pos, 0)
+	a.setExprResolvedType(target, resolved)
+	return a.types["Boolean"]
+}
+
+// Normal type registration also defines the root-scope symbol; child scopes retain that root.
+// Keep the missing-symbol fallback for inconsistent analyzer state.
+func (a *Analyzer) isBareTypeTestSubject(expr ast.Expr, scope *Scope) bool {
+	name, ok := expr.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	symbol := scope.Lookup(name.Name)
+	if symbol == nil {
+		return a.types[name.Name] != nil
+	}
+	switch symbol.Kind {
+	case SymModel, SymType, SymInterface, SymEnum, SymSealed:
+		return true
+	default:
+		return false
+	}
+}
 
 // ========== Pass 2: Resolve Inheritance ==========
 
 func (a *Analyzer) resolveInheritance(file *ast.File) {
 	for _, m := range file.Models {
 		typ := a.types[m.Name]
-		if typ == nil {
+		if typ == nil || a.rejectedTypeDeclarations[typeDeclarationKey{model: m}] {
 			continue
 		}
 		for _, parentName := range m.Parents {
@@ -23,9 +62,47 @@ func (a *Analyzer) resolveInheritance(file *ast.File) {
 				a.addErrorWithSuggestion(m.Pos, parentName, "type '%s' not found / 类型 '%s' 未找到", parentName, parentName)
 				continue
 			}
+			if a.isBuiltinIdentityDataType(parent) {
+				a.reportIdentityDataType(m.Pos)
+				continue
+			}
 			typ.Parents = append(typ.Parents, parent)
 		}
 	}
+}
+
+func (a *Analyzer) checkInheritanceCycles(files []*ast.File) {
+	var states map[*ResolvedType]uint8
+	for _, file := range files {
+		for _, model := range file.Models {
+			typ := a.types[model.Name]
+			if typ == nil || len(typ.Parents) == 0 {
+				continue
+			}
+			if states == nil {
+				states = make(map[*ResolvedType]uint8)
+			}
+			a.checkInheritanceType(typ, states)
+		}
+	}
+}
+
+func (a *Analyzer) checkInheritanceType(typ *ResolvedType, states map[*ResolvedType]uint8) {
+	if states[typ] != 0 {
+		return
+	}
+	states[typ] = 1
+	parents := typ.Parents[:0]
+	for _, parent := range typ.Parents {
+		if states[parent] == 1 {
+			a.addError(typ.Pos, "inheritance cycle: '%s' inherits '%s' / 继承循环：'%s' 继承 '%s'", typ.Name, parent.Name, typ.Name, parent.Name)
+			continue // Keep later diagnostic passes safe; the source AST is unchanged.
+		}
+		a.checkInheritanceType(parent, states)
+		parents = append(parents, parent)
+	}
+	typ.Parents = parents
+	states[typ] = 2
 }
 
 // ========== Pass 3: Resolve Fields ==========
@@ -34,10 +111,42 @@ func (a *Analyzer) resolveFields(file *ast.File) {
 	a.resolveModelFields(file)
 	a.resolveInterfaceFields(file)
 	a.resolveTypeFields(file)
+	a.resolveSealedFields(file)
 	a.resolveEventTypes(file)
+	a.resolveErrorTypes(file)
 	a.resolveApiTypes(file)
 	a.resolveFnTypes(file)
 	a.resolveExtendFields(file)
+}
+
+func (a *Analyzer) resolveSealedFields(file *ast.File) {
+	for _, declaration := range file.Sealeds {
+		typ := a.types[declaration.Name]
+		if typ == nil || typ.Kind != TypeSealed || typ.Pos != declaration.Pos {
+			continue
+		}
+		for _, variant := range typ.Variants {
+			if variant.source == nil {
+				continue
+			}
+			a.checkSealedPayloadParameters(variant.source.Fields)
+			a.resolveParameterTypes("sealed variant", variant.Name, variant.source.Fields, 0, func(index int, resolved *ResolvedType) {
+				field := variant.Fields[index]
+				if resolved.Kind == TypeInterface || resolved.Kind == TypeTuple {
+					a.addError(field.Pos, "sealed payload field '%s' requires a concrete data representation, got '%s' / 密封载荷字段 '%s' 必须具有具体数据表示，实际为 '%s'", field.Name, formatResolvedType(resolved), field.Name, formatResolvedType(resolved))
+				}
+				field.Type = resolved
+				field.Nullable = resolved != nil && resolved.Nullable
+				field.HasDefault = variant.source.Fields[index].Default != nil
+			})
+		}
+	}
+}
+
+func (a *Analyzer) resolveErrorTypes(file *ast.File) {
+	for _, declaration := range file.Errors {
+		a.validateCallableParameters("error", declaration.Name, declaration.Fields)
+	}
 }
 
 func (a *Analyzer) resolveEventTypes(file *ast.File) {
@@ -49,16 +158,17 @@ func (a *Analyzer) resolveEventTypes(file *ast.File) {
 				continue
 			}
 			seen[param.Name] = true
-			resolved := a.resolveTypeRef(param.Type, param.Pos)
+			resolved := a.resolveWireTypeRef(param.Type, param.Pos)
 			if resolved == nil || resolved.Kind == TypeUnknown {
 				continue
 			}
+			a.validateParameterDefault(param, resolved)
 			if param.Type.IsList && param.Type.Nullable {
 				a.addError(param.Pos, "event parameter '%s.%s' cannot be a nullable list / 事件参数 '%s.%s' 不能是可空列表", event.Name, param.Name, event.Name, param.Name)
 			}
-			switch resolved.Kind {
-			case TypeInt, TypeFloat, TypeString, TypeBool, TypeDateTime, TypeDuration, TypeUUID, TypeDecimal, TypeBytes, TypeJSON, TypeModel, TypeCustom, TypeEnum:
-			default:
+			// Model references receive a path-aware snapshot diagnostic after all
+			// declarations have resolved, including references nested in types.
+			if resolved.Kind != TypeModel && !isEventWireKind(resolved.Kind) {
 				a.addError(param.Pos, "event parameter '%s.%s' has unsupported wire type '%s' / 事件参数 '%s.%s' 使用了不支持的传输类型 '%s'",
 					event.Name, param.Name, formatTypeRef(param.Type), event.Name, param.Name, formatTypeRef(param.Type))
 			}
@@ -69,47 +179,47 @@ func (a *Analyzer) resolveEventTypes(file *ast.File) {
 func (a *Analyzer) resolveModelFields(file *ast.File) {
 	for _, m := range file.Models {
 		typ := a.types[m.Name]
-		if typ == nil {
+		if typ == nil || a.rejectedTypeDeclarations[typeDeclarationKey{model: m}] {
 			continue
 		}
 		if typ.Fields == nil {
-			typ.Fields = make(map[string]*FieldInfo)
+			typ.Fields = make(map[string]*FieldInfo, len(m.Fields))
 		}
-		for _, f := range m.Fields {
-			fi := a.resolveFieldDecl(f)
-			if fi != nil {
-				if _, exists := typ.Fields[fi.Name]; exists {
-					a.addError(f.Pos, "duplicate field '%s' in model '%s' / 模型 '%s' 中字段 '%s' 重复", fi.Name, m.Name, m.Name, fi.Name)
-					continue
-				}
-				typ.Fields[fi.Name] = fi
-			}
-			// @visible requires nullable field — non-nullable fields can't be conditionally hidden
-			if hasModelDirective(f.Directives, "visible") && f.Type != nil && !f.Type.Nullable {
-				a.addError(f.Pos, "@visible requires nullable field (use %s? instead of %s) / @visible 字段必须可空", f.Type.Name, f.Type.Name)
-			}
+		fields := make([]FieldInfo, len(m.Fields))
+		for index, field := range m.Fields {
+			resolved := &fields[index]
+			a.fillFieldDecl(field, resolved)
+			a.validateStoredField(m.Name, field, resolved)
+			a.registerDeclaredField(typ, resolved, "model", "模型")
 		}
 		a.validatePrimaryKeyFields(m)
 		a.checkDirectives(m.Directives, OnModel)
-		// @withAuth: inject .createToken(), .verify(), .refreshToken() methods
-		if hasModelDirective(m.Directives, "withAuth") {
-			a.injectWithAuthMethods(typ, m.Directives)
-		}
-		// @hash: inject .verifyPassword() method on the model
-		for _, f := range m.Fields {
-			if hasModelDirective(f.Directives, "hash") {
-				if existing, exists := typ.Fields["verifyPassword"]; exists && !existing.IsMethod {
-					a.addError(f.Pos, "field 'verifyPassword' conflicts with @hash injected method / 字段 'verifyPassword' 与 @hash 注入方法冲突")
-					break
-				}
-				typ.Fields["verifyPassword"] = &FieldInfo{
-					Name:     "verifyPassword",
-					Type:     a.types["Boolean"],
-					IsMethod: true,
-					Doc:      ".verifyPassword(plain: String): Boolean — Verify plaintext against @hash field / 校验明文与 @hash 字段",
-				}
-				break
-			}
+		a.checkModelAuthOwnership(m)
+
+	}
+}
+
+// Value and abstract declarations have no database relation or column mapping.
+func (a *Analyzer) validateStoredField(owner string, field *ast.FieldDecl, resolved *FieldInfo) {
+	if field.Computed != nil || resolved == nil || resolved.Type == nil {
+		return
+	}
+	switch resolved.Type.Kind {
+	case TypeCustom, TypeInterface, TypeSealed:
+	default:
+		return
+	}
+	a.addError(field.Pos, "type '%s' has no database mapping for stored field '%s.%s'", resolved.Type.Name, owner, field.Name)
+}
+
+// Validate effective fields after inheritance and local overrides are resolved.
+func (a *Analyzer) validateInheritedStoredFields(model *ast.ModelDecl) {
+	if len(model.Parents) == 0 {
+		return
+	}
+	for _, field := range model.Fields {
+		if field.Type != nil {
+			a.validateStoredField(model.Name, field, &FieldInfo{Type: a.types[field.Type.Name]})
 		}
 	}
 }
@@ -148,6 +258,9 @@ func isPrimaryKeyType(name string) bool {
 }
 
 func (a *Analyzer) validateComputedFields(files []*ast.File) {
+	if !hasComputedFields(files) {
+		return
+	}
 	models := make(map[string]*ast.ModelDecl)
 	modelModules := make(map[string]string)
 	for _, file := range files {
@@ -163,6 +276,19 @@ func (a *Analyzer) validateComputedFields(files []*ast.File) {
 			}
 		}
 	}
+}
+
+func hasComputedFields(files []*ast.File) bool {
+	for _, file := range files {
+		for _, model := range file.Models {
+			for _, field := range model.Fields {
+				if field.Computed != nil {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (a *Analyzer) validateComputedField(model *ast.ModelDecl, field *ast.FieldDecl, models map[string]*ast.ModelDecl, modelModules map[string]string) {
@@ -234,7 +360,7 @@ func (a *Analyzer) validateComputedField(model *ast.ModelDecl, field *ast.FieldD
 		return
 	}
 	want := targetField.Type.Name
-	if aggregate.Name == "avg" {
+	if aggregate.Name == "avg" && want != "Decimal" {
 		want = "Float"
 	}
 	a.validateComputedAggregateResult(model, field, aggregate.Name, want, targetField.Type.Name)
@@ -283,20 +409,10 @@ func computedRelationKeyNames(model *ast.ModelDecl, relation *ast.FieldDecl) (lo
 		}
 		return local, remote
 	}
-	return local, lowerFirstIdentifier(model.Name) + upperFirstIdentifier(local)
+	return local, inferred.ForeignKeyName(model.Name, local)
 }
 
-func computedModelPrimaryKeyName(model *ast.ModelDecl) string {
-	for _, field := range model.Fields {
-		if hasModelDirective(field.Directives, "id") {
-			return field.Name
-		}
-	}
-	if findModelField(model, "id") != nil {
-		return "id"
-	}
-	return "id"
-}
+func computedModelPrimaryKeyName(model *ast.ModelDecl) string { return inferred.PrimaryKeyName(model) }
 
 func validComputedKey(field *ast.FieldDecl, nullableAllowed bool) bool {
 	return field != nil && field.Type != nil && field.Computed == nil && !field.Type.IsList &&
@@ -375,7 +491,7 @@ func isAggregateNumericType(name string) bool {
 func (a *Analyzer) resolveInterfaceFields(file *ast.File) {
 	for _, i := range file.Interfaces {
 		typ := a.types[i.Name]
-		if typ == nil {
+		if typ == nil || a.rejectedTypeDeclarations[typeDeclarationKey{contract: i}] {
 			continue
 		}
 		if typ.Fields == nil {
@@ -384,7 +500,7 @@ func (a *Analyzer) resolveInterfaceFields(file *ast.File) {
 		for _, f := range i.Fields {
 			fi := a.resolveFieldDecl(f)
 			if fi != nil {
-				typ.Fields[fi.Name] = fi
+				a.registerDeclaredField(typ, fi, "interface", "接口")
 			}
 		}
 	}
@@ -393,19 +509,33 @@ func (a *Analyzer) resolveInterfaceFields(file *ast.File) {
 func (a *Analyzer) resolveTypeFields(file *ast.File) {
 	for _, t := range file.Types {
 		typ := a.types[t.Name]
-		if typ == nil {
+		if typ == nil || a.rejectedTypeDeclarations[typeDeclarationKey{valueType: t}] {
 			continue
 		}
 		if typ.Fields == nil {
 			typ.Fields = make(map[string]*FieldInfo)
 		}
+		previousParameters := a.typeParameters
+		a.typeParameters = a.resolveTypeParameters(t)
 		for _, f := range t.Fields {
 			fi := a.resolveFieldDecl(f)
 			if fi != nil {
-				typ.Fields[fi.Name] = fi
+				a.registerDeclaredField(typ, fi, "type", "类型")
 			}
 		}
+		a.typeParameters = previousParameters
 	}
+}
+
+// Check raw declaration names without treating an inherited field as a local duplicate.
+func (a *Analyzer) registerDeclaredField(owner *ResolvedType, field *FieldInfo, kind, localizedKind string) bool {
+	if _, exists := owner.Fields[field.Name]; exists {
+		a.addError(field.Pos, "duplicate field '%s' in %s '%s' / %s '%s' 中字段 '%s' 重复",
+			field.Name, kind, owner.Name, localizedKind, owner.Name, field.Name)
+		return false
+	}
+	owner.Fields[field.Name] = field
+	return true
 }
 
 func (a *Analyzer) resolveApiTypes(file *ast.File) {
@@ -414,21 +544,118 @@ func (a *Analyzer) resolveApiTypes(file *ast.File) {
 		if sym == nil {
 			continue
 		}
-		retType := a.resolveTypeRef(api.ReturnType, api.Pos)
-		sym.Type = retType
+		if api.Body != nil && api.ReturnType == nil {
+			a.addError(api.Pos, "API with a body must declare a return type")
+		}
+		retType := a.resolveWireTypeRef(api.ReturnType, api.Pos)
+		if sym.Kind == SymFn {
+			if api.Body != nil {
+				if a.apiBodyReturns == nil {
+					a.apiBodyReturns = make(map[*ast.ApiDecl]*ResolvedType)
+				}
+				a.apiBodyReturns[api] = retType
+			}
+		} else {
+			sym.Type = retType
+		}
 		if api.ReturnType != nil && api.ReturnType.Name == "Result" {
 			a.addError(api.ReturnType.Pos, "API return types must be response values, not Result<T> / API 返回类型必须是响应值，不能是 Result<T>")
 		}
 
-		for _, p := range api.Params {
-			a.resolveTypeRef(p.Type, api.Pos)
-		}
+		a.validateAPIParameters(api)
 		a.checkDirectives(api.Directives, OnApi)
+		a.checkAuthOwnership(api.Directives, api.Params)
 		a.validatePaginateAPI(api)
 		a.validateStreamAPI(api)
 		a.validateNativeReturnType(api)
 		a.validateScopeDirective(api)
 	}
+}
+
+func (a *Analyzer) validateAPIParameters(api *ast.ApiDecl) {
+	a.validateCallableParameters("API", api.Name, api.Params)
+	for _, param := range api.Params {
+		if param.Spread {
+			a.addError(param.Pos, "API parameter '%s' cannot be variadic; use [%s] / API 参数 '%s' 不能是不定参数，请使用 [%s]", param.Name, param.Type.Name, param.Name, param.Type.Name)
+		}
+	}
+}
+
+func (a *Analyzer) validateCallableParameters(kind, name string, params []*ast.ParamDecl) {
+	a.validateCallableParametersInContext(kind, name, params, 0)
+}
+
+func (a *Analyzer) validateCallableParametersInContext(kind, name string, params []*ast.ParamDecl, context typeContext) {
+	a.resolveParameterTypes(kind, name, params, context, nil)
+}
+
+func (a *Analyzer) resolveParameterTypes(kind, name string, params []*ast.ParamDecl, context typeContext, assign func(int, *ResolvedType)) {
+	seen := make(map[string]bool, len(params))
+	for index, param := range params {
+		expected := a.resolveTypeRefInContext(param.Type, param.Pos, context)
+		if seen[param.Name] {
+			a.addError(param.Pos, "duplicate parameter '%s' in %s '%s' / %s '%s' 中参数 '%s' 重复", param.Name, kind, name, kind, name, param.Name)
+		} else {
+			seen[param.Name] = true
+		}
+		a.validateParameterDefault(param, expected)
+		if assign != nil {
+			assign(index, expected)
+		}
+	}
+}
+
+func (a *Analyzer) validateParameterDefault(param *ast.ParamDecl, expected *ResolvedType) {
+	a.validateDefaultValue(param.Default, expected, param.Name, "parameter", "参数")
+}
+
+func (a *Analyzer) validateDefaultValue(value ast.Expr, expected *ResolvedType, name, kind, localizedKind string) {
+	if value == nil {
+		return
+	}
+	actual, constant := a.parameterDefaultType(value)
+	if !constant {
+		if kind == "field" {
+			a.checkNumericLiteralTree(value)
+		}
+		a.addError(value.GetPos(), "default value for %s '%s' must be a compile-time constant / %s '%s' 的默认值必须是编译期常量", kind, name, localizedKind, name)
+		return
+	}
+	if actual != nil && !isTypeAssignable(expected, actual) {
+		a.addError(value.GetPos(), "default value for %s '%s' expects '%s', got '%s' / %s '%s' 的默认值需要 '%s'，实际得到 '%s'", kind, name, formatResolvedType(expected), formatDefaultValueType(actual), localizedKind, name, formatResolvedType(expected), formatDefaultValueType(actual))
+	}
+}
+
+func (a *Analyzer) parameterDefaultType(expr ast.Expr) (*ResolvedType, bool) {
+	switch value := expr.(type) {
+	case *ast.Literal:
+		return a.literalType(value), true
+	case *ast.UnaryExpr:
+		if literal, ok := signedIntegralLiteral(value); ok {
+			return a.integralLiteralType(literal, true), true
+		}
+		literal, ok := value.Value.(*ast.Literal)
+		if ok && (value.Op == "+" || value.Op == "-") && (literal.Kind == token.Int || literal.Kind == token.Float || literal.Kind == token.Duration) {
+			return a.literalType(literal), true
+		}
+	case *ast.MemberExpr:
+		owner, ok := value.Object.(*ast.Ident)
+		if !ok {
+			return nil, false
+		}
+		typ := a.types[owner.Name]
+		if typ != nil && typ.Kind == TypeEnum && stringInSlice(value.Field, typ.EnumValues) {
+			return typ, true
+		}
+	}
+	return nil, false
+}
+
+func formatDefaultValueType(typ *ResolvedType) string {
+	if typ.Kind == TypeUnknown && typ.Name == "null" {
+		return "null"
+	}
+	return formatResolvedType(typ)
 }
 
 func (a *Analyzer) validatePaginateAPI(api *ast.ApiDecl) {
@@ -464,8 +691,6 @@ func (a *Analyzer) validateStreamAPI(api *ast.ApiDecl) {
 	}
 	if api.ReturnType == nil {
 		a.addError(api.Pos, "@stream API must declare a return type / @stream API 必须声明返回类型")
-	} else if api.ReturnType.Nullable {
-		a.addError(api.ReturnType.Pos, "@stream return type must be non-nullable / @stream 返回类型必须非空")
 	}
 	for _, incompatible := range []string{"cache", "paginate", "scope"} {
 		if directive, _ := findAPIDirective(api.Directives, incompatible); directive != nil {
@@ -525,7 +750,12 @@ func findAPIDirective(directives []*ast.Directive, name string) (*ast.Directive,
 	return found, count
 }
 
+// Declaration collection indexes every event before lookup; a nil index implies no source events.
+// Keep the source scan for incomplete setup.
 func (a *Analyzer) findEvent(name string) *ast.EventDecl {
+	if a.events != nil {
+		return a.events[name]
+	}
 	for _, file := range a.files {
 		for _, event := range file.Events {
 			if event.Name == name {
@@ -560,6 +790,11 @@ func formatTypeRef(ref *ast.TypeRef) string {
 	if ref == nil {
 		return ""
 	}
+	if len(ref.TypeArgs) != 0 || len(ref.Tuple) != 0 {
+		var result strings.Builder
+		writeFormattedTypeRef(&result, ref)
+		return result.String()
+	}
 	name := ref.Name
 	if ref.IsList {
 		name = "[" + name + "]"
@@ -568,6 +803,43 @@ func formatTypeRef(ref *ast.TypeRef) string {
 		name += "?"
 	}
 	return name
+}
+
+// The wrapper rejects a nil root and parsed/cloned type components are non-nil.
+// Retain the nil guard for incomplete metadata.
+func writeFormattedTypeRef(result *strings.Builder, ref *ast.TypeRef) {
+	if ref == nil {
+		return
+	}
+	if ref.IsList {
+		result.WriteByte('[')
+	}
+	if len(ref.Tuple) != 0 {
+		writeFormattedTypeArguments(result, ref.Tuple, '(', ')')
+	} else {
+		result.WriteString(ref.Name)
+		writeFormattedTypeArguments(result, ref.TypeArgs, '<', '>')
+	}
+	if ref.IsList {
+		result.WriteByte(']')
+	}
+	if ref.Nullable {
+		result.WriteByte('?')
+	}
+}
+
+func writeFormattedTypeArguments(result *strings.Builder, arguments []*ast.TypeRef, start, end byte) {
+	if len(arguments) == 0 {
+		return
+	}
+	result.WriteByte(start)
+	for index, argument := range arguments {
+		if index != 0 {
+			result.WriteByte(',')
+		}
+		writeFormattedTypeRef(result, argument)
+	}
+	result.WriteByte(end)
 }
 
 func (a *Analyzer) validateGeneratedStreamMatcher(api *ast.ApiDecl, event *ast.EventDecl) {
@@ -720,7 +992,7 @@ func (a *Analyzer) findModelInName(rest string) (string, *ResolvedType) {
 		if mt.Kind != TypeModel {
 			continue
 		}
-		plural := mn + "s"
+		plural := ast.PluralModelName(mn)
 		if strings.HasPrefix(rest, plural) && len(plural) > len(bestName) {
 			bestName = plural
 			bestType = mt
@@ -799,7 +1071,7 @@ func (a *Analyzer) validateFieldSegments(pos token.Position, apiName, afterBy st
 		}
 
 		// Lowercase first char to match field names
-		fieldName := strings.ToLower(field[:1]) + field[1:]
+		fieldName := lowerFirstIdentifier(field)
 		// Check explicit fields + implicit timestamp fields
 		if _, ok := model.Fields[fieldName]; !ok {
 			if fieldName != "createdAt" && fieldName != "updatedAt" && fieldName != "deletedAt" {
@@ -855,8 +1127,8 @@ func isPascalBoundary(s string, idx, sepLen int) bool {
 		return false
 	}
 	// Char before must be lowercase (end of previous field name)
-	prev := s[idx-1]
-	if prev < 'a' || prev > 'z' {
+	prev, _ := utf8.DecodeLastRuneInString(s[:idx])
+	if !unicode.IsLower(prev) {
 		return false
 	}
 	// Char after separator must be uppercase (start of next field) or end of string
@@ -864,16 +1136,23 @@ func isPascalBoundary(s string, idx, sepLen int) bool {
 	if after >= len(s) {
 		return true // trailing And/Or
 	}
-	return s[after] >= 'A' && s[after] <= 'Z'
+	next, _ := utf8.DecodeRuneInString(s[after:])
+	return unicode.IsUpper(next)
 }
 
 // validateNativeReturnType checks that @native APIs declare a return type.
 func (a *Analyzer) validateNativeReturnType(api *ast.ApiDecl) {
 	for _, d := range api.Directives {
-		if d.Name == "native" && api.ReturnType == nil {
-			a.addError(api.Pos, "@native API must declare a return type")
-			return
+		if d.Name != "native" {
+			continue
 		}
+		if api.ReturnType == nil {
+			a.addError(api.Pos, "@native API must declare a return type")
+		}
+		if api.Body != nil && !hasNamedDirective(api.Directives, "stream") {
+			a.addError(api.Body.Pos, "@native API cannot declare a Luxo body / @native API 不能声明 Luxo 函数体")
+		}
+		return
 	}
 }
 
@@ -949,13 +1228,55 @@ func (a *Analyzer) resolveFnTypes(file *ast.File) {
 			continue
 		}
 		if fn.ReturnType != nil {
-			sym.Type = a.resolveTypeRef(fn.ReturnType, fn.Pos)
+			context := allowNativeResult
+			if !hasNamedDirective(fn.Directives, "service") {
+				context |= allowLocalChannel
+			}
+			sym.Type = a.resolveTypeRefInContext(fn.ReturnType, fn.Pos, context)
 		}
-		for _, p := range fn.Params {
-			a.resolveTypeRef(p.Type, fn.Pos)
-		}
+		a.validateFunctionParameters(fn)
 		a.checkDirectives(fn.Directives, OnFn)
+		a.checkAuthOwnership(fn.Directives, fn.Params)
+		a.validateFunctionBoundary(fn)
 		a.validateFunctionResult(fn)
+	}
+}
+
+func (a *Analyzer) validateFunctionParameters(fn *ast.FnDecl) {
+	context := allowLocalChannel
+	if hasNamedDirective(fn.Directives, "service") {
+		context = 0
+	}
+	a.validateCallableParametersInContext("fn", fn.Name, fn.Params, context)
+	variadicSeen := false
+	for index, param := range fn.Params {
+		if !param.Spread {
+			continue
+		}
+		if variadicSeen {
+			a.addError(param.Pos, "only one variadic parameter is allowed / 只允许一个不定参数")
+		}
+		variadicSeen = true
+		if index != len(fn.Params)-1 {
+			a.addError(param.Pos, "variadic parameter '%s' must be last / 不定参数 '%s' 必须位于最后", param.Name, param.Name)
+		}
+		if param.Default != nil {
+			a.addError(param.Pos, "variadic parameter '%s' cannot have a default value / 不定参数 '%s' 不能有默认值", param.Name, param.Name)
+		}
+	}
+}
+
+func (a *Analyzer) validateFunctionBoundary(fn *ast.FnDecl) {
+	isNative := hasNamedDirective(fn.Directives, "native")
+	isService := hasNamedDirective(fn.Directives, "service")
+	if isNative && fn.Body != nil {
+		a.addError(fn.Body.Pos, "@native fn '%s' cannot declare a Luxo body / @native fn '%s' 不能声明 Luxo 函数体", fn.Name, fn.Name)
+	}
+	if !isNative && fn.Body == nil {
+		a.addError(fn.Pos, "fn '%s' must declare a Luxo body or use @native / fn '%s' 必须声明 Luxo 函数体或使用 @native", fn.Name, fn.Name)
+	}
+	if hasNamedDirective(fn.Directives, "auth") && !isService {
+		a.addError(fn.Pos, "@auth on fn '%s' requires @service / fn '%s' 上的 @auth 必须与 @service 一起使用", fn.Name, fn.Name)
 	}
 }
 
@@ -993,6 +1314,9 @@ func (a *Analyzer) resolveExtendFields(file *ast.File) {
 	// detect extend field conflicts: same model + same field name
 	extendFields := map[string]map[string]token.Position{} // model → field → first pos
 	for _, ext := range file.Extends {
+		if a.isBuiltinIdentityDataType(a.types[ext.Name]) {
+			a.reportIdentityDataType(ext.Pos)
+		}
 		if _, ok := a.types[ext.Name]; !ok {
 			// extend target might be in another module (resolved at gateway)
 		}
@@ -1007,7 +1331,8 @@ func (a *Analyzer) resolveExtendFields(file *ast.File) {
 			} else {
 				extendFields[ext.Name][f.Name] = f.Pos
 			}
-			a.resolveFieldDecl(f)
+			fi := a.resolveFieldDecl(f)
+			a.validateStoredField(ext.Name, f, fi)
 		}
 	}
 }
@@ -1097,7 +1422,7 @@ func federationRelationKeys(modelName, primaryKey string, field *ast.FieldDecl) 
 			return foreignKey, localKey
 		}
 	}
-	return lowerFirstIdentifier(modelName) + upperFirstIdentifier(primaryKey), primaryKey
+	return inferred.ForeignKeyName(modelName, primaryKey), primaryKey
 }
 
 func directiveIdentifierArg(directive *ast.Directive, index int) string {
@@ -1128,7 +1453,13 @@ func upperFirstIdentifier(value string) string {
 }
 
 func (a *Analyzer) resolveFieldDecl(f *ast.FieldDecl) *FieldInfo {
-	fi := &FieldInfo{
+	fi := new(FieldInfo)
+	a.fillFieldDecl(f, fi)
+	return fi
+}
+
+func (a *Analyzer) fillFieldDecl(f *ast.FieldDecl, fi *FieldInfo) {
+	*fi = FieldInfo{
 		Name:     f.Name,
 		Pos:      f.Pos,
 		Doc:      f.Doc,
@@ -1136,12 +1467,13 @@ func (a *Analyzer) resolveFieldDecl(f *ast.FieldDecl) *FieldInfo {
 	}
 
 	if f.Type != nil {
-		fi.Type = a.resolveTypeRef(f.Type, f.Pos)
+		fi.Type = a.resolveWireTypeRef(f.Type, f.Pos)
 		fi.Nullable = f.Type.Nullable
 	}
 
 	if f.Default != nil {
 		fi.HasDefault = true
+		a.validateFieldDefault(f, fi.Type)
 	}
 
 	for _, d := range f.Directives {
@@ -1149,11 +1481,32 @@ func (a *Analyzer) resolveFieldDecl(f *ast.FieldDecl) *FieldInfo {
 	}
 
 	a.checkFieldDirectives(f)
-	a.checkTransformDirective(f, fi.Type)
-	return fi
+}
+
+func (a *Analyzer) validateFieldDefault(field *ast.FieldDecl, expected *ResolvedType) {
+	if expected != nil {
+		// JSON null is a field value; this does not change its SQL representation.
+		if literal, ok := field.Default.(*ast.Literal); ok && literal.Kind == token.Null &&
+			(expected.Nullable || (!expected.IsList && expected.Name == "JSON")) {
+			return
+		}
+		// Preserve the existing unqualified enum defaults used by model declarations.
+		if value, ok := field.Default.(*ast.Ident); ok && !expected.IsList && expected.Kind == TypeEnum && stringInSlice(value.Name, expected.EnumValues) {
+			return
+		}
+	}
+	a.validateDefaultValue(field.Default, expected, field.Name, "field", "字段")
 }
 
 func (a *Analyzer) resolveTypeRef(ref *ast.TypeRef, pos token.Position) *ResolvedType {
+	return a.resolveTypeRefInContext(ref, pos, allowLocalChannel)
+}
+
+func (a *Analyzer) resolveWireTypeRef(ref *ast.TypeRef, pos token.Position) *ResolvedType {
+	return a.resolveTypeRefInContext(ref, pos, 0)
+}
+
+func (a *Analyzer) resolveTypeRefInContext(ref *ast.TypeRef, pos token.Position, context typeContext) *ResolvedType {
 	if ref == nil {
 		return &ResolvedType{Kind: TypeVoid, Name: "Void"}
 	}
@@ -1165,19 +1518,20 @@ func (a *Analyzer) resolveTypeRef(ref *ast.TypeRef, pos token.Position) *Resolve
 			Nullable: ref.Nullable,
 		}
 		for _, t := range ref.Tuple {
-			resolved := a.resolveTypeRef(t, pos)
+			resolved := a.resolveTypeRefInContext(t, pos, context&^allowNativeResult)
 			result.Tuple = append(result.Tuple, resolved)
 		}
 		return result
 	}
 
-	name := ref.Name
-
-	// Look up the type
-	typ, ok := a.types[name]
-	if !ok {
-		a.addErrorWithSuggestion(pos, name, "unknown type '%s' / 未知类型 '%s'", name, name)
-		return &ResolvedType{Kind: TypeUnknown, Name: name, Nullable: ref.Nullable}
+	if len(a.typeParameters) != 0 {
+		if parameter := a.resolveTypeParameter(ref, pos); parameter != nil {
+			return parameter
+		}
+	}
+	typ := a.resolveNamedType(ref, pos, context)
+	if typ == nil {
+		return &ResolvedType{Kind: TypeUnknown, Name: ref.Name, Nullable: ref.Nullable}
 	}
 
 	result := &ResolvedType{
@@ -1192,9 +1546,12 @@ func (a *Analyzer) resolveTypeRef(ref *ast.TypeRef, pos token.Position) *Resolve
 		EnumValues: typ.EnumValues,
 	}
 
-	// Generic args
-	for _, arg := range ref.TypeArgs {
-		result.TypeArgs = append(result.TypeArgs, a.resolveTypeRef(arg, pos))
+	if len(ref.TypeArgs) != 0 {
+		result.TypeArgs = make([]*ResolvedType, len(ref.TypeArgs))
+		for index, arg := range ref.TypeArgs {
+			result.TypeArgs[index] = a.resolveTypeRefInContext(arg, pos, context&^allowNativeResult)
+		}
+		a.registerGenericInstance(result, ref, pos)
 	}
 
 	return result

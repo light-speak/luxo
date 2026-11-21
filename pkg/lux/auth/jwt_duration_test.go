@@ -1,9 +1,94 @@
 package auth
 
 import (
+	"math"
+	"math/big"
+	"strconv"
 	"testing"
 	"time"
 )
+
+func FuzzJWTDurationIntegerUnits(f *testing.F) {
+	for _, seed := range [][3]uint64{{0, 0, 0}, {7, 0, 0}, {1, 2, 3}, {106751, 0, 23}, {100000, 100000, 100000}, {math.MaxUint64, 0, 0}} {
+		f.Add(seed[0], seed[1], seed[2])
+	}
+	f.Fuzz(func(t *testing.T, days, weeks, hours uint64) {
+		input := strconv.FormatUint(days, 10) + "d" + strconv.FormatUint(weeks, 10) + "w" + strconv.FormatUint(hours, 10) + "h"
+		var expected, component, unit big.Int
+		for _, pair := range [][2]uint64{{days, uint64(24 * time.Hour)}, {weeks, uint64(7 * 24 * time.Hour)}, {hours, uint64(time.Hour)}} {
+			component.SetUint64(pair[0])
+			unit.SetUint64(pair[1])
+			expected.Add(&expected, component.Mul(&component, &unit))
+		}
+		got, err := parseDuration(input)
+		if !expected.IsInt64() {
+			if err == nil {
+				t.Fatalf("overflow accepted: %s = %v", input, got)
+			}
+			return
+		}
+		if err != nil || int64(got) != expected.Int64() {
+			t.Fatalf("%s = %v, %v; want %s ns", input, got, err, expected.String())
+		}
+	})
+}
+
+func TestJWTDurationArithmeticBoundaries(t *testing.T) {
+	for _, input := range []string{"NaN*24h", "Inf*24h", "-Inf*24h", "1e309*24h", "-106752*24h", "-2562047h47m16.854775808s+-1ns"} {
+		if got, err := parseDurationWithMultiplier(input); err == nil {
+			t.Errorf("accepted %q as %v", input, got)
+		}
+	}
+	for input, expected := range map[string]time.Duration{
+		"106751d23h47m16.854775807s": math.MaxInt64,
+		"0.5d":                       12 * time.Hour,
+		"0.25w":                      42 * time.Hour,
+	} {
+		if got, err := parseDuration(input); err != nil || got != expected {
+			t.Errorf("%q = %v, %v; want %v", input, got, err, expected)
+		}
+	}
+}
+
+func TestLoadConfigAcceptsMixedDurationUnitOrder(t *testing.T) {
+	ResetConfig()
+	t.Cleanup(ResetConfig)
+	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("JWT_EXPIRES", "12h1d")
+	t.Setenv("JWT_REFRESH", "true")
+	t.Setenv("JWT_REFRESH_EXPIRES", "30m1w15s0.5d")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Expires != 36*time.Hour || cfg.RefreshExpires != 180*time.Hour+30*time.Minute+15*time.Second {
+		t.Fatalf("access expiry=%v, refresh expiry=%v", cfg.Expires, cfg.RefreshExpires)
+	}
+}
+
+func BenchmarkJWTDurationConfig(b *testing.B) {
+	for _, input := range []string{"7d", "1d12h", "0.5d", "30m"} {
+		b.Run(input, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := parseDuration(input); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestJWTDurationRejectsOverflowAndMalformedNumbers(t *testing.T) {
+	for _, input := range []string{"100000d100000d100000d", "106752d", "106751d23h47m16.854775808s", "1..2d", "1.2.3w"} {
+		t.Run(input, func(t *testing.T) {
+			if duration, err := parseDuration(input); err == nil {
+				t.Fatalf("accepted invalid duration %q as %v", input, duration)
+			}
+		})
+	}
+}
 
 func TestParseDuration_InvalidNumber(t *testing.T) {
 	// "xd" — x is not a valid number

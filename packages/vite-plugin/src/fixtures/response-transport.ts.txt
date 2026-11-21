@@ -1,0 +1,14 @@
+import type { GeneratedTransport } from '@luxojs/client'
+
+export function responseTransport(read: () => unknown, readStream = read): GeneratedTransport {
+  return {
+    async call() { throw new Error('Unexpected dynamic call') },
+    async subscribe() { throw new Error('Unexpected dynamic subscription') },
+    async callGenerated() { return read() },
+    async subscribeGenerated(_api, _codec, _params, decode, onData) {
+      onData(decode(readStream()))
+      return () => {}
+    },
+    setSchema() {}, setMode() {}, setToken() {},
+  }
+}

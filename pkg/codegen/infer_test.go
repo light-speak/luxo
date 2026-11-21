@@ -1,9 +1,11 @@
 package codegen
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -394,7 +396,7 @@ func TestGenerateInferredHandler(t *testing.T) {
 			},
 		}
 		var b strings.Builder
-		generateInferredHandler(&b, api, inf, enums, m)
+		defaultGenerator().generateInferredHandler(&b, api, inf, enums, m)
 		out := b.String()
 
 		if !strings.Contains(out, "func handleGetUserByEmail(app *App)") {
@@ -425,7 +427,7 @@ func TestGenerateInferredHandler(t *testing.T) {
 			},
 		}
 		var b strings.Builder
-		generateInferredHandler(&b, api, inf, enums, m)
+		defaultGenerator().generateInferredHandler(&b, api, inf, enums, m)
 		out := b.String()
 
 		if !strings.Contains(out, "func handleGetUserByAge(app *App)") {
@@ -451,13 +453,13 @@ func TestGenerateInferredHandler(t *testing.T) {
 			OrderDesc: true,
 		}
 		var b strings.Builder
-		generateInferredHandler(&b, api, inf, enums, m)
+		defaultGenerator().generateInferredHandler(&b, api, inf, enums, m)
 		out := b.String()
 
 		if !strings.Contains(out, "AllWithCount(ctx)") {
 			t.Errorf("missing AllWithCount for list action, got:\n%s", out)
 		}
-		if !strings.Contains(out, "created_at DESC") {
+		if !strings.Contains(out, "\\\"created_at\\\" DESC") {
 			t.Errorf("missing ORDER BY created_at DESC, got:\n%s", out)
 		}
 	})
@@ -475,7 +477,7 @@ func TestGenerateInferredHandler(t *testing.T) {
 			},
 		}
 		var b strings.Builder
-		generateInferredHandler(&b, api, inf, enums, m)
+		defaultGenerator().generateInferredHandler(&b, api, inf, enums, m)
 		out := b.String()
 
 		if !strings.Contains(out, "Limit(3)") {
@@ -498,7 +500,7 @@ func TestGenerateInferredHandler(t *testing.T) {
 			},
 		}
 		var b strings.Builder
-		generateInferredHandler(&b, api, inf, enums, m)
+		defaultGenerator().generateInferredHandler(&b, api, inf, enums, m)
 		out := b.String()
 
 		if !strings.Contains(out, "orParts") {
@@ -534,14 +536,14 @@ func TestGenerateInferredHandlerEnumParam(t *testing.T) {
 		},
 	}
 	var b strings.Builder
-	generateInferredHandler(&b, api, inf, enumMap, m)
+	defaultGenerator().generateInferredHandler(&b, api, inf, enumMap, m)
 	out := b.String()
 	if !strings.Contains(out, "req.ParamString") {
 		t.Errorf("enum param: expected ParamString for enum type, got:\n%s", out)
 	}
 }
 
-func TestGenerateInferredHandlerParamJSON(t *testing.T) {
+func TestGenerateInferredHandlerParamUUID(t *testing.T) {
 	mWithUUID := testModel("User", nil, []*ast.FieldDecl{
 		testField("id", "UUID"),
 		testField("email", "String"),
@@ -557,14 +559,14 @@ func TestGenerateInferredHandlerParamJSON(t *testing.T) {
 		},
 	}
 	var b strings.Builder
-	generateInferredHandler(&b, api, inf, map[string]bool{}, mWithUUID)
+	defaultGenerator().generateInferredHandler(&b, api, inf, map[string]bool{}, mWithUUID)
 	out := b.String()
-	if !strings.Contains(out, "req.ParamJSON") {
-		t.Errorf("UUID param: expected ParamJSON for UUID type, got:\n%s", out)
+	if !strings.Contains(out, "req.ParamUUID") {
+		t.Errorf("UUID param: expected ParamUUID, got:\n%s", out)
 	}
 }
 
-func TestGenerateInferredHandlerNullableParamJSON(t *testing.T) {
+func TestGenerateInferredHandlerNullableParamUUID(t *testing.T) {
 	model := testModel("User", nil, []*ast.FieldDecl{testField("id", "UUID")})
 	api := testApiDecl("getUserById", []*ast.ParamDecl{{
 		Name: "id",
@@ -576,9 +578,9 @@ func TestGenerateInferredHandlerNullableParamJSON(t *testing.T) {
 		Groups:    []ClauseGroup{{Clauses: []InferClause{{Field: "id", Op: "eq"}}}},
 	}
 	var b strings.Builder
-	generateInferredHandler(&b, api, inf, nil, model)
-	if out := b.String(); !strings.Contains(out, "req.ParamJSONNullable") {
-		t.Fatalf("nullable UUID parameter did not use nullable JSON decoding:\n%s", out)
+	defaultGenerator().generateInferredHandler(&b, api, inf, nil, model)
+	if out := b.String(); !strings.Contains(out, `req.ParamIsNull("id")`) || !strings.Contains(out, `req.ParamUUID("id")`) {
+		t.Fatalf("nullable UUID parameter did not use static nullable decoding:\n%s", out)
 	}
 }
 
@@ -592,7 +594,7 @@ func TestGenerateInferredHandlerSelectsRelationColumns(t *testing.T) {
 			api := testApiDecl(action+"Users", nil)
 			inf := &InferredAPI{Action: action, ModelName: "User"}
 			var b strings.Builder
-			generateInferredHandler(&b, api, inf, nil, model)
+			defaultGenerator().generateInferredHandler(&b, api, inf, nil, model)
 			out := b.String()
 			if !strings.Contains(out, "cols := selectUserSQLColumns(req.Select)") ||
 				!strings.Contains(out, "resolveUser") {
@@ -604,6 +606,101 @@ func TestGenerateInferredHandlerSelectsRelationColumns(t *testing.T) {
 		})
 	}
 }
+
+func TestGenerateInferredTopListPropagatesRelationError(t *testing.T) {
+	model := testModel("User", nil, []*ast.FieldDecl{
+		testField("id", "Int"),
+		{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+	})
+	var output strings.Builder
+	defaultGenerator().generateInferredHandler(&output, testApiDecl("listTop5Users", nil),
+		&InferredAPI{Action: "list", ModelName: "User", TopN: 5}, nil, model)
+	code := output.String()
+	for _, expected := range []string{
+		"q.Limit(5).All(ctx)",
+		"if err := resolveUserListRelations(ctx, app, results, req.Select); err != nil {\n\t\t\treturn err",
+		"WriteColumnarUser(req.Buf, results, req.FieldMask)",
+	} {
+		if !strings.Contains(code, expected) {
+			t.Fatalf("missing %q:\n%s", expected, code)
+		}
+	}
+	if strings.Contains(code, "AllWithCount") {
+		t.Fatal("fixed top list unexpectedly enabled pagination")
+	}
+}
+
+func TestGeneratedTopListRelationFailure(t *testing.T) {
+	runGeneratedFixture(t, `
+model User @noTime { id: Int @id
+ name: String
+ posts: [Post]
+}
+model Post @noTime { id: Int @id
+ userId: Int
+ user: User
+}
+api listTop5Users
+api listTop5UsersByName
+api listUsersByName
+`, topListRelationAssertions, StableIDs{ModelFields: map[string]map[string]int{
+		"User": {"id": 1, "name": 2, "posts": 3}, "Post": {"id": 1, "userId": 2, "user": 3},
+	}})
+}
+
+const topListRelationAssertions = `package generated
+import("bytes";"encoding/json";"net/http/httptest";"testing"
+"github.com/light-speak/luxo/internal/testutil"
+"github.com/light-speak/luxo/pkg/lux/api"
+"github.com/light-speak/luxo/pkg/lux/codec"
+"github.com/light-speak/luxo/pkg/lux/pg"
+"github.com/light-speak/luxo/pkg/lux/schema"
+"github.com/testcontainers/testcontainers-go"
+"github.com/testcontainers/testcontainers-go/modules/postgres")
+func TestTopListRelationFailure(t *testing.T){
+ container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+ testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
+ connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+ db,err:=pg.NewDB(t.Context(),connection);if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
+ if _,err:=pg.Exec(t.Context(),db,"CREATE TABLE users(id bigint PRIMARY KEY,name text); INSERT INTO users VALUES(1,'first'),(2,'second')");err!=nil{t.Fatal(err)}
+ for _,apiName:=range []string{"listTop5Users","listTop5UsersByName","listUsersByName"}{for _,binary:=range []bool{false,true}{for _,relation:=range []bool{false,true}{
+  router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+  app:=NewFromDB(db)
+  if err:=RegisterHandlers(router,app);err!=nil{t.Fatal(err)}
+  selection:="id";if relation{selection="id,posts { id }"}
+  payload:=map[string]any{"$api":apiName,"$select":selection}
+  var params map[string]any
+  wantRows:=2
+  if apiName!="listTop5Users"{params=map[string]any{"name":"first"};payload["name"]="first";wantRows=1}
+  body,err:=json.Marshal(payload);if err!=nil{t.Fatal(err)}
+  if binary{
+   fields:=[]byte{1};var children []codec.SelectionMaskChild
+   if relation{fields=[]byte{5};child,err:=codec.AppendSelectionMask(nil,[]byte{1},nil);if err!=nil{t.Fatal(err)};children=[]codec.SelectionMaskChild{{FieldID:3,Mask:child}}}
+   mask,err:=codec.AppendSelectionMask(nil,fields,children);if err!=nil{t.Fatal(err)}
+   body,err=api.EncodeBinaryRequest(router.Schema.APIs[apiName].ID,mask,params,router.Registry.ParamOrder(apiName));if err!=nil{t.Fatal(err)}
+  }
+  request:=httptest.NewRequest("POST","/",bytes.NewReader(body));if binary{request.Header.Set("X-Luxo-Mode","binary")}else{request.Header.Set("Content-Type","application/json")}
+  response:=httptest.NewRecorder();router.ServeHTTP(response,request)
+  want:=200;if relation{want=500}
+  if response.Code!=want{t.Fatalf("binary=%v relation=%v status=%d want=%d body=%s",binary,relation,response.Code,want,response.Body.String())}
+  if !relation{
+   var rows []User
+   if apiName=="listUsersByName"{rows=readInferredPage(t,router,response.Body.Bytes(),binary)}else if binary{rows,err=ReadColumnarUser(response.Body.Bytes())}else{var envelope struct{Data []User};err=json.Unmarshal(response.Body.Bytes(),&envelope);rows=envelope.Data}
+   if err!=nil||len(rows)!=wantRows{t.Fatal(apiName,binary,rows,err)}
+   if wantRows==1&&rows[0].Id!=1{t.Fatal("filter was not applied",rows)}
+  }
+ }}}
+}
+func readInferredPage(t *testing.T,router *api.Router,body []byte,binary bool)[]User{
+ t.Helper()
+ var err error
+ if binary{body,err=schema.BinaryPaginatedListToJSON(nil,body,router.Schema.Models["User"],router.Schema);if err!=nil{t.Fatal(err)}}else{var envelope struct{Data json.RawMessage};if err=json.Unmarshal(body,&envelope);err!=nil{t.Fatal(err)};body=envelope.Data}
+ var page struct{Items []User;Total int;Page int;PageSize int}
+ if err=json.Unmarshal(body,&page);err!=nil{t.Fatal(err)}
+ if page.Total!=1||page.Page!=1||page.PageSize<=0{t.Fatalf("incorrect pagination: %+v",page)}
+ return page.Items
+}
+`
 
 func TestWriteAndClause(t *testing.T) {
 	m := testModel("Post", nil, []*ast.FieldDecl{
@@ -641,7 +738,7 @@ func TestWriteAndClause(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.clause.Field+"_"+tc.clause.Op, func(t *testing.T) {
 			var b strings.Builder
-			writeAndClause(&b, tc.clause, m, params, 0)
+			defaultGenerator().writeAndClause(&b, tc.clause, m, params, 0)
 			out := b.String()
 			if !strings.Contains(out, tc.want) {
 				t.Errorf("writeAndClause(%+v) output missing %q:\n%s", tc.clause, tc.want, out)
@@ -651,7 +748,7 @@ func TestWriteAndClause(t *testing.T) {
 
 	t.Run("between uses native Between", func(t *testing.T) {
 		var b strings.Builder
-		writeAndClause(&b, InferClause{Field: "age", Op: "between"}, m, params, 0)
+		defaultGenerator().writeAndClause(&b, InferClause{Field: "age", Op: "between"}, m, params, 0)
 		out := b.String()
 		if !strings.Contains(out, "Between(p0, p1)") {
 			t.Errorf("between missing Between(p0, p1):\n%s", out)
@@ -663,7 +760,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("count", func(t *testing.T) {
 		inf := &InferredAPI{Action: "count", ModelName: "User"}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "User", false, nil)
+		defaultGenerator().writeInferredAction(&b, inf, "User", false, nil)
 		out := b.String()
 		if !strings.Contains(out, "app.User.Where(conds...).Count(ctx)") {
 			t.Errorf("count: missing Count call:\n%s", out)
@@ -676,7 +773,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("exists", func(t *testing.T) {
 		inf := &InferredAPI{Action: "exists", ModelName: "User"}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "User", false, nil)
+		defaultGenerator().writeInferredAction(&b, inf, "User", false, nil)
 		out := b.String()
 		if !strings.Contains(out, "app.User.Where(conds...).Exists(ctx)") {
 			t.Errorf("exists: missing Exists call:\n%s", out)
@@ -689,7 +786,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("delete hard", func(t *testing.T) {
 		inf := &InferredAPI{Action: "delete", ModelName: "Post"}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "Post", false, nil)
+		defaultGenerator().writeInferredAction(&b, inf, "Post", false, nil)
 		out := b.String()
 		if !strings.Contains(out, "app.Post.Where(conds...).Delete(ctx)") {
 			t.Errorf("delete hard: missing Delete call:\n%s", out)
@@ -699,7 +796,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("delete soft", func(t *testing.T) {
 		inf := &InferredAPI{Action: "delete", ModelName: "Post"}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "Post", true, nil)
+		defaultGenerator().writeInferredAction(&b, inf, "Post", true, nil)
 		out := b.String()
 		if !strings.Contains(out, "app.Post.SoftDelete(ctx, conds...)") {
 			t.Errorf("delete soft: missing SoftDelete call:\n%s", out)
@@ -709,7 +806,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("get default", func(t *testing.T) {
 		inf := &InferredAPI{Action: "get", ModelName: "User"}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "User", false, nil)
+		defaultGenerator().writeInferredAction(&b, inf, "User", false, nil)
 		out := b.String()
 		if !strings.Contains(out, "First(ctx)") {
 			t.Errorf("get: missing First(ctx):\n%s", out)
@@ -722,9 +819,9 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("list with orderBy asc", func(t *testing.T) {
 		inf := &InferredAPI{Action: "list", ModelName: "User", OrderBy: "name", OrderDesc: false}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "User", false, nil)
+		defaultGenerator().writeInferredAction(&b, inf, "User", false, nil)
 		out := b.String()
-		if !strings.Contains(out, "name ASC") {
+		if !strings.Contains(out, "\\\"name\\\" ASC") {
 			t.Errorf("list: missing ASC order:\n%s", out)
 		}
 		if !strings.Contains(out, "AllWithCount(ctx)") {
@@ -735,7 +832,7 @@ func TestWriteInferredAction(t *testing.T) {
 	t.Run("list topN no pagination", func(t *testing.T) {
 		inf := &InferredAPI{Action: "list", ModelName: "User", TopN: 10}
 		var b strings.Builder
-		writeInferredAction(&b, inf, "User", false, nil)
+		defaultGenerator().writeInferredAction(&b, inf, "User", false, nil)
 		out := b.String()
 		if !strings.Contains(out, "Limit(10)") {
 			t.Errorf("list topN: missing Limit(10):\n%s", out)
@@ -835,10 +932,10 @@ func TestWriteClauseSQL(t *testing.T) {
 		clause InferClause
 		want   string
 	}{
-		{InferClause{Field: "active", Op: "true"}, `"active = true"`},
-		{InferClause{Field: "active", Op: "false"}, `"active = false"`},
-		{InferClause{Field: "deletedAt", Op: "isNull"}, `"deleted_at IS NULL"`},
-		{InferClause{Field: "deletedAt", Op: "isNotNull"}, `"deleted_at IS NOT NULL"`},
+		{InferClause{Field: "active", Op: "true"}, `"\"active\" = true"`},
+		{InferClause{Field: "active", Op: "false"}, `"\"active\" = false"`},
+		{InferClause{Field: "deletedAt", Op: "isNull"}, `"\"deleted_at\" IS NULL"`},
+		{InferClause{Field: "deletedAt", Op: "isNotNull"}, `"\"deleted_at\" IS NOT NULL"`},
 		{InferClause{Field: "title", Op: "containing"}, "LIKE"},
 		{InferClause{Field: "title", Op: "like"}, "LIKE"},
 		{InferClause{Field: "views", Op: "ne"}, "!="},
@@ -852,7 +949,7 @@ func TestWriteClauseSQL(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.clause.Field+"_"+tc.clause.Op, func(t *testing.T) {
 			var b strings.Builder
-			writeClauseSQL(&b, tc.clause, m, params, 0)
+			defaultGenerator().writeClauseSQL(&b, tc.clause, m, params, 0)
 			out := b.String()
 			if !strings.Contains(out, tc.want) {
 				t.Errorf("writeClauseSQL(%+v) missing %q:\n%s", tc.clause, tc.want, out)
@@ -880,7 +977,7 @@ func TestSingularize(t *testing.T) {
 		{"User", "User"},
 	}
 	for _, tc := range cases {
-		got := singularize(tc.input)
+		got := inferred.Singularize(tc.input)
 		if got != tc.want {
 			t.Errorf("singularize(%q) = %q, want %q", tc.input, got, tc.want)
 		}
@@ -899,7 +996,7 @@ func TestParseOrderByAsc(t *testing.T) {
 		{"UpdatedAt", "updatedAt", false}, // no suffix
 	}
 	for _, tc := range cases {
-		field, desc := parseOrderBy(tc.input)
+		field, desc := inferred.ParseOrderBy(tc.input)
 		if field != tc.wantField {
 			t.Errorf("parseOrderBy(%q) field = %q, want %q", tc.input, field, tc.wantField)
 		}
@@ -993,7 +1090,7 @@ func TestWriteAndClauseInAndNotIn(t *testing.T) {
 
 	t.Run("in", func(t *testing.T) {
 		var b strings.Builder
-		writeAndClause(&b, InferClause{Field: "id", Op: "in"}, m, params, 0)
+		defaultGenerator().writeAndClause(&b, InferClause{Field: "id", Op: "in"}, m, params, 0)
 		out := b.String()
 		if !strings.Contains(out, ".In(ids...)") {
 			t.Errorf("missing .In(ids...) for 'in' op:\n%s", out)
@@ -1002,7 +1099,7 @@ func TestWriteAndClauseInAndNotIn(t *testing.T) {
 
 	t.Run("notIn", func(t *testing.T) {
 		var b strings.Builder
-		writeAndClause(&b, InferClause{Field: "id", Op: "notIn"}, m, params, 0)
+		defaultGenerator().writeAndClause(&b, InferClause{Field: "id", Op: "notIn"}, m, params, 0)
 		out := b.String()
 		if !strings.Contains(out, ".NotIn(ids...)") {
 			t.Errorf("missing .NotIn(ids...) for 'notIn' op:\n%s", out)
@@ -1066,7 +1163,7 @@ func TestWriteClauseSQLAllOps(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.clause.Field+"_"+tc.clause.Op, func(t *testing.T) {
 			var b strings.Builder
-			writeClauseSQL(&b, tc.clause, m, params, 0)
+			defaultGenerator().writeClauseSQL(&b, tc.clause, m, params, 0)
 			out := b.String()
 			if !strings.Contains(out, tc.want) {
 				t.Errorf("writeClauseSQL(%+v) missing %q:\n%s", tc.clause, tc.want, out)
@@ -1234,7 +1331,7 @@ func TestBuildInferredParamsStringPatternOps(t *testing.T) {
 func TestSplitBySeparatorLowercaseAfterSep(t *testing.T) {
 	// "EmailOrphone" split by "Or": idx=5, char after "Or" is 'p' (lowercase)
 	// → else-break, no split occurs, whole string returned as one part.
-	parts := splitBySeparator("EmailOrphone", "Or")
+	parts := inferred.SplitBySeparator("EmailOrphone", "Or")
 	if len(parts) != 1 {
 		t.Errorf("expected 1 part for lowercase-after-sep, got %d: %v", len(parts), parts)
 	}
@@ -1285,7 +1382,7 @@ func TestGenerateInferredHandlerORGroupAllOps(t *testing.T) {
 			},
 		}
 		var b strings.Builder
-		generateInferredHandler(&b, api, inf, map[string]bool{}, m)
+		defaultGenerator().generateInferredHandler(&b, api, inf, map[string]bool{}, m)
 		return b.String()
 	}
 
@@ -1295,8 +1392,8 @@ func TestGenerateInferredHandlerORGroupAllOps(t *testing.T) {
 			InferClause{Field: "views", Op: "eq"},
 			[]*ast.ParamDecl{testParamDecl("views", "Int")},
 		)
-		if !strings.Contains(out, "active = true") {
-			t.Errorf("missing 'active = true' in OR group:\n%s", out)
+		if !strings.Contains(out, "\\\"active\\\" = true") {
+			t.Errorf("missing '\\\"active\\\" = true' in OR group:\n%s", out)
 		}
 	})
 
@@ -1365,4 +1462,98 @@ func TestGenerateInferredHandlerORGroupAllOps(t *testing.T) {
 			t.Errorf("missing != in OR group:\n%s", out)
 		}
 	})
+}
+
+func TestGeneratedInferredBindingNames(t *testing.T) {
+	runGeneratedFixture(t, `
+enum State { Open Closed }
+model Entry @noTime {
+ id: Int @id
+ req: Int
+ conds: Int
+ orArgs: Int
+ snapshot: State
+}
+api countEntriesByReq
+api countEntriesByConds
+api countEntriesByReqOrOrArgs
+api countEntriesBySnapshot
+api aliasCount(ctx: Int): Int {
+ val req = Entry.where(it.req == ctx)
+ return req.count()
+}
+api aliasField(ctx: Int): Int {
+ val req = Entry.where(it.req == ctx)
+ return req.sum(req)
+}
+api aliasAggregate(ctx: Int): Int {
+ val (req, err) = await {
+  Entry.where(it.req == ctx).count()
+  Entry.where(it.req == ctx).sum { it.req }
+ }
+ return req + err
+}
+`, inferredBindingAssertions, StableIDs{ModelFields: map[string]map[string]int{
+		"Entry": {"id": 1, "req": 2, "conds": 3, "orArgs": 4, "snapshot": 5},
+	}})
+}
+
+const inferredBindingAssertions = `package generated
+import("bytes";"encoding/json";"net/http/httptest";"testing"
+"github.com/light-speak/luxo/internal/testutil"
+"github.com/light-speak/luxo/pkg/lux/api"
+"github.com/light-speak/luxo/pkg/lux/codec"
+"github.com/light-speak/luxo/pkg/lux/pg"
+"github.com/testcontainers/testcontainers-go"
+"github.com/testcontainers/testcontainers-go/modules/postgres")
+func TestInferredBindings(t *testing.T){
+ container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+ testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
+ connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+ db,err:=pg.NewDB(t.Context(),connection);if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
+ if _,err:=pg.Exec(t.Context(),db,"CREATE TABLE entrys(id bigint PRIMARY KEY,req bigint,conds bigint,or_args bigint,snapshot text); INSERT INTO entrys VALUES(1,42,42,99,'Open'),(2,99,99,42,'Closed')");err!=nil{t.Fatal(err)}
+ router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+ if err:=RegisterHandlers(router,NewFromDB(db));err!=nil{t.Fatal(err)}
+ for _,tc:=range []struct{name string;params map[string]any;want int64}{
+  {"countEntriesByReq",map[string]any{"req":int64(42)},1},
+  {"aliasCount",map[string]any{"ctx":int64(42)},1},
+  {"aliasField",map[string]any{"ctx":int64(42)},42},
+  {"aliasAggregate",map[string]any{"ctx":int64(42)},43},
+  {"countEntriesByConds",map[string]any{"conds":int64(42)},1},
+  {"countEntriesByReqOrOrArgs",map[string]any{"req":int64(42),"orArgs":int64(42)},2},
+  {"countEntriesBySnapshot",map[string]any{"snapshot":"Open"},1},
+ }{for _,binary:=range []bool{false,true}{
+  payload:=map[string]any{"$api":tc.name};for key,value:=range tc.params{payload[key]=value}
+  body,err:=json.Marshal(payload);if err!=nil{t.Fatal(err)}
+  if binary{body,err=api.EncodeBinaryRequest(router.Schema.APIs[tc.name].ID,nil,tc.params,router.Registry.ParamOrder(tc.name));if err!=nil{t.Fatal(err)}}
+  request:=httptest.NewRequest("POST","/",bytes.NewReader(body));if binary{request.Header.Set("X-Luxo-Mode","binary")}else{request.Header.Set("Content-Type","application/json")}
+  response:=httptest.NewRecorder();router.ServeHTTP(response,request)
+  if response.Code!=200{t.Fatal(tc.name,binary,response.Code,response.Body.String())}
+  var count int64
+  if binary{decoder:=codec.NewDecoder(response.Body.Bytes());count=decoder.ReadInt();if err:=decoder.Finish();err!=nil{t.Fatal(err)}}else{var envelope struct{Data int64};if err:=json.Unmarshal(response.Body.Bytes(),&envelope);err!=nil{t.Fatal(err)};count=envelope.Data}
+  if count!=tc.want{t.Fatal(tc.name,binary,count,tc.want)}
+ }}
+}
+`
+
+func TestInferredBindingPreservesKeysAndAST(t *testing.T) {
+	for _, kind := range []string{"Int", "State"} {
+		param := testParamDecl("req", kind)
+		original := []*ast.ParamDecl{param}
+		var output strings.Builder
+		locals := writeInferredParamBindings(&output, original, map[string]bool{"State": true})
+		if locals[0].Name == "req" || original[0] != param || param.Name != "req" {
+			t.Fatal("inferred binding mutated source or retained conflicting name", locals, original)
+		}
+		code := output.String()
+		if !strings.Contains(code, `("req")`) || strings.Contains(code, fmt.Sprintf("(%q)", locals[0].Name)) {
+			t.Fatal("inferred binding changed request key", code)
+		}
+	}
+	param := testParamDecl("value", "Int")
+	var output strings.Builder
+	locals := writeInferredParamBindings(&output, []*ast.ParamDecl{param}, nil)
+	if locals[0] != param {
+		t.Fatal("ordinary parameter was unnecessarily copied")
+	}
 }

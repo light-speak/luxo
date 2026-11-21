@@ -80,11 +80,14 @@ type typeOwnership struct {
 }
 
 func newTypeOwnership() *typeOwnership {
-	return &typeOwnership{owners: make(map[string]string)}
+	return &typeOwnership{}
 }
 
 // register records that a type was declared in a given module.
 func (o *typeOwnership) register(typeName, moduleName string) {
+	if o.owners == nil {
+		o.owners = make(map[string]string)
+	}
 	o.owners[typeName] = moduleName
 }
 

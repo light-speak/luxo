@@ -4,8 +4,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Version is set at build time via ldflags.
-var Version = "dev"
+// Version identifies this candidate and may be overridden at build time via ldflags.
+var Version = "1.0.0-beta.1"
 
 var rootCmd = &cobra.Command{
 	Use:   "luxo",

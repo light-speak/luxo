@@ -200,15 +200,36 @@ type TypeRef struct {
 	IsList   bool       // [xxx]
 	TypeArgs []*TypeRef // generic args: Page<User>
 	Tuple    []*TypeRef // polymorphic: (Post, Video, Product)
-	FKField  string     // custom foreign key: User(key: authorId)
 }
 
-// Directive: @cache(ttl: 60), @hidden, @transform { ... }
+// Directive: @cache(policy: "preview"), @hidden, @transform { ... }
 type Directive struct {
-	Pos  token.Position
-	Name string
-	Args []*NamedArg
-	Body *Block // @transform { ... }, @beforeSave { ... }
+	// AuthSubject is resolved by semantic analysis, never inferred from JWT fields.
+	AuthSubject string
+	Pos         token.Position
+	Name        string
+	Args        []*NamedArg
+	Body        *Block // @transform { ... }, @beforeSave { ... }
+}
+
+// SingleExpression returns an unambiguous positional or expression-body value.
+func (d *Directive) SingleExpression() Expr {
+	if d == nil {
+		return nil
+	}
+	if d.Body == nil {
+		if len(d.Args) == 1 && d.Args[0] != nil && d.Args[0].Name == "" {
+			return d.Args[0].Value
+		}
+		return nil
+	}
+	if len(d.Args) != 0 || len(d.Body.Stmts) != 1 {
+		return nil
+	}
+	if statement, ok := d.Body.Stmts[0].(*ExprStmt); ok {
+		return statement.Expr
+	}
+	return nil
 }
 
 // ========== Expressions ==========
@@ -222,14 +243,23 @@ type Expr interface {
 	SetNullable(bool)
 	IsListType() bool
 	SetListType(bool)
+	IsModelType() bool
+	SetModelType(bool)
+	IsEnumType() bool
+	SetEnumType(bool)
+	SetTypeMetadata(name string, nullable, list, model, enum bool)
 }
 
 // TypeTagged provides type tag storage for all Expr nodes via embedding.
 // Semantic analyzer writes the tag; codegen reads it. O(1) access, zero allocation.
 type TypeTagged struct {
-	TypeTag     string
-	NullableTag bool
-	ListTypeTag bool
+	TypeTag             string
+	NullableTag         bool
+	ListTypeTag         bool
+	ModelTypeTag        bool
+	EnumTypeTag         bool
+	NarrowedTag         bool // Identifier read narrowed from a nullable lexical binding.
+	ResultValueNullable bool // Result<T> payload nullability before '?' lifts a nullable call.
 }
 
 func (t *TypeTagged) GetTypeTag() string  { return t.TypeTag }
@@ -238,6 +268,19 @@ func (t *TypeTagged) IsNullable() bool    { return t.NullableTag }
 func (t *TypeTagged) SetNullable(v bool)  { t.NullableTag = v }
 func (t *TypeTagged) IsListType() bool    { return t.ListTypeTag }
 func (t *TypeTagged) SetListType(v bool)  { t.ListTypeTag = v }
+func (t *TypeTagged) IsModelType() bool   { return t.ModelTypeTag }
+func (t *TypeTagged) SetModelType(v bool) { t.ModelTypeTag = v }
+func (t *TypeTagged) IsEnumType() bool    { return t.EnumTypeTag }
+func (t *TypeTagged) SetEnumType(v bool)  { t.EnumTypeTag = v }
+
+// SetTypeMetadata stores the inferred type while preserving flow-specific tags.
+func (t *TypeTagged) SetTypeMetadata(name string, nullable, list, model, enum bool) {
+	t.TypeTag = name
+	t.NullableTag = nullable
+	t.ListTypeTag = list
+	t.ModelTypeTag = model
+	t.EnumTypeTag = enum
+}
 
 // Literal: 42, 3.14, "hello", true, false, null, 7d
 type Literal struct {
@@ -257,24 +300,62 @@ type Ident struct {
 // MemberExpr: user.name, user?.address?.city
 type MemberExpr struct {
 	TypeTagged
-	Pos      token.Position
-	Object   Expr
-	Field    string
-	SafeCall bool // ?.
+	Pos               token.Position
+	Object            Expr
+	Field             string
+	SafeCall          bool // ?.
+	ValueNullable     bool // Declared result before safe access lifts it to nullable.
+	EnumConstant      bool // Semantic analysis resolved an enum declaration member.
+	SealedConstructor bool // Semantic analysis resolved a sealed declaration variant constructor.
+	DeclaredField     bool // An instance field takes precedence over a builtin property.
 }
 
 // CallExpr: find(User, id: 1), encrypt(password)
 type CallExpr struct {
 	TypeTagged
-	Pos  token.Position
-	Func Expr
-	Args []*NamedArg
+	Pos              token.Position
+	Func             Expr
+	TypeArgs         []*TypeRef // Explicit constructor arguments; nil means none were written.
+	ConstructorType  *TypeRef   // Semantically checked concrete constructor; never set by the parser.
+	Args             []*NamedArg
+	Group            *GroupProjection // Set only after semantic validation of a grouped query.
+	ErrorConstructor *ErrorDecl       // Declaration used to validate and lower typed error arguments.
+}
+
+// GroupProjection is a backend-independent, statically checked query result.
+type GroupProjection struct {
+	Input   Expr
+	Model   string
+	Result  string
+	Keys    []string
+	Columns []GroupColumn
+	Having  []*GroupCondition
+}
+
+// GroupCondition is a checked comparison or Boolean composition for HAVING.
+// Value is row-independent; columns and operators are never supplied by clients.
+type GroupCondition struct {
+	Operator string
+	Column   GroupColumn
+	Value    Expr
+	Left     *GroupCondition
+	Right    *GroupCondition
+}
+
+// GroupColumn maps a result field to a grouping key or a supported aggregate.
+type GroupColumn struct {
+	Field     string
+	Source    string
+	Aggregate string // Empty for a grouping key; count has no source column.
+	Type      string
+	Nullable  bool
 }
 
 // NamedArg: name: value or positional value
 type NamedArg struct {
-	Name  string // empty = positional
-	Value Expr
+	Name         string // empty = positional
+	Value        Expr
+	ExpectedType *TypeRef // analyzed destination type, distinct from the value type
 }
 
 // BinaryExpr: a + b, a == b, a && b, a in 1..10
@@ -331,6 +412,23 @@ type LambdaExpr struct {
 	Pos    token.Position
 	Params []string // named params: { x -> ... }, nil = use implicit 'it'
 	Body   *Block
+}
+
+// SingleExpression returns a query lambda's expression and row binding.
+// Executable statements and multiple bindings are not a single SQL expression.
+func (e *LambdaExpr) SingleExpression() (Expr, string) {
+	if e == nil || e.Body == nil || len(e.Body.Stmts) != 1 || len(e.Params) > 1 {
+		return nil, ""
+	}
+	statement, ok := e.Body.Stmts[0].(*ExprStmt)
+	if !ok || statement.Expr == nil {
+		return nil, ""
+	}
+	parameter := "it"
+	if len(e.Params) == 1 {
+		parameter = e.Params[0]
+	}
+	return statement.Expr, parameter
 }
 
 // ListExpr: [1, 2, 3]
@@ -544,97 +642,148 @@ func (n *OnDecl) GetPos() token.Position       { return n.Pos }
 
 // WalkExprs calls fn for every Expr node in the block (recursive).
 func WalkExprs(block *Block, fn func(Expr)) {
+	Walk(block, Visitor{Expr: fn})
+}
+
+// WalkExpr visits an expression and its descendants without a temporary block.
+func WalkExpr(expression Expr, fn func(Expr)) {
+	Visitor{Expr: fn}.walkExpr(expression)
+}
+
+// Visitor observes statements and expressions before their children.
+// Either callback may be nil. Traversal does not modify the tree.
+type Visitor struct {
+	Stmt               func(Stmt)
+	Expr               func(Expr)
+	skipForExpressions bool
+}
+
+// WalkYields visits yields owned by the enclosing for expression.
+// Ordinary for statements do not introduce a new yield scope.
+func WalkYields(block *Block, fn func(*YieldExpr)) {
+	Walk(block, yieldVisitor(fn))
+}
+
+// WalkExpressionYields excludes nested for expressions from yield ownership.
+func WalkExpressionYields(expression Expr, fn func(*YieldExpr)) {
+	yieldVisitor(fn).walkExpr(expression)
+}
+
+func yieldVisitor(fn func(*YieldExpr)) Visitor {
+	return Visitor{skipForExpressions: true, Expr: func(expr Expr) {
+		if value, ok := expr.(*YieldExpr); ok {
+			fn(value)
+		}
+	}}
+}
+
+// Walk traverses all statements and expressions in a block, including closures.
+func Walk(block *Block, visitor Visitor) {
 	if block == nil {
 		return
 	}
 	for _, stmt := range block.Stmts {
-		walkStmtExprs(stmt, fn)
+		visitor.walkStmt(stmt)
 	}
 }
 
-func walkStmtExprs(stmt Stmt, fn func(Expr)) {
+func (v Visitor) walkStmt(stmt Stmt) {
+	if stmt == nil {
+		return
+	}
+	if v.Stmt != nil {
+		v.Stmt(stmt)
+	}
 	switch s := stmt.(type) {
 	case *ValStmt:
-		walkExpr(s.Value, fn)
+		v.walkExpr(s.Value)
 	case *AssignStmt:
-		walkExpr(s.Value, fn)
+		v.walkExpr(s.Target)
+		v.walkExpr(s.Value)
 	case *ReturnStmt:
-		walkExpr(s.Value, fn)
+		v.walkExpr(s.Value)
 	case *ThrowStmt:
-		walkExpr(s.Error, fn)
+		v.walkExpr(s.Error)
 	case *ExprStmt:
-		walkExpr(s.Expr, fn)
+		v.walkExpr(s.Expr)
 	case *IfStmt:
-		walkExpr(s.Condition, fn)
-		WalkExprs(s.Then, fn)
+		v.walkExpr(s.Condition)
+		Walk(s.Then, v)
 	case *ForStmt:
-		walkExpr(s.Collection, fn)
-		WalkExprs(s.Body, fn)
+		v.walkExpr(s.Collection)
+		Walk(s.Body, v)
 	case *EmitStmt:
 		for _, a := range s.Args {
-			walkExpr(a.Value, fn)
+			v.walkExpr(a.Value)
 		}
 	}
 }
 
-func walkExpr(e Expr, fn func(Expr)) {
+func (visitor Visitor) walkExpr(e Expr) {
 	if e == nil {
 		return
 	}
-	fn(e)
+	if visitor.Expr != nil {
+		visitor.Expr(e)
+	}
 	switch v := e.(type) {
 	case *MemberExpr:
-		walkExpr(v.Object, fn)
+		visitor.walkExpr(v.Object)
 	case *CallExpr:
-		walkExpr(v.Func, fn)
+		visitor.walkExpr(v.Func)
 		for _, a := range v.Args {
-			walkExpr(a.Value, fn)
+			visitor.walkExpr(a.Value)
 		}
 	case *BinaryExpr:
-		walkExpr(v.Left, fn)
-		walkExpr(v.Right, fn)
+		visitor.walkExpr(v.Left)
+		visitor.walkExpr(v.Right)
 	case *UnaryExpr:
-		walkExpr(v.Value, fn)
+		visitor.walkExpr(v.Value)
 	case *ElvisExpr:
-		walkExpr(v.Left, fn)
-		walkExpr(v.Right, fn)
+		visitor.walkExpr(v.Left)
+		visitor.walkExpr(v.Right)
 	case *BangElvisExpr:
-		walkExpr(v.Left, fn)
-		walkExpr(v.Right, fn)
+		visitor.walkExpr(v.Left)
+		visitor.walkExpr(v.Right)
 	case *LambdaExpr:
-		WalkExprs(v.Body, fn)
+		Walk(v.Body, visitor)
 	case *ListExpr:
 		for _, item := range v.Items {
-			walkExpr(item, fn)
+			visitor.walkExpr(item)
 		}
 	case *ObjectExpr:
 		for _, f := range v.Fields {
-			walkExpr(f.Value, fn)
+			visitor.walkExpr(f.Value)
 		}
 	case *WhenExpr:
-		walkExpr(v.Subject, fn)
+		visitor.walkExpr(v.Subject)
 		for _, b := range v.Branches {
-			walkExpr(b.Condition, fn)
-			walkExpr(b.Body, fn)
+			visitor.walkExpr(b.Condition)
+			visitor.walkExpr(b.Body)
 		}
-		walkExpr(v.Else, fn)
+		visitor.walkExpr(v.Else)
 	case *TemplateString:
 		for _, p := range v.Parts {
-			walkExpr(p, fn)
+			visitor.walkExpr(p)
 		}
 	case *RangeExpr:
-		walkExpr(v.Start, fn)
-		walkExpr(v.End, fn)
+		visitor.walkExpr(v.Start)
+		visitor.walkExpr(v.End)
 	case *TransactionExpr:
-		WalkExprs(v.Body, fn)
+		Walk(v.Body, visitor)
 	case *YieldExpr:
-		walkExpr(v.Value, fn)
+		visitor.walkExpr(v.Value)
 	case *AsyncExpr:
-		WalkExprs(v.Body, fn)
+		Walk(v.Body, visitor)
 	case *AwaitExpr:
-		WalkExprs(v.Body, fn)
+		Walk(v.Body, visitor)
 	case *ForStmt:
-		walkExpr(v.Collection, fn)
-		WalkExprs(v.Body, fn)
+		visitor.walkForExpression(v)
+	}
+}
+
+func (visitor Visitor) walkForExpression(loop *ForStmt) {
+	if !visitor.skipForExpressions {
+		visitor.walkStmt(loop)
 	}
 }

@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +17,92 @@ import (
 )
 
 type dependencyStatsProviderFunc func(context.Context) []lux.RuntimeDependencyStats
+
+const testStudioProjectID = "531f2d00-20e5-47f2-b874-22b6fc76328b"
+
+func TestRegistrarEncodingFailureDoesNotSendPartialPayload(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	gr := &GatewayRegistrar{studioURL: server.URL, projectID: testStudioProjectID, apiKey: "test", instanceID: "invalid\xff", client: server.Client(), startedAt: time.Now()}
+	if gr.register() {
+		t.Fatal("invalid registration reported success")
+	}
+	gr.heartbeat()
+	gr.deregister()
+	if calls.Load() != 0 {
+		t.Fatal("encoding failure sent a partial control request")
+	}
+	gr.instanceID = "valid-instance"
+	if !gr.register() {
+		t.Fatal("corrected registration could not recover")
+	}
+	gr.heartbeat()
+	gr.deregister()
+	if calls.Load() != 3 {
+		t.Fatal("corrected control requests were lost", calls.Load())
+	}
+}
+
+func TestStudioProjectUUIDConfiguration(t *testing.T) {
+	for _, value := range []string{"", "1", "7junk", "00000000-0000-0000-0000-000000000000", "531f2d0020e547f2b87422b6fc76328b"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("LUXO_STUDIO_URL", "http://127.0.0.1:9100")
+			t.Setenv("LUXO_API_KEY", "test-key")
+			t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
+			t.Setenv("LUXO_PROJECT_ID", value)
+			if _, err := studioProjectIDFromEnv(); err == nil {
+				t.Fatal("registration must reject non-canonical or missing project UUIDs")
+			}
+			if NewGatewayRegistrar("0") != nil || NewMetricsCollector() != nil {
+				t.Fatal("invalid project identifiers must not start exporters")
+			}
+			if err := New().Serve("test"); err == nil || !strings.Contains(err.Error(), "LUXO_PROJECT_ID") {
+				t.Fatalf("Serve must report invalid Studio configuration: %v", err)
+			}
+		})
+	}
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
+	if got, err := studioProjectIDFromEnv(); err != nil || got != testStudioProjectID {
+		t.Fatalf("UUID = %q, err = %v", got, err)
+	}
+}
+
+func TestRegistrarRetriesRegistrationBeforeSendingHeartbeat(t *testing.T) {
+	var calls []string
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			API string `json:"$api"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		calls = append(calls, body.API)
+		if body.API == "registerGateway" {
+			attempts++
+			if attempts == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	registrar := &GatewayRegistrar{studioURL: server.URL, client: server.Client()}
+	registrar.refreshRegistration()
+	registrar.refreshRegistration()
+	registrar.refreshRegistration()
+	want := []string{"registerGateway", "registerGateway", "heartbeat", "heartbeat"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("requests = %v, want %v", calls, want)
+	}
+}
 
 func (provider dependencyStatsProviderFunc) RuntimeDependencies(ctx context.Context) []lux.RuntimeDependencyStats {
 	return provider(ctx)
@@ -33,6 +122,7 @@ func TestNewGatewayRegistrarNilWhenNoEnv(t *testing.T) {
 func TestNewGatewayRegistrarNilPartialEnv(t *testing.T) {
 	os.Unsetenv("LUXO_STUDIO_URL")
 	os.Setenv("LUXO_API_KEY", "test-key")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
 	defer os.Unsetenv("LUXO_API_KEY")
 
 	gr := NewGatewayRegistrar("8080")
@@ -65,7 +155,8 @@ func TestGatewayRegistrarRegisterBody(t *testing.T) {
 
 	os.Setenv("LUXO_STUDIO_URL", srv.URL)
 	os.Setenv("LUXO_API_KEY", "test-key-123")
-	os.Setenv("LUXO_PROJECT_ID", "7")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
 	os.Unsetenv("INTROSPECTION_KEY")
 	defer os.Unsetenv("LUXO_STUDIO_URL")
 	defer os.Unsetenv("LUXO_API_KEY")
@@ -77,8 +168,8 @@ func TestGatewayRegistrarRegisterBody(t *testing.T) {
 	}
 	defer gr.Close()
 
-	if gr.projectID != 7 {
-		t.Errorf("projectID = %d, want 7", gr.projectID)
+	if gr.projectID != testStudioProjectID {
+		t.Errorf("projectID = %s, want UUID", gr.projectID)
 	}
 
 	// register is async now — wait briefly for it to complete
@@ -92,8 +183,8 @@ func TestGatewayRegistrarRegisterBody(t *testing.T) {
 	}
 
 	regBody := received[0]
-	if regBody["$api"] != "svc:registerGateway" {
-		t.Errorf("$api = %v, want svc:registerGateway", regBody["$api"])
+	if regBody["$api"] != "registerGateway" {
+		t.Errorf("$api = %v, want registerGateway", regBody["$api"])
 	}
 	if regBody["$select"] != "id" {
 		t.Errorf("$select = %v, want id", regBody["$select"])
@@ -132,7 +223,7 @@ func TestGatewayRegistrarHeartbeatBody(t *testing.T) {
 	gr := &GatewayRegistrar{
 		studioURL:  srv.URL,
 		apiKey:     "test-key",
-		projectID:  1,
+		projectID:  testStudioProjectID,
 		instanceID: "test-instance",
 		endpoint:   "http://test-instance:8080",
 		version:    "v1.2.3",
@@ -151,14 +242,14 @@ func TestGatewayRegistrarHeartbeatBody(t *testing.T) {
 	}
 
 	hb := received[0]
-	if hb["$api"] != "svc:heartbeat" {
-		t.Errorf("$api = %v, want svc:heartbeat", hb["$api"])
+	if hb["$api"] != "heartbeat" {
+		t.Errorf("$api = %v, want heartbeat", hb["$api"])
 	}
 	if hb["instanceId"] != "test-instance" {
 		t.Errorf("instanceId = %v, want test-instance", hb["instanceId"])
 	}
-	if hb["projectId"] != float64(1) {
-		t.Errorf("projectId = %v, want 1", hb["projectId"])
+	if hb["projectId"] != testStudioProjectID {
+		t.Errorf("projectId = %v, want %s", hb["projectId"], testStudioProjectID)
 	}
 	if _, ok := hb["memoryMB"]; !ok {
 		t.Error("memoryMB should be present")
@@ -192,7 +283,7 @@ func TestGatewayRegistrarHeartbeatReregistersExpiredLease(t *testing.T) {
 		mu.Lock()
 		apiNames = append(apiNames, apiName)
 		mu.Unlock()
-		if apiName == "svc:heartbeat" {
+		if apiName == "heartbeat" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -201,14 +292,14 @@ func TestGatewayRegistrarHeartbeatReregistersExpiredLease(t *testing.T) {
 	defer srv.Close()
 
 	gr := &GatewayRegistrar{
-		studioURL: srv.URL, apiKey: "test", projectID: 7, instanceID: "gateway-1",
+		studioURL: srv.URL, apiKey: "test", projectID: testStudioProjectID, instanceID: "gateway-1",
 		endpoint: "http://gateway-1:8080", done: make(chan struct{}), client: srv.Client(),
 	}
 	gr.heartbeat()
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(apiNames) != 2 || apiNames[0] != "svc:heartbeat" || apiNames[1] != "svc:registerGateway" {
+	if len(apiNames) != 2 || apiNames[0] != "heartbeat" || apiNames[1] != "registerGateway" {
 		t.Fatalf("API sequence = %v, want heartbeat then registration", apiNames)
 	}
 }
@@ -219,8 +310,8 @@ func TestGatewayRegistrarDeregisterPayloads(t *testing.T) {
 		nodeType string
 		apiName  string
 	}{
-		{name: "gateway", apiName: "svc:deregisterGateway"},
-		{name: "service", nodeType: "service", apiName: "svc:deregisterServiceNode"},
+		{name: "gateway", apiName: "deregisterGateway"},
+		{name: "service", nodeType: "service", apiName: "deregisterServiceNode"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var received map[string]any
@@ -233,11 +324,11 @@ func TestGatewayRegistrarDeregisterPayloads(t *testing.T) {
 			defer srv.Close()
 
 			gr := &GatewayRegistrar{
-				studioURL: srv.URL, apiKey: "key", projectID: 9, instanceID: "node-1",
+				studioURL: srv.URL, apiKey: "key", projectID: testStudioProjectID, instanceID: "node-1",
 				nodeType: test.nodeType, done: make(chan struct{}), client: srv.Client(),
 			}
 			gr.deregister()
-			if received["$api"] != test.apiName || received["projectId"] != float64(9) || received["instanceId"] != "node-1" {
+			if received["$api"] != test.apiName || received["projectId"] != testStudioProjectID || received["instanceId"] != "node-1" {
 				t.Fatalf("deregister payload = %+v", received)
 			}
 		})
@@ -406,7 +497,11 @@ func TestGatewayRegistrarHeartbeatLoopDone(t *testing.T) {
 func TestGatewayRegistrarHeartbeatLoopTicks(t *testing.T) {
 	requestReceived := make(chan struct{}, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		requestReceived <- struct{}{}
+		// Coalesce ticks: the assertion consumes only the first notification.
+		select {
+		case requestReceived <- struct{}{}:
+		default:
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -452,6 +547,7 @@ func TestGatewayRegistrarRegisterIntroKey(t *testing.T) {
 
 	os.Setenv("LUXO_STUDIO_URL", srv.URL)
 	os.Setenv("LUXO_API_KEY", "test-key")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
 	os.Setenv("INTROSPECTION_KEY", "intro-secret")
 	defer os.Unsetenv("LUXO_STUDIO_URL")
 	defer os.Unsetenv("LUXO_API_KEY")
@@ -502,6 +598,7 @@ func TestGatewayRegistrarRegisterNoIntroKey(t *testing.T) {
 
 	os.Setenv("LUXO_STUDIO_URL", srv.URL)
 	os.Setenv("LUXO_API_KEY", "test-key")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
 	os.Unsetenv("INTROSPECTION_KEY")
 	defer os.Unsetenv("LUXO_STUDIO_URL")
 	defer os.Unsetenv("LUXO_API_KEY")
@@ -534,6 +631,7 @@ func TestGatewayRegistrarCustomEndpoint(t *testing.T) {
 
 	os.Setenv("LUXO_STUDIO_URL", srv.URL)
 	os.Setenv("LUXO_API_KEY", "test-key")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
 	os.Setenv("LUXO_GATEWAY_ENDPOINT", "https://my-gateway.example.com")
 	defer os.Unsetenv("LUXO_STUDIO_URL")
 	defer os.Unsetenv("LUXO_API_KEY")
@@ -566,6 +664,7 @@ func TestServiceNodeRegistrarPayloads(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("LUXO_STUDIO_URL", srv.URL)
 	t.Setenv("LUXO_API_KEY", "key")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
 	t.Setenv("LUXO_NODE_TYPE", "service")
 	t.Setenv("LUXO_SERVICE_NAME", "billing")
 	t.Setenv("LUXO_INSTANCE_ID", "billing-1")
@@ -585,7 +684,7 @@ func TestServiceNodeRegistrarPayloads(t *testing.T) {
 	if len(received) < 2 {
 		t.Fatalf("received %d payloads, want registration and heartbeat", len(received))
 	}
-	if received[0]["$api"] != "svc:registerServiceNode" || received[0]["name"] != "billing" || received[0]["addr"] == nil {
+	if received[0]["$api"] != "registerServiceNode" || received[0]["name"] != "billing" || received[0]["addr"] == nil {
 		t.Fatalf("registration payload = %+v", received[0])
 	}
 	if received[0]["$select"] != "id" {
@@ -594,7 +693,7 @@ func TestServiceNodeRegistrarPayloads(t *testing.T) {
 	if _, ok := received[0]["introKey"]; ok {
 		t.Fatalf("service registration must not send gateway-only introKey: %+v", received[0])
 	}
-	if received[len(received)-1]["$api"] != "svc:heartbeatServiceNode" {
+	if received[len(received)-1]["$api"] != "heartbeatServiceNode" {
 		t.Fatalf("heartbeat payload = %+v", received[len(received)-1])
 	}
 }
@@ -615,6 +714,7 @@ func TestGatewayRegistrarHeartbeatIncludesRuntimeDependencies(t *testing.T) {
 	defer server.Close()
 	t.Setenv("LUXO_STUDIO_URL", server.URL)
 	t.Setenv("LUXO_API_KEY", "key")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
 
 	provider := dependencyStatsProviderFunc(func(context.Context) []lux.RuntimeDependencyStats {
 		latency := 1.25

@@ -1,0 +1,52 @@
+import 'dart:convert';
+import 'dart:io';
+import 'package:luxo_client/luxo_client.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:test/test.dart';
+import 'client.dart';
+import 'types.dart';
+
+void main() {
+ test('ordinary model payload and list retain projection through both wire modes', () async {
+  final fixture=jsonDecode(File('../vite-plugin/src/fixtures/sealed-model.json').readAsStringSync()) as Map<String,dynamic>;
+  final vectors=fixture['vectors'] as List;
+  final driver=Platform.environment['LUXO_SEALED_HTTP_CONSUMER'];
+  final capture=Platform.environment['LUXO_SEALED_CAPTURE'];
+  final root=Directory('.tmp')..createSync(recursive:true);
+  final own=root.createTempSync('sealed-model-go-');
+  addTearDown(()=>own.deleteSync(recursive:true));
+  var sent=0;
+  for(final mode in [TransportMode.json,TransportMode.binary]) {
+   final transport=HttpTransport('http://sealed.fixture.invalid',options:TransportOptions(mode:mode),client:MockClient((request) async {
+    final vector=vectors[sent++%3] as Map<String,dynamic>;
+    final input=mode==TransportMode.json?{'mode':'json','request':jsonDecode(request.body)}:{'mode':'binary','bytes':request.bodyBytes.toList()};
+    if(driver==null)return mode==TransportMode.json?http.Response(jsonEncode({'data':vector['outputJSON']}),200):http.Response.bytes((vector['outputBytes'] as List).cast<int>(),200);
+    final file=File('${own.path}/input.jsonl')..writeAsStringSync('${jsonEncode(input)}\n');
+    final process=await Process.run(driver,[file.absolute.path]);
+    expect(process.exitCode,0,reason:process.stderr.toString());
+    final result=jsonDecode(process.stdout.toString()) as Map<String,dynamic>;
+    if(capture!=null)File(capture).writeAsStringSync('${jsonEncode({'request':input,'response':result})}\n',mode:FileMode.append);
+    expect(result['status'],200,reason:result.toString());
+    return mode==TransportMode.json?http.Response(jsonEncode(result['json']),200):http.Response.bytes((result['bytes'] as List).cast<int>(),200);
+   }));
+   final client=LuxoClient(transport);
+   try {
+    final input=ModelResultInput.Owner(person:PersonInput(id:LuxoInt64.fromInt(7),name:'first'),people:[PersonInput(id:LuxoInt64.fromInt(8),name:'second')]);
+    final full=await client.echo(value:input,select:'Owner{person{id,name},people{id,name}}');
+    if(full is ModelResult$Owner$1) {
+     expect(full.person.value.id.value,LuxoInt64.fromInt(7));expect(full.person.value.name.value,'first');
+     expect(full.people.value.single.id.value,LuxoInt64.fromInt(8));expect(full.people.value.single.name.value,'second');
+    } else {fail('expected Owner');}
+    final tag=await client.echo(value:input,select:'Owner');
+    if(tag is ModelResult$Owner$1) {expect(tag.person.isSelected,isFalse);expect(tag.people.isSelected,isFalse);}else{fail('expected tag');}
+    final selected=await client.echo(value:input);
+    if(selected is ModelResult$Owner$1) {
+     expect(selected.person.value.id.value,LuxoInt64.fromInt(7));
+     expect(selected.people.value.single.name.value,'second');
+    } else {fail('expected projected Owner');}
+   } finally {client.close();}
+  }
+  expect(sent,6);
+ });
+}

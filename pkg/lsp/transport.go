@@ -42,7 +42,7 @@ func (t *Transport) ReadMessage() (*Request, error) {
 		if strings.HasPrefix(line, "Content-Length:") {
 			val := strings.TrimSpace(strings.TrimPrefix(line, "Content-Length:"))
 			contentLength, err = strconv.Atoi(val)
-			if err != nil {
+			if err != nil || contentLength < 0 {
 				return nil, fmt.Errorf("invalid Content-Length: %s", val)
 			}
 		}

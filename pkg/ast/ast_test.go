@@ -2,9 +2,22 @@ package ast
 
 import (
 	"testing"
+	"unsafe"
 
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestNarrowingMetadataDoesNotGrowTypeTags(t *testing.T) {
+	type previousTags struct {
+		TypeTag      string
+		NullableTag  bool
+		ListTypeTag  bool
+		ModelTypeTag bool
+	}
+	if got, previous := unsafe.Sizeof(TypeTagged{}), unsafe.Sizeof(previousTags{}); got != previous {
+		t.Fatalf("type tag size grew: %d -> %d", previous, got)
+	}
+}
 
 func TestExprGetPos(t *testing.T) {
 	pos := token.Position{File: "test.luxo", Line: 10, Col: 5, Offset: 100}
@@ -17,6 +30,7 @@ func TestExprGetPos(t *testing.T) {
 		&BinaryExpr{Pos: pos},
 		&UnaryExpr{Pos: pos},
 		&ElvisExpr{Pos: pos},
+		&BangElvisExpr{Pos: pos},
 		&WhenExpr{Pos: pos},
 		&LambdaExpr{Pos: pos},
 		&ListExpr{Pos: pos},
@@ -162,6 +176,30 @@ func TestPaginationHelpersHandleDefensiveInputs(t *testing.T) {
 	}
 }
 
+func TestWalkYieldsExcludesNestedForExpressions(t *testing.T) {
+	outer := &YieldExpr{Value: &Ident{Name: "outer"}}
+	inner := &YieldExpr{Value: &Ident{Name: "inner"}}
+	loop := &ForStmt{Body: &Block{Stmts: []Stmt{&ExprStmt{Expr: inner}}}}
+	root := &Block{Stmts: []Stmt{
+		&ValStmt{Name: "inner", Value: loop},
+		&ForStmt{Body: &Block{Stmts: []Stmt{&ExprStmt{Expr: outer}}}},
+	}}
+	var seen []*YieldExpr
+	visit := func(value *YieldExpr) { seen = append(seen, value) }
+	WalkYields(root, visit)
+	if len(seen) != 1 || seen[0] != outer {
+		t.Fatalf("owned yields = %v, want only outer yield", seen)
+	}
+	WalkExpressionYields(loop, visit)
+	if len(seen) != 1 {
+		t.Fatal("nested expression yield escaped its scope")
+	}
+	WalkExpressionYields(outer, visit)
+	if len(seen) != 2 || seen[1] != outer {
+		t.Fatal("direct yield was skipped")
+	}
+}
+
 func TestWalkExprsTraversesAllNestedExpressionBlocks(t *testing.T) {
 	blockWith := func(name string) *Block {
 		return &Block{Stmts: []Stmt{&ExprStmt{Expr: &Ident{Name: name}}}}
@@ -214,6 +252,25 @@ func TestStructFieldAccessDecls(t *testing.T) {
 	d := &Directive{Name: "cache", Args: []*NamedArg{{Name: "ttl", Value: &Literal{Value: "60"}}}}
 	if d.Name != "cache" || len(d.Args) != 1 {
 		t.Error("Directive fields not accessible")
+	}
+}
+
+func TestCRUDModelNames(t *testing.T) {
+	for name, plural := range map[string]string{
+		"User": "Users", "Address": "Addresses", "Box": "Boxes", "Quiz": "Quizes",
+		"TimeEntry": "TimeEntries", "Gateway": "Gateways", "Key": "Keys", "y": "ys",
+	} {
+		if got := PluralModelName(name); got != plural {
+			t.Errorf("PluralModelName(%q) = %q, want %q", name, got, plural)
+		}
+		for operation, want := range map[string]string{
+			"get": "get" + name, "list": "list" + plural, "create": "create" + name,
+			"update": "update" + name, "delete": "delete" + name, "deleteMany": "delete" + plural,
+		} {
+			if got := CRUDAPIName(name, operation); got != want {
+				t.Errorf("CRUDAPIName(%q, %q) = %q, want %q", name, operation, got, want)
+			}
+		}
 	}
 }
 

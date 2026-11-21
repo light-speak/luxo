@@ -1,0 +1,111 @@
+import { LuxoClient } from './client.js'
+import { LuxoError, WsTransport } from '@luxojs/client'
+import type { StreamObserver } from '@luxojs/client'
+
+type Receive = (value: unknown) => void
+type Sample = {
+  start(client: LuxoClient, receive: Receive, observer: StreamObserver): Promise<() => void>
+  json: string
+  binary: number[]
+}
+const samples: Sample[] = [
+  { start: (client, receive, observer) => client.subscribeLiveString(receive, observer), json: '7', binary: [1, 255] },
+  { start: (client, receive, observer) => client.subscribeLiveInt(receive, observer), json: '9223372036854775808', binary: [128] },
+  { start: (client, receive, observer) => client.subscribeLiveStringList(receive, observer), json: '[7]', binary: [1, 1, 255] },
+  { start: (client, receive, observer) => client.subscribeLiveMetrics({ $select: 'id' }, receive, observer), json: '{"id":true}', binary: [0, 1, 128] },
+  { start: (client, receive, observer) => client.subscribeLiveMetricRows({ $select: 'id' }, receive, observer), json: '[{}]', binary: [1, 0, 0] },
+]
+
+function check(value: boolean, message: string): asserts value {
+  if (!value) throw new Error(message)
+}
+
+class Socket {
+  static readonly OPEN = 1
+  static latest: Socket
+  readyState = 0
+  binaryType = ''
+  onopen: (() => void) | null = null
+  onclose: (() => void) | null = null
+  onmessage: ((event: { data: string | ArrayBuffer }) => void) | null = null
+  sent: (string | ArrayBuffer)[] = []
+  constructor() {
+    Socket.latest = this
+    queueMicrotask(() => { this.readyState = 1; this.onopen?.() })
+  }
+  send(data: string | ArrayBuffer): void {
+    this.sent.push(data)
+    if (typeof data === 'string') {
+      const request = JSON.parse(data) as { $id: number; $sub?: string; $api?: string }
+      if (request.$sub) this.receive(`{"$sub":${request.$id},"ok":true}`)
+      else if (request.$api) this.receive(`{"$id":${request.$id},"data":42}`)
+    } else {
+      const bytes = new Uint8Array(data), id = bytes[1]
+      check(id < 128, 'fixture expects a small subscription ID')
+      if (bytes[0] === 0x10) this.receive(Uint8Array.of(0x13, id).buffer)
+      else if (bytes[0] === 1) this.receive(Uint8Array.of(2, id, 84).buffer)
+    }
+  }
+  receive(data: string | ArrayBuffer): void { this.onmessage?.({ data }) }
+  close(): void { this.readyState = 3; this.onclose?.() }
+}
+
+function frame(binary: boolean, id: number, json: string, bytes: number[]): string | ArrayBuffer {
+  return binary ? Uint8Array.from([0x12, id, ...bytes]).buffer : `{"$stream":${id},"data":${json}}`
+}
+
+async function verifyFailure(binary: boolean, sample: Sample): Promise<void> {
+  const transport = new WsTransport('ws://local.test', { mode: binary ? 'binary' : 'json' })
+  const client = new LuxoClient(transport), failures: LuxoError[] = [], values: unknown[] = [], peer: string[] = []
+  let complete = 0
+  try {
+    const cancel = await sample.start(client, value => values.push(value), {
+      onError: error => failures.push(error), onComplete: () => { complete++ },
+    })
+    const cancelPeer = await client.subscribeLiveString(value => peer.push(value))
+    const socket = Socket.latest, malformed = frame(binary, 1, sample.json, sample.binary)
+    socket.receive(malformed)
+    const count = socket.sent.length
+    check(count === 3, 'decode failure did not cancel only its remote subscription')
+    socket.receive(malformed)
+    socket.receive(binary ? Uint8Array.of(0x15, 1).buffer : '{"$end":1,"ok":true}')
+    cancel()
+    check(socket.sent.length === count, 'retired cancellation sent another frame')
+    check(values.length === 0 && complete === 0, 'malformed data became success or completion')
+    check(failures.length === 1 && failures[0].error === 'DecodeError', 'missing isolated decoder failure')
+    socket.receive(frame(binary, 2, '"ok"', [2, 111, 107]))
+    check(peer.length === 1 && peer[0] === 'ok', 'peer subscription was affected')
+    check(await client.count() === 42n, 'ordinary request was affected')
+    cancelPeer()
+  } finally { transport.close() }
+}
+
+async function verifyBusinessFailure(binary: boolean): Promise<void> {
+  const transport = new WsTransport('ws://local.test', { mode: binary ? 'binary' : 'json' })
+  const client = new LuxoClient(transport), failure = new Error('application exception')
+  let calls = 0, errors = 0
+  try {
+    const cancel = await client.subscribeLiveString(() => { calls++; throw failure }, { onError: () => { errors++ } })
+    const socket = Socket.latest
+    for (let index = 0; index < 2; index++) {
+      let thrown: unknown
+      try { socket.receive(frame(binary, 1, '"ok"', [2, 111, 107])) } catch (error) { thrown = error }
+      check(thrown === failure, 'application exception was swallowed or changed')
+    }
+    check(calls === 2 && errors === 0 && socket.sent.length === 1, 'business failure retired the subscription')
+    cancel()
+  } finally { transport.close() }
+}
+
+async function main(): Promise<void> {
+  const original = globalThis.WebSocket
+  globalThis.WebSocket = Socket as unknown as typeof WebSocket
+  try {
+    for (const binary of [false, true]) {
+      for (const sample of samples) await verifyFailure(binary, sample)
+      await verifyBusinessFailure(binary)
+    }
+  } finally { globalThis.WebSocket = original }
+}
+
+void main().catch(error => { throw error })

@@ -6,16 +6,11 @@ import org.gradle.api.file.ConfigurableFileCollection
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.provider.Property
-import org.gradle.api.tasks.CacheableTask
 import org.gradle.api.tasks.Classpath
 import org.gradle.api.tasks.Input
-import org.gradle.api.tasks.InputFile
-import org.gradle.api.tasks.InputFiles
 import org.gradle.api.tasks.Internal
 import org.gradle.api.tasks.OutputDirectory
 import org.gradle.api.tasks.OutputFile
-import org.gradle.api.tasks.PathSensitive
-import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.TaskAction
 import org.gradle.process.ExecOperations
 import org.gradle.work.DisableCachingByDefault
@@ -59,53 +54,5 @@ abstract class LuxoGenerateTask : DefaultTask() {
         packageName.set(extension.packageName)
         outputDirectory.set(extension.outputDirectory)
         schemaFile.set(extension.schemaFile)
-    }
-}
-
-@CacheableTask
-abstract class LuxoAnalyzeTask : DefaultTask() {
-    @get:Classpath abstract val toolingClasspath: ConfigurableFileCollection
-    @get:Internal abstract val sourceDirectory: DirectoryProperty
-    @get:InputFiles
-    @get:PathSensitive(PathSensitivity.RELATIVE)
-    abstract val sourceFiles: ConfigurableFileCollection
-    @get:Input abstract val packageName: Property<String>
-    @get:InputFile
-    @get:PathSensitive(PathSensitivity.RELATIVE)
-    abstract val schemaFile: RegularFileProperty
-    @get:OutputFile abstract val hintsFile: RegularFileProperty
-    @get:Inject abstract val execOperations: ExecOperations
-
-    init {
-        group = "luxo"
-        description = "Generate SelectHints from Kotlin syntax trees and the Luxo schema"
-    }
-
-    @TaskAction
-    fun analyze() {
-        execOperations.javaexec {
-            it.classpath(toolingClasspath)
-            it.mainClass.set("com.luxo.client.SelectAnalyzerCli")
-            it.args(
-                sourceDirectory.get().asFile.path,
-                hintsFile.get().asFile.path,
-                packageName.get(),
-                schemaFile.get().asFile.path,
-            )
-        }
-    }
-
-    internal fun configureFrom(extension: LuxoExtension, classpath: Configuration) {
-        toolingClasspath.from(classpath)
-        sourceDirectory.set(extension.sourceDirectory)
-        sourceFiles.from(extension.sourceDirectory.map { directory ->
-            directory.asFileTree.matching {
-                it.include("**/*.kt")
-                it.exclude("**/generated/**", "**/test/**")
-            }
-        })
-        packageName.set(extension.packageName)
-        schemaFile.set(extension.schemaFile)
-        hintsFile.set(extension.hintsFile)
     }
 }

@@ -2,6 +2,7 @@ package httputil
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -44,6 +45,18 @@ func TestGet(t *testing.T) {
 	}
 	if resp.Headers.Get("X-Test") != "hello" {
 		t.Error("missing header")
+	}
+}
+
+func TestGetRejectsTruncatedResponseBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "10")
+		_, _ = w.Write([]byte("cut"))
+	}))
+	defer server.Close()
+	response, err := Get(t.Context(), server.URL)
+	if response != nil || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated HTTP body returned success: response=%+v err=%v", response, err)
 	}
 }
 

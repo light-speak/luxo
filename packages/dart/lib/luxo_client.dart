@@ -4,8 +4,18 @@
 /// Supports JSON (debugging) and binary (production) modes.
 library luxo_client;
 
-export 'src/transport.dart';
+export 'src/transport.dart' hide wsTransportWithSequence;
 export 'src/error.dart';
 export 'src/types.dart';
 export 'src/codec.dart';
+export 'src/int64.dart';
+export 'src/json.dart'
+    hide
+        JSONRequestEncoder,
+        JSONSocketDecoder,
+        JSONModelDepthError,
+        LuxoJSONWritable,
+        LuxoSealedJSONWritable,
+        LuxoJSONOutput,
+        normalizeLuxoJSONList;
 export 'src/codegen.dart' show generate;

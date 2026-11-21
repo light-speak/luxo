@@ -20,3 +20,13 @@ func BenchmarkParseWide(b *testing.B) {
 		Parse(input)
 	}
 }
+
+func BenchmarkParseUnicode(b *testing.B) {
+	b.ReportAllocs()
+	for range b.N {
+		fields, err := Parse("café,中文2{𐐀_name},_é")
+		if err != nil || len(fields) != 3 {
+			b.Fatal(fields, err)
+		}
+	}
+}

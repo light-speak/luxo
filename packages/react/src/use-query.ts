@@ -25,11 +25,15 @@ function dependenciesEqual(previous: readonly unknown[], next: readonly unknown[
 
 /**
  * React hook for Luxo API queries.
- * Works with @luxo/vite-plugin for compile-time $select injection.
+ * Works with generated clients from @luxojs/vite-plugin; use explicit selections
+ * across hook callbacks where downstream field usage cannot be inferred.
  *
  * @example
  * ```tsx
- * const { data: user, loading } = useLuxoQuery(() => client.getUser(1), [1])
+ * const { data: user, loading } = useLuxoQuery(
+ *   ({ signal }) => client.getUser({ id: 1n, $select: 'name' }, { signal }),
+ *   [1n],
+ * )
  * return <div>{user?.name}</div>
  * ```
  */

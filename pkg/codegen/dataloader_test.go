@@ -7,13 +7,83 @@ import (
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/lux/str"
+	"github.com/light-speak/luxo/pkg/parser"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
 func pos0() token.Position {
 	return token.Position{File: "test.luxo", Line: 1, Col: 1}
+}
+
+func TestLoaderCollectionBoundaries(t *testing.T) {
+	if got := loaderNameFromLoadCall(loadCallInfo{modelName: "User"}); got != "ExtendUser" {
+		t.Fatalf("primary-key loader = %q", got)
+	}
+	var calls []loadCallInfo
+	seen := make(map[string]bool)
+	recordLoadCallExpr(nil, seen, &calls, nil)
+	recordLoadCallExpr(&ast.CallExpr{Func: &ast.MemberExpr{
+		Object: &ast.Literal{Kind: token.Int, Value: "1"}, Field: "load",
+	}}, seen, &calls, nil)
+	if len(calls) != 0 || len(seen) != 0 {
+		t.Fatal("invalid receiver registered a loader")
+	}
+	result := &semantic.Result{Files: []*ast.File{
+		{Name: "origin/first/model.luxo", Extends: []*ast.ExtendDecl{{Name: "User"}}},
+		{Name: "origin/second/model.luxo", Extends: []*ast.ExtendDecl{{Name: "User"}}},
+	}}
+	if got := collectExtendModels(result); !slices.Equal(got, []string{"User"}) {
+		t.Fatalf("repeated external model = %v", got)
+	}
+}
+
+func TestNamedLoaderTypesDoNotDuplicateDeclarations(t *testing.T) {
+	call := loadCallInfo{modelName: "Post", argNames: []string{"userId"}, argTypes: []string{"int64"}}
+	var output strings.Builder
+	generateNamedLoaderTypes(&output, []loadCallInfo{call, call}, make(map[string]bool))
+	if strings.Count(output.String(), "type PostByUserIdLoader =") != 1 {
+		t.Fatalf("duplicate loader declaration:\n%s", output.String())
+	}
+}
+
+func TestRemoteLoadersDeduplicateSharedRelations(t *testing.T) {
+	group := modelRelations{modelName: "User", relations: []Relation{{
+		TargetName: "Post", RemoteKey: "userId", IsList: true, KeyGoType: "int64",
+	}}}
+	result := &semantic.Result{Files: []*ast.File{{Extends: []*ast.ExtendDecl{{Name: "User"}}}}}
+	var single, repeated strings.Builder
+	g := defaultGenerator()
+	g.generateRemoteLoaders(&single, result, dataLoaderInputs{relations: []modelRelations{group}, pkModels: []string{"User"}, remotePKModels: []string{"User"}, hasRemote: true})
+	g.generateRemoteLoaders(&repeated, result, dataLoaderInputs{relations: []modelRelations{group, group}, pkModels: []string{"User"}, remotePKModels: []string{"User"}, hasRemote: true})
+	if single.Len() == 0 || single.String() != repeated.String() {
+		t.Fatal("duplicate relation changed remote loader construction")
+	}
+}
+
+func TestNamedLoadersPreserveSoftDeleteConditions(t *testing.T) {
+	for _, call := range []loadCallInfo{
+		{modelName: "Post", argNames: []string{"userId"}, argTypes: []string{"int64"}},
+		{modelName: "Post", argNames: []string{"userId", "slug"}, argTypes: []string{"int64", "string"}},
+	} {
+		for _, soft := range []bool{false, true} {
+			var source strings.Builder
+			defaultGenerator().generateFKLoadBatchFunc(&source, call, soft)
+			text := source.String()
+			want := 0
+			if soft {
+				want = 1
+			}
+			if got := strings.Count(text, `lux.NewTimeField("\"deleted_at\"").IsNull()`); got != want {
+				t.Fatalf("%v soft=%v: deletion predicate count=%d, want=%d", call.argNames, soft, got, want)
+			}
+			if soft && strings.Index(text, `lux.NewTimeField("\"deleted_at\"")`) > strings.Index(text, "lux.BuildSelectSQL") {
+				t.Fatal("soft deletion was added after query construction")
+			}
+		}
+	}
 }
 
 func TestAnalyzeRelationsBelongsTo(t *testing.T) {
@@ -162,6 +232,17 @@ func TestGenerateDataLoaderFile(t *testing.T) {
 		if !strings.Contains(code, check) {
 			t.Errorf("missing %q in:\n%s", check, code)
 		}
+	}
+}
+
+func TestDataLoaderGenericQueryDoesNotImportDriver(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{Extends: []*ast.ExtendDecl{{Name: "User"}}}}}
+	source := string(generateDataLoaderFile(result, "generated", nil, nil, DriverPG))
+	if !strings.Contains(source, "app.DB.QueryRows(") {
+		t.Fatal("expected the generic database method")
+	}
+	if strings.Contains(source, DriverPG.DriverImport()) {
+		t.Fatal("method-based loaders must not import an unused database package")
 	}
 }
 
@@ -748,6 +829,7 @@ func TestGenerateDataLoaderExtendByPK(t *testing.T) {
 		Events: &EventContext{ModelModule: map[string]string{"User": "user"}},
 		IDs: StableIDs{
 			APIs:        map[string]int{"svc:batchLoad:User": 42},
+			APIParams:   map[string]map[string]int{"svc:batchLoad:User": {"keys": 1}},
 			ModelFields: map[string]map[string]int{"User": {"id": 1, "phone": 2}},
 		},
 	})
@@ -797,12 +879,12 @@ func TestGenerateDataLoaderExtendByPK(t *testing.T) {
 	}
 
 	// Should have load-by-PK batch function
-	if !strings.Contains(code, `lux.NewIntField("id").In(keys...)`) {
+	if !strings.Contains(code, `lux.NewIntField("\"id\"").In(keys...)`) {
 		t.Error("missing PK condition in extend batch function")
 	}
 
 	// Should query users table
-	if !strings.Contains(code, `"users"`) {
+	if !strings.Contains(code, `lux.BuildSelectSQL("\"users\""`) {
 		t.Error("missing users table in extend batch function")
 	}
 
@@ -837,6 +919,7 @@ func TestGenerateRemoteLoadersUsesRPCForExternalBelongsToRelations(t *testing.T)
 		Events: &EventContext{ModelModule: map[string]string{"Post": "post", "User": "user"}},
 		IDs: StableIDs{
 			APIs:        map[string]int{"svc:batchLoad:User": 42},
+			APIParams:   map[string]map[string]int{"svc:batchLoad:User": {"keys": 1}},
 			ModelFields: map[string]map[string]int{"User": {"id": 1, "username": 2}},
 		},
 	})
@@ -870,6 +953,10 @@ func TestGenerateRemoteLoadersUsesRPCForExternalBelongsToRelations(t *testing.T)
 	if strings.Contains(remote, `lux.BuildSelectSQL("users"`) {
 		t.Fatalf("external relation must not query a table in the local service database:\n%s", remote)
 	}
+	if !strings.Contains(remote, "return NewRemoteLoaders(tx, rpcClients, registry, cfg)") ||
+		!strings.Contains(remote, "cfg.MaxBatch = 1") {
+		t.Fatalf("transaction loader factory lost remote routing or synchronous dispatch:\n%s", remote)
+	}
 }
 
 func TestGenerateDataLoaderExtendByUUID(t *testing.T) {
@@ -878,6 +965,7 @@ func TestGenerateDataLoaderExtendByUUID(t *testing.T) {
 		ModelIDType: map[string]string{"Account": "UUID"},
 	}, IDs: StableIDs{
 		APIs:        map[string]int{"svc:batchLoad:Account": 44},
+		APIParams:   map[string]map[string]int{"svc:batchLoad:Account": {"keys": 1}},
 		ModelFields: map[string]map[string]int{"Account": {"id": 1, "name": 2}},
 	}})
 
@@ -897,9 +985,10 @@ func TestGenerateDataLoaderExtendByUUID(t *testing.T) {
 		`"github.com/google/uuid"`,
 		"ExtendAccount *dataloader.Loader[uuid.UUID, *Account]",
 		"keys []uuid.UUID",
-		`lux.NewUUIDField("id").In(keys...)`,
-		"rawKeys := make([][16]byte, len(keys))",
-		"enc.WriteFieldUUIDArray(1, rawKeys)",
+		`lux.NewUUIDField("\"id\"").In(keys...)`,
+		"enc.WriteFieldHeader(1)",
+		"if err := enc.WriteArrayHeader(len(keys)); err != nil { return nil, err }",
+		"for _, key := range keys { enc.WriteUUID([16]byte(key)) }",
 		`client := rpcClients["identity"]`,
 	}
 	for _, check := range checks {
@@ -911,7 +1000,7 @@ func TestGenerateDataLoaderExtendByUUID(t *testing.T) {
 
 func TestGenerateRemoteKeyEncodingString(t *testing.T) {
 	var b strings.Builder
-	generateRemoteKeyEncoding(&b, "String")
+	generateRemoteKeyEncoding(&b, "String", 1)
 	if got := b.String(); !strings.Contains(got, "enc.WriteFieldStringArray(1, keys)") {
 		t.Fatalf("string key encoding = %q", got)
 	}
@@ -972,7 +1061,7 @@ func TestGenerateDataLoaderFKLoad(t *testing.T) {
 		t.Error("missing PostByUserId loader")
 	}
 	// Should have batch function with user_id condition
-	if !strings.Contains(code, `"user_id"`) {
+	if !strings.Contains(code, `"\"user_id\""`) {
 		t.Error("missing user_id FK condition")
 	}
 }
@@ -1066,9 +1155,9 @@ func TestGenerateRemoteArrayEncodingUUID(t *testing.T) {
 	generateRemoteArrayEncoding(&b, 7, "UUID", "keys")
 	out := b.String()
 	for _, want := range []string{
-		"keysRaw := make([][16]byte, len(keys))",
-		"for i, key := range keys { keysRaw[i] = [16]byte(key) }",
-		"enc.WriteFieldUUIDArray(7, keysRaw)",
+		"enc.WriteFieldHeader(7)",
+		"if err := enc.WriteArrayHeader(len(keys)); err != nil { return nil, err }",
+		"for _, key := range keys { enc.WriteUUID([16]byte(key)) }",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("UUID array encoding missing %q:\n%s", want, out)
@@ -1087,8 +1176,8 @@ func TestGenerateRemoteLoadersKeepsLocalNamedLoadsLocal(t *testing.T) {
 	}
 	var b strings.Builder
 	result := &semantic.Result{Files: []*ast.File{{Extends: []*ast.ExtendDecl{{Name: "User"}}}}}
-	generator.generateRemoteLoaders(&b, result, nil, nil, []string{"User"}, []loadCallInfo{call})
-	if out := b.String(); !strings.Contains(out, `lux.NewStringField("slug").In(keys...)`) {
+	generator.generateRemoteLoaders(&b, result, dataLoaderInputs{pkModels: []string{"User"}, remotePKModels: []string{"User"}, loadCalls: []loadCallInfo{call}, hasRemote: true})
+	if out := b.String(); !strings.Contains(out, `lux.NewStringField("\"slug\"").In(keys...)`) {
 		t.Fatalf("local named load did not use the database batch function:\n%s", out)
 	}
 }
@@ -1151,7 +1240,7 @@ func TestGenerateDataLoaderCompositeKeyLoad(t *testing.T) {
 		t.Error("missing composite loader")
 	}
 	// Should have multi-condition WHERE
-	if !strings.Contains(code, `"user_id"`) && !strings.Contains(code, `"type"`) {
+	if !strings.Contains(code, `"\"user_id\""`) && !strings.Contains(code, `"\"type\""`) {
 		t.Error("missing multi-condition WHERE")
 	}
 	// Composite key field types must be resolved from the model declaration:
@@ -1159,7 +1248,7 @@ func TestGenerateDataLoaderCompositeKeyLoad(t *testing.T) {
 	if !strings.Contains(code, "Type string") {
 		t.Errorf("composite key 'type' field should be string, not int64:\n%s", code)
 	}
-	if !strings.Contains(code, `lux.NewStringField("type").Eq(k.Type)`) {
+	if !strings.Contains(code, `lux.NewStringField("\"type\"").Eq(k.Type)`) {
 		t.Errorf("composite key 'type' condition should use NewStringField:\n%s", code)
 	}
 	if !strings.Contains(code, "groups[i] = lux.AllOf(") || !strings.Contains(code, "lux.AnyOf(groups...)") {
@@ -1210,7 +1299,7 @@ func TestGenerateDataLoaderSingleStringFKLoad(t *testing.T) {
 	if !strings.Contains(code, "PostBySlug *dataloader.Loader[string, []*Post]") {
 		t.Errorf("string FK load should produce string-keyed loader:\n%s", code)
 	}
-	if !strings.Contains(code, `lux.NewStringField("slug").In(keys...)`) {
+	if !strings.Contains(code, `lux.NewStringField("\"slug\"").In(keys...)`) {
 		t.Errorf("string FK load should use NewStringField:\n%s", code)
 	}
 	if !strings.Contains(code, "keys []string") {
@@ -1460,5 +1549,96 @@ func TestGenerateDataLoaderExtendOnlyModule(t *testing.T) {
 	}
 	if !strings.Contains(code, "NewDefaultLoaders") {
 		t.Error("missing NewDefaultLoaders")
+	}
+}
+
+func TestDefaultExtendLoaderPreservesSoftDelete(t *testing.T) {
+	for _, soft := range []bool{false, true} {
+		var source strings.Builder
+		defaultGenerator().generateDefaultLoaders(&source, nil, map[string]bool{"Post": soft}, []string{"Post"}, nil)
+		want := 0
+		if soft {
+			want = 1
+		}
+		predicate := `lux.NewTimeField("\"deleted_at\"").IsNull()`
+		if got := strings.Count(source.String(), predicate); got != want {
+			t.Fatalf("soft=%v: deletion predicates=%d want=%d", soft, got, want)
+		}
+	}
+}
+
+func TestExplicitByPreservesChosenForeignKey(t *testing.T) {
+	source := `model User @noTime { id: Int @id }
+model Post @noTime { id: Int @id userId: Int authorId: Int author: User @by(id, authorId) }`
+	tokens, lexErrors := lexer.New(source, "probe.luxo").Tokenize()
+	if len(lexErrors) != 0 {
+		t.Fatal(lexErrors)
+	}
+	file, parseErrors := parser.New(tokens).Parse("probe.luxo")
+	if len(parseErrors) != 0 {
+		t.Fatal(parseErrors)
+	}
+	result := semantic.Analyze([]*ast.File{file})
+	if len(result.Errors) != 0 {
+		t.Fatal(result.Errors)
+	}
+	generator := mustNewGenerator(t, GeneratorConfig{Driver: DriverPG, IDs: completeFixtureAPIIDs(result, StableIDs{ModelFields: map[string]map[string]int{"User": {"id": 1}, "Post": {"id": 1, "userId": 2, "authorId": 3, "author": 4}}})})
+	if _, err := generator.Generate(result, "generated", nil); err != nil {
+		t.Fatal(err)
+	}
+	relations := generator.analyzeRelations(file.Models[1], nil)
+	if len(relations) != 1 {
+		t.Fatal(relations)
+	}
+	if relations[0].LocalKey != "authorId" {
+		t.Fatalf("explicit authorId discarded: relation=%+v", relations[0])
+	}
+}
+
+func TestGenerateRejectsInvalidRelationArguments(t *testing.T) {
+	for _, directive := range []string{"@by", `@by("id")`, "@by(id, null)", "@by(id, authorId) @by(id, userId)", "@by(missing, authorId)", "@by(id, missing)"} {
+		source := `model User @noTime { id: Int @id }
+model Post @noTime { id: Int @id userId: Int authorId: Int author: User ` + directive + ` }`
+		tokens, lexErrors := lexer.New(source, "relation.luxo").Tokenize()
+		if len(lexErrors) != 0 {
+			t.Fatal(lexErrors)
+		}
+		file, parseErrors := parser.New(tokens).Parse("relation.luxo")
+		if len(parseErrors) != 0 {
+			t.Fatal(parseErrors)
+		}
+		result := semantic.Analyze([]*ast.File{file})
+		if len(result.Errors) == 0 {
+			t.Fatal("invalid relation accepted", directive)
+		}
+		generated, err := Generate(result, "generated", GeneratorConfig{Driver: DriverPG})
+		if err == nil || generated != nil {
+			t.Fatal("invalid relation produced files", directive, err)
+		}
+	}
+}
+
+func TestFormalEntriesRejectInvalidLoadPrimaryKeys(t *testing.T) {
+	for _, source := range []string{
+		`model Base @noTime { key: String @id } model Product : Base @noTime { name: String } api wrong(value: Int): Product { return Product.load(value) }`,
+		`model Product @noTime { key: String @id } api wrong(key: Int): Product { return Product.load(key) }`,
+		`model Product @noTime { name: String } api wrong(value: Int): Product { return Product.load(value) }`,
+		`model Base @noTime { key: String @id } model Product : Base @noTime { id: Int @id }`,
+	} {
+		input := analyzePermissionFixture(t, source)
+		if len(input.Errors) == 0 {
+			t.Fatal("invalid load contract accepted", source)
+		}
+		config := GeneratorConfig{Driver: DriverPG, IDs: completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{
+			"Base": {"key": 1}, "Product": {"key": 1, "name": 2, "id": 3},
+		}})}
+		generated, err := Generate(input, "generated", config)
+		if err == nil || generated != nil || !strings.Contains(err.Error(), "successful semantic analysis") {
+			t.Fatal("invalid semantic result reached generation", err)
+		}
+		data, err := BuildSchemaJSON(input, nil, config)
+		if err == nil || data != nil || !strings.Contains(err.Error(), "successful semantic analysis") {
+			t.Fatal("invalid semantic result reached SDK schema export", err)
+		}
 	}
 }

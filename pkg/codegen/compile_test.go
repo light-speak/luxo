@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -12,12 +13,107 @@ import (
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
+func TestDecimalArithmeticEffectClassification(t *testing.T) {
+	for _, kind := range []string{"Int", "Decimal"} {
+		for _, op := range []string{"+", "*"} {
+			left, right := &ast.Ident{Name: "left"}, &ast.Ident{Name: "right"}
+			left.SetTypeTag(kind)
+			right.SetTypeTag(kind)
+			value := &ast.BinaryExpr{Op: op, Left: left, Right: right}
+			want := kind == "Decimal"
+			if got := expressionMayHaveEffects(value); got != want {
+				t.Errorf("%s %s: effects=%v, want %v", kind, op, got, want)
+			}
+		}
+	}
+}
+
+func TestMemberEffectClassification(t *testing.T) {
+	for _, sample := range []struct {
+		name string
+		expr ast.Expr
+		want bool
+	}{
+		{"field", &ast.MemberExpr{Object: &ast.Ident{Name: "source"}, Field: "id"}, false},
+		{"nestedField", &ast.MemberExpr{Object: &ast.MemberExpr{Object: &ast.Ident{Name: "source"}, Field: "owner"}, Field: "id"}, false},
+		{"callReceiver", &ast.MemberExpr{Object: &ast.CallExpr{Func: &ast.Ident{Name: "read"}}, Field: "id"}, true},
+		{"identity", &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "id"}, true},
+		{"nullable", &ast.MemberExpr{Object: &ast.Ident{Name: "source"}, Field: "id", SafeCall: true}, true},
+		{"log", &ast.MemberExpr{Object: &ast.Literal{Kind: token.String, Value: "hello"}, Field: "i"}, true},
+		{"textProperty", &ast.MemberExpr{Object: &ast.Literal{Kind: token.String, Value: "hello"}, Field: "length"}, false},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			if got := expressionMayHaveEffects(sample.expr); got != sample.want {
+				t.Fatalf("effects=%v, want %v", got, sample.want)
+			}
+		})
+	}
+}
+
+func TestGeneratedInheritedInferredParameter(t *testing.T) {
+	runGeneratedFixture(t, `
+model Base @noTime { id: Int @id }
+model Item : Base @noTime { name: String }
+api getItemById(key: Int): Item
+`, `package generated
+import("strings";"net/http/httptest";"testing";"github.com/light-speak/luxo/pkg/lux/api")
+func TestInheritedParameter(t *testing.T) {
+ router:=api.NewRouter()
+ if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+ if err:=RegisterHandlers(router,&App{});err!=nil{t.Fatal(err)}
+ request:=httptest.NewRequest("POST","/luvia",strings.NewReader("{\"$api\":\"getItemById\",\"key\":\"bad\",\"$select\":\"id\"}"))
+ request.Header.Set("Content-Type","application/json")
+ response:=httptest.NewRecorder();router.ServeHTTP(response,request)
+ if response.Code!=400 { t.Fatalf("status=%d body=%s",response.Code,response.Body.String()) }
+}
+`, StableIDs{APIs: map[string]int{"getItemById": 1}, ModelFields: map[string]map[string]int{
+		"Base": {"id": 1}, "Item": {"id": 1, "name": 2},
+	}})
+}
+
+func TestGeneratedUnusedAPIParametersRemainValidated(t *testing.T) {
+	runGeneratedFixture(t, `
+type Input { value: Int }
+api ignore(value: Int): Int { return 42 }
+api ignoreBytes(value: Bytes): Int { return 42 }
+api ignoreInput(value: Input): Int { return 42 }
+api ignoreList(value: [Int]): Int { return 42 }
+api ignoreOptional(value: String? = null): Int { return 42 }
+`, `package generated
+import("bytes";"net/http/httptest";"testing";"github.com/light-speak/luxo/pkg/lux/api")
+
+func TestUnusedInputValidation(t *testing.T){
+ router:=api.NewRouter()
+ if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+ if err:=RegisterHandlers(router,&App{});err!=nil{t.Fatal(err)}
+ for _,sample:=range []struct{body string;content string;status int}{
+  {"{\"$api\":\"ignore\",\"value\":1}","application/json",200},
+  {"{\"$api\":\"ignore\",\"value\":null}","application/json",400},
+  {"{\"$api\":\"ignore\",\"value\":\"bad\"}","application/json",400},
+  {"{\"$api\":\"ignore\"}","application/json",400},
+  {string([]byte{1,0,1,2,0}),"application/x-luxo",200},
+  {string([]byte{1,0,1,128}),"application/x-luxo",400},
+  {"{\"$api\":\"ignoreBytes\",\"value\":\"AQ==\"}","application/json",200},
+  {"{\"$api\":\"ignoreInput\",\"value\":{\"value\":1}}","application/json",200},
+  {"{\"$api\":\"ignoreList\",\"value\":[1]}","application/json",200},
+  {"{\"$api\":\"ignoreOptional\"}","application/json",200},
+ }{
+  request:=httptest.NewRequest("POST","/luvia",bytes.NewBufferString(sample.body));request.Header.Set("Content-Type",sample.content)
+  if sample.content=="application/x-luxo"{request.Header.Set("X-Luxo-Mode","binary")}
+  response:=httptest.NewRecorder();router.ServeHTTP(response,request)
+  if response.Code!=sample.status{t.Fatalf("%q: status=%d body=%s",sample.body,response.Code,response.Body.String())}
+ }
+}
+`, StableIDs{APIs: map[string]int{"ignore": 1, "ignoreBytes": 2, "ignoreInput": 3, "ignoreList": 4, "ignoreOptional": 5}, ModelFields: map[string]map[string]int{"Input": {"value": 1}}})
+}
+
 func newCompiler(models map[string]*ast.ModelDecl) *compiler {
 	if models == nil {
 		models = map[string]*ast.ModelDecl{}
 	}
 	var b strings.Builder
 	return &compiler{
+		generator:        defaultGenerator(),
 		b:                &b,
 		indent:           "\t\t",
 		models:           models,
@@ -40,26 +136,15 @@ func TestCompilerWritesPaginatedInMemoryModelReturn(t *testing.T) {
 	}
 }
 
-func TestStructuredParamAndLoadSelectionBoundaries(t *testing.T) {
-	if isStructuredParam(nil, nil) || isStructuredParam(&ast.ParamDecl{}, nil) {
-		t.Fatal("incomplete parameters were classified as structured")
-	}
-	if isStructuredParam(&ast.ParamDecl{Type: &ast.TypeRef{Name: "Role"}}, map[string]bool{"Role": true}) {
-		t.Fatal("enum parameter was classified as structured")
-	}
+func TestLoadSelectionBoundaries(t *testing.T) {
 	if _, ok := directLoadModel(&ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Literal{}, Field: "load"}}); ok {
 		t.Fatal("load call with a non-model receiver was accepted")
 	}
 
-	bindings := map[string]string{"existing": "User"}
-	collectLoadBindings(nil, bindings)
-	if len(bindings) != 1 {
-		t.Fatalf("nil block changed bindings: %#v", bindings)
+	if projections := analyzeLoadProjections(nil, nil, nil); projections != nil {
+		t.Fatal("nil block registered projections")
 	}
-	root, path := memberSelectionPath(&ast.MemberExpr{Object: &ast.Literal{}, Field: "name"})
-	if root != "" || path != nil {
-		t.Fatalf("invalid member path = %q, %#v", root, path)
-	}
+
 	if validModelSelectionPath("Missing", []string{"id"}, nil) {
 		t.Fatal("unknown model selection path was accepted")
 	}
@@ -73,6 +158,33 @@ func TestStructuredParamAndLoadSelectionBoundaries(t *testing.T) {
 
 func compilerOut(c *compiler) string {
 	return c.b.String()
+}
+
+func TestCompilerDeclarationAndLiteralBoundaries(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	c.enums = map[string]bool{"Role": true}
+	for _, name := range []string{"User", "Role", "Int", "", "lowercase"} {
+		if c.isTypeDecl(name) {
+			t.Fatalf("%q was classified as a type declaration", name)
+		}
+	}
+	if !c.isTypeDecl("Snapshot") {
+		t.Fatal("standalone type declaration was not recognized")
+	}
+	if got := c.dbPackage(); got != DriverPG.DriverPkg() {
+		t.Fatalf("default database package = %q", got)
+	}
+	if got := c.compileTemplate(&ast.TemplateString{Parts: []ast.Expr{
+		&ast.Literal{Kind: token.String, Value: "literal\ntext"},
+	}}); got != `"literal\ntext"` {
+		t.Fatalf("literal template = %q", got)
+	}
+	if isLogTarget(&ast.Ident{Name: "message"}) {
+		t.Fatal("identifier was accepted as a literal log target")
+	}
+	if !isLogTarget(&ast.TemplateString{}) {
+		t.Fatal("template was rejected as a log target")
+	}
 }
 
 func TestCompileCompatibilityPaths(t *testing.T) {
@@ -95,7 +207,7 @@ func TestCompileCompatibilityPaths(t *testing.T) {
 			&ast.ExprStmt{Expr: &ast.Literal{Kind: token.Int, Value: "1"}},
 		}}}}},
 	})
-	if !ok || !strings.Contains(transaction, "app.DB.Tx") {
+	if !ok || !strings.Contains(transaction, "app.Tx") {
 		t.Fatalf("transaction = %q, %v", transaction, ok)
 	}
 
@@ -193,7 +305,7 @@ func TestServiceFunctionCallsNativeResultThroughResolver(t *testing.T) {
 		},
 	}}}
 	var body strings.Builder
-	defaultGenerator().generateServiceFnHandlers(&body, result, nil)
+	defaultGenerator().generateServiceFnHandlers(&body, result, nil, nil, collectFunctionDeclarations(result), nil)
 	if !strings.Contains(body.String(), "app.Resolver.LoadCount(ctx)") {
 		t.Fatalf("service function did not route native Result call through resolver:\n%s", body.String())
 	}
@@ -244,8 +356,8 @@ func TestCompileLiteralInt(t *testing.T) {
 func TestCompileLiteralFloat(t *testing.T) {
 	c := newCompiler(nil)
 	got := c.compileExpr(&ast.Literal{Kind: token.Float, Value: "3.14"})
-	if got != "3.14" {
-		t.Fatalf("want '3.14', got %q", got)
+	if got != "float64(3.14)" {
+		t.Fatalf("want typed Float64 literal, got %q", got)
 	}
 }
 
@@ -314,8 +426,8 @@ func TestCompileBinaryAnd(t *testing.T) {
 		Right: &ast.Literal{Kind: token.True, Value: "true"},
 	}
 	got := c.compileExpr(expr)
-	if got != "x && true" {
-		t.Fatalf("want 'x && true', got %q", got)
+	if got != "(x && true)" {
+		t.Fatalf("want '(x && true)', got %q", got)
 	}
 }
 
@@ -441,12 +553,13 @@ func TestCompileUnaryThrowIdent(t *testing.T) {
 func TestCompileElvisExprStandalone(t *testing.T) {
 	c := newCompiler(nil)
 	expr := &ast.ElvisExpr{
-		Left:  &ast.Ident{Name: "x"},
-		Right: &ast.Ident{Name: "y"},
+		TypeTagged: ast.TypeTagged{TypeTag: "String"},
+		Left:       &ast.Ident{TypeTagged: ast.TypeTagged{TypeTag: "String", NullableTag: true}, Name: "x"},
+		Right:      &ast.Ident{Name: "y"},
 	}
 	got := c.compileExpr(expr)
-	if !strings.Contains(got, "/* elvis */") {
-		t.Fatalf("expected elvis comment in output, got %q", got)
+	if !strings.Contains(got, "!= nil") || !strings.Contains(got, "return y") || !strings.Contains(got, "return *") {
+		t.Fatalf("expected a lazy nullable default, got %q", got)
 	}
 	if !strings.Contains(got, "x") {
 		t.Fatalf("expected 'x' in output, got %q", got)
@@ -469,6 +582,17 @@ func TestCompileYieldExpr(t *testing.T) {
 	}
 	if !strings.Contains(out, "break") {
 		t.Fatalf("yield outside for-expr should break, got:\n%s", out)
+	}
+}
+
+func TestCompileYieldStatementDoesNotDiscardEmptyExpression(t *testing.T) {
+	c := newCompiler(nil)
+	c.inForExpr = true
+	value := &ast.YieldExpr{Value: &ast.Ident{Name: "item"}}
+	value.SetTypeTag("Int")
+	c.compileExprStmt(&ast.ExprStmt{Expr: value})
+	if out := strings.TrimSpace(compilerOut(c)); out != "return item" {
+		t.Fatalf("yield statement must only emit its return, got %q", out)
 	}
 }
 
@@ -664,6 +788,31 @@ func TestIsModelQueryFalseNonTerminal(t *testing.T) {
 	}
 }
 
+func TestIsModelQueryNonChainAllocations(t *testing.T) {
+	c := newCompiler(makeModels("Node"))
+	for _, sample := range []struct {
+		name string
+		expr ast.Expr
+	}{
+		{"variable", &ast.Ident{Name: "row"}},
+		{"literal", &ast.Literal{Kind: token.Int, Value: "2"}},
+		{"list", &ast.ListExpr{}},
+		{"object", &ast.ObjectExpr{}},
+		{"unary", &ast.UnaryExpr{Op: "!", Value: &ast.Literal{Kind: token.True, Value: "true"}}},
+		{"absent", nil},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			matched := false
+			allocations := testing.AllocsPerRun(100, func() {
+				matched = c.isModelQuery(sample.expr)
+			})
+			if matched || allocations != 0 {
+				t.Fatalf("non-chain query check allocated or matched: allocations=%g matched=%v", allocations, matched)
+			}
+		})
+	}
+}
+
 func TestIsModelQueryFalseSingleLink(t *testing.T) {
 	models := makeModels("User")
 	c := newCompiler(models)
@@ -687,7 +836,7 @@ func TestCompileModelChainFind(t *testing.T) {
 		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
 	}
 	got := c.compileExpr(call)
-	if !strings.Contains(got, "app.User.Where(UserWhere.Id.Eq(id)).First(ctx)") {
+	if !strings.Contains(got, "app.User.Where(UserWhere.Id.Eq(id)).FirstRequired(ctx)") {
 		t.Fatalf("unexpected output: %q", got)
 	}
 }
@@ -893,7 +1042,7 @@ func TestCompileModelChainOrderBy(t *testing.T) {
 		Args: []*ast.NamedArg{},
 	}
 	got := c.compileExpr(call)
-	if !strings.Contains(got, `.OrderBy("name DESC")`) {
+	if !strings.Contains(got, `.OrderBy("\"name\" DESC")`) {
 		t.Fatalf("expected OrderBy with DESC, got %q", got)
 	}
 	if !strings.Contains(got, ".All(ctx)") {
@@ -931,6 +1080,36 @@ func TestCompileModelChainLimitOffset(t *testing.T) {
 }
 
 // ─── compileWhereArg ─────────────────────────────────────────────────────────
+
+func TestCompileWhereEnumValues(t *testing.T) {
+	for _, tagged := range []bool{false, true} {
+		c := newCompiler(nil)
+		c.enums = map[string]bool{"State": true}
+		c.vars["state"] = valType{name: "State"}
+		value := &ast.Ident{Name: "state"}
+		if tagged {
+			value.SetTypeTag("State")
+		}
+		condition := &ast.BinaryExpr{Left: &ast.Ident{Name: "state"}, Op: "!=", Right: value}
+		if got := c.compileWhereArg("Order", condition); got != "OrderWhere.State.Neq(string(state))" {
+			t.Fatalf("tagged=%v: %s", tagged, got)
+		}
+		var out strings.Builder
+		c.compileWhereChain(&out, "Order", []*ast.NamedArg{{Name: "state", Value: value}}, true)
+		if got := out.String(); got != "app.Order.Where(OrderWhere.State.Eq(string(state)))" {
+			t.Fatalf("tagged=%v named: %s", tagged, got)
+		}
+	}
+	c := newCompiler(nil)
+	c.enums = map[string]bool{"State": true}
+	condition := &ast.BinaryExpr{
+		Left: &ast.Ident{Name: "state"}, Op: "==",
+		Right: &ast.MemberExpr{Object: &ast.Ident{Name: "State"}, Field: "OPEN"},
+	}
+	if got := c.compileWhereArg("Order", condition); got != "OrderWhere.State.Eq(string(StateOPEN))" {
+		t.Fatalf("untagged enum literal: %s", got)
+	}
+}
 
 func TestCompileWhereArgItField(t *testing.T) {
 	models := makeModels("User")
@@ -1027,7 +1206,7 @@ func TestCompileWhereArgLte(t *testing.T) {
 	}
 }
 
-func TestCompileWhereArgUnknownOp(t *testing.T) {
+func TestCompileWhereArgIn(t *testing.T) {
 	c := newCompiler(nil)
 	bin := &ast.BinaryExpr{
 		Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "x"},
@@ -1035,9 +1214,16 @@ func TestCompileWhereArgUnknownOp(t *testing.T) {
 		Right: &ast.Ident{Name: "vals"},
 	}
 	got := c.compileWhereArg("User", bin)
-	// Falls back to compileExpr of the whole binary expression
-	if !strings.Contains(got, "in") {
-		t.Fatalf("expected 'in' in fallback output, got %q", got)
+	if got != "UserWhere.X.In(vals...)" {
+		t.Fatalf("expected typed membership, got %q", got)
+	}
+}
+
+func TestCompileWhereArgUnknownOp(t *testing.T) {
+	c := newCompiler(nil)
+	expression := &ast.BinaryExpr{Left: &ast.Ident{Name: "x"}, Op: "unregistered", Right: &ast.Ident{Name: "value"}}
+	if got := c.compileWhereArg("User", expression); got != "x unregistered value" {
+		t.Fatalf("unknown source-fragment operator changed: %s", got)
 	}
 }
 
@@ -1075,6 +1261,50 @@ func TestCompileWhereArgMemberNonIt(t *testing.T) {
 }
 
 // ─── compileWhereArg — method calls (contains/startsWith/endsWith) ───────────
+
+func TestCompileFindReadVariants(t *testing.T) {
+	model := testModel("Probe", nil, []*ast.FieldDecl{testField("id", "Int", directive("id"))})
+	for _, sample := range []struct {
+		method string
+		args   []*ast.NamedArg
+		want   string
+	}{
+		{"find", []*ast.NamedArg{{Value: &ast.Ident{Name: "key"}}}, "app.Probe.Where(ProbeWhere.Id.Eq(key)).FirstRequired(ctx)"},
+		{"find", []*ast.NamedArg{{Name: "id", Value: &ast.Ident{Name: "key"}}}, "app.Probe.Where(ProbeWhere.Id.Eq(key)).FirstRequired(ctx)"},
+		{"findMany", nil, "app.Probe.Where().All(ctx)"},
+		{"findFirst", nil, "app.Probe.Where().First(ctx)"},
+	} {
+		t.Run(sample.method+sample.want, func(t *testing.T) {
+			compiler := newCompiler(map[string]*ast.ModelDecl{"Probe": model})
+			got := compiler.compileModelChain("Probe", []chainLink{{method: sample.method, args: sample.args}})
+			if got != sample.want {
+				t.Fatalf("got %s; want %s", got, sample.want)
+			}
+		})
+	}
+}
+
+func TestFunctionFindNormalization(t *testing.T) {
+	for _, sample := range []struct {
+		name string
+		args []*ast.NamedArg
+		want bool
+	}{
+		{"find", []*ast.NamedArg{{Value: &ast.Ident{Name: "Probe"}}}, true},
+		{"findMany", []*ast.NamedArg{{Value: &ast.Ident{Name: "Probe"}}}, true},
+		{"findFirst", []*ast.NamedArg{{Value: &ast.Ident{Name: "Probe"}}}, true},
+		{"find", nil, false},
+		{"find", []*ast.NamedArg{{Name: "model", Value: &ast.Ident{Name: "Probe"}}}, false},
+		{"find", []*ast.NamedArg{{Value: &ast.Literal{Kind: token.String, Value: "Probe"}}}, false},
+		{"helper", []*ast.NamedArg{{Value: &ast.Ident{Name: "Probe"}}}, false},
+	} {
+		call := &ast.CallExpr{Func: &ast.Ident{Name: sample.name}, Args: sample.args}
+		model, method := functionFindModel(call)
+		if (model != nil) != sample.want || sample.want && (model.Name != "Probe" || method != sample.name) {
+			t.Fatalf("%s: model=%v method=%s", sample.name, model, method)
+		}
+	}
+}
 
 func TestCompileWhereArgContainsWithSearch(t *testing.T) {
 	// Model with @search on title field
@@ -1174,6 +1404,17 @@ func TestCompileWhereArgEndsWith(t *testing.T) {
 	got := c.compileWhereArg("User", call)
 	if !strings.Contains(got, "UserWhere.Email.Like") {
 		t.Fatalf("expected Like condition, got %q", got)
+	}
+}
+
+func TestCompileWhereMethodCallNonMember(t *testing.T) {
+	c := newCompiler(nil)
+	call := &ast.CallExpr{
+		Func: &ast.Ident{Name: "predicate"},
+		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "value"}}},
+	}
+	if got := c.compileWhereMethodCall("User", call, "it"); got != "" {
+		t.Fatalf("ordinary function must not become a column method: %q", got)
 	}
 }
 
@@ -1614,7 +1855,7 @@ func TestCompileStmtUnknown(t *testing.T) {
 		if r == nil {
 			t.Fatal("expected panic on unhandled statement type")
 		}
-		if msg, ok := r.(string); !ok || !strings.Contains(msg, "unhandled statement type") {
+		if failure, ok := r.(*InternalCompilerError); !ok || !strings.Contains(failure.Error(), "unhandled statement type") {
 			t.Fatalf("expected unhandled statement panic, got %v", r)
 		}
 	}()
@@ -1629,7 +1870,7 @@ func TestCompileElvisGuardPointerNilCheck(t *testing.T) {
 	c.compileStmt(&ast.ExprStmt{
 		Expr: &ast.ElvisExpr{
 			Left:  &ast.Ident{Name: "user"},
-			Right: &ast.Ident{Name: "errNotFound"},
+			Right: &ast.UnaryExpr{Op: "throw", Value: &ast.Ident{Name: "errNotFound"}},
 		},
 	})
 	out := compilerOut(c)
@@ -1646,7 +1887,7 @@ func TestCompileElvisGuardUnaryNot(t *testing.T) {
 	c.compileStmt(&ast.ExprStmt{
 		Expr: &ast.ElvisExpr{
 			Left:  &ast.UnaryExpr{Op: "!", Value: &ast.Ident{Name: "exists"}},
-			Right: &ast.Ident{Name: "errDuplicate"},
+			Right: &ast.UnaryExpr{Op: "throw", Value: &ast.Ident{Name: "errDuplicate"}},
 		},
 	})
 	out := compilerOut(c)
@@ -1720,14 +1961,14 @@ func TestCompileAPIBodyWithCustomTypeParam(t *testing.T) {
 	if !strings.Contains(out, "var input PostInput") {
 		t.Fatalf("expected 'var input PostInput', got %q", out)
 	}
-	if !strings.Contains(out, `req.ParamJSON("input", &input)`) {
-		t.Fatalf("expected JSON fallback, got %q", out)
+	if strings.Contains(out, "req.ParamJSON") || strings.Contains(out, "req.BinaryMode") {
+		t.Fatalf("structured decoder still has a transport-specific fallback: %q", out)
 	}
 	for _, want := range []string{
-		"if req.BinaryMode",
 		`req.ParamMessage("input", false, false)`,
-		"input.ReadLuxo(_inputDecoder)",
-		`api.InvalidParam("input", _inputDecoder.Err())`,
+		"input.ReadLuxoInput(_inputDecoder)",
+		"_inputDecoder.Finish()",
+		`api.InvalidParam("input", err)`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("expected native structured decode %q, got %q", want, out)
@@ -1749,8 +1990,7 @@ func TestCompileAPIBodyWithCustomTypeListParam(t *testing.T) {
 	for _, want := range []string{
 		`req.ParamMessageArray("inputs", false, false)`,
 		"inputs = make([]PostInput, len(_inputsMessages))",
-		"inputs[i].ReadLuxo(_inputsDecoder)",
-		`req.ParamJSON("inputs", &inputs)`,
+		"inputs[_index].ReadLuxoInput(_inputsDecoder)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("expected native structured list decode %q, got %q", want, out)
@@ -1831,7 +2071,7 @@ func TestCompileAPIBodyFullFlow(t *testing.T) {
 				&ast.ExprStmt{
 					Expr: &ast.ElvisExpr{
 						Left:  &ast.Ident{Name: "user"},
-						Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"},
+						Right: &ast.UnaryExpr{Op: "throw", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"}},
 					},
 				},
 				&ast.ReturnStmt{Value: &ast.Ident{Name: "user"}},
@@ -1883,11 +2123,14 @@ func TestCompileWhereChainMultipleArgs(t *testing.T) {
 		Args: nil,
 	}
 	got := c.compileExpr(allCall)
-	if !strings.Contains(got, "UserWhere.Email.Eq(email)") {
-		t.Fatalf("expected first where arg, got %q", got)
+	if !strings.Contains(c.b.String()+got, "UserWhere.Email.Eq(email)") {
+		t.Fatalf("expected first where arg, got %q", c.b.String()+got)
 	}
 	if !strings.Contains(got, "UserWhere.Active.Eq(true)") {
 		t.Fatalf("expected second where arg, got %q", got)
+	}
+	if c.b.Len() != 0 {
+		t.Fatalf("pure predicates emitted unnecessary temporaries: %s", c.b.String())
 	}
 }
 
@@ -1923,7 +2166,7 @@ func TestCompileModelChainDoubleWhere(t *testing.T) {
 		Args: nil,
 	}
 	got := c.compileExpr(firstCall)
-	if !strings.Contains(got, "app.Post.Where(") {
+	if !strings.Contains(c.b.String()+got, "app.Post.Where(") {
 		t.Fatalf("expected app.Post.Where(, got %q", got)
 	}
 	if !strings.Contains(got, ".Where(") {
@@ -1931,6 +2174,9 @@ func TestCompileModelChainDoubleWhere(t *testing.T) {
 	}
 	if !strings.Contains(got, ".First(ctx)") {
 		t.Fatalf("expected .First(ctx), got %q", got)
+	}
+	if c.b.Len() != 0 {
+		t.Fatalf("pure query chain emitted unnecessary temporaries: %s", c.b.String())
 	}
 }
 
@@ -2087,12 +2333,12 @@ func TestWriteScalarReturnCoversEveryWireScalar(t *testing.T) {
 		{"Float", "codec.AppendFixed64(req.Buf.B, value)"},
 		{"Boolean", "codec.AppendBool(req.Buf.B, value)"},
 		{"String", "codec.AppendString(req.Buf.B, value)"},
-		{"DateTime", "codec.AppendSvarint(req.Buf.B, value.Unix())"},
+		{"DateTime", "codec.AppendDateTime(req.Buf.B, value)"},
 		{"Duration", "codec.AppendSvarint(req.Buf.B, int64(value))"},
 		{"UUID", "codec.AppendUUID(req.Buf.B, value)"},
-		{"Decimal", "codec.AppendString(req.Buf.B, value.String())"},
+		{"Decimal", "codec.AppendString(req.Buf.B, lux.FormatDecimal(value))"},
 		{"Bytes", "codec.AppendBytes(req.Buf.B, value)"},
-		{"JSON", "codec.AppendBytes(req.Buf.B, value)"},
+		{"JSON", "codec.AppendJSON(req.Buf.B, value)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2111,12 +2357,31 @@ func TestWriteScalarListReturnUsesUnsignedCountAndElementCodec(t *testing.T) {
 	c.api = &ast.ApiDecl{ReturnType: &ast.TypeRef{Name: "Bytes", IsList: true}}
 	c.writeScalarReturn("values")
 	out := compilerOut(c)
-	if !strings.Contains(out, "codec.AppendVarint(req.Buf.B, uint64(len(values)))") {
-		t.Fatalf("list must use unsigned count prefix:\n%s", out)
+	if !strings.Contains(out, "if encoded, err := codec.AppendArrayHeader(req.Buf.B, len(values)); err != nil { return err }") {
+		t.Fatalf("list must use the checked unsigned header and propagate errors:\n%s", out)
 	}
 	if !strings.Contains(out, "for _, v := range values") ||
 		!strings.Contains(out, "codec.AppendBytes(req.Buf.B, v)") {
 		t.Fatalf("Bytes list must encode every element:\n%s", out)
+	}
+}
+
+func TestCompiledAPIListParameterReturnPreservesListShape(t *testing.T) {
+	for _, name := range []string{"Int", "Float", "Boolean", "String", "DateTime", "Duration", "UUID", "Decimal", "Bytes", "JSON", "Role"} {
+		t.Run(name, func(t *testing.T) {
+			ref := &ast.TypeRef{Name: name, IsList: true}
+			declaration := &ast.ApiDecl{
+				Name: "echo", Params: []*ast.ParamDecl{{Name: "values", Type: ref}}, ReturnType: ref,
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.Ident{Name: "values"}}}},
+			}
+			var out strings.Builder
+			compileAPIBody(&out, declaration, nil, map[string]bool{"Role": true})
+			for _, want := range []string{"codec.AppendArrayHeader(req.Buf.B, len(values))", "for _, v := range values"} {
+				if !strings.Contains(out.String(), want) {
+					t.Fatalf("list return missing %q:\n%s", want, out.String())
+				}
+			}
+		})
 	}
 }
 
@@ -2163,7 +2428,7 @@ func TestCompilerWritesModelAndTypeDeclarationReturns(t *testing.T) {
 	out := compilerOut(c)
 	for _, want := range []string{
 		"resolveUserComputed", "[]*User{user}", "WriteColumnarPayload", "payload.WriteLuxo",
-		"codec.AppendString(req.Buf.B, string(role))",
+		"Role(role).AppendLuxo(req.Buf.B)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("typed return missing %q:\n%s", want, out)
@@ -2328,6 +2593,115 @@ func TestCompileListEmpty(t *testing.T) {
 	}
 }
 
+func TestCompileModelListElements(t *testing.T) {
+	for _, typed := range []bool{false, true} {
+		c := newCompiler(map[string]*ast.ModelDecl{"User": {Name: "User"}})
+		c.vars["value"] = valType{name: "User", isModel: true, isValue: true}
+		c.vars["pointer"] = valType{name: "User", isModel: true}
+		list := &ast.ListExpr{Items: []ast.Expr{
+			&ast.ObjectExpr{TypeName: "User"}, &ast.Ident{Name: "value"}, &ast.Ident{Name: "pointer"},
+		}}
+		list.SetTypeTag("User")
+		list.SetListType(true)
+		got := c.compileList(list)
+		if typed {
+			got = c.compileTypedList(list, &ast.TypeRef{Name: "User", IsList: true})
+		}
+		if got != "[]*User{&User{}, &value, pointer}" {
+			t.Fatalf("typed=%v: model list = %s", typed, got)
+		}
+	}
+}
+
+func TestCompileListCallsExecuteOnce(t *testing.T) {
+	for _, target := range []string{"variable", "return", "function"} {
+		t.Run(target, func(t *testing.T) {
+			c := newCompiler(nil)
+			c.functions = map[string]*ast.FnDecl{"next": {Name: "next", Body: &ast.Block{}, ReturnType: &ast.TypeRef{Name: "Int"}}}
+			c.api.ReturnType = &ast.TypeRef{Name: "Int", IsList: true}
+			list := &ast.ListExpr{Items: []ast.Expr{&ast.CallExpr{Func: &ast.Ident{Name: "next"}}}}
+			switch target {
+			case "variable":
+				c.compileVal(&ast.ValStmt{Name: "values", Value: list})
+			case "return":
+				c.compileReturn(&ast.ReturnStmt{Value: list})
+			case "function":
+				c.functionResult = c.api.ReturnType
+				c.compileFunctionReturn(&ast.ReturnStmt{Value: list})
+			}
+			if got := strings.Count(compilerOut(c), "app.next(ctx)"); got != 1 {
+				t.Fatalf("%s compiled one function call %d times:\n%s", target, got, compilerOut(c))
+			}
+		})
+	}
+}
+
+func TestCompileLocalListUsesItsOwnType(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	c.api.ReturnType = &ast.TypeRef{Name: "User", IsList: true}
+	list := &ast.ListExpr{Items: []ast.Expr{&ast.Literal{Kind: token.Int, Value: "7"}}}
+	list.SetTypeTag("Int")
+	list.SetListType(true)
+	c.compileVal(&ast.ValStmt{Name: "values", Value: list})
+	if !strings.Contains(compilerOut(c), "values := []int64{7}") || c.vars["values"].isModel {
+		t.Fatalf("API return type leaked into local list: %s / %+v", compilerOut(c), c.vars["values"])
+	}
+}
+
+func TestCompileValTracksUntypedWhenResult(t *testing.T) {
+	c := newCompiler(nil)
+	c.api.ReturnType = &ast.TypeRef{Name: "Int"}
+	c.compileVal(&ast.ValStmt{Name: "result", Value: &ast.WhenExpr{
+		Else: &ast.Literal{Kind: token.Int, Value: "7"},
+	}})
+	if got := c.vars["result"]; got.name != "Int" {
+		t.Fatalf("untyped when did not inherit the return type: %+v", got)
+	}
+}
+
+func TestCompileModelFunctionABI(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	model := &ast.ObjectExpr{TypeName: "User"}
+	model.SetTypeTag("User")
+	c.compileVal(&ast.ValStmt{Name: "value", Value: model})
+	c.compileVal(&ast.ValStmt{Name: "alias", Value: &ast.Ident{Name: "value"}})
+	c.vars["pointer"] = valType{name: "User", isModel: true}
+	for _, name := range []string{"value", "alias", "pointer"} {
+		c.functionResult = &ast.TypeRef{Name: "User"}
+		c.compileFunctionReturn(&ast.ReturnStmt{Value: &ast.Ident{Name: name}})
+	}
+	c.compileFunctionReturn(&ast.ReturnStmt{Value: model})
+	for _, want := range []string{"return value, nil", "return alias, nil", "return pointer, nil", "return &User{}, nil"} {
+		if !strings.Contains(compilerOut(c), want) {
+			t.Fatalf("missing %q: %s", want, compilerOut(c))
+		}
+	}
+	fn := &ast.FnDecl{Params: []*ast.ParamDecl{{Name: "users", Type: &ast.TypeRef{Name: "User"}, Spread: true}}}
+	call := &ast.CallExpr{Args: []*ast.NamedArg{{Value: model}, {Value: &ast.Ident{Name: "alias"}}, {Value: &ast.Ident{Name: "pointer"}}}}
+	if got := strings.Join(c.compileDeclaredFunctionArguments(call, fn), ", "); got != "_argument1, _argument2, _argument3" {
+		t.Fatalf("variadic model arguments = %s", got)
+	}
+	for _, want := range []string{"var _argument1 *User = &User{}", "var _argument2 *User = alias", "var _argument3 *User = pointer"} {
+		if !strings.Contains(compilerOut(c), want) {
+			t.Fatalf("missing model reference %q: %s", want, compilerOut(c))
+		}
+	}
+}
+
+func TestCompileDeclaredLocalPreservesPaginationTotal(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	c.paginationTotals["source"] = "total"
+	value := &ast.Ident{Name: "source"}
+	value.SetTypeTag("User")
+	value.SetListType(true)
+	if !c.compileDeclaredLocal(&ast.ValStmt{Name: "alias", Type: &ast.TypeRef{Name: "User", IsList: true}, Value: value}) {
+		t.Fatal("declared alias was not compiled")
+	}
+	if c.pageTotal(&ast.Ident{Name: "alias"}) != "total" || !c.vars["alias"].isList || !strings.Contains(compilerOut(c), "var alias []*User = source") {
+		t.Fatal("declared list alias lost its pagination total", compilerOut(c))
+	}
+}
+
 func TestCompileTemplate(t *testing.T) {
 	c := newCompiler(nil)
 	got := c.compileExpr(&ast.TemplateString{Parts: []ast.Expr{
@@ -2346,8 +2720,8 @@ func TestCompileRange(t *testing.T) {
 		Start: &ast.Literal{Kind: token.Int, Value: "1"},
 		End:   &ast.Literal{Kind: token.Int, Value: "10"},
 	})
-	if got != "lux.IntRange(1, 10)" {
-		t.Fatalf("expected lux.IntRange(1, 10), got %q", got)
+	if got != "_range1" || !strings.Contains(compilerOut(c), "_range1, err := lux.IntRange(1, 10)") || !strings.Contains(compilerOut(c), "if err != nil") {
+		t.Fatalf("range must propagate errors: %q / %s", got, compilerOut(c))
 	}
 }
 
@@ -2392,29 +2766,28 @@ func TestCompileWhenWithoutSubject(t *testing.T) {
 	}
 }
 
+func assertUntypedLambdaRejected(t *testing.T, expression *ast.LambdaExpr) {
+	t.Helper()
+	defer func() {
+		failure, ok := recover().(*InternalCompilerError)
+		if !ok || !strings.Contains(failure.Detail, "untyped lambda") {
+			t.Fatal("untyped lambda must fail with an internal compiler diagnostic")
+		}
+	}()
+	newCompiler(nil).compileExpr(expression)
+}
+
 func TestCompileLambda(t *testing.T) {
-	c := newCompiler(nil)
-	got := c.compileExpr(&ast.LambdaExpr{
+	assertUntypedLambdaRejected(t, &ast.LambdaExpr{
 		Params: []string{"x"},
-		Body: &ast.Block{Stmts: []ast.Stmt{
-			&ast.ReturnStmt{Value: &ast.Ident{Name: "x"}},
-		}},
+		Body:   &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.Ident{Name: "x"}}}},
 	})
-	if !strings.Contains(got, "func(x any) any {") {
-		t.Fatalf("missing lambda signature, got %q", got)
-	}
 }
 
 func TestCompileLambdaImplicitIt(t *testing.T) {
-	c := newCompiler(nil)
-	got := c.compileExpr(&ast.LambdaExpr{
-		Body: &ast.Block{Stmts: []ast.Stmt{
-			&ast.ReturnStmt{Value: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "price"}},
-		}},
+	assertUntypedLambdaRejected(t, &ast.LambdaExpr{
+		Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "price"}}}},
 	})
-	if !strings.Contains(got, "func(it any) any {") {
-		t.Fatalf("missing implicit it, got %q", got)
-	}
 }
 
 func TestCompileTransaction(t *testing.T) {
@@ -2424,7 +2797,7 @@ func TestCompileTransaction(t *testing.T) {
 			&ast.ExprStmt{Expr: &ast.Ident{Name: "doSomething"}},
 		}},
 	})
-	if !strings.Contains(got, "app.DB.Tx(ctx, func(ctx context.Context) error {") {
+	if !strings.Contains(got, "app.Tx(ctx, func(app *App) error {") {
 		t.Fatalf("missing Tx wrapper, got %q", got)
 	}
 	if !strings.Contains(got, "return nil") {
@@ -2447,10 +2820,10 @@ func TestCompileModelUpdate(t *testing.T) {
 			{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "new"}},
 		},
 	})
-	if !strings.Contains(got, ".Update(ctx,") {
-		t.Fatalf("missing .Update(ctx, ...), got %q", got)
+	if !strings.Contains(got, ".updatePrepared(ctx,") {
+		t.Fatalf("missing .updatePrepared(ctx, ...), got %q", got)
 	}
-	if !strings.Contains(got, `lux.SetField{Col: "name"`) {
+	if !strings.Contains(got, `lux.SetField{Col: "\"name\""`) {
 		t.Fatalf("missing SetField, got %q", got)
 	}
 }
@@ -2568,7 +2941,7 @@ func TestCompileRegisterAPI(t *testing.T) {
 			&ast.ExprStmt{
 				Expr: &ast.ElvisExpr{
 					Left:  &ast.UnaryExpr{Op: "!", Value: &ast.Ident{Name: "exists"}},
-					Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "conflict"},
+					Right: &ast.UnaryExpr{Op: "throw", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "conflict"}},
 				},
 			},
 			// val user = User.create(name: name, email: email, password: password)
@@ -2697,7 +3070,7 @@ func TestCompileUpdateProfileAPI(t *testing.T) {
 		t.Fatalf("missing ParamString for name, got:\n%s", out)
 	}
 	// Check find
-	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(id)).First(ctx)") {
+	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(id)).FirstRequired(ctx)") {
 		t.Fatalf("missing find chain, got:\n%s", out)
 	}
 	// Check assignments
@@ -2742,7 +3115,7 @@ func TestCompileDeleteWithCheckAPI(t *testing.T) {
 			&ast.ExprStmt{
 				Expr: &ast.ElvisExpr{
 					Left:  &ast.Ident{Name: "user"},
-					Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"},
+					Right: &ast.UnaryExpr{Op: "throw", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"}},
 				},
 			},
 			// val count = User.where(it.id == id).delete()
@@ -2777,7 +3150,7 @@ func TestCompileDeleteWithCheckAPI(t *testing.T) {
 		t.Fatalf("missing function signature, got:\n%s", out)
 	}
 	// Check find
-	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(id)).First(ctx)") {
+	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(id)).FirstRequired(ctx)") {
 		t.Fatalf("missing find, got:\n%s", out)
 	}
 	// Check elvis nil guard
@@ -3224,7 +3597,7 @@ func TestCompileTransactionWithModelOps(t *testing.T) {
 			},
 		}},
 	})
-	if !strings.Contains(got, "app.DB.Tx(ctx, func(ctx context.Context) error {") {
+	if !strings.Contains(got, "app.Tx(ctx, func(app *App) error {") {
 		t.Fatalf("missing Tx wrapper, got:\n%s", got)
 	}
 	if !strings.Contains(got, "app.User.Create()") {
@@ -3254,8 +3627,8 @@ func TestCompileAsyncFireAndForget(t *testing.T) {
 			},
 		}},
 	})
-	if !strings.Contains(got, "go func() {") {
-		t.Fatalf("missing go func(), got:\n%s", got)
+	if !strings.Contains(got, "api.RunAsyncTask(func() {") {
+		t.Fatalf("missing asynchronous task boundary, got:\n%s", got)
 	}
 	if !strings.Contains(got, "EmitEmailSent") {
 		t.Fatalf("missing EmitEmailSent, got:\n%s", got)
@@ -3301,15 +3674,15 @@ func TestCompileAwaitParallelQueries(t *testing.T) {
 		}},
 	})
 	out := compilerOut(c)
-	// Should declare vars in outer scope
-	if !strings.Contains(out, "var user *User") {
+	// Standalone await keeps typed task slots inside its own lexical scope.
+	if !strings.Contains(out, " *User") {
 		t.Fatalf("missing var user *User, got:\n%s", out)
 	}
-	if !strings.Contains(out, "var posts []*Post") {
+	if !strings.Contains(out, " []*Post") {
 		t.Fatalf("missing var posts []*Post, got:\n%s", out)
 	}
 	// Should use errgroup
-	if !strings.Contains(out, "errgroup.WithContext(ctx)") {
+	if !strings.Contains(out, "api.NewTaskGroup(ctx)") {
 		t.Fatalf("missing errgroup, got:\n%s", out)
 	}
 	if !strings.Contains(out, "g.Go(func() error {") {
@@ -3323,12 +3696,11 @@ func TestCompileAwaitParallelQueries(t *testing.T) {
 	if !strings.Contains(out, "g.Wait()") {
 		t.Fatalf("missing g.Wait(), got:\n%s", out)
 	}
-	// Vars should be tracked
-	if vt, ok := c.vars["user"]; !ok || !vt.isModel {
-		t.Error("user var not tracked as model")
+	if _, leaked := c.vars["user"]; leaked {
+		t.Error("await user binding leaked into its parent")
 	}
-	if vt, ok := c.vars["posts"]; !ok || !vt.isList {
-		t.Error("posts var not tracked as list")
+	if _, leaked := c.vars["posts"]; leaked {
+		t.Error("await posts binding leaked into its parent")
 	}
 }
 
@@ -3361,8 +3733,11 @@ func TestCompileAwaitDestructuringBindsParallelResults(t *testing.T) {
 	for _, want := range []string{
 		"var user *User",
 		"var posts []*Post",
-		"user, err = app.User.Where(UserWhere.Id.Eq(id)).First(gctx)",
-		"posts, err = app.Post.Where().All(gctx)",
+		"ctx := gctx",
+		"_awaitValue, err := app.User.Where(UserWhere.Id.Eq(id)).FirstRequired(ctx)",
+		"user = _awaitValue",
+		"_awaitValue, err := app.Post.Where().All(ctx)",
+		"posts = _awaitValue",
 		"if err := g.Wait(); err != nil",
 	} {
 		if !strings.Contains(out, want) {
@@ -3386,7 +3761,7 @@ func TestCompileAwaitSingleExpressionBinding(t *testing.T) {
 		}}},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, "var user *User") || !strings.Contains(out, "user, err = app.User.Where(UserWhere.Id.Eq(id)).First(gctx)") {
+	if !strings.Contains(out, "var user *User") || !strings.Contains(out, "ctx := gctx") || !strings.Contains(out, "_awaitValue, err := app.User.Where(UserWhere.Id.Eq(id)).FirstRequired(ctx)") || !strings.Contains(out, "user = _awaitValue") {
 		t.Fatalf("single-expression await binding was not compiled:\n%s", out)
 	}
 }
@@ -3413,7 +3788,7 @@ func TestCompileAwaitBindingsIgnoreInvalidRecoveryNodes(t *testing.T) {
 		nil,
 		&ast.ExprStmt{},
 	}}}, []string{"value"})
-	if out := compilerOut(c); !strings.Contains(out, "errgroup.WithContext(ctx)") {
+	if out := compilerOut(c); !strings.Contains(out, "api.NewTaskGroup(ctx)") {
 		t.Fatalf("recovered await block was not emitted:\n%s", out)
 	}
 }
@@ -3436,10 +3811,15 @@ func TestGoTypeForAwaitValue(t *testing.T) {
 		want  string
 	}{
 		{name: "model", value: valType{name: "User", isModel: true}, want: "*User"},
+		{name: "model value", value: valType{name: "User", isModel: true, isValue: true}, want: "User"},
 		{name: "model list", value: valType{name: "User", isModel: true, isList: true}, want: "[]*User"},
 		{name: "primitive", value: valType{name: "Int"}, want: "int64"},
 		{name: "primitive list", value: valType{name: "String", isList: true}, want: "[]string"},
 		{name: "nullable primitive", value: valType{name: "Int", nullable: true}, want: "*int64"},
+		{name: "bytes", value: valType{name: "Bytes"}, want: "[]byte"},
+		{name: "nullable bytes", value: valType{name: "Bytes", nullable: true}, want: "*[]byte"},
+		{name: "nullable JSON", value: valType{name: "JSON", nullable: true}, want: "*json.RawMessage"},
+		{name: "typed channel", value: valType{name: "Channel", isChan: true, typeRef: &ast.TypeRef{Name: "Channel", TypeArgs: []*ast.TypeRef{{Name: "Int"}}}}, want: "chan int64"},
 		{name: "nullable list", value: valType{name: "String", isList: true, nullable: true}, want: "[]string"},
 	}
 	for _, test := range tests {
@@ -3470,7 +3850,7 @@ func TestCompileAwaitAggregateUsesGroupContext(t *testing.T) {
 		}}},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, `.Sum(gctx, "story_points")`) {
+	if !strings.Contains(out, "ctx := gctx") || !strings.Contains(out, `.Sum(ctx, "\"story_points\"")`) {
 		t.Fatalf("await aggregate did not use group context:\n%s", out)
 	}
 }
@@ -3543,10 +3923,10 @@ func TestCompileAwaitFusesScalarAggregateFunctions(t *testing.T) {
 	out := compilerOut(c)
 	for _, want := range []string{
 		"Function: lux.AggregateCount",
-		"Function: lux.AggregateSum, Column: \"story_points\"",
-		"Function: lux.AggregateAvg, Column: \"story_points\"",
-		"Function: lux.AggregateMin, Column: \"story_points\"",
-		"Function: lux.AggregateMax, Column: \"story_points\"",
+		"Function: lux.AggregateSum, Column: \"\\\"story_points\\\"\"",
+		"Function: lux.AggregateAvg, Column: \"\\\"story_points\\\"\"",
+		"Function: lux.AggregateMin, Column: \"\\\"story_points\\\"\"",
+		"Function: lux.AggregateMax, Column: \"\\\"story_points\\\"\"",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("fused scalar aggregates missing %q:\n%s", want, out)
@@ -3598,7 +3978,7 @@ func TestCompileAwaitAggregateFusionFallsBackSafely(t *testing.T) {
 			}
 			c.compileStmt(&ast.ValStmt{Names: []string{"left", "right"}, Value: &ast.AwaitExpr{Body: &ast.Block{Stmts: stmts}}})
 			out := compilerOut(c)
-			if strings.Contains(out, ".AggregateBatch(") || strings.Count(out, ".Count(gctx)") != 2 {
+			if strings.Contains(out, ".AggregateBatch(") || strings.Count(out, "ctx := gctx") != 2 || strings.Count(out, ".Count(ctx)") != 2 {
 				t.Fatalf("unsafe aggregates must retain independent execution:\n%s", out)
 			}
 		})
@@ -3750,7 +4130,7 @@ func TestCompileAwaitNoVals(t *testing.T) {
 		}},
 	})
 	out := compilerOut(c)
-	if strings.Contains(out, "errgroup") {
+	if strings.Contains(out, "api.NewTaskGroup") {
 		t.Fatalf("should not use errgroup for non-val stmts, got:\n%s", out)
 	}
 	if !strings.Contains(out, "doSomething") {
@@ -3761,19 +4141,21 @@ func TestCompileAwaitNoVals(t *testing.T) {
 // TestCompileAwaitNonQueryVal — await with non-model-query val → no error handling
 func TestCompileAwaitNonQueryVal(t *testing.T) {
 	c := newCompiler(nil)
+	value := &ast.Literal{Kind: token.Int, Value: "42"}
+	value.SetTypeTag("Int")
 	c.compileExpr(&ast.AwaitExpr{
 		Body: &ast.Block{Stmts: []ast.Stmt{
 			&ast.ValStmt{
 				Name:  "x",
-				Value: &ast.Literal{Kind: token.Int, Value: "42"},
+				Value: value,
 			},
 		}},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, "var x any") {
+	if !strings.Contains(out, " int64") {
 		t.Fatalf("missing var declaration, got:\n%s", out)
 	}
-	if !strings.Contains(out, "x = 42") {
+	if !strings.Contains(out, "int64(42)") {
 		t.Fatalf("missing assignment, got:\n%s", out)
 	}
 	if !strings.Contains(out, "return nil") {
@@ -3787,10 +4169,10 @@ func TestCompileElvisWithThrow(t *testing.T) {
 	c.compileStmt(&ast.ExprStmt{
 		Expr: &ast.ElvisExpr{
 			Left: &ast.Ident{Name: "user"},
-			Right: &ast.MemberExpr{
+			Right: &ast.UnaryExpr{Op: "throw", Value: &ast.MemberExpr{
 				Object: &ast.Ident{Name: "error"},
 				Field:  "notFound",
-			},
+			}},
 		},
 	})
 	out := compilerOut(c)
@@ -3920,7 +4302,7 @@ func TestCompileModelUpdateExpr(t *testing.T) {
 	if !strings.Contains(got, "app.User.Where(UserWhere.Id.Eq(id))") {
 		t.Fatalf("missing where clause, got:\n%s", got)
 	}
-	if !strings.Contains(got, `.Update(ctx, lux.SetField{Col: "name"`) {
+	if !strings.Contains(got, `.updatePrepared(ctx, lux.SetField{Col: "\"name\""`) {
 		t.Fatalf("missing .Update with SetField, got:\n%s", got)
 	}
 }
@@ -3969,7 +4351,7 @@ func TestCompileIfWithElvisGuard(t *testing.T) {
 	c.compileStmt(&ast.ExprStmt{
 		Expr: &ast.ElvisExpr{
 			Left:  &ast.Ident{Name: "data"},
-			Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "badRequest"},
+			Right: &ast.UnaryExpr{Op: "throw", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "badRequest"}},
 		},
 	})
 	// Then: if check
@@ -4029,7 +4411,7 @@ func TestCompileReturnList(t *testing.T) {
 	if !strings.Contains(out, "[]int64{1, 2, 3}") {
 		t.Fatalf("missing typed list literal, got:\n%s", out)
 	}
-	if !strings.Contains(out, "codec.AppendVarint(req.Buf.B, uint64(len([]int64{1, 2, 3})))") {
+	if !strings.Contains(out, "codec.AppendArrayHeader(req.Buf.B, len([]int64{1, 2, 3}))") {
 		t.Fatalf("missing canonical list encoding, got:\n%s", out)
 	}
 }
@@ -4157,19 +4539,17 @@ func TestCompileParallelProfileAPI(t *testing.T) {
 			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
 		},
 		Body: &ast.Block{Stmts: []ast.Stmt{
-			// await { val user = User.find(id); val posts = Post.where(...).all() }
-			&ast.ExprStmt{Expr: &ast.AwaitExpr{
+			// Export await results explicitly; standalone await bindings stay local.
+			&ast.ValStmt{Names: []string{"user", "posts"}, Value: &ast.AwaitExpr{
 				Body: &ast.Block{Stmts: []ast.Stmt{
-					&ast.ValStmt{
-						Name: "user",
-						Value: &ast.CallExpr{
+					&ast.ExprStmt{
+						Expr: &ast.CallExpr{
 							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "find"},
 							Args: []*ast.NamedArg{{Name: "id", Value: &ast.Ident{Name: "id"}}},
 						},
 					},
-					&ast.ValStmt{
-						Name: "posts",
-						Value: &ast.CallExpr{
+					&ast.ExprStmt{
+						Expr: &ast.CallExpr{
 							Func: &ast.MemberExpr{
 								Object: &ast.CallExpr{
 									Func: &ast.MemberExpr{Object: &ast.Ident{Name: "Post"}, Field: "where"},
@@ -4207,7 +4587,7 @@ func TestCompileParallelProfileAPI(t *testing.T) {
 		t.Fatalf("missing var posts, got:\n%s", out)
 	}
 	// Should have errgroup
-	if !strings.Contains(out, "errgroup.WithContext") {
+	if !strings.Contains(out, "api.NewTaskGroup") {
 		t.Fatalf("missing errgroup, got:\n%s", out)
 	}
 	// Should use gctx in goroutines
@@ -4257,7 +4637,9 @@ func TestCompileForRangeWithExprBounds(t *testing.T) {
 		Body: &ast.Block{Stmts: []ast.Stmt{}},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, "for idx := int64(offset); idx <= offset + limit; idx++") {
+	if !strings.Contains(out, "var _evaluated1 int64 = offset") || !strings.Contains(out, "var _evaluated2 int64 = offset + limit") ||
+		!strings.Contains(out, "for idx, _rangeMore3 := int64(_evaluated1), _evaluated1 <= _evaluated2;") ||
+		!strings.Contains(out, "idx, _rangeMore3 = idx + 1, idx < _evaluated2") {
 		t.Fatalf("expected range with expr bounds, got:\n%s", out)
 	}
 }
@@ -4330,7 +4712,10 @@ func TestCompileForExprEmpty(t *testing.T) {
 
 // TestCompileIntRange — lux.IntRange runtime function
 func TestIntRange(t *testing.T) {
-	result := lux.IntRange(0, 5)
+	result, err := lux.IntRange(0, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(result) != 6 {
 		t.Fatalf("IntRange(0,5) len = %d, want 6", len(result))
 	}
@@ -4340,14 +4725,20 @@ func TestIntRange(t *testing.T) {
 }
 
 func TestIntRangeReverse(t *testing.T) {
-	result := lux.IntRange(10, 5)
+	result, err := lux.IntRange(10, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if result != nil {
 		t.Errorf("IntRange(10,5) should be nil, got %v", result)
 	}
 }
 
 func TestIntRangeSingle(t *testing.T) {
-	result := lux.IntRange(3, 3)
+	result, err := lux.IntRange(3, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(result) != 1 || result[0] != 3 {
 		t.Errorf("IntRange(3,3) = %v, want [3]", result)
 	}
@@ -4405,7 +4796,7 @@ func TestCompileChainOrderByDesc(t *testing.T) {
 		Args: []*ast.NamedArg{},
 	}
 	got := c.compileExpr(call)
-	if !strings.Contains(got, `.OrderBy("name DESC")`) {
+	if !strings.Contains(got, `.OrderBy("\"name\" DESC")`) {
 		t.Fatalf("expected OrderBy DESC, got %q", got)
 	}
 }
@@ -4449,7 +4840,7 @@ func TestCompileModelChainSum(t *testing.T) {
 		Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "total"}}},
 	}
 	got := c.compileExpr(call)
-	if !strings.Contains(got, `.Sum(ctx, "total")`) {
+	if !strings.Contains(got, `.Sum(ctx, "\"total\"")`) {
 		t.Fatalf("expected Sum, got %q", got)
 	}
 }
@@ -4466,7 +4857,7 @@ func TestCompileModelChainSum(t *testing.T) {
 //	  tx {
 //	    val balance = getBalance(from)?
 //	    if balance < amount {
-//	      throw error.InsufficientFunds
+//	      throw InsufficientFunds
 //	    }
 //	    from.balance -= amount
 //	  }
@@ -4494,10 +4885,10 @@ func TestCompileTransferAPI(t *testing.T) {
 			&ast.ExprStmt{
 				Expr: &ast.ElvisExpr{
 					Left:  &ast.Ident{Name: "from"},
-					Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"},
+					Right: &ast.UnaryExpr{Op: "throw", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"}},
 				},
 			},
-			// tx { val balance = getBalance(from)?; if balance < amount { throw error.InsufficientFunds }; from.balance -= amount }
+			// tx { val balance = getBalance(from)?; if balance < amount { throw InsufficientFunds }; from.balance -= amount }
 			&ast.ExprStmt{
 				Expr: &ast.TransactionExpr{
 					Body: &ast.Block{Stmts: []ast.Stmt{
@@ -4519,7 +4910,7 @@ func TestCompileTransferAPI(t *testing.T) {
 							},
 							Then: &ast.Block{Stmts: []ast.Stmt{
 								&ast.ThrowStmt{
-									Error: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "insufficientFunds"},
+									Error: &ast.Ident{Name: "InsufficientFunds"},
 								},
 							}},
 						},
@@ -4562,7 +4953,7 @@ func TestCompileTransferAPI(t *testing.T) {
 		t.Fatalf("missing ParamFloat for amount, got:\n%s", out)
 	}
 	// Check find
-	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(fromId)).First(ctx)") {
+	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(fromId)).FirstRequired(ctx)") {
 		t.Fatalf("missing User.find, got:\n%s", out)
 	}
 	// Check elvis guard
@@ -4573,7 +4964,7 @@ func TestCompileTransferAPI(t *testing.T) {
 		t.Fatalf("missing throw NotFound, got:\n%s", out)
 	}
 	// Check transaction
-	if !strings.Contains(out, "app.DB.Tx(ctx, func(ctx context.Context) error {") {
+	if !strings.Contains(out, "app.Tx(ctx, func(app *App) error {") {
 		t.Fatalf("missing Tx wrapper, got:\n%s", out)
 	}
 	// Check ? operator inside tx
@@ -4585,7 +4976,7 @@ func TestCompileTransferAPI(t *testing.T) {
 		t.Fatalf("missing balance < amount check, got:\n%s", out)
 	}
 	// Check throw inside if
-	if !strings.Contains(out, "return errors.InsufficientFunds") {
+	if !strings.Contains(out, "return NewInsufficientFunds()") {
 		t.Fatalf("missing throw InsufficientFunds, got:\n%s", out)
 	}
 	// Check compound assignment
@@ -4678,7 +5069,7 @@ func TestCompileSearchAPI(t *testing.T) {
 	if !strings.Contains(out, "PostWhere.Title.Eq(keyword)") {
 		t.Fatalf("missing where clause, got:\n%s", out)
 	}
-	if !strings.Contains(out, `.OrderBy("views DESC")`) {
+	if !strings.Contains(out, `.OrderBy("\"views\" DESC")`) {
 		t.Fatalf("missing OrderBy DESC, got:\n%s", out)
 	}
 	if !strings.Contains(out, ".Limit(int(limit))") {
@@ -4766,7 +5157,7 @@ func TestCompileAnalyticsAPI(t *testing.T) {
 		t.Fatalf("missing .Count(ctx), got:\n%s", out)
 	}
 	// Check sum query
-	if !strings.Contains(out, `.Sum(ctx, "amount")`) {
+	if !strings.Contains(out, `.Sum(ctx, "\"amount\"")`) {
 		t.Fatalf("missing .Sum(ctx, amount), got:\n%s", out)
 	}
 	// Check return — total tracked as Int from count → AppendSvarint
@@ -4850,8 +5241,8 @@ func TestCompileAsyncNotificationAPI(t *testing.T) {
 	if !strings.Contains(out, "for _, user := range users {") {
 		t.Fatalf("missing for range, got:\n%s", out)
 	}
-	if !strings.Contains(out, "go func() {") {
-		t.Fatalf("missing go func(), got:\n%s", out)
+	if !strings.Contains(out, "api.RunAsyncTask(func() {") {
+		t.Fatalf("missing asynchronous task boundary, got:\n%s", out)
 	}
 	if !strings.Contains(out, "EmitNotification") {
 		t.Fatalf("missing EmitNotification, got:\n%s", out)
@@ -4956,6 +5347,7 @@ func TestCompileWhenWithModelQuery(t *testing.T) {
 		},
 		Else: &ast.Literal{Kind: token.Int, Value: "0"},
 	})
+	got = compilerOut(c) + got
 	if !strings.Contains(got, "switch role") {
 		t.Fatalf("missing switch, got:\n%s", got)
 	}
@@ -4972,31 +5364,14 @@ func TestCompileWhenWithModelQuery(t *testing.T) {
 
 // TestCompileLambdaWithForLoop — lambda containing a for loop
 func TestCompileLambdaWithForLoop(t *testing.T) {
-	c := newCompiler(nil)
-	got := c.compileExpr(&ast.LambdaExpr{
+	assertUntypedLambdaRejected(t, &ast.LambdaExpr{
 		Params: []string{"items"},
-		Body: &ast.Block{Stmts: []ast.Stmt{
-			&ast.ForStmt{
-				VarName:    "item",
-				Collection: &ast.Ident{Name: "items"},
-				Body: &ast.Block{Stmts: []ast.Stmt{
-					&ast.ExprStmt{Expr: &ast.CallExpr{
-						Func: &ast.Ident{Name: "process"},
-						Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "item"}}},
-					}},
-				}},
-			},
-		}},
+		Body: &ast.Block{Stmts: []ast.Stmt{&ast.ForStmt{
+			VarName: "item", Collection: &ast.Ident{Name: "items"}, Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.Ident{Name: "process"}, Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "item"}}}}},
+			}},
+		}}},
 	})
-	if !strings.Contains(got, "func(items any) any {") {
-		t.Fatalf("missing lambda signature, got:\n%s", got)
-	}
-	if !strings.Contains(got, "for _, item := range items {") {
-		t.Fatalf("missing for range inside lambda, got:\n%s", got)
-	}
-	if !strings.Contains(got, "process(item)") {
-		t.Fatalf("missing process(item), got:\n%s", got)
-	}
 }
 
 // TestCompileNestedTransaction — tx containing model create + update
@@ -5036,7 +5411,7 @@ func TestCompileNestedTransaction(t *testing.T) {
 			},
 		}},
 	})
-	if !strings.Contains(got, "app.DB.Tx(ctx, func(ctx context.Context) error {") {
+	if !strings.Contains(got, "app.Tx(ctx, func(app *App) error {") {
 		t.Fatalf("missing Tx wrapper, got:\n%s", got)
 	}
 	if !strings.Contains(got, "app.User.Create()") {
@@ -5048,10 +5423,10 @@ func TestCompileNestedTransaction(t *testing.T) {
 	if !strings.Contains(got, "PostWhere.UserId.Eq(user.Id)") {
 		t.Fatalf("missing where condition, got:\n%s", got)
 	}
-	if !strings.Contains(got, ".Update(ctx,") {
+	if !strings.Contains(got, ".updatePrepared(ctx,") {
 		t.Fatalf("missing Update, got:\n%s", got)
 	}
-	if !strings.Contains(got, `lux.SetField{Col: "author_name"`) {
+	if !strings.Contains(got, `lux.SetField{Col: "\"author_name\""`) {
 		t.Fatalf("missing SetField for authorName, got:\n%s", got)
 	}
 }
@@ -5173,13 +5548,13 @@ func TestCompileAwaitWithThreeQueries(t *testing.T) {
 		}},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, "var user *User") {
+	if !strings.Contains(out, " *User") {
 		t.Fatalf("missing var user, got:\n%s", out)
 	}
-	if !strings.Contains(out, "var posts []*Post") {
+	if !strings.Contains(out, " []*Post") {
 		t.Fatalf("missing var posts, got:\n%s", out)
 	}
-	if !strings.Contains(out, "var orderCount int64") {
+	if !strings.Contains(out, " int64") {
 		t.Fatalf("missing var orderCount int64, got:\n%s", out)
 	}
 	// Should have 3 g.Go calls
@@ -5261,7 +5636,7 @@ func TestCompileChainWhereOrderByLimitAll(t *testing.T) {
 	if !strings.Contains(got, "app.Post.Where(PostWhere.Views.Gt(100))") {
 		t.Fatalf("missing where clause, got:\n%s", got)
 	}
-	if !strings.Contains(got, `.OrderBy("views DESC")`) {
+	if !strings.Contains(got, `.OrderBy("\"views\" DESC")`) {
 		t.Fatalf("missing OrderBy, got:\n%s", got)
 	}
 	if !strings.Contains(got, ".Limit(10)") {
@@ -5294,9 +5669,9 @@ func TestCompileTemplateWithMemberAccess(t *testing.T) {
 	c := newCompiler(nil)
 	got := c.compileExpr(&ast.TemplateString{Parts: []ast.Expr{
 		&ast.Literal{Kind: token.String, Value: "Hello "},
-		&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "name"},
+		&ast.MemberExpr{TypeTagged: ast.TypeTagged{TypeTag: "String"}, Object: &ast.Ident{Name: "user"}, Field: "name"},
 		&ast.Literal{Kind: token.String, Value: ", you have "},
-		&ast.MemberExpr{Object: &ast.Ident{Name: "post"}, Field: "count"},
+		&ast.MemberExpr{TypeTagged: ast.TypeTagged{TypeTag: "Int"}, Object: &ast.Ident{Name: "post"}, Field: "count"},
 		&ast.Literal{Kind: token.String, Value: " posts"},
 	}})
 	if !strings.Contains(got, `"Hello "`) {
@@ -5318,14 +5693,14 @@ func TestCompileTemplateWithMemberAccess(t *testing.T) {
 	if !strings.Contains(got, "strings.Builder") {
 		t.Fatalf("missing strings.Builder, got:\n%s", got)
 	}
-	// 3 literal WriteStrings + 2 fmt.Fprintf for unknown-type member access
+	// Literals and text write directly; the analyzed Int uses a stack buffer.
 	wsCount := strings.Count(got, "_sb.WriteString(")
 	fmtCount := strings.Count(got, "fmt.Fprintf(&_sb")
-	if wsCount != 3 {
-		t.Fatalf("expected 3 WriteString calls for literals, got %d:\n%s", wsCount, got)
+	if wsCount != 4 {
+		t.Fatalf("expected 4 WriteString calls, got %d:\n%s", wsCount, got)
 	}
-	if fmtCount != 2 {
-		t.Fatalf("expected 2 fmt.Fprintf for unknown member access, got %d:\n%s", fmtCount, got)
+	if fmtCount != 0 || !strings.Contains(got, "strconv.AppendInt") {
+		t.Fatalf("expected static integer formatting, got:\n%s", got)
 	}
 }
 
@@ -5358,21 +5733,21 @@ func TestCompileElvisChainedGuards(t *testing.T) {
 	c.compileStmt(&ast.ExprStmt{
 		Expr: &ast.ElvisExpr{
 			Left:  &ast.Ident{Name: "user"},
-			Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"},
+			Right: &ast.UnaryExpr{Op: "throw", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"}},
 		},
 	})
 	// profile ?: throw error.NotFound
 	c.compileStmt(&ast.ExprStmt{
 		Expr: &ast.ElvisExpr{
 			Left:  &ast.Ident{Name: "profile"},
-			Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"},
+			Right: &ast.UnaryExpr{Op: "throw", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "notFound"}},
 		},
 	})
 	// token ?: throw error.Unauthorized
 	c.compileStmt(&ast.ExprStmt{
 		Expr: &ast.ElvisExpr{
 			Left:  &ast.Ident{Name: "token"},
-			Right: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "unauthorized"},
+			Right: &ast.UnaryExpr{Op: "throw", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "error"}, Field: "unauthorized"}},
 		},
 	})
 	out := compilerOut(c)
@@ -5452,7 +5827,7 @@ func TestCompileQuestionWithModelFind(t *testing.T) {
 	if !strings.Contains(out, "_result1, err :=") || !strings.Contains(out, "user := _result1") {
 		t.Fatalf("missing user, err :=, got:\n%s", out)
 	}
-	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(id)).First(ctx)") {
+	if !strings.Contains(out, "app.User.Where(UserWhere.Id.Eq(id)).FirstRequired(ctx)") {
 		t.Fatalf("missing find chain, got:\n%s", out)
 	}
 	if !strings.Contains(out, "if err != nil") {
@@ -5475,8 +5850,8 @@ func TestCompileAsyncWithMultipleEmits(t *testing.T) {
 			},
 		}},
 	})
-	if !strings.Contains(got, "go func() {") {
-		t.Fatalf("missing go func(), got:\n%s", got)
+	if !strings.Contains(got, "api.RunAsyncTask(func() {") {
+		t.Fatalf("missing asynchronous task boundary, got:\n%s", got)
 	}
 	if !strings.Contains(got, "EmitTaskStarted") {
 		t.Fatalf("missing EmitTaskStarted, got:\n%s", got)
@@ -5529,7 +5904,7 @@ func TestCompileEmptyTransaction(t *testing.T) {
 	got := c.compileExpr(&ast.TransactionExpr{
 		Body: &ast.Block{Stmts: nil},
 	})
-	if !strings.Contains(got, "app.DB.Tx(ctx, func(ctx context.Context) error {") {
+	if !strings.Contains(got, "app.Tx(ctx, func(app *App) error {") {
 		t.Fatalf("missing Tx wrapper, got:\n%s", got)
 	}
 	if !strings.Contains(got, "return nil") {
@@ -5546,11 +5921,11 @@ func TestCompileEmptyAsync(t *testing.T) {
 	got := c.compileExpr(&ast.AsyncExpr{
 		Body: &ast.Block{Stmts: nil},
 	})
-	if !strings.Contains(got, "go func() {") {
-		t.Fatalf("missing go func(), got:\n%s", got)
+	if !strings.Contains(got, "api.RunAsyncTask(func() {") {
+		t.Fatalf("missing asynchronous task boundary, got:\n%s", got)
 	}
-	if !strings.Contains(got, "}()") {
-		t.Fatalf("missing }(), got:\n%s", got)
+	if !strings.Contains(got, "})") {
+		t.Fatalf("missing task argument terminator, got:\n%s", got)
 	}
 }
 
@@ -5562,24 +5937,14 @@ func TestCompileEmptyAwait(t *testing.T) {
 	})
 	out := compilerOut(c)
 	// Empty await with no val stmts → no errgroup, just empty
-	if strings.Contains(out, "errgroup") {
+	if strings.Contains(out, "api.NewTaskGroup") {
 		t.Fatalf("empty await should not produce errgroup, got:\n%s", out)
 	}
 }
 
 // TestCompileEmptyLambda — { -> } (empty body)
 func TestCompileEmptyLambda(t *testing.T) {
-	c := newCompiler(nil)
-	got := c.compileExpr(&ast.LambdaExpr{
-		Params: nil,
-		Body:   &ast.Block{Stmts: nil},
-	})
-	if !strings.Contains(got, "func(it any) any {") {
-		t.Fatalf("missing lambda signature with implicit it, got:\n%s", got)
-	}
-	if !strings.Contains(got, "}") {
-		t.Fatalf("missing closing brace, got:\n%s", got)
-	}
+	assertUntypedLambdaRejected(t, &ast.LambdaExpr{Body: &ast.Block{}})
 }
 
 // TestCompileReturnNullExplicit — return null
@@ -5726,19 +6091,76 @@ func TestCompileUnaryNegation(t *testing.T) {
 
 // ─── Channel ───────────────────────────────────────────────────────────────
 
+func TestCompileChannelTypePropagation(t *testing.T) {
+	c := newCompiler(nil)
+	element := &ast.TypeRef{Name: "Int"}
+	channel := &ast.TypeRef{Name: "Channel", TypeArgs: []*ast.TypeRef{element}}
+	c.vars["ch"] = valType{isChan: true, name: "Channel", typeRef: channel}
+	c.compileVal(&ast.ValStmt{Name: "alias", Value: &ast.Ident{Name: "ch"}})
+	if c.vars["alias"].typeRef != channel || !c.vars["alias"].isChan {
+		t.Fatal("channel alias lost its element type")
+	}
+	c.functions = map[string]*ast.FnDecl{"makeChannel": {ReturnType: channel}}
+	call := &ast.CallExpr{Func: &ast.Ident{Name: "makeChannel"}}
+	if c.channelTypeRef(call) != channel {
+		t.Fatal("function channel result lost its element type")
+	}
+	if c.channelTypeRef(&ast.UnaryExpr{Op: "<-", Value: &ast.Ident{Name: "ch"}}) != element {
+		t.Fatal("receive lost element type")
+	}
+	if c.channelTypeRef(&ast.UnaryExpr{Op: "<-", Value: &ast.Ident{Name: "unknown"}}) != nil ||
+		c.channelTypeRef(&ast.CallExpr{Func: &ast.Ident{Name: "unknown"}}) != nil {
+		t.Fatal("unknown channel acquired a type")
+	}
+	if got := resolveGoType(channel); got != "chan int64" {
+		t.Fatalf("channel Go type = %s", got)
+	}
+}
+
+func TestCompileInvalidChannelConstructorsFailExplicitly(t *testing.T) {
+	for _, declaration := range []bool{false, true} {
+		t.Run(map[bool]string{false: "expression", true: "declaration"}[declaration], func(t *testing.T) {
+			defer func() {
+				if _, ok := recover().(*InternalCompilerError); !ok {
+					t.Fatal("missing typed Channel did not produce an internal compiler error")
+				}
+			}()
+			c := newCompiler(nil)
+			call := &ast.CallExpr{Func: &ast.Ident{Name: "Channel"}}
+			if declaration {
+				c.compileChannelValue(&ast.ValStmt{Name: "ch", Value: call})
+			} else {
+				c.compileCall(call)
+			}
+		})
+	}
+}
+
+func TestCompileQueryAliasModifiersAndEmptyChain(t *testing.T) {
+	c := newCompiler(makeModels("User"))
+	if got := c.compileQueryAlias("query", "User", nil); got != "query" {
+		t.Fatalf("empty query chain = %s", got)
+	}
+	links := []chainLink{{method: "limit", args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "1"}}}}}
+	if got := c.compileQueryAlias("query", "User", links); got != "query.Limit(1)" {
+		t.Fatalf("query modifier = %s", got)
+	}
+}
+
 func TestCompileChannelConstruct(t *testing.T) {
 	c := newCompiler(nil)
 	// val ch = Channel(10)
 	c.compileStmt(&ast.ValStmt{
 		Name: "ch",
+		Type: &ast.TypeRef{Name: "Channel", TypeArgs: []*ast.TypeRef{{Name: "Int"}}},
 		Value: &ast.CallExpr{
 			Func: &ast.Ident{Name: "Channel"},
 			Args: []*ast.NamedArg{{Value: &ast.Literal{Value: "10"}}},
 		},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, "ch := make(chan any, 10)") {
-		t.Fatalf("want make(chan any, 10), got:\n%s", out)
+	if !strings.Contains(out, "ch := make(chan int64, _luxoCapacitych)") {
+		t.Fatalf("want typed channel, got:\n%s", out)
 	}
 	// ch should be tracked as channel
 	if vt, ok := c.vars["ch"]; !ok || !vt.isChan {
@@ -5750,11 +6172,12 @@ func TestCompileChannelConstructNoArgs(t *testing.T) {
 	c := newCompiler(nil)
 	c.compileStmt(&ast.ValStmt{
 		Name:  "ch",
+		Type:  &ast.TypeRef{Name: "Channel", TypeArgs: []*ast.TypeRef{{Name: "Int"}}},
 		Value: &ast.CallExpr{Func: &ast.Ident{Name: "Channel"}},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, "ch := make(chan any, 0)") {
-		t.Fatalf("want make(chan any, 0), got:\n%s", out)
+	if !strings.Contains(out, "ch := make(chan int64, 0)") {
+		t.Fatalf("want make(chan int64, 0), got:\n%s", out)
 	}
 }
 
@@ -5889,11 +6312,11 @@ func TestCompileChannelSelect(t *testing.T) {
 	if !strings.Contains(got, "select {") {
 		t.Fatalf("should generate select, got:\n%s", got)
 	}
-	if !strings.Contains(got, "case msg := <-ch1:") {
-		t.Fatalf("should have 'case msg := <-ch1:', got:\n%s", got)
+	if !strings.Contains(got, "_selectChannel1 := ch1") || !strings.Contains(got, "case msg := <-_selectChannel1:") {
+		t.Fatalf("should receive the captured ch1, got:\n%s", got)
 	}
-	if !strings.Contains(got, "case data := <-ch2:") {
-		t.Fatalf("should have 'case data := <-ch2:', got:\n%s", got)
+	if !strings.Contains(got, "_selectChannel2 := ch2") || !strings.Contains(got, "case data := <-_selectChannel2:") {
+		t.Fatalf("should receive the captured ch2, got:\n%s", got)
 	}
 	if !strings.Contains(got, "process(msg)") {
 		t.Fatalf("should call process(msg), got:\n%s", got)
@@ -5938,13 +6361,13 @@ func TestCompileChannelSelectNoLambda(t *testing.T) {
 	if !strings.Contains(got, "select {") {
 		t.Fatalf("should generate select, got:\n%s", got)
 	}
-	if !strings.Contains(got, "case <-ch:") {
-		t.Fatalf("should have 'case <-ch:' for no-lambda branch, got:\n%s", got)
+	if !strings.Contains(got, "case <-ch:") || strings.Contains(got, "_selectChannel") {
+		t.Fatalf("a single receiver should avoid a redundant capture, got:\n%s", got)
 	}
 }
 
 func TestCompileChannelSelectMixed(t *testing.T) {
-	// Mix of channel receive and non-channel condition
+	// Receive from an ordinary channel and a timer channel.
 	c := newCompiler(nil)
 	got := c.compileExpr(&ast.WhenExpr{
 		Branches: []*ast.WhenBranch{
@@ -5956,14 +6379,14 @@ func TestCompileChannelSelectMixed(t *testing.T) {
 				},
 			},
 			{
-				// Non-channel branch: timeout case
-				Condition: &ast.CallExpr{
+				// The timer expression is also an explicit receive.
+				Condition: &ast.UnaryExpr{Op: "<-", Value: &ast.CallExpr{
 					Func: &ast.MemberExpr{
 						Object: &ast.Ident{Name: "time"},
 						Field:  "After",
 					},
 					Args: []*ast.NamedArg{{Value: &ast.Literal{Value: "1000"}}},
-				},
+				}},
 				Body: &ast.Literal{Value: `"timeout"`},
 			},
 		},
@@ -5972,11 +6395,11 @@ func TestCompileChannelSelectMixed(t *testing.T) {
 	if !strings.Contains(got, "select {") {
 		t.Fatalf("should generate select, got:\n%s", got)
 	}
-	if !strings.Contains(got, "case msg := <-ch1:") {
-		t.Fatalf("should have channel case, got:\n%s", got)
+	if !strings.Contains(got, "case msg := <-_selectChannel1:") {
+		t.Fatalf("should have a captured channel case, got:\n%s", got)
 	}
-	if !strings.Contains(got, "case time.After(1000):") {
-		t.Fatalf("should have non-channel case, got:\n%s", got)
+	if !strings.Contains(got, "_selectChannel2 := time.After(1000)") || !strings.Contains(got, "case <-_selectChannel2:") {
+		t.Fatalf("should evaluate and receive the timer channel, got:\n%s", got)
 	}
 }
 
@@ -6066,13 +6489,14 @@ func TestCompileChannelProducerConsumer(t *testing.T) {
 	// for value in ch { process(value) }
 	c.compileStmt(&ast.ValStmt{
 		Name: "ch",
+		Type: &ast.TypeRef{Name: "Channel", TypeArgs: []*ast.TypeRef{{Name: "Int"}}},
 		Value: &ast.CallExpr{
 			Func: &ast.Ident{Name: "Channel"},
 			Args: []*ast.NamedArg{{Value: &ast.Literal{Value: "10"}}},
 		},
 	})
 	out := compilerOut(c)
-	if !strings.Contains(out, "make(chan any, 10)") {
+	if !strings.Contains(out, "make(chan int64, _luxoCapacitych)") {
 		t.Fatalf("missing channel creation, got:\n%s", out)
 	}
 }
@@ -6084,8 +6508,8 @@ func TestCompileUpdateChainEmpty(t *testing.T) {
 	var b strings.Builder
 	c.compileUpdateChain(&b, "User", nil)
 	got := b.String()
-	if got != ".Update(ctx)" {
-		t.Fatalf("empty args should produce .Update(ctx), got %q", got)
+	if got != ".updatePrepared(ctx)" {
+		t.Fatalf("empty args should produce .updatePrepared(ctx), got %q", got)
 	}
 }
 
@@ -6096,12 +6520,12 @@ func TestCompileUpdateChainBasic(t *testing.T) {
 		{Name: "name", Value: &ast.Literal{Kind: token.String, Value: "lin"}},
 	})
 	got := b.String()
-	if !strings.Contains(got, `lux.SetField{Col: "name", Val: "lin"}`) {
+	if !strings.Contains(got, `lux.SetField{Col: "\"name\"", Val: "lin"}`) {
 		t.Fatalf("basic update chain wrong, got:\n%s", got)
 	}
 }
 
-func TestCompileUpdateChainAtomic(t *testing.T) {
+func TestCompileUpdateChainPreservesObjectValue(t *testing.T) {
 	c := newCompiler(makeModels("User"))
 	var b strings.Builder
 	c.compileUpdateChain(&b, "User", []*ast.NamedArg{
@@ -6112,8 +6536,8 @@ func TestCompileUpdateChainAtomic(t *testing.T) {
 		}},
 	})
 	got := b.String()
-	if !strings.Contains(got, `Atomic: "+"`) {
-		t.Fatalf("atomic update should have Atomic field, got:\n%s", got)
+	if strings.Contains(got, "Atomic:") || !strings.Contains(got, "user.Score") {
+		t.Fatalf("update replaced the source object value: %s", got)
 	}
 }
 
@@ -6298,7 +6722,7 @@ func TestCompileTerminalMethodSumWithLambda(t *testing.T) {
 	if !done {
 		t.Fatal("sum should return true")
 	}
-	if !strings.Contains(b.String(), `.Sum(ctx, "amount")`) {
+	if !strings.Contains(b.String(), `.Sum(ctx, "\"amount\"")`) {
 		t.Fatalf("sum with lambda should extract field, got: %s", b.String())
 	}
 }
@@ -6325,7 +6749,7 @@ func TestCompileTerminalMethodUpdate(t *testing.T) {
 	if !done {
 		t.Fatal("update should return true")
 	}
-	if !strings.Contains(b.String(), ".Update(ctx,") {
+	if !strings.Contains(b.String(), ".updatePrepared(ctx,") {
 		t.Fatalf("got: %s", b.String())
 	}
 }
@@ -6400,51 +6824,6 @@ func TestCompileScopeExprOrderByAndLimit(t *testing.T) {
 	}
 	if !strings.Contains(got, "Limit(10)") {
 		t.Fatalf("scope should compile limit, got:\n%s", got)
-	}
-}
-
-// --- isStringExpr ---
-
-func TestIsStringExprLiteral(t *testing.T) {
-	c := newCompiler(nil)
-	if !c.isStringExpr(&ast.Literal{Kind: token.String, Value: "hello"}) {
-		t.Error("string literal should be string")
-	}
-	if c.isStringExpr(&ast.Literal{Kind: token.Int, Value: "42"}) {
-		t.Error("int literal should not be string")
-	}
-}
-
-func TestIsStringExprIdent(t *testing.T) {
-	c := newCompiler(nil)
-	c.vars["name"] = valType{name: "String"}
-	if !c.isStringExpr(&ast.Ident{Name: "name"}) {
-		t.Error("String var should be string")
-	}
-	c.vars["count"] = valType{name: "Int"}
-	if c.isStringExpr(&ast.Ident{Name: "count"}) {
-		t.Error("Int var should not be string")
-	}
-}
-
-func TestIsStringExprMember(t *testing.T) {
-	models := map[string]*ast.ModelDecl{
-		"User": {
-			Name: "User",
-			Fields: []*ast.FieldDecl{
-				{Name: "name", Type: &ast.TypeRef{Name: "String"}},
-				{Name: "age", Type: &ast.TypeRef{Name: "Int"}},
-			},
-		},
-	}
-	c := newCompiler(models)
-	c.vars["user"] = valType{name: "User", isModel: true}
-
-	if !c.isStringExpr(&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "name"}) {
-		t.Error("user.name should be string")
-	}
-	if c.isStringExpr(&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "age"}) {
-		t.Error("user.age should not be string")
 	}
 }
 
@@ -6630,6 +7009,13 @@ func TestCompileModelChainWithScope(t *testing.T) {
 	if !strings.Contains(got, "PostWhere.Status.Eq") {
 		t.Fatalf("scope injection should add where condition, got:\n%s", got)
 	}
+	c.api.Directives[0].Args = []*ast.NamedArg{
+		{Value: &ast.Literal{Kind: token.Int, Value: "0"}},
+		{Name: "published", Value: &ast.Ident{Name: "published"}},
+	}
+	if got := c.compileModelChain("Post", []chainLink{{method: "all"}}); strings.Count(got, "PostWhere.Status.Eq") != 1 {
+		t.Fatalf("named scope or malformed argument handling changed: %s", got)
+	}
 }
 
 // --- compileCreateLink ---
@@ -6725,6 +7111,14 @@ func TestCompileCreateLinkNullableIdent(t *testing.T) {
 	// Plain identifiers are addressable — no temp var needed.
 	if !strings.Contains(b.String(), ".SetSubtitle(&sub)") {
 		t.Fatalf("nullable ident should keep direct address-of, got:\n%s", b.String())
+	}
+	b.Reset()
+	c.vars["sub"] = valType{name: "String", nullable: true}
+	c.compileCreateLink(&b, "Post", chainLink{method: "create", args: []*ast.NamedArg{
+		{Name: "subtitle", Value: &ast.Ident{Name: "sub"}},
+	}}, false)
+	if !strings.Contains(b.String(), ".SetSubtitle(sub)") || strings.Contains(b.String(), "&sub") {
+		t.Fatalf("nullable parameter acquired an extra pointer: %s", b.String())
 	}
 }
 
@@ -6896,14 +7290,18 @@ func TestCompileUnaryQuestion(t *testing.T) {
 // ─── compileMember — enum member ────────────────────────────────────────────
 
 func TestCompileMemberEnumValue(t *testing.T) {
-	c := newCompiler(nil)
-	c.enums = map[string]bool{"Role": true}
-	got := c.compileExpr(&ast.MemberExpr{
-		Object: &ast.Ident{Name: "Role"},
-		Field:  "admin",
-	})
-	if got != "RoleADMIN" {
-		t.Fatalf("enum member should be RoleADMIN, got %q", got)
+	for _, member := range []string{"admin", "Admin", "ADMIN"} {
+		t.Run(member, func(t *testing.T) {
+			c := newCompiler(nil)
+			c.enums = map[string]bool{"Role": true}
+			got := c.compileExpr(&ast.MemberExpr{
+				Object: &ast.Ident{Name: "Role"},
+				Field:  member,
+			})
+			if got != "Role"+member {
+				t.Fatalf("enum member should be Role%s, got %q", member, got)
+			}
+		})
 	}
 }
 
@@ -6932,8 +7330,8 @@ func TestCompileCallTransactionLambda(t *testing.T) {
 			{Value: &ast.LambdaExpr{Body: &ast.Block{Stmts: []ast.Stmt{}}}},
 		},
 	})
-	if !strings.Contains(got, "app.DB.Tx(ctx") {
-		t.Fatalf("transaction should compile to app.DB.Tx, got %q", got)
+	if !strings.Contains(got, "app.Tx(ctx") {
+		t.Fatalf("transaction should compile to app.Tx, got %q", got)
 	}
 }
 
@@ -6946,22 +7344,8 @@ func TestCompileModifierMethodSelect(t *testing.T) {
 		{method: "select"},
 		{method: "all"},
 	})
-	if !strings.Contains(got, "selectUserSQLColumns(req.Select)") {
-		t.Fatalf("select should use the model SQL selector, got %q", got)
-	}
-}
-
-func TestCompileModifierMethodGroupBy(t *testing.T) {
-	models := makeModels("User")
-	c := newCompiler(models)
-	got := c.compileModelChain("User", []chainLink{
-		{method: "groupBy", args: []*ast.NamedArg{{Value: &ast.Ident{Name: "status"}}}},
-	})
-	if !strings.Contains(got, `"status"`) {
-		t.Fatalf("groupBy should contain column name, got %q", got)
-	}
-	if !strings.Contains(got, "GroupBy(ctx") {
-		t.Fatalf("groupBy should call GroupBy(ctx, ...), got %q", got)
+	if got != "app.User.Where().Select(selectUserSQLColumns(req.Select)...).All(ctx)" {
+		t.Fatalf("select must start a typed query and use the SQL selector, got %q", got)
 	}
 }
 
@@ -6994,27 +7378,226 @@ func TestCompileModifierMethodUnknown(t *testing.T) {
 func TestCompileOrderByChainPlainIdent(t *testing.T) {
 	c := newCompiler(nil)
 	var b strings.Builder
-	c.compileOrderByChain(&b, []*ast.NamedArg{
+	c.compileOrderByChain(&b, "", []*ast.NamedArg{
 		{Value: &ast.Ident{Name: "createdAt"}},
 	})
 	out := b.String()
-	if !strings.Contains(out, `"created_at ASC"`) {
+	if !strings.Contains(out, `"\"created_at\" ASC"`) {
 		t.Fatalf("plain ident should default to ASC, got %q", out)
+	}
+}
+
+func TestFormalGenerateStoredOrderSelectors(t *testing.T) {
+	for _, sample := range []struct{ expression, clause string }{
+		{`id`, `"\"id\" ASC"`}, {`id.asc`, `"\"id\" ASC"`}, {`id.desc`, `"\"id\" DESC"`},
+		{`it.createdAt`, `"\"created_at\" ASC"`}, {`(it.createdAt).desc`, `"\"created_at\" DESC"`},
+		{`asc`, `"\"asc\" ASC"`}, {`desc`, `"\"desc\" ASC"`},
+		{`it.asc`, `"\"asc\" ASC"`}, {`it.desc`, `"\"desc\" ASC"`},
+		{`asc.desc`, `"\"asc\" DESC"`}, {`desc.asc`, `"\"desc\" ASC"`},
+		{`it.asc.desc`, `"\"asc\" DESC"`}, {`it.desc.asc`, `"\"desc\" ASC"`},
+		{`inherited.desc`, `"\"inherited\" DESC"`}, {`it.raw`, `"\"raw\" ASC"`},
+		{`tags`, `"\"tags\" ASC"`}, {`bytes.desc`, `"\"bytes\" DESC"`},
+		{`updatedAt.desc`, `"\"updated_at\" DESC"`}, {`deletedAt`, `"\"deleted_at\" ASC"`},
+	} {
+		for name, query := range map[string]string{
+			"direct":   `Item.orderBy(` + sample.expression + `).all()`,
+			"selected": `Item.select().orderBy(` + sample.expression + `).all()`,
+			"method":   `Item.findMany(order: ` + sample.expression + `)`,
+			"function": `findMany(Item, order: ` + sample.expression + `)`,
+		} {
+			t.Run(name+"/"+sample.expression, func(t *testing.T) {
+				input := analyzePermissionFixture(t, `type OrderBase { inherited: String } model Item : OrderBase @soft { id: Int @id asc: Int desc: Int createdAt: DateTime raw: JSON tags: [String] bytes: Bytes } api sorted(): [Item] { return `+query+` }`)
+				if len(input.Errors) != 0 {
+					t.Fatal(input.Errors)
+				}
+				ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{
+					"Item": {"id": 1, "asc": 2, "desc": 3, "createdAt": 4, "inherited": 5, "raw": 6, "tags": 7, "bytes": 8}, "OrderBase": {"inherited": 1},
+				}})
+				generated, err := mustNewGenerator(t, GeneratorConfig{Driver: DriverPG, IDs: ids}).Generate(input, "generated", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if handler := string(generated.Files["handler.gen.go"]); !strings.Contains(handler, ".OrderBy("+sample.clause+")") {
+					t.Fatalf("sort selector lost its stored column or direction: %s\n%s", query, handler)
+				}
+			})
+		}
+	}
+}
+
+func TestFormalGenerateRejectsUnvalidatedOrderSelector(t *testing.T) {
+	input := analyzePermissionFixture(t, `model Item @noTime { id: Int @id } api sorted(): [Item] { return Item.orderBy(id.desc).all() }`)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	// Simulate an internal consumer bypassing the semantic selector contract.
+	ast.WalkExprs(input.Files[0].APIs[0].Body, func(expression ast.Expr) {
+		if call, ok := expression.(*ast.CallExpr); ok {
+			if member, ok := call.Func.(*ast.MemberExpr); ok && member.Field == "orderBy" {
+				call.Args[0].Value = &ast.CallExpr{Pos: call.Args[0].Value.GetPos(), Func: call.Args[0].Value}
+			}
+		}
+	})
+	ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+	generated, err := mustNewGenerator(t, GeneratorConfig{Driver: DriverPG, IDs: ids}).Generate(input, "generated", nil)
+	if err == nil || generated != nil || !strings.Contains(err.Error(), "unvalidated order selector") || !strings.Contains(err.Error(), "permission.luxo:") {
+		t.Fatalf("unvalidated order selector escaped formal generation: output=%v error=%v", generated, err)
+	}
+}
+
+func TestFormalGenerateOrderArgumentBoundaries(t *testing.T) {
+	for _, sample := range []struct{ query, clause string }{
+		{`Item.orderBy().all()`, `.OrderBy()`},
+		{`Item.orderBy(id.asc, it.name.desc).all()`, `.OrderBy("\"id\" ASC", "\"name\" DESC")`},
+		{`Item.findMany(order: id.asc, order: name.desc)`, `.OrderBy("\"id\" ASC").OrderBy("\"name\" DESC")`},
+		{`findMany(Item, order: id.asc, order: name.desc)`, `.OrderBy("\"id\" ASC").OrderBy("\"name\" DESC")`},
+	} {
+		t.Run(sample.query, func(t *testing.T) {
+			input := analyzePermissionFixture(t, `model Item @noTime { id: Int @id name: String } api sorted(): [Item] { return `+sample.query+` }`)
+			if len(input.Errors) != 0 {
+				t.Fatal(input.Errors)
+			}
+			ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1, "name": 2}}})
+			generated, err := mustNewGenerator(t, GeneratorConfig{Driver: DriverPG, IDs: ids}).Generate(input, "generated", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if handler := string(generated.Files["handler.gen.go"]); !strings.Contains(handler, sample.clause) {
+				t.Fatalf("sort argument boundaries changed: %s\n%s", sample.query, handler)
+			}
+		})
+	}
+}
+
+func TestFormalGenerateOrderFieldNamedIt(t *testing.T) {
+	for _, sample := range []struct{ expression, clause string }{
+		{`it`, `"\"it\" ASC"`}, {`it.asc`, `"\"it\" ASC"`}, {`it.desc`, `"\"it\" DESC"`},
+		{`it.it`, `"\"it\" ASC"`}, {`it.it.desc`, `"\"it\" DESC"`},
+		{`it.asc.desc`, `"\"asc\" DESC"`}, {`it.desc.asc`, `"\"desc\" ASC"`},
+	} {
+		for name, query := range map[string]string{
+			"direct": `Item.orderBy(` + sample.expression + `).all()`, "selected": `Item.select().orderBy(` + sample.expression + `).all()`,
+			"method": `Item.findMany(order: ` + sample.expression + `)`, "function": `findMany(Item, order: ` + sample.expression + `)`,
+		} {
+			t.Run(name+"/"+sample.expression, func(t *testing.T) {
+				input := analyzePermissionFixture(t, `model Item @noTime { id: Int @id it: Int asc: Int desc: Int } api sorted(): [Item] { return `+query+` }`)
+				if len(input.Errors) != 0 {
+					t.Fatal(input.Errors)
+				}
+				ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1, "it": 2, "asc": 3, "desc": 4}}})
+				generated, err := mustNewGenerator(t, GeneratorConfig{Driver: DriverPG, IDs: ids}).Generate(input, "generated", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if handler := string(generated.Files["handler.gen.go"]); !strings.Contains(handler, ".OrderBy("+sample.clause+")") {
+					t.Fatalf("field it lost its existing sort semantics: %s\n%s", query, handler)
+				}
+			})
+		}
+	}
+}
+
+func TestFormalGenerateScopedOrderSelectors(t *testing.T) {
+	for _, sample := range []struct{ expression, clause string }{
+		{`id.desc`, `"\"id\" DESC"`}, {`it.desc`, `"\"it\" DESC"`}, {`it.asc.desc`, `"\"asc\" DESC"`},
+	} {
+		for _, prefix := range []string{"", "where(id > 0)."} {
+			input := analyzePermissionFixture(t, `model Item @noTime { id: Int @id it: Int asc: Int scope sorted = `+prefix+`orderBy(`+sample.expression+`) } api sorted(): [Item] @scope(sorted) { return Item.all() }`)
+			if len(input.Errors) != 0 {
+				t.Fatal(input.Errors)
+			}
+			ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1, "it": 2, "asc": 3}}})
+			generated, err := mustNewGenerator(t, GeneratorConfig{Driver: DriverPG, IDs: ids}).Generate(input, "generated", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if handler := string(generated.Files["handler.gen.go"]); !strings.Contains(handler, ".OrderBy("+sample.clause+")") {
+				t.Fatalf("scope sort lost its field or direction: %s\n%s", sample.expression, handler)
+			}
+		}
+	}
+}
+
+func TestFormalGenerateOrderQualifierIgnoresNonColumnIt(t *testing.T) {
+	for _, sample := range []struct {
+		fields string
+		ids    map[string]int
+	}{
+		{`otherId: Int it: Other @by(id, otherId)`, map[string]int{"id": 1, "asc": 2, "otherId": 3, "it": 4}},
+		{`children: [Other] @by(itemId, id) val it: Int get @count(children)`, map[string]int{"id": 1, "asc": 2, "children": 3, "it": 4}},
+	} {
+		input := analyzePermissionFixture(t, `model Item @noTime { id: Int @id asc: Int `+sample.fields+` } model Other @noTime { id: Int @id itemId: Int } api sorted(): [Item] { return Item.orderBy(it.asc).all() }`)
+		if len(input.Errors) != 0 {
+			t.Fatal(input.Errors)
+		}
+		ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": sample.ids, "Other": {"id": 1, "itemId": 2}}})
+		generated, err := mustNewGenerator(t, GeneratorConfig{Driver: DriverPG, IDs: ids}).Generate(input, "generated", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if handler := string(generated.Files["handler.gen.go"]); !strings.Contains(handler, `.OrderBy("\"asc\" ASC")`) {
+			t.Fatal("a non-column field named it shadowed the row qualifier", handler)
+		}
 	}
 }
 
 func TestCompileOrderByChainItQualifiedField(t *testing.T) {
 	c := newCompiler(nil)
 	var b strings.Builder
-	c.compileOrderByChain(&b, []*ast.NamedArg{
+	c.compileOrderByChain(&b, "", []*ast.NamedArg{
 		{Value: &ast.MemberExpr{
 			Object: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "createdAt"},
 			Field:  "desc",
 		}},
 	})
 	out := b.String()
-	if !strings.Contains(out, `"created_at DESC"`) {
+	if !strings.Contains(out, `"\"created_at\" DESC"`) {
 		t.Fatalf("it-qualified field should not become a SQL table qualifier, got %q", out)
+	}
+}
+
+func TestCompileModifierMethodProjectionSelection(t *testing.T) {
+	for _, sample := range []struct {
+		name, client, want string
+		projection         loadProjection
+		private            bool
+	}{
+		{"fixed-columns", "", `app.User.Where().Select(selectUserSQLColumns([]*selection.Field{}, "name")...).All(ctx)`, loadProjection{columns: [][]string{{"name"}}}, false},
+		{"function-private-client", functionSelectionParameter, `app.User.Where().Select((*User)(nil).loadSQLColumns(` + functionSelectionParameter + `)...).All(ctx)`, loadProjection{client: true, logic: "[]*selection.Field{}"}, true},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			models := makeModels("User")
+			if sample.private {
+				models["User"].Fields = append(models["User"].Fields, testField("secret", "String", directive("hidden")))
+			}
+			c := newCompiler(models)
+			selectCall := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "select"}}
+			c.querySelections = map[ast.Expr]loadProjection{selectCall: sample.projection}
+			c.clientSelection = sample.client
+			got := c.compileModelChain("User", []chainLink{{method: "select", expr: selectCall}, {method: "all"}})
+			if got != sample.want {
+				t.Fatalf("projection changed SQL columns or private selection: got %s; want %s", got, sample.want)
+			}
+		})
+	}
+}
+
+func TestCompileFindReadModifiers(t *testing.T) {
+	for _, sample := range []struct {
+		name, want string
+		value      ast.Expr
+	}{
+		{"where", "app.User.Where(UserWhere.Id.Eq(key)).All(ctx)", &ast.BinaryExpr{Left: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "id"}, Op: "==", Right: &ast.Ident{Name: "key"}}},
+		{"limit", "app.User.Where().Limit(int(amount)).All(ctx)", &ast.Ident{Name: "amount"}},
+		{"offset", "app.User.Where().Offset(int(amount)).All(ctx)", &ast.Ident{Name: "amount"}},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			c := newCompiler(makeModels("User"))
+			got := c.compileModelChain("User", []chainLink{{method: "findMany", args: []*ast.NamedArg{{Name: sample.name, Value: sample.value}}}})
+			if got != sample.want {
+				t.Fatalf("named find modifier changed SQL or argument conversion: got %s; want %s", got, sample.want)
+			}
+		})
 	}
 }
 
@@ -7180,8 +7763,8 @@ func TestCompileTemplateWithIntExpr(t *testing.T) {
 			&ast.Ident{Name: "count"},
 		},
 	})
-	if !strings.Contains(got, "strconv.FormatInt") {
-		t.Fatalf("int expr in template should use FormatInt, got:\n%s", got)
+	if !strings.Contains(got, "strconv.AppendInt") {
+		t.Fatalf("int expr in template should use AppendInt, got:\n%s", got)
 	}
 }
 
@@ -7199,11 +7782,11 @@ func TestCompileTemplateWithStringMember(t *testing.T) {
 	got := c.compileExpr(&ast.TemplateString{
 		Parts: []ast.Expr{
 			&ast.Literal{Kind: token.String, Value: "hello "},
-			&ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "name"},
+			&ast.MemberExpr{TypeTagged: ast.TypeTagged{TypeTag: "String"}, Object: &ast.Ident{Name: "user"}, Field: "name"},
 		},
 	})
-	if !strings.Contains(got, "WriteString(user.Name)") {
-		t.Fatalf("string member in template should use WriteString, got:\n%s", got)
+	if !strings.Contains(got, "_templatePart1 := user.Name") || !strings.Contains(got, "WriteString(_templatePart1)") {
+		t.Fatalf("string member in template should be evaluated once and written directly, got:\n%s", got)
 	}
 }
 
@@ -7314,7 +7897,7 @@ func TestCompileTerminalMethodSumWithColumn(t *testing.T) {
 			}},
 		}},
 	})
-	if !strings.Contains(got, `.Sum(ctx, "amount")`) {
+	if !strings.Contains(got, `.Sum(ctx, "\"amount\"")`) {
 		t.Fatalf("sum with lambda should extract column, got %q", got)
 	}
 }
@@ -7333,7 +7916,7 @@ func TestResolveQueryTypeAggregates(t *testing.T) {
 		{"update", "Int"},
 		{"delete", "Int"},
 		{"sum", "Int"},
-		{"avg", "Int"},
+		{"avg", "Float"},
 		{"min", "Int"},
 		{"max", "Int"},
 	}
@@ -7373,7 +7956,7 @@ func TestCompileAwaitWithNonValStmts(t *testing.T) {
 		}},
 	}})
 	out := compilerOut(c)
-	if !strings.Contains(out, "errgroup") {
+	if !strings.Contains(out, "api.NewTaskGroup") {
 		t.Fatalf("await with val should use errgroup, got:\n%s", out)
 	}
 	if !strings.Contains(out, "doSomething()") {
@@ -7431,7 +8014,7 @@ func TestCompileReturnPaginatedQueryUsesExactTotal(t *testing.T) {
 
 	out := compilerOut(c)
 	for _, want := range []string{
-		"_result, _luxoTotal1, err := app.Post.Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).AllWithCount(ctx)",
+		"_result, _luxoTotal1, err := app.Post.Where().Limit(req.PageSize).Offset((req.Page - 1) * req.PageSize).AllWithCount(ctx)",
 		"codec.AppendSvarint(req.Buf.B, _luxoTotal1)",
 	} {
 		if !strings.Contains(out, want) {
@@ -7524,7 +8107,7 @@ func TestCompileRemoteLoadUsesOnlyReferencedFields(t *testing.T) {
 	c := newCompiler(models)
 	c.generator = generator
 	c.api = apiDecl
-	c.loadSelections = analyzeLoadSelections(apiDecl.Body, models)
+	c.loadSelections = analyzeLoadProjections(apiDecl.Body, models, apiDecl.ReturnType)
 	c.compileHandlerBody(apiDecl.Body.Stmts)
 
 	got := compilerOut(c)
@@ -7588,8 +8171,8 @@ func TestResolveQueryType_Load_PK(t *testing.T) {
 	if !vt.isModel || vt.name != "User" {
 		t.Errorf("PK load should return model User, got %+v", vt)
 	}
-	if vt.isList {
-		t.Error("PK load should not be a list")
+	if vt.isList || !vt.nullable {
+		t.Error("PK load should return a nullable single model")
 	}
 }
 
@@ -7603,8 +8186,8 @@ func TestResolveQueryType_Load_FK(t *testing.T) {
 	if !vt.isModel || vt.name != "Post" {
 		t.Errorf("FK load should return model Post, got %+v", vt)
 	}
-	if !vt.isList {
-		t.Error("FK load should be a list")
+	if !vt.isList || vt.nullable {
+		t.Error("FK load should return a non-null model list")
 	}
 }
 
@@ -7726,9 +8309,9 @@ func TestCompileStringTransformAll(t *testing.T) {
 		{"reversed", 0, nil, "str.Reverse(s)"},
 		{"replace", 2, []string{`"a"`, `"b"`}, `strings.ReplaceAll(s, "a", "b")`},
 		{"replaceAll", 2, []string{`"a"`, `"b"`}, `strings.ReplaceAll(s, "a", "b")`},
-		{"substring", 2, []string{"1", "5"}, "s[1:5]"},
-		{"substring", 1, []string{"3"}, "s[3:]"},
-		{"repeat", 1, []string{"3"}, "strings.Repeat(s, int(3))"},
+		{"substring", 2, []string{"1", "5"}, ""},
+		{"substring", 1, []string{"3"}, ""},
+		{"repeat", 1, []string{"3"}, ""},
 		{"padStart", 2, []string{"10", `" "`}, `str.PadLeft(s, int(10), " ")`},
 		{"padEnd", 2, []string{"10", `" "`}, `str.PadRight(s, int(10), " ")`},
 		{"split", 1, []string{`","`}, `strings.Split(s, ",")`},
@@ -7741,7 +8324,7 @@ func TestCompileStringTransformAll(t *testing.T) {
 				}
 				return ""
 			}
-			got := compileStringTransform(tt.method, "s", arg, tt.nargs)
+			got := compileStringTransform(tt.method, func() string { return "s" }, arg, tt.nargs)
 			if got != tt.want {
 				t.Errorf("compileStringTransform(%q) = %q, want %q", tt.method, got, tt.want)
 			}
@@ -7772,7 +8355,7 @@ func TestCompileStringQueryAll(t *testing.T) {
 				}
 				return ""
 			}
-			got := compileStringQuery(tt.method, "s", arg, tt.nargs)
+			got := compileStringQuery(tt.method, func() string { return "s" }, arg, tt.nargs)
 			if got != tt.want {
 				t.Errorf("compileStringQuery(%q) = %q, want %q", tt.method, got, tt.want)
 			}
@@ -7781,13 +8364,13 @@ func TestCompileStringQueryAll(t *testing.T) {
 }
 
 func TestCompileStringConvertAll(t *testing.T) {
-	if got := compileStringConvert("toInt", "s"); got != `convert.StringToInt(s)` {
+	if got := compileStringConvert("toInt", func() string { return "s" }); got != `convert.StringToInt(s)` {
 		t.Errorf("toInt = %q", got)
 	}
-	if got := compileStringConvert("toFloat", "s"); got != `convert.StringToFloat(s)` {
+	if got := compileStringConvert("toFloat", func() string { return "s" }); got != `convert.StringToFloat(s)` {
 		t.Errorf("toFloat = %q", got)
 	}
-	if got := compileStringConvert("unknown", "s"); got != "" {
+	if got := compileStringConvert("unknown", func() string { return "s" }); got != "" {
 		t.Errorf("unknown should return empty, got %q", got)
 	}
 }
@@ -7830,11 +8413,24 @@ func TestCompileFieldExpr_Literal(t *testing.T) {
 }
 
 func TestCompileMyField(t *testing.T) {
-	if got := compileMyField("id", "identity"); got != "api.IdentityID(identity)" {
+	if got := compileMyField(&ast.MemberExpr{Field: "id"}, "identity"); got != "api.IdentityID(identity)" {
 		t.Errorf("my.id = %q", got)
 	}
-	if got := compileMyField("role", "identity"); got != `api.IdentityInt(identity, "role")` {
+	if got := compileMyField(&ast.MemberExpr{Field: "role"}, "identity"); got != `api.IdentityInt(identity, "role")` {
 		t.Errorf("my.role = %q", got)
+	}
+}
+
+func TestYieldDetectionNilAndVariableInitializer(t *testing.T) {
+	if containsYield(nil) || containsYieldExpr(nil) {
+		t.Fatal("absent bodies and expressions must not produce yields")
+	}
+	for _, value := range []ast.Expr{nil, &ast.Ident{Name: "value"}, &ast.YieldExpr{Value: &ast.Ident{Name: "value"}}} {
+		_, want := value.(*ast.YieldExpr)
+		block := &ast.Block{Stmts: []ast.Stmt{&ast.ValStmt{Name: "selected", Value: value}}}
+		if got := containsYield(block); got != want {
+			t.Fatalf("initializer %T: yield=%v, want=%v", value, got, want)
+		}
 	}
 }
 
@@ -7856,9 +8452,23 @@ func TestInferMyFieldType(t *testing.T) {
 	if got != "something" {
 		t.Errorf("non-my should be unchanged, got %q", got)
 	}
+	for _, other := range []ast.Expr{&ast.Ident{Name: "expectedRole"}, &ast.Literal{Kind: token.True, Value: "true"}} {
+		if got := inferMyFieldType(compiled, myRole, other, "identity"); got != compiled {
+			t.Errorf("unresolved comparison context changed identity access: %q", got)
+		}
+	}
 }
 
 // ─── compileStringMethod integration (dispatches to sub-functions) ──────────
+
+func TestCompileStringMethodDoesNotEvaluateUnknownReceiver(t *testing.T) {
+	c := newCompiler(nil)
+	c.functions = map[string]*ast.FnDecl{"receiver": {Name: "receiver", ReturnType: &ast.TypeRef{Name: "String"}, Body: &ast.Block{}}}
+	call := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.CallExpr{Func: &ast.Ident{Name: "receiver"}}, Field: "unknown"}}
+	if got := c.compileStringMethod(call); got != "" || c.b.Len() != 0 || c.resultTmp != 0 {
+		t.Fatalf("method probe emitted receiver effects: %q / %s", got, c.b.String())
+	}
+}
 
 func TestCompileStringMethod_ViaCallExpr(t *testing.T) {
 	c := newCompiler(nil)
@@ -7926,6 +8536,46 @@ func TestCompileFieldExpr_MemberExpr(t *testing.T) {
 	}
 }
 
+func TestCompileFieldExpr_StringProperties(t *testing.T) {
+	if got := compileFieldExpr(&ast.MemberExpr{Field: "length"}, "value"); got != "" {
+		t.Fatalf("accepted missing receiver: %q", got)
+	}
+	value := &ast.Ident{Name: "it"}
+	value.SetTypeTag("String")
+	for _, test := range []struct{ property, want string }{
+		{"length", "int64(len(value))"},
+		{"size", "int64(len(value))"},
+		{"isEmpty", "(len(value) == 0)"},
+	} {
+		expression := &ast.MemberExpr{Object: value, Field: test.property}
+		if got := compileFieldExpr(expression, "value"); got != test.want {
+			t.Fatalf("%s: %q", test.property, got)
+		}
+	}
+	unsupported := &ast.ElvisExpr{}
+	unsupported.SetTypeTag("String")
+	if got := compileFieldExpr(&ast.MemberExpr{Object: unsupported, Field: "length"}, "value"); got != "" {
+		t.Fatalf("accepted unsupported receiver: %q", got)
+	}
+	value.SetListType(true)
+	if got := compileFieldExpr(&ast.MemberExpr{Object: value, Field: "length"}, "value"); got == "int64(len(value))" {
+		t.Fatal("treated string list as scalar")
+	}
+}
+
+func TestCompileFieldExpr_EnumConstant(t *testing.T) {
+	for _, member := range []string{"OPEN", "Open"} {
+		expr := &ast.MemberExpr{Object: &ast.Ident{Name: "State"}, Field: member, EnumConstant: true}
+		if got := compileFieldExpr(expr, "value"); got != "State"+member {
+			t.Fatalf("enum constant = %q", got)
+		}
+		expr.EnumConstant = false
+		if got := compileFieldExpr(expr, "value"); got != "" {
+			t.Fatalf("unresolved member accepted as enum constant: %q", got)
+		}
+	}
+}
+
 func TestCompileFieldExpr_OtherIdent(t *testing.T) {
 	got := compileFieldExpr(&ast.Ident{Name: "other"}, "val")
 	if got != "other" {
@@ -7956,7 +8606,7 @@ func TestCompileFieldExpr_ConvertMethod(t *testing.T) {
 }
 
 func TestCompileFieldExpr_Unsupported(t *testing.T) {
-	got := compileFieldExpr(&ast.BinaryExpr{Left: &ast.Ident{Name: "a"}, Op: "+", Right: &ast.Ident{Name: "b"}}, "val")
+	got := compileFieldExpr(&ast.BinaryExpr{Left: &ast.Ident{Name: "a"}, Op: "<-", Right: &ast.Ident{Name: "b"}}, "val")
 	if got != "" {
 		t.Errorf("unsupported should be empty, got %q", got)
 	}
@@ -8168,18 +8818,18 @@ func TestIsBoolExpr(t *testing.T) {
 // ─── Duration arithmetic ────────────────────────────────────────────────────
 
 func TestCompileDurationProperties(t *testing.T) {
-	c := newCompiler(nil)
 	tests := []struct {
 		field string
 		want  string
 	}{
-		{"days", "(time.Duration(7) * 24 * time.Hour)"},
-		{"hours", "(time.Duration(7) * time.Hour)"},
-		{"minutes", "(time.Duration(7) * time.Minute)"},
-		{"seconds", "(time.Duration(7) * time.Second)"},
-		{"milliseconds", "(time.Duration(7) * time.Millisecond)"},
+		{"days", "24 * time.Hour"},
+		{"hours", "time.Hour"},
+		{"minutes", "time.Minute"},
+		{"seconds", "time.Second"},
+		{"milliseconds", "time.Millisecond"},
 	}
 	for _, tt := range tests {
+		c := newCompiler(nil)
 		expr := &ast.MemberExpr{
 			Object: &ast.Literal{Kind: token.Int, Value: "7"},
 			Field:  tt.field,
@@ -8187,8 +8837,8 @@ func TestCompileDurationProperties(t *testing.T) {
 		// Simulate semantic analyzer setting TypeTag
 		expr.SetTypeTag("Duration")
 		got := c.compileExpr(expr)
-		if got != tt.want {
-			t.Errorf("%s: got %q, want %q", tt.field, got, tt.want)
+		if got != "_integer1" || !strings.Contains(c.b.String(), "lux.DurationFromUnits(7, "+tt.want+")") || !strings.Contains(c.b.String(), "errors.BadRequest") {
+			t.Errorf("%s: missing checked duration conversion: %s\n%s", tt.field, got, c.b.String())
 		}
 	}
 }
@@ -8236,8 +8886,8 @@ func TestCompileDateTimeMinusDuration(t *testing.T) {
 		Right: dur,
 	}
 	got := c.compileExpr(expr)
-	if !strings.Contains(got, ".Add(-") {
-		t.Errorf("DateTime - Duration should use .Add(-): got %q", got)
+	if !strings.Contains(got, "lux.SubDateTime(") {
+		t.Errorf("DateTime - Duration should use overflow-safe subtraction: got %q", got)
 	}
 }
 
@@ -8292,156 +8942,10 @@ func TestDurationTypeTagGuard(t *testing.T) {
 		Field:  "days",
 	}
 	expr3.SetTypeTag("Duration")
+	expr3.Object.SetTypeTag("Int")
 	got3 := c.compileExpr(expr3)
-	if !strings.Contains(got3, "time.Duration") {
+	if !strings.Contains(compilerOut(c), "lux.DurationFromUnits(n,") || got3 == "n.Days" {
 		t.Errorf("tagged n.days should be duration: got %q", got3)
-	}
-}
-
-// ─── GroupBy ────────────────────────────────────────────────────────────────
-
-func TestFindGroupByLink(t *testing.T) {
-	links := []chainLink{
-		{method: "where"},
-		{method: "groupBy"},
-		{method: "select"},
-	}
-	idx := findGroupByLink(links)
-	if idx != 1 {
-		t.Errorf("expected 1, got %d", idx)
-	}
-	if findGroupByLink([]chainLink{{method: "where"}, {method: "all"}}) != -1 {
-		t.Error("should be -1 when no groupBy")
-	}
-}
-
-func TestExtractGroupByCols(t *testing.T) {
-	c := newCompiler(nil)
-	// Single field: groupBy { it.apiName }
-	link := chainLink{
-		method: "groupBy",
-		args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
-			Body: &ast.Block{Stmts: []ast.Stmt{
-				&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "apiName"}},
-			}},
-		}}},
-	}
-	cols := c.extractGroupByCols(link)
-	if len(cols) != 1 || cols[0] != `"api_name"` {
-		t.Errorf("expected [\"api_name\"], got %v", cols)
-	}
-}
-
-func TestIsGroupKeyRef(t *testing.T) {
-	if !isGroupKeyRef(&ast.MemberExpr{Field: "key"}) {
-		t.Error("it.key should be key ref")
-	}
-	if isGroupKeyRef(&ast.MemberExpr{Field: "count"}) {
-		t.Error("it.count should not be key ref")
-	}
-}
-
-func TestExtractSelectAggs(t *testing.T) {
-	c := newCompiler(nil)
-	// .select { count: it.count(), totalSum: it.sum { it.total } }
-	link := chainLink{
-		method: "select",
-		args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
-			Body: &ast.Block{Stmts: []ast.Stmt{
-				&ast.ExprStmt{Expr: &ast.ObjectExpr{
-					Fields: []*ast.NamedArg{
-						{Name: "apiName", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "key"}},
-						{Name: "count", Value: &ast.CallExpr{
-							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "count"},
-						}},
-						{Name: "totalSum", Value: &ast.CallExpr{
-							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "sum"},
-							Args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
-								Body: &ast.Block{Stmts: []ast.Stmt{
-									&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "total"}},
-								}},
-							}}},
-						}},
-					},
-				}},
-			}},
-		}}},
-	}
-	aggs := c.extractSelectAggs(link)
-	if len(aggs) != 2 {
-		t.Fatalf("expected 2 aggs, got %d: %v", len(aggs), aggs)
-	}
-	if !strings.Contains(aggs[0], "COUNT") {
-		t.Errorf("first agg should be COUNT: %s", aggs[0])
-	}
-	if !strings.Contains(aggs[1], "SUM") || !strings.Contains(aggs[1], "total") {
-		t.Errorf("second agg should be SUM(total): %s", aggs[1])
-	}
-}
-
-func TestCompileGroupByChainWithWhere(t *testing.T) {
-	models := makeModels("Order")
-	c := newCompiler(models)
-	// Order.where(...).groupBy { it.status }.select { count: it.count() }
-	got := c.compileModelChain("Order", []chainLink{
-		{method: "where", args: []*ast.NamedArg{{Value: &ast.BinaryExpr{
-			Left: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "total"},
-			Op:   ">", Right: &ast.Literal{Kind: token.Int, Value: "100"},
-		}}}},
-		{method: "groupBy", args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
-			Body: &ast.Block{Stmts: []ast.Stmt{
-				&ast.ExprStmt{Expr: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "status"}},
-			}},
-		}}}},
-		{method: "select", args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
-			Body: &ast.Block{Stmts: []ast.Stmt{
-				&ast.ExprStmt{Expr: &ast.ObjectExpr{
-					Fields: []*ast.NamedArg{
-						{Name: "status", Value: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "key"}},
-						{Name: "count", Value: &ast.CallExpr{
-							Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "count"},
-						}},
-					},
-				}},
-			}},
-		}}}},
-	})
-	if !strings.Contains(got, "GroupBy(ctx") {
-		t.Errorf("should call GroupBy: got %q", got)
-	}
-	if !strings.Contains(got, `"status"`) {
-		t.Errorf("should contain group column: got %q", got)
-	}
-	if !strings.Contains(got, "COUNT") {
-		t.Errorf("should contain COUNT agg: got %q", got)
-	}
-}
-
-func TestExtractGroupByColsList(t *testing.T) {
-	c := newCompiler(nil)
-	// groupBy { [it.status, it.apiName] } — multi-column
-	link := chainLink{
-		method: "groupBy",
-		args: []*ast.NamedArg{{Value: &ast.LambdaExpr{
-			Body: &ast.Block{Stmts: []ast.Stmt{
-				&ast.ExprStmt{Expr: &ast.ListExpr{Items: []ast.Expr{
-					&ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "status"},
-					&ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "apiName"},
-				}}},
-			}},
-		}}},
-	}
-	cols := c.extractGroupByCols(link)
-	if len(cols) != 2 {
-		t.Fatalf("expected 2 cols, got %d: %v", len(cols), cols)
-	}
-}
-
-func TestExtractGroupByColsEmpty(t *testing.T) {
-	c := newCompiler(nil)
-	cols := c.extractGroupByCols(chainLink{method: "groupBy"})
-	if len(cols) != 0 {
-		t.Errorf("empty args should return nil: got %v", cols)
 	}
 }
 
@@ -8455,7 +8959,7 @@ func TestCompileBuiltinCryptoRandomBytes(t *testing.T) {
 		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "16"}}},
 	}
 	got := c.compileExpr(expr)
-	if !strings.Contains(got, "luxocrypto.RandomBytes(16)") {
+	if got != "_randomBytes1" || !strings.Contains(compilerOut(c), "luxocrypto.RandomBytes(int(_randomSize1))") || !strings.Contains(compilerOut(c), "var _randomSize1 int64 = 16") {
 		t.Errorf("crypto.randomBytes: got %q", got)
 	}
 	if strings.Contains(got, "hex.EncodeToString") {
@@ -8505,11 +9009,11 @@ func TestCompileCryptoRandomHex(t *testing.T) {
 		Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "32"}}},
 	}
 	got := c.compileExpr(expr)
-	if got != "_hex" {
+	if got != "_hex1" {
 		t.Errorf("crypto.randomHex should return temp var: got %q", got)
 	}
 	out := compilerOut(c)
-	if !strings.Contains(out, "luxocrypto.RandomHex(32)") {
+	if !strings.Contains(out, "luxocrypto.RandomHex(int(_randomSize1))") || !strings.Contains(out, "var _randomSize1 int64 = 32") {
 		t.Errorf("should call luxocrypto.RandomHex: %s", out)
 	}
 	if !strings.Contains(out, "_hexErr") {
@@ -8543,10 +9047,10 @@ func TestCompileInstanceUpdate(t *testing.T) {
 		},
 	}
 	got := c.compileExpr(expr)
-	if !strings.Contains(got, "app.Project.Where(ProjectWhere.Id.Eq(project.Id)).Update(ctx") {
+	if !strings.Contains(got, "app.Project.Where(ProjectWhere.Id.Eq(project.Id)).updatePrepared(ctx") {
 		t.Errorf("instance update: got %q", got)
 	}
-	if !strings.Contains(got, `lux.SetField{Col: "name"`) {
+	if !strings.Contains(got, `lux.SetField{Col: "\"name\""`) {
 		t.Errorf("instance update missing SetField: got %q", got)
 	}
 }
@@ -8572,7 +9076,7 @@ func TestCompileInstanceUpdateHashesProtectedField(t *testing.T) {
 	if !strings.Contains(out, "luxocrypto.HashPassword(newPassword)") {
 		t.Fatalf("instance update must hash @hash field, preamble:\n%s", out)
 	}
-	if !strings.Contains(got, `lux.SetField{Col: "password", Val: hashedPassword}`) {
+	if !strings.Contains(got, `lux.SetField{Col: "\"password\"", Val: hashedPassword1}`) {
 		t.Fatalf("instance update must persist hash, got %q", got)
 	}
 }
@@ -8586,7 +9090,7 @@ func TestCompileMyRoleEnumCast(t *testing.T) {
 	}
 	expr.SetTypeTag("MemberRole")
 	got := c.compileExpr(expr)
-	if got != `MemberRole(identity.String("role"))` {
+	if got != `MemberRole(_identityValue1)` {
 		t.Errorf("my.role enum cast: got %q", got)
 	}
 }
@@ -8599,7 +9103,7 @@ func TestCompileMyFieldNoEnum(t *testing.T) {
 		Field:  "teamId",
 	}
 	got := c.compileExpr(expr)
-	if got != `identity.String("teamId")` {
+	if got != `_identityValue1` {
 		t.Errorf("my.teamId: got %q", got)
 	}
 }
@@ -8623,6 +9127,15 @@ func TestCompileInstanceMethodNonMember(t *testing.T) {
 	got := c.compileInstanceMethod(expr)
 	if got != "" {
 		t.Errorf("non-member should return empty: got %q", got)
+	}
+}
+
+func TestCompileInstanceMethodUnknownMethod(t *testing.T) {
+	c := newCompiler(map[string]*ast.ModelDecl{"User": {Name: "User"}})
+	c.vars["user"] = valType{name: "User", isModel: true}
+	expr := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "user"}, Field: "unrecognized"}}
+	if got := c.compileInstanceMethod(expr); got != "" {
+		t.Fatalf("unrecognized model method matched: %q", got)
 	}
 }
 
@@ -8680,58 +9193,45 @@ func TestCompileDeleteManyTerminal(t *testing.T) {
 }
 
 func TestCompileStaticDeleteManyPreservesWhere(t *testing.T) {
-	models := map[string]*ast.ModelDecl{
-		"Notification": {
-			Name:       "Notification",
-			Directives: []*ast.Directive{{Name: "soft"}},
-		},
+	input := analyzePermissionFixture(t, `model Notification @noTime @soft { id: Int @id userId: Int }
+api probe(userId: Int): Int { return Notification.deleteMany(where: it.userId == userId) }`)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
 	}
-	c := newCompiler(models)
-	got := c.compileModelChain("Notification", []chainLink{{
-		method: "deleteMany",
-		args: []*ast.NamedArg{{Name: "where", Value: &ast.BinaryExpr{
-			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "userId"},
-			Op:    "==",
-			Right: &ast.Ident{Name: "userId"},
-		}}},
-	}})
+	c := newCompiler(map[string]*ast.ModelDecl{"Notification": input.Files[0].Models[0]})
+	c.vars["userId"] = valType{name: "Int"}
+	call := input.Files[0].APIs[0].Body.Stmts[0].(*ast.ReturnStmt).Value.(*ast.CallExpr)
+	got := c.compileModelChain("Notification", flattenChain(call)[1:])
 	if want := "app.Notification.Where(NotificationWhere.UserId.Eq(userId)).SoftDelete(ctx)"; got != want {
 		t.Fatalf("deleteMany = %q, want %q", got, want)
 	}
 }
 
+func analyzedBulkUpdateFixture(t *testing.T, expression string) (*compiler, *ast.CallExpr) {
+	t.Helper()
+	input := analyzePermissionFixture(t, `model Task @noTime { id: Int @id projectId: Int status: String }
+api probe(projectId: Int, newStatus: String): Int { return `+expression+` }`)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	c := newCompiler(map[string]*ast.ModelDecl{"Task": input.Files[0].Models[0]})
+	c.vars["projectId"], c.vars["newStatus"] = valType{name: "Int"}, valType{name: "String"}
+	return c, input.Files[0].APIs[0].Body.Stmts[0].(*ast.ReturnStmt).Value.(*ast.CallExpr)
+}
+
 func TestCompileStaticUpdateManyPreservesWhereAndSets(t *testing.T) {
-	c := newCompiler(makeModels("Task"))
-	got := c.compileModelChain("Task", []chainLink{{
-		method: "updateMany",
-		args: []*ast.NamedArg{
-			{Name: "where", Value: &ast.BinaryExpr{
-				Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "projectId"},
-				Op:    "==",
-				Right: &ast.Ident{Name: "projectId"},
-			}},
-			{Name: "status", Value: &ast.Ident{Name: "newStatus"}},
-		},
-	}})
-	want := `app.Task.Where(TaskWhere.ProjectId.Eq(projectId)).Update(ctx, lux.SetField{Col: "status", Val: newStatus})`
+	c, call := analyzedBulkUpdateFixture(t, `Task.updateMany(where: it.projectId == projectId, status: newStatus)`)
+	got := c.compileModelChain("Task", flattenChain(call)[1:])
+	want := `app.Task.Where(TaskWhere.ProjectId.Eq(projectId)).updatePrepared(ctx, lux.SetField{Col: "\"status\"", Val: newStatus})`
 	if got != want {
 		t.Fatalf("updateMany = %q, want %q", got, want)
 	}
 }
 
 func TestCompileChainedUpdateManyKeepsExistingWhere(t *testing.T) {
-	c := newCompiler(makeModels("Task"))
-	got := c.compileModelChain("Task", []chainLink{
-		{method: "where", args: []*ast.NamedArg{{Value: &ast.BinaryExpr{
-			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "projectId"},
-			Op:    "==",
-			Right: &ast.Ident{Name: "projectId"},
-		}}}},
-		{method: "updateMany", args: []*ast.NamedArg{
-			{Name: "status", Value: &ast.Ident{Name: "newStatus"}},
-		}},
-	})
-	want := `app.Task.Where(TaskWhere.ProjectId.Eq(projectId)).Update(ctx, lux.SetField{Col: "status", Val: newStatus})`
+	c, call := analyzedBulkUpdateFixture(t, `Task.where(it.projectId == projectId).updateMany(status: newStatus)`)
+	got := c.compileModelChain("Task", flattenChain(call)[1:])
+	want := `app.Task.Where(TaskWhere.ProjectId.Eq(projectId)).updatePrepared(ctx, lux.SetField{Col: "\"status\"", Val: newStatus})`
 	if got != want {
 		t.Fatalf("chained updateMany = %q, want %q", got, want)
 	}
@@ -8745,19 +9245,8 @@ func TestCompileStaticDeleteManyWithoutWhereUsesQuery(t *testing.T) {
 }
 
 func TestCompileReturnDirectBulkMutationUsesScalarCodec(t *testing.T) {
-	c := newCompiler(makeModels("Task"))
+	c, call := analyzedBulkUpdateFixture(t, `Task.updateMany(where: it.projectId == projectId, status: newStatus)`)
 	c.api.ReturnType = &ast.TypeRef{Name: "Int"}
-	call := &ast.CallExpr{Func: &ast.MemberExpr{
-		Object: &ast.Ident{Name: "Task"},
-		Field:  "updateMany",
-	}, Args: []*ast.NamedArg{
-		{Name: "where", Value: &ast.BinaryExpr{
-			Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "projectId"},
-			Op:    "==",
-			Right: &ast.Ident{Name: "projectId"},
-		}},
-		{Name: "status", Value: &ast.Ident{Name: "newStatus"}},
-	}}
 	c.compileStmt(&ast.ReturnStmt{Value: call})
 	out := compilerOut(c)
 	if !strings.Contains(out, "codec.AppendSvarint(req.Buf.B, _result)") {
@@ -8853,8 +9342,8 @@ func TestCompileDefaultValueIntLiteral(t *testing.T) {
 
 func TestCompileDefaultValueFloatLiteral(t *testing.T) {
 	got := compileDefaultValue(&ast.Literal{Kind: token.Float, Value: "0.1"}, "float64", nil)
-	if got != "0.1" {
-		t.Fatalf("want %q, got %q", "0.1", got)
+	if got != "float64(0.1)" {
+		t.Fatalf("want typed Float64 default, got %q", got)
 	}
 }
 
@@ -8888,6 +9377,15 @@ func TestCompileDefaultValueEnumMember(t *testing.T) {
 	got := compileDefaultValue(expr, "DeployMode", enums)
 	if got != "DeployModeEMBEDDED" {
 		t.Fatalf("want %q, got %q", "DeployModeEMBEDDED", got)
+	}
+}
+
+func TestCompileDefaultValuePreservesEnumMemberCase(t *testing.T) {
+	for _, member := range []string{"Open", "OPEN"} {
+		expr := &ast.MemberExpr{Object: &ast.Ident{Name: "State"}, Field: member}
+		if got := compileDefaultValue(expr, "State", map[string]bool{"State": true}); got != "State"+member {
+			t.Fatalf("default member changed: %q", got)
+		}
 	}
 }
 
@@ -9104,5 +9602,1129 @@ func TestIsIntExprFalseForUnknownVar(t *testing.T) {
 	c := newCompiler(nil)
 	if c.isIntExpr(&ast.Ident{Name: "unknown"}) {
 		t.Fatal("isIntExpr should be false for unknown variable")
+	}
+}
+
+func TestGeneratedLeadingSelection(t *testing.T) {
+	runGeneratedFixture(t, `
+model Product @noTime { id: Int @id name: String price: Int }
+api unselectedProducts(): [Product] { return Product.all() }
+api firstProduct(): Product? { return Product.first() }
+api orderedProducts(): [Product] { return Product.orderBy(price.desc).all() }
+api limitedProducts(): [Product] { return Product.limit(2).all() }
+api offsetProducts(): [Product] { return Product.offset(1).all() }
+api selectedProducts(): [Product] { return Product.select().all() }
+api filteredProducts(): [Product] { return Product.where(it.id > 0).select().all() }
+`, `package generated
+import (
+ "slices"
+ "testing"
+ "github.com/light-speak/luxo/pkg/lux/selection"
+)
+func TestSelectedSQLColumns(t *testing.T) {
+ got := selectProductSQLColumns([]*selection.Field{{Name:"name"}})
+ if !slices.Equal(got, []string{"\"name\"","\"id\""}) { t.Fatalf("columns=%v",got) }
+}
+`, StableIDs{APIs: map[string]int{"selectedProducts": 1, "filteredProducts": 2, "unselectedProducts": 3, "firstProduct": 4, "orderedProducts": 5, "limitedProducts": 6, "offsetProducts": 7},
+		ModelFields: map[string]map[string]int{"Product": {"id": 1, "name": 2, "price": 3}}})
+}
+
+func TestResolvedIdentityStringInConditions(t *testing.T) {
+	role := &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "role"}
+	role.SetTypeTag("String")
+	expected := &ast.Ident{Name: "expectedRole"}
+	expected.SetTypeTag("String")
+	params := map[string]*ast.ParamDecl{"expectedRole": {Name: "expectedRole", Type: &ast.TypeRef{Name: "String"}}}
+	for _, reverse := range []bool{false, true} {
+		expression := &ast.BinaryExpr{Left: role, Op: "==", Right: expected}
+		if reverse {
+			expression.Left, expression.Right = expression.Right, expression.Left
+		}
+		stream, ok := compileStreamExpr(expression, params, nil, "")
+		if !ok || !strings.Contains(stream, `api.IdentityString(identity, "role")`) || strings.Contains(stream, "IdentityInt") {
+			t.Fatal(stream, ok)
+		}
+		visible := compileVisibleExpr(expression)
+		if !strings.Contains(visible, `api.IdentityString(buf.Identity, "role")`) || strings.Contains(visible, "IdentityInt") {
+			t.Fatal(visible)
+		}
+	}
+}
+
+func TestFormalDeleteManyPreservesExistingPredicates(t *testing.T) {
+	for _, sample := range []struct{ expression, query string }{
+		{"Item.deleteMany()", "app.Item.Where().Delete(ctx)"},
+		{"Item.deleteMany(where: id == 1)", "app.Item.Where(ItemWhere.Id.Eq(1)).Delete(ctx)"},
+		{"Item.where(id > 0).deleteMany()", "app.Item.Where(ItemWhere.Id.Gt(0)).Delete(ctx)"},
+		{"Item.where(id > 0).deleteMany(where: id < 5)", "app.Item.Where(ItemWhere.Id.Gt(0)).Where(ItemWhere.Id.Lt(5)).Delete(ctx)"},
+		{"deleteMany(Item)", "app.Item.Where().Delete(ctx)"},
+		{"deleteMany(Item, where: id == 1)", "app.Item.Where(ItemWhere.Id.Eq(1)).Delete(ctx)"},
+	} {
+		t.Run(sample.expression, func(t *testing.T) {
+			input := analyzePermissionFixture(t, "model Item @noTime { id: Int @id } api probe(): Int { return "+sample.expression+" }")
+			if len(input.Errors) != 0 {
+				t.Fatal(input.Errors)
+			}
+			ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+			output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+			if err != nil || output == nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(output.Files["handler.gen.go"]), sample.query) {
+				t.Fatalf("bulk delete lost an existing filter or emitted a generic call: %s", output.Files["handler.gen.go"])
+			}
+		})
+	}
+	input := analyzePermissionFixture(t, "fn deleteMany(value: Int): Int { return value } api probe(): Int { return deleteMany(1) }")
+	ids := completeFixtureAPIIDs(input, StableIDs{})
+	output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+	if err != nil || output == nil || !strings.Contains(string(output.Files["handler.gen.go"]), "app.deleteMany(ctx, 1)") {
+		t.Fatal("ordinary deleteMany function was rewritten as a database call", err)
+	}
+}
+
+func TestFormalDeleteManyRejectsMutatedArguments(t *testing.T) {
+	for name, expression := range map[string]string{
+		"model":    "Item.deleteMany(where: id == 1)",
+		"alias":    "query.deleteMany(where: id == 1)",
+		"chain":    "Item.where(id > 0).deleteMany(where: id == 1)",
+		"function": "deleteMany(Item, where: id == 1)",
+	} {
+		for _, kind := range []string{"unknown", "positional", "duplicate", "non-boolean", "missing-value", "side-effect"} {
+			t.Run(name+"/"+kind, func(t *testing.T) {
+				prefix := ""
+				if name == "alias" {
+					prefix = "val query = Item.where(id > 0) "
+				}
+				input := analyzePermissionFixture(t, "fn sideEffect(): Result<Int> @native model Item @noTime { id: Int @id } api probe(): Int { "+prefix+"return "+expression+" }")
+				if len(input.Errors) != 0 {
+					t.Fatal(input.Errors)
+				}
+				mutateBulkDeleteArguments(input.Files[0].APIs[0].Body, kind)
+				ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+				output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+				failure, internal := err.(*InternalCompilerError)
+				if output != nil || !internal || len(failure.Stack) == 0 || !strings.Contains(err.Error(), "permission.luxo:") || !strings.Contains(err.Error(), "deleteMany") {
+					t.Fatalf("invalid internal bulk delete emitted output or lost location: output=%v error=%v", output != nil, err)
+				}
+			})
+		}
+	}
+}
+
+func mutateBulkDeleteArguments(body *ast.Block, kind string) {
+	mutateQueryWhereArguments(body, "deleteMany", kind)
+}
+
+func mutateQueryWhereArguments(body *ast.Block, method, kind string) {
+	ast.WalkExprs(body, func(expression ast.Expr) {
+		call, ok := expression.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		name := ""
+		switch target := call.Func.(type) {
+		case *ast.Ident:
+			name = target.Name
+		case *ast.MemberExpr:
+			name = target.Field
+		}
+		if name != method {
+			return
+		}
+		value := &ast.Literal{Pos: call.Pos, Kind: token.Int, Value: "1"}
+		value.SetTypeTag("Int")
+		for _, argument := range call.Args {
+			if argument.Name == "where" {
+				switch kind {
+				case "non-boolean":
+					argument.Value = value
+				case "missing-value":
+					argument.Value = nil
+				case "duplicate":
+					call.Args = append(call.Args, &ast.NamedArg{Name: "where", Value: argument.Value})
+				}
+				break
+			}
+		}
+		switch kind {
+		case "side-effect":
+			call.Args = append(call.Args, &ast.NamedArg{Name: "unknown", Value: &ast.CallExpr{Pos: call.Pos, Func: &ast.Ident{Name: "sideEffect"}}})
+		case "unknown":
+			call.Args = append(call.Args, &ast.NamedArg{Name: "id", Value: value})
+		case "positional":
+			call.Args = append(call.Args, &ast.NamedArg{Value: value})
+		}
+	})
+}
+
+func TestGeneratedBulkDeleteArgumentContract(t *testing.T) {
+	runGeneratedFixture(t, `model Item @noTime { id: Int @id }
+api directDelete(): Int { return Item.deleteMany(where: id > 0) }
+api chainDelete(): Int { return Item.where(id > 0).deleteMany() }
+api functionDelete(): Int { return deleteMany(Item, where: id > 0) }
+api aliasDelete(): Int { val query = Item.where(id > 0) return query.deleteMany(where: id < 5) }
+api allDelete(): Int { return deleteMany(Item) }
+api defaultLambda(): Int { return Item.where { it.id > 0 }.deleteMany(where: false) }
+api namedLambda(): Int { return Item.where { row -> row.id > 0 }.deleteMany(where: false) }
+api falseDelete(): Int { return Item.deleteMany(where: false) }
+api flagDelete(allowed: Boolean): Int { return Item.deleteMany(where: allowed) }
+fn removeItems(): Int { val removed = deleteMany(Item, where: id > 0) return removed }
+api functionLocalDelete(): Int { return removeItems() }
+api parallelDelete(): Int { val removed = await { deleteMany(Item, where: id > 0) } return removed }
+
+
+`, `package generated
+import("testing";"github.com/light-speak/luxo/pkg/lux/api")
+func TestBulkDeleteHandlersCompile(t *testing.T) {
+ for _, handler := range []api.HandlerFunc{handleDirectDelete(nil),handleChainDelete(nil),handleFunctionDelete(nil),handleAliasDelete(nil),handleAllDelete(nil)} {
+  if handler == nil { t.Fatal("bulk delete handler constructor returned nil") }
+ }
+}
+`, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+}
+
+func TestFormalDeleteManyPredicateForms(t *testing.T) {
+	for _, sample := range []struct{ predicate, condition string }{
+		{"false", "lux.BoolCondition(false)"}, {"allowed", "lux.BoolCondition(allowed)"},
+	} {
+		for _, query := range []string{"Item.deleteMany(where: PREDICATE)", "deleteMany(Item, where: PREDICATE)"} {
+			input := analyzePermissionFixture(t, "model Item @noTime { id: Int @id } api probe(allowed: Boolean): Int { return "+strings.ReplaceAll(query, "PREDICATE", sample.predicate)+" }")
+			if len(input.Errors) != 0 {
+				t.Fatal(input.Errors)
+			}
+			ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+			output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+			if err != nil || output == nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(output.Files["handler.gen.go"]), ".Where("+sample.condition+").Delete(ctx)") {
+				t.Fatal("bulk delete lost predicate semantics", string(output.Files["handler.gen.go"]))
+			}
+		}
+	}
+}
+
+func TestFormalDeleteManyPreservesPredicateEvaluationOrder(t *testing.T) {
+	input := analyzePermissionFixture(t, `model Item @noTime { id: Int @id }
+fn firstValue(): Result<Int> @native
+fn secondValue(): Result<Int> @native
+api probe(): Int { return Item.where(id > firstValue()?).deleteMany(where: id < secondValue()?) }`)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+	output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+	if err != nil || output == nil {
+		t.Fatal(err)
+	}
+	code := string(output.Files["handler.gen.go"])
+	first, capture, second, deletion := strings.Index(code, "app.Resolver.FirstValue(ctx)"), strings.Index(code, ":= app.Item.Where(ItemWhere.Id.Gt("), strings.Index(code, "app.Resolver.SecondValue(ctx)"), strings.Index(code, ".Delete(ctx)")
+	if first < 0 || capture <= first || second <= capture || deletion <= second || !strings.Contains(code, ".Where(ItemWhere.Id.Lt(") {
+		t.Fatal("bulk delete reordered or discarded predicate effects", code)
+	}
+}
+
+func TestDeleteManyInvalidInternalArgumentLocation(t *testing.T) {
+	for _, arguments := range [][]*ast.NamedArg{{nil}, {{Name: "where"}}} {
+		c := newCompiler(makeModels("Item"))
+		var output strings.Builder
+		call := &ast.CallExpr{Pos: token.Position{File: "invalid.luxo", Line: 7, Col: 9}}
+		func() {
+			defer func() {
+				value := recover()
+				failure, ok := value.(*InternalCompilerError)
+				if !ok {
+					t.Fatalf("invalid internal argument did not preserve compiler failure type: %v", value)
+				}
+				if !strings.Contains(failure.Detail, "invalid.luxo:7:9") || output.Len() != 0 {
+					t.Fatal("invalid internal argument lost location or wrote SQL", failure.Detail, output.String())
+				}
+			}()
+			c.compileDeleteMany(&output, "Item", chainLink{method: "deleteMany", expr: call, args: arguments})
+		}()
+	}
+}
+
+func TestFormalDeleteManyAnalyzedLambdaArgument(t *testing.T) {
+	for _, parameter := range []string{"it", "row"} {
+		input := analyzePermissionFixture(t, "model Item @noTime { id: Int @id } api probe(): Int { return Item.deleteMany(where: id > 0) }")
+		if len(input.Errors) != 0 {
+			t.Fatal(input.Errors)
+		}
+		ast.WalkExprs(input.Files[0].APIs[0].Body, func(expression ast.Expr) {
+			call, ok := expression.(*ast.CallExpr)
+			if !ok {
+				return
+			}
+			member, ok := call.Func.(*ast.MemberExpr)
+			if !ok || member.Field != "deleteMany" {
+				return
+			}
+			condition := call.Args[0].Value.(*ast.BinaryExpr)
+			condition.Left = &ast.MemberExpr{Pos: condition.Pos, Object: &ast.Ident{Name: parameter}, Field: "id"}
+			lambda := &ast.LambdaExpr{Pos: condition.Pos, Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: condition}}}}
+			if parameter != "it" {
+				lambda.Params = []string{parameter}
+			}
+			call.Args[0].Value = lambda
+		})
+		input = semantic.Analyze(input.Files)
+		if len(input.Errors) != 0 {
+			t.Fatal(input.Errors)
+		}
+		ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+		output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+		if err != nil || output == nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(output.Files["handler.gen.go"]), ".Where(ItemWhere.Id.Gt(0)).Delete(ctx)") {
+			t.Fatal("AST predicate argument lost row binding", string(output.Files["handler.gen.go"]))
+		}
+	}
+}
+
+func TestFormalDeleteManyRejectsInvalidModelOperand(t *testing.T) {
+	for _, kind := range []string{"missing", "named", "value", "shadowed"} {
+		t.Run(kind, func(t *testing.T) {
+			input := analyzePermissionFixture(t, "model Item @noTime { id: Int @id } api probe(): Int { return deleteMany(Item, where: id > 0) }")
+			if len(input.Errors) != 0 {
+				t.Fatal(input.Errors)
+			}
+			api := input.Files[0].APIs[0]
+			ast.WalkExprs(api.Body, func(expression ast.Expr) {
+				call, ok := expression.(*ast.CallExpr)
+				if !ok {
+					return
+				}
+				name, ok := call.Func.(*ast.Ident)
+				if !ok || name.Name != "deleteMany" {
+					return
+				}
+				switch kind {
+				case "missing":
+					call.Args = nil
+				case "named":
+					call.Args[0].Name = "target"
+				case "value":
+					call.Args[0].Value = &ast.Literal{Pos: call.Pos, Kind: token.Int, Value: "1"}
+				case "shadowed":
+					api.Params = append(api.Params, &ast.ParamDecl{Name: "Item", Type: &ast.TypeRef{Name: "Int"}})
+				}
+			})
+			ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+			output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+			failure, ok := err.(*InternalCompilerError)
+			if output != nil || !ok || len(failure.Stack) == 0 || !strings.Contains(err.Error(), "permission.luxo:") || !strings.Contains(err.Error(), "deleteMany requires a positional model") {
+				t.Fatalf("invalid model operand emitted code or lost location: output=%v error=%v", output != nil, err)
+			}
+		})
+	}
+}
+
+func TestFormalDeleteManyPreservesSoftDelete(t *testing.T) {
+	input := analyzePermissionFixture(t, "model Item @noTime @soft { id: Int @id } api probe(): Int { return Item.deleteMany(where: id > 0) }")
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+	output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+	if err != nil || output == nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(output.Files["handler.gen.go"]), "app.Item.Where(ItemWhere.Id.Gt(0)).SoftDelete(ctx)") {
+		t.Fatal("bulk delete removed soft-delete semantics", string(output.Files["handler.gen.go"]))
+	}
+}
+
+func TestFormalModelQueryReceiverRejectsUnvalidatedAST(t *testing.T) {
+	for _, sample := range []struct{ name, body, binding string }{
+		{"direct", "return Item.deleteMany()", "row"},
+		{"parameter-shadow", "return Item.deleteMany()", "Item"},
+		{"chain", "return Item.where(id > 0).deleteMany()", "row"},
+		{"alias", "val query = Item.where(id > 0) return query.deleteMany()", "row"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			input := analyzePermissionFixture(t, "model Item @noTime { id: Int @id } api probe(): Int { "+sample.body+" }")
+			if len(input.Errors) != 0 {
+				t.Fatal(input.Errors)
+			}
+			api := input.Files[0].APIs[0]
+			api.Params = append(api.Params, &ast.ParamDecl{Name: sample.binding, Type: &ast.TypeRef{Name: "Item"}})
+			ast.WalkExprs(api.Body, func(expression ast.Expr) {
+				if member, ok := expression.(*ast.MemberExpr); ok {
+					if root, ok := member.Object.(*ast.Ident); ok && root.Name == "Item" {
+						root.Name = sample.binding
+					}
+				}
+			})
+			ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+			output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+			failure, internal := err.(*InternalCompilerError)
+			if output != nil || !internal || len(failure.Stack) == 0 || !strings.Contains(err.Error(), "permission.luxo:") || !strings.Contains(err.Error(), "requires a model type or query builder") {
+				t.Fatalf("unvalidated instance query emitted output: %v %v", output != nil, err)
+			}
+		})
+	}
+}
+
+func TestGeneratedModelQueryReceiverBindings(t *testing.T) {
+	runGeneratedFixture(t, `model Item @noTime { id: Int @id name: String count: Int }
+model Other @noTime { id: Int @id label: String }
+api updateInstance(row: Item): Int { return row.update(name: "kept") }
+api deleteInstance(row: Item): Int { return row.delete() }
+api shadowField(Item: Item): Int { return Item.count }
+api fieldMethod(Item: Item): String { return Item.name.trim() }
+api readAlias(): [Other] { val Item = Other.where(id > 0).orderBy(id.desc) return Item.all() }
+api sortedAlias(): Int { val query = Item.where(id > 0).orderBy(id.desc) return query.count() }
+`, `package generated
+import("testing";"github.com/light-speak/luxo/pkg/lux/api")
+func TestQueryReceiverBindingsCompile(t *testing.T) {
+ for _, handler:=range []api.HandlerFunc{handleUpdateInstance(nil),handleDeleteInstance(nil),handleShadowField(nil),handleFieldMethod(nil),handleReadAlias(nil),handleSortedAlias(nil)} {
+  if handler==nil { t.Fatal("query/instance binding lost its handler") }
+ }
+}
+`, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1, "name": 2, "count": 3}, "Other": {"id": 1, "label": 2}}})
+}
+
+func TestModelQueryReceiverResolvedFieldMetadata(t *testing.T) {
+	c := newCompiler(makeModels("Item"))
+	c.vars["row"] = valType{name: "Item", isModel: true}
+	member := &ast.MemberExpr{Object: &ast.Ident{Name: "row"}, Field: "where", DeclaredField: true}
+	c.checkModelQueryReceiver(&ast.CallExpr{Func: member})
+}
+
+func TestFormalQueryTerminalPreservesWhere(t *testing.T) {
+	for _, method := range []string{"count", "exists"} {
+		resultType, terminal := "Int", "Count"
+		if method == "exists" {
+			resultType, terminal = "Boolean", "Exists"
+		}
+		for _, sample := range []struct{ expression, query string }{
+			{"Item.METHOD()", "app.Item.TERMINAL(ctx)"},
+			{"Item.METHOD(where: false)", "app.Item.Where(lux.BoolCondition(false)).TERMINAL(ctx)"},
+			{"Item.METHOD(where: it.id == requested)", "app.Item.Where(ItemWhere.Id.Eq(requested)).TERMINAL(ctx)"},
+			{"Item.where(id > 0).METHOD(where: id < requested)", "app.Item.Where(ItemWhere.Id.Gt(0)).Where(ItemWhere.Id.Lt(requested)).TERMINAL(ctx)"},
+			{"METHOD(Item, where: id == requested)", "app.Item.Where(ItemWhere.Id.Eq(requested)).TERMINAL(ctx)"},
+			{"query.METHOD(where: allowed)", "query.Where(lux.BoolCondition(allowed)).TERMINAL(ctx)"},
+		} {
+			t.Run(method+"/"+sample.expression, func(t *testing.T) {
+				expression := strings.ReplaceAll(sample.expression, "METHOD", method)
+				code := compileQueryTerminalFixture(t, "api probe(requested: Int, allowed: Boolean): "+resultType+" { val query = Item.where(id > 0) return "+expression+" }")
+				if want := strings.ReplaceAll(sample.query, "TERMINAL", terminal); !strings.Contains(code, want) {
+					t.Fatal("query terminal lost its predicate or call ownership", want, code)
+				}
+			})
+		}
+		code := compileQueryTerminalFixture(t, "fn "+method+"(value: "+resultType+"): "+resultType+" { return value } api probe(value: "+resultType+"): "+resultType+" { return "+method+"(value) }")
+		if !strings.Contains(code, "app."+method+"(ctx, ") || strings.Contains(code, "app.Item."+terminal+"(ctx") {
+			t.Fatal("ordinary function became a database query", code)
+		}
+	}
+}
+
+func compileQueryTerminalFixture(t *testing.T, source string) string {
+	t.Helper()
+	input := analyzePermissionFixture(t, "model Item @noTime { id: Int @id } "+source)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+	output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+	if err != nil || output == nil {
+		t.Fatal(err)
+	}
+	return string(output.Files["handler.gen.go"])
+}
+
+func TestFormalQueryTerminalRejectsMutatedArguments(t *testing.T) {
+	for _, method := range []string{"count", "exists"} {
+		resultType := "Int"
+		if method == "exists" {
+			resultType = "Boolean"
+		}
+		for name, expression := range map[string]string{"model": "Item.METHOD(where: id == 1)", "alias": "query.METHOD(where: id == 1)", "chain": "Item.where(id > 0).METHOD(where: id == 1)", "function": "METHOD(Item, where: id == 1)"} {
+			for _, kind := range []string{"unknown", "positional", "duplicate", "non-boolean", "missing-value", "side-effect"} {
+				t.Run(method+"/"+name+"/"+kind, func(t *testing.T) {
+					input := analyzePermissionFixture(t, "fn sideEffect(): Result<Int> @native model Item @noTime { id: Int @id } api probe(): "+resultType+" { val query = Item.where(id > 0) return "+strings.ReplaceAll(expression, "METHOD", method)+" }")
+					if len(input.Errors) != 0 {
+						t.Fatal(input.Errors)
+					}
+					mutateQueryWhereArguments(input.Files[0].APIs[0].Body, method, kind)
+					ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+					output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+					failure, internal := err.(*InternalCompilerError)
+					if output != nil || !internal || len(failure.Stack) == 0 || !strings.Contains(err.Error(), "permission.luxo:") || !strings.Contains(err.Error(), method) {
+						t.Fatalf("invalid terminal AST emitted output or lost diagnostic: %v %v", output != nil, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestFormalQueryTerminalPreservesPredicateEffects(t *testing.T) {
+	for _, method := range []string{"count", "exists"} {
+		resultType, terminal := "Int", "Count"
+		if method == "exists" {
+			resultType, terminal = "Boolean", "Exists"
+		}
+		code := compileQueryTerminalFixture(t, "fn firstValue(): Result<Int> @native fn secondValue(): Result<Int> @native api probe(): "+resultType+" { return Item.where(id > firstValue()?)."+method+"(where: id < secondValue()?) }")
+		first, capture, second, call := strings.Index(code, "app.Resolver.FirstValue(ctx)"), strings.Index(code, ":= app.Item.Where(ItemWhere.Id.Gt("), strings.Index(code, "app.Resolver.SecondValue(ctx)"), strings.Index(code, "."+terminal+"(ctx)")
+		if first < 0 || capture <= first || second <= capture || call <= second || !strings.Contains(code, ".Where(ItemWhere.Id.Lt(") {
+			t.Fatal("query terminal reordered or discarded predicate effects", code)
+		}
+	}
+}
+
+func TestFormalQueryTerminalRejectsValueReceivers(t *testing.T) {
+	for _, method := range []string{"count", "exists"} {
+		resultType := "Int"
+		if method == "exists" {
+			resultType = "Boolean"
+		}
+		for _, function := range []bool{false, true} {
+			t.Run(method+"/function="+fmt.Sprint(function), func(t *testing.T) {
+				expression := "Item." + method + "()"
+				if function {
+					expression = method + "(Item)"
+				}
+				input := analyzePermissionFixture(t, "model Item @noTime { id: Int @id } api probe(): "+resultType+" { return "+expression+" }")
+				if len(input.Errors) != 0 {
+					t.Fatal(input.Errors)
+				}
+				input.Files[0].APIs[0].Params = append(input.Files[0].APIs[0].Params, &ast.ParamDecl{Name: "Item", Type: &ast.TypeRef{Name: "Item"}})
+				ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+				output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+				failure, internal := err.(*InternalCompilerError)
+				if output != nil || !internal || len(failure.Stack) == 0 || !strings.Contains(err.Error(), "permission.luxo:") {
+					t.Fatal("model value became a whole-table query", output != nil, err)
+				}
+			})
+		}
+	}
+}
+
+func TestFormalQueryTerminalAwaitKeepsWhere(t *testing.T) {
+	code := compileQueryTerminalFixture(t, `api probe(): Int {
+val (first, second) = await {
+ Item.count(where: false)
+ Item.where(id > 0).count(where: id < 10)
+}
+return first + second
+}`)
+	if strings.Contains(code, ".AggregateBatch(") || !strings.Contains(code, ".Where(lux.BoolCondition(false)).Count(ctx)") || !strings.Contains(code, ".Where(ItemWhere.Id.Gt(0)).Where(ItemWhere.Id.Lt(10)).Count(ctx)") {
+		t.Fatal("await optimization discarded terminal predicates", code)
+	}
+}
+
+func TestFormalQueryTerminalAliasAwaitOwnership(t *testing.T) {
+	input := analyzePermissionFixture(t, `model Item @noTime { id: Int @id } model Other @noTime { id: Int @id }
+api probe(): Int {
+ val Item = Other.where(id > 0)
+ val (first, second) = await { Item.count() Item.count() }
+ return first + second
+}`)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}, "Other": {"id": 1}}})
+	output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+	if err != nil || output == nil {
+		t.Fatal(err)
+	}
+	code := string(output.Files["handler.gen.go"])
+	if strings.Contains(code, "app.Item.") || strings.Contains(code, ".AggregateBatch(") || awaitFilteredQueryCountCalls(code) != 2 {
+		t.Fatal("await query alias lost its model or existing predicates", code)
+	}
+}
+
+func awaitFilteredQueryCountCalls(code string) int {
+	prefix, _, found := strings.Cut(code, " := app.Other.Where(OtherWhere.Id.Gt(0))")
+	if !found {
+		return 0
+	}
+	name := strings.TrimSpace(prefix[strings.LastIndex(prefix, "\n")+1:])
+	return strings.Count(code, name+".Count(ctx)")
+}
+
+func TestGeneratedQueryTerminalArguments(t *testing.T) {
+	runGeneratedFixture(t, `model Item @noTime { id: Int @id count: Int }
+model Other @noTime { id: Int @id }
+api directCount(allowed: Boolean): Int { return Item.count(where: allowed) }
+api directExists(requested: Int): Boolean { return Item.exists(where: it.id == requested) }
+api functionCount(): Int { return count(Item, where: false) }
+api functionExists(): Boolean { return exists(Item, where: false) }
+api chainCount(): Int { return Item.where(id > 0).count(where: false) }
+api aliasExists(): Boolean { val query = Item.where(id > 0) return query.exists(where: false) }
+api otherAlias(): Int { val Item = Other.where(id > 0) return Item.count(where: false) }
+api originalCount(): Int { return Item.count() }
+api originalExists(): Boolean { return Item.exists() }
+api fieldControl(Item: Item): Int { return Item.count }
+fn countItems(): Int { val total = count(Item, where: false) return total }
+fn hasItems(): Boolean { val found = exists(Item, where: false) return found }
+fn guardItems(): Int { if exists(Item, where: false) { return 1 } return 0 }
+fn logicalItems(): Boolean { return exists(Item, where: false) && true }
+api awaitedCount(): Int { val total = await { count(Item, where: false) } return total }
+api awaitedExists(): Boolean { val found = await { exists(Item, where: false) } return found }
+`, `package generated
+import("testing";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux")
+func TestTerminalHandlersCompile(t *testing.T) {
+ for _, handler := range []api.HandlerFunc{handleDirectCount(nil),handleDirectExists(nil),handleFunctionCount(nil),handleFunctionExists(nil),handleChainCount(nil),handleAliasExists(nil)} {
+  if handler == nil { t.Fatal("query terminal handler was nil") }
+ }
+}
+func TestTerminalPredicateSQL(t *testing.T) {
+ conditions := []lux.Condition{ItemWhere.Id.Gt(0),lux.BoolCondition(false)}
+ countSQL,args := lux.BuildCountSQL("items", conditions)
+ if countSQL != "SELECT COUNT(*) FROM items WHERE \"id\" > $1 AND FALSE" || len(args) != 1 || args[0] != int64(0) { t.Fatal(countSQL,args) }
+ existsSQL,args := lux.BuildExistsSQL("items", conditions)
+ if existsSQL != "SELECT EXISTS(SELECT 1 FROM items WHERE \"id\" > $1 AND FALSE LIMIT 1)" || len(args) != 1 || args[0] != int64(0) { t.Fatal(existsSQL,args) }
+}
+`, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1, "count": 2}, "Other": {"id": 1}}})
+}
+
+func TestFormalQueryTerminalPreparedAwaitPreservesWhere(t *testing.T) {
+	for _, sample := range []struct {
+		name, prefix, first, second string
+		fused                       bool
+	}{
+		{"global-model", "", "Item.where(id > 0).count()", "Item.where(id > 0).count()", true},
+		{"terminal-where", "", "Item.count(where: false)", "Item.count(where: false)", false},
+		{"shadowed-alias", "val Item = Other.where(id > 0)", "Item.count()", "Item.count()", false},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			input := analyzePermissionFixture(t, "model Item @noTime { id: Int @id } model Other @noTime { id: Int @id } api probe(): Int { "+sample.prefix+" await { val first = "+sample.first+" val second = "+sample.second+" } return 0 }")
+			if len(input.Errors) != 0 {
+				t.Fatal(input.Errors)
+			}
+			ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}, "Other": {"id": 1}}})
+			output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+			if err != nil || output == nil {
+				t.Fatal(err)
+			}
+			code := string(output.Files["handler.gen.go"])
+			if strings.Contains(code, ".AggregateBatch(") != sample.fused {
+				t.Fatal("prepared await changed the existing fusion boundary", code)
+			}
+			if sample.name == "terminal-where" && strings.Count(code, ".Where(lux.BoolCondition(false)).Count(ctx)") != 2 {
+				t.Fatal("prepared task discarded explicit where", code)
+			}
+			if sample.name == "shadowed-alias" && (strings.Contains(code, "app.Item.") || awaitFilteredQueryCountCalls(code) != 2) {
+				t.Fatal("prepared task rebuilt a local query from its variable name", code)
+			}
+		})
+	}
+}
+
+func TestFormalQueryTerminalPreservesGroupedCount(t *testing.T) {
+	input := analyzePermissionFixture(t, `model Item @noTime { id: Int @id }
+type Summary { count: Int }
+api summarize(): [Summary] { return Item.groupBy { it.id }.select { Summary { count: it.count() } } }`)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}, "Summary": {"count": 1}}})
+	output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+	if err != nil || output == nil {
+		t.Fatal(err)
+	}
+	code := string(output.Files["handler.gen.go"])
+	if !strings.Contains(code, `{Fn: "COUNT", Col: "", Alias: "\"count\""}`) || strings.Contains(code, ".Count(ctx)") {
+		t.Fatal("group count was rewritten as a database terminal", code)
+	}
+}
+
+func TestQueryTerminalResolvedFieldMethods(t *testing.T) {
+	for _, method := range []string{"count", "exists"} {
+		c := newCompiler(makeModels("Item"))
+		c.vars["row"] = valType{name: "Item", isModel: true}
+		member := &ast.MemberExpr{Object: &ast.Ident{Name: "row"}, Field: method, DeclaredField: true}
+		c.checkModelQueryReceiver(&ast.CallExpr{Func: member})
+	}
+}
+
+func TestGeneratedQueryTerminalAwaitResultModelName(t *testing.T) {
+	runGeneratedFixture(t, `model Item @noTime { id: Int @id }
+api probe(): Int {
+ val (Item, second) = await { Item.count() Item.count() }
+ return Item + second
+}
+api single(): Int { val Item = await { Item.count() } return Item }
+api prepared(): Int { val Item: Int = await { Item.count() } return Item }
+api existing(value: Int): Int {
+ val Item = value
+ if true {
+  val (Item, second) = await { Item + 1 Item + 2 }
+  return Item + second
+ }
+ return Item
+}
+`, `package generated
+import("testing";"github.com/light-speak/luxo/pkg/lux/api")
+func TestAwaitModelNameHandlerCompiles(t *testing.T) {
+ for _, handler := range []api.HandlerFunc{handleProbe(nil),handleSingle(nil),handlePrepared(nil),handleExisting(nil)} {
+  if handler == nil { t.Fatal("query handler constructor returned nil") }
+ }
+}
+`, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1}}})
+}
+
+func TestFormalUpdateManyPreservesWrites(t *testing.T) {
+	for _, sample := range []struct{ expression, query string }{
+		{`Item.updateMany()`, `app.Item.Where().updatePrepared(ctx)`},
+		{`Item.updateMany(where: false)`, `app.Item.Where(lux.BoolCondition(false)).updatePrepared(ctx)`},
+		{`Item.updateMany(where: false, where: true, name: name)`, `app.Item.Where(lux.BoolCondition(false)).Where(lux.BoolCondition(true)).updatePrepared(ctx, lux.SetField{Col: "\"name\"", Val: name})`},
+		{`Item.updateMany(name: name)`, `.updatePrepared(ctx, lux.SetField{Col: "\"name\"", Val: name})`},
+		{`Item.where(id > 0).updateMany(name: name)`, `app.Item.Where(ItemWhere.Id.Gt(0)).updatePrepared(ctx, lux.SetField{Col: "\"name\"", Val: name})`},
+		{`query.updateMany(name: name)`, `query.updatePrepared(ctx, lux.SetField{Col: "\"name\"", Val: name})`},
+		{`updateMany(Item, name: name)`, `app.Item.Where().updatePrepared(ctx, lux.SetField{Col: "\"name\"", Val: name})`},
+	} {
+		t.Run(sample.expression, func(t *testing.T) {
+			input := analyzePermissionFixture(t, `model Item @noTime { id: Int @id name: String } api probe(name: String): Int { val query = Item.where(id > 0) return `+sample.expression+` }`)
+			if len(input.Errors) != 0 {
+				t.Fatal(input.Errors)
+			}
+			ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1, "name": 2}}})
+			output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+			if err != nil || output == nil || !strings.Contains(string(output.Files["handler.gen.go"]), sample.query) {
+				t.Fatalf("bulk update lost query/value ownership: %v\n%s", err, output.Files["handler.gen.go"])
+			}
+		})
+	}
+}
+
+func TestFormalUpdateManyRejectsMutatedSetters(t *testing.T) {
+	for name, expression := range map[string]string{
+		"model": `Item.updateMany(where: id > 0, name: "kept")`, "chain": `Item.where(id > 0).updateMany(name: "kept")`,
+		"alias": `query.updateMany(name: "kept")`, "function": `updateMany(Item, name: "kept")`,
+	} {
+		for _, kind := range []string{"unknown", "positional", "wrong-type", "nullable", "immutable", "missing-value", "side-effect"} {
+			t.Run(name+"/"+kind, func(t *testing.T) {
+				input := analyzePermissionFixture(t, `fn sideEffect(): Result<Int> @native model Item @noTime { id: Int @id name: String locked: String @immutable }
+api probe(): Int { val query = Item.where(id > 0) return `+expression+` }`)
+				if len(input.Errors) != 0 {
+					t.Fatal(input.Errors)
+				}
+				mutateBulkUpdateSetter(input.Files[0].APIs[0].Body, kind)
+				ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1, "name": 2, "locked": 3}}})
+				output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+				failure, internal := err.(*InternalCompilerError)
+				if output != nil || !internal || len(failure.Stack) == 0 || !strings.Contains(err.Error(), "permission.luxo:") || !strings.Contains(err.Error(), "updateMany") {
+					t.Fatal("invalid updateMany AST produced output or lost location", output != nil, err)
+				}
+			})
+		}
+	}
+}
+
+func mutateBulkUpdateSetter(body *ast.Block, kind string) {
+	ast.WalkExprs(body, func(expression ast.Expr) {
+		call, ok := expression.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		method := ""
+		switch target := call.Func.(type) {
+		case *ast.Ident:
+			method = target.Name
+		case *ast.MemberExpr:
+			method = target.Field
+		}
+		if method != "updateMany" {
+			return
+		}
+		for _, argument := range call.Args {
+			if argument.Name != "name" {
+				continue
+			}
+			switch kind {
+			case "unknown":
+				argument.Name = "missing"
+			case "positional":
+				argument.Name = ""
+			case "wrong-type":
+				value := &ast.Literal{Pos: call.Pos, Kind: token.Int, Value: "1"}
+				value.SetTypeTag("Int")
+				argument.Value = value
+			case "nullable":
+				value := &ast.Literal{Pos: call.Pos, Kind: token.Null, Value: "null"}
+				value.SetTypeTag("null")
+				value.SetNullable(true)
+				argument.Value = value
+			case "immutable":
+				argument.Name = "locked"
+			case "missing-value":
+				argument.Value = nil
+			case "side-effect":
+				argument.Name = "missing"
+				argument.Value = &ast.CallExpr{Pos: call.Pos, Func: &ast.Ident{Name: "sideEffect"}}
+			}
+			return
+		}
+	})
+}
+
+func TestFormalUpdateManyStaticLists(t *testing.T) {
+	input := analyzePermissionFixture(t, `model Item @noTime { id: Int @id values: [Int] words: [String] maybe: [Int]? }
+api empty(): Int { return Item.updateMany(values: [], words: [], maybe: []) }
+api nullable(value: [Int]?): Int { return Item.updateMany(maybe: value) }
+api explicitNull(): Int { return Item.updateMany(maybe: null) }`)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1, "values": 2, "words": 3, "maybe": 4}}})
+	output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+	if err != nil || output == nil {
+		t.Fatal(err)
+	}
+	code := string(output.Files["handler.gen.go"])
+	for _, want := range []string{`Val: []int64{}`, `Val: []string{}`, `Col: "\"maybe\"", Val: nil`} {
+		if !strings.Contains(code, want) || strings.Contains(code, "[]any{}") {
+			t.Fatal("setter list lost its declared element type or null value", want, code)
+		}
+	}
+}
+
+func TestFormalUpdateManyPreparationOrder(t *testing.T) {
+	input := analyzePermissionFixture(t, `model Item @noTime { id: Int @id value: Int @beforeSave { it + 1 } password: String @beforeSave { it.trim() } @hash @hidden }
+fn firstValue(): Result<Int> @native
+fn nextValue(): Result<Int> @native
+fn secondCondition(): Result<Int> @native
+fn passwordValue(): Result<String> @native
+api probe(): Int { return Item.where(id > firstValue()?).updateMany(value: nextValue()?, where: id < secondCondition()?, password: passwordValue()?) }`)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1, "value": 2, "password": 3}}})
+	output, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+	if err != nil || output == nil {
+		t.Fatal(err)
+	}
+	code := string(output.Files["handler.gen.go"])
+	last := -1
+	for _, stage := range []string{"app.Resolver.FirstValue(ctx)", ":= app.Item.Where(ItemWhere.Id.Gt(", "app.Resolver.NextValue(ctx)", "prepareSave4ItemValue(", "app.Resolver.SecondCondition(ctx)", "app.Resolver.PasswordValue(ctx)", "prepareSave4ItemPassword(", "luxocrypto.HashPassword(", ".updatePrepared(ctx"} {
+		index := strings.Index(code, stage)
+		if index <= last {
+			t.Fatal("bulk update reordered query, values, preparation or hashing", stage, code)
+		}
+		last = index
+	}
+}
+
+func TestGeneratedUpdateManyArgumentContract(t *testing.T) {
+	runGeneratedFixture(t, `model Parent @noTime { id: Int @id inherited: String }
+model Item : Parent @noTime {
+ name: String
+ optional: String?
+ secret: String @internal
+ createdAt: DateTime
+ values: [Int]
+ words: [String]
+ maybe: [Int]?
+ value: Int @beforeSave { it + 1 }
+ password: String @hidden @hash @beforeSave { it.trim() }
+}
+model Other @noTime { id: Int @id name: String }
+api direct(name: String): Int { return Item.updateMany(name: name) }
+api alias(name: String): Int { val query = Item.where(id > 0) return query.updateMany(where: id < 5, name: name) }
+api function(name: String): Int { return updateMany(Item, name: name) }
+api inherited(name: String): Int { return Item.updateMany(inherited: name) }
+api internal(name: String): Int { return Item.updateMany(secret: name) }
+api primary(): Int { return Item.updateMany(id: 2) }
+api nullable(name: String?): Int { return Item.updateMany(optional: name) }
+api noTime(stamp: DateTime): Int { return Item.updateMany(createdAt: stamp) }
+api emptyLists(): Int { return Item.updateMany(values: [], words: [], maybe: []) }
+api nonemptyLists(): Int { return Item.updateMany(values: [1, 2]) }
+api nullableList(values: [Int]?): Int { return Item.updateMany(maybe: values) }
+api nullList(): Int { return Item.updateMany(maybe: null) }
+api shadowAlias(): Int { val Item = Other.where(id > 0) return Item.updateMany(name: "kept") }
+api emptySets(): Int { return Item.updateMany() }
+fn rejectedHash(password: String): Int { return Item.updateMany(password: password) }
+`, `package generated
+import("strings";"testing";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux";luxocrypto "github.com/light-speak/luxo/pkg/lux/crypto")
+func TestUpdateHandlersCompile(t *testing.T) {
+ for _,handler:=range []api.HandlerFunc{handleDirect(nil),handleAlias(nil),handleFunction(nil),handleInherited(nil),handleInternal(nil),handlePrimary(nil),handleNullable(nil),handleNoTime(nil),handleEmptyLists(nil),handleNonemptyLists(nil),handleNullableList(nil),handleNullList(nil),handleShadowAlias(nil),handleEmptySets(nil)} {
+  if handler==nil { t.Fatal("nil update handler") }
+ }
+}
+func TestUpdatePreparationBeforeDatabase(t *testing.T) {
+ builder:=(&ItemClient{}).Where().Update().SetValue(1).SetPassword(" kept ")
+ sets:=builder.state.UpdateBase.Sets
+ if len(sets)!=2 || sets[0].Val!=int64(2) { t.Fatal("beforeSave was lost or repeated",sets) }
+ hashed,ok:=sets[1].Val.(string)
+ if !ok || !luxocrypto.VerifyPassword("kept",hashed) || luxocrypto.VerifyPassword(" kept ",hashed) { t.Fatal("hashing did not consume exactly the prepared value") }
+ if _,err:=NewFromDB(nil).rejectedHash(t.Context(),strings.Repeat("x",73));err==nil { t.Fatal("oversized password reached database") }
+}
+func TestUpdateListSQLTypes(t *testing.T) {
+ query,args:=lux.BuildUpdateSQL("items",[]lux.SetField{{Col:"\"values\"",Val:[]int64{}}},[]lux.Condition{ItemWhere.Id.Eq(7)})
+ values,ok:=args[0].([]int64)
+ if query!="UPDATE items SET \"values\" = $1 WHERE \"id\" = $2" || len(args)!=2 || !ok || values==nil || len(values)!=0 || args[1]!=int64(7) { t.Fatal(query,args) }
+}
+`, StableIDs{ModelFields: map[string]map[string]int{
+		"Parent": {"id": 1, "inherited": 2},
+		"Item":   {"id": 1, "inherited": 2, "name": 3, "optional": 4, "secret": 5, "createdAt": 6, "values": 7, "words": 8, "maybe": 9, "value": 10, "password": 11},
+		"Other":  {"id": 1, "name": 2},
+	}})
+}
+
+func TestGeneratedOrdinaryUpdateManyFunction(t *testing.T) {
+	runGeneratedFixture(t, `fn updateMany(value: String): String { return value }
+api probe(): String { return updateMany("kept") }`, `package generated
+import "testing"
+func TestOrdinaryUpdateMany(t *testing.T) { value,err:=(&App{}).updateMany(t.Context(),"kept");if err!=nil || value!="kept" {t.Fatal(value,err)} }
+`, StableIDs{})
+}
+
+func TestGeneratedOrdinaryUpdateManyModelArgument(t *testing.T) {
+	runGeneratedFixture(t, `model Item @noTime { id: Int @id value: String }
+fn updateMany(row: Item, value: Int): Int { return value }
+api probe(Item: Item, value: Int): Int { return updateMany(Item, value) }`, `package generated
+import "testing"
+func TestOrdinaryModelArgument(t *testing.T) { value,err:=(&App{}).updateMany(t.Context(),&Item{Value:"stored"},17);if err!=nil || value!=17 {t.Fatal(value,err)} }
+`, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1, "value": 2}}})
+}
+
+func TestGeneratedDeclaredCRUDNamesUseCallerScope(t *testing.T) {
+	for _, name := range []string{"count", "create"} {
+		t.Run(name, func(t *testing.T) {
+			runGeneratedFixture(t, `model Item @noTime { id: Int @id value: String }
+fn `+name+`(row: Item, value: Int): Int { return value }
+api probe(Item: Item, value: Int): Int { return `+name+`(Item, value) }`, `package generated
+import "testing"
+func TestDeclaredFunction(t *testing.T) { value,err:=(&App{}).`+name+`(t.Context(),&Item{Value:"stored"},17);if err!=nil || value!=17 {t.Fatal(value,err)} }
+`, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1, "value": 2}}})
+		})
+	}
+}
+
+func TestGeneratedUpdateManyActualQueryBuilderFields(t *testing.T) {
+	source := `model Item @noTime { id: Int @id value: String }
+model Other @noTime { id: Int @id value: Int }
+api probe(): Int { val Item = Other.where(id > 0) return Item.updateMany(where: value > 0, value: 1) }`
+	runGeneratedFixture(t, source, `package generated
+import "testing"
+func TestActualQueryBuilder(t *testing.T) { if handleProbe(nil)==nil {t.Fatal("nil handler")} }
+`, StableIDs{ModelFields: map[string]map[string]int{"Item": {"id": 1, "value": 2}, "Other": {"id": 1, "value": 2}}})
+}
+
+func TestGeneratedReachableQueryWrapperBranches(t *testing.T) {
+	runGeneratedFixture(t, `model User @noTime { id: Int @id password: String @hash }
+fn fromLocal(user: User, plain: String): Boolean { return user.verifyPassword(plain) }
+fn identityUser(user: User): User { return user }
+fn fromCall(user: User, plain: String): Boolean { return identityUser(user).verifyPassword(plain) }
+fn fromExpression(user: User, plain: String): Boolean { return (when { user.id > 0 -> user else -> user }).verifyPassword(plain) }
+fn safeTrim(text: String?): String? { val result = text?.trim() return result }
+fn lookup(key: Int): User? { return User.load(key) }
+`, `package generated
+import "testing"
+func TestPureQueryWrapperReceivers(t *testing.T) {
+ app:=&App{};user:=&User{Id:1,Password:"stored"}
+ for name,call:=range map[string]func()(bool,error){
+  "local":func()(bool,error){return app.fromLocal(t.Context(),user,"plain")},
+  "call":func()(bool,error){return app.fromCall(t.Context(),user,"plain")},
+  "expression":func()(bool,error){return app.fromExpression(t.Context(),user,"plain")},
+ } {
+  valid,err:=call();if err!=nil||valid {t.Fatal(name,valid,err)}
+ }
+ if value,err:=app.safeTrim(t.Context(),nil);err!=nil||value!=nil {t.Fatal(value,err)}
+ text:=" kept ";value,err:=app.safeTrim(t.Context(),&text)
+ if err!=nil||value==nil||*value!="kept" {t.Fatal(value,err)}
+}
+`, StableIDs{ModelFields: map[string]map[string]int{"User": {"id": 1, "password": 2}}})
+}
+
+func TestCompilerZeroGeneratorFallback(t *testing.T) {
+	c := &compiler{}
+	if got := c.dbPackage(); got != DriverPG.DriverPkg() {
+		t.Fatalf("zero compiler database package = %q", got)
+	}
+	first := c.asyncSnapshotState()
+	if first == nil || c.generator == nil || first != c.asyncSnapshotState() {
+		t.Fatal("zero compiler snapshot state was not initialized once")
+	}
+}
+
+func TestGeneratedComparisonAndResultMemberFallbacks(t *testing.T) {
+	runGeneratedFixture(t, `
+fn keep(value: Boolean): Boolean { return value }
+fn text(): Result<String> @native
+fn names(): Result<[String]> @native
+fn compare(a: Decimal, b: Decimal): String {
+ if !keep(a < b) { return "no" }
+ var value = (text()?).trim()
+ for suffix in names()? { value += suffix }
+ return value
+}
+api probe(a: Decimal, b: Decimal): String { return compare(a, b) }
+`, `package generated
+import("context";"errors";"testing";"github.com/shopspring/decimal")
+type fallbackResolver struct { textCalls, namesCalls int; failure error }
+func(r *fallbackResolver)Text(context.Context)(string,error){r.textCalls++;return " 7 ",r.failure}
+func(r *fallbackResolver)Names(context.Context)([]string,error){r.namesCalls++;return []string{"a","b"},r.failure}
+func TestComparisonAndResult(t *testing.T) {
+ resolver := &fallbackResolver{}
+ app := &App{Resolver:resolver}
+ for _, sample := range []struct{a,b int64; want string}{{1,2,"7ab"},{2,1,"no"}} {
+  got, err := app.compare(t.Context(), decimal.NewFromInt(sample.a), decimal.NewFromInt(sample.b))
+  if err != nil || got != sample.want { t.Fatalf("value=%q error=%v",got,err) }
+ }
+ if resolver.textCalls != 1 || resolver.namesCalls != 1 { t.Fatalf("calls=%d/%d",resolver.textCalls,resolver.namesCalls) }
+ failure := errors.New("text failed")
+ resolver.failure = failure
+ if value,err:=app.compare(t.Context(),decimal.NewFromInt(1),decimal.NewFromInt(2));value!=""||!errors.Is(err,failure){t.Fatal(value,err)}
+}
+`, StableIDs{APIs: map[string]int{"probe": 1}})
+}
+
+func TestAnalyzedDecimalComparisonEffectClassification(t *testing.T) {
+	input := analyzePermissionFixture(t, `fn ordered(a: Decimal, b: Decimal): Boolean { return a < b }`)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	var comparison ast.Expr
+	ast.WalkExprs(input.Files[0].Functions[0].Body, func(expression ast.Expr) {
+		if _, ok := expression.(*ast.BinaryExpr); ok {
+			comparison = expression
+		}
+	})
+	if comparison == nil {
+		t.Fatal("missing analyzed comparison")
+	}
+	if expressionMayHaveEffects(comparison) || fieldExpressionMayFail(comparison) {
+		t.Fatal("a Decimal comparison acquired fallible arithmetic semantics")
+	}
+}
+
+func rejectedFragmentInput(t testing.TB, source, diagnostic string) *semantic.Result {
+	t.Helper()
+	input := analyzePermissionFixture(t, source)
+	before := fmt.Sprint(input.Errors)
+	if len(input.Errors) == 0 || !strings.Contains(before, diagnostic) {
+		t.Fatalf("missing %q diagnostic: %v", diagnostic, input.Errors)
+	}
+	generated, err := Generate(input, "generated", GeneratorConfig{})
+	if generated != nil || err == nil || !strings.Contains(err.Error(), input.Errors[0].Message) {
+		t.Fatalf("invalid source produced public output: generated=%v error=%v", generated, err)
+	}
+	t.Cleanup(func() {
+		if got := fmt.Sprint(input.Errors); got != before {
+			t.Errorf("fragment inspection changed diagnostics: before=%s after=%s", before, got)
+		}
+	})
+	t.Logf("public Generate rejected original diagnostics without output: %s", before)
+	return input
+}
+
+func fragmentOriginalCall(t testing.TB, input *semantic.Result) *ast.CallExpr {
+	t.Helper()
+	var expression ast.Expr
+	switch statement := input.Files[0].Functions[0].Body.Stmts[0].(type) {
+	case *ast.ReturnStmt:
+		expression = statement.Value
+	case *ast.ExprStmt:
+		expression = statement.Expr
+	}
+	call, ok := expression.(*ast.CallExpr)
+	if !ok {
+		t.Fatalf("original first expression is %T, want call", expression)
+	}
+	return call
+}
+
+func TestAggregateInvalidFieldFragmentFallback(t *testing.T) {
+	input := rejectedFragmentInput(t, `model Item @noTime { id: Int @id amount: Int }
+fn probe(): Int { return Item.sum("amount") }`, "aggregate requires one stored numeric field")
+	call := fragmentOriginalCall(t, input)
+	if len(call.Args) != 1 || aggregateFieldName(call.Args[0].Value) != "" {
+		t.Fatal("negative aggregate did not retain its non-field argument")
+	}
+	compiler := newCompiler(map[string]*ast.ModelDecl{"Item": input.Files[0].Models[0]})
+	var output strings.Builder
+	if !compiler.compileTerminalResult(&output, "Item", chainLink{method: "sum", args: call.Args}) {
+		t.Fatal("existing terminal fragment fallback was not handled")
+	}
+	// Observe the private fallback only; this is neither valid DSL nor executable SQL.
+	want := fmt.Sprintf(".Sum(ctx, %q)", `"""amount"""`)
+	if got := output.String(); got != want {
+		t.Fatalf("fallback=%q, want %q", got, want)
+	}
+}
+
+func TestNativeModelResultRejectsOriginalNonCall(t *testing.T) {
+	input := rejectedFragmentInput(t, `fn probe(value: Int): Int { return value? }`, "must be applied directly")
+	statement, ok := input.Files[0].Functions[0].Body.Stmts[0].(*ast.ReturnStmt)
+	if !ok {
+		t.Fatal("missing original return")
+	}
+	question, ok := statement.Value.(*ast.UnaryExpr)
+	if !ok {
+		t.Fatalf("original expression is %T, want question", statement.Value)
+	}
+	if _, ok := question.Value.(*ast.Ident); !ok {
+		t.Fatalf("original operand is %T, want identifier", question.Value)
+	}
+	compiler := newCompiler(nil)
+	if compiler.nativeValueModelResult(question.Value) || compiler.b.Len() != 0 {
+		t.Fatal("non-call was treated as a native model result or emitted output")
+	}
+}
+
+func TestCollectionNonLambdaFragmentBoundaries(t *testing.T) {
+	for _, sample := range []struct{ method, source string }{
+		{"forEach", "fn probe(values: [Int]): Int {\nvalues.forEach(1)\nreturn 0\n}"},
+		{"sortBy", "fn probe(values: [Int]): [Int] { return values.sortBy(1) }"},
+		{"sumOf", "fn probe(values: [Int]): Int { return values.sumOf(1) }"},
+	} {
+		t.Run(sample.method, func(t *testing.T) {
+			input := rejectedFragmentInput(t, sample.source, "collection method requires one non-empty lambda")
+			call := fragmentOriginalCall(t, input)
+			member, ok := call.Func.(*ast.MemberExpr)
+			if !ok || !member.Object.IsListType() || len(call.Args) != 1 {
+				t.Fatal("Analyze did not retain the original list receiver and argument")
+			}
+			if _, ok := call.Args[0].Value.(*ast.Literal); !ok {
+				t.Fatalf("original argument is %T, want literal", call.Args[0].Value)
+			}
+			compiler := newCompiler(nil)
+			value, handled := "", false
+			switch sample.method {
+			case "forEach":
+				handled = compiler.compileForEachStatement(call)
+			case "sortBy":
+				value, handled = compiler.compileSortBy(call)
+			case "sumOf":
+				value, handled = compiler.compileSumOf(call)
+			}
+			if handled || value != "" || compiler.b.Len() != 0 {
+				t.Fatalf("non-lambda emitted output: handled=%v value=%q statements=%q", handled, value, compiler.b.String())
+			}
+		})
+	}
+}
+
+func TestResolveQueryTypeSpecialForms(t *testing.T) {
+	models := makeModels("User")
+	compiler := newCompiler(models)
+	compiler.generator = &GeneratorContext{instanceSaves: map[string]*instanceSavePlan{"User": {model: models["User"]}}}
+	compiler.vars["row"] = valType{isModel: true, name: "User"}
+	row := &ast.Ident{Name: "row"}
+	row.SetTypeTag("User")
+	for _, sample := range []struct {
+		name       string
+		expression ast.Expr
+		want       valType
+	}{
+		{"save", &ast.CallExpr{Func: &ast.MemberExpr{Object: row, Field: "save"}}, valType{isModel: true, name: "User"}},
+		{"group", &ast.CallExpr{Group: &ast.GroupProjection{Model: "User", Result: "Summary"}}, valType{isList: true, name: "Summary"}},
+		{"count", &ast.CallExpr{Func: &ast.Ident{Name: "count"}, Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "User"}}}}, valType{name: "Int"}},
+		{"all", &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "all"}}, valType{isModel: true, isList: true, name: "User"}},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			got := compiler.resolveQueryType(sample.expression)
+			if got.name != sample.want.name || got.isList != sample.want.isList || got.isModel != sample.want.isModel || got.nullable != sample.want.nullable {
+				t.Fatalf("query result = %+v, want %+v", got, sample.want)
+			}
+		})
 	}
 }

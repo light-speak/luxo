@@ -4,50 +4,48 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/jsonutil"
 	"github.com/shopspring/decimal"
 )
 
 // JSONToBinary converts one structured JSON value into its native Luxo message.
 func (s *Schema) JSONToBinary(typeName string, raw json.RawMessage) ([]byte, error) {
-	model := s.structuredModel(typeName)
+	if declaration := s.Sealeds[typeName]; declaration != nil {
+		var enc codec.Encoder
+		if err := s.writeJSONSealed(&enc, declaration, raw, 1); err != nil {
+			return nil, addJSONContext(err, declaration.Name, "", jsonModelContext, true)
+		}
+		return enc.Bytes(), nil
+	}
+	model := s.LookupModel(typeName)
 	if model == nil {
 		return nil, fmt.Errorf("schema: unknown structured type %q", typeName)
 	}
 	var enc codec.Encoder
-	if err := s.writeJSONObject(&enc, model, raw); err != nil {
+	if err := s.writeJSONObject(&enc, model, raw, 1); err != nil {
 		return nil, err
 	}
 	return enc.Bytes(), nil
 }
 
-func (s *Schema) structuredModel(typeName string) *Model {
-	if model := s.Models[typeName]; model != nil {
-		return model
+func (s *Schema) writeJSONObject(enc *codec.Encoder, model *Model, raw json.RawMessage, depth int) error {
+	if depth > codec.MaxModelDepth {
+		return codec.ErrModelDepth
 	}
-	if declaration := s.Types[typeName]; declaration != nil {
-		return declaration.AsModel()
+	values, err := s.jsonObjectValues(model, raw, depth)
+	if err != nil {
+		return addJSONContext(err, model.Name, "", jsonModelContext, depth == 1)
 	}
-	return nil
+	return s.writeJSONObjectValues(enc, model, values, depth)
 }
 
-func (s *Schema) writeJSONObject(enc *codec.Encoder, model *Model, raw json.RawMessage) error {
-	var values map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &values); err != nil {
-		return fmt.Errorf("%s: expected object: %w", model.Name, err)
-	}
-	if values == nil {
-		return fmt.Errorf("%s: expected object", model.Name)
-	}
-	if field := unknownJSONField(values, model); field != "" {
-		return fmt.Errorf("%s: unknown field %q", model.Name, field)
-	}
+func (s *Schema) writeJSONObjectValues(enc *codec.Encoder, model *Model, values map[string]json.RawMessage, depth int) error {
 	arenaLength, err := jsonArenaLength(values, model.Fields)
 	if err != nil {
-		return fmt.Errorf("%s: %w", model.Name, err)
+		return addJSONContext(err, model.Name, "", jsonModelContext, depth == 1)
 	}
 	enc.WriteVarint(uint64(arenaLength))
 	for i := range model.Fields {
@@ -56,37 +54,90 @@ func (s *Schema) writeJSONObject(enc *codec.Encoder, model *Model, raw json.RawM
 		if !present {
 			continue
 		}
-		if err := s.writeJSONField(enc, field, value); err != nil {
-			return fmt.Errorf("%s.%s: %w", model.Name, field.Name, err)
+		if err := s.writeJSONField(enc, field, value, depth); err != nil {
+			return addJSONContext(err, model.Name, field.Name, jsonFieldContext, depth == 1)
 		}
 	}
 	enc.WriteEnd()
 	return nil
 }
 
-func unknownJSONField(values map[string]json.RawMessage, model *Model) string {
+// Borrow values only while encoding. Canonical metadata names avoid retaining
+// input keys, and overwritten values receive resource checks, not business decoding.
+func (s *Schema) jsonObjectValues(model *Model, raw []byte, depth int) (map[string]json.RawMessage, error) {
+	values := make(map[string]json.RawMessage)
 	unknown := ""
-	for name := range values {
-		if modelHasField(model, name) {
-			continue
+	hasUnknown := false
+	err := jsonutil.VisitObject(raw, func(name, value []byte) error {
+		field := lookupJSONField(model, string(name))
+		if field == nil {
+			if !hasUnknown || string(name) < unknown {
+				unknown = string(name)
+				hasUnknown = true
+			}
+			return nil
 		}
-		if unknown == "" || name < unknown {
-			unknown = name
+		if previous := values[field.Name]; previous != nil {
+			if err := jsonutil.CheckJSONValueDepth(previous, func(reader *jsonutil.DepthReader) error {
+				return s.checkJSONFieldDepth(reader, field, depth)
+			}); err != nil {
+				return err
+			}
 		}
+		values[field.Name] = value
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("expected object: %w", err)
 	}
-	return unknown
+	if hasUnknown {
+		return nil, fmt.Errorf("unknown field %q", unknown)
+	}
+	return values, nil
 }
 
-func modelHasField(model *Model, name string) bool {
-	if model.FieldByName(name) != nil {
-		return true
+func lookupJSONField(model *Model, name string) *Field {
+	if field := model.FieldByName(name); field != nil {
+		return field
 	}
 	for i := range model.Fields {
 		if model.Fields[i].Name == name {
-			return true
+			return &model.Fields[i]
 		}
 	}
-	return false
+	return nil
+}
+
+func (s *Schema) checkJSONFieldDepth(reader *jsonutil.DepthReader, field *Field, depth int) error {
+	if field.IsList {
+		return reader.List(codec.MaxArrayElements, func(reader *jsonutil.DepthReader) error {
+			return s.checkJSONScalarDepth(reader, field, depth)
+		})
+	}
+	return s.checkJSONScalarDepth(reader, field, depth)
+}
+
+func (s *Schema) checkJSONScalarDepth(reader *jsonutil.DepthReader, field *Field, depth int) error {
+	if field.Type == FieldSealed {
+		return s.checkJSONSealedDepth(reader, s.Sealeds[field.TypeName], depth+1)
+	}
+	if field.Type != FieldModel || reader.Kind() != '{' {
+		return reader.JSON()
+	}
+	model := s.LookupModel(field.TypeName)
+	if model == nil {
+		return reader.JSON()
+	}
+	if depth >= codec.MaxModelDepth {
+		return codec.ErrModelDepth
+	}
+	return reader.Object(func(name []byte) error {
+		child := lookupJSONField(model, string(name))
+		if child == nil {
+			return reader.JSON()
+		}
+		return s.checkJSONFieldDepth(reader, child, depth+1)
+	})
 }
 
 func jsonArenaLength(values map[string]json.RawMessage, fields []Field) (int, error) {
@@ -97,8 +148,8 @@ func jsonArenaLength(values map[string]json.RawMessage, fields []Field) (int, er
 		if !present || field.IsList || (field.Type != FieldString && field.Type != FieldEnum) || isJSONNull(raw) {
 			continue
 		}
-		var value string
-		if err := json.Unmarshal(raw, &value); err != nil {
+		value, err := jsonutil.ParseString(raw)
+		if err != nil {
 			return 0, fmt.Errorf("%s must be a string", field.Name)
 		}
 		length += len(value)
@@ -106,9 +157,9 @@ func jsonArenaLength(values map[string]json.RawMessage, fields []Field) (int, er
 	return length, nil
 }
 
-func (s *Schema) writeJSONField(enc *codec.Encoder, field *Field, raw json.RawMessage) error {
+func (s *Schema) writeJSONField(enc *codec.Encoder, field *Field, raw json.RawMessage, depth int) error {
 	enc.WriteFieldHeader(field.ID)
-	if isJSONNull(raw) {
+	if isJSONNull(raw) && (field.Type != FieldJSON || field.IsList || field.Nullable) {
 		if !field.Nullable {
 			return fmt.Errorf("must not be null")
 		}
@@ -119,32 +170,32 @@ func (s *Schema) writeJSONField(enc *codec.Encoder, field *Field, raw json.RawMe
 		enc.WritePresent()
 	}
 	if field.IsList {
-		return s.writeJSONList(enc, field, raw)
+		return s.writeJSONList(enc, field, raw, depth)
 	}
-	return s.writeJSONScalar(enc, field, raw)
+	return s.writeJSONScalar(enc, field, raw, depth)
 }
 
-func (s *Schema) writeJSONList(enc *codec.Encoder, field *Field, raw json.RawMessage) error {
-	var values []json.RawMessage
-	if err := json.Unmarshal(raw, &values); err != nil {
+func (s *Schema) writeJSONList(enc *codec.Encoder, field *Field, raw json.RawMessage, depth int) error {
+	values, err := jsonutil.ParseRawArray(raw, codec.MaxArrayElements)
+	if err != nil {
 		return fmt.Errorf("expected array: %w", err)
 	}
-	enc.WriteArrayHeader(len(values))
+	enc.WriteVarint(uint64(len(values))) // ParseRawArray already validated the array bound.
 	element := *field
 	element.IsList = false
 	element.Nullable = false
 	for i := range values {
-		if isJSONNull(values[i]) {
+		if field.Type != FieldJSON && isJSONNull(values[i]) {
 			return fmt.Errorf("element %d must not be null", i)
 		}
-		if err := s.writeJSONScalar(enc, &element, values[i]); err != nil {
-			return fmt.Errorf("element %d: %w", i, err)
+		if err := s.writeJSONScalar(enc, &element, values[i], depth); err != nil {
+			return addJSONContext(err, "", "", i, false)
 		}
 	}
 	return nil
 }
 
-func (s *Schema) writeJSONScalar(enc *codec.Encoder, field *Field, raw json.RawMessage) error {
+func (s *Schema) writeJSONScalar(enc *codec.Encoder, field *Field, raw json.RawMessage, depth int) error {
 	switch field.Type {
 	case FieldInt, FieldDuration:
 		return writeJSONInt(enc, raw)
@@ -161,12 +212,17 @@ func (s *Schema) writeJSONScalar(enc *codec.Encoder, field *Field, raw json.RawM
 	case FieldEnum:
 		return s.writeJSONEnum(enc, field, raw)
 	case FieldModel:
-		return s.writeJSONModel(enc, field, raw)
+		return s.writeJSONModel(enc, field, raw, depth)
+	case FieldSealed:
+		return s.writeJSONSealedField(enc, field, raw, depth)
 	case FieldUUID:
 		return writeJSONUUID(enc, raw)
 	case FieldDecimal:
 		return writeJSONDecimal(enc, raw)
 	case FieldJSON:
+		if err := jsonutil.CheckJSONDepth(raw); err != nil {
+			return err
+		}
 		enc.WriteBytes(raw)
 		return nil
 	default:
@@ -175,8 +231,8 @@ func (s *Schema) writeJSONScalar(enc *codec.Encoder, field *Field, raw json.RawM
 }
 
 func writeJSONInt(enc *codec.Encoder, raw json.RawMessage) error {
-	var value int64
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, err := jsonutil.ParseInt64(raw)
+	if err != nil {
 		return fmt.Errorf("expected integer: %w", err)
 	}
 	enc.WriteInt(value)
@@ -184,26 +240,24 @@ func writeJSONInt(enc *codec.Encoder, raw json.RawMessage) error {
 }
 
 func writeJSONFloat(enc *codec.Encoder, raw json.RawMessage) error {
-	var value float64
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, err := jsonutil.ParseFloat64(raw)
+	if err != nil {
 		return fmt.Errorf("expected number: %w", err)
 	}
-	enc.WriteFloat(value)
-	return nil
+	return enc.WriteFloat(value)
 }
 
 func writeJSONString(enc *codec.Encoder, raw json.RawMessage) error {
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, err := jsonutil.ParseString(raw)
+	if err != nil {
 		return fmt.Errorf("expected string: %w", err)
 	}
-	enc.WriteString(value)
-	return nil
+	return enc.WriteString(value)
 }
 
 func writeJSONBool(enc *codec.Encoder, raw json.RawMessage) error {
-	var value bool
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, err := jsonutil.ParseBool(raw)
+	if err != nil {
 		return fmt.Errorf("expected boolean: %w", err)
 	}
 	enc.WriteBool(value)
@@ -211,21 +265,16 @@ func writeJSONBool(enc *codec.Encoder, raw json.RawMessage) error {
 }
 
 func writeJSONDateTime(enc *codec.Encoder, raw json.RawMessage) error {
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return fmt.Errorf("expected RFC3339 string: %w", err)
-	}
-	parsed, err := time.Parse(time.RFC3339Nano, value)
+	parsed, err := jsonutil.ParseDateTime(raw)
 	if err != nil {
 		return fmt.Errorf("expected RFC3339 string: %w", err)
 	}
-	enc.WriteInt(parsed.Unix())
-	return nil
+	return enc.WriteDateTime(parsed)
 }
 
 func writeJSONBytes(enc *codec.Encoder, raw json.RawMessage) error {
-	var value []byte
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, err := jsonutil.ParseBase64(raw)
+	if err != nil {
 		return fmt.Errorf("expected base64 bytes: %w", err)
 	}
 	enc.WriteBytes(value)
@@ -233,28 +282,27 @@ func writeJSONBytes(enc *codec.Encoder, raw json.RawMessage) error {
 }
 
 func (s *Schema) writeJSONEnum(enc *codec.Encoder, field *Field, raw json.RawMessage) error {
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, err := jsonutil.ParseString(raw)
+	if err != nil {
 		return fmt.Errorf("expected enum string: %w", err)
 	}
 	if enum := s.Enums[field.TypeName]; enum != nil && !containsString(enum.Values, value) {
 		return fmt.Errorf("unknown %s value %q", field.TypeName, value)
 	}
-	enc.WriteString(value)
-	return nil
+	return enc.WriteString(value)
 }
 
-func (s *Schema) writeJSONModel(enc *codec.Encoder, field *Field, raw json.RawMessage) error {
-	model := s.structuredModel(field.TypeName)
+func (s *Schema) writeJSONModel(enc *codec.Encoder, field *Field, raw json.RawMessage, depth int) error {
+	model := s.LookupModel(field.TypeName)
 	if model == nil {
 		return fmt.Errorf("unknown structured type %q", field.TypeName)
 	}
-	return s.writeJSONObject(enc, model, raw)
+	return s.writeJSONObject(enc, model, raw, depth+1)
 }
 
 func writeJSONUUID(enc *codec.Encoder, raw json.RawMessage) error {
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, err := jsonutil.ParseString(raw)
+	if err != nil {
 		return fmt.Errorf("expected UUID string: %w", err)
 	}
 	parsed, err := uuid.Parse(value)
@@ -266,15 +314,14 @@ func writeJSONUUID(enc *codec.Encoder, raw json.RawMessage) error {
 }
 
 func writeJSONDecimal(enc *codec.Encoder, raw json.RawMessage) error {
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
+	value, err := jsonutil.ParseString(raw)
+	if err != nil {
 		return fmt.Errorf("expected decimal string: %w", err)
 	}
 	if _, err := decimal.NewFromString(value); err != nil {
 		return fmt.Errorf("expected decimal string: %w", err)
 	}
-	enc.WriteString(value)
-	return nil
+	return enc.WriteString(value)
 }
 
 func containsString(values []string, value string) bool {

@@ -10,6 +10,71 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
+func TestHandlerImportsIncludeDeferredSelectors(t *testing.T) {
+	var output strings.Builder
+	writeHandlerImports(&output, &semantic.Result{}, nil, handlerFeatures{}, false,
+		"func lookup() {}", "func selectFields(fields []*selection.Field) {}")
+	if !strings.Contains(output.String(), `"github.com/light-speak/luxo/pkg/lux/selection"`) {
+		t.Fatal("deferred selection helper lost its import", output.String())
+	}
+}
+
+func TestNativeStreamNeverRegistersUnaryHandler(t *testing.T) {
+	stream := &ast.ApiDecl{
+		Name: "watch", ReturnType: &ast.TypeRef{Name: "Int"},
+		Directives: []*ast.Directive{{Name: "native"}, {Name: "stream"}},
+	}
+	result := buildResult(&ast.File{APIs: []*ast.ApiDecl{stream}})
+	var out strings.Builder
+	if names := generateNativeAPIHandlers(&out, result); len(names) != 0 || out.Len() != 0 {
+		t.Fatalf("native stream generated unary handler: %v\n%s", names, out.String())
+	}
+	if source := generateHandlerFile(result, "main", nil); source != nil {
+		t.Fatalf("stream-only service must not emit unary handlers:\n%s", source)
+	}
+	result.Files[0].APIs = append(result.Files[0].APIs, &ast.ApiDecl{
+		Name: "echo", ReturnType: &ast.TypeRef{Name: "Int"},
+		Directives: []*ast.Directive{{Name: "native"}},
+	})
+	source := string(generateHandlerFile(result, "main", nil))
+	if !strings.Contains(source, "handleEcho") || strings.Contains(source, "handleWatch") {
+		t.Fatalf("mixed native service must only register unary echo:\n%s", source)
+	}
+}
+
+func TestModelOnlyModuleRetainsInternalSelectors(t *testing.T) {
+	model := &ast.ModelDecl{Name: "Post", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}}}}
+	result := buildResult(&ast.File{Models: []*ast.ModelDecl{model}, Extends: []*ast.ExtendDecl{{Name: "User", Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}}}}})
+	source := string(generateHandlerFile(result, "luxo", nil))
+	for _, want := range []string{"func selectPostSQLColumns(", "func selectUserSQLColumns("} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("model-only module omitted %s", want)
+		}
+	}
+	if strings.Contains(source, "handleCreate") {
+		t.Fatal("model-only module exposed implicit CRUD")
+	}
+}
+
+func TestInternalModelHandlerOwnership(t *testing.T) {
+	models := []*ast.ModelDecl{{Name: "User"}}
+	result := buildResult(&ast.File{Models: models})
+	for _, sample := range []struct {
+		events *EventContext
+		want   bool
+	}{
+		{nil, false},
+		{&EventContext{}, false},
+		{&EventContext{remotePKModels: map[string]bool{"Other": true}}, false},
+		{&EventContext{remotePKModels: map[string]bool{"User": true}}, true},
+	} {
+		generator := &GeneratorContext{events: sample.events}
+		if got := generator.needsInternalModelHandlers(result, models, nil); got != sample.want {
+			t.Fatalf("internal handler ownership = %v, want %v", got, sample.want)
+		}
+	}
+}
+
 func TestGenerateCRUDHandlersUseDeclaredPrimaryKey(t *testing.T) {
 	model := &ast.ModelDecl{
 		Name: "Product",
@@ -35,6 +100,23 @@ func TestGenerateCRUDHandlersUseDeclaredPrimaryKey(t *testing.T) {
 	}
 	if strings.Contains(code, "selection.SQLColumns(req.Select)") {
 		t.Fatalf("generic selection hardcodes id and must not be used for CRUD:\n%s", code)
+	}
+}
+
+func TestGeneratedCRUDDoesNotImplicitlyInvalidateTTLCache(t *testing.T) {
+	model := testModel("User", []*ast.Directive{{Name: "crud"}}, []*ast.FieldDecl{
+		testField("id", "Int", &ast.Directive{Name: "id"}), testField("name", "String"),
+	})
+	var source strings.Builder
+	generateCRUDHandlers(&source, []*ast.ModelDecl{model}, nil, nil)
+	code := source.String()
+	for _, name := range []string{"CreateUser", "UpdateUser", "DeleteUser", "DeleteUsers"} {
+		if !strings.Contains(code, "func handle"+name+"(") {
+			t.Fatalf("missing generated mutation %s", name)
+		}
+	}
+	if strings.Contains(code, "InvalidateCache") {
+		t.Fatal("TTL CRUD generated implicit invalidation")
 	}
 }
 
@@ -67,9 +149,6 @@ func TestHandlerCompatibilityFunctions(t *testing.T) {
 	}
 	generateSelectedSQLFields(&b, model)
 	writeAPIRegistration(&b, "getUser")
-	if typ, nullable, list := resolveParamMetaFromAST("getUser", "id"); typ == "" || nullable || list {
-		t.Fatalf("resolved param = %q, %v, %v", typ, nullable, list)
-	}
 	if groups := collectComputedAggregateGroups(model, models, nil); len(groups) != 0 {
 		t.Fatalf("computed aggregate groups = %#v", groups)
 	}
@@ -100,6 +179,37 @@ func TestDirectiveDurationRejectsMalformedValues(t *testing.T) {
 	}}}, "value", 0); !ok || got != "5 * time.Millisecond" {
 		t.Fatalf("duration = %q, %v", got, ok)
 	}
+	if got, ok := directiveDuration(&ast.Directive{Args: []*ast.NamedArg{{
+		Value: &ast.Literal{Kind: token.Int, Value: "5"},
+	}}}, "value", 0); !ok || got != "5 * time.Second" {
+		t.Fatalf("integer duration = %q, %v", got, ok)
+	}
+}
+
+func TestBeforeSaveRejectsIncompleteExpressions(t *testing.T) {
+	field := &ast.FieldDecl{Directives: []*ast.Directive{{Name: "beforeSave", Body: &ast.Block{
+		Stmts: []ast.Stmt{&ast.AssignStmt{}, &ast.ExprStmt{}},
+	}}}}
+	assertInvalidBeforeSave(t, field)
+	call := &ast.CallExpr{Func: &ast.Ident{Name: "normalize"}, Args: []*ast.NamedArg{
+		{Value: &ast.BinaryExpr{Left: &ast.Ident{Name: "it"}, Op: "<-", Right: &ast.Literal{Kind: token.Int, Value: "1"}}},
+	}}
+	if got := compileFieldExpr(call, "value"); got != "" {
+		t.Fatalf("unsupported argument emitted partial call: %q", got)
+	}
+}
+
+func TestSelectedSQLFieldsSkipUnnumberedFields(t *testing.T) {
+	var output strings.Builder
+	defaultGenerator().generateSelectedSQLFields(&output, &ast.ModelDecl{
+		Name: "User", Fields: []*ast.FieldDecl{
+			{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
+			{Name: "unregistered", Type: &ast.TypeRef{Name: "String"}},
+		},
+	})
+	if strings.Contains(output.String(), "unregistered") || strings.Contains(output.String(), "FieldMaskHas(fieldMask, 0)") {
+		t.Fatalf("unnumbered field emitted selection: %q", output.String())
+	}
 }
 
 func TestGenerateSQLColumnSelectorUsesDeclaredDatabaseFields(t *testing.T) {
@@ -115,23 +225,27 @@ func TestGenerateSQLColumnSelectorUsesDeclaredDatabaseFields(t *testing.T) {
 	}
 
 	var b strings.Builder
-	generateSQLColumnSelector(&b, model, nil)
+	defaultGenerator().generateSQLColumnSelector(&b, model, nil)
 	code := b.String()
 	for _, want := range []string{
 		"func selectProductSQLColumns(fields []*selection.Field) []string",
 		`case "sku":`,
-		`cols = ensureSelectedColumn(cols, "sku")`,
+		`cols = ensureSelectedColumn(cols, "\"sku\"")`,
 		`case "displayName":`,
-		`cols = ensureSelectedColumn(cols, "display_name")`,
+		`cols = ensureSelectedColumn(cols, "\"display_name\"")`,
 		`case "reviews":`,
-		`if !hasPrimaryKey { cols = append(cols, "sku") }`,
+		`if !hasPrimaryKey { cols = append(cols, "\"sku\"") }`,
 	} {
 		if !strings.Contains(code, want) {
 			t.Fatalf("model SQL selector missing %q:\n%s", want, code)
 		}
 	}
+	public, private, ok := strings.Cut(code, "func (*Product) loadSQLColumns")
+	if !ok || !strings.Contains(private, `case "secret":`) {
+		t.Fatal("missing business-only private selector", code)
+	}
 	for _, excluded := range []string{`case "secret":`, `case "reviewCount":`, `"id"`} {
-		if strings.Contains(code, excluded) {
+		if strings.Contains(public, excluded) {
 			t.Fatalf("model SQL selector contains non-database field %q:\n%s", excluded, code)
 		}
 	}
@@ -148,11 +262,11 @@ func TestGenerateSQLColumnSelectorIncludesSelectedRelationLocalKey(t *testing.T)
 	}
 
 	var b strings.Builder
-	generateSQLColumnSelector(&b, model, nil)
+	defaultGenerator().generateSQLColumnSelector(&b, model, nil)
 	code := b.String()
 	for _, want := range []string{
 		`case "user":`,
-		`cols = ensureSelectedColumn(cols, "user_id")`,
+		`cols = ensureSelectedColumn(cols, "\"user_id\"")`,
 	} {
 		if !strings.Contains(code, want) {
 			t.Fatalf("selected relation dependency missing %q:\n%s", want, code)
@@ -227,6 +341,9 @@ func TestGenerateBatchLoadHandlersUsesCanonicalListAndSelection(t *testing.T) {
 	if !strings.Contains(code, `fields := selectUserSQLColumns(req.Select)`) {
 		t.Errorf("batch handler must map the decoded recursive selection to SQL columns:\n%s", code)
 	}
+	if !strings.Contains(code, `app.DB.QueryRows(ctx, scanUser, query, args...)`) {
+		t.Errorf("batch handler must use the Go 1.27 generic database method and concrete scanner:\n%s", code)
+	}
 	if strings.Contains(code, `fieldMask := codec.SelectionMaskFields(req.FieldMask)`) {
 		t.Errorf("batch handler must not flatten the recursive selection before resolving relation keys:\n%s", code)
 	}
@@ -247,7 +364,7 @@ func TestGenerateBatchLoadHandlersSupportsUUID(t *testing.T) {
 	code := b.String()
 	for _, check := range []string{
 		`ParamUUIDArray("keys")`,
-		`lux.NewUUIDField("id").In(keys...)`,
+		`lux.NewUUIDField("\"id\"").In(keys...)`,
 		`Name: "keys", Type: "UUID", IsList: true`,
 	} {
 		if !strings.Contains(code, check) {
@@ -289,11 +406,11 @@ func TestGenerateRemoteNamedLoadHandlers(t *testing.T) {
 		`ParamIntArray("tenantId")`,
 		`ParamStringArray("email")`,
 		`fields := selectUserSQLColumns(req.Select)`,
-		`fields = append(fields, "tenant_id")`,
-		`fields = append(fields, "email")`,
+		`fields = append(fields, "\"tenant_id\"")`,
+		`fields = append(fields, "\"email\"")`,
 		"groups[i] = lux.AllOf(",
 		"lux.AnyOf(groups...)",
-		`router.Handle("svc:load:User:tenantId:email"`,
+		`router.HandleInternal("svc:load:User:tenantId:email"`,
 		`FieldID: 4, Name: "tenantId", Type: "Int", IsList: true`,
 		`FieldID: 7, Name: "email", Type: "String", IsList: true`,
 	}
@@ -338,8 +455,8 @@ func TestGenerateRemoteNamedLoadHandlerSingleSoftKey(t *testing.T) {
 	generateRemoteNamedLoadHandler(&b, model, call)
 	out := b.String()
 	for _, want := range []string{
-		`lux.NewStringField("email").In(emailKeys...)`,
-		`lux.NewTimeField("deleted_at").IsNull()`,
+		`lux.NewStringField("\"email\"").In(emailKeys...)`,
+		`lux.NewTimeField("\"deleted_at\"").IsNull()`,
 		"resolveUserComputed(ctx, app, rows, req.FieldMask)",
 		"resolveUserListRelations(ctx, app, rows, req.Select)",
 		"key := row.Email",
@@ -392,7 +509,7 @@ func TestGenerateFederationResolversUsesCanonicalListAndSelection(t *testing.T) 
 	if !strings.Contains(code, `fields := selectPostSQLColumns(req.Select)`) {
 		t.Errorf("resolver must map the decoded recursive selection to SQL columns:\n%s", code)
 	}
-	if !strings.Contains(code, `fields = append(fields, "user_id")`) {
+	if !strings.Contains(code, `fields = append(fields, "\"user_id\"")`) {
 		t.Errorf("resolver must select its grouping key:\n%s", code)
 	}
 	if !strings.Contains(code, "resolvePostListRelations(ctx, app, rows, req.Select)") {
@@ -430,7 +547,7 @@ func TestGenerateFederationResolversUsesExtendedModelPrimaryKeyType(t *testing.T
 	code := b.String()
 	for _, want := range []string{
 		`ParamStringArray("keys")`,
-		`lux.NewStringField("product_sku").In(keys...)`,
+		`lux.NewStringField("\"product_sku\"").In(keys...)`,
 		`make(map[string][]*Review, len(keys))`,
 		`Name: "keys", Type: "String", IsList: true`,
 	} {
@@ -707,9 +824,9 @@ func TestPluralize(t *testing.T) {
 		{"Category", "Categories"},
 	}
 	for _, tt := range tests {
-		got := pluralize(tt.input)
+		got := ast.PluralModelName(tt.input)
 		if got != tt.want {
-			t.Errorf("pluralize(%q) = %q, want %q", tt.input, got, tt.want)
+			t.Errorf("ast.PluralModelName(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }
@@ -901,9 +1018,9 @@ func TestParamMethodDateTime(t *testing.T) {
 }
 
 func TestParamMethodCustomType(t *testing.T) {
-	// Custom types return empty for ParamJSON dispatch
-	if got := paramMethod("uuid.UUID"); got != "" {
-		t.Errorf("paramMethod(uuid.UUID) = %q, want empty", got)
+	// Native scalar types use concrete request readers.
+	if got := paramMethod("uuid.UUID"); got != "UUID" {
+		t.Errorf("paramMethod(uuid.UUID) = %q, want UUID", got)
 	}
 }
 
@@ -1073,16 +1190,33 @@ func TestGenerateHandlerNullableRelation(t *testing.T) {
 	src := generateHandlerFile(result, "luxo", nil)
 	code := string(src)
 
-	// Nullable FK should have nil check: if post.UserId != nil {
-	if !strings.Contains(code, "if post.UserId != nil") {
+	// Nullable FK should have nil check: if value.UserId != nil {
+	if !strings.Contains(code, "if value.UserId != nil") {
 		t.Errorf("nullable FK should have nil check before Load:\n%s", code)
 	}
-	// Should dereference the pointer: *post.UserId
-	if !strings.Contains(code, "*post.UserId") {
+	// Should dereference the pointer: *value.UserId
+	if !strings.Contains(code, "*value.UserId") {
 		t.Errorf("nullable FK should dereference pointer in Load call:\n%s", code)
 	}
 	if !strings.Contains(code, "resolveUserRelations(traceCtx, app, result, f.Children, d-1)") {
 		t.Errorf("nullable relation should recursively resolve selected child relations:\n%s", code)
+	}
+}
+
+func TestNestedRelationResolverByShape(t *testing.T) {
+	for _, nullable := range []bool{false, true} {
+		for _, list := range []bool{false, true} {
+			var output strings.Builder
+			relation := Relation{FieldName: "targets", TargetName: "Target", LocalKey: "groupKey", RemoteKey: "groupKey", KeyGoType: "string", FKNullable: nullable, IsList: list}
+			generateRelationResolver(&output, &ast.ModelDecl{Name: "Source"}, []Relation{relation}, map[string]bool{"Target": true})
+			call := "resolveTargetRelations(traceCtx, app, result, f.Children, d-1)"
+			if list {
+				call = "resolveTargetListRelations(traceCtx, app, result, f.Children, d-1)"
+			}
+			if !strings.Contains(output.String(), call) {
+				t.Fatalf("nullable=%v list=%v missing typed nested resolver %s: %s", nullable, list, call, output.String())
+			}
+		}
 	}
 }
 
@@ -1107,15 +1241,15 @@ func TestGenerateHandlerNonNullableRelation(t *testing.T) {
 	code := string(src)
 
 	// Non-nullable FK should NOT have nil check
-	if strings.Contains(code, "if post.UserId != nil") {
+	if strings.Contains(code, "if value.UserId != nil") {
 		t.Errorf("non-nullable FK should NOT have nil check:\n%s", code)
 	}
 	// Should NOT dereference pointer
-	if strings.Contains(code, "*post.UserId") {
+	if strings.Contains(code, "*value.UserId") {
 		t.Errorf("non-nullable FK should NOT dereference:\n%s", code)
 	}
-	// Should directly pass post.UserId
-	if !strings.Contains(code, "post.UserId, f.Children") {
+	// Should directly pass value.UserId
+	if !strings.Contains(code, "key := value.UserId") || !strings.Contains(code, "LoadAll(ctx, []int64{key}, f.Children)") {
 		t.Errorf("should directly pass FK value:\n%s", code)
 	}
 }
@@ -1224,12 +1358,12 @@ func TestGenerateHandlerNullableParam(t *testing.T) {
 	src := generateHandlerFile(result, "app", nil)
 	code := string(src)
 
-	if !strings.Contains(code, "&subtitleVal") {
-		t.Errorf("nullable param should use & prefix:\n%s", code)
+	if !strings.Contains(code, "_value := subtitleVal") || !strings.Contains(code, "builder.SetSubtitle(&_value)") {
+		t.Errorf("nullable param should pass a branch-local pointer:\n%s", code)
 	}
 }
 
-func TestNativeHandlersDecodeOptionalNullableJSON(t *testing.T) {
+func TestNativeHandlersDecodeOptionalNullableStructure(t *testing.T) {
 	param := &ast.ParamDecl{
 		Name:    "payload",
 		Type:    &ast.TypeRef{Name: "Payload", Nullable: true},
@@ -1241,7 +1375,7 @@ func TestNativeHandlersDecodeOptionalNullableJSON(t *testing.T) {
 		Params:     []*ast.ParamDecl{param},
 		Directives: []*ast.Directive{{Name: "native"}},
 	}, nil, nil)
-	if out := apiBuilder.String(); !strings.Contains(out, `req.ParamJSONOptionalNullable("payload", &payload)`) ||
+	if out := apiBuilder.String(); strings.Contains(out, `req.ParamJSON`) || !strings.Contains(out, "payload = nil") ||
 		!strings.Contains(out, `req.ParamMessage("payload", true, true)`) {
 		t.Fatalf("native API nullable parameter decoding missing:\n%s", out)
 	}
@@ -1252,9 +1386,40 @@ func TestNativeHandlersDecodeOptionalNullableJSON(t *testing.T) {
 		Params:     []*ast.ParamDecl{param},
 		Directives: []*ast.Directive{{Name: "native"}, {Name: "service"}},
 	}, nil, nil)
-	if out := serviceBuilder.String(); !strings.Contains(out, `req.ParamJSONOptionalNullable("payload", &payload)`) ||
+	if out := serviceBuilder.String(); strings.Contains(out, `req.ParamJSON`) || !strings.Contains(out, "payload = nil") ||
 		!strings.Contains(out, `req.ParamMessage("payload", true, true)`) {
 		t.Fatalf("native service nullable parameter decoding missing:\n%s", out)
+	}
+}
+
+func TestNativeHandlersApplyPrimitiveParameterDefaults(t *testing.T) {
+	param := &ast.ParamDecl{
+		Name:    "limit",
+		Type:    &ast.TypeRef{Name: "Int"},
+		Default: &ast.Literal{Kind: token.Int, Value: "20"},
+	}
+	var apiBuilder strings.Builder
+	generateNativeAPIHandler(&apiBuilder, &ast.ApiDecl{
+		Name:       "search",
+		Params:     []*ast.ParamDecl{param},
+		ReturnType: &ast.TypeRef{Name: "Int"},
+		Directives: []*ast.Directive{{Name: "native"}},
+	}, nil, nil)
+
+	var serviceBuilder strings.Builder
+	generateNativeServiceHandler(&serviceBuilder, &ast.FnDecl{
+		Name:       "searchRemote",
+		Params:     []*ast.ParamDecl{param},
+		ReturnType: &ast.TypeRef{Name: "Int"},
+		Directives: []*ast.Directive{{Name: "native"}, {Name: "service"}},
+	}, nil, nil)
+	for name, out := range map[string]string{"API": apiBuilder.String(), "service fn": serviceBuilder.String()} {
+		if !strings.Contains(out, `var limit int64 = 20`) ||
+			!strings.Contains(out, `if req.HasParam("limit")`) ||
+			!strings.Contains(out, `_valueLimit, err := req.ParamInt("limit")`) ||
+			!strings.Contains(out, `limit = _valueLimit`) {
+			t.Errorf("%s handler does not apply the declared default:\n%s", name, out)
+		}
 	}
 }
 
@@ -1279,7 +1444,7 @@ func TestGenerateHandlerEnumParam(t *testing.T) {
 	src := generateHandlerFile(result, "app", enums)
 	code := string(src)
 
-	if !strings.Contains(code, "Role(roleVal)") {
+	if !strings.Contains(code, "Role(_roleValText)") || !strings.Contains(code, "_roleValEnum.IsValid()") {
 		t.Errorf("enum param should cast to enum type:\n%s", code)
 	}
 }
@@ -1779,7 +1944,7 @@ func TestWriteAuthCheckOwn(t *testing.T) {
 	if !strings.Contains(code, `req.ParamInt("userId")`) {
 		t.Errorf("own param check missing:\n%s", code)
 	}
-	if !strings.Contains(code, "identity.ID()") {
+	if !strings.Contains(code, `identity.Get("id").Int64()`) {
 		t.Errorf("own identity check missing:\n%s", code)
 	}
 }
@@ -1812,7 +1977,7 @@ func TestWriteAuthCheckPermission(t *testing.T) {
 							Field:  "role",
 						},
 						Op:    "==",
-						Right: &ast.Literal{Value: "SUPER"},
+						Right: &ast.Literal{Kind: token.String, Value: "SUPER"},
 					}},
 				}},
 			}},
@@ -1820,7 +1985,7 @@ func TestWriteAuthCheckPermission(t *testing.T) {
 	}
 	writeAuthCheck(&b, "\t", d)
 	code := b.String()
-	if !strings.Contains(code, `identity.String("role") == "SUPER"`) {
+	if !strings.Contains(code, `valid && value == "SUPER"`) {
 		t.Errorf("permission expression missing:\n%s", code)
 	}
 }
@@ -1846,14 +2011,14 @@ func TestWriteAuthCheckRoleAndOwn(t *testing.T) {
 
 // --- compilePermissionExpr ---
 
-func TestCompilePermissionExprMemberIdent(t *testing.T) {
+func TestCompilePermissionExprRejectsVariableNameAsText(t *testing.T) {
 	expr := &ast.BinaryExpr{
 		Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "role"},
 		Op:    "==",
 		Right: &ast.Ident{Name: "ADMIN"},
 	}
 	got := compilePermissionExpr(expr)
-	if got != `identity.String("role") == "ADMIN"` {
+	if got != "" {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -1863,10 +2028,10 @@ func TestCompilePermissionExprMemberMember(t *testing.T) {
 	expr := &ast.BinaryExpr{
 		Left:  &ast.MemberExpr{Object: &ast.Ident{Name: "my"}, Field: "role"},
 		Op:    "!=",
-		Right: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "BANNED"},
+		Right: &ast.MemberExpr{Object: &ast.Ident{Name: "Role"}, Field: "BANNED", EnumConstant: true},
 	}
 	got := compilePermissionExpr(expr)
-	if got != `identity.String("role") != "BANNED"` {
+	if got != `func() bool { value, valid := identity.Get("role").String(); return valid && value != "BANNED" }()` {
 		t.Fatalf("got %q", got)
 	}
 }
@@ -2033,67 +2198,6 @@ func TestBodyContainsTemplateString(t *testing.T) {
 	}
 }
 
-// --- inferParamType ---
-
-func TestInferParamType(t *testing.T) {
-	tests := []struct {
-		name string
-		want string
-	}{
-		{"id", "Int"},
-		{"userId", "Int"},
-		{"page", "Int"},
-		{"pageSize", "Int"},
-		{"limit", "Int"},
-		{"offset", "Int"},
-		{"priority", "Int"},
-		{"minutes", "Int"},
-		{"quantity", "Int"},
-		{"count", "Int"},
-		{"isActive", "Boolean"},
-		{"active", "Boolean"},
-		{"published", "Boolean"},
-		{"amount", "Float"},
-		{"price", "Float"},
-		{"balance", "Float"},
-		{"score", "Float"},
-		{"total", "Float"},
-		{"budget", "Float"},
-		{"name", "String"},
-		{"email", "String"},
-		{"unknown", "String"},
-	}
-	for _, tt := range tests {
-		if got := inferParamType(tt.name); got != tt.want {
-			t.Errorf("inferParamType(%q) = %q, want %q", tt.name, got, tt.want)
-		}
-	}
-}
-
-// --- resolveParamTypeFromAST ---
-
-func TestResolveParamTypeFromAST(t *testing.T) {
-	// No AST data — falls back to heuristic
-	if got := resolveParamTypeFromAST("getUser", "id"); got != "Int" {
-		t.Fatalf("fallback should use inferParamType, got %q", got)
-	}
-
-	// With AST data
-	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIParamTypes: map[string]map[string]string{
-		"getUser": {"id": "UUID"},
-	}}})
-	if got, _, _ := generator.resolveParamMetaFromAST("getUser", "id"); got != "UUID" {
-		t.Fatalf("should use AST type, got %q", got)
-	}
-	if got, _, _ := generator.resolveParamMetaFromAST("svc:getUser", "id"); got != "UUID" {
-		t.Fatalf("service API should use the unprefixed AST type, got %q", got)
-	}
-	// Missing param in AST — fallback
-	if got, _, _ := generator.resolveParamMetaFromAST("getUser", "name"); got != "String" {
-		t.Fatalf("missing param should fallback, got %q", got)
-	}
-}
-
 // --- writeAPIRegistration ---
 
 func TestWriteAPIRegistration(t *testing.T) {
@@ -2110,9 +2214,9 @@ func TestWriteAPIRegistration(t *testing.T) {
 	generator.ids.APIParams = map[string]map[string]int{
 		"getUser": {"id": 2, "name": 1},
 	}
-	generator.ids.APIParamTypes = map[string]map[string]string{
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{
 		"getUser": {"id": "Int", "name": "String"},
-	}
+	})
 	b.Reset()
 	generator.writeAPIRegistration(&b, "getUser")
 	code := b.String()
@@ -2130,7 +2234,7 @@ func TestWriteAPIRegistration(t *testing.T) {
 	}
 
 	generator.ids.APIParams["getUser"] = map[string]int{"ids": 2}
-	generator.ids.APIParamTypes["getUser"] = map[string]string{"ids": "[UUID]?"}
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{"getUser": {"ids": "[UUID]?"}})
 	b.Reset()
 	generator.writeAPIRegistration(&b, "getUser")
 	if code := b.String(); !strings.Contains(code, `Type: "UUID", FieldID: 2, IsList: true, Nullable: true`) {
@@ -2138,7 +2242,7 @@ func TestWriteAPIRegistration(t *testing.T) {
 	}
 
 	generator.ids.APIParams["getUser"] = map[string]int{"input": 3}
-	generator.ids.APIParamTypes["getUser"] = map[string]string{"input": "CreateUserInput"}
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{"getUser": {"input": "CreateUserInput"}})
 	b.Reset()
 	generator.writeAPIRegistration(&b, "getUser")
 	if code := b.String(); !strings.Contains(code, `Type: "Model", TypeName: "CreateUserInput", FieldID: 3`) {
@@ -2146,7 +2250,7 @@ func TestWriteAPIRegistration(t *testing.T) {
 	}
 
 	generator.ids.APIParams["getUser"] = map[string]int{"id": 1, "removed": 9}
-	generator.ids.APIParamTypes["getUser"] = map[string]string{"id": "Int"}
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{"getUser": {"id": "Int"}})
 	b.Reset()
 	generator.writeAPIRegistration(&b, "getUser")
 	if code := b.String(); strings.Contains(code, `Name: "removed"`) {
@@ -2165,6 +2269,48 @@ func TestWriteAPIRegistrationNoParams(t *testing.T) {
 	}
 	if strings.Contains(code, "RegisterParams") {
 		t.Error("no params should skip RegisterParams")
+	}
+}
+
+func TestWriteAPIRegistrationNamedEnums(t *testing.T) {
+	for _, name := range []string{"echoState", "svc:echoState"} {
+		generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+			APIs:      map[string]int{name: 5},
+			APIParams: map[string]map[string]int{name: {"value": 1, "values": 2, "input": 3}},
+		}})
+		generator.requestParams = requestParamDeclarations(map[string]map[string]string{name: {"value": "State", "values": "[State]?", "input": "Input"}})
+		var b strings.Builder
+		if strings.HasPrefix(name, "svc:") {
+			generator.generateRegisterServiceFns(&b, []string{"echoState"}, map[string]bool{"State": true})
+		} else {
+			generator.writeAPIRegistration(&b, name, map[string]bool{"State": true})
+		}
+		for _, want := range []string{
+			`Name: "value", Type: "Enum", TypeName: "State", FieldID: 1`,
+			`Name: "values", Type: "Enum", TypeName: "State", FieldID: 2, IsList: true, Nullable: true`,
+			`Name: "input", Type: "Model", TypeName: "Input", FieldID: 3`,
+		} {
+			if !strings.Contains(b.String(), want) {
+				t.Errorf("%s missing %s:\n%s", name, want, b.String())
+			}
+		}
+	}
+}
+
+func TestCompiledCRUDOverrideRegistersEnumMetadataOnce(t *testing.T) {
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		APIs:      map[string]int{"getTask": 1},
+		APIParams: map[string]map[string]int{"getTask": {"state": 1}},
+	}})
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{"getTask": {"state": "State"}})
+	model := &ast.ModelDecl{Name: "Task", Directives: []*ast.Directive{{Name: "crud"}}}
+	var output strings.Builder
+	generator.generateRegisterFuncWithInferred(&output, []*ast.ModelDecl{model}, []string{"getTask"}, nil, map[string]bool{"State": true})
+	if strings.Count(output.String(), `router.Handle("getTask",`) != 1 {
+		t.Fatalf("compiled CRUD override registered multiple times:\n%s", output.String())
+	}
+	if !strings.Contains(output.String(), `Name: "state", Type: "Enum", TypeName: "State", FieldID: 1`) {
+		t.Fatalf("compiled CRUD override lost enum metadata:\n%s", output.String())
 	}
 }
 
@@ -2240,8 +2386,8 @@ func TestGenerateParamSetNullableEnum(t *testing.T) {
 	if !strings.Contains(out, "roleValEnum") {
 		t.Fatalf("nullable enum should create enum tmp var, got:\n%s", out)
 	}
-	if !strings.Contains(out, "&roleValEnum") {
-		t.Fatalf("nullable enum should take pointer, got:\n%s", out)
+	if !strings.Contains(out, "_value := roleVal") || !strings.Contains(out, "builder.SetRole(&_value)") {
+		t.Fatalf("nullable enum should allocate its setter pointer only in the non-null branch, got:\n%s", out)
 	}
 }
 
@@ -2255,12 +2401,28 @@ func TestGenerateParamSetCustomType(t *testing.T) {
 	}
 	generateParamSet(&b, f, "SetMetadata", "\t\t", nil)
 	out := b.String()
-	if !strings.Contains(out, "ParamJSON") {
-		t.Fatalf("custom type should use ParamJSON, got:\n%s", out)
+	if !strings.Contains(out, "ParamRawJSON") {
+		t.Fatalf("JSON should use its raw document reader, got:\n%s", out)
 	}
 }
 
 // ─── writeHandlerImports: all features enabled ──────────────────────────────
+
+func TestWriteHandlerImportsPatternAndStandaloneTransaction(t *testing.T) {
+	var output strings.Builder
+	model := &ast.ModelDecl{Name: "User", Directives: []*ast.Directive{{Name: "crud"}}, Fields: []*ast.FieldDecl{
+		{Name: "name", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "pattern"}}},
+	}}
+	writeHandlerImports(&output, &semantic.Result{}, []*ast.ModelDecl{model}, handlerFeatures{}, false)
+	if !strings.Contains(output.String(), `"regexp"`) {
+		t.Fatalf("pattern validator omitted regexp: %s", output.String())
+	}
+	output.Reset()
+	writeHandlerImports(&output, &semantic.Result{}, nil, handlerFeatures{hasTransaction: true}, false)
+	if !strings.Contains(output.String(), `"`+DriverPG.DriverImport()+`"`) {
+		t.Fatalf("standalone transaction omitted driver: %s", output.String())
+	}
+}
 
 func TestWriteHandlerImportsAllFeatures(t *testing.T) {
 	var b strings.Builder
@@ -2477,8 +2639,8 @@ func TestGenerateServiceFnHandler(t *testing.T) {
 	code := string(src)
 
 	// Should have fn handler
-	if !strings.Contains(code, "handleGetUserScore") {
-		t.Error("missing fn @service handler: handleGetUserScore")
+	if !strings.Contains(code, "_handleService_getUserScore") {
+		t.Error("missing fn @service handler: _handleService_getUserScore")
 	}
 
 	// Should have RegisterServiceFns
@@ -2517,7 +2679,7 @@ func TestGenerateNativeServiceFnHandler(t *testing.T) {
 	code := string(src)
 
 	// Should have native handler delegating to Resolver
-	if !strings.Contains(code, "handleProcessPayment") {
+	if !strings.Contains(code, "_handleService_processPayment") {
 		t.Error("missing @native @service handler")
 	}
 	if !strings.Contains(code, "app.Resolver.ProcessPayment") {
@@ -2605,17 +2767,16 @@ func TestNativeAPIHandler(t *testing.T) {
 	}
 
 	// Registration in RegisterHandlers
-	if !strings.Contains(code, `router.Handle("getDashboardOverview"`) {
+	if !strings.Contains(code, `router.HandleLocal("getDashboardOverview"`) {
 		t.Error("native API should be registered in RegisterHandlers")
 	}
-	if !strings.Contains(code, `router.Handle("getErrorBreakdown"`) {
+	if !strings.Contains(code, `router.HandleLocal("getErrorBreakdown"`) {
 		t.Error("native API should be registered in RegisterHandlers")
 	}
 }
 
 func TestNativeAPIHandlerModelList(t *testing.T) {
-	// Native API returning [Model] — resolver returns a VALUE slice []Model,
-	// but WriteColumnarModel takes []*Model, so the handler needs an adapter.
+	// Native and compiled model lists share references without a per-response adapter.
 	result := &semantic.Result{
 		Files: []*ast.File{{
 			Name: "origin/user.luxo",
@@ -2633,10 +2794,10 @@ func TestNativeAPIHandlerModelList(t *testing.T) {
 	}
 
 	code := string(generateHandlerFile(result, "luxo", nil))
-	if !strings.Contains(code, "_ptrs[i] = &result[i]") {
-		t.Errorf("model list should build pointer slice adapter:\n%s", code)
+	if strings.Contains(code, "_ptrs") {
+		t.Errorf("model list should not build pointer slice adapter:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteColumnarUser(req.Buf, _ptrs, req.FieldMask)") {
+	if !strings.Contains(code, "WriteColumnarUser(req.Buf, result, req.FieldMask)") {
 		t.Errorf("model list should encode columnar via pointer slice:\n%s", code)
 	}
 }
@@ -2671,8 +2832,8 @@ func TestNativeAPIHandlerListPrimitive(t *testing.T) {
 		ReturnType: &ast.TypeRef{Name: "Int", IsList: true},
 	}, nil, nil)
 	code := b.String()
-	if !strings.Contains(code, "codec.AppendVarint(req.Buf.B, uint64(len(result)))") {
-		t.Errorf("[Int] should use unsigned count prefix:\n%s", code)
+	if !strings.Contains(code, "codec.AppendArrayHeader(req.Buf.B, len(result))") {
+		t.Errorf("[Int] should use the checked unsigned count prefix:\n%s", code)
 	}
 	if !strings.Contains(code, "codec.AppendSvarint(req.Buf.B, v)") {
 		t.Errorf("[Int] should encode each element with AppendSvarint:\n%s", code)
@@ -2714,12 +2875,12 @@ func TestNativeAPIHandlerAdvancedScalarReturns(t *testing.T) {
 		name string
 		want string
 	}{
-		{"DateTime", "codec.AppendSvarint(req.Buf.B, result.Unix())"},
+		{"DateTime", "codec.AppendDateTime(req.Buf.B, result)"},
 		{"Duration", "codec.AppendSvarint(req.Buf.B, int64(result))"},
 		{"UUID", "codec.AppendUUID(req.Buf.B, result)"},
-		{"Decimal", "codec.AppendString(req.Buf.B, result.String())"},
+		{"Decimal", "codec.AppendString(req.Buf.B, lux.FormatDecimal(result))"},
 		{"Bytes", "codec.AppendBytes(req.Buf.B, result)"},
-		{"JSON", "codec.AppendBytes(req.Buf.B, result)"},
+		{"JSON", "codec.AppendJSON(req.Buf.B, result)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -2787,6 +2948,462 @@ func TestServiceFnNotRegisteredWithoutAnnotation(t *testing.T) {
 	// Should NOT have RegisterServiceFns (no service fns)
 	if strings.Contains(code, "RegisterServiceFns") {
 		t.Error("no service fns, should not generate RegisterServiceFns")
+	}
+}
+
+func TestGenerateCompiledFunctionsEmptyDoesNotAllocate(t *testing.T) {
+	var b strings.Builder
+	g := defaultGenerator()
+	result := &semantic.Result{}
+	allocations := testing.AllocsPerRun(100, func() {
+		g.generateCompiledFunctions(&b, result, nil, nil, nil, nil, nil)
+	})
+	if allocations != 0 || b.Len() != 0 {
+		t.Fatalf("empty functions allocated %v times and wrote %d bytes", allocations, b.Len())
+	}
+}
+
+func TestGenerateLocalCompiledFunction(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/task/task.luxo",
+		Functions: []*ast.FnDecl{
+			{
+				Name:       "doubleScore",
+				Params:     []*ast.ParamDecl{{Name: "score", Type: &ast.TypeRef{Name: "Int"}}},
+				ReturnType: &ast.TypeRef{Name: "Int"},
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.BinaryExpr{
+					Left: &ast.Ident{Name: "score"}, Op: "*", Right: &ast.Literal{Kind: token.Int, Value: "2"},
+				}}}},
+			},
+			{
+				Name:       "implicitDouble",
+				Params:     []*ast.ParamDecl{{Name: "score", Type: &ast.TypeRef{Name: "Int"}}},
+				ReturnType: &ast.TypeRef{Name: "Int"},
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.BinaryExpr{
+					Left: &ast.Ident{Name: "score"}, Op: "*", Right: &ast.Literal{Kind: token.Int, Value: "2"},
+				}}}},
+			},
+			{
+				Name:   "prepareCalculation",
+				Params: []*ast.ParamDecl{{Name: "score", Type: &ast.TypeRef{Name: "Int"}}},
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ValStmt{
+					Name: "doubled", Value: &ast.BinaryExpr{
+						Left: &ast.Ident{Name: "score"}, Op: "*", Right: &ast.Literal{Kind: token.Int, Value: "2"},
+					},
+				}}},
+			},
+			{Name: "recordCalculation", Body: &ast.Block{}},
+		},
+		APIs: []*ast.ApiDecl{{
+			Name:       "calculateScore",
+			Params:     []*ast.ParamDecl{{Name: "score", Type: &ast.TypeRef{Name: "Int"}}},
+			ReturnType: &ast.TypeRef{Name: "Int"},
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.Ident{Name: "recordCalculation"}}},
+				&ast.ExprStmt{Expr: &ast.CallExpr{
+					Func: &ast.Ident{Name: "doubleScore"}, Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "score"}}},
+				}},
+				&ast.ReturnStmt{Value: &ast.CallExpr{
+					Func: &ast.Ident{Name: "doubleScore"}, Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "score"}}},
+				}},
+			}},
+		}},
+	}}}
+
+	code := string(generateHandlerFile(result, "generated", nil))
+	for _, want := range []string{
+		"func (app *App) doubleScore(ctx context.Context, score int64) (_value int64, err error)",
+		"func (app *App) implicitDouble(ctx context.Context, score int64) (_value int64, err error)",
+		"func (app *App) prepareCalculation(ctx context.Context, score int64) error",
+		"func (app *App) recordCalculation(ctx context.Context) error",
+		"return score * 2, nil",
+		"doubled := score * 2",
+		"if err := app.recordCalculation(ctx); err != nil",
+		"if err != nil",
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("compiled function output missing %q:\n%s", want, code)
+		}
+	}
+	if strings.Contains(code, `router.Handle("doubleScore"`) || strings.Contains(code, `"svc:doubleScore"`) {
+		t.Fatalf("local compiled function must not be registered as an API or RPC handler:\n%s", code)
+	}
+	if _, err := format.Source([]byte(code)); err != nil {
+		t.Fatalf("compiled function output is invalid Go: %v\n%s", err, code)
+	}
+	runGeneratedProtocolPackage(t, code, localCompiledFunctionAssertions)
+}
+
+const localCompiledFunctionAssertions = `package generated
+import("context";"encoding/json";"strconv";"testing";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec")
+type App struct{}
+func TestCompiledLocalCalls(t *testing.T){
+ app:=&App{};ctx:=context.Background()
+ for _,score:=range []int64{-7,0,21}{
+  for _,call:=range []func(context.Context,int64)(int64,error){app.doubleScore,app.implicitDouble}{
+   got,err:=call(ctx,score);if err!=nil||got!=score*2{t.Fatalf("local call score=%d got=%d err=%v",score,got,err)}
+  }
+  if err:=app.prepareCalculation(ctx,score);err!=nil{t.Fatal(err)}
+  if err:=app.recordCalculation(ctx);err!=nil{t.Fatal(err)}
+  req:=&api.Request{Params:map[string]json.RawMessage{"score":json.RawMessage(strconv.AppendInt(nil,score,10))},Buf:&api.ResponseBuf{}}
+  if err:=handleCalculateScore(app)(ctx,req);err!=nil{t.Fatal(err)}
+  dec:=codec.NewDecoder(req.Buf.B);if got:=dec.ReadInt();got!=score*2{t.Fatalf("handler score=%d got=%d",score,got)};if err:=dec.Finish();err!=nil{t.Fatal(err)}
+ }
+}
+`
+
+func TestCompiledFunctionsPropagateClientSelectionTransitively(t *testing.T) {
+	model := testModel("User", nil, []*ast.FieldDecl{
+		testField("id", "Int", directive("id")),
+		testField("name", "String"),
+	})
+	findUser := &ast.CallExpr{
+		Func: &ast.MemberExpr{
+			Object: &ast.CallExpr{
+				Func: &ast.MemberExpr{
+					Object: &ast.CallExpr{
+						Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: "where"},
+						Args: []*ast.NamedArg{{Value: &ast.BinaryExpr{
+							Left: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "id"},
+							Op:   "==", Right: &ast.Ident{Name: "id"},
+						}}},
+					},
+					Field: "select",
+				},
+			},
+			Field: "first",
+		},
+	}
+	loadUser := &ast.FnDecl{
+		Name:       "loadUser",
+		Params:     []*ast.ParamDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+		ReturnType: &ast.TypeRef{Name: "User"},
+		Body:       &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: findUser}}},
+	}
+	getUser := &ast.FnDecl{
+		Name:       "getUser",
+		Params:     []*ast.ParamDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+		ReturnType: &ast.TypeRef{Name: "User"},
+		Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.CallExpr{
+			Func: &ast.Ident{Name: "loadUser"}, Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+		}}}},
+	}
+	result := &semantic.Result{Files: []*ast.File{{
+		Models:    []*ast.ModelDecl{model},
+		Functions: []*ast.FnDecl{loadUser, getUser},
+		APIs: []*ast.ApiDecl{{
+			Name:       "findUser",
+			Params:     []*ast.ParamDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}}},
+			ReturnType: &ast.TypeRef{Name: "User"},
+			Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.CallExpr{
+				Func: &ast.Ident{Name: "getUser"}, Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "id"}}},
+			}}}},
+		}},
+	}}}
+
+	code := string(generateHandlerFile(result, "luxo", nil))
+	for _, want := range []string{
+		"func (app *App) loadUser(ctx context.Context, _select []*selection.Field, id int64)",
+		"func (app *App) getUser(ctx context.Context, _select []*selection.Field, id int64)",
+		".Select(selectUserSQLColumns(_select)...)",
+		"var _argument1 int64 = id",
+		"app.loadUser(ctx, _select, _argument1)",
+		"app.getUser(ctx, req.Select, _argument1)",
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("selection-aware function output missing %q:\n%s", want, code)
+		}
+	}
+	if _, err := format.Source([]byte(code)); err != nil {
+		t.Fatalf("selection-aware function output is invalid Go: %v\n%s", err, code)
+	}
+}
+
+func TestCompiledFunctionGoTypePreservesModelPointers(t *testing.T) {
+	models := map[string]*ast.ModelDecl{"Project": {Name: "Project"}}
+	tests := []struct {
+		name string
+		ref  *ast.TypeRef
+		want string
+	}{
+		{name: "nil", want: "any"},
+		{name: "scalar list", ref: &ast.TypeRef{Name: "Int", IsList: true}, want: "[]int64"},
+		{name: "model", ref: &ast.TypeRef{Name: "Project"}, want: "*Project"},
+		{name: "model list", ref: &ast.TypeRef{Name: "Project", IsList: true}, want: "[]*Project"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := compiledFunctionGoType(tt.ref, models); got != tt.want {
+				t.Fatalf("compiledFunctionGoType() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompiledFunctionCallsNativeFunction(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/task/task.luxo",
+		Functions: []*ast.FnDecl{
+			{
+				Name: "loadBaseScore",
+				Params: []*ast.ParamDecl{
+					{Name: "projectId", Type: &ast.TypeRef{Name: "Int"}},
+					{Name: "adjustment", Type: &ast.TypeRef{Name: "Int"}, Default: &ast.Literal{Kind: token.Int, Value: "4"}},
+				},
+				ReturnType: &ast.TypeRef{Name: "Result", TypeArgs: []*ast.TypeRef{{Name: "Int"}}},
+				Directives: []*ast.Directive{{Name: "native"}},
+			},
+			{
+				Name:       "evaluateDefaultScore",
+				Params:     []*ast.ParamDecl{{Name: "projectId", Type: &ast.TypeRef{Name: "Int"}}},
+				ReturnType: &ast.TypeRef{Name: "Int"},
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.UnaryExpr{
+					Op: "?", Value: &ast.CallExpr{
+						Func: &ast.Ident{Name: "loadBaseScore"}, Args: []*ast.NamedArg{{Name: "projectId", Value: &ast.Ident{Name: "projectId"}}},
+					},
+				}}}},
+			},
+			{
+				Name:       "evaluateScore",
+				Params:     []*ast.ParamDecl{{Name: "projectId", Type: &ast.TypeRef{Name: "Int"}}},
+				ReturnType: &ast.TypeRef{Name: "Int"},
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.BinaryExpr{
+					Left: &ast.UnaryExpr{Op: "?", Value: &ast.CallExpr{
+						Func: &ast.Ident{Name: "loadBaseScore"}, Args: []*ast.NamedArg{
+							{Name: "adjustment", Value: &ast.Literal{Kind: token.Int, Value: "3"}},
+							{Name: "projectId", Value: &ast.Ident{Name: "projectId"}},
+						},
+					}},
+					Op: "+", Right: &ast.Literal{Kind: token.Int, Value: "1"},
+				}}}},
+			},
+		},
+		APIs: []*ast.ApiDecl{{
+			Name:       "releaseScore",
+			Params:     []*ast.ParamDecl{{Name: "projectId", Type: &ast.TypeRef{Name: "Int"}}},
+			ReturnType: &ast.TypeRef{Name: "Int"},
+			Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.CallExpr{
+				Func: &ast.Ident{Name: "evaluateScore"}, Args: []*ast.NamedArg{{Value: &ast.Ident{Name: "projectId"}}},
+			}}}},
+		}},
+	}}}
+
+	code := string(generateHandlerFile(result, "luxo", nil))
+	for _, want := range []string{
+		"func (app *App) evaluateScore(ctx context.Context, projectId int64) (_value int64, err error)",
+		"_result2, err := app.Resolver.LoadBaseScore(ctx, _argument1, 4)",
+		"_result2, err := app.Resolver.LoadBaseScore(ctx, _argument1, 3)",
+		"return _result2 + 1, nil",
+		"_result2, err := app.evaluateScore(ctx, _argument1)",
+		"req.Buf.B = codec.AppendSvarint(req.Buf.B, _result2)",
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("compiled/native function interaction missing %q:\n%s", want, code)
+		}
+	}
+	if strings.Contains(code, "func (app *App) loadBaseScore") {
+		t.Fatalf("@native function must not receive a generated Luxo body:\n%s", code)
+	}
+	nativeCode := string(GenerateNativeFile(result, "luxo"))
+	if !strings.Contains(nativeCode, "LoadBaseScore(ctx context.Context, projectId int64, adjustment int64) (int64, error)") {
+		t.Fatalf("@native function interface does not match the compiled call boundary:\n%s", nativeCode)
+	}
+	if _, err := format.Source([]byte(code)); err != nil {
+		t.Fatalf("compiled/native function output is invalid Go: %v\n%s", err, code)
+	}
+}
+
+func TestCompiledFunctionCallOrdersNamedArgumentsAndDefaults(t *testing.T) {
+	defaultCount := &ast.Literal{Kind: token.Int, Value: "2"}
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/task/task.luxo",
+		Functions: []*ast.FnDecl{{
+			Name: "formatScore",
+			Params: []*ast.ParamDecl{
+				{Name: "label", Type: &ast.TypeRef{Name: "String"}},
+				{Name: "count", Type: &ast.TypeRef{Name: "Int"}, Default: defaultCount},
+			},
+			ReturnType: &ast.TypeRef{Name: "String"},
+			Body:       &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.Ident{Name: "label"}}}},
+		}},
+		APIs: []*ast.ApiDecl{
+			{
+				Name:       "formatDefaultScore",
+				ReturnType: &ast.TypeRef{Name: "String"},
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.CallExpr{
+					Func: &ast.Ident{Name: "formatScore"}, Args: []*ast.NamedArg{{Name: "label", Value: &ast.Literal{Kind: token.String, Value: "task"}}},
+				}}}},
+			},
+			{
+				Name:       "formatNamedScore",
+				ReturnType: &ast.TypeRef{Name: "String"},
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.CallExpr{
+					Func: &ast.Ident{Name: "formatScore"},
+					Args: []*ast.NamedArg{
+						{Name: "count", Value: &ast.Literal{Kind: token.Int, Value: "9"}},
+						{Name: "label", Value: &ast.Literal{Kind: token.String, Value: "task"}},
+					},
+				}}}},
+			},
+		},
+	}}}
+
+	code := string(generateHandlerFile(result, "luxo", nil))
+	for _, want := range []string{
+		`app.formatScore(ctx, "task", 2)`,
+		`app.formatScore(ctx, "task", 9)`,
+	} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("compiled function arguments missing %q:\n%s", want, code)
+		}
+	}
+}
+
+func TestCompiledFunctionCallBuildsStableNullableDefault(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Functions: []*ast.FnDecl{{
+			Name: "normalizeLabel",
+			Params: []*ast.ParamDecl{{
+				Name:    "label",
+				Type:    &ast.TypeRef{Name: "String", Nullable: true},
+				Default: &ast.Literal{Kind: token.String, Value: "ready"},
+			}},
+			ReturnType: &ast.TypeRef{Name: "Boolean"},
+			Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.BinaryExpr{
+				Left: &ast.Ident{Name: "label"}, Op: "!=", Right: &ast.Literal{Kind: token.Null, Value: "null"},
+			}}}},
+		}},
+		APIs: []*ast.ApiDecl{{
+			Name:       "label",
+			ReturnType: &ast.TypeRef{Name: "Boolean"},
+			Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.CallExpr{
+				Func: &ast.Ident{Name: "normalizeLabel"},
+			}}}},
+		}},
+	}}}
+
+	code := string(generateHandlerFile(result, "luxo", nil))
+	if !strings.Contains(code, `var _default1 string = "ready"`) ||
+		!strings.Contains(code, `app.normalizeLabel(ctx, &_default1)`) {
+		t.Fatalf("nullable function default must have a stable pointer:\n%s", code)
+	}
+	if _, err := format.Source([]byte(code)); err != nil {
+		t.Fatalf("compiled nullable default is invalid Go: %v\n%s", err, code)
+	}
+}
+
+func TestPropagateSelectionFunctionsHandlesCycles(t *testing.T) {
+	selectionFunctions := map[string]bool{"leaf": true}
+	callers := map[string][]string{
+		"leaf":   {"middle"},
+		"middle": {"leaf", "root"},
+	}
+
+	propagateSelectionFunctions(selectionFunctions, callers)
+
+	for _, name := range []string{"leaf", "middle", "root"} {
+		if !selectionFunctions[name] {
+			t.Errorf("selection was not propagated to %q", name)
+		}
+	}
+}
+
+func TestCompiledAndNativeFunctionsPreserveVariadicABI(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/task/task.luxo",
+		Functions: []*ast.FnDecl{
+			{
+				Name: "nativeSum",
+				Params: []*ast.ParamDecl{{
+					Name: "values", Type: &ast.TypeRef{Name: "Int"}, Spread: true,
+				}},
+				ReturnType: &ast.TypeRef{Name: "Result", TypeArgs: []*ast.TypeRef{{Name: "Int"}}},
+				Directives: []*ast.Directive{{Name: "native"}},
+			},
+			{
+				Name: "sumReleaseScores",
+				Params: []*ast.ParamDecl{{
+					Name: "values", Type: &ast.TypeRef{Name: "Int"}, Spread: true,
+				}},
+				ReturnType: &ast.TypeRef{Name: "Int"},
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.UnaryExpr{
+					Op: "?", Value: &ast.CallExpr{Func: &ast.Ident{Name: "nativeSum"}, Args: []*ast.NamedArg{
+						{Value: &ast.Literal{Kind: token.Int, Value: "1"}},
+						{Value: &ast.Literal{Kind: token.Int, Value: "2"}},
+						{Value: &ast.Literal{Kind: token.Int, Value: "3"}},
+					}},
+				}}}},
+			},
+		},
+		APIs: []*ast.ApiDecl{{
+			Name:       "releaseScore",
+			ReturnType: &ast.TypeRef{Name: "Int"},
+			Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{Value: &ast.CallExpr{
+				Func: &ast.Ident{Name: "sumReleaseScores"}, Args: []*ast.NamedArg{
+					{Value: &ast.Literal{Kind: token.Int, Value: "4"}},
+					{Value: &ast.Literal{Kind: token.Int, Value: "5"}},
+				},
+			}}}},
+		}},
+	}}}
+
+	handler := string(generateHandlerFile(result, "luxo", nil))
+	nativeResolver := string(GenerateNativeFile(result, "luxo"))
+	for _, expected := range []string{
+		"func (app *App) sumReleaseScores(ctx context.Context, values ...int64)",
+		"app.Resolver.NativeSum(ctx, 1, 2, 3)",
+		"app.sumReleaseScores(ctx, 4, 5)",
+	} {
+		if !strings.Contains(handler, expected) {
+			t.Errorf("generated variadic function boundary is missing %q:\n%s", expected, handler)
+		}
+	}
+	if !strings.Contains(nativeResolver, "NativeSum(ctx context.Context, values ...int64) (int64, error)") {
+		t.Errorf("generated native variadic interface is invalid:\n%s", nativeResolver)
+	}
+}
+
+func TestCompiledCodePropagatesVoidNativeFunctionErrors(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{{
+		Name: "origin/task/task.luxo",
+		Functions: []*ast.FnDecl{
+			{
+				Name: "recordAudit",
+				Params: []*ast.ParamDecl{{
+					Name: "action", Type: &ast.TypeRef{Name: "String"},
+				}},
+				Directives: []*ast.Directive{{Name: "native"}},
+			},
+			{
+				Name: "recordRelease",
+				Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.CallExpr{
+					Func: &ast.Ident{Name: "recordAudit"},
+					Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.String, Value: "release"}}},
+				}}}},
+			},
+		},
+		APIs: []*ast.ApiDecl{{
+			Name:       "release",
+			ReturnType: &ast.TypeRef{Name: "Boolean"},
+			Body: &ast.Block{Stmts: []ast.Stmt{
+				&ast.ExprStmt{Expr: &ast.CallExpr{Func: &ast.Ident{Name: "recordRelease"}}},
+				&ast.ReturnStmt{Value: &ast.Literal{Kind: token.True, Value: "true"}},
+			}},
+		}},
+	}}}
+
+	handler := string(generateHandlerFile(result, "luxo", nil))
+	nativeResolver := string(GenerateNativeFile(result, "luxo"))
+	if !strings.Contains(handler, `if err := app.Resolver.RecordAudit(ctx, "release"); err != nil {`) ||
+		!strings.Contains(handler, "if err := app.recordRelease(ctx); err != nil {") ||
+		!strings.Contains(handler, "return err") {
+		t.Fatalf("void @native function errors must propagate through the caller:\n%s", handler)
+	}
+	if !strings.Contains(nativeResolver, "RecordAudit(ctx context.Context, action string) error") {
+		t.Fatalf("void @native function interface is invalid:\n%s", nativeResolver)
+	}
+	if _, err := format.Source([]byte(handler)); err != nil {
+		t.Fatalf("void @native function call generated invalid Go: %v\n%s", err, handler)
 	}
 }
 
@@ -2965,8 +3582,8 @@ func TestWriteHandlerRegistration_Cache(t *testing.T) {
 	}
 	writeHandlerRegistration(&b, "getUser", dirs)
 	out := b.String()
-	if !strings.Contains(out, "api.WithCache") {
-		t.Errorf("@cache should wrap with WithCache: %s", out)
+	if strings.Contains(out, "WithCache") || !strings.Contains(out, `router.RequireCache("getUser")`) || !strings.Contains(out, `router.Handle("getUser", handleGetUser(app))`) {
+		t.Errorf("@cache must not bypass handler preflight: %s", out)
 	}
 }
 
@@ -3113,12 +3730,12 @@ func TestGenerateComputedResolversCustomRelationKeys(t *testing.T) {
 		}
 	}
 	var selector strings.Builder
-	generateSQLColumnSelector(&selector, product, map[string]bool{})
+	defaultGenerator().generateSQLColumnSelector(&selector, product, map[string]bool{})
 	generator.generateSelectedSQLFields(&selector, product, map[string]bool{})
 	for _, want := range []string{
 		`case "reviewCount":`,
-		`cols = ensureSelectedColumn(cols, "tenant")`,
-		`if codec.FieldMaskHas(fieldMask, 3) { fields = ensureSelectedColumn(fields, "tenant") }`,
+		`cols = ensureSelectedColumn(cols, "\"tenant\"")`,
+		`if codec.FieldMaskHas(fieldMask, 3) { fields = ensureSelectedColumn(fields, "\"tenant\"") }`,
 	} {
 		if !strings.Contains(selector.String(), want) {
 			t.Errorf("computed selection dependency missing %q:\n%s", want, selector.String())
@@ -3160,9 +3777,9 @@ func TestNestedRelationResolvesComputedFieldsInOneBatch(t *testing.T) {
 	for _, want := range []string{
 		"func resolvePostComputedFields(",
 		"case \"commentCount\": needComments = true",
-		"computedItems := make([]*Post, 0)",
-		"computedItems = append(computedItems, &item.Posts[i])",
-		"resolvePostComputedFields(ctx, app, computedItems, f.Children)",
+		"var nestedBuf [8]*Post",
+		"nestedItems = append(nestedItems, item.Posts...)",
+		"resolvePostComputedFields(ctx, app, nestedItems, f.Children)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("nested computed resolution missing %q:\n%s", want, out)
@@ -3170,7 +3787,7 @@ func TestNestedRelationResolvesComputedFieldsInOneBatch(t *testing.T) {
 	}
 }
 
-func TestNestedListRelationUsesValueSliceBatchResolver(t *testing.T) {
+func TestNestedListRelationUsesReferenceSliceBatchResolver(t *testing.T) {
 	project := &ast.ModelDecl{Name: "Project", Directives: []*ast.Directive{{Name: "crud"}}, Fields: []*ast.FieldDecl{
 		{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
 		{Name: "tasks", Type: &ast.TypeRef{Name: "Task", IsList: true}},
@@ -3189,7 +3806,7 @@ func TestNestedListRelationUsesValueSliceBatchResolver(t *testing.T) {
 	for _, want := range []string{
 		"func resolveTaskValueListRelations(ctx context.Context, app *App, items []Task",
 		"traceCtx := api.WithTraceFieldPath(ctx, f.Name)",
-		"resolveTaskValueListRelations(traceCtx, app, project.Tasks, f.Children, d-1)",
+		"resolveTaskListRelations(traceCtx, app, result, f.Children, d-1)",
 	} {
 		if !strings.Contains(code, want) {
 			t.Fatalf("nested list relation resolver missing %q:\n%s", want, code)
@@ -3239,11 +3856,12 @@ func TestNestedComputedResolveSupportsScalarRelations(t *testing.T) {
 	computed := map[string]bool{"Profile": true}
 	var b strings.Builder
 	writeNestedComputedResolve(&b, relation, "item.Profile", "\t", computed)
-	writeNestedListComputedResolve(&b, relation, computed)
+	writeNestedListResolvers(&b, relation, false, nil, computed)
 	out := b.String()
 	for _, want := range []string{
 		"[]*Profile{item.Profile}",
-		"if item.Profile != nil { computedItems = append(computedItems, item.Profile) }",
+		"if item.Profile != nil {",
+		"nestedItems = append(nestedItems, item.Profile)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("scalar computed relation missing %q:\n%s", want, out)
@@ -3263,10 +3881,10 @@ func TestCollectBatchLoadModelsIncludesRemotePrimaryKeyModel(t *testing.T) {
 
 func TestWriteAPIRegistrationSkipsOnlyStaleParams(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
-		APIs:          map[string]int{"svc:lookup": 9},
-		APIParams:     map[string]map[string]int{"svc:lookup": {"stale": 1}},
-		APIParamTypes: map[string]map[string]string{"lookup": {"active": "String"}},
+		APIs:      map[string]int{"svc:lookup": 9},
+		APIParams: map[string]map[string]int{"svc:lookup": {"stale": 1}},
 	}})
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{"svc:lookup": {"active": "String"}})
 	var b strings.Builder
 	generator.writeAPIRegistration(&b, "svc:lookup")
 	out := b.String()
@@ -3356,7 +3974,6 @@ func TestScanModelsForValidation_NoCrud(t *testing.T) {
 }
 
 func TestGenerateBeforeSave_EmptyBody(t *testing.T) {
-	var b strings.Builder
 	f := &ast.FieldDecl{
 		Name: "name",
 		Type: &ast.TypeRef{Name: "String"},
@@ -3364,14 +3981,10 @@ func TestGenerateBeforeSave_EmptyBody(t *testing.T) {
 			{Name: "beforeSave", Body: &ast.Block{}},
 		},
 	}
-	generateBeforeSave(&b, f, "nameVal", "\t")
-	if b.Len() > 0 {
-		t.Error("empty body should generate nothing")
-	}
+	assertInvalidBeforeSave(t, f)
 }
 
 func TestGenerateBeforeSave_NonExprBody(t *testing.T) {
-	var b strings.Builder
 	f := &ast.FieldDecl{
 		Name: "name",
 		Type: &ast.TypeRef{Name: "String"},
@@ -3379,10 +3992,7 @@ func TestGenerateBeforeSave_NonExprBody(t *testing.T) {
 			{Name: "beforeSave", Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}}},
 		},
 	}
-	generateBeforeSave(&b, f, "nameVal", "\t")
-	if b.Len() > 0 {
-		t.Error("non-ExprStmt body should generate nothing")
-	}
+	assertInvalidBeforeSave(t, f)
 }
 
 func TestGenerateBeforeSave_AssignTrim(t *testing.T) {
@@ -3558,7 +4168,7 @@ func TestCRUDHandlerSkipDebug(t *testing.T) {
 	ops := crudOperations(models[0])
 	t.Logf("ops: %v", ops)
 	for _, op := range ops {
-		t.Logf("crudAPIName(Project, %s) = %s", op, crudAPIName("Project", op))
+		t.Logf("ast.CRUDAPIName(Project, %s) = %s", op, ast.CRUDAPIName("Project", op))
 	}
 }
 
@@ -3852,5 +4462,324 @@ func TestWriteHandlerImportsIncludesGeneratedTimeUsage(t *testing.T) {
 	writeHandlerImports(&b, &semantic.Result{}, nil, handlerFeatures{}, false, "time.Now()")
 	if !strings.Contains(b.String(), `"time"`) {
 		t.Fatalf("generated time usage did not add the time import:\n%s", b.String())
+	}
+}
+
+func TestGeneratedBeforeSaveCompoundAssignments(t *testing.T) {
+	field := &ast.FieldDecl{Directives: []*ast.Directive{{Name: "beforeSave", Body: &ast.Block{}}}}
+	for _, step := range []struct{ op, value string }{{"+=", "2"}, {"*=", "3"}, {"-=", "4"}, {"/=", "2"}, {"%=", "5"}} {
+		field.Directives[0].Body.Stmts = append(field.Directives[0].Body.Stmts, &ast.AssignStmt{Target: &ast.Ident{Name: "it"}, Op: step.op, Value: &ast.Literal{Kind: token.Int, Value: step.value}})
+	}
+	var body strings.Builder
+	generateBeforeSave(&body, field, "value", "\t")
+	runGeneratedProtocolPackage(t, "package generated\nfunc transform(value int64)int64{\n"+body.String()+"return value\n}\n", `package generated
+import "testing"
+func TestCompoundAssignments(t *testing.T){if got:=transform(4);got!=2{t.Fatalf("got %d, want 2",got)}}
+`)
+}
+
+func assertInvalidBeforeSave(t *testing.T, field *ast.FieldDecl) {
+	t.Helper()
+	defer func() {
+		if _, ok := recover().(*InternalCompilerError); !ok {
+			t.Fatal("invalid beforeSave must stop generation")
+		}
+	}()
+	var output strings.Builder
+	generateBeforeSave(&output, field, "value", "\t")
+}
+
+func TestBeforeSaveRejectsMalformedAssignments(t *testing.T) {
+	for _, statement := range []ast.Stmt{
+		&ast.AssignStmt{Target: &ast.Ident{Name: "other"}, Op: "=", Value: &ast.Ident{Name: "it"}},
+		&ast.AssignStmt{Target: &ast.Ident{Name: "it"}, Op: "?=", Value: &ast.Ident{Name: "it"}},
+		&ast.AssignStmt{Target: &ast.Ident{Name: "it"}, Op: "="},
+		&ast.ExprStmt{},
+		&ast.ExprStmt{Expr: &ast.LambdaExpr{}},
+	} {
+		assertInvalidBeforeSave(t, &ast.FieldDecl{Directives: []*ast.Directive{{Name: "beforeSave", Body: &ast.Block{Stmts: []ast.Stmt{statement}}}}})
+	}
+	assertInvalidBeforeSave(t, &ast.FieldDecl{Directives: []*ast.Directive{{Name: "beforeSave"}}})
+}
+
+func TestFieldCallRejectsUnsupportedChildren(t *testing.T) {
+	for _, call := range []*ast.CallExpr{
+		{Func: &ast.MemberExpr{Object: &ast.LambdaExpr{}, Field: "trim"}},
+		{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "replace"}, Args: []*ast.NamedArg{{Value: &ast.LambdaExpr{}}, {Value: &ast.Literal{Kind: token.String, Value: "x"}}}},
+		{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "it"}, Field: "contains"}, Args: []*ast.NamedArg{{Value: &ast.LambdaExpr{}}}},
+		{Func: &ast.MemberExpr{Object: &ast.LambdaExpr{}, Field: "toInt"}},
+	} {
+		if got := compileFieldExpr(call, "value"); got != "" {
+			t.Errorf("unsupported child emitted %q", got)
+		}
+	}
+}
+
+func TestGeneratedDateBeforeSave(t *testing.T) {
+	field := &ast.FieldDecl{Type: &ast.TypeRef{Name: "DateTime"}, Directives: []*ast.Directive{{Name: "beforeSave", Body: &ast.Block{}}}}
+	for _, step := range []struct{ op, value string }{{"+=", "2h"}, {"-=", "30m"}} {
+		field.Directives[0].Body.Stmts = append(field.Directives[0].Body.Stmts, &ast.AssignStmt{Target: &ast.Ident{Name: "it"}, Op: step.op, Value: &ast.Literal{Kind: token.Duration, Value: step.value}})
+	}
+	var body strings.Builder
+	generateBeforeSave(&body, field, "value", "\t")
+	runGeneratedProtocolPackage(t, "package generated\nimport (\"time\";\"github.com/light-speak/luxo/pkg/lux\")\nfunc transform(value time.Time)time.Time{\n"+body.String()+"return value\n}\n", `package generated
+import("testing";"time")
+func TestDateBeforeSave(t *testing.T){origin:=time.Unix(10,123);if got:=transform(origin);!got.Equal(origin.Add(90*time.Minute)){t.Fatal(got)}}
+`)
+}
+
+func TestGeneratedRelationModelNameIsolation(t *testing.T) {
+	for _, name := range []string{"Ctx", "Fields", "Depth", "D", "F", "TraceCtx", "Value"} {
+		t.Run(name, func(t *testing.T) {
+			source := "model " + name + " @noTime @crud { id: Int @id ownerId: Int? owner: Owner? }\nmodel Owner @noTime @crud { id: Int @id }"
+			assertions := `package generated
+import "testing"
+func TestResolver(t *testing.T) {
+ if err := resolve` + name + `Relations(t.Context(), nil, nil, nil); err != nil {t.Fatal(err)}
+ if err := resolve` + name + `Relations(t.Context(), nil, &` + name + `{}, nil); err != nil {t.Fatal(err)}
+ if err := resolve` + name + `Relations(t.Context(), nil, &` + name + `{}, nil, 0); err != nil {t.Fatal(err)}
+}
+`
+			runGeneratedFixture(t, source, assertions, StableIDs{ModelFields: map[string]map[string]int{
+				name: {"id": 1, "ownerId": 2, "owner": 3}, "Owner": {"id": 1},
+			}})
+		})
+	}
+}
+
+func TestGeneratedRelationDepthDoesNotTruncateSelection(t *testing.T) {
+	runGeneratedFixture(t, `
+model Node @noTime {
+ id: Int @id
+ parentId: Int?
+ parent: Node? @by(id, parentId)
+ children: [Node] @by(parentId, id)
+}
+api getNodeById(id: Int): Node
+`, relationDepthAssertions, StableIDs{ModelFields: map[string]map[string]int{
+		"Node": {"id": 1, "parentId": 2, "parent": 3, "children": 4},
+	}}, relationDepthHTTPAssertions, relationScopeTraceAssertions)
+}
+
+const relationScopeTraceAssertions = `package generated
+import("context";"reflect";"testing";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/dataloader";"github.com/light-speak/luxo/pkg/lux/selection")
+func TestRelationScopePreservesTracePath(t *testing.T){
+ for _,maxBatch:=range []int{1,100}{for _,list:=range []bool{false,true}{
+  app:=&App{};cfg:=dataloader.DefaultConfig();cfg.MaxBatch=maxBatch;var paths []string
+  app.SetLoaders(NewLoaders(cfg,
+   func(ctx context.Context,keys []int64,_ []*selection.Field)(map[int64]*Node,error){paths=append(paths,api.TraceFieldPath(ctx));out:=map[int64]*Node{};for _,key:=range keys{next:=key+1;out[key]=&Node{Id:key,ParentId:&next}};return out,nil},
+   func(context.Context,[]int64,[]*selection.Field)(map[int64][]*Node,error){t.Fatal("unexpected child loader");return nil,nil},
+  ))
+  ctx,_:=api.WithDebugTrace(t.Context(),"scope-trace");scope,err:=dataloader.NewScope(ctx);if err!=nil{t.Fatal(err)}
+  key:=int64(2);root:=&Node{Id:1,ParentId:&key};fields:=depthFields(t,"parent",2)
+  if list{err=resolveNodeListRelations(scope,app,[]*Node{root},fields)}else{err=resolveNodeRelations(scope,app,root,fields)}
+  if err!=nil||!reflect.DeepEqual(paths,[]string{"","parent"}){t.Fatalf("scope froze a changed trace path: max=%d list=%v paths=%v err=%v",maxBatch,list,paths,err)}
+ }}
+}
+`
+
+const relationDepthAssertions = `package generated
+import("context";"errors";"strings";"sync/atomic";"testing";"github.com/light-speak/luxo/pkg/lux/dataloader";luxerrors "github.com/light-speak/luxo/pkg/lux/errors";"github.com/light-speak/luxo/pkg/lux/selection")
+func depthApp(calls *atomic.Int32)*App{
+ app:=&App{};cfg:=dataloader.DefaultConfig();cfg.MaxBatch=1
+ app.SetLoaders(NewLoaders(cfg,
+  func(_ context.Context,keys []int64,_ []*selection.Field)(map[int64]*Node,error){calls.Add(1);result:=map[int64]*Node{};for _,key:=range keys{next:=key+1;result[key]=&Node{Id:key,ParentId:&next}};return result,nil},
+  func(_ context.Context,keys []int64,_ []*selection.Field)(map[int64][]*Node,error){calls.Add(1);result:=map[int64][]*Node{};for _,key:=range keys{next:=key+2;result[key]=[]*Node{{Id:key+1,ParentId:&next}}};return result,nil},
+ ));return app
+}
+func depthFields(t *testing.T,name string,depth int)[]*selection.Field{
+ t.Helper();fields,err:=selection.Parse(strings.Repeat(name+"{",depth)+"id"+strings.Repeat("}",depth));if err!=nil{t.Fatal(err)};return fields
+}
+func TestDepthBoundary(t *testing.T){
+ for _,name:=range []string{"parent","children"}{for _,mode:=range []string{"row","list","values"}{for _,limit:=range []int{0,-1,1,MaxRelationDepth}{
+  t.Run(name+"/"+mode+"/"+strings.Repeat("x",max(limit,0)),func(t *testing.T){
+   var calls atomic.Int32;app:=depthApp(&calls);next:=int64(2);root:=&Node{Id:1,ParentId:&next}
+   fields:=depthFields(t,name,max(limit,0)+1)
+   var err error
+   switch mode{case "row":err=resolveNodeRelations(t.Context(),app,root,fields,limit);case "list":err=resolveNodeListRelations(t.Context(),app,[]*Node{root},fields,limit);case "values":err=resolveNodeValueListRelations(t.Context(),app,[]Node{*root},fields,limit)}
+   appError,ok:=errors.AsType[*luxerrors.AppError](err)
+   if !ok||appError.Code!=400||appError.Name!="RelationDepthExceeded"{t.Fatalf("selected relation was truncated instead of rejected: %v",err)}
+   if calls.Load()!=int32(max(limit,0)){t.Fatalf("depth limit did not bound loading: %d",calls.Load())}
+  })
+ }}}
+}
+func TestDepthExhaustionWithoutFurtherLoad(t *testing.T){
+ var calls atomic.Int32;app:=depthApp(&calls)
+ scalar:=[]*selection.Field{{Name:"id"}}
+ nested:=depthFields(t,"parent",1)
+ for _,fields:=range [][]*selection.Field{nil,scalar,nested}{
+  if err:=resolveNodeRelations(t.Context(),app,nil,fields,0);err!=nil{t.Fatal(err)}
+  if err:=resolveNodeListRelations(t.Context(),app,nil,fields,0);err!=nil{t.Fatal(err)}
+  if err:=resolveNodeValueListRelations(t.Context(),app,nil,fields,0);err!=nil{t.Fatal(err)}
+ }
+ root:=&Node{Id:1}
+ if err:=resolveNodeRelations(t.Context(),app,root,nested,0);err!=nil{t.Fatal("null foreign key needs no loading",err)}
+ if err:=resolveNodeListRelations(t.Context(),app,[]*Node{root},nested,0);err!=nil{t.Fatal("null foreign key list needs no loading",err)}
+ next:=int64(2);root.ParentId=&next
+ if err:=resolveNodeRelations(t.Context(),app,root,scalar,0);err!=nil{t.Fatal("scalar projection needs no loading",err)}
+ if calls.Load()!=0{t.Fatal("boundary controls queried data")}
+ if err:=resolveNodeRelations(t.Context(),app,root,nested,1);err!=nil||root.Parent==nil{t.Fatal("exactly allowed depth rejected",err)}
+}
+`
+
+const relationDepthHTTPAssertions = `package generated
+import("bytes";"context";"encoding/json";"errors";"io";"net";"net/http";"net/http/httptest";"sync/atomic";"testing";"time";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";luxerrors "github.com/light-speak/luxo/pkg/lux/errors";"github.com/light-speak/luxo/pkg/lux/rpc";"github.com/light-speak/luxo/pkg/lux/schema";"github.com/light-speak/luxo/pkg/lux/selection";"nhooyr.io/websocket")
+func depthRouter(t *testing.T,calls *atomic.Int32)*api.Router{
+ t.Helper();app:=depthApp(calls);router:=api.NewRouter()
+ if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
+ if err:=router.Registry.RegisterSchemaAPIs(router.Schema);err!=nil{t.Fatal(err)}
+ router.Handle("getNodeById",func(ctx context.Context,req *api.Request)error{
+  next:=int64(2);row:=&Node{Id:1,ParentId:&next}
+  if err:=resolveNodeRelations(ctx,app,row,req.Select);err!=nil{return err}
+  return row.WriteLuxo(req.Buf,req.FieldMask)
+ });if err:=router.Prepare();err!=nil{t.Fatal(err)};return router
+}
+func TestRelationDepthHTTP(t *testing.T){
+ for _,binary:=range []bool{false,true}{
+  var calls atomic.Int32;router:=depthRouter(t,&calls);server:=httptest.NewServer(router);defer server.Close()
+  fields:=depthFields(t,"parent",MaxRelationDepth+1);body:=depthRequest(t,router,fields,binary)
+  req,err:=http.NewRequestWithContext(t.Context(),"POST",server.URL,bytes.NewReader(body));if err!=nil{t.Fatal(err)}
+  req.Header.Set("Content-Type","application/json");if binary{req.Header.Set("Content-Type","application/x-luxo");req.Header.Set("X-Luxo-Mode","binary")}
+  response,err:=server.Client().Do(req);if err!=nil{t.Fatal(err)}
+  data,err:=io.ReadAll(response.Body);response.Body.Close();if err!=nil{t.Fatal(err)}
+  var envelope struct{Code int;Error string;Data json.RawMessage}
+  if binary{value,decodeErr:=api.DecodeBinaryError(data,response.StatusCode);err=decodeErr;if value!=nil{envelope.Code=value.Code;envelope.Error=value.Name;envelope.Data=value.Data}}else{err=json.Unmarshal(data,&envelope)}
+  if err!=nil||response.StatusCode!=400||envelope.Code!=400||envelope.Error!="RelationDepthExceeded"||len(envelope.Data)!=0{t.Fatalf("partial success or unclear error: %d/%+v/%v",response.StatusCode,envelope,err)}
+  if calls.Load()!=int32(MaxRelationDepth){t.Fatal("extra relation was loaded",calls.Load())}
+ }
+}
+func TestRelationDepthRPC(t *testing.T){
+ var calls atomic.Int32;router:=depthRouter(t,&calls);server:=rpc.NewServer(router)
+ listener,err:=net.Listen("tcp","127.0.0.1:0");if err!=nil{t.Fatal(err)}
+ done:=make(chan error,1);go func(){done<-server.Serve(listener)}();defer func(){server.Close();if err:=<-done;err!=nil{t.Error(err)}}()
+ client:=rpc.NewClient(listener.Addr().String());defer client.Close()
+ for _,deep:=range []bool{true,false}{
+  fields:=depthFields(t,"parent",0);if deep{fields=depthFields(t,"parent",MaxRelationDepth+1)}
+  req,err:=router.Registry.ParseBinaryRequest(depthRequest(t,router,fields,true));if err!=nil{t.Fatal(err)}
+  result,err:=client.CallWithMaskTargetContext(t.Context(),"",router.Schema.APIs["getNodeById"].ID,req.FieldMask,req.BinaryParams(),rpc.TraceTarget{})
+  if deep{value,ok:=errors.AsType[*luxerrors.AppError](err);if !ok||value.Code!=400||value.Name!="RelationDepthExceeded"||len(result)!=0{t.Fatal("depth error became success",result,err)}}else if err!=nil||len(result)==0{t.Fatal("next call failed",result,err)}
+ }
+}
+func depthRequest(t *testing.T,router *api.Router,fields []*selection.Field,binary bool)[]byte{
+ t.Helper()
+ if !binary{body,err:=json.Marshal(map[string]any{"$api":"getNodeById","id":int64(1),"$select":selection.Format(fields)});if err!=nil{t.Fatal(err)};return body}
+ mask,err:=schema.SelectToFieldMask(fields,router.Schema.Models["Node"],router.Schema);if err!=nil{t.Fatal(err)}
+ body,err:=api.EncodeBinaryRequest(router.Schema.APIs["getNodeById"].ID,mask,map[string]any{"id":int64(1)},router.Registry.ParamOrder("getNodeById"));if err!=nil{t.Fatal(err)};return body
+}
+func TestRelationDepthWebSocket(t *testing.T){
+ for _,binary:=range []bool{false,true}{
+  var calls atomic.Int32;router:=depthRouter(t,&calls);server:=httptest.NewServer(router);defer server.Close()
+  ctx,cancel:=context.WithTimeout(t.Context(),5*time.Second);defer cancel()
+  conn,_,err:=websocket.Dial(ctx,"ws"+server.URL[4:],nil);if err!=nil{t.Fatal(err)};defer conn.CloseNow()
+  for _,deep:=range []bool{true,false}{
+   fields:=depthFields(t,"parent",0);if deep{fields=depthFields(t,"parent",MaxRelationDepth+1)}
+   body:=depthRequest(t,router,fields,binary);kind:=websocket.MessageText
+   if binary{kind=websocket.MessageBinary;body=append([]byte{api.BinaryFrameCallRequest,1},body...)}else{body=append([]byte(` + "`" + `{"$id":1,` + "`" + `),body[1:]...)}
+   if err:=conn.Write(ctx,kind,body);err!=nil{t.Fatal(err)}
+   _,frame,err:=conn.Read(ctx);if err!=nil{t.Fatal(err)}
+   if binary{
+    if len(frame)<2||frame[1]!=1{t.Fatalf("wrong frame identity: %x",frame)}
+    if deep{if frame[0]!=api.BinaryFrameCallError{t.Fatalf("partial binary success: %x",frame)};value,err:=api.DecodeBinaryError(frame[2:],400);if err!=nil||value.Code!=400||value.Name!="RelationDepthExceeded"||len(value.Data)!=0{t.Fatal(value,err)}}else{
+     if frame[0]!=api.BinaryFrameCallSuccess{t.Fatalf("next binary call failed: %x",frame)};decoder:=codec.NewDecoder(frame[2:]);var value Node;value.ReadLuxo(decoder);if value.Id!=1||decoder.Finish()!=nil{t.Fatal("next response damaged")}
+    };continue
+   }
+   var envelope struct{Code int;Error string;Data json.RawMessage};if err:=json.Unmarshal(frame,&envelope);err!=nil{t.Fatal(err)}
+   if deep{if envelope.Code!=400||envelope.Error!="RelationDepthExceeded"||len(envelope.Data)!=0{t.Fatalf("partial JSON success: %s",frame)}}else if envelope.Code!=0||len(envelope.Data)==0{t.Fatalf("next JSON call failed: %s",frame)}
+  }
+ }
+}
+`
+
+func TestGeneratedRelationWithoutPublicAPI(t *testing.T) {
+	runGeneratedFixture(t, `
+model Document @noTime { id: Int @id ownerId: Int? owner: Owner? }
+model Owner @noTime { id: Int @id }
+`, `package generated
+import "testing"
+func TestResolver(t *testing.T) {
+ if err:=resolveDocumentRelations(t.Context(),nil,&Document{},nil);err!=nil{t.Fatal(err)}
+}
+`, StableIDs{ModelFields: map[string]map[string]int{
+		"Document": {"id": 1, "ownerId": 2, "owner": 3}, "Owner": {"id": 1},
+	}})
+}
+
+func TestInternalRelationHandlerSelection(t *testing.T) {
+	for _, sample := range []struct {
+		name  string
+		field *ast.FieldDecl
+		want  bool
+	}{
+		{"missing type", &ast.FieldDecl{Name: "field"}, false},
+		{"scalar", &ast.FieldDecl{Name: "field", Type: &ast.TypeRef{Name: "Int"}}, false},
+		{"enum", &ast.FieldDecl{Name: "field", Type: &ast.TypeRef{Name: "Status"}}, false},
+		{"computed", &ast.FieldDecl{Name: "field", Type: &ast.TypeRef{Name: "Owner"}, Computed: &ast.ComputedField{}}, false},
+		{"relation", &ast.FieldDecl{Name: "owner", Type: &ast.TypeRef{Name: "Owner", Nullable: true}}, true},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			model := &ast.ModelDecl{Name: "Document", Fields: []*ast.FieldDecl{sample.field}}
+			result := buildResult(&ast.File{Models: []*ast.ModelDecl{model}})
+			source := string(generateHandlerFile(result, "generated", map[string]bool{"Status": true}))
+			if (source != "") != sample.want {
+				t.Fatalf("internal helpers generated=%v, want %v", source != "", sample.want)
+			}
+			for _, forbidden := range []string{"func handleGetDocument(", "func handleListDocuments(", "func handleCreateDocument(", "func handleUpdateDocument(", "func handleDeleteDocument("} {
+				if strings.Contains(source, forbidden) {
+					t.Fatalf("implicit public CRUD: %s", forbidden)
+				}
+			}
+		})
+	}
+}
+
+func TestCallableBindingsKeepRequestScope(t *testing.T) {
+	input := analyzePermissionFixture(t, `model Item @noTime { id: Int @id value: Int }
+fn fetch(id: Int): Item? { return Item.load(id) }
+api read(Item: Int): Item? { return fetch(Item) }`)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	generator := defaultGenerator().withModelReferences(input)
+	models := map[string]*ast.ModelDecl{"Item": input.Files[0].Models[0]}
+	var output strings.Builder
+	generator.compileAPIBody(&output, input.Files[0].APIs[0], models, nil, nil, collectFunctionDeclarations(input), nil)
+	code := output.String()
+	if !strings.Contains(code, "dataloader.NewScope(ctx)") || strings.Contains(code, "Item, err := req.ParamInt") || !strings.Contains(code, `req.ParamInt("Item")`) {
+		t.Fatal("type binding lost caller scope or wire key", code)
+	}
+}
+
+func TestCreateHandlerExplicitAuthFragmentRequirement(t *testing.T) {
+	input := analyzePermissionFixture(t, `model Record @noTime @crud { id: Int @id @auto name: String }`)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	model := input.Files[0].Models[0]
+	if findDirective(model.Directives, "auth") != nil || findDirective(model.Directives, "withAuth") != nil {
+		t.Fatal("plain CRUD fixture unexpectedly requires authentication")
+	}
+	ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Record": {"id": 1, "name": 2}}})
+	generated, err := Generate(input, "generated", GeneratorConfig{IDs: ids})
+	if err != nil || generated == nil {
+		t.Fatalf("plain CRUD formal generation failed: %v", err)
+	}
+	if strings.Contains(string(generated.Files["handler.gen.go"]), "identity := luvia.Identity(ctx)") {
+		t.Fatal("formal plain CRUD gained an auth requirement")
+	}
+	var plain, guarded strings.Builder
+	generateCreateHandler(&plain, model, "plainRecord", nil, false, nil)
+	generateCreateHandler(&guarded, model, "guardedRecord", nil, true, nil)
+	if strings.Contains(plain.String(), "errors.Unauthorized") {
+		t.Fatal("unrequested fragment auth guard was emitted")
+	}
+	want := "identity := luvia.Identity(ctx)\n\t\tif identity == nil {\n\t\t\treturn errors.Unauthorized\n\t\t}\n\t\treq.Buf.Identity = identity"
+	if !strings.Contains(guarded.String(), want) {
+		t.Fatal("explicit needAuth omitted the default identity guard", guarded.String())
+	}
+	if strings.Index(guarded.String(), want) >= strings.Index(guarded.String(), "builder := app.Record.Create()") {
+		t.Fatal("identity guard follows the mutation builder")
+	}
+	if _, err := format.Source([]byte("package generated\n" + guarded.String())); err != nil {
+		t.Fatalf("guarded private fragment is not Go syntax: %v", err)
 	}
 }

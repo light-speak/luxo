@@ -1,0 +1,114 @@
+{
+  "stage": "actual local Go producer; sealed feature remains in progress",
+  "vectors": [
+    {
+      "name": "success7",
+      "json": {
+        "Success": {
+          "value": 7
+        }
+      },
+      "raw": [
+        1,
+        4,
+        0,
+        1,
+        14,
+        0
+      ]
+    },
+    {
+      "name": "pending",
+      "json": {
+        "Pending": {}
+      },
+      "raw": [
+        3,
+        2,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "defaultFailure",
+      "json": {
+        "Failure": {
+          "reason": "failed"
+        }
+      },
+      "raw": [
+        2,
+        10,
+        6,
+        1,
+        6,
+        102,
+        97,
+        105,
+        108,
+        101,
+        100,
+        0
+      ]
+    },
+    {
+      "name": "nestedDefaults",
+      "json": {
+        "Nested": {
+          "child": null,
+          "history": null
+        }
+      },
+      "raw": [
+        4,
+        6,
+        0,
+        1,
+        0,
+        2,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "nestedPresent",
+      "json": {
+        "Nested": {
+          "child": {
+            "Success": {
+              "value": 7
+            }
+          },
+          "history": [
+            {
+              "Pending": {}
+            }
+          ]
+        }
+      },
+      "raw": [
+        4,
+        19,
+        0,
+        1,
+        1,
+        6,
+        1,
+        4,
+        0,
+        1,
+        14,
+        0,
+        2,
+        1,
+        1,
+        4,
+        3,
+        2,
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}

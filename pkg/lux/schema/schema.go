@@ -3,8 +3,10 @@ package schema
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 
+	"github.com/light-speak/luxo/pkg/cachepolicy"
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
@@ -12,11 +14,16 @@ import (
 // Schema holds runtime metadata for Luxo binary ↔ JSON conversion.
 // Used by Luvia to convert responses without requiring model structs.
 // Loaded from luxo.lock + codegen-emitted schema registration.
+// Complete registration and usage inference before serving requests. All maps,
+// fields and returned metadata are read-only while requests are in flight.
 type Schema struct {
-	Models map[string]*Model    `json:"models"`
-	APIs   map[string]*API      `json:"apis"`
-	Enums  map[string]*Enum     `json:"enums,omitempty"`
-	Types  map[string]*TypeDecl `json:"types,omitempty"`
+	Models     map[string]*Model    `json:"models"`
+	APIs       map[string]*API      `json:"apis"`
+	Enums      map[string]*Enum     `json:"enums,omitempty"`
+	Types      map[string]*TypeDecl `json:"types,omitempty"`
+	Sealeds    map[string]*Sealed   `json:"sealeds,omitempty"`
+	typeModels map[string]*Model
+	apiNames   map[int]string
 }
 
 // Enum describes an enum type with its values.
@@ -48,26 +55,6 @@ type TypeDecl struct {
 	Directives  []string  `json:"directives,omitempty"`
 }
 
-// AsModel converts TypeDecl to a Model for Binary↔JSON conversion.
-// Types use the same field-based binary encoding as models.
-func (td *TypeDecl) AsModel() *Model {
-	// Copy the fields slice so we don't mutate td.Fields (JSONPrefix append).
-	fields := make([]Field, len(td.Fields))
-	copy(fields, td.Fields)
-	m := &Model{Name: td.Name, Module: td.Module, Fields: fields, Description: td.Description, Directives: td.Directives}
-	m.byID = make(map[int]*Field, len(m.Fields))
-	m.byName = make(map[string]*Field, len(m.Fields))
-	for i := range m.Fields {
-		f := &m.Fields[i]
-		f.JSONPrefix = append(f.JSONPrefix[:0:0], '"')
-		f.JSONPrefix = append(f.JSONPrefix, f.Name...)
-		f.JSONPrefix = append(f.JSONPrefix, '"', ':')
-		m.byID[f.ID] = f
-		m.byName[f.Name] = f
-	}
-	return m
-}
-
 // Model describes a model's fields for binary ↔ JSON conversion.
 type Model struct {
 	Name        string    `json:"name"`
@@ -76,8 +63,16 @@ type Model struct {
 	Fields      []Field   `json:"fields"`
 	Description string    `json:"description,omitempty"`
 	Directives  []string  `json:"directives,omitempty"`
-	byID        map[int]*Field
-	byName      map[string]*Field
+	// ComputedSources is startup metadata kept outside the hot field descriptors.
+	ComputedSources map[string]ComputedSource `json:"computedSources,omitempty"`
+	byID            map[int]*Field
+	byName          map[string]*Field
+}
+
+// ComputedSource identifies the persistent model read by a selected aggregate.
+type ComputedSource struct {
+	Model  string `json:"model"`
+	Module string `json:"module,omitempty"`
 }
 
 // RelationKind describes where the join key is stored.
@@ -122,7 +117,7 @@ const (
 	FieldFloat
 	FieldString
 	FieldBool
-	FieldDateTime // int64 unix timestamp
+	FieldDateTime // floor Unix seconds followed by unsigned nanoseconds
 	FieldDuration // int64 nanoseconds
 	FieldBytes
 	FieldEnum    // string on wire
@@ -130,23 +125,55 @@ const (
 	FieldUUID    // 16-byte fixed value
 	FieldDecimal // decimal string
 	FieldJSON    // length-prefixed raw JSON
+	FieldSealed  // stable variant tag followed by one framed payload row
 )
 
 // API describes an API's params and return type.
 type API struct {
-	ID               int      `json:"id"`
-	Name             string   `json:"name"`
-	Module           string   `json:"module"`
-	ReturnType       string   `json:"returnType,omitempty"`
-	ReturnList       bool     `json:"returnList,omitempty"`
-	Paginated        bool     `json:"paginated,omitempty"`
-	DefaultPageSize  int      `json:"defaultPageSize,omitempty"`
-	Stream           bool     `json:"stream,omitempty"`
-	Params           []Param  `json:"params,omitempty"`
-	Deprecated       bool     `json:"deprecated,omitempty"`
-	DeprecatedReason string   `json:"deprecatedReason,omitempty"`
-	Description      string   `json:"description,omitempty"`
-	Directives       []string `json:"directives,omitempty"`
+	ID               int                `json:"id"`
+	Name             string             `json:"name"`
+	Module           string             `json:"module"`
+	Internal         bool               `json:"internal"` // RPC-only; never inferred from the API name.
+	ReturnType       string             `json:"returnType,omitempty"`
+	ReturnList       bool               `json:"returnList,omitempty"`
+	ReturnNullable   bool               `json:"returnNullable,omitempty"`
+	Paginated        bool               `json:"paginated,omitempty"`
+	DefaultPageSize  int                `json:"defaultPageSize,omitempty"`
+	Stream           bool               `json:"stream,omitempty"`
+	Params           []Param            `json:"params,omitempty"`
+	Query            *QueryCapabilities `json:"query,omitempty"`
+	Deprecated       bool               `json:"deprecated,omitempty"`
+	DeprecatedReason string             `json:"deprecatedReason,omitempty"`
+	Description      string             `json:"description,omitempty"`
+	Directives       []string           `json:"directives,omitempty"`
+	// CacheDependencies is generated server-only startup metadata. Introspection
+	// is not an authority for enabling response caching after deserialization.
+	CacheDependencies *CacheDependencies `json:"-"`
+	// CachePolicy is a generated server contract, not client-provided metadata.
+	CachePolicy *CachePolicy `json:"-"`
+}
+
+// QueryCapabilities describes controls actually consumed by this API's handler.
+// A model return type alone does not grant filtering or sorting capability.
+type QueryCapabilities struct {
+	Filters []QueryFilter `json:"filters,omitempty"`
+	Sorters []string      `json:"sorters,omitempty"`
+}
+
+type QueryFilter struct {
+	Field     string   `json:"field"`
+	Type      string   `json:"type"`
+	Operators []string `json:"operators"`
+}
+
+// CachePolicy shares the compiler's validated value contract without wire fields.
+type CachePolicy = cachepolicy.Policy
+
+// CacheDependencies separates persistent models from native external resources.
+// A non-nil empty value means checked pure execution, not missing analysis.
+type CacheDependencies struct {
+	Models   []ComputedSource
+	External []string
 }
 
 // Param describes an API parameter.
@@ -175,22 +202,27 @@ var fieldTypeNames = [...]string{
 	FieldUUID:     "UUID",
 	FieldDecimal:  "Decimal",
 	FieldJSON:     "JSON",
+	FieldSealed:   "Sealed",
 }
 
 // String returns the Luxo type name for the field type.
 func (t FieldType) String() string {
-	if t >= 0 && int(t) < len(fieldTypeNames) {
+	if t.valid() {
 		return fieldTypeNames[t]
 	}
 	return "Unknown"
 }
 
+func (t FieldType) valid() bool {
+	return t >= 0 && int(t) < len(fieldTypeNames)
+}
+
 // MarshalJSON outputs FieldType as a string.
 func (t FieldType) MarshalJSON() ([]byte, error) {
-	if t >= 0 && int(t) < len(fieldTypeNames) {
+	if t.valid() {
 		return json.Marshal(fieldTypeNames[t])
 	}
-	return json.Marshal("Unknown")
+	return nil, fmt.Errorf("schema: unknown field type %d", t)
 }
 
 // UnmarshalJSON decodes the stable string form used by luxo.schema.json.
@@ -228,22 +260,58 @@ func (s *Schema) RegisterEnum(e *Enum) {
 	s.Enums[e.Name] = e
 }
 
-// RegisterType adds a type declaration to the schema.
-func (s *Schema) RegisterType(t *TypeDecl) {
-	s.Types[t.Name] = t
+// RegisterType owns a copy of the declaration and prepares its runtime indexes.
+// It may replace a declaration during startup, never while serving requests.
+func (s *Schema) RegisterType(t *TypeDecl) error {
+	if t == nil {
+		return fmt.Errorf("schema: nil type declaration")
+	}
+	if err := validateFields(t.Name, t.Fields); err != nil {
+		return err
+	}
+	s.registerType(t)
+	return nil
+}
+
+func (s *Schema) registerType(t *TypeDecl) {
+	m := t.AsModel()
+	owned := *t
+	owned.Fields, owned.Directives = m.Fields, m.Directives
+	if s.Types == nil {
+		s.Types = make(map[string]*TypeDecl)
+	}
+	s.Types[t.Name] = &owned
+	if s.typeModels == nil {
+		s.typeModels = make(map[string]*Model)
+	}
+	s.typeModels[t.Name] = m
 }
 
 // RegisterModel adds a model definition to the schema.
-func (s *Schema) RegisterModel(m *Model) {
+func (s *Schema) RegisterModel(m *Model) error {
+	if m == nil {
+		return fmt.Errorf("schema: nil model declaration")
+	}
+	if err := validateFields(m.Name, m.Fields); err != nil {
+		return err
+	}
 	if existing := s.Models[m.Name]; existing != nil {
 		m = mergeModels(existing, m)
+		if err := validateFields(m.Name, m.Fields); err != nil {
+			return err
+		}
 	}
 	initializeModel(m)
+	if s.Models == nil {
+		s.Models = make(map[string]*Model)
+	}
 	s.Models[m.Name] = m
+	return nil
 }
 
 func mergeModels(existing, incoming *Model) *Model {
 	merged := &Model{Name: existing.Name, Module: existing.Module, Description: existing.Description, Directives: existing.Directives}
+	merged.ComputedSources = maps.Clone(existing.ComputedSources)
 	if incoming.Module != "" {
 		merged.Module = incoming.Module
 	}
@@ -267,6 +335,7 @@ func mergeModels(existing, incoming *Model) *Model {
 		}
 		if exists {
 			old := merged.Fields[index]
+			delete(merged.ComputedSources, old.Name)
 			field.PrimaryKey = field.PrimaryKey || old.PrimaryKey
 			delete(byID, old.ID)
 			delete(byName, old.Name)
@@ -277,6 +346,12 @@ func mergeModels(existing, incoming *Model) *Model {
 		}
 		byID[field.ID] = index
 		byName[field.Name] = index
+		if source, ok := incoming.ComputedSources[field.Name]; ok && field.Computed {
+			if merged.ComputedSources == nil {
+				merged.ComputedSources = make(map[string]ComputedSource)
+			}
+			merged.ComputedSources[field.Name] = source
+		}
 	}
 	sort.Slice(merged.Fields, func(i, j int) bool { return merged.Fields[i].ID < merged.Fields[j].ID })
 	return merged
@@ -297,8 +372,31 @@ func initializeModel(m *Model) {
 }
 
 // RegisterAPI adds an API definition to the schema.
-func (s *Schema) RegisterAPI(a *API) {
+func (s *Schema) RegisterAPI(a *API) error {
+	if err := validateAPIDefinition(a); err != nil {
+		return err
+	}
+	ids := s.apiNames
+	if ids == nil {
+		var err error
+		ids, err = s.validatedAPIIndex()
+		if err != nil {
+			return err
+		}
+	}
+	if previous, ok := ids[a.ID]; ok && previous != a.Name {
+		return fmt.Errorf("schema: API ID %d already belongs to %q", a.ID, previous)
+	}
+	if previous := s.APIs[a.Name]; previous != nil && previous.ID != a.ID {
+		return fmt.Errorf("schema: API %q already has ID %d", a.Name, previous.ID)
+	}
+	if s.APIs == nil {
+		s.APIs = make(map[string]*API)
+	}
 	s.APIs[a.Name] = a
+	ids[a.ID] = a.Name
+	s.apiNames = ids
+	return nil
 }
 
 // InferTypeUsage derives input/output roles from API roots and follows nested
@@ -311,12 +409,20 @@ func (s *Schema) InferTypeUsage() {
 	for _, decl := range s.Types {
 		decl.Usage = TypeUsageUnused
 	}
+	for _, declaration := range s.Sealeds {
+		declaration.Usage = TypeUsageUnused
+	}
 
-	visited := make(map[typeUsageVisit]bool, len(s.Models)+len(s.Types))
+	visited := make(map[typeUsageVisit]bool, len(s.Models)+len(s.Types)+len(s.Sealeds))
 	for _, api := range s.APIs {
 		s.markTypeUsage(api.ReturnType, TypeUsageOutput, visited)
 		for _, param := range api.Params {
 			s.markTypeUsage(param.TypeName, TypeUsageInput, visited)
+		}
+	}
+	for name, decl := range s.Types {
+		if model := s.typeModels[name]; model != nil {
+			model.Usage = decl.Usage
 		}
 	}
 }
@@ -344,6 +450,15 @@ func (s *Schema) markTypeUsage(name string, usage TypeUsage, visited map[typeUsa
 	if decl := s.Types[name]; decl != nil {
 		decl.Usage = mergeTypeUsage(decl.Usage, usage)
 		s.markFieldUsage(decl.Fields, usage, visited)
+		return
+	}
+	if declaration := s.Sealeds[name]; declaration != nil {
+		declaration.Usage = mergeTypeUsage(declaration.Usage, usage)
+		for _, variant := range declaration.Variants {
+			for _, field := range variant.Fields {
+				s.markTypeUsage(field.TypeName, usage, visited)
+			}
+		}
 	}
 }
 
@@ -407,7 +522,7 @@ func selectToFieldMask(fields []*selection.Field, model *Model, schema *Schema, 
 	if model == nil {
 		return nil, fmt.Errorf("selection has no return model")
 	}
-	if depth >= 32 {
+	if depth >= codec.MaxSelectionDepth {
 		return nil, fmt.Errorf("selection depth exceeds 32")
 	}
 	var fieldMask []byte
@@ -422,19 +537,18 @@ func selectToFieldMask(fields []*selection.Field, model *Model, schema *Schema, 
 		if mf == nil {
 			return nil, fmt.Errorf("unknown selected field %q on %s", f.Name, model.Name)
 		}
-		fieldMask = codec.FieldMaskSet(fieldMask, mf.ID)
+		var err error
+		fieldMask, err = codec.FieldMaskSet(fieldMask, mf.ID)
+		if err != nil {
+			return nil, err
+		}
 		if f.Children == nil {
 			continue
 		}
-		if !mf.Relation || schema == nil {
+		if (!mf.Relation && mf.Type != FieldSealed) || schema == nil {
 			return nil, fmt.Errorf("field %s.%s does not support nested selection", model.Name, f.Name)
 		}
-		nested := schema.Models[mf.TypeName]
-		if nested == nil {
-			if decl := schema.Types[mf.TypeName]; decl != nil {
-				nested = decl.AsModel()
-			}
-		}
+		nested := schema.SelectionModel(mf.TypeName)
 		if nested == nil {
 			return nil, fmt.Errorf("nested type %q for %s.%s is not registered", mf.TypeName, model.Name, f.Name)
 		}
@@ -446,5 +560,5 @@ func selectToFieldMask(fields []*selection.Field, model *Model, schema *Schema, 
 			children = append(children, codec.SelectionMaskChild{FieldID: mf.ID, Mask: childMask})
 		}
 	}
-	return codec.AppendSelectionMask(nil, fieldMask, children), nil
+	return codec.AppendSelectionMask(nil, fieldMask, children)
 }

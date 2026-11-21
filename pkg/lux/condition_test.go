@@ -34,6 +34,10 @@ func TestCmpCondToSQL(t *testing.T) {
 		{"neq string", NewStringField("name").Neq("x"), 1, "name != $1", []any{"x"}},
 		{"like string", NewStringField("name").Like("%lin%"), 1, "name LIKE $1", []any{"%lin%"}},
 		{"eq bool", NewBoolField("active").Eq(true), 1, "active = $1", []any{true}},
+		{"neq bool true", NewBoolField("active").Neq(true), 3, "active = $3", []any{false}},
+		{"neq bool false", NewBoolField("active").Neq(false), 12, "active = $12", []any{true}},
+		{"null bool", NewBoolField("active").IsNull(), 3, "active IS NULL", nil},
+		{"nonnull bool", NewBoolField("active").IsNotNull(), 12, "active IS NOT NULL", nil},
 		{"isTrue", NewBoolField("active").IsTrue(), 1, "active = $1", []any{true}},
 		{"isFalse", NewBoolField("active").IsFalse(), 1, "active = $1", []any{false}},
 	}
@@ -51,6 +55,37 @@ func TestCmpCondToSQL(t *testing.T) {
 				if a != tt.wantArgs[i] {
 					t.Errorf("args[%d] = %v, want %v", i, a, tt.wantArgs[i])
 				}
+			}
+		})
+	}
+}
+
+func TestScalarMembershipConditions(t *testing.T) {
+	type state string
+	stamp := time.Unix(10, 123456000)
+	for _, test := range []struct {
+		name      string
+		condition Condition
+		values    []any
+	}{
+		{"bool", NewBoolField("value").In(true, false), []any{true, false}},
+		{"time", NewTimeField("value").In(stamp), []any{stamp}},
+		{"enum", NewStringField("value").InEnum(state("OPEN"), state("CLOSED")), []any{"OPEN", "CLOSED"}},
+		{"empty bool", NewBoolField("value").In(), nil},
+		{"empty time", NewTimeField("value").In(), nil},
+		{"empty enum", NewStringField("value").InEnum[state](), nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sql, args := test.condition.ToSQL(7)
+			want := "value IN ($7)"
+			if len(test.values) == 0 {
+				want = "FALSE"
+			}
+			if len(test.values) == 2 {
+				want = "value IN ($7, $8)"
+			}
+			if sql != want || !reflect.DeepEqual(args, test.values) {
+				t.Fatalf("got %s %v, want %s %v", sql, args, want, test.values)
 			}
 		})
 	}
@@ -257,10 +292,9 @@ func TestIntFieldFilterOp(t *testing.T) {
 		{"gte", "18", "age >= $1"},
 		{"lt", "100", "age < $1"},
 		{"lte", "100", "age <= $1"},
-		{"unknown", "0", "age = $1"},
 	}
 	for _, tt := range tests {
-		sql, _ := f.FilterOp(tt.op, tt.val).ToSQL(1)
+		sql, _ := requireFilter(f.FilterOp(tt.op, tt.val)).ToSQL(1)
 		if sql != tt.wantSQL {
 			t.Errorf("IntField.FilterOp(%q, %q) = %q, want %q", tt.op, tt.val, sql, tt.wantSQL)
 		}
@@ -277,10 +311,9 @@ func TestStringFieldFilterOp(t *testing.T) {
 		{"contains", "lin", "name LIKE $1"},
 		{"startswith", "li", "name LIKE $1"},
 		{"endswith", "in", "name LIKE $1"},
-		{"unknown", "x", "name = $1"},
 	}
 	for _, tt := range tests {
-		sql, _ := f.FilterOp(tt.op, tt.val).ToSQL(1)
+		sql, _ := requireFilter(f.FilterOp(tt.op, tt.val)).ToSQL(1)
 		if sql != tt.wantSQL {
 			t.Errorf("StringField.FilterOp(%q, %q) = %q, want %q", tt.op, tt.val, sql, tt.wantSQL)
 		}
@@ -289,15 +322,15 @@ func TestStringFieldFilterOp(t *testing.T) {
 
 func TestStringFieldFilterOpContainsValue(t *testing.T) {
 	f := NewStringField("name")
-	_, args := f.FilterOp("contains", "lin").ToSQL(1)
+	_, args := requireFilter(f.FilterOp("contains", "lin")).ToSQL(1)
 	if args[0] != "%lin%" {
 		t.Errorf("contains value = %q, want %%lin%%", args[0])
 	}
-	_, args = f.FilterOp("startswith", "li").ToSQL(1)
+	_, args = requireFilter(f.FilterOp("startswith", "li")).ToSQL(1)
 	if args[0] != "li%" {
 		t.Errorf("startswith value = %q, want li%%", args[0])
 	}
-	_, args = f.FilterOp("endswith", "in").ToSQL(1)
+	_, args = requireFilter(f.FilterOp("endswith", "in")).ToSQL(1)
 	if args[0] != "%in" {
 		t.Errorf("endswith value = %q, want %%in", args[0])
 	}
@@ -305,17 +338,13 @@ func TestStringFieldFilterOpContainsValue(t *testing.T) {
 
 func TestBoolFieldFilterOp(t *testing.T) {
 	f := NewBoolField("active")
-	sql, args := f.FilterOp("eq", "true").ToSQL(1)
+	sql, args := requireFilter(f.FilterOp("eq", "true")).ToSQL(1)
 	if sql != "active = $1" || args[0] != true {
 		t.Errorf("BoolField true: sql=%q args=%v", sql, args)
 	}
-	sql, args = f.FilterOp("eq", "false").ToSQL(1)
+	sql, args = requireFilter(f.FilterOp("eq", "false")).ToSQL(1)
 	if sql != "active = $1" || args[0] != false {
 		t.Errorf("BoolField false: sql=%q args=%v", sql, args)
-	}
-	sql, args = f.FilterOp("eq", "1").ToSQL(1)
-	if args[0] != true {
-		t.Errorf("BoolField '1' should be true")
 	}
 }
 
@@ -404,34 +433,11 @@ func TestTimeFieldFilterOp(t *testing.T) {
 		{"lt", "2026-04-13T10:00:00Z", "created_at < $1"},
 		{"before", "2026-04-13T10:00:00Z", "created_at < $1"},
 		{"lte", "2026-04-13T10:00:00Z", "created_at <= $1"},
-		{"unknown", "2026-04-13T10:00:00Z", "created_at = $1"},
 	}
 	for _, tt := range tests {
-		sql, _ := f.FilterOp(tt.op, tt.val).ToSQL(1)
+		sql, _ := requireFilter(f.FilterOp(tt.op, tt.val)).ToSQL(1)
 		if sql != tt.wantSQL {
 			t.Errorf("TimeField.FilterOp(%q) = %q, want %q", tt.op, sql, tt.wantSQL)
-		}
-	}
-}
-
-func TestParseInt64(t *testing.T) {
-	tests := []struct {
-		input string
-		want  int64
-		err   bool
-	}{
-		{"42", 42, false},
-		{"-7", -7, false},
-		{"0", 0, false},
-		{"abc", 0, true},
-	}
-	for _, tt := range tests {
-		got, err := parseInt64(tt.input)
-		if tt.err && err == nil {
-			t.Errorf("parseInt64(%q) should error", tt.input)
-		}
-		if !tt.err && got != tt.want {
-			t.Errorf("parseInt64(%q) = %d, want %d", tt.input, got, tt.want)
 		}
 	}
 }
@@ -493,23 +499,12 @@ func TestFloatFieldFilterOp(t *testing.T) {
 		{"gte", "5.0", "price >= $1"},
 		{"lt", "100.0", "price < $1"},
 		{"lte", "100.0", "price <= $1"},
-		{"unknown", "1.0", "price = $1"},
 	}
 	for _, tt := range tests {
-		sql, _ := f.FilterOp(tt.op, tt.val).ToSQL(1)
+		sql, _ := requireFilter(f.FilterOp(tt.op, tt.val)).ToSQL(1)
 		if sql != tt.wantSQL {
 			t.Errorf("FloatField.FilterOp(%q, %q) = %q, want %q", tt.op, tt.val, sql, tt.wantSQL)
 		}
-	}
-}
-
-func TestFloatFieldFilterOpParseError(t *testing.T) {
-	sql, args := NewFloatField("price").FilterOp("eq", "not-a-float").ToSQL(1)
-	if sql != "FALSE" {
-		t.Errorf("SQL = %q, want FALSE", sql)
-	}
-	if len(args) != 0 {
-		t.Errorf("args should be nil for false cond")
 	}
 }
 
@@ -631,16 +626,6 @@ func TestIntFieldNotIn(t *testing.T) {
 	}
 }
 
-func TestIntFieldFilterOpParseError(t *testing.T) {
-	sql, args := NewIntField("age").FilterOp("eq", "not-a-number").ToSQL(1)
-	if sql != "FALSE" {
-		t.Errorf("SQL = %q, want FALSE", sql)
-	}
-	if len(args) != 0 {
-		t.Errorf("args should be nil for false cond")
-	}
-}
-
 // --- StringField ---
 
 func TestStringFieldNotLike(t *testing.T) {
@@ -700,15 +685,15 @@ func TestStringFieldIsNullIsNotNull(t *testing.T) {
 func TestStringFieldFilterOpEscapeLike(t *testing.T) {
 	f := NewStringField("title")
 	// Special chars in LIKE values must be escaped
-	_, args := f.FilterOp("contains", "100%off").ToSQL(1)
+	_, args := requireFilter(f.FilterOp("contains", "100%off")).ToSQL(1)
 	if args[0] != "%100\\%off%" {
 		t.Errorf("contains escaped = %q, want %%100\\%%off%%", args[0])
 	}
-	_, args = f.FilterOp("startswith", "under_score").ToSQL(1)
+	_, args = requireFilter(f.FilterOp("startswith", "under_score")).ToSQL(1)
 	if args[0] != "under\\_score%" {
 		t.Errorf("startswith escaped = %q, want under\\_score%%", args[0])
 	}
-	_, args = f.FilterOp("endswith", "50%").ToSQL(1)
+	_, args = requireFilter(f.FilterOp("endswith", "50%")).ToSQL(1)
 	if args[0] != "%50\\%" {
 		t.Errorf("endswith escaped = %q, want %%50\\%%", args[0])
 	}
@@ -716,22 +701,12 @@ func TestStringFieldFilterOpEscapeLike(t *testing.T) {
 
 // --- TimeField ---
 
-func TestTimeFieldFilterOpParseError(t *testing.T) {
-	sql, args := NewTimeField("created_at").FilterOp("eq", "not-a-time").ToSQL(1)
-	if sql != "FALSE" {
-		t.Errorf("SQL = %q, want FALSE", sql)
-	}
-	if len(args) != 0 {
-		t.Errorf("args should be nil for false cond")
-	}
-}
-
 // --- BoolField ---
 
 func TestBoolFieldFilterOpNe(t *testing.T) {
 	f := NewBoolField("active")
 	// "ne" with true value → eq(!true) = false
-	sql, args := f.FilterOp("ne", "true").ToSQL(1)
+	sql, args := requireFilter(f.FilterOp("ne", "true")).ToSQL(1)
 	if sql != "active = $1" {
 		t.Errorf("SQL = %q, want active = $1", sql)
 	}
@@ -739,45 +714,16 @@ func TestBoolFieldFilterOpNe(t *testing.T) {
 		t.Errorf("args[0] = %v, want false", args[0])
 	}
 	// "ne" with false value → eq(!false) = true
-	sql, args = f.FilterOp("ne", "false").ToSQL(1)
+	sql, args = requireFilter(f.FilterOp("ne", "false")).ToSQL(1)
 	if sql != "active = $1" {
 		t.Errorf("SQL = %q, want active = $1", sql)
 	}
 	if args[0] != true {
 		t.Errorf("args[0] = %v, want true", args[0])
 	}
-	// "ne" with "1" → eq(!true) = false
-	sql, args = f.FilterOp("ne", "1").ToSQL(1)
-	if args[0] != false {
-		t.Errorf("ne '1' args[0] = %v, want false", args[0])
-	}
 }
 
 // --- falseCond ---
-
-func TestFalseCondToSQL(t *testing.T) {
-	var c falseCond
-	sql, args := c.ToSQL(1)
-	if sql != "FALSE" {
-		t.Errorf("SQL = %q, want FALSE", sql)
-	}
-	if len(args) != 0 {
-		t.Errorf("args should be nil")
-	}
-	// Also test via FilterOp parse-error paths
-	sql, _ = NewIntField("x").FilterOp("eq", "bad").ToSQL(5)
-	if sql != "FALSE" {
-		t.Errorf("IntField parse error: SQL = %q, want FALSE", sql)
-	}
-	sql, _ = NewFloatField("x").FilterOp("eq", "bad").ToSQL(5)
-	if sql != "FALSE" {
-		t.Errorf("FloatField parse error: SQL = %q, want FALSE", sql)
-	}
-	sql, _ = NewTimeField("x").FilterOp("eq", "bad").ToSQL(5)
-	if sql != "FALSE" {
-		t.Errorf("TimeField parse error: SQL = %q, want FALSE", sql)
-	}
-}
 
 // --- EscapeLike ---
 
@@ -900,6 +846,37 @@ func TestEmptyConditionGroupsAreDeterministic(t *testing.T) {
 	}
 }
 
+func TestNegatedConditionsPreserveBindings(t *testing.T) {
+	condition := AllOf(NewIntField("id").Gt(3), Not(AnyOf(
+		NewBoolField("enabled").Eq(true), NewIntField("id").In(5, 7),
+	)))
+	sql, args := condition.ToSQL(9)
+	if sql != "(id > $9 AND NOT ((enabled = $10 OR id IN ($11, $12))))" {
+		t.Fatal(sql)
+	}
+	if !reflect.DeepEqual(args, []any{int64(3), true, int64(5), int64(7)}) {
+		t.Fatal(args)
+	}
+}
+
+func TestBooleanConstantsAndNegation(t *testing.T) {
+	for _, sample := range []struct {
+		condition Condition
+		want      string
+	}{
+		{BoolCondition(true), "TRUE"}, {BoolCondition(false), "FALSE"},
+		{Not(BoolCondition(true)), "FALSE"}, {Not(BoolCondition(false)), "TRUE"},
+		{Not(nil), "FALSE"}, {Not(AllOf()), "NOT (TRUE)"},
+		{Not(Not(NewIntField("id").Eq(1))), "id = $3"},
+		{Not(NewBoolField("enabled").IsNull()), "NOT (enabled IS NULL)"},
+	} {
+		sql, _ := sample.condition.ToSQL(3)
+		if sql != sample.want {
+			t.Fatalf("got %q want %q", sql, sample.want)
+		}
+	}
+}
+
 func TestRawConditionArgRebase(t *testing.T) {
 	// When used at argOffset=3, $1/$2 should become $3/$4
 	cond := RawCondition("a = $1 AND b = $2", "x", "y")
@@ -965,7 +942,7 @@ func TestSearchField_Match(t *testing.T) {
 
 func TestSearchField_FilterOp(t *testing.T) {
 	f := NewSearchField("content")
-	cond := f.FilterOp("match", "test query")
+	cond := requireFilter(f.FilterOp("match", "test query"))
 	sql, _ := cond.ToSQL(1)
 	if !strings.Contains(sql, "$1") {
 		t.Errorf("should use placeholder: %s", sql)
@@ -982,8 +959,8 @@ func TestSearchFieldSupportsStringFiltering(t *testing.T) {
 		{name: "eq", cond: f.Eq("Luxo"), want: "title = $1"},
 		{name: "neq", cond: f.Neq("Legacy"), want: "title != $1"},
 		{name: "in", cond: f.In("A", "B"), want: "title IN ($1, $2)"},
-		{name: "filter-eq", cond: f.FilterOp("eq", "Luxo"), want: "title = $1"},
-		{name: "filter-match", cond: f.FilterOp("match", "fast api"), want: "to_tsvector"},
+		{name: "filter-eq", cond: requireFilter(f.FilterOp("eq", "Luxo")), want: "title = $1"},
+		{name: "filter-match", cond: requireFilter(f.FilterOp("match", "fast api")), want: "to_tsvector"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

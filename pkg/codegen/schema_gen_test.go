@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -10,6 +11,208 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestBuildSchemaJSONEmptyEnumValuesAreArray(t *testing.T) {
+	input := analyzePermissionFixture(t, "enum Empty {}")
+	data, err := BuildSchemaJSON(input, nil, GeneratorConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output struct {
+		Enums map[string]struct {
+			Values json.RawMessage `json:"values"`
+		} `json:"enums"`
+	}
+	if err := json.Unmarshal(data, &output); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(output.Enums["Empty"].Values); got != "[]" {
+		t.Fatalf("empty enum must export an array for SDK generators, got %s", got)
+	}
+	if input.Files[0].Enums[0].Values != nil {
+		t.Fatal("schema export mutated the analyzed empty enum")
+	}
+}
+
+func TestBuildSchemaJSONRejectsMissingCatalogFields(t *testing.T) {
+	for _, sample := range []struct{ kind, source, declaration, field string }{
+		{"model", "model User @noTime { id: Int @id }", "User", "id"},
+		{"type", "type Payload { value: Int }", "Payload", "value"},
+	} {
+		t.Run(sample.kind, func(t *testing.T) {
+			input := analyzePermissionFixture(t, sample.source)
+			if len(input.Errors) != 0 {
+				t.Fatal(input.Errors)
+			}
+			config := GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{sample.declaration: {sample.field: 1}}}}
+			valid := mustNewGenerator(t, config)
+			before, err := valid.BuildSchemaJSON(input, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertSchemaCatalogField(t, before, sample.kind, sample.declaration, sample.field)
+			missing := mustNewGenerator(t, GeneratorConfig{})
+			for name, export := range map[string]func() ([]byte, error){
+				"context": func() ([]byte, error) { return missing.BuildSchemaJSON(input, nil) },
+				"public":  func() ([]byte, error) { return BuildSchemaJSON(input, nil, GeneratorConfig{}) },
+			} {
+				t.Run(name, func(t *testing.T) {
+					data, err := export()
+					expected := "model/type field " + sample.declaration + "." + sample.field + " has no stable ID"
+					if data != nil || err == nil || !strings.Contains(err.Error(), expected) {
+						t.Fatalf("missing field catalog produced a partial schema or lost its error: data=%s error=%v", data, err)
+					}
+				})
+			}
+			after, err := valid.BuildSchemaJSON(input, nil)
+			if err != nil || string(after) != string(before) {
+				t.Fatalf("rejection affected a valid generator: error=%v schema=%s", err, after)
+			}
+			public, err := BuildSchemaJSON(input, nil, config)
+			if err != nil || string(public) != string(before) {
+				t.Fatalf("valid public export differs: error=%v schema=%s", err, public)
+			}
+			assertSchemaCatalogField(t, public, sample.kind, sample.declaration, sample.field)
+		})
+	}
+}
+
+func assertSchemaCatalogField(t *testing.T, data []byte, kind, declaration, field string) {
+	t.Helper()
+	var restored schema.Schema
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	var fields []schema.Field
+	if kind == "model" {
+		if restored.Models[declaration] == nil {
+			t.Fatalf("missing exported model %s", declaration)
+		}
+		fields = restored.Models[declaration].Fields
+	} else {
+		if restored.Types[declaration] == nil {
+			t.Fatalf("missing exported type %s", declaration)
+		}
+		fields = restored.Types[declaration].Fields
+	}
+	if len(fields) != 1 || fields[0].ID != 1 || fields[0].Name != field || fields[0].Type != schema.FieldInt {
+		t.Fatalf("exported field catalog differs: %+v", fields)
+	}
+}
+
+func TestBuildSchemaJSONRejectsEmptyDeclarations(t *testing.T) {
+	for _, sample := range []struct{ kind, source, declaration, field string }{
+		{"model", "model User @noTime { id: Int @id }", "User", "id"},
+		{"type", "type Payload { value: Int }", "Payload", "value"},
+	} {
+		t.Run(sample.kind, func(t *testing.T) {
+			input := analyzePermissionFixture(t, sample.source)
+			if len(input.Errors) != 0 {
+				t.Fatal(input.Errors)
+			}
+			config := GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{sample.declaration: {sample.field: 1}}}}
+			generator := mustNewGenerator(t, config)
+			before, err := generator.BuildSchemaJSON(input, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sample.kind == "model" {
+				input.Files[0].Models[0].Name = ""
+				input.Files[0].Models[0].Fields = nil
+			} else {
+				input.Files[0].Types[0].Name = ""
+				input.Files[0].Types[0].Fields = nil
+			}
+			for name, export := range map[string]func() ([]byte, error){
+				"context": func() ([]byte, error) { return generator.BuildSchemaJSON(input, nil) },
+				"public":  func() ([]byte, error) { return BuildSchemaJSON(input, nil, config) },
+			} {
+				t.Run(name, func(t *testing.T) {
+					data, err := export()
+					if data != nil || err == nil || !strings.Contains(err.Error(), "schema: declaration must have a nonempty name") {
+						t.Fatalf("empty %s declaration produced partial JSON or lost its error: data=%s error=%v", sample.kind, data, err)
+					}
+				})
+			}
+			after, err := generator.BuildSchemaJSON(analyzePermissionFixture(t, sample.source), nil)
+			if err != nil || string(after) != string(before) {
+				t.Fatalf("rejected declaration affected valid export: error=%v data=%s", err, after)
+			}
+			assertSchemaCatalogField(t, after, sample.kind, sample.declaration, sample.field)
+		})
+	}
+}
+
+func TestTypeRegistrationSkipsIncompleteFields(t *testing.T) {
+	g := defaultGenerator()
+	var output strings.Builder
+	g.writeTypeRegistration(&output, &ast.TypeDecl{Name: "Snapshot", Fields: []*ast.FieldDecl{
+		{Name: "missingType"},
+		{Name: "missingID", Type: &ast.TypeRef{Name: "String"}},
+	}}, "example", nil)
+	if strings.Contains(output.String(), "missingType") || strings.Contains(output.String(), "missingID") {
+		t.Fatalf("incomplete fields leaked into schema:\n%s", output.String())
+	}
+	if got := g.inferForeignKey(&ast.ModelDecl{Name: "User"}, &ast.FieldDecl{
+		Type: &ast.TypeRef{Name: "Post", IsList: true},
+	}, nil); got != "userId" {
+		t.Fatalf("list relation foreign key = %q", got)
+	}
+}
+
+func TestAPIDeprecationSchema(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []*ast.NamedArg
+		want string
+	}{
+		{name: "auth"},
+		{name: "deprecated", want: "\t\tDeprecated: true,\n"},
+		{name: "deprecated", args: []*ast.NamedArg{{Value: &ast.Ident{Name: "reason"}}}, want: "\t\tDeprecated: true,\n"},
+		{name: "deprecated", args: []*ast.NamedArg{{Value: &ast.Literal{Value: "use replacement"}}}, want: "\t\tDeprecated: true,\n\t\tDeprecatedReason: \"use replacement\",\n"},
+	} {
+		var source strings.Builder
+		writeAPIDeprecationSchema(&source, []*ast.Directive{{Name: test.name, Args: test.args}})
+		if got := source.String(); got != test.want {
+			t.Fatalf("%s: got %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
+func TestSchemaPreservesNullableRoot(t *testing.T) {
+	for _, nullable := range []bool{false, true} {
+		for _, list := range []bool{false, true} {
+			t.Run(fmt.Sprintf("nullable=%v/list=%v", nullable, list), func(t *testing.T) {
+				generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{"read": 1, "svc:readInternal": 2}}})
+				ret := &ast.TypeRef{Name: "Int", Nullable: nullable, IsList: list}
+				result := &semantic.Result{Files: []*ast.File{{Name: "origin/example.luxo",
+					APIs:      []*ast.ApiDecl{{Name: "read", ReturnType: ret}},
+					Functions: []*ast.FnDecl{{Name: "readInternal", ReturnType: ret, Directives: []*ast.Directive{{Name: "service"}}}},
+				}}}
+				data, err := generator.BuildSchemaJSON(result, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var exported struct {
+					APIs map[string]struct {
+						ReturnNullable bool `json:"returnNullable"`
+					} `json:"apis"`
+				}
+				if err := json.Unmarshal(data, &exported); err != nil {
+					t.Fatal(err)
+				}
+				if exported.APIs["read"].ReturnNullable != nullable {
+					t.Fatalf("lost root nullability: %s", data)
+				}
+				code := string(generator.generateSchemaFile(result, "generated", nil))
+				want := fmt.Sprintf("ReturnType: %q, ReturnList: %v, ReturnNullable: %v", "Int", list, nullable)
+				if strings.Count(code, want) != 2 {
+					t.Fatalf("public/internal metadata mismatch: %s", code)
+				}
+			})
+		}
+	}
+}
 
 func TestLuxoTypeToSchemaType(t *testing.T) {
 	tests := []struct {
@@ -216,6 +419,65 @@ func TestGenerateSchemaFile_IncludesComputedFields(t *testing.T) {
 	}
 }
 
+func TestSchemaPreservesComputedSourceModel(t *testing.T) {
+	user := testModel("User", nil, []*ast.FieldDecl{
+		testField("id", "Int"),
+		{Name: "posts", Type: &ast.TypeRef{Name: "Post", IsList: true}},
+		computedAggregateField("postCount", "Int", "count", &ast.Ident{Name: "posts"}),
+		computedAggregateField("likes", "Int", "sum", &ast.MemberExpr{Object: &ast.Ident{Name: "posts"}, Field: "likes"}),
+	})
+	post := testModel("Post", nil, []*ast.FieldDecl{testField("id", "Int"), testField("userId", "Int"), testField("likes", "Int")})
+	input := &semantic.Result{Files: []*ast.File{{Name: "origin/blog/models.luxo", Models: []*ast.ModelDecl{user, post}}}}
+	g := mustNewGenerator(t, GeneratorConfig{
+		IDs: StableIDs{ModelFields: map[string]map[string]int{
+			"User": {"id": 1, "posts": 2, "postCount": 3, "likes": 4},
+			"Post": {"id": 1, "userId": 2, "likes": 3},
+		}},
+		Events: BuildEventContext(input.Files, "example"),
+	})
+	data, err := g.BuildSchemaJSON(input, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"postCount":{"model":"Post","module":"blog"}`) ||
+		!strings.Contains(string(data), `"likes":{"model":"Post","module":"blog"}`) {
+		t.Fatalf("JSON schema lost aggregate source: %s", data)
+	}
+	code := string(g.generateSchemaFile(input, "generated", nil))
+	if !strings.Contains(code, `"postCount": {Model: "Post", Module: "blog"}`) ||
+		!strings.Contains(code, `"likes": {Model: "Post", Module: "blog"}`) {
+		t.Fatalf("generated registration lost aggregate source: %s", code)
+	}
+	assertGeneratedComputedSchema(t, code, data)
+}
+
+func assertGeneratedComputedSchema(t *testing.T, code string, expected []byte) {
+	t.Helper()
+	assertions := fmt.Sprintf(`package generated
+import (
+  "testing"
+  "github.com/light-speak/luxo/pkg/lux/schema"
+  "github.com/light-speak/luxo/pkg/lux/selection"
+)
+func TestComputedSchemaRegistration(t *testing.T) {
+  s := schema.New()
+  RegisterSchema(s)
+  source := s.Models["User"].ComputedSources["postCount"]
+  if source.Model != "Post" || source.Module != "blog" { t.Fatalf("wrong source: %%v", source) }
+  data, err := s.ToJSON()
+  if err != nil { t.Fatal(err) }
+  if string(data) != %q { t.Fatalf("registration/export mismatch: %%s", data) }
+  plan, err := s.PrepareSelectionDependencies("User")
+  if err != nil { t.Fatal(err) }
+  selected, err := selection.Parse("postCount, likes, posts { id }")
+  if err != nil { t.Fatal(err) }
+  sources, err := plan.AppendSources(nil, selected)
+  if err != nil || len(sources) != 1 || sources[0] != source { t.Fatalf("wrong dependency plan: %%v, %%v", sources, err) }
+}
+`, string(expected))
+	runGeneratedProtocolPackage(t, code, assertions)
+}
+
 func TestGenerateSchemaFile_Nil(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{}}
 	code := generateSchemaFile(result, "luxo", nil)
@@ -300,7 +562,7 @@ func TestWriteAPIRegistrationSchema(t *testing.T) {
 	}
 	retType := &ast.TypeRef{Name: "User"}
 
-	generator.writeAPIRegistrationSchema(&b, "createUser", "user", params, retType, false, 0, false, nil, nil, "")
+	generator.writeAPIRegistrationSchema(&b, schemaAPIInfo{name: "createUser", moduleName: "user", params: params, returnType: retType}, nil)
 	src := b.String()
 
 	checks := []string{
@@ -329,7 +591,7 @@ func TestWriteAPIRegistrationSchemaListParam(t *testing.T) {
 
 	var b strings.Builder
 	params := []*ast.ParamDecl{{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}}}
-	generator.writeAPIRegistrationSchema(&b, "search", "search", params, nil, false, 0, false, nil, nil, "")
+	generator.writeAPIRegistrationSchema(&b, schemaAPIInfo{name: "search", moduleName: "search", params: params}, nil)
 	if src := b.String(); !strings.Contains(src, `Name: "tags", Type: schema.FieldString, TypeName: "String", IsList: true`) {
 		t.Fatalf("list parameter metadata missing:\n%s", src)
 	}
@@ -420,7 +682,8 @@ func TestBuildSchemaJSONSkipsInvalidExtensionField(t *testing.T) {
 			Fields: []*ast.FieldDecl{{Name: "invalid"}},
 		}},
 	}}}
-	if _, err := defaultGenerator().BuildSchemaJSON(result, nil); err != nil {
+	g := generatorWithModelFieldIDs(map[string]map[string]int{"User": {"invalid": 1, "id": 2}})
+	if _, err := g.BuildSchemaJSON(result, nil); err != nil {
 		t.Fatalf("BuildSchemaJSON() error = %v", err)
 	}
 }
@@ -428,13 +691,13 @@ func TestBuildSchemaJSONSkipsInvalidExtensionField(t *testing.T) {
 func TestBuildSchemaJSONIncludesCompleteCRUDParams(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{
 		"getProject": 1, "listProjects": 2, "createProject": 3,
-		"updateProject": 4, "deleteProject": 5, "deleteProjects": 6,
+		"updateProject": 4, "deleteProject": 5, "deleteProjects": 6, "svc:batchLoad:Project": 7,
 	}, APIParams: map[string]map[string]int{
 		"getProject": {"id": 1}, "listProjects": {"page": 1, "pageSize": 2},
 		"createProject": {"name": 1, "description": 2},
 		"updateProject": {"id": 1, "name": 2, "description": 3},
-		"deleteProject": {"id": 1}, "deleteProjects": {"ids": 1},
-	}}})
+		"deleteProject": {"id": 1}, "deleteProjects": {"ids": 1}, "svc:batchLoad:Project": {"keys": 1},
+	}, ModelFields: map[string]map[string]int{"Project": {"id": 1, "name": 2, "description": 3}}}})
 
 	result := &semantic.Result{Files: []*ast.File{{
 		Name: "origin/project.luxo",
@@ -515,6 +778,7 @@ func TestBuildSchemaJSON_Full(t *testing.T) {
 		}},
 	}
 
+	generator = mustNewGenerator(t, GeneratorConfig{IDs: completeFixtureAPIIDs(result, generator.ids)})
 	data, err := generator.BuildSchemaJSON(result, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -695,6 +959,31 @@ func TestBuildSchemaJSONMarksDeclaredPrimaryKey(t *testing.T) {
 	}
 }
 
+func TestBuildSchemaJSONIncludesInheritedFieldIDs(t *testing.T) {
+	base := &ast.ModelDecl{Name: "Base", Fields: []*ast.FieldDecl{{Name: "id", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}}}}
+	child := &ast.ModelDecl{Name: "Child", Parents: []string{"Base"}, Fields: []*ast.FieldDecl{{Name: "name", Type: &ast.TypeRef{Name: "String"}}}}
+	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{base, child}}}}
+	g := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
+		"Base": {"id": 1}, "Child": {"name": 1, "id": 7},
+	}}})
+	data, err := g.BuildSchemaJSON(result, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exported schema.Schema
+	if err := json.Unmarshal(data, &exported); err != nil {
+		t.Fatal(err)
+	}
+	if child := exported.Models["Child"]; child != nil {
+		for _, field := range child.Fields {
+			if field.Name == "id" && field.ID == 7 && field.PrimaryKey {
+				return
+			}
+		}
+	}
+	t.Fatalf("inherited field missing child-specific ID: %s", data)
+}
+
 func TestBuildSchemaJSONPreservesDocumentationAndRelationMetadata(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{
 		IDs: StableIDs{
@@ -763,7 +1052,7 @@ func TestBuildSchemaJSONPreservesDocumentationAndRelationMetadata(t *testing.T) 
 }
 
 func TestBuildSchemaJSONMergesExtensionAndKeepsProjectionLocal(t *testing.T) {
-	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{"svc:resolve:Post:userId": 1}, APIParams: map[string]map[string]int{"svc:resolve:Post:userId": {"keys": 1, "shape": 2}}, ModelFields: map[string]map[string]int{
 		"User": {"id": 1, "name": 2, "posts": 10},
 		"Post": {"id": 1, "userId": 2},
 	}}})
@@ -811,7 +1100,7 @@ func TestWriteAPIRegistrationSchema_Paginated(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIs: map[string]int{"listUser": 30}}})
 
 	var b strings.Builder
-	generator.writeAPIRegistrationSchema(&b, "listUser", "user", nil, &ast.TypeRef{Name: "User", IsList: true}, true, 20, false, nil, nil, "")
+	generator.writeAPIRegistrationSchema(&b, schemaAPIInfo{name: "listUser", moduleName: "user", returnType: &ast.TypeRef{Name: "User", IsList: true}, paginated: true, defaultPageSize: 20}, nil)
 	src := b.String()
 
 	if !strings.Contains(src, "Paginated: true") {
@@ -900,7 +1189,7 @@ func TestBuildSchemaTypes_NilTypeSkipped(t *testing.T) {
 			}},
 		}},
 	}
-	data, err := BuildSchemaJSON(result, nil)
+	data, err := BuildSchemaJSON(result, nil, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{"Broken": {"ok": 1, "noType": 2}}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1237,11 +1526,13 @@ func TestWriteModelRegistration_ExtendRelation(t *testing.T) {
 
 func TestWriteModelRegistrationPreservesScalarTypeNameAndListShape(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{
-		"Task": {"status": 1, "tags": 2},
+		"Task": {"status": 1, "tags": 2, "key": 3, "note": 4},
 	}}})
 	model := &ast.ModelDecl{Name: "Task", Fields: []*ast.FieldDecl{
 		{Name: "status", Type: &ast.TypeRef{Name: "TaskStatus"}},
 		{Name: "tags", Type: &ast.TypeRef{Name: "String", IsList: true}},
+		{Name: "key", Type: &ast.TypeRef{Name: "Int"}, Directives: []*ast.Directive{{Name: "id"}}},
+		{Name: "note", Type: &ast.TypeRef{Name: "String", Nullable: true}},
 	}}
 
 	var output strings.Builder
@@ -1249,10 +1540,17 @@ func TestWriteModelRegistrationPreservesScalarTypeNameAndListShape(t *testing.T)
 	code := output.String()
 	for _, expected := range []string{
 		`Name: "status", Type: schema.FieldEnum, TypeName: "TaskStatus"`,
-		`Name: "tags", Type: schema.FieldString, TypeName: "String", Nullable: false, IsList: true`,
+		`Name: "tags", Type: schema.FieldString, TypeName: "String", IsList: true`,
+		`Name: "key", Type: schema.FieldInt, TypeName: "Int", PrimaryKey: true`,
+		`Name: "note", Type: schema.FieldString, TypeName: "String", Nullable: true`,
 	} {
 		if !strings.Contains(code, expected) {
 			t.Errorf("generated runtime schema missing %q:\n%s", expected, code)
+		}
+	}
+	for _, inactive := range []string{"Nullable: false", "IsList: false", "Computed: false", "PrimaryKey: false"} {
+		if strings.Contains(code, inactive) {
+			t.Errorf("generated runtime schema explicitly sets the zero value %q:\n%s", inactive, code)
 		}
 	}
 }
@@ -1496,6 +1794,41 @@ func TestGenerateSchemaFileWithRemoteNamedLoad(t *testing.T) {
 	} {
 		if !strings.Contains(code, check) {
 			t.Errorf("named load schema missing %q:\n%s", check, code)
+		}
+	}
+}
+
+func TestSchemaJSONUsesImplicitCustomTargetKey(t *testing.T) {
+	input := analyzePermissionFixture(t, `model Target @noTime { key: String @id }
+model Source @noTime { id: Int @id targetKey: String? target: Target? }
+`)
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{
+		"Source": {"id": 1, "targetKey": 2, "target": 3}, "Target": {"key": 1},
+	}})
+	for _, context := range []*EventContext{nil, BuildEventContext(input.Files, "example.com/app")} {
+		data, err := BuildSchemaJSON(input, nil, GeneratorConfig{Driver: DriverPG, IDs: ids, Events: context})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var exported schema.Schema
+		if err := json.Unmarshal(data, &exported); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, field := range exported.Models["Source"].Fields {
+			if field.Name != "target" {
+				continue
+			}
+			found = true
+			if field.RelationKind != schema.RelationBelongsTo || field.LocalKey != "targetKey" || field.RemoteKey != "key" {
+				t.Fatalf("custom key discarded: %+v", field)
+			}
+		}
+		if !found {
+			t.Fatal("relation missing from exported schema")
 		}
 	}
 }

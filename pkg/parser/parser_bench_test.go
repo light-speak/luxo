@@ -1,9 +1,10 @@
 package parser
 
 import (
-	"os"
+	"strings"
 	"testing"
 
+	"github.com/light-speak/luxo/internal/testutil"
 	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -89,7 +90,71 @@ func tokenize(b *testing.B, input string) []token.Token {
 	return tokens
 }
 
+func BenchmarkParseChannelPayload(b *testing.B) {
+	for _, sample := range []struct{ name, body string }{
+		{"send-simple", "ch <- value"},
+		{"send-arithmetic", "ch <- value + 2 * 3"},
+		{"send-parenthesized", "ch <- (value + 2 * 3)"},
+		{"send-boolean", "ch <- value > 0 && value < 10"},
+		{"receive-control", "val value = <-ch + 1"},
+		{"arithmetic-control", "val value = a + b * 2"},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			tokens := tokenize(b, "api run(): Int { "+sample.body+" return 0 }")
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, errors := New(tokens).Parse("bench.luxo"); len(errors) != 0 {
+					b.Fatal(errors)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkParseForBoundary(b *testing.B) {
+	for _, sample := range []struct{ name, body string }{
+		{"collection", `for row in rows { consume(row) }`},
+		{"condition", `for count > 0 { count -= 1 }`},
+		{"value", `val selected = for row in rows { row }`},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			tokens := tokenize(b, "api run(): Int { "+sample.body+" return 0 }")
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, errors := New(tokens).Parse("bench.luxo"); len(errors) != 0 {
+					b.Fatal(errors)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkParse measures parsing of a medium-sized .luxo source.
+func BenchmarkParseAssignmentStatements(b *testing.B) {
+	for _, sample := range []struct{ name, statement string }{
+		{"calls", "consume()\n"},
+		{"members", "item.value += 1\n"},
+	} {
+		for _, size := range []struct {
+			name  string
+			count int
+		}{{"single", 1}, {"batch", 32}} {
+			b.Run(sample.name+"/"+size.name, func(b *testing.B) {
+				tokens := tokenize(b, "api run(): Int {\n"+strings.Repeat(sample.statement, size.count)+"return 0\n}")
+				if _, errs := New(tokens).Parse("bench.luxo"); len(errs) != 0 {
+					b.Fatal(errs)
+				}
+				b.ReportAllocs()
+				for b.Loop() {
+					if _, errs := New(tokens).Parse("bench.luxo"); len(errs) != 0 {
+						b.Fatal(errs)
+					}
+				}
+			})
+		}
+	}
+}
+
 func BenchmarkParse(b *testing.B) {
 	tokens := tokenize(b, benchParseInput)
 	b.ReportAllocs()
@@ -111,18 +176,76 @@ func BenchmarkParseExpr(b *testing.B) {
 	}
 }
 
-// BenchmarkParseDemoFile measures parsing of the full demo.luxo file.
+// BenchmarkParseDemoFile measures parsing of the immutable V1 corpus.
 func BenchmarkParseDemoFile(b *testing.B) {
-	data, err := os.ReadFile("../../editors/vscode/examples/demo.luxo")
-	if err != nil {
-		b.Skipf("demo.luxo not found: %v", err)
-	}
-	src := string(data)
+	src := testutil.CompilerDemoV1()
 	tokens := tokenize(b, src)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
 		p := New(tokens)
 		p.Parse("demo.luxo")
+	}
+}
+
+func BenchmarkParseListDeclarations(b *testing.B) {
+	tokens := tokenize(b, `model User { id: Int } type Sample { ints: [Int] names: [String]? models: [User] }`)
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, diagnostics := New(tokens).Parse("bench.luxo"); len(diagnostics) != 0 {
+			b.Fatal(diagnostics)
+		}
+	}
+}
+
+var benchmarkNamedArgumentDiagnostic string
+
+func BenchmarkParseNamedArgumentValue(b *testing.B) {
+	for _, sample := range []struct {
+		name, call string
+		errors     int
+		consume    bool
+	}{
+		{"empty-control", "helper()", 0, false},
+		{"positional-control", "helper(1)", 0, false},
+		{"named", "helper(value: 1)", 0, false},
+		{"mixed", "helper(1, enabled: true, value: 2)", 0, false},
+		{"missing-value", "helper(value: )", 1, false},
+		{"missing-value-error-consumption", "helper(value: )", 1, true},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			tokens := tokenize(b, "fn run(): Int { "+sample.call+" 0 } fn recovered(): Int { 1 }")
+			if _, errors := New(tokens).Parse("bench.luxo"); len(errors) != sample.errors {
+				b.Fatal(errors)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				_, errors := New(tokens).Parse("bench.luxo")
+				if len(errors) != sample.errors {
+					b.Fatal(errors)
+				}
+				if sample.consume {
+					benchmarkNamedArgumentDiagnostic = errors[0].Error()
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkParseGenericConstructors(b *testing.B) {
+	for _, sample := range []struct{ name, expression string }{
+		{"explicit", `Box<Int>(value: 1)`}, {"nested", `Box<Box<Int>>(value: Box<Int>(value: 1))`},
+		{"comparison", `a < b && c > (d)`},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			tokens := tokenize(b, `api probe(): Int { return `+sample.expression+` }`)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if _, errors := New(tokens).Parse("benchmark.luxo"); len(errors) != 0 {
+					b.Fatal(errors)
+				}
+			}
+		})
 	}
 }

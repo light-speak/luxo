@@ -1,0 +1,114 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"sync"
+	"sync/atomic"
+
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"nhooyr.io/websocket"
+)
+
+// This explicit test peer sends hostile bytes after the normal service's
+// serialization boundary. It never changes the generated service's guards.
+type depthPeer struct {
+	h1, h2, ws, active   atomic.Int64
+	malformed, recovered atomic.Int64
+	group                sync.WaitGroup
+}
+
+type depthPeerRequest struct {
+	ID        uint64 `json:"$id"`
+	API       string `json:"$api"`
+	Depth     int    `json:"depth"`
+	Lists     bool   `json:"lists"`
+	JSONDepth int    `json:"jsonDepth"`
+}
+
+func (p *depthPeer) snapshot() map[string]int64 {
+	return map[string]int64{"h1": p.h1.Load(), "h2": p.h2.Load(), "ws": p.ws.Load(),
+		"active": p.active.Load(), "malformed": p.malformed.Load(), "recovered": p.recovered.Load()}
+}
+
+func (r depthPeerRequest) response(correlated bool) ([]byte, error) {
+	if (r.API != "depthOne" && r.API != "depthMany") || (r.Depth != 1 && r.Depth != 65) || r.JSONDepth != 0 {
+		return nil, fmt.Errorf("hostile peer only serves the bounded unary depth corpus")
+	}
+	value := malformedDepthJSON(r.Depth, r.Lists)
+	if r.API == "depthMany" {
+		value = append(append(append([]byte{'['}, value...), ','), value...)
+		value = append(value, ']')
+	}
+	output := []byte{'{'}
+	if correlated {
+		output = strconv.AppendUint(append(output, `"$id":`...), r.ID, 10)
+		output = append(output, ',')
+	}
+	output = append(output, `"data":`...)
+	return append(append(output, value...), '}'), nil
+}
+
+func (p *depthPeer) sent(depth int) {
+	if depth == 65 {
+		p.malformed.Add(1)
+	} else {
+		p.recovered.Add(1)
+	}
+}
+
+func (p *depthPeer) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if api.IsWebSocketUpgrade(r) {
+		p.serveWS(w, r)
+		return
+	}
+	if r.ProtoMajor == 2 {
+		p.h2.Add(1)
+	} else {
+		p.h1.Add(1)
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, (64<<10)+1))
+	var request depthPeerRequest
+	if err != nil || len(raw) > 64<<10 || json.Unmarshal(raw, &request) != nil {
+		http.Error(w, "invalid hostile peer request", http.StatusBadRequest)
+		return
+	}
+	response, err := request.response(false)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(response); err == nil {
+		p.sent(request.Depth)
+	}
+}
+
+func (p *depthPeer) serveWS(w http.ResponseWriter, r *http.Request) {
+	conn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(64 << 10)
+	p.group.Add(1)
+	defer p.group.Done()
+	p.ws.Add(1)
+	p.active.Add(1)
+	defer p.active.Add(-1)
+	for {
+		kind, raw, err := conn.Read(r.Context())
+		var request depthPeerRequest
+		if err != nil || kind != websocket.MessageText || json.Unmarshal(raw, &request) != nil {
+			return
+		}
+		response, err := request.response(true)
+		if err != nil || conn.Write(r.Context(), websocket.MessageText, response) != nil {
+			return
+		}
+		p.sent(request.Depth)
+	}
+}

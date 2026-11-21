@@ -1,0 +1,24 @@
+import { Decoder, Encoder } from '@luxojs/client'
+import * as checked from './types.js'
+import * as unchecked from './types.unchecked.js'
+import { measure } from './measure.js'
+
+const row = new Encoder()
+row.writeVarint(0)
+row.writeFieldInt(1, (1n << 63n) - 1n)
+row.writeFieldFloat(4, 1.5)
+row.writeEnd()
+const rowBytes = row.bytes()
+measure('row', () => unchecked.decodeMetric(new Decoder(rowBytes)), () => checked.decodeMetric(new Decoder(rowBytes)))
+for (const count of [1, 16, 128]) {
+  const column = new Encoder()
+  column.writeVarint(count)
+  column.writeVarint(0)
+  column.writeVarint(1)
+  for (let index = 0; index < count; index++) column.writeSvarint((1n << 63n) - 1n)
+  column.writeVarint(4)
+  for (let index = 0; index < count; index++) column.writeFixed64(1.5)
+  column.writeEnd()
+  const bytes = column.bytes()
+  measure(`column ${count}`, () => unchecked.decodeColumnarMetric(bytes), () => checked.decodeColumnarMetric(bytes))
+}

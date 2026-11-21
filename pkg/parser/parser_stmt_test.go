@@ -5,8 +5,27 @@ import (
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lexer"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestParseBlockAllocatesOneShortStatementSlice(t *testing.T) {
+	const source = "{\n return 1\n return 2\n return 3\n return 4\n return 5\n}"
+	tokens, lexErrors := lexer.New(source, "block.luxo").Tokenize()
+	if len(lexErrors) != 0 {
+		t.Fatal(lexErrors)
+	}
+	allocations := testing.AllocsPerRun(20, func() {
+		parser := New(tokens)
+		block := parser.parseBlock()
+		if len(block.Stmts) != 5 || len(parser.errors) != 0 {
+			t.Fatalf("failed to parse all statements: %d %v", len(block.Stmts), parser.errors)
+		}
+	})
+	if allocations > 12 {
+		t.Fatalf("five returns, five literals, a block and its slice allocated %.0f objects", allocations)
+	}
+}
 
 func TestParseForStmt(t *testing.T) {
 	input := `api test(): Int {
@@ -24,6 +43,50 @@ func TestParseForStmt(t *testing.T) {
 	}
 	if forStmt.VarName != "item" {
 		t.Errorf("expected 'item', got %q", forStmt.VarName)
+	}
+}
+
+func TestParseForCallBodyBoundary(t *testing.T) {
+	for _, sample := range []struct{ name, loop string }{
+		{"function", `for row in fetch() { consume(row) }`},
+		{"query", `for row in Node.where(id: 1).all() { consume(row) }`},
+		{"condition", `for ready() { consume(1) }`},
+		{"fallback", `for row in source?.rows() ?: fallback() { consume(row) }`},
+		{"range", `for number in start()..finish() { consume(number) }`},
+		{"value", `val found = for row in fetch() { if row.id > 0 { yield row } }`},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			file := parse(t, `api run(): Int { `+sample.loop+` val mapped = [1].map { it } return 0 }`)
+			statement := file.APIs[0].Body.Stmts[0]
+			loop, ok := statement.(*ast.ForStmt)
+			if binding, value := statement.(*ast.ValStmt); value {
+				loop, ok = binding.Value.(*ast.ForStmt)
+			}
+			if !ok || len(loop.Body.Stmts) != 1 {
+				t.Fatal("call consumed the loop body", statement)
+			}
+			ast.WalkExpr(loop.Collection, func(expr ast.Expr) {
+				if _, lambda := expr.(*ast.LambdaExpr); lambda {
+					t.Fatal("loop body became a collection lambda")
+				}
+			})
+			mapped := file.APIs[0].Body.Stmts[1].(*ast.ValStmt).Value.(*ast.CallExpr)
+			if len(mapped.Args) != 1 {
+				t.Fatal("condition flag leaked beyond the loop")
+			}
+			if _, ok := mapped.Args[0].Value.(*ast.LambdaExpr); !ok {
+				t.Fatal("subsequent trailing lambda was lost")
+			}
+		})
+	}
+}
+
+func TestParseForConditionPrecedence(t *testing.T) {
+	file := parse(t, `api run(): Int { for count - 1 > 0 { count -= 1 } return 0 }`)
+	condition := file.APIs[0].Body.Stmts[0].(*ast.ForStmt).Collection.(*ast.BinaryExpr)
+	left, ok := condition.Left.(*ast.BinaryExpr)
+	if condition.Op != ">" || !ok || left.Op != "-" {
+		t.Fatal("loop condition ignored arithmetic precedence", condition)
 	}
 }
 
@@ -394,6 +457,23 @@ func TestParseCompoundAssignStmt(t *testing.T) {
 				t.Errorf("expected op %q, got %q", tt.op, assign.Op)
 			}
 		})
+	}
+}
+
+func TestParseCallReceiverAssignment(t *testing.T) {
+	for _, target := range []string{"load().value", "(item).value", "(load()).value"} {
+		for _, operator := range []string{"=", "+=", "-="} {
+			t.Run(target+operator, func(t *testing.T) {
+				file := parse(t, "api test(): Int { "+target+" "+operator+" 1 return 0 }")
+				assignment, ok := file.APIs[0].Body.Stmts[0].(*ast.AssignStmt)
+				if !ok || assignment.Op != operator {
+					t.Fatalf("expected %s assignment, got %#v", operator, file.APIs[0].Body.Stmts[0])
+				}
+				if member, ok := assignment.Target.(*ast.MemberExpr); !ok || member.Field != "value" {
+					t.Fatalf("invalid target %#v", assignment.Target)
+				}
+			})
+		}
 	}
 }
 

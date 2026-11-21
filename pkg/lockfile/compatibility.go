@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 )
 
@@ -29,10 +30,12 @@ func (c BreakingChange) String() string {
 // BreakingChanges compares the current AST with the persisted wire contract.
 // Additive response fields and optional API parameters remain compatible.
 func (lf *LockFile) BreakingChanges(files []*ast.File) []BreakingChange {
+	files = inferred.ExpandedFiles(files)
 	contracts := collectContracts(files)
 	var changes []BreakingChange
 	changes = append(changes, compareFields("model", lf.Models, contracts.models, false)...)
 	changes = append(changes, compareFields("type", lf.Types, contracts.types, false)...)
+	changes = append(changes, compareSealedContracts(lf.Types, contracts)...)
 	changes = append(changes, compareFields("event", lf.Events, contracts.events, true)...)
 	changes = append(changes, lf.compareAPIs(files, contracts.apis)...)
 	sort.Slice(changes, func(i, j int) bool { return changes[i].Path < changes[j].Path })
@@ -40,10 +43,12 @@ func (lf *LockFile) BreakingChanges(files []*ast.File) []BreakingChange {
 }
 
 type wireContracts struct {
-	models map[string]map[string]string
-	types  map[string]map[string]string
-	events map[string]map[string]string
-	apis   map[string]apiContract
+	models   map[string]map[string]string
+	types    map[string]map[string]string
+	events   map[string]map[string]string
+	apis     map[string]apiContract
+	kinds    map[string]string
+	defaults map[string]map[string]bool
 }
 
 type apiContract struct {
@@ -52,6 +57,7 @@ type apiContract struct {
 }
 
 func collectContracts(files []*ast.File) wireContracts {
+	models := inferred.ModelsForAPIs(files)
 	contracts := wireContracts{
 		models: make(map[string]map[string]string),
 		types:  make(map[string]map[string]string),
@@ -78,6 +84,7 @@ func collectContracts(files []*ast.File) wireContracts {
 		for _, declaration := range file.Types {
 			contracts.types[declaration.Name] = fieldTypes(declaration.Fields)
 		}
+		collectSealedContracts(&contracts, file.Sealeds)
 		for _, event := range file.Events {
 			params := make(map[string]string, len(event.Params))
 			for _, param := range event.Params {
@@ -86,6 +93,7 @@ func collectContracts(files []*ast.File) wireContracts {
 			contracts.events[event.Name] = params
 		}
 		for _, api := range file.APIs {
+			api = inferred.Contract(api, models)
 			contracts.apis[api.Name] = newAPIContract(api.EffectiveParams(), api.ReturnType)
 		}
 		for _, fn := range file.Functions {
@@ -223,12 +231,16 @@ func (lf *LockFile) updateContractMetadata(files []*ast.File) {
 func updateFieldMetadata(locked map[string]*ModelLock, current map[string]map[string]string) {
 	for name, entity := range locked {
 		fields := current[name]
-		entity.FieldTypes = make(map[string]string, len(fields))
-		for field, typeName := range fields {
-			if _, active := entity.Fields[field]; active {
-				entity.FieldTypes[field] = typeName
+		if fields == nil {
+			fields = make(map[string]string)
+		}
+		for field := range fields {
+			if _, active := entity.Fields[field]; !active {
+				delete(fields, field)
 			}
 		}
+		// The collected contract is local to this update and owns its field maps.
+		entity.FieldTypes = fields
 	}
 }
 

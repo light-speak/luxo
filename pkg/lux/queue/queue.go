@@ -5,11 +5,8 @@ package queue
 
 import (
 	"context"
-	"fmt"
-	"os"
+	"errors"
 	"time"
-
-	"github.com/light-speak/luxo/pkg/lux/env"
 )
 
 // Queue is the interface for publishing and consuming tasks.
@@ -21,20 +18,25 @@ type Queue interface {
 	// Subscribe registers a handler for tasks on the named queue.
 	// Handler receives task payload; returning nil acknowledges the task,
 	// returning an error triggers retry (up to MaxRetries).
+	// A nil handler is rejected before reserving local or broker resources.
 	Subscribe(queue string, handler Handler) error
 
 	// Close gracefully shuts down the queue, draining in-flight tasks
-	// with a reasonable timeout.
+	// with a reasonable timeout. Concurrent and repeated calls return the
+	// first shutdown result; failure is not converted to success on retry.
 	Close() error
 }
 
 // Handler processes a task payload.
 type Handler func(ctx context.Context, payload []byte) error
 
+// DeadLetterSuffix names the portable dead-letter destination of a task queue.
+const DeadLetterSuffix = ".dlq"
+
 // Config controls queue behavior.
 type Config struct {
 	MaxRetries  int           // maximum delivery attempts (default 3)
-	RetryDelay  time.Duration // base delay before retry, doubled each attempt (default 5s)
+	RetryDelay  time.Duration // base retry delay, doubled each attempt (default 5s; NATS caps at 1m)
 	Concurrency int           // concurrent workers per queue (default 4)
 }
 
@@ -47,31 +49,25 @@ func DefaultConfig() Config {
 	}
 }
 
-// validate fills zero-value fields with defaults.
-func (c *Config) validate() {
-	if c.MaxRetries <= 0 {
+// SetDefaults fills zero-value fields with defaults.
+func (c *Config) SetDefaults() {
+	if c.MaxRetries == 0 {
 		c.MaxRetries = 3
 	}
-	if c.RetryDelay <= 0 {
+	if c.RetryDelay == 0 {
 		c.RetryDelay = 5 * time.Second
 	}
-	if c.Concurrency <= 0 {
+	if c.Concurrency == 0 {
 		c.Concurrency = 4
 	}
 }
 
-// NewFromEnv creates a Queue based on environment configuration.
-// If NATS_URL is set, connects to NATS JetStream (falls back to MemoryQueue on failure).
-// Otherwise uses MemoryQueue.
-func NewFromEnv(cfg Config) Queue {
-	cfg.validate()
-	if natsURL, ok := env.Get("NATS_URL"); ok {
-		q, err := NewNATSQueue(natsURL, cfg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: NATS JetStream connect failed, using memory queue: %v\n", err)
-			return NewMemoryQueue(cfg)
-		}
-		return q
+// Validate rejects invalid settings; zero values select defaults at construction.
+func (c Config) Validate() error {
+	if c.MaxRetries < 0 || c.RetryDelay < 0 || c.Concurrency < 0 {
+		return errNegativeConfig
 	}
-	return NewMemoryQueue(cfg)
+	return nil
 }
+
+var errNegativeConfig = errors.New("queue: configuration values must not be negative")

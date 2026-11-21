@@ -1,0 +1,29 @@
+model PrecisionRecord @noTime {
+  id: Int @id
+  whole: Int
+  ratio: Float
+  amount: Decimal
+  moment: DateTime
+  elapsed: Duration
+  token: UUID
+}
+api storePrecision(id: Int, whole: Int, ratio: Float, amount: Decimal, moment: DateTime, elapsed: Duration, token: UUID): PrecisionRecord {
+  return PrecisionRecord.create(id: id, whole: whole, ratio: ratio, amount: amount, moment: moment, elapsed: elapsed, token: token)
+}
+api readPrecision(id: Int): PrecisionRecord? {
+  return PrecisionRecord.where(id: id).first()
+}
+api precisionRecords(): [PrecisionRecord] { return PrecisionRecord.all() }
+
+model NullableRecord @noTime {
+  id: Int @id
+  number: Int?
+  items: [Int]?
+}
+api storeNullableRecord(id: Int, number: Int?, items: [Int]?): NullableRecord {
+  return NullableRecord.create(id: id, number: number, items: items)
+}
+api readNullableRecord(id: Int): NullableRecord? {
+  return NullableRecord.where(id: id).first()
+}
+api nullableRecords(): [NullableRecord] { return NullableRecord.all() }

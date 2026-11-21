@@ -1,0 +1,65 @@
+package app
+
+import com.luxo.client.*
+import com.luxo.generated.Role
+import kotlinx.serialization.json.*
+
+object EnumBenchmark {
+    @Volatile private var result: Any? = null
+
+    @JvmStatic
+    fun main(args: Array<String>) {
+        println("Generated enums JVM ${System.getProperty("java.version")}; ${System.getProperty("os.arch")}")
+        for (text in listOf("MEMBER", "未来状态")) {
+            scalar(text)
+            for (count in listOf(0, 1, 128)) lists(text, count)
+        }
+    }
+
+    private fun scalar(text: String) {
+        val json = JsonPrimitive(text)
+        val binary = LuxoEncoder().apply { writeString(text) }.bytes()
+        check(Role.fromValue(decodeLuxoJsonString(json)).rawValue == text)
+        PairedJvmBenchmark.compare("enum JSON scalar $text", {
+            val value = decodeLuxoJsonString(json); result = value; value.length.toLong()
+        }, {
+            val value = Role.fromValue(decodeLuxoJsonString(json)); result = value; value.rawValue.length.toLong()
+        })
+        PairedJvmBenchmark.compare("enum Binary scalar $text", {
+            val decoder = LuxoDecoder(binary); val value = decoder.readString(); decoder.checkComplete()
+            result = value; value.length.toLong()
+        }, {
+            val decoder = LuxoDecoder(binary); val value = Role.fromValue(decoder.readString()); decoder.checkComplete()
+            result = value; value.rawValue.length.toLong()
+        })
+    }
+
+    private fun lists(text: String, count: Int) {
+        val strings = List(count) { text }
+        val enums = strings.map(Role::fromValue)
+        val json = JsonArray(strings.map(::JsonPrimitive))
+        val binary = LuxoEncoder().apply { writeVarint(count.toLong()); strings.forEach(::writeString) }.bytes()
+        val iterations = if (count == 128) 20_000 else 300_000
+        check(json.map { Role.fromValue(decodeLuxoJsonString(it)).rawValue } == strings)
+        check(LuxoDecoder(binary).let { dec ->
+            val value = dec.readArray { Role.fromValue(dec.readString()) }; dec.checkComplete(); value
+        } == enums)
+        PairedJvmBenchmark.compare("enum JSON list $count $text", {
+            val value = json.map { decodeLuxoJsonString(it) }; result = value; value.size.toLong()
+        }, {
+            val value = json.map { Role.fromValue(decodeLuxoJsonString(it)) }; result = value; value.size.toLong()
+        }, iterations)
+        PairedJvmBenchmark.compare("enum Binary list $count $text", {
+            val dec = LuxoDecoder(binary); val value = dec.readArray { dec.readString() }; dec.checkComplete()
+            result = value; value.size.toLong()
+        }, {
+            val dec = LuxoDecoder(binary); val value = dec.readArray { Role.fromValue(dec.readString()) }; dec.checkComplete()
+            result = value; value.size.toLong()
+        }, iterations)
+        PairedJvmBenchmark.compare("enum parameter list $count $text", {
+            val value = mapOf("states" to strings); result = value; value.size.toLong()
+        }, {
+            val value = mapOf("states" to enums.map { it.rawValue }); result = value; value.size.toLong()
+        }, iterations)
+    }
+}

@@ -1,0 +1,100 @@
+package app
+
+import com.luxo.generated.LuxoClient
+import com.luxo.generated.decodeJSONPrecisionRecord
+import com.luxo.generated.decodeJSONProjection
+import com.luxo.generated.decodeColumnarPrecisionRecord
+import com.luxo.projectionbefore.LuxoClient as BeforeClient
+import com.luxo.projectionbefore.decodeJSONPrecisionRecord as beforeRecord
+import com.luxo.projectionbefore.decodeJSONProjection as beforeProjection
+import com.luxo.projectionbefore.decodeColumnarPrecisionRecord as beforeColumnar
+import kotlinx.serialization.json.*
+import java.util.function.LongSupplier
+import kotlin.coroutines.*
+import kotlin.coroutines.intrinsics.*
+
+/** Parsing, construction and subscription setup are outside measured decoding batches. */
+object JsonProjectionBenchmark {
+    @Volatile private var observed: Any? = null
+
+    @JvmStatic
+    fun main(args: Array<String>) = immediate {
+        println("JDK ${System.getProperty("java.version")}; 12 warmup pairs; 20 alternating samples; ns/op and B/op")
+        compareRows()
+        for (count in listOf(0, 1, 128)) {
+            compareNested(count)
+            compareClients(count)
+        }
+        val binary = byteArrayOf(1, 0, 1, 14, 0)
+        compare("Binary single row control", { beforeColumnar(binary) }, { decodeColumnarPrecisionRecord(binary) })
+        println("sink=${PairedJvmBenchmark.sink}; result=${observed != null}")
+    }
+
+    private fun compareRows() {
+        val inputs = linkedMapOf(
+            "empty unary" to "{}",
+            "first field" to """{"value":7}""",
+            "last field" to """{"optionalRatios":null}""",
+            "nullable" to """{"optional":null}""",
+            "mixed" to """{"value":9223372036854775807,"duration":-7,"optional":null,"values":[1,2],"ratio":0.5}""",
+        )
+        for ((label, json) in inputs) {
+            val row = Json.parseToJsonElement(json).jsonObject
+            compare("row $label", { beforeRecord(row) }, { decodeJSONPrecisionRecord(row) })
+        }
+    }
+
+    private fun compareNested(count: Int) {
+        val child = Json.parseToJsonElement("""{"label":null,"models":[{"enabled":true}]}""")
+        val nested = JsonObject(mapOf("children" to JsonArray(List(count) { child })))
+        compare("nested $count", { beforeProjection(nested) }, { decodeJSONProjection(nested) }, count)
+    }
+
+    private suspend fun compareClients(count: Int) {
+        val oldTransport = ResponseTransport()
+        val newTransport = ResponseTransport()
+        val before = BeforeClient(oldTransport)
+        val after = LuxoClient(newTransport)
+        val row = Json.parseToJsonElement("""{"enabled":true,"texts":["hello"],"payload":{"n":12345678901234567890}}""")
+        val rows = JsonArray(List(count) { row })
+        oldTransport.response = rows; newTransport.response = rows
+        compare("list $count", { immediate { before.probeTextRecords(select = "enabled, texts, payload") } },
+            { immediate { after.probeTextRecords(select = "enabled, texts, payload") } }, count)
+        val stopBefore = before.subscribeWatchTextRecords(select = "enabled, texts, payload") { observed = it }
+        val stopAfter = after.subscribeWatchTextRecords(select = "enabled, texts, payload") { observed = it }
+        oldTransport.callback(rows)
+        val expected = observed.toString()
+        newTransport.callback(rows)
+        check(observed.toString() == expected)
+        PairedJvmBenchmark.compare("stream $count", LongSupplier { oldTransport.callback(rows); count.toLong() },
+            LongSupplier { newTransport.callback(rows); count.toLong() }, iterations(count))
+        stopBefore(); stopAfter()
+        val precision = Json.parseToJsonElement("""{"value":7,"optional":null,"values":[]}""")
+        val page = JsonObject(mapOf("items" to JsonArray(List(count) { precision }),
+            "total" to JsonPrimitive(count), "page" to JsonPrimitive(1), "pageSize" to JsonPrimitive(128)))
+        oldTransport.response = page; newTransport.response = page
+        compare("page $count", { immediate { before.precisionPage(0, 0, null, emptyList(), select = "value, optional, values") } },
+            { immediate { after.precisionPage(0, 0, null, emptyList(), select = "value, optional, values") } }, count)
+    }
+
+    private fun iterations(count: Int) = if (count >= 128) 5_000 else 100_000
+
+    private fun compare(name: String, before: () -> Any, after: () -> Any, count: Int = 1) {
+        check(before().toString() == after().toString()) { "Mismatched generated result: $name" }
+        PairedJvmBenchmark.compare(name, LongSupplier { observed = before(); 1 },
+            LongSupplier { observed = after(); 1 }, iterations(count))
+    }
+
+    // ResponseTransport completes synchronously: fail if a benchmark accidentally starts real asynchronous work.
+    private object NoSuspend : Continuation<Any?> {
+        override val context: CoroutineContext = EmptyCoroutineContext
+        override fun resumeWith(result: Result<Any?>) = error("Benchmark operation unexpectedly suspended")
+    }
+
+    private fun <T> immediate(operation: suspend () -> T): T {
+        val result = operation.startCoroutineUninterceptedOrReturn(NoSuspend)
+        check(result !== COROUTINE_SUSPENDED)
+        @Suppress("UNCHECKED_CAST")
+        return result as T
+    }
+}

@@ -3,6 +3,6 @@ builders:
     import: "package:luxo_client/src/builder/select_builder.dart"
     builder_factories: ["selectHintsBuilder"]
     build_extensions: {"lib/$lib$": ["lib/src/luxo/_select_hints.g.dart"]}
-    auto_apply: dependents
+    auto_apply: none
     build_to: source
     runs_before: ["source_gen|combining_builder"]

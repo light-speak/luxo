@@ -1,0 +1,82 @@
+import 'dart:convert';
+import 'dart:io';
+import 'package:luxo_client/luxo_client.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:test/test.dart';
+import 'client.dart';
+import 'types.dart';
+
+void main() {
+ test('closed sum requests retain defaults, selection and typed payloads', () async {
+  final driver=Platform.environment['LUXO_SEALED_HTTP_CONSUMER'];
+  final capture=Platform.environment['LUXO_SEALED_CAPTURE'];
+  final scratch=Directory('.tmp')..createSync(recursive:true);
+  final own=scratch.createTempSync('sealed-go-');
+  addTearDown(() { own.deleteSync(recursive:true); });
+  final raw=<List<int>>[
+   [1,4,0,1,14,0],[2,10,6,1,6,102,97,105,108,101,100,0],[3,2,0,0],[4,6,0,1,0,2,0,0],
+   [4,19,0,1,1,6,1,4,0,1,14,0,2,1,1,4,3,2,0,0,0],[1,2,0,0],[0],[0],
+  ];
+  final outputs=<Object?>[
+   {'Success':{'value':7}},{'Failure':{'reason':'failed'}},{'Pending':{}},
+   {'Nested':{'child':null,'history':null}},
+   {'Nested':{'child':{'Success':{'value':7}},'history':[{'Pending':{}}]}},
+   {'Success':{}},null,[],
+  ];
+  var sent=0;
+  for(final mode in [TransportMode.json,TransportMode.binary]) {
+   final transport=HttpTransport('http://sealed.fixture.invalid',options:TransportOptions(mode:mode),client:MockClient((request) async {
+    final index=sent++%8;
+    final input=mode==TransportMode.json
+     ? {'mode':'json','request':jsonDecode(request.body)}
+     : {'mode':'binary','bytes':request.bodyBytes.toList()};
+    if(driver==null) return mode==TransportMode.json
+     ? http.Response(jsonEncode({'data':outputs[index]}),200)
+     : http.Response.bytes(raw[index],200);
+    final file=File('${own.path}/request.jsonl')..writeAsStringSync('${jsonEncode(input)}\n');
+    final process=await Process.run(driver,[file.absolute.path]);
+    expect(process.exitCode,0,reason:process.stderr.toString());
+    final response=jsonDecode(process.stdout.toString()) as Map<String,dynamic>;
+    if(capture!=null) File(capture).writeAsStringSync('${jsonEncode({'request':input,'response':response})}\n',mode:FileMode.append);
+    expect(response['status'],200,reason:response.toString());
+    return mode==TransportMode.json
+     ? http.Response(jsonEncode(response['json']),200)
+     : http.Response.bytes((response['bytes'] as List).cast<int>(),200);
+   }));
+   final client=LuxoClient(transport);
+   try {
+    final seven=LuxoInt64.fromInt(7);
+    final success=await client.echo(value:OutcomeInput.Success(value:seven));
+    if(success is Outcome$Success$1) { expect(success.value.value,seven); }
+    else { fail('expected success'); }
+    final failure=await client.echo(value:OutcomeInput.Failure());
+    if(failure is Outcome$Failure$2) { expect(failure.reason.value,'failed'); }
+    else { fail('expected failure'); }
+    final pending=await client.echo(value:OutcomeInput.Pending());
+    expect(pending is Outcome$Pending$3,isTrue);
+    final defaults=await client.echo(value:OutcomeInput.Nested());
+    if(defaults is Outcome$Nested$4) {
+     expect(defaults.child.value==null,isTrue);
+     expect(defaults.history.value==null,isTrue);
+    } else { fail('expected nested defaults'); }
+    final nested=await client.echo(value:OutcomeInput.Nested(
+     child:LuxoOptional<OutcomeInput>.present(OutcomeInput.Success(value:seven)),
+     history:LuxoOptional<List<OutcomeInput>>.present([OutcomeInput.Pending()])));
+    if(nested is Outcome$Nested$4) {
+     final child=nested.child.value;
+     if(child is Outcome$Success$1) { expect(child.value.value,seven); }
+     else { fail('expected child success'); }
+     expect(nested.history.value?.length,1);
+     expect(nested.history.value?.first is Outcome$Pending$3,isTrue);
+    } else { fail('expected nested present'); }
+    final tagOnly=await client.echo(value:OutcomeInput.Success(value:seven),select:'Success');
+    if(tagOnly is Outcome$Success$1) { expect(tagOnly.value.isSelected,isFalse); }
+    else { fail('expected tag-only success'); }
+    expect(await client.echoEmpty(value:null),isNull);
+    expect((await client.echoEmptyList(values:[])).length,0);
+   } finally { client.close(); }
+  }
+  expect(sent,16);
+ });
+}

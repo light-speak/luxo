@@ -1,0 +1,250 @@
+part of 'int64_consumer_test.dart';
+
+void verifyJSONProjection() {
+  test('nested inputs preserve Binary row bytes and JSON fields', () {
+    const input = CreateInput(child: ChildInput(name: 'nested'));
+    final encoder = sdk.LuxoEncoder();
+    input.writeLuxo(encoder);
+    expect(encoder.bytes(), [0, 1, 6, 1, 6, 110, 101, 115, 116, 101, 100, 0, 0]);
+    expect(input.toJson(), {'child': {'name': 'nested'}});
+  });
+  test('selected Bytes and nested objects retain their JSON projection', () {
+    final row = <String, Object?>{
+      'data': 'AAH/',
+      'child': {'name': 'nested'},
+    };
+    final value = Payload.fromJson(row);
+    expect(value.data.value, [0, 1, 255]);
+    expect(value.child.value.name.value, 'nested');
+    expect(value.toJson(), row);
+    expect(sdk.decodeLuxoJSON(sdk.encodeLuxoJSON(value)), row);
+    expect(value.metadata.isSelected, isFalse);
+    expect(value.chunks.isSelected, isFalse);
+  });
+  test('generated HTTP responses keep JSON128 independent from model64', () async {
+    var body = '';
+    final transport = sdk.HttpTransport(
+      'http://example.test/luxo',
+      client: MockClient((_) async => http.Response(body, 200)),
+    );
+    final client = LuxoClient(transport);
+    addTearDown(client.close);
+    final json128 = '${'[' * 128}null${']' * 128}';
+    body = '{"data":{"metadata":$json128}}';
+    expect((await client.createSnapshot()).metadata.value, isA<List>());
+    body = '{"data":[{"metadata":$json128}]}';
+    expect((await client.listPayloads()).single.metadata.value, isA<List>());
+    body =
+        '{"data":{"items":[{"metadata":$json128}],"total":1,"page":1,"pageSize":10}}';
+    expect(
+      (await client.listPayloadPage()).items.single.metadata.value,
+      isA<List>(),
+    );
+    body = '{"data":$json128}';
+    expect(await client.scalarJSON(), isA<List>());
+    for (final depth in [64, 65]) {
+      body =
+          '{"data":${'{"child":' * (depth - 1)}{"child":null}${'}' * (depth - 1)}}';
+      if (depth == 64) {
+        await client.projection();
+      } else {
+        await expectLater(
+          client.projection(),
+          throwsA(
+            isA<sdk.LuxoError>().having(
+              (error) => error.error,
+              'error',
+              'ParseError',
+            ),
+          ),
+        );
+      }
+    }
+  });
+  test(
+    'JSON model lists reject every fieldless record before delivery',
+    _rejectFieldlessRows,
+  );
+  test(
+    'nested model and type lists enforce projection recursively',
+    _rejectNestedRows,
+  );
+  test(
+    'valid selections, singleton objects and generic JSON keep their meaning',
+    _validProjections,
+  );
+  test(
+    'valid nested selections and unary constructors remain compatible',
+    _validNestedProjections,
+  );
+}
+
+Future<void> _rejectFieldlessRows() async {
+  final transport = _ResponseTransport(),
+      valid = {'metadata': <String, Object?>{}};
+  final client = LuxoClient(transport);
+  var delivered = 0;
+  final cancel = await client.subscribeWatchPayloadList(
+    onData: (_) => delivered++,
+  );
+  for (final bad in [
+    {},
+    {'unknown': true},
+  ]) {
+    for (final rows in [
+      [bad],
+      [valid, bad],
+      [bad, valid],
+      [valid, bad, valid],
+    ]) {
+      transport.response = _projectionWire(rows);
+      await expectLater(
+        client.listPayloads(select: 'metadata'),
+        throwsFormatException,
+      );
+      expect(
+        () => transport.emit(_projectionWire(rows) as Object),
+        throwsFormatException,
+      );
+      expect(delivered, 0);
+      transport.response = _projectionWire({
+        'items': rows,
+        'total': rows.length,
+        'page': 1,
+        'pageSize': 3,
+      });
+      await expectLater(
+        client.listPayloadPage(select: 'metadata'),
+        throwsFormatException,
+      );
+    }
+  }
+  for (final rows in [
+    [null],
+    [true],
+    ['text'],
+    [[]],
+    [7],
+  ]) {
+    transport.response = rows;
+    await expectLater(
+      client.listPayloads(select: 'metadata'),
+      throwsA(isA<TypeError>()),
+    );
+  }
+  cancel();
+}
+
+void _rejectNestedRows() {
+  for (final field in ['models', 'children']) {
+    for (final bad in [
+      {},
+      {'unknown': true},
+    ]) {
+      final data = <String, dynamic>{
+        field: [bad],
+      };
+      for (final row in [
+        data,
+        {'child': data},
+        {
+          'children': [data],
+        },
+      ]) {
+        expect(
+          () =>
+              Projection.fromJson(_projectionWire(row) as Map<String, dynamic>),
+          throwsFormatException,
+        );
+      }
+    }
+  }
+}
+
+Future<void> _validProjections() async {
+  final transport = _ResponseTransport();
+  final listClient = LuxoClient(transport);
+  List<Payload>? received;
+  final cancel = await listClient.subscribeWatchPayloadList(
+    onData: (value) => received = value,
+  );
+  for (final rows in [
+    [],
+    [
+      {'metadata': {}},
+    ],
+    [
+      {'chunks': []},
+    ],
+    [
+      {'child': {}},
+    ],
+  ]) {
+    transport.response = _projectionWire(rows);
+    expect((await listClient.listPayloads()).map((e) => e.toJson()), rows);
+    received = null;
+    transport.emit(transport.response!);
+    expect(received?.map((e) => e.toJson()), rows);
+    transport.response = _projectionWire({
+      'items': rows,
+      'total': rows.length,
+      'page': 1,
+      'pageSize': 3,
+    });
+    expect(
+      (await listClient.listPayloadPage()).items.map((e) => e.toJson()),
+      rows,
+    );
+  }
+  transport.response = [
+    {},
+    null,
+    {'unknown': []},
+  ];
+  expect(await listClient.arrayJSON(), transport.response);
+  cancel();
+  listClient.close();
+}
+
+void _validNestedProjections() {
+  for (final row in <Map<String, dynamic>>[
+    {'children': []},
+    {
+      'children': [
+        {'label': null},
+      ],
+    },
+    {'child': {}},
+    {
+      'children': [
+        {'child': {}},
+        {'models': []},
+      ],
+    },
+    {
+      'models': [
+        {'metadata': {}},
+      ],
+    },
+  ]) {
+    expect(
+      Projection.fromJson(_projectionWire(row) as Map<String, dynamic>)
+          .toJson(),
+      row,
+    );
+  }
+  expect(Payload.fromJson({}).toJson(), isEmpty);
+  expect(
+    [
+      <String, dynamic>{},
+      {'metadata': {}},
+    ].map(Payload.fromJson).map((value) => value.toJson()).toList(),
+    [
+      {},
+      {'metadata': {}},
+    ],
+  );
+}
+
+Object? _projectionWire(Object? value) =>
+    sdk.decodeLuxoJSON(sdk.encodeLuxoJSON(value));

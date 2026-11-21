@@ -1,0 +1,148 @@
+package com.luxo.nullablefixture
+
+import com.luxo.client.*
+import java.util.Base64
+import java.util.function.LongSupplier
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.*
+
+private typealias RootDecoder = (Any) -> Any?
+private data class RootCase(val name: String, val kind: String, val binary: ByteArray, val json: JsonElement, val expected: Any)
+
+object NullableRootProbe {
+    @Volatile private var sink: Any? = null
+
+    @JvmStatic
+    fun main(args: Array<String>) = runBlocking {
+        val transport = ProbeTransport()
+        val client = LuxoClient(transport)
+        // __REGISTER_DECODERS__
+        val samples = scalarCases() + modelCases()
+        val plainOnly = args.single() == "--plain-only"
+        verify(transport.decoders, samples, plainOnly)
+        if (args.single() == "--verify") {
+            println("verified 11 generated nullable root fixtures")
+            return@runBlocking
+        }
+        for (sample in samples) {
+            val plain = transport.decoders.getValue("${sample.kind}Plain")
+            if (plainOnly) {
+                prepare(plain, sample.binary)
+                PairedJvmBenchmark.isolated("plain binary ${sample.name}", operation(plain, sample.binary), 10_000)
+                prepare(plain, sample.json)
+                PairedJvmBenchmark.isolated("plain json ${sample.name}", operation(plain, sample.json), 10_000)
+            } else {
+                val nullable = transport.decoders.getValue("${sample.kind}Nullable")
+                compare("nullable binary ${sample.name}", plain, sample.binary, nullable, envelope(sample.binary))
+                compare("nullable json ${sample.name}", plain, sample.json, nullable, sample.json)
+            }
+        }
+        if (!plainOnly) measureNulls(transport.decoders)
+        println("verified results; generated decode only; sinkPresent=${sink != null}; no network or subscription lifecycle")
+    }
+
+    private fun measureNulls(decoders: Map<String, RootDecoder>) {
+        for (kind in listOf("integer", "boolean", "text", "bytes", "integers", "object", "objects")) {
+            val nullable = decoders.getValue("${kind}Nullable")
+            compare("null absolute json/binary $kind", nullable, JsonNull, nullable, byteArrayOf(0))
+        }
+    }
+
+    private fun compare(name: String, before: RootDecoder, oldInput: Any, after: RootDecoder, newInput: Any) {
+        equal(before(oldInput), after(newInput))
+        prepare(before, oldInput)
+        prepare(after, newInput)
+        PairedJvmBenchmark.compare(name, operation(before, oldInput), operation(after, newInput), 10_000)
+    }
+
+    private fun prepare(decoder: RootDecoder, input: Any) {
+        // Allow generated readers to reach steady JIT compilation before short timed batches.
+        repeat(1_000_000) { sink = decoder(input) }
+    }
+
+    private fun operation(decoder: RootDecoder, input: Any) = LongSupplier {
+        sink = decoder(input)
+        if (sink == null) 0 else 1
+    }
+
+    private fun scalarCases(): List<RootCase> {
+        val samples = mutableListOf<RootCase>()
+        for (value in listOf(0L, 42L, Long.MAX_VALUE)) {
+            samples += RootCase("integer-$value", "integer", encoded { writeSvarint(value) }, JsonPrimitive(value), value)
+        }
+        samples += RootCase("false", "boolean", byteArrayOf(0), JsonPrimitive(false), false)
+        for (text in listOf("", "发布冻结".repeat(350))) {
+            samples += RootCase("text-${text.toByteArray().size}", "text", encoded { writeString(text) }, JsonPrimitive(text), text)
+        }
+        val bytes = ByteArray(4096) { 7 }
+        samples += RootCase("bytes-4096", "bytes", encoded { writeBytes(bytes) }, JsonPrimitive(Base64.getEncoder().encodeToString(bytes)), bytes)
+        for (count in listOf(0, 128)) {
+            val values = List(count) { it.toLong() }
+            samples += RootCase("integers-$count", "integers", encoded {
+                writeVarint(count.toLong()); for (value in values) writeSvarint(value)
+            }, JsonArray(values.map(::JsonPrimitive)), values)
+        }
+        return samples
+    }
+
+    private fun modelCases(): List<RootCase> {
+        val value = Snapshot(Selected.value(42L), Selected.value("发布"))
+        val values = List(128) { Snapshot(Selected.value(it.toLong()), Selected.value("发布")) }
+        fun json(id: Long) = buildJsonObject { put("id", id); put("label", "发布") }
+        val row = encoded { writeVarint(6); writeFieldInt(1, 42); writeFieldString(2, "发布"); writeEnd() }
+        val columns = encoded {
+            writeVarint(128); writeVarint(128 * 6L); writeVarint(1)
+            repeat(128) { writeSvarint(it.toLong()) }
+            writeVarint(2); repeat(128) { writeString("发布") }; writeEnd()
+        }
+        return listOf(RootCase("object", "object", row, json(42), value),
+            RootCase("objects-128", "objects", columns, JsonArray(List(128) { json(it.toLong()) }), values))
+    }
+
+    private fun encoded(write: LuxoEncoder.() -> Unit): ByteArray = LuxoEncoder().apply(write).bytes()
+    private fun envelope(body: ByteArray): ByteArray = ByteArray(body.size + 1).also { it[0] = 1; body.copyInto(it, 1) }
+
+    private fun verify(decoders: Map<String, RootDecoder>, samples: List<RootCase>, plainOnly: Boolean) {
+        check(samples.size == 11 && decoders.size == 14)
+        for (sample in samples) {
+            val plain = decoders.getValue("${sample.kind}Plain")
+            equal(plain(sample.binary), sample.expected)
+            equal(plain(sample.json), sample.expected)
+            if (plainOnly) continue
+            val nullable = decoders.getValue("${sample.kind}Nullable")
+            val bytes = envelope(sample.binary)
+            val original = bytes.copyOf()
+            equal(nullable(bytes), sample.expected)
+            equal(nullable(sample.json), sample.expected)
+            check(bytes.contentEquals(original))
+            check(nullable(JsonNull) == null && nullable(byteArrayOf(0)) == null)
+            for (bad in listOf(byteArrayOf(), byteArrayOf(1), byteArrayOf(2), byteArrayOf(-1), byteArrayOf(0, 0), bytes + byteArrayOf(0))) {
+                reject { nullable(bad) }
+            }
+            if (sample.binary.size > 1) reject { nullable(bytes.copyOf(bytes.size - 1)) }
+        }
+    }
+
+    private fun equal(actual: Any?, expected: Any?) {
+        if (actual is ByteArray && expected is ByteArray) check(actual.contentEquals(expected))
+        else check(actual == expected) { "Unexpected result: $actual != $expected" }
+    }
+
+    private fun reject(operation: () -> Any?) {
+        try { operation() } catch (_: LuxoCodecException) { return }
+        error("Accepted malformed nullable root")
+    }
+
+    private class ProbeTransport : Transport {
+        val decoders = linkedMapOf<String, RootDecoder>()
+        override suspend fun call(api: String, params: Map<String, Any?>): Any = error("Unexpected unary call")
+        override suspend fun <T> subscribe(api: String, decoder: (Any) -> T, request: GeneratedRequest,
+            observer: StreamObserver?, handler: (T) -> Unit): () -> Unit {
+            check(decoders.put(api, decoder) == null)
+            return {}
+        }
+        override fun setSchema(schema: Map<String, APISchemaEntry>) {}
+        override fun setMode(mode: TransportMode) {}
+        override fun setToken(token: String) {}
+    }
+}

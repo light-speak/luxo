@@ -1,57 +1,37 @@
 // Package event provides a typed event system for the Luxo runtime.
-// Embedded mode uses Go channels, multi-service mode uses NATS.
+// Applications select an in-process or independent network adapter at build time.
 package event
 
-import (
-	"context"
-	"errors"
-	"fmt"
-	"os"
-
-	"github.com/light-speak/luxo/pkg/lux/env"
-)
-
-var ErrBinaryPayloadRequired = errors.New("event: NATS payload must use Luxo binary or []byte")
+import "context"
 
 // Bus is the interface for publishing and subscribing to events.
 // ChanBus (channel) and NATSBus implement this interface.
 type Bus interface {
 	// Emit publishes an event with the given name and payload. Consumer handlers
 	// run with a bus-owned context because delivery can outlive the caller.
-	// payload can be any type — ChanBus passes it directly (zero serialization),
-	// while NATSBus accepts LuxoMarshaler values or pre-encoded []byte only.
+	// Generated payloads implement SnapshotSource for ChanBus and LuxoMarshaler
+	// for NATSBus. Untyped in-memory values are rejected, never silently shared.
+	// Low-level pre-encoded []byte is decoded by the registered listener.
 	Emit(ctx context.Context, name string, payload any) error
 
 	// On registers a broadcast handler — every instance receives the event.
 	// Use for cache invalidation, config refresh, etc.
+	// A nil handler is rejected before creating subscription resources.
 	On(name string, handler Handler) error
 
 	// OnQueue registers a queue handler — only one instance per group
 	// receives each event. Different groups each get a copy.
 	// group is typically the module name (auto-set by codegen).
+	// A nil handler is rejected before creating subscription resources.
 	OnQueue(name string, group string, handler Handler) error
 
-	// Close shuts down the bus and all subscriptions.
-	Close()
+	// Close shuts down the bus and all subscriptions, returning shutdown failures.
+	// Concurrent or repeated calls preserve the first shutdown result.
+	Close() error
 }
 
 // Handler processes an event payload and returns an error if processing fails.
-// For ChanBus, payload is the original struct (zero-copy).
+// For ChanBus, payload is an independently owned, statically copied struct.
 // For NATSBus, payload is []byte containing the published wire representation.
-// Returning an error signals a delivery failure — the bus may retry or dead-letter.
+// Current backends log handler failures without retry or dead-letter delivery.
 type Handler func(ctx context.Context, payload any) error
-
-// NewFromEnv creates a Bus based on environment configuration.
-// If NATS_URL is set, connects to NATS (falls back to ChanBus on failure).
-// Otherwise uses ChanBus with default buffer size 256.
-func NewFromEnv() Bus {
-	if natsURL, ok := env.Get("NATS_URL"); ok {
-		bus, err := NewNATSBus(natsURL)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: NATS connect failed, using channel bus: %v\n", err)
-			return NewChanBus(256)
-		}
-		return bus
-	}
-	return NewChanBus(256)
-}

@@ -2,18 +2,68 @@ package codegen
 
 import (
 	"fmt"
+	"maps"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lux"
+	pgdialect "github.com/light-speak/luxo/pkg/lux/dialect/pg"
+	"github.com/light-speak/luxo/pkg/semantic"
 )
+
+func (g *GeneratorContext) prepareValueCompilation(result *semantic.Result) (*GeneratorContext, *semantic.Result, error) {
+	if !result.RequiresTypeCompilation() {
+		return g, result, nil
+	}
+	view, err := semantic.CompilationView(result)
+	if err != nil {
+		return nil, nil, err
+	}
+	origins := view.ConcreteTypeOrigins()
+	if len(origins) == 0 && len(view.CompiledSealedDeclarations()) == 0 {
+		return g, view, nil
+	}
+	copy := *g
+	declarations := view.CompiledValueDeclarations()
+	copy.events = compiledEventContext(g.events, view, declarations)
+	copy.valueTypes = newCompiledValuePlan(view, copy.events, declarations)
+	copy.ids.ModelFields = maps.Clone(g.ids.ModelFields)
+	if copy.ids.ModelFields == nil {
+		copy.ids.ModelFields = make(map[string]map[string]int, len(origins))
+	}
+	for name, origin := range origins {
+		if copy.ids.ModelFields[name] != nil {
+			continue
+		}
+		if fields := g.ids.ModelFields[origin]; fields != nil {
+			copy.ids.ModelFields[name] = fields
+			continue
+		}
+		if fields := builtinValueFieldIDs(origin); fields != nil {
+			copy.ids.ModelFields[name] = fields
+		}
+	}
+	return &copy, view, nil
+}
+
+func builtinValueFieldIDs(name string) map[string]int {
+	switch name {
+	case "Page":
+		return map[string]int{"items": 1, "total": 2, "page": 3, "pageSize": 4}
+	case "Cursor":
+		return map[string]int{"items": 1, "nextCursor": 2, "hasMore": 3}
+	default:
+		return nil
+	}
+}
 
 // StableIDs contains the wire identifiers assigned by luxo.lock.
 // A GeneratorContext takes an immutable snapshot of these maps at construction time.
 type StableIDs struct {
-	EventFields   map[string]map[string]int
-	ModelFields   map[string]map[string]int
-	APIs          map[string]int
-	APIParams     map[string]map[string]int
-	APIParamTypes map[string]map[string]string
+	EventFields map[string]map[string]int
+	ModelFields map[string]map[string]int
+	APIs        map[string]int
+	APIParams   map[string]map[string]int
 }
 
 // GeneratorConfig configures one isolated compilation.
@@ -26,17 +76,42 @@ type GeneratorConfig struct {
 // GeneratorContext owns every piece of state used by one compilation.
 // Separate generators can safely run concurrently without locks.
 type GeneratorContext struct {
-	driver DBDriver
-	dbPkg  string
-	ids    StableIDs
-	events *EventContext
+	codecDepthNames    map[string]bool
+	singleObjectDepth  bool
+	driver             DBDriver
+	sqlDialect         lux.Dialect
+	dbPkg              string
+	ids                StableIDs
+	events             *EventContext
+	requestParams      map[string][]*ast.ParamDecl
+	modelDeclarations  map[string]*ast.ModelDecl
+	typeDeclarations   map[string]*ast.TypeDecl
+	objectDefaults     map[string][]*ast.FieldDecl
+	fieldTransforms    map[*ast.FieldDecl]string
+	functionNames      localBindings
+	enumSymbols        enumSymbols
+	bindingPlan        *bindingSymbolPlan
+	bindingSource      *semantic.Result
+	scopeFunctions     map[string]bool
+	explicitSelections map[string]bool
+	querySQLSelectors  map[string]bool
+	paginationPlans    map[*ast.ApiDecl]*inferred.PaginationPlan
+	genericExprTypes   map[ast.Expr]*ast.TypeRef
+	valueTypes         *compiledValuePlan
+	asyncSnapshots     *asyncSnapshotGenerator
+	asyncSource        *semantic.Result
+	asyncSnapshotOwner *GeneratorContext
+	debugLogs          *debugLogGenerator
+	globalValues       map[string]generatedGlobalValue
+	sealed             *sealedPlan
+	instanceSaves      map[string]*instanceSavePlan
 }
 
 // Generator is kept as a source-compatible alias for GeneratorContext.
 type Generator = GeneratorContext
 
 func defaultGenerator() *GeneratorContext {
-	return &GeneratorContext{driver: DriverPG, dbPkg: DriverPG.DriverPkg()}
+	return &GeneratorContext{driver: DriverPG, dbPkg: DriverPG.DriverPkg(), sqlDialect: pgdialect.Dialect{}}
 }
 
 // NewGenerator creates an isolated generator for one compilation.
@@ -48,11 +123,15 @@ func NewGenerator(config GeneratorConfig) (*GeneratorContext, error) {
 	if err := validateDriver(driver); err != nil {
 		return nil, err
 	}
+	if err := validateStableIDs(config.IDs); err != nil {
+		return nil, err
+	}
 	return &GeneratorContext{
-		driver: driver,
-		dbPkg:  driver.DriverPkg(),
-		ids:    cloneStableIDs(config.IDs),
-		events: cloneEventContext(config.Events),
+		driver:     driver,
+		sqlDialect: pgdialect.Dialect{},
+		dbPkg:      driver.DriverPkg(),
+		ids:        cloneStableIDs(config.IDs),
+		events:     cloneEventContext(config.Events),
 	}, nil
 }
 
@@ -69,11 +148,10 @@ func validateDriver(driver DBDriver) error {
 
 func cloneStableIDs(ids StableIDs) StableIDs {
 	return StableIDs{
-		EventFields:   cloneNestedIntMap(ids.EventFields),
-		ModelFields:   cloneNestedIntMap(ids.ModelFields),
-		APIs:          cloneIntMap(ids.APIs),
-		APIParams:     cloneNestedIntMap(ids.APIParams),
-		APIParamTypes: cloneNestedStringMap(ids.APIParamTypes),
+		EventFields: cloneNestedIntMap(ids.EventFields),
+		ModelFields: cloneNestedIntMap(ids.ModelFields),
+		APIs:        cloneIntMap(ids.APIs),
+		APIParams:   cloneNestedIntMap(ids.APIParams),
 	}
 }
 
@@ -99,37 +177,40 @@ func cloneNestedIntMap(source map[string]map[string]int) map[string]map[string]i
 	return result
 }
 
-func cloneNestedStringMap(source map[string]map[string]string) map[string]map[string]string {
-	if source == nil {
-		return nil
-	}
-	result := make(map[string]map[string]string, len(source))
-	for key, values := range source {
-		cloned := make(map[string]string, len(values))
-		for name, value := range values {
-			cloned[name] = value
-		}
-		result[key] = cloned
-	}
-	return result
-}
-
 func cloneEventContext(source *EventContext) *EventContext {
 	if source == nil {
 		return nil
 	}
 	result := &EventContext{
-		EventModule:     cloneStringMap(source.EventModule),
-		Events:          cloneEventMap(source.Events),
-		ModelModule:     cloneStringMap(source.ModelModule),
-		TypeModule:      cloneStringMap(source.TypeModule),
-		EnumModule:      cloneStringMap(source.EnumModule),
-		ModelIDType:     cloneStringMap(source.ModelIDType),
-		ModelIDField:    cloneStringMap(source.ModelIDField),
-		ModelFields:     cloneBoolSetMap(source.ModelFields),
-		remoteLoadCalls: cloneLoadCalls(source.remoteLoadCalls),
-		remotePKModels:  cloneBoolMap(source.remotePKModels),
-		ModulePath:      source.ModulePath,
+		EventModule:       cloneStringMap(source.EventModule),
+		Events:            cloneEventMap(source.Events),
+		ModelModule:       cloneStringMap(source.ModelModule),
+		TypeModule:        cloneStringMap(source.TypeModule),
+		EnumModule:        cloneStringMap(source.EnumModule),
+		Enums:             cloneEnumMap(source.Enums),
+		SharedEnumPackage: source.SharedEnumPackage,
+		ModelIDType:       cloneStringMap(source.ModelIDType),
+		ModelIDField:      cloneStringMap(source.ModelIDField),
+		ModelFields:       cloneBoolSetMap(source.ModelFields),
+		remoteLoadCalls:   cloneLoadCalls(source.remoteLoadCalls),
+		remotePKModels:    cloneBoolMap(source.remotePKModels),
+		ModulePath:        source.ModulePath,
+	}
+	return result
+}
+
+func cloneEnumMap(source map[string]*ast.EnumDecl) map[string]*ast.EnumDecl {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string]*ast.EnumDecl, len(source))
+	for name, declaration := range source {
+		if declaration == nil {
+			continue
+		}
+		copy := *declaration
+		copy.Values = append([]string(nil), declaration.Values...)
+		result[name] = &copy
 	}
 	return result
 }
@@ -221,6 +302,9 @@ func (g *GeneratorContext) ownerModelHasField(modelName, fieldName string) bool 
 }
 
 func (g *GeneratorContext) externalModelIDFieldName(modelName string) string {
+	if model := g.modelDeclarations[modelName]; model != nil {
+		return inferred.PrimaryKeyName(model)
+	}
 	if g.events != nil {
 		if fieldName := g.events.ModelIDField[modelName]; fieldName != "" {
 			return fieldName
@@ -230,6 +314,12 @@ func (g *GeneratorContext) externalModelIDFieldName(modelName string) string {
 }
 
 func (g *GeneratorContext) externalModelIDTypeName(modelName string) string {
+	if model := g.modelDeclarations[modelName]; model != nil {
+		if key := inferred.PrimaryKeyField(model); key != nil {
+			return key.Type.Name
+		}
+		return "Int"
+	}
 	if g.events != nil {
 		if typeName := g.events.ModelIDType[modelName]; typeName != "" {
 			return typeName

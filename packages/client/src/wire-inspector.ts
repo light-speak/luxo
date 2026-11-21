@@ -1,4 +1,5 @@
 import { fieldMaskHas } from './codec'
+import { WireReader as ValueReader } from './wire-reader'
 import type { APISchema } from './transport'
 
 const FILTERS_FIELD_ID = 0x7ffffffe
@@ -22,44 +23,41 @@ export interface WireRequestInspection {
   fields: WireFieldInspection[]
 }
 
-class WireReader {
-  offset = 0
-
-  constructor(private readonly data: Uint8Array) {}
+class WireReader extends ValueReader {
+  get offset(): number { return this.wireOffset }
 
   readVarint(label: string): number {
-    let value = 0
-    let multiplier = 1
-    while (this.offset < this.data.length) {
-      const byte = this.data[this.offset++]
-      value += (byte & 0x7f) * multiplier
-      if (byte < 0x80) return value
-      multiplier *= 128
-      if (multiplier > Number.MAX_SAFE_INTEGER) throw new Error(`${label} exceeds safe integer range`)
-    }
-    throw new Error(`truncated ${label}`)
+    const value = this.readUnsigned()
+    if (this.error !== null) throw new Error(`${label}: ${this.error}`)
+    return value
+  }
+
+  skipInt64(label: string): void {
+    this.readSigned()
+    if (this.error !== null) throw new Error(`${label}: ${this.error}`)
   }
 
   skip(length: number, label: string): void {
-    if (!Number.isSafeInteger(length) || length < 0 || this.offset + length > this.data.length) {
+    if (!Number.isSafeInteger(length) || length < 0 || this.offset + length > this.wireBytes.length) {
       throw new Error(`truncated ${label}`)
     }
-    this.offset += length
+    this.wireOffset += length
   }
 
   readBytes(length: number, label: string): Uint8Array {
     const start = this.offset
     this.skip(length, label)
-    return this.data.subarray(start, this.offset)
+    return this.wireBytes.subarray(start, this.offset)
   }
 
-  readBool(label: string): void {
+  readBool(label: string): boolean {
     const value = this.readBytes(1, label)[0]
     if (value !== 0 && value !== 1) throw new Error(`invalid ${label}`)
+    return value === 1
   }
 
   get done(): boolean {
-    return this.offset === this.data.length
+    return this.offset === this.wireBytes.length
   }
 }
 
@@ -97,9 +95,14 @@ function skipScalar(reader: WireReader, type: string): void {
   switch (type) {
     case 'Int':
     case 'Duration':
+      reader.skipInt64(`${type} value`)
+      return
     case 'DateTime':
+      reader.readDateTime()
+      if (reader.error !== null) throw new Error(`DateTime: ${reader.error}`)
+      return
     case 'Boolean':
-      reader.readVarint(`${type} value`)
+      reader.readBool(`${type} value`)
       return
     case 'Float':
       reader.skip(8, 'Float value')
@@ -111,6 +114,7 @@ function skipScalar(reader: WireReader, type: string): void {
     case 'Enum':
     case 'Decimal':
     case 'Bytes':
+    case 'JSON':
     case 'Model': {
       const length = reader.readVarint(`${type} length`)
       reader.skip(length, `${type} value`)
@@ -180,7 +184,10 @@ export function inspectBinaryRequest(
     if (!param) throw new Error(`unknown field ID ${fieldID} for API ${api}`)
     const valueStart = reader.offset
     let itemCount: number | undefined
-    if (param.isList) {
+    const present = !param.nullable || reader.readBool(`${param.name} presence`)
+    if (!present) {
+      // Null has no payload, including for nullable lists.
+    } else if (param.isList) {
       itemCount = reader.readVarint(`${param.name} item count`)
       for (let index = 0; index < itemCount; index++) skipScalar(reader, param.type)
     } else {

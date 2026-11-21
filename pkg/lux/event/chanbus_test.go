@@ -11,6 +11,32 @@ import (
 	"time"
 )
 
+func BenchmarkChanBusSubscriptionLifecycle(b *testing.B) {
+	handler := func(context.Context, any) error { return nil }
+	b.ReportAllocs()
+	for b.Loop() {
+		bus := NewChanBus(1)
+		if err := bus.On("events", handler); err != nil {
+			b.Fatal(err)
+		}
+		bus.Close()
+	}
+}
+
+func TestChanBusRejectsNilHandler(t *testing.T) {
+	bus := NewChanBus(1)
+	defer bus.Close()
+	if err := bus.On("events", nil); err == nil {
+		t.Error("nil broadcast handler registered")
+	}
+	if err := bus.OnQueue("events", "workers", nil); err == nil {
+		t.Error("nil queue handler registered")
+	}
+	if len(bus.channels) != 0 || len(bus.subs) != 0 {
+		t.Fatal("invalid handlers started dispatchers")
+	}
+}
+
 func TestChanBusEmitOn(t *testing.T) {
 	bus := NewChanBus(10)
 	defer bus.Close()
@@ -24,7 +50,7 @@ func TestChanBusEmitOn(t *testing.T) {
 		return nil
 	})
 
-	bus.Emit(context.Background(), "user.created", map[string]any{"id": 1})
+	bus.Emit(context.Background(), "user.created", testEvent{UserID: 1})
 
 	select {
 	case <-done:
@@ -32,9 +58,82 @@ func TestChanBusEmitOn(t *testing.T) {
 		t.Fatal("timeout waiting for event")
 	}
 
-	got := received.Load().(map[string]any)
-	if got["id"] != 1 {
+	got := received.Load().(testEvent)
+	if got.UserID != 1 {
 		t.Errorf("got %v", got)
+	}
+}
+
+func TestChanBusListenerAddedDuringDispatchReceivesQueuedEvent(t *testing.T) {
+	bus := NewChanBus(2)
+	waiting, release := context.WithCancel(t.Context())
+	defer bus.Close()
+	defer release()
+	started := make(chan struct{})
+	if err := bus.On("audit", func(_ context.Context, value any) error {
+		if value == 1 {
+			close(started)
+			<-waiting.Done()
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Emit(t.Context(), "audit", immutablePayload(1)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first listener did not start")
+	}
+	if err := bus.Emit(t.Context(), "audit", immutablePayload(2)); err != nil {
+		t.Fatal(err)
+	}
+	received := make(chan int, 2)
+	if err := bus.On("audit", func(_ context.Context, value any) error {
+		received <- value.(int)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if err := bus.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(received) != 1 || <-received != 2 {
+		t.Fatal("new listener did not receive exactly the queued event")
+	}
+}
+
+func TestChanBusGoexitDoesNotDiscardAcceptedEvents(t *testing.T) {
+	bus := NewChanBus(2)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var received atomic.Int32
+	if err := bus.On("audit", func(_ context.Context, value any) error {
+		if value == 1 {
+			close(started)
+			<-release
+			runtime.Goexit()
+		}
+		received.Add(1)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Emit(context.Background(), "audit", immutablePayload(1)); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	err := bus.Emit(context.Background(), "audit", immutablePayload(2))
+	close(release)
+	bus.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if received.Load() != 1 {
+		t.Fatalf("Close returned without draining accepted second event: received=%d", received.Load())
 	}
 }
 
@@ -58,7 +157,7 @@ func TestChanBusHandlerContextOutlivesEmitter(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := bus.Emit(ctx, "audit", nil); err != nil {
+	if err := bus.Emit(ctx, "audit", immutablePayload(0)); err != nil {
 		t.Fatal(err)
 	}
 	got := <-result
@@ -89,7 +188,7 @@ func TestChanBusMultipleHandlers(t *testing.T) {
 		return nil
 	})
 
-	bus.Emit(context.Background(), "order.placed", "test")
+	bus.Emit(context.Background(), "order.placed", immutablePayload("test"))
 
 	wg.Wait()
 	if count.Load() != 2 {
@@ -101,7 +200,7 @@ func TestChanBusNoSubscribers(t *testing.T) {
 	bus := NewChanBus(10)
 	defer bus.Close()
 
-	err := bus.Emit(context.Background(), "nobody.listens", "test")
+	err := bus.Emit(context.Background(), "nobody.listens", immutablePayload("test"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,14 +220,14 @@ func TestChanBusBufferFull(t *testing.T) {
 		return nil
 	})
 
-	if err := bus.Emit(context.Background(), "slow", "1"); err != nil {
+	if err := bus.Emit(context.Background(), "slow", immutablePayload("1")); err != nil {
 		t.Fatal(err)
 	}
 	<-started
-	if err := bus.Emit(context.Background(), "slow", "2"); err != nil {
+	if err := bus.Emit(context.Background(), "slow", immutablePayload("2")); err != nil {
 		t.Fatal(err)
 	}
-	if err := bus.Emit(context.Background(), "slow", "3"); !errors.Is(err, ErrBufferFull) {
+	if err := bus.Emit(context.Background(), "slow", immutablePayload("3")); !errors.Is(err, ErrBufferFull) {
 		t.Fatalf("full buffer error = %v, want %v", err, ErrBufferFull)
 	}
 
@@ -145,7 +244,7 @@ func TestChanBusCloseDrainsAcceptedEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := range 16 {
-		if err := bus.Emit(context.Background(), "audit", i); err != nil {
+		if err := bus.Emit(context.Background(), "audit", immutablePayload(i)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -162,7 +261,7 @@ func TestChanBusClose(t *testing.T) {
 	bus.Close()
 	bus.Close() // double close should not panic
 
-	bus.Emit(context.Background(), "test", "after close")
+	bus.Emit(context.Background(), "test", immutablePayload("after close"))
 }
 
 func TestChanBusCloseWaitsForInFlightEmit(t *testing.T) {
@@ -182,8 +281,19 @@ func TestChanBusCloseWaitsForInFlightEmit(t *testing.T) {
 		bus.Close()
 		close(closed)
 	}()
-	<-bus.done
-	ch <- "accepted"
+	deadline := time.Now().Add(time.Second)
+	for !bus.closed.Load() {
+		if time.Now().After(deadline) {
+			bus.mu.RUnlock()
+			t.Fatal("Close did not publish the closed state")
+		}
+		runtime.Gosched()
+	}
+	owned, err := immutablePayload("accepted").SnapshotEvent()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch <- owned
 	bus.mu.RUnlock()
 
 	select {
@@ -217,7 +327,7 @@ func TestChanBusTypedPayload(t *testing.T) {
 		return nil
 	})
 
-	bus.Emit(context.Background(), "order.created", OrderEvent{OrderID: 1, UserID: 42, Total: 99.99})
+	bus.Emit(context.Background(), "order.created", immutablePayload(OrderEvent{OrderID: 1, UserID: 42, Total: 99.99}))
 
 	<-done
 	if got.OrderID != 1 || got.UserID != 42 {
@@ -241,7 +351,7 @@ func TestChanBusConcurrent(t *testing.T) {
 	n := 100
 	wg.Add(n)
 	for range n {
-		go bus.Emit(context.Background(), "concurrent", "test")
+		go bus.Emit(context.Background(), "concurrent", immutablePayload("test"))
 	}
 
 	wg.Wait()
@@ -267,7 +377,7 @@ func TestChanBusHandlerPanicRecovery(t *testing.T) {
 		return nil
 	})
 
-	bus.Emit(context.Background(), "crash", "test")
+	bus.Emit(context.Background(), "crash", immutablePayload("test"))
 
 	select {
 	case <-done:
@@ -281,11 +391,11 @@ func TestChanBusHandlerPanicRecovery(t *testing.T) {
 }
 
 func TestSafeCall(t *testing.T) {
-	err := safeCall(func(ctx context.Context, payload any) error {
+	err := InvokeHandler(func(ctx context.Context, payload any) error {
 		panic("should not crash")
 	}, context.Background(), nil)
 	if err == nil {
-		t.Error("safeCall should return panic-converted error")
+		t.Error("InvokeHandler should return panic-converted error")
 	}
 	if !strings.Contains(err.Error(), "panic") {
 		t.Errorf("error should mention panic: %v", err)
@@ -319,7 +429,7 @@ func TestChanBusOnQueue(t *testing.T) {
 		return nil
 	})
 
-	bus.Emit(context.Background(), "user.created", map[string]any{"id": 1})
+	bus.Emit(context.Background(), "user.created", testEvent{UserID: 1})
 
 	select {
 	case <-done:
@@ -327,8 +437,8 @@ func TestChanBusOnQueue(t *testing.T) {
 		t.Fatal("timeout")
 	}
 
-	got := received.Load().(map[string]any)
-	if got["id"] != 1 {
+	got := received.Load().(testEvent)
+	if got.UserID != 1 {
 		t.Errorf("got %v", got)
 	}
 }
@@ -352,7 +462,7 @@ func TestChanBusOnQueueMultipleGroups(t *testing.T) {
 		return nil
 	})
 
-	bus.Emit(context.Background(), "order.created", "test")
+	bus.Emit(context.Background(), "order.created", immutablePayload("test"))
 
 	wg.Wait()
 	if count.Load() != 2 {
@@ -365,7 +475,7 @@ func TestChanBusEmitAfterClose(t *testing.T) {
 	bus.On("test", func(ctx context.Context, payload any) error { return nil })
 	bus.Close()
 
-	err := bus.Emit(context.Background(), "test", "data")
+	err := bus.Emit(context.Background(), "test", immutablePayload("data"))
 	if err == nil {
 		t.Fatal("Emit after Close should return error")
 	}
@@ -386,12 +496,16 @@ func BenchmarkChanBusEmit(b *testing.B) {
 	if err := bus.On("benchmark", func(context.Context, any) error { return nil }); err != nil {
 		b.Fatal(err)
 	}
-	b.Cleanup(bus.Close)
+	b.Cleanup(func() {
+		if err := bus.Close(); err != nil {
+			b.Error(err)
+		}
+	})
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
 		for {
-			err := bus.Emit(context.Background(), "benchmark", "payload")
+			err := bus.Emit(context.Background(), "benchmark", immutablePayload("payload"))
 			if err == nil {
 				break
 			}
@@ -400,5 +514,116 @@ func BenchmarkChanBusEmit(b *testing.B) {
 			}
 			runtime.Gosched()
 		}
+	}
+}
+func TestChanBusDispatchChannelClose(t *testing.T) {
+	bus := NewChanBus(1)
+
+	block := make(chan struct{})
+	bus.On("dispatch.close", func(ctx context.Context, payload any) error {
+		<-block
+		return nil
+	})
+
+	bus.Emit(context.Background(), "dispatch.close", immutablePayload("1"))
+	time.Sleep(10 * time.Millisecond)
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		bus.Close()
+	}()
+	close(block)
+	time.Sleep(50 * time.Millisecond)
+}
+
+type hostilePanicPayload struct{ called *bool }
+
+func (p hostilePanicPayload) String() string {
+	*p.called = true
+	panic("must not format panic payload")
+}
+
+func TestPanicRecoveryDoesNotInvokeFormatter(t *testing.T) {
+	called := false
+	err := InvokeHandler(func(context.Context, any) error {
+		panic(hostilePanicPayload{&called})
+	}, t.Context(), nil)
+	if called || err == nil {
+		t.Fatal("panic recovery invoked a user formatter")
+	}
+}
+
+func TestChanBusGoexitContinuesListenersWithOwnedSnapshots(t *testing.T) {
+	bus := NewChanBus(64)
+	var second, third atomic.Int32
+	if err := bus.On("audit", func(_ context.Context, value any) error {
+		value.([]byte)[0] = 99
+		runtime.Goexit()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.On("audit", func(_ context.Context, value any) error {
+		data := value.([]byte)
+		if data[0] != 7 {
+			t.Errorf("second listener received mutated data: %v", data)
+		}
+		data[0] = 88
+		second.Add(1)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.On("audit", func(_ context.Context, value any) error {
+		if value.([]byte)[0] != 7 {
+			t.Errorf("final listener received mutated data: %v", value)
+		}
+		third.Add(1)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for range 64 {
+		if err := bus.Emit(t.Context(), "audit", []byte{7}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bus.Close()
+	if second.Load() != 64 || third.Load() != 64 {
+		t.Fatalf("accepted dispatch lost listeners: second=%d third=%d", second.Load(), third.Load())
+	}
+}
+
+func BenchmarkChanBusDispatchRoundTrip(b *testing.B) {
+	for _, tc := range []struct {
+		name      string
+		listeners int
+	}{{"one", 1}, {"eight", 8}} {
+		b.Run(tc.name, func(b *testing.B) {
+			bus := NewChanBus(1)
+			done := make(chan struct{}, 1)
+			for i := range tc.listeners {
+				handler := func(context.Context, any) error { return nil }
+				if i+1 == tc.listeners {
+					handler = func(context.Context, any) error { done <- struct{}{}; return nil }
+				}
+				if err := bus.On("events", handler); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.Cleanup(func() {
+				if err := bus.Close(); err != nil {
+					b.Error(err)
+				}
+			})
+			payload := immutablePayload("payload")
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := bus.Emit(b.Context(), "events", payload); err != nil {
+					b.Fatal(err)
+				}
+				<-done
+			}
+		})
 	}
 }

@@ -1,3 +1,8 @@
+import 'int64.dart';
+import 'json.dart';
+import 'schema.dart' show maxSelectionFieldID, maxAPIID, maxParamID;
+import 'schema_ids.dart' show checkSchemaID;
+
 /// Three-state optional argument used by patch APIs.
 ///
 /// `absent` leaves the field unchanged, while `present(null)` explicitly
@@ -6,9 +11,7 @@ class LuxoOptional<T> {
   final bool isPresent;
   final T? value;
 
-  const LuxoOptional.absent()
-      : isPresent = false,
-        value = null;
+  const LuxoOptional.absent() : isPresent = false, value = null;
 
   const LuxoOptional.present(this.value) : isPresent = true;
 }
@@ -21,13 +24,9 @@ class Selected<T> {
   final bool isSelected;
   final T? _value;
 
-  const Selected.unselected()
-      : isSelected = false,
-        _value = null;
+  const Selected.unselected() : isSelected = false, _value = null;
 
-  const Selected.value(T value)
-      : isSelected = true,
-        _value = value;
+  const Selected.value(T value) : isSelected = true, _value = value;
 
   T get value {
     if (!isSelected) {
@@ -39,20 +38,41 @@ class Selected<T> {
 
 enum TypeUsage { input, output, inputOutput, unused }
 
+/// Static provenance read by the compiler from generated sum declarations.
+final class LuxoSealedProjection {
+  final String owner;
+  final List<String> variants;
+  const LuxoSealedProjection(this.owner, this.variants);
+}
+
+/// A generated case retains its wire owner, case name and stable tag.
+final class LuxoSealedCaseProjection {
+  final String owner;
+  final String variant;
+  final int tag;
+  const LuxoSealedCaseProjection(this.owner, this.variant, this.tag);
+}
+
+/// A target-language alias still selects the original wire field.
+final class LuxoSelectionFieldProjection {
+  final String name;
+  const LuxoSelectionFieldProjection(this.name);
+}
+
 TypeUsage? _typeUsageFromJson(Object? value) => switch (value) {
-      'input' => TypeUsage.input,
-      'output' => TypeUsage.output,
-      'inputOutput' => TypeUsage.inputOutput,
-      'unused' => TypeUsage.unused,
-      _ => null,
-    };
+  'input' => TypeUsage.input,
+  'output' => TypeUsage.output,
+  'inputOutput' => TypeUsage.inputOutput,
+  'unused' => TypeUsage.unused,
+  _ => null,
+};
 
 /// Paginated list response.
 class Page<T> {
   final List<T> items;
-  final int total;
-  final int page;
-  final int pageSize;
+  final LuxoInt64 total;
+  final LuxoInt64 page;
+  final LuxoInt64 pageSize;
 
   const Page({
     required this.items,
@@ -70,9 +90,9 @@ class Page<T> {
       items: (json['items'] as List)
           .map((e) => fromJson(e as Map<String, dynamic>))
           .toList(),
-      total: json['total'] as int,
-      page: json['page'] as int,
-      pageSize: json['pageSize'] as int,
+      total: luxoInt64FromJSON(json['total']),
+      page: luxoInt64FromJSON(json['page']),
+      pageSize: luxoInt64FromJSON(json['pageSize']),
     );
   }
 }
@@ -83,18 +103,69 @@ class LuxoSchema {
   final Map<String, LuxoAPI> apis;
   final Map<String, LuxoEnum> enums;
   final Map<String, LuxoTypeDecl> types;
+  final Map<String, LuxoSealed> sealeds;
 
-  const LuxoSchema(
-      {required this.models,
-      required this.apis,
-      this.enums = const {},
-      this.types = const {}});
+  const LuxoSchema({
+    required this.models,
+    required this.apis,
+    this.enums = const {},
+    this.types = const {},
+    this.sealeds = const {},
+  });
+
+  /// Validate the complete stable ID directory before generating files.
+  void validateIDs() {
+    for (final model in models.values) {
+      _validateFieldIDs(model.fields, 'model ${model.name}');
+    }
+    for (final type in types.values) {
+      _validateFieldIDs(type.fields, 'type ${type.name}');
+    }
+    for (final sealed in sealeds.values) {
+      final tags = <int>{};
+      for (final variant in sealed.variants) {
+        checkSchemaID(
+          variant.id,
+          maxSelectionFieldID,
+          tags,
+          'sealed ${sealed.name}',
+          variant.name,
+        );
+        final fields = <int>{};
+        for (final field in variant.fields) {
+          checkSchemaID(
+            field.id,
+            maxSelectionFieldID,
+            fields,
+            '${sealed.name}.${variant.name}',
+            field.name,
+          );
+        }
+      }
+    }
+    final seen = <int>{};
+    for (final api in apis.values) {
+      checkSchemaID(api.id, maxAPIID, seen, 'API', api.name);
+      _validatePagination(api);
+      final params = <int>{};
+      for (final param in api.params) {
+        checkSchemaID(
+          param.id,
+          maxParamID,
+          params,
+          'API ${api.name}',
+          param.name,
+        );
+      }
+    }
+  }
 
   factory LuxoSchema.fromJson(Map<String, dynamic> json) {
     final models = <String, LuxoModel>{};
     final apis = <String, LuxoAPI>{};
     final enums = <String, LuxoEnum>{};
     final types = <String, LuxoTypeDecl>{};
+    final sealeds = <String, LuxoSealed>{};
     if (json['models'] != null) {
       for (final e in (json['models'] as Map<String, dynamic>).entries) {
         models[e.key] = LuxoModel.fromJson(e.value as Map<String, dynamic>);
@@ -115,7 +186,42 @@ class LuxoSchema {
         types[e.key] = LuxoTypeDecl.fromJson(e.value as Map<String, dynamic>);
       }
     }
-    return LuxoSchema(models: models, apis: apis, enums: enums, types: types);
+    if (json['sealeds'] != null) {
+      for (final entry in (json['sealeds'] as Map<String, dynamic>).entries) {
+        sealeds[entry.key] = LuxoSealed.fromJson(
+          entry.value as Map<String, dynamic>,
+        );
+      }
+    }
+    return LuxoSchema(
+      models: models,
+      apis: apis,
+      enums: enums,
+      types: types,
+      sealeds: sealeds,
+    );
+  }
+}
+
+void _validatePagination(LuxoAPI api) {
+  if (!api.paginated) return;
+  for (final name in const ['page', 'pageSize']) {
+    final matches = api.params.where((param) => param.name == name);
+    if (matches.length != 1 ||
+        matches.single.type != 'Int' ||
+        matches.single.nullable ||
+        matches.single.isList) {
+      throw FormatException(
+        'API ${api.name} pagination requires a numbered non-null Int parameter $name',
+      );
+    }
+  }
+}
+
+void _validateFieldIDs(List<LuxoField> fields, String owner) {
+  final seen = <int>{};
+  for (final field in fields) {
+    checkSchemaID(field.id, maxSelectionFieldID, seen, owner, field.name);
   }
 }
 
@@ -124,9 +230,9 @@ class LuxoEnum {
   final List<String> values;
   const LuxoEnum({required this.name, required this.values});
   factory LuxoEnum.fromJson(Map<String, dynamic> json) => LuxoEnum(
-        name: json['name'] as String,
-        values: (json['values'] as List).cast<String>(),
-      );
+    name: json['name'] as String,
+    values: List<String>.from(json['values'] as List),
+  );
 }
 
 class LuxoTypeDecl {
@@ -135,10 +241,55 @@ class LuxoTypeDecl {
   final List<LuxoField> fields;
   const LuxoTypeDecl({required this.name, this.usage, required this.fields});
   factory LuxoTypeDecl.fromJson(Map<String, dynamic> json) => LuxoTypeDecl(
+    name: json['name'] as String,
+    usage: _typeUsageFromJson(json['usage']),
+    fields: (json['fields'] as List)
+        .map((e) => LuxoField.fromJson(e as Map<String, dynamic>))
+        .toList(),
+  );
+}
+
+class LuxoSealed {
+  final String name;
+  final String? module;
+  final TypeUsage? usage;
+  final String? description;
+  final List<LuxoSealedVariant> variants;
+  const LuxoSealed({
+    required this.name,
+    required this.variants,
+    this.module,
+    this.usage,
+    this.description,
+  });
+  factory LuxoSealed.fromJson(Map<String, dynamic> json) => LuxoSealed(
+    name: json['name'] as String,
+    module: json['module'] as String?,
+    usage: _typeUsageFromJson(json['usage']),
+    description: json['description'] as String?,
+    variants: (json['variants'] as List)
+        .map(
+          (value) => LuxoSealedVariant.fromJson(value as Map<String, dynamic>),
+        )
+        .toList(),
+  );
+}
+
+class LuxoSealedVariant {
+  final int id;
+  final String name;
+  final List<LuxoParam> fields;
+  const LuxoSealedVariant({
+    required this.id,
+    required this.name,
+    required this.fields,
+  });
+  factory LuxoSealedVariant.fromJson(Map<String, dynamic> json) =>
+      LuxoSealedVariant(
+        id: json['id'] as int,
         name: json['name'] as String,
-        usage: _typeUsageFromJson(json['usage']),
         fields: (json['fields'] as List)
-            .map((e) => LuxoField.fromJson(e as Map<String, dynamic>))
+            .map((value) => LuxoParam.fromJson(value as Map<String, dynamic>))
             .toList(),
       );
 }
@@ -147,15 +298,42 @@ class LuxoModel {
   final String name;
   final TypeUsage? usage;
   final List<LuxoField> fields;
+  final Map<String, LuxoComputedSource> computedSources;
 
-  const LuxoModel({required this.name, this.usage, required this.fields});
+  const LuxoModel({
+    required this.name,
+    this.usage,
+    required this.fields,
+    this.computedSources = const {},
+  });
 
   factory LuxoModel.fromJson(Map<String, dynamic> json) => LuxoModel(
-        name: json['name'] as String,
-        usage: _typeUsageFromJson(json['usage']),
-        fields: (json['fields'] as List)
-            .map((e) => LuxoField.fromJson(e as Map<String, dynamic>))
-            .toList(),
+    name: json['name'] as String,
+    usage: _typeUsageFromJson(json['usage']),
+    fields: (json['fields'] as List)
+        .map((e) => LuxoField.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    computedSources:
+        (json['computedSources'] as Map<String, dynamic>?)?.map(
+          (name, value) => MapEntry(
+            name,
+            LuxoComputedSource.fromJson(value as Map<String, dynamic>),
+          ),
+        ) ??
+        const {},
+  );
+}
+
+class LuxoComputedSource {
+  final String model;
+  final String module;
+
+  const LuxoComputedSource({required this.model, this.module = ''});
+
+  factory LuxoComputedSource.fromJson(Map<String, dynamic> json) =>
+      LuxoComputedSource(
+        model: json['model'] as String,
+        module: json['module'] as String? ?? '',
       );
 }
 
@@ -179,53 +357,94 @@ class LuxoField {
   });
 
   factory LuxoField.fromJson(Map<String, dynamic> json) => LuxoField(
-        id: json['id'] as int,
-        name: json['name'] as String,
-        type: json['type'] as String,
-        typeName: json['typeName'] as String?,
-        nullable: json['nullable'] as bool? ?? false,
-        isList: json['isList'] as bool? ?? false,
-        relation: json['relation'] as bool? ?? false,
-      );
+    id: json['id'] as int,
+    name: json['name'] as String,
+    type: json['type'] as String,
+    typeName: json['typeName'] as String?,
+    nullable: json['nullable'] as bool? ?? false,
+    isList: json['isList'] as bool? ?? false,
+    relation: json['relation'] as bool? ?? false,
+  );
 }
 
 class LuxoAPI {
   final int id;
   final String name;
   final String module;
+  final bool internal;
   final String? returnType;
   final bool returnList;
+  final bool returnNullable;
   final bool paginated;
   final int? defaultPageSize;
   final bool stream;
   final List<LuxoParam> params;
+  final LuxoQueryCapabilities? query;
 
   const LuxoAPI({
     required this.id,
     required this.name,
     required this.module,
+    this.internal = false,
     this.returnType,
     this.returnList = false,
+    this.returnNullable = false,
     this.paginated = false,
     this.defaultPageSize,
     this.stream = false,
     this.params = const [],
+    this.query,
   });
 
   factory LuxoAPI.fromJson(Map<String, dynamic> json) => LuxoAPI(
-        id: json['id'] as int,
-        name: json['name'] as String,
-        module: json['module'] as String,
-        returnType: json['returnType'] as String?,
-        returnList: json['returnList'] as bool? ?? false,
-        paginated: json['paginated'] as bool? ?? false,
-        defaultPageSize: json['defaultPageSize'] as int?,
-        stream: json['stream'] as bool? ?? false,
-        params: (json['params'] as List?)
-                ?.map((e) => LuxoParam.fromJson(e as Map<String, dynamic>))
-                .toList() ??
-            [],
-      );
+    id: json['id'] as int,
+    name: json['name'] as String,
+    module: json['module'] as String,
+    internal: json['internal'] as bool? ?? false,
+    returnType: json['returnType'] as String?,
+    returnList: json['returnList'] as bool? ?? false,
+    returnNullable: json['returnNullable'] as bool? ?? false,
+    paginated: json['paginated'] as bool? ?? false,
+    defaultPageSize: json['defaultPageSize'] as int?,
+    stream: json['stream'] as bool? ?? false,
+    query: json['query'] == null
+        ? null
+        : LuxoQueryCapabilities.fromJson(json['query'] as Map<String, dynamic>),
+    params:
+        (json['params'] as List?)
+            ?.map((e) => LuxoParam.fromJson(e as Map<String, dynamic>))
+            .toList() ??
+        [],
+  );
+}
+
+class LuxoQueryCapabilities {
+  final List<LuxoQueryFilter> filters;
+  final List<String> sorters;
+  const LuxoQueryCapabilities({
+    this.filters = const [],
+    this.sorters = const [],
+  });
+  LuxoQueryCapabilities.fromJson(Map<String, dynamic> json)
+    : filters = (json['filters'] as List? ?? [])
+          .map((e) => LuxoQueryFilter.fromJson(e as Map<String, dynamic>))
+          .toList(),
+      sorters = (json['sorters'] as List? ?? []).cast<String>();
+}
+
+class LuxoQueryFilter {
+  final String field;
+  final String type;
+  final List<String> operators;
+  const LuxoQueryFilter({
+    required this.field,
+    required this.type,
+    required this.operators,
+  });
+  LuxoQueryFilter.fromJson(Map<String, dynamic> json)
+    : field = json['field'] as String,
+      type = json['type'] as String,
+      operators = (json['operators'] as List).cast<String>();
 }
 
 class LuxoParam {
@@ -236,6 +455,7 @@ class LuxoParam {
   final bool isList;
   final bool nullable;
   final bool hasDefault;
+  final String? description;
 
   const LuxoParam({
     required this.id,
@@ -245,15 +465,17 @@ class LuxoParam {
     this.isList = false,
     this.nullable = false,
     this.hasDefault = false,
+    this.description,
   });
 
   factory LuxoParam.fromJson(Map<String, dynamic> json) => LuxoParam(
-        id: json['id'] as int,
-        name: json['name'] as String,
-        type: json['type'] as String,
-        typeName: json['typeName'] as String?,
-        isList: json['isList'] as bool? ?? false,
-        nullable: json['nullable'] as bool? ?? false,
-        hasDefault: json['hasDefault'] as bool? ?? false,
-      );
+    id: json['id'] as int,
+    name: json['name'] as String,
+    type: json['type'] as String,
+    typeName: json['typeName'] as String?,
+    isList: json['isList'] as bool? ?? false,
+    nullable: json['nullable'] as bool? ?? false,
+    hasDefault: json['hasDefault'] as bool? ?? false,
+    description: json['description'] as String?,
+  );
 }

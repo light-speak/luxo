@@ -1,0 +1,517 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:luxo_client/luxo_client.dart' as sdk;
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:test/test.dart';
+
+import 'types.dart';
+import 'client.dart';
+
+const socketEndpoint = '__MODEL_DEPTH_WS__';
+
+Object? jsonValue(int layers) {
+  Object? value;
+  for (var i = 0; i < layers; i++) value = [value];
+  return value;
+}
+
+Map<String, dynamic> jsonNode(int layers, {bool lists = false}) {
+  var node = <String, dynamic>{'metadata': jsonValue(128), 'children': []};
+  for (var i = 1; i < layers; i++) {
+    node = lists
+        ? {
+            'children': [node],
+          }
+        : {'child': node};
+  }
+  return node;
+}
+
+Uint8List wireNode(
+  int layers, {
+  bool columnar = false,
+  bool lists = false,
+  int count = 1,
+  int jsonDepth = 128,
+}) {
+  final value = layers == 1
+      ? Uint8List.fromList(
+          utf8.encode('${'[' * jsonDepth}null${']' * jsonDepth}'),
+        )
+      : wireNode(
+          layers - 1,
+          columnar: lists,
+          lists: lists,
+          jsonDepth: jsonDepth,
+        );
+  final encoder = sdk.LuxoEncoder();
+  if (columnar) encoder.writeVarint(count);
+  encoder.writeVarint(0);
+  encoder.writeVarint(
+    layers == 1
+        ? 3
+        : lists
+        ? 2
+        : 1,
+  );
+  for (var i = 0; i < (columnar ? count : 1); i++) {
+    encoder.writePresent();
+    encoder.writeBytes(value);
+  }
+  if (layers == 1) {
+    final empty = sdk.LuxoEncoder()
+      ..writeVarint(0)
+      ..writeVarint(0)
+      ..writeEnd();
+    encoder.writeVarint(2);
+    for (var i = 0; i < (columnar ? count : 1); i++) {
+      encoder.writePresent();
+      encoder.writeBytes(empty.bytes());
+    }
+  }
+  encoder.writeEnd();
+  return encoder.bytes();
+}
+
+Uint8List page(Uint8List columns) {
+  final encoder = sdk.LuxoEncoder();
+  for (final value in [1, 1, 10])
+    encoder.writeSvarint(sdk.LuxoInt64.fromInt(value));
+  return Uint8List.fromList([...columns, ...encoder.bytes()]);
+}
+
+Node outputNode(int layers, {bool lists = false, int jsonDepth = 128}) {
+  var value = Node(
+    metadata: sdk.Selected.value(jsonValue(jsonDepth)),
+    children: const sdk.Selected.value([]),
+  );
+  for (var i = 1; i < layers; i++) {
+    value = lists
+        ? Node(children: sdk.Selected.value([value]))
+        : Node(child: sdk.Selected.value(value));
+  }
+  return value;
+}
+
+NodeInput inputNode(int layers, {bool lists = false, int jsonDepth = 128}) {
+  var value = NodeInput(metadata: jsonValue(jsonDepth), children: []);
+  for (var i = 1; i < layers; i++) {
+    value = lists ? NodeInput(children: [value]) : NodeInput(child: value);
+  }
+  return value;
+}
+
+void main() {
+  for (final mode in sdk.TransportMode.values) {
+    test(
+      'generated HTTP checks model writes and read64/read65: $mode',
+      () async {
+        var sent = 0;
+        final client = LuxoClient(
+          sdk.HttpTransport(
+            'http://example.test/luxo',
+            options: sdk.TransportOptions(mode: mode),
+            client: MockClient((request) async {
+              sent++;
+              final nodes = requestControl(request, mode);
+              return mode == sdk.TransportMode.json
+                  ? http.Response(
+                      jsonEncode({
+                        'data': {'node': jsonNode(nodes)},
+                      }),
+                      200,
+                    )
+                  : http.Response.bytes(containerBytes(nodes), 200);
+            }),
+          ),
+        );
+        addTearDown(client.close);
+        await exerciseClient(client, mode, websocket: false);
+        expect(sent, 6);
+      },
+    );
+    test(
+      'generated real WS checks model writes and isolates read65: $mode',
+      () async {
+        final client = LuxoClient(
+          sdk.WsTransport(
+            socketEndpoint,
+            options: sdk.TransportOptions(mode: mode),
+            autoReconnect: false,
+          ),
+        );
+        addTearDown(client.close);
+        await exerciseClient(client, mode, websocket: true);
+      },
+    );
+  }
+  test('typed model cycles fail without leaking depth into later writes', () {
+    final outputs = <Node>[];
+    final output = Node(children: sdk.Selected.value(outputs));
+    outputs.add(output);
+    final inputs = <NodeInput>[];
+    final input = NodeInput(children: inputs);
+    inputs.add(input);
+    expect(() => output.toJson(), throwsFormatException);
+    expect(() => input.toJson(), throwsFormatException);
+    expect(() => sdk.encodeLuxoJSON(output), throwsFormatException);
+    expect(() => input.writeLuxo(sdk.LuxoEncoder()), throwsFormatException);
+    outputs.clear();
+    inputs.clear();
+    expect(() => sdk.encodeLuxoJSON(output), returnsNormally);
+    expect(() => input.writeLuxo(sdk.LuxoEncoder()), returnsNormally);
+  });
+  for (final lists in [false, true]) {
+    for (final layers in [63, 64]) {
+      test(
+        'generated model$layers JSON writing preserves JSON128 lists=$lists',
+        () {
+          final output = outputNode(layers, lists: lists);
+          final input = inputNode(layers, lists: lists);
+          expect(output.toJson(), isA<Map<String, Object?>>());
+          expect(input.toJson(), isA<Map<String, Object?>>());
+          expect(() => sdk.encodeLuxoJSON(output), returnsNormally);
+          expect(() => sdk.encodeLuxoJSON(input), returnsNormally);
+          expect(() => sdk.encodeLuxoJSON([output, output]), returnsNormally);
+        },
+      );
+      test(
+        'generated model$layers Binary writing accepts independent JSON128 lists=$lists',
+        () {
+          expect(
+            () => inputNode(layers, lists: lists).writeLuxo(sdk.LuxoEncoder()),
+            returnsNormally,
+          );
+        },
+      );
+    }
+    test('output toJson rejects model65 lists=$lists', () {
+      expect(
+        () => outputNode(65, lists: lists).toJson(),
+        throwsFormatException,
+      );
+    });
+    test('input toJson rejects model65 lists=$lists', () {
+      expect(() => inputNode(65, lists: lists).toJson(), throwsFormatException);
+    });
+    test('generic model encoding rejects model65 lists=$lists', () {
+      expect(
+        () => sdk.encodeLuxoJSON(outputNode(65, lists: lists, jsonDepth: 0)),
+        throwsFormatException,
+      );
+      expect(
+        () => sdk.encodeLuxoJSON(inputNode(65, lists: lists, jsonDepth: 0)),
+        throwsFormatException,
+      );
+    });
+    test('Binary model writing rejects model65 lists=$lists', () {
+      expect(
+        () => inputNode(65, lists: lists).writeLuxo(sdk.LuxoEncoder()),
+        throwsFormatException,
+      );
+    });
+  }
+  test(
+    'parameter projection preserves typed children without copying their graph',
+    () {
+      final child = inputNode(64, jsonDepth: 0);
+      final input = NodeInput(child: child, children: [child]);
+      final projected = input.toLuxoParameters();
+      expect(identical(projected['child'], child), isTrue);
+      expect(identical((projected['children'] as List).single, child), isTrue);
+    },
+  );
+  test('JSON128 values retain their identity in typed projections and JSON129 fails', () {
+    final raw = jsonValue(128);
+    final input = NodeInput(metadata: raw);
+    final output = Node(metadata: sdk.Selected.value(raw));
+    expect(identical(input.toJson()['metadata'], raw), isTrue);
+    expect(identical(output.toJson()['metadata'], raw), isTrue);
+    expect(() => inputNode(1, jsonDepth: 129).toJson(), throwsFormatException);
+    expect(() => outputNode(1, jsonDepth: 129).toJson(), throwsFormatException);
+  });
+  test('JSON projections count every Map implementation without copying', () {
+    for (final layers in [128, 129]) {
+      Object? raw;
+      for (var i = 0; i < layers; i++) raw = <Object?, Object?>{'next': raw};
+      final input = NodeInput(metadata: raw);
+      final output = Node(metadata: sdk.Selected.value(raw));
+      if (layers == 128) {
+        expect(identical(input.toJson()['metadata'], raw), isTrue);
+        expect(identical(output.toJson()['metadata'], raw), isTrue);
+      } else {
+        expect(() => input.toJson(), throwsFormatException);
+        expect(() => output.toJson(), throwsFormatException);
+      }
+    }
+    expect(
+      () => NodeInput(metadata: <Object?, Object?>{1: true}).toJson(),
+      throwsFormatException,
+    );
+    expect(
+      () =>
+          Node(metadata: sdk.Selected.value(<Object?, Object?>{1: true}))
+              .toJson(),
+      throwsFormatException,
+    );
+  });
+  test(
+    'opaque JSON budgets include every container of embedded typed models',
+    () {
+      final typed = outputNode(1);
+      expect(() => sdk.encodeLuxoJSON(typed), returnsNormally);
+      expect(
+        () => sdk.encodeLuxoJSON(typed, opaque: true),
+        throwsFormatException,
+      );
+      expect(
+        () => sdk.encodeLuxoJSON(Node(metadata: sdk.Selected.value(typed))),
+        throwsFormatException,
+      );
+    },
+  );
+  test('decoded model lists retain growable results', () {
+    final columns = wireNode(1, columnar: true);
+    final values = decodeColumnarNode(columns);
+    values.add(values.first);
+    expect(values, hasLength(2));
+    final items = decodePaginatedNode(page(columns)).items;
+    items.add(items.first);
+    expect(items, hasLength(2));
+    final model = Node.fromJson({
+      'children': [
+        {'metadata': null},
+      ],
+    }).children.value!;
+    model.add(model.first);
+    expect(model, hasLength(2));
+    final input = NodeInput.fromJson({
+      'children': [
+        {'metadata': null},
+      ],
+    }).children!;
+    input.add(input.first);
+    expect(input, hasLength(2));
+  });
+  test('nullable Binary JSON preserves literal null and field selection', () {
+    final value = Uint8List.fromList(utf8.encode('null'));
+    final row = sdk.LuxoEncoder()
+      ..writeVarint(0)
+      ..writeVarint(3)
+      ..writePresent()
+      ..writeBytes(value)
+      ..writeEnd();
+    final decoded = decodeNode(sdk.LuxoDecoder(row.bytes()));
+    expect(decoded.metadata.isSelected, isTrue);
+    expect(decoded.metadata.value, isNull);
+    final column = sdk.LuxoEncoder()
+      ..writeVarint(1)
+      ..writeVarint(0)
+      ..writeVarint(3)
+      ..writePresent()
+      ..writeBytes(value)
+      ..writeEnd();
+    expect(decodeColumnarNode(column.bytes()).single.metadata.value, isNull);
+    final absent = sdk.LuxoEncoder()
+      ..writeVarint(0)
+      ..writeEnd();
+    expect(
+      decodeNode(sdk.LuxoDecoder(absent.bytes())).metadata.isSelected,
+      isFalse,
+    );
+  });
+  for (final lists in [false, true]) {
+    for (final layers in [63, 64]) {
+      test(
+        'direct JSON and input accept model$layers with JSON128 lists=$lists',
+        () {
+          final source = jsonNode(layers, lists: lists);
+          expect(Node.fromJson(source), isA<Node>());
+          expect(NodeInput.fromJson(source), isA<NodeInput>());
+          expect(Node.$fromJsonItem(source), isA<Node>());
+        },
+      );
+      test(
+        'Binary row, columnar and page accept model$layers lists=$lists',
+        () {
+          expect(
+            decodeNode(sdk.LuxoDecoder(wireNode(layers, lists: lists))),
+            isA<Node>(),
+          );
+          final columns = wireNode(
+            layers,
+            columnar: true,
+            lists: lists,
+            count: 2,
+          );
+          expect(decodeColumnarNode(columns), hasLength(2));
+          expect(decodePaginatedNode(page(columns)).items, hasLength(2));
+        },
+      );
+    }
+    test('direct JSON rejects model65 lists=$lists', () {
+      final source = jsonNode(65, lists: lists);
+      expect(() => Node.fromJson(source), throwsFormatException);
+    });
+    test('direct input rejects model65 lists=$lists', () {
+      final source = jsonNode(65, lists: lists);
+      expect(() => NodeInput.fromJson(source), throwsFormatException);
+    });
+    test('direct JSON list item rejects model65 lists=$lists', () {
+      final source = jsonNode(65, lists: lists);
+      expect(() => Node.$fromJsonItem(source), throwsFormatException);
+    });
+    test('Binary row rejects model65 lists=$lists', () {
+      expect(
+        () => decodeNode(sdk.LuxoDecoder(wireNode(65, lists: lists))),
+        throwsFormatException,
+      );
+    });
+    test('Binary columnar rejects model65 lists=$lists', () {
+      expect(
+        () => decodeColumnarNode(wireNode(65, columnar: true, lists: lists)),
+        throwsFormatException,
+      );
+    });
+    test('Binary page rejects model65 lists=$lists', () {
+      expect(
+        () => decodePaginatedNode(
+          page(wireNode(65, columnar: true, lists: lists)),
+        ),
+        throwsFormatException,
+      );
+    });
+  }
+  test('outer model consumes one object level and siblings reset depth', () {
+    expect(Container.fromJson({'node': jsonNode(63)}), isA<Container>());
+    expect(
+      () => Container.fromJson({'node': jsonNode(64)}),
+      throwsFormatException,
+    );
+    final row = sdk.LuxoEncoder()
+      ..writeVarint(0)
+      ..writeVarint(1)
+      ..writeBytes(wireNode(63))
+      ..writeEnd();
+    expect(decodeContainer(sdk.LuxoDecoder(row.bytes())), isA<Container>());
+    final tooDeep = sdk.LuxoEncoder()
+      ..writeVarint(0)
+      ..writeVarint(1)
+      ..writeBytes(wireNode(64))
+      ..writeEnd();
+    expect(
+      () => decodeContainer(sdk.LuxoDecoder(tooDeep.bytes())),
+      throwsFormatException,
+    );
+    expect(
+      Node.fromJson({
+        'children': [jsonNode(63), jsonNode(63)],
+      }).children.value,
+      hasLength(2),
+    );
+  });
+  test(
+    'cyclic direct JSON reports FormatException and later calls recover',
+    () {
+      final source = <String, dynamic>{};
+      source['child'] = source;
+      expect(() => Node.fromJson(source), throwsFormatException);
+      expect(() => NodeInput.fromJson(source), throwsFormatException);
+      expect(Node.fromJson({'metadata': jsonValue(128)}), isA<Node>());
+      expect(
+        NodeInput.fromJson({'metadata': jsonValue(128)}),
+        isA<NodeInput>(),
+      );
+    },
+  );
+  test(
+    'generic JSON129 remains independent and empty model lists are valid',
+    () {
+      expect(
+        () => Node.fromJson({'metadata': jsonValue(129)}),
+        throwsFormatException,
+      );
+      expect(
+        () => NodeInput.fromJson({'metadata': jsonValue(129)}),
+        throwsFormatException,
+      );
+      final empty = sdk.LuxoEncoder()
+        ..writeVarint(0)
+        ..writeVarint(0)
+        ..writeEnd();
+      expect(decodeColumnarNode(empty.bytes()), isEmpty);
+      expect(decodePaginatedNode(page(empty.bytes())).items, isEmpty);
+    },
+  );
+  test('Binary JSON129 is rejected inside an otherwise valid model64', () {
+    expect(
+      () => decodeNode(sdk.LuxoDecoder(wireNode(64, jsonDepth: 129))),
+      throwsFormatException,
+    );
+    final columns = wireNode(64, columnar: true, jsonDepth: 129);
+    expect(() => decodeColumnarNode(columns), throwsFormatException);
+    expect(() => decodePaginatedNode(page(columns)), throwsFormatException);
+  });
+}
+
+List<int> containerBytes(int nodes) {
+  final value = wireNode(nodes);
+  return (sdk.LuxoEncoder()
+        ..writeVarint(0)
+        ..writeVarint(1)
+        ..writeBytes(value)
+        ..writeEnd())
+      .bytes();
+}
+
+int requestControl(http.Request request, sdk.TransportMode mode) {
+  if (mode == sdk.TransportMode.json)
+    return (jsonDecode(request.body) as Map)['control'] as int;
+  final decoder = sdk.LuxoDecoder(request.bodyBytes);
+  expect(decoder.readUnsigned(), 1);
+  expect(decoder.readBytes(), isNotEmpty);
+  var nodes = 1;
+  while (decoder.nextField()) {
+    if (decoder.fieldID == 1) {
+      decoder.readBytes();
+    } else {
+      expect(decoder.fieldID, 2);
+      nodes = decoder.readInt().toInt();
+    }
+  }
+  decoder.checkComplete();
+  return nodes;
+}
+
+Future<void> exerciseClient(
+  LuxoClient client,
+  sdk.TransportMode mode, {
+  required bool websocket,
+}) async {
+  final selection = LuxoClient.$prepareSelection('node{metadata}');
+  Future<Container> read(int nodes, NodeInput value) => client.read(
+    value: value,
+    control: sdk.LuxoInt64.fromInt(nodes),
+    $selectionPlan: selection,
+  );
+  Matcher failure(String label) => throwsA(
+    isA<sdk.LuxoError>().having((error) => error.error, 'error', label),
+  );
+  final badInput = mode == sdk.TransportMode.binary
+      ? throwsFormatException
+      : failure('ConfigError');
+  final badOutput = mode == sdk.TransportMode.binary
+      ? throwsFormatException
+      : failure(websocket ? 'DecodeError' : 'ParseError');
+  expect(await read(1, inputNode(64)), isA<Container>());
+  await expectLater(read(1, inputNode(65)), badInput);
+  expect(await read(63, inputNode(1)), isA<Container>());
+  await expectLater(read(64, inputNode(1)), badOutput);
+  final bad = expectLater(read(64, inputNode(1)), badOutput);
+  final good = read(1, inputNode(1));
+  await bad;
+  expect(await good, isA<Container>());
+  expect(await read(1, inputNode(1)), isA<Container>());
+}

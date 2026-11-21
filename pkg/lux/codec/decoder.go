@@ -47,6 +47,10 @@ func (d *Decoder) NextField() bool {
 		}
 		return false
 	}
+	if id > uint64(^uint(0)>>1) {
+		d.err = fmt.Errorf("codec: field ID %d exceeds host index range at offset %d", id, d.off)
+		return false
+	}
 	d.off += n
 	d.fieldID = int(id)
 	return d.fieldID != 0 // 0 = end marker
@@ -73,6 +77,15 @@ func (d *Decoder) Fail(err error) {
 // Offset returns the current read position.
 func (d *Decoder) Offset() int {
 	return d.off
+}
+
+// Finish validates an independent message or value boundary. Inline fields must
+// not call it: their following bytes still belong to the enclosing message.
+func (d *Decoder) Finish() error {
+	if d.err == nil && d.off != len(d.buf) {
+		d.err = fmt.Errorf("codec: trailing data at offset %d", d.off)
+	}
+	return d.err
 }
 
 // --- Typed readers ---
@@ -176,6 +189,9 @@ func (d *Decoder) ReadStringPtr() *string {
 		return nil
 	}
 	v := d.ReadString()
+	if d.err != nil {
+		return nil
+	}
 	return &v
 }
 
@@ -233,21 +249,27 @@ func (d *Decoder) ReadBytesValuePtr() *[]byte {
 func (d *Decoder) ReadArrayLength() int {
 	count, n := ReadArrayHeader(d.buf, d.off)
 	if n == 0 {
-		d.err = fmt.Errorf("codec: invalid array header at offset %d", d.off)
-		return 0
-	}
-	if count > MaxArrayElements {
-		d.err = fmt.Errorf("codec: array size %d exceeds limit %d at offset %d", count, MaxArrayElements, d.off)
+		d.err = fmt.Errorf("codec: invalid array header (limit %d) at offset %d", MaxArrayElements, d.off)
 		return 0
 	}
 	d.off += n
 	return count
 }
 
+// CheckElementBytes validates the minimum payload before allocating results.
+// Generated inline readers use it after ReadArrayLength; it preserves errors
+// and does not consume data or replace per-element validation.
+func (d *Decoder) CheckElementBytes(count, minSize int) bool {
+	if d.err == nil && !HasElementBytes(d.buf, d.off, count, minSize) {
+		d.err = ErrInsufficientElementBytes
+	}
+	return d.err == nil
+}
+
 // ReadIntArray reads a count-prefixed int64 array.
 func (d *Decoder) ReadIntArray() []int64 {
 	count := d.ReadArrayLength()
-	if d.err != nil {
+	if !d.CheckElementBytes(count, 1) {
 		return nil
 	}
 	result := make([]int64, 0, count)
@@ -263,7 +285,7 @@ func (d *Decoder) ReadIntArray() []int64 {
 // ReadStringArray reads a count-prefixed string array.
 func (d *Decoder) ReadStringArray() []string {
 	count := d.ReadArrayLength()
-	if d.err != nil {
+	if !d.CheckElementBytes(count, 1) {
 		return nil
 	}
 	result := make([]string, 0, count)
@@ -279,7 +301,7 @@ func (d *Decoder) ReadStringArray() []string {
 // ReadFloatArray reads a count-prefixed float64 array.
 func (d *Decoder) ReadFloatArray() []float64 {
 	count := d.ReadArrayLength()
-	if d.err != nil {
+	if !d.CheckElementBytes(count, 8) {
 		return nil
 	}
 	result := make([]float64, 0, count)
@@ -295,7 +317,7 @@ func (d *Decoder) ReadFloatArray() []float64 {
 // ReadBoolArray reads a count-prefixed bool array.
 func (d *Decoder) ReadBoolArray() []bool {
 	count := d.ReadArrayLength()
-	if d.err != nil {
+	if !d.CheckElementBytes(count, 1) {
 		return nil
 	}
 	result := make([]bool, 0, count)
@@ -312,7 +334,7 @@ func (d *Decoder) ReadBoolArray() []bool {
 // Encoder.WriteFieldBytesArray). Each element is a length-prefixed byte blob.
 func (d *Decoder) ReadBytesArray() [][]byte {
 	count := d.ReadArrayLength()
-	if d.err != nil {
+	if !d.CheckElementBytes(count, 1) {
 		return nil
 	}
 	result := make([][]byte, 0, count)
@@ -359,17 +381,14 @@ func (d *Decoder) ReadUUIDPtr() *[16]byte {
 // ReadUUIDArray reads a count-prefixed UUID array (fixed 16-byte items).
 func (d *Decoder) ReadUUIDArray() [][16]byte {
 	count := d.ReadArrayLength()
-	if d.err != nil {
+	if !d.CheckElementBytes(count, 16) {
 		return nil
 	}
 	result := make([][16]byte, 0, count)
 	for i := 0; i < count; i++ {
-		u, un := ReadUUID(d.buf, d.off)
-		if un == 0 {
-			d.err = fmt.Errorf("codec: truncated uuid at array index %d", i)
-			return nil
-		}
-		d.off += un
+		var u [16]byte
+		copy(u[:], d.buf[d.off:d.off+16])
+		d.off += 16
 		result = append(result, u)
 	}
 	return result
@@ -388,7 +407,7 @@ const MaxArenaSize = 64 * 1024 * 1024
 // ReadArenaSize reads the totalStringLen varint that prefixes a model's binary
 // encoding. The caller allocates make([]byte, size) and passes it to
 // ReadStringArena / ReadStringArenaPtr.
-// Returns 0 (with error) if the size exceeds MaxArenaSize.
+// Returns 0 with an error if the size exceeds MaxArenaSize or the remaining payload.
 func (d *Decoder) ReadArenaSize() int {
 	v, n := ReadVarint(d.buf, d.off)
 	if n <= 0 {
@@ -400,18 +419,17 @@ func (d *Decoder) ReadArenaSize() int {
 		d.err = fmt.Errorf("codec: arena size %d exceeds limit %d at offset %d", v, MaxArenaSize, d.off-n)
 		return 0
 	}
+	if v > uint64(len(d.buf)-d.off) {
+		d.err = ErrInsufficientArenaBytes
+		return 0
+	}
 	return int(v)
 }
 
 // SkipArenaHeader skips the totalStringLen varint prefix.
 // Used by code paths that don't need arena allocation (e.g. Binary→JSON conversion).
 func (d *Decoder) SkipArenaHeader() {
-	_, n := ReadVarint(d.buf, d.off)
-	if n <= 0 {
-		d.err = fmt.Errorf("codec: invalid arena header varint at offset %d", d.off)
-		return
-	}
-	d.off += n
+	d.ReadArenaSize()
 }
 
 // ReadStringArena reads a length-prefixed string, copies the bytes into arena
@@ -420,7 +438,7 @@ func (d *Decoder) SkipArenaHeader() {
 // Falls back to a regular string allocation if the arena is too small
 // (defensive: should not happen with correct totalStringLen).
 func (d *Decoder) ReadStringArena(arena []byte, arenaOff *int) string {
-	b, n := ReadBytes(d.buf, d.off)
+	b, n := readStringBytes(d.buf, d.off)
 	if n == 0 {
 		d.err = fmt.Errorf("codec: invalid string at offset %d", d.off)
 		return ""
@@ -453,6 +471,9 @@ func (d *Decoder) ReadStringArenaPtr(arena []byte, arenaOff *int) *string {
 		return nil
 	}
 	v := d.ReadStringArena(arena, arenaOff)
+	if d.err != nil {
+		return nil
+	}
 	return &v
 }
 
@@ -461,14 +482,18 @@ func (d *Decoder) ReadStringArenaPtr(arena []byte, arenaOff *int) *string {
 type FieldSkipType int
 
 const (
-	SkipVarint      FieldSkipType = iota // Int, DateTime, Duration, Bool
-	SkipFixed64                          // Float (8 bytes)
-	SkipBytes                            // String, Bytes, JSON, Decimal (length-prefixed)
-	SkipNullVarint                       // Nullable varint (1 byte flag + optional varint)
-	SkipNullFixed64                      // Nullable float (1 byte flag + optional 8 bytes)
-	SkipNullBytes                        // Nullable string/bytes (1 byte flag + optional length-prefixed)
-	SkipFixed16                          // UUID (16 bytes)
-	SkipNullFixed16                      // Nullable UUID (1 byte flag + optional 16 bytes)
+	SkipVarint       FieldSkipType = iota // Int, Duration, Bool
+	SkipFixed64                           // Float (8 bytes)
+	SkipBytes                             // Opaque length-prefixed bytes
+	SkipNullVarint                        // Nullable varint (1 byte flag + optional varint)
+	SkipNullFixed64                       // Nullable float (1 byte flag + optional 8 bytes)
+	SkipNullBytes                         // Nullable opaque bytes (1 byte flag + optional length-prefixed)
+	SkipFixed16                           // UUID (16 bytes)
+	SkipNullFixed16                       // Nullable UUID (1 byte flag + optional 16 bytes)
+	SkipString                            // Strict UTF-8 length-prefixed text
+	SkipNullString                        // Nullable strict UTF-8 text
+	SkipDateTime                          // Signed seconds + unsigned nanoseconds
+	SkipNullDateTime                      // Nullable seconds/nanoseconds pair
 )
 
 // --- Zero-allocation skip methods ---
@@ -486,8 +511,8 @@ func (d *Decoder) SkipVarint() {
 
 // SkipFixed64 advances past an 8-byte fixed64 value.
 func (d *Decoder) SkipFixed64() {
-	if d.off+8 > len(d.buf) {
-		d.err = fmt.Errorf("codec: truncated fixed64 at offset %d", d.off)
+	if _, n := ReadFixed64(d.buf, d.off); n == 0 {
+		d.err = fmt.Errorf("codec: invalid fixed64 at offset %d", d.off)
 		return
 	}
 	d.off += 8
@@ -502,7 +527,7 @@ func (d *Decoder) SkipFixed16() {
 	d.off += 16
 }
 
-// SkipLenPrefixed advances past a length-prefixed value (string/bytes) without allocating.
+// SkipLenPrefixed advances past opaque bytes without allocating. Text uses SkipString.
 func (d *Decoder) SkipLenPrefixed() {
 	_, n := ReadBytes(d.buf, d.off)
 	if n == 0 {
@@ -510,6 +535,29 @@ func (d *Decoder) SkipLenPrefixed() {
 		return
 	}
 	d.off += n
+}
+
+// SkipString validates UTF-8 without materializing a Go string.
+func (d *Decoder) SkipString() {
+	_, n := readStringBytes(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid string at offset %d", d.off)
+		return
+	}
+	d.off += n
+}
+
+// SkipNullableString preserves null and validates only present text.
+func (d *Decoder) SkipNullableString() {
+	present, n := ReadNullable(d.buf, d.off)
+	if n == 0 {
+		d.err = fmt.Errorf("codec: invalid nullable at offset %d", d.off)
+		return
+	}
+	d.off += n
+	if present {
+		d.SkipString()
+	}
 }
 
 // SkipNullableVarint advances past a nullable varint (flag + optional value).
@@ -583,6 +631,14 @@ func (d *Decoder) SkipValue(fieldType FieldSkipType) {
 		d.SkipFixed16()
 	case SkipNullFixed16:
 		d.SkipNullableFixed16()
+	case SkipString:
+		d.SkipString()
+	case SkipNullString:
+		d.SkipNullableString()
+	case SkipDateTime:
+		d.SkipDateTime()
+	case SkipNullDateTime:
+		d.SkipNullableDateTime()
 	default:
 		d.err = fmt.Errorf("codec: unknown skip type %d", fieldType)
 	}
@@ -590,16 +646,7 @@ func (d *Decoder) SkipValue(fieldType FieldSkipType) {
 
 // SkipArray advances past a count-prefixed sequence without allocating.
 func (d *Decoder) SkipArray(elementType FieldSkipType) {
-	count, n := ReadArrayHeader(d.buf, d.off)
-	if n == 0 {
-		d.err = fmt.Errorf("codec: invalid array header at offset %d", d.off)
-		return
-	}
-	if count > MaxArrayElements {
-		d.err = fmt.Errorf("codec: array size %d exceeds limit %d at offset %d", count, MaxArrayElements, d.off)
-		return
-	}
-	d.off += n
+	count := d.ReadArrayLength()
 	for range count {
 		d.SkipValue(elementType)
 		if d.err != nil {

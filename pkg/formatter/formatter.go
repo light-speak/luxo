@@ -476,7 +476,7 @@ func (f *formatter) emitRawFieldTokens(fld field) {
 			f.newline()
 			f.indent++
 			// Format remaining tokens as body lines
-			f.emitRawBodyTokens(fld.tokens[i+1:])
+			f.emitRawBodyTokens(fld.tokens[i+1:], tok.Pos.Line)
 			return
 		}
 		f.emitTokenWithSpacing(tok, prevType)
@@ -485,53 +485,15 @@ func (f *formatter) emitRawFieldTokens(fld field) {
 }
 
 // emitRawBodyTokens formats tokens collected from a raw block body with proper indentation.
-func (f *formatter) emitRawBodyTokens(tokens []token.Token) {
-	// Group tokens by original line
-	if len(tokens) == 0 {
-		f.indent--
-		f.writeIndent()
-		f.writeStr("}")
-		return
-	}
-
-	i := 0
-	for i < len(tokens) {
-		tok := tokens[i]
-
-		// Closing brace at depth 0
-		if tok.Type == token.RBrace {
-			f.indent--
-			f.writeIndent()
-			f.writeStr("}")
-			return
-		}
-
-		// Emit one line of tokens
-		line := tok.Pos.Line
-		f.writeIndent()
-		var prevType token.Type
-		for i < len(tokens) {
-			tok = tokens[i]
-			if tok.Pos.Line != line {
-				break
-			}
-			// Defensive: stop at inner RBrace to avoid emitting it as content.
-			// Unreachable in normal flow because the outer loop handles the
-			// final RBrace via the i == len(tokens)-1 check above.
-			if tok.Type == token.RBrace {
-				break
-			}
-			f.emitTokenWithSpacing(tok, prevType)
-			prevType = tok.Type
-			i++
-		}
-		f.newline()
-	}
-	// collectRawBody always includes the closing }, so we should never get here.
-	// Defensive fallback (unreachable in normal flow):
+func (f *formatter) emitRawBodyTokens(tokens []token.Token, startLine int) {
+	// Reuse statement/block handling so an inner brace cannot discard the rest of the body.
+	outerTokens, outerPos, outerLine := f.tokens, f.pos, f.lastLine
+	f.tokens, f.pos, f.lastLine = tokens, 0, startLine
 	f.indent--
+	f.formatBody()
 	f.writeIndent()
 	f.writeStr("}")
+	f.tokens, f.pos, f.lastLine = outerTokens, outerPos, outerLine
 }
 
 // collectFields gathers field descriptors from the current position until the matching }.
@@ -948,11 +910,6 @@ func (f *formatter) emitDeclTail(checkTopLevel bool) {
 		if tok.Type == token.Comment || tok.Type == token.DocComment {
 			break
 		}
-		// Defensive: atEnd() already returns true for EOF, so this is unreachable
-		// in normal flow, but guards against any future changes to atEnd().
-		if checkTopLevel && tok.Type == token.EOF {
-			break
-		}
 		if checkTopLevel && parenDepth == 0 && isTopLevelKeyword(tok.Type) {
 			break
 		}
@@ -1307,10 +1264,16 @@ func (f *formatter) formatOnInlineBody() {
 	f.writeStr("{")
 	f.advance()
 	var prevType token.Type = token.LBrace
+	depth := 0
 	for !f.atEnd() {
 		tok := f.peek()
 		if tok.Type == token.RBrace {
-			break
+			if depth == 0 {
+				break
+			}
+			depth--
+		} else if tok.Type == token.LBrace {
+			depth++
 		}
 		f.emitTokenWithSpacing(tok, prevType)
 		prevType = tok.Type
@@ -1329,18 +1292,7 @@ func (f *formatter) formatOnMultilineBody(startLine int) {
 	f.space()
 	f.writeStr("{")
 	f.advance()
-	if f.peek().Pos.Line == startLine {
-		var prevType token.Type = token.LBrace
-		for !f.atEnd() {
-			tok := f.peek()
-			if tok.Pos.Line != startLine || tok.Type == token.RBrace {
-				break
-			}
-			f.emitTokenWithSpacing(tok, prevType)
-			prevType = tok.Type
-			f.advance()
-		}
-	}
+	f.emitLambdaParams()
 	f.newline()
 	f.lastLine = startLine
 	f.formatBody()
@@ -1403,11 +1355,6 @@ func (f *formatter) formatBody() {
 		if tok.Type == token.RBrace {
 			break
 		}
-		// Defensive: atEnd() already returns true for EOF, making this unreachable
-		// in normal flow, but kept as a safety guard.
-		if tok.Type == token.EOF {
-			break
-		}
 
 		f.emitBlankLineIfNeeded(tok)
 
@@ -1432,6 +1379,7 @@ func (f *formatter) formatBody() {
 type stmtState struct {
 	prevType   token.Type
 	parenDepth int
+	braceDepth int
 	curLine    int
 }
 
@@ -1443,12 +1391,16 @@ func (f *formatter) formatStatement(startLine int) {
 			break
 		}
 		if tok.Type == token.LBrace && st.parenDepth == 0 {
-			if done := f.handleNestedBlock(startLine, &st.prevType); done {
+			if done := f.handleNestedBlock(st); done {
 				return
 			}
 			continue
 		}
 		if tok.Type == token.RBrace && st.parenDepth == 0 {
+			if st.braceDepth == 0 {
+				break
+			}
+			st.braceDepth--
 			if f.handleInlineRBrace(st) {
 				return
 			}
@@ -1483,11 +1435,6 @@ func (f *formatter) stmtShouldBreak(tok token.Token, st *stmtState) bool {
 	if tok.Type == token.RBrace && tok.Pos.Line != st.curLine && st.parenDepth == 0 {
 		return true
 	}
-	// Defensive: atEnd() in the caller loop already returns true for EOF,
-	// making this unreachable in normal flow, but kept as a safety guard.
-	if tok.Type == token.EOF {
-		return true
-	}
 	if tok.Type == token.Comment || tok.Type == token.DocComment {
 		if tok.Pos.Line == st.curLine {
 			f.space()
@@ -1507,6 +1454,9 @@ func (f *formatter) handleInlineRBrace(st *stmtState) bool {
 	st.prevType = tok.Type
 	f.advance()
 	st.curLine = tok.Pos.Line
+	if st.braceDepth > 0 {
+		return false
+	}
 	next := f.peek()
 	// Chain continuation after }
 	if next.Pos.Line != st.curLine && (next.Type == token.Dot || next.Type == token.SafeDot) {
@@ -1557,13 +1507,14 @@ func (f *formatter) handleLineContinuation(tok token.Token, st *stmtState) bool 
 
 // handleNestedBlock handles a { block inside a statement.
 // Returns true if the statement is complete (caller should return).
-func (f *formatter) handleNestedBlock(startLine int, prevType *token.Type) bool {
+func (f *formatter) handleNestedBlock(st *stmtState) bool {
 	tok := f.peek()
 	closeLine := f.findClosingBraceLine()
 	if closeLine == tok.Pos.Line {
 		// Single-line block — emit inline
-		f.emitTokenWithSpacing(tok, *prevType)
-		*prevType = tok.Type
+		f.emitTokenWithSpacing(tok, st.prevType)
+		st.prevType = tok.Type
+		st.braceDepth++
 		f.advance()
 		return false
 	}
@@ -1584,7 +1535,7 @@ func (f *formatter) handleNestedBlock(startLine int, prevType *token.Type) bool 
 	// Check if there's more on the same statement
 	if f.peek().Pos.Line == f.lastLine && f.peek().Type != token.RBrace &&
 		f.peek().Type != token.EOF {
-		*prevType = token.RBrace
+		st.prevType = token.RBrace
 		return false
 	}
 	f.newline()

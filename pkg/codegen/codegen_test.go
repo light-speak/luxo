@@ -19,6 +19,22 @@ func buildResult(files ...*ast.File) *semantic.Result {
 	}
 }
 
+func TestGeneratorSnapshotsSharedEnumDeclarations(t *testing.T) {
+	declaration := &ast.EnumDecl{Name: "Role", Values: []string{"USER", "ADMIN"}, Doc: "Roles"}
+	context := BuildEventContext([]*ast.File{{Name: "origin/common/types.luxo", Enums: []*ast.EnumDecl{declaration}}}, "example.com/app")
+	generator := mustNewGenerator(t, GeneratorConfig{Events: context})
+	declaration.Values[0] = "CHANGED"
+	declaration.Doc = "changed"
+	delete(context.Enums, "Role")
+	got := generator.events.Enums["Role"]
+	if got == nil || got.Values[0] != "USER" || got.Doc != "Roles" {
+		t.Fatalf("shared enum snapshot changed: %#v", got)
+	}
+	if generator.events.EnumModule["Role"] != "common" {
+		t.Fatal("shared enum lost schema ownership")
+	}
+}
+
 func TestGeneratorAllEnumsMergesLocalAndCrossModuleEnums(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{Events: &EventContext{
 		EnumModule: map[string]string{"Role": "auth"},
@@ -65,10 +81,10 @@ func TestGenerateEmpty(t *testing.T) {
 	}
 }
 
-func TestFormatGeneratedReturnsInvalidSourceUnchanged(t *testing.T) {
+func TestFormatGeneratedRejectsInvalidSource(t *testing.T) {
 	raw := []byte("package invalid {")
-	if got := formatGenerated(raw); !bytes.Equal(got, raw) {
-		t.Fatalf("formatGenerated() = %q, want original %q", got, raw)
+	if got, err := formatGeneratedChecked(raw); err == nil || got != nil {
+		t.Fatalf("formatGeneratedChecked() = %q, %v; want nil source and error", got, err)
 	}
 }
 
@@ -177,7 +193,7 @@ func TestGenerateOutputIsGofmtFormatted(t *testing.T) {
 		},
 	}
 
-	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{ModelFields: modelIDs}})
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: completeFixtureAPIIDs(result(file), StableIDs{ModelFields: modelIDs})})
 	gr, err := generator.Generate(result(file), "gen", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -405,8 +421,11 @@ func TestGenerateAutoUUIDDBImports(t *testing.T) {
 	if !strings.Contains(dbSrc, `"time"`) {
 		t.Errorf("missing time import in db.gen.go:\n%s", dbSrc)
 	}
-	if !strings.Contains(dbSrc, "uuid.Must(uuid.NewV7())") {
+	if !strings.Contains(dbSrc, "_autoIdRaw, err := uuid.NewV7()") || strings.Contains(dbSrc, "uuid.Must(") {
 		t.Errorf("missing uuid auto-fill:\n%s", dbSrc)
+	}
+	if !strings.Contains(dbSrc, "if err != nil {\n\t\treturn nil, err\n\t}") {
+		t.Error("UUID generation failure must propagate")
 	}
 }
 
@@ -589,7 +608,11 @@ func TestGenerateAppFile(t *testing.T) {
 		"&OrderClient{db: db}",
 		"func (a *App) Close()",
 		"func (a *App) Tx(ctx context.Context, fn func(tx *App) error) error",
-		"NewFromDB(txDB)",
+		"txApp := *a",
+		"txApp.DB = txDB",
+		"txApp.User = &UserClient{db: txDB}",
+		"txApp.Order = &OrderClient{db: txDB}",
+		"return fn(&txApp)",
 	}
 	for _, check := range checks {
 		if !strings.Contains(appSrc, check) {
@@ -919,15 +942,6 @@ func TestGeneratorAPIParamIDs(t *testing.T) {
 	}
 }
 
-func TestGeneratorAPIParamTypes(t *testing.T) {
-	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{APIParamTypes: map[string]map[string]string{
-		"getUser": {"id": "Int"},
-	}}})
-	if generator.ids.APIParamTypes["getUser"]["id"] != "Int" {
-		t.Fatal("API parameter type not copied")
-	}
-}
-
 func TestDriverImportAndPkg(t *testing.T) {
 	tests := []struct {
 		d          DBDriver
@@ -955,7 +969,7 @@ func TestBuildSchemaJSON(t *testing.T) {
 	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
 		ModelFields: map[string]map[string]int{"User": {"id": 1, "name": 2, "email": 3}},
 		APIs:        map[string]int{"getUser": 7, "listUsers": 8},
-		APIParams:   map[string]map[string]int{"getUser": {"id": 1}},
+		APIParams:   map[string]map[string]int{"getUser": {"id": 1}, "listUsers": {"page": 1, "pageSize": 2}},
 	}})
 
 	r := result(
@@ -973,6 +987,7 @@ func TestBuildSchemaJSON(t *testing.T) {
 		},
 	)
 
+	generator = mustNewGenerator(t, GeneratorConfig{IDs: completeFixtureAPIIDs(r, generator.ids)})
 	data, err := generator.BuildSchemaJSON(r, map[string]bool{})
 	if err != nil {
 		t.Fatal(err)
@@ -1505,5 +1520,24 @@ func TestAppNeedsEvents(t *testing.T) {
 	r10 := &semantic.Result{Files: []*ast.File{{}}}
 	if appNeedsEvents(r10) {
 		t.Error("should not need events when empty")
+	}
+}
+
+func TestGenerationRejectsCrossFileInheritanceCycle(t *testing.T) {
+	first := &ast.ModelDecl{Name: "First", Parents: []string{"Second"}}
+	second := &ast.ModelDecl{Name: "Second", Parents: []string{"First"}}
+	for _, reverse := range []bool{false, true} {
+		files := []*ast.File{{Name: "first.luxo", Models: []*ast.ModelDecl{first}}, {Name: "second.luxo", Models: []*ast.ModelDecl{second}}}
+		if reverse {
+			files[0], files[1] = files[1], files[0]
+		}
+		result := semantic.Analyze(files)
+		generated, err := Generate(result, "generated", GeneratorConfig{IDs: StableIDs{ModelFields: map[string]map[string]int{"First": {}, "Second": {}}}})
+		if err == nil || generated != nil || !strings.Contains(err.Error(), "inheritance cycle") {
+			t.Fatalf("cyclic model generated output: %v", err)
+		}
+		if len(first.Parents) != 1 || first.Parents[0] != "Second" || len(second.Parents) != 1 || second.Parents[0] != "First" {
+			t.Fatal("diagnosis changed source inheritance")
+		}
 	}
 }

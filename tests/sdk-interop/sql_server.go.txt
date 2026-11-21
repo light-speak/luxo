@@ -1,0 +1,320 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/h2transport"
+	"github.com/light-speak/luxo/pkg/lux/pg"
+	"github.com/light-speak/luxo/pkg/lux/rpc"
+	"io"
+	"mime"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type capture struct {
+	mu         sync.Mutex
+	queries    []string
+	rpc        atomic.Int64
+	calls      map[string]int64
+	failed     int64
+	diagnostic bool
+	timing     captureTimings
+	active     atomic.Int64
+	overlaps   atomic.Int64
+}
+
+type captureTimings struct {
+	HandlerNs   []int64 `json:"handlerNs"`
+	QueryNs     []int64 `json:"queryNs"`
+	HTTPNs      []int64 `json:"httpNs"`
+	QueryErrors int64   `json:"queryErrors"`
+}
+
+type queryTimingKey struct{}
+
+func (c *capture) Record(name string, duration time.Duration, failed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.calls == nil {
+		c.calls = make(map[string]int64)
+	}
+	c.calls[name]++
+	if c.diagnostic {
+		c.timing.HandlerNs = append(c.timing.HandlerNs, int64(duration))
+	}
+	if failed {
+		c.failed++
+	}
+}
+
+func (c *capture) counts() (map[string]int64, int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	calls := make(map[string]int64, len(c.calls))
+	for name, count := range c.calls {
+		calls[name] = count
+	}
+	return calls, c.failed
+}
+
+func (c *capture) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	c.mu.Lock()
+	c.queries = append(c.queries, d.SQL)
+	c.mu.Unlock()
+	if c.diagnostic {
+		return context.WithValue(ctx, queryTimingKey{}, time.Now())
+	}
+	return ctx
+}
+func (c *capture) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
+	if !c.diagnostic {
+		return
+	}
+	started, ok := ctx.Value(queryTimingKey{}).(time.Time)
+	if !ok {
+		return
+	}
+	elapsed := time.Since(started)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.timing.QueryNs = append(c.timing.QueryNs, int64(elapsed))
+	if data.Err != nil {
+		c.timing.QueryErrors++
+	}
+}
+
+func (c *capture) recordHTTP(duration time.Duration) {
+	if c.diagnostic {
+		c.mu.Lock()
+		c.timing.HTTPNs = append(c.timing.HTTPNs, int64(duration))
+		c.mu.Unlock()
+	}
+}
+
+func (c *capture) takeTimings() *captureTimings {
+	if !c.diagnostic {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	snapshot := c.timing
+	c.timing = captureTimings{}
+	return &snapshot
+}
+func (c *capture) take() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	q := c.queries
+	c.queries = nil
+	return q
+}
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+func run() (result error) {
+	ctx := context.Background()
+	dsn := os.Getenv("LUXO_TEST_DATABASE_URL")
+	if dsn == "" {
+		return fmt.Errorf("LUXO_TEST_DATABASE_URL must identify a dedicated empty test database")
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return err
+	}
+	trace := &capture{diagnostic: os.Getenv("LUXO_SQL_TIMING") == "1"}
+	cfg.ConnConfig.Tracer = trace
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	_, err = pool.Exec(ctx, fixtureSetupSQL)
+	if err != nil {
+		return err
+	}
+	trace.take()
+	trace.takeTimings()
+	router, err := prepareSQLRouter(pool)
+	if err != nil {
+		return err
+	}
+	if os.Getenv("LUXO_SQL_GATEWAY") == "1" {
+		gateway, closeGateway, err := startSQLGateway(router, trace)
+		if err != nil {
+			return err
+		}
+		defer func() { result = errors.Join(result, closeGateway()) }()
+		router = gateway
+	}
+	return serveSQLFixture(router, trace)
+}
+
+func startSQLGateway(backend *api.Router, trace *capture) (*api.Router, func() error, error) {
+	internal := api.NewRouter()
+	internal.Schema, internal.Registry = backend.Schema, backend.Registry
+	for name, handler := range backend.ExportHandlers() {
+		wrapped := func(ctx context.Context, req *api.Request) error {
+			trace.rpc.Add(1)
+			return handler(ctx, req)
+		}
+		if definition := internal.Schema.APIs[name]; definition != nil && definition.Internal {
+			internal.HandleInternal(name, wrapped)
+		} else {
+			internal.Handle(name, wrapped)
+		}
+	}
+	if err := internal.Prepare(); err != nil {
+		return nil, nil, err
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, nil, err
+	}
+	server := rpc.NewServer(internal)
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(listener) }()
+	client := rpc.NewNamedClient("precision", listener.Addr().String())
+	closeGateway := func() error {
+		client.Close()
+		server.Close()
+		return <-done
+	}
+	gateway, err := sqlGatewayRouter(backend, client)
+	if err != nil {
+		return nil, nil, errors.Join(err, closeGateway())
+	}
+	return gateway, closeGateway, nil
+}
+
+func sqlGatewayRouter(backend *api.Router, client *rpc.Client) (*api.Router, error) {
+	router := api.NewRouter()
+	router.SetDevMode(false)
+	router.IntrospectionKey = backend.IntrospectionKey
+	router.Schema, router.Registry = backend.Schema, backend.Registry
+	clients := map[string]*rpc.Client{"precision": client}
+	for name, definition := range router.Schema.APIs {
+		if !definition.Internal {
+			router.Handle(name, proxyHandler(client, router.Schema, name, clients))
+		}
+	}
+	if err := router.Prepare(); err != nil {
+		return nil, err
+	}
+	return router, nil
+}
+
+func prepareSQLRouter(pool *pgxpool.Pool) (*api.Router, error) {
+	app := NewFromDB(pg.NewDBFromPool(pool))
+	configureSQLApp(app)
+	router := api.NewRouter()
+	router.SetDevMode(false)
+	router.IntrospectionKey = "benchmark"
+	if err := RegisterSchema(router.Schema); err != nil {
+		return nil, err
+	}
+	if err := router.Registry.RegisterSchemaAPIs(router.Schema); err != nil {
+		return nil, err
+	}
+	if err := RegisterHandlers(router, app); err != nil {
+		return nil, err
+	}
+	if err := router.Prepare(); err != nil {
+		return nil, err
+	}
+	return router, nil
+}
+
+func sqlRequestMode(r *http.Request) string {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		return ""
+	}
+	mode := r.Header.Get("X-Luxo-Mode")
+	if (mode == "" || mode == "json") && mediaType == "application/json" {
+		return "json"
+	}
+	if mode == "binary" && mediaType == "application/x-luxo" {
+		return "binary"
+	}
+	return ""
+}
+
+func serveSQLFixture(router *api.Router, trace *capture) error {
+	router.SetMetricsCollector(trace)
+	var h2, other, jsonRequests, binaryRequests, unknownMode atomic.Int64
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if trace.diagnostic {
+			started := time.Now()
+			if trace.active.Add(1) != 1 {
+				trace.overlaps.Add(1)
+			}
+			defer func() {
+				trace.recordHTTP(time.Since(started))
+				trace.active.Add(-1)
+			}()
+		}
+		if r.ProtoMajor == 2 {
+			h2.Add(1)
+		} else {
+			other.Add(1)
+		}
+		switch sqlRequestMode(r) {
+		case "json":
+			jsonRequests.Add(1)
+		case "binary":
+			binaryRequests.Add(1)
+		default:
+			unknownMode.Add(1)
+		}
+		router.ServeHTTP(w, r)
+	})
+	secure := httptest.NewUnstartedServer(handler)
+	engine, err := h2transport.NewServer(handler)
+	if err != nil {
+		return err
+	}
+	if err = engine.ConfigureHTTPServer(secure.Config); err != nil {
+		return err
+	}
+	secure.TLS = secure.Config.TLSConfig
+	secure.EnableHTTP2 = true
+	secure.StartTLS()
+	defer secure.Close()
+	defer engine.Close()
+	plain := httptest.NewServer(router)
+	defer plain.Close()
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: secure.Certificate().Raw})
+	if err := json.NewEncoder(os.Stdout).Encode(map[string]string{"url": secure.URL + "/luvia", "plain": plain.URL + "/luvia", "certificate": string(certificate)}); err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	calls, failed := trace.counts()
+	return json.NewEncoder(os.Stdout).Encode(struct {
+		H2       int64            `json:"h2Requests"`
+		Other    int64            `json:"otherRequests"`
+		SQL      []string         `json:"sql"`
+		RPC      int64            `json:"rpcRequests"`
+		JSON     int64            `json:"jsonRequests"`
+		Binary   int64            `json:"binaryRequests"`
+		Unknown  int64            `json:"unknownMode"`
+		Calls    map[string]int64 `json:"apiRequests"`
+		Errors   int64            `json:"apiErrors"`
+		Timings  *captureTimings  `json:"timings,omitempty"`
+		Overlaps int64            `json:"timingOverlaps,omitempty"`
+	}{h2.Load(), other.Load(), trace.take(), trace.rpc.Load(), jsonRequests.Load(), binaryRequests.Load(), unknownMode.Load(), calls, failed, trace.takeTimings(), trace.overlaps.Load()})
+}

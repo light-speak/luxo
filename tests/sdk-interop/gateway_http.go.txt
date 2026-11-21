@@ -1,0 +1,503 @@
+package main
+
+import (
+	"github.com/light-speak/luxo/internal/testutil"
+
+	"bytes"
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/rpc"
+	"github.com/light-speak/luxo/pkg/lux/schema"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+)
+
+type proxyHTTPFixture struct {
+	endpoint      string
+	client        *http.Client
+	body, want    []byte
+	contentType   string
+	binary        bool
+	protocolMajor int
+	connections   []*atomic.Int64
+}
+
+func TestProxyHTTPFixture(t *testing.T) {
+	for _, rows := range []int{1, 128} {
+		for _, branches := range []int{0, 2} {
+			for _, binary := range []bool{false, true} {
+				t.Run(fmt.Sprintf("rows=%d/branches=%d/binary=%v", rows, branches, binary), func(t *testing.T) {
+					fixture := newProxyHTTPFixture(t, rows, branches, binary)
+					for range 3 {
+						if err := fixture.call(); err != nil {
+							t.Fatal(err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestProxyHTTPRejectsInvalidBenchmarkResponse(t *testing.T) {
+	fixture := proxyHTTPFixture{want: []byte(`{"id":42}`), contentType: "application/json"}
+	for _, item := range []struct {
+		status     int
+		kind, body string
+	}{
+		{404, "application/json", `{"id":42}`},
+		{200, "application/x-luxo", `{"id":42}`},
+		{200, "application/json", `{"id":43}`},
+		{200, "application/json", `{"id":42,"unselected":true}`},
+	} {
+		if err := fixture.validate(item.status, item.kind, []byte(item.body)); err == nil {
+			t.Fatalf("invalid benchmark response accepted: %+v", item)
+		}
+	}
+	if err := fixture.validate(200, "application/json", fixture.want); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProxyHTTPWideFixture(t *testing.T) {
+	for _, fields := range []int{16, 128} {
+		for _, rows := range []int{1, 128} {
+			for _, branches := range []int{0, 2} {
+				for _, binary := range []bool{false, true} {
+					t.Run(fmt.Sprintf("fields=%d/rows=%d/branches=%d/binary=%v", fields, rows, branches, binary), func(t *testing.T) {
+						fixture := newProxyHTTPWideFixture(t, rows, branches, fields, binary)
+						if err := fixture.call(); err != nil {
+							t.Fatal(err)
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestProxyHTTPPrimaryRejectsWrongProjection(t *testing.T) {
+	handler := proxyHTTPPrimaryHandler(t, 1, 16)
+	req := &api.Request{FieldMask: proxyTestMask(t, 0)}
+	if err := handler(context.Background(), req); err == nil {
+		t.Fatal("primary accepted a different field selection")
+	}
+}
+
+func TestProxyHTTP2Fixture(t *testing.T) {
+	for _, sample := range proxyHTTP2Shapes() {
+		t.Run(sample.name(), func(t *testing.T) {
+			fixture := newProxyHTTPTransportFixture(t, sample.rows, sample.branches, sample.fields, sample.binary, true)
+			for range 3 {
+				if err := fixture.call(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestProxyHTTP2RejectsHTTP1Fallback(t *testing.T) {
+	fixture := newProxyHTTPFixture(t, 1, 0, false)
+	fixture.protocolMajor = 2
+	if err := fixture.call(); err == nil || !strings.Contains(err.Error(), "HTTP version") {
+		t.Fatalf("HTTP/1 response must not satisfy HTTP/2 verification: %v", err)
+	}
+}
+
+func TestProxyHTTPReusesEveryHop(t *testing.T) {
+	for _, useHTTP2 := range []bool{false, true} {
+		for _, binary := range []bool{false, true} {
+			t.Run(fmt.Sprintf("h2=%t/binary=%t", useHTTP2, binary), func(t *testing.T) {
+				fixture := newProxyHTTPTransportFixture(t, 128, 2, 128, binary, useHTTP2)
+				for range 32 {
+					if err := fixture.call(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := fixture.checkConnectionReuse(); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
+func TestProxyHTTPDetectsReconnect(t *testing.T) {
+	if err := (proxyHTTPFixture{}).checkConnectionReuse(); err == nil {
+		t.Fatal("missing counters cannot prove reuse")
+	}
+	fixture := newProxyHTTPFixture(t, 1, 0, false)
+	if err := fixture.checkConnectionReuse(); err == nil {
+		t.Fatal("unused connections cannot prove reuse")
+	}
+	if err := fixture.call(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.checkConnectionReuse(); err != nil {
+		t.Fatal(err)
+	}
+	fixture.client.CloseIdleConnections()
+	if err := fixture.call(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.checkConnectionReuse(); err == nil {
+		t.Fatal("fresh HTTP connection passed the warm-connection gate")
+	}
+}
+
+type proxyHTTP2Shape struct {
+	fields, rows, branches int
+	binary                 bool
+}
+
+func (s proxyHTTP2Shape) name() string {
+	return fmt.Sprintf("fields=%d/rows=%d/branches=%d/binary=%v", s.fields, s.rows, s.branches, s.binary)
+}
+
+func proxyHTTP2Shapes() []proxyHTTP2Shape {
+	var shapes []proxyHTTP2Shape
+	for _, fields := range []int{1, 16, 128} {
+		for _, rows := range []int{1, 128} {
+			for _, branches := range []int{0, 2} {
+				for _, binary := range []bool{false, true} {
+					shapes = append(shapes, proxyHTTP2Shape{fields, rows, branches, binary})
+				}
+			}
+		}
+	}
+	return shapes
+}
+
+// This measures real HTTP and TCP RPC, including routing and response validation.
+// Backends return fixed protocol payloads: no database, external SDK or business work.
+func BenchmarkProxyHTTP(b *testing.B) {
+	for _, rows := range []int{1, 128} {
+		for _, branches := range []int{0, 2} {
+			for _, binary := range []bool{false, true} {
+				b.Run(fmt.Sprintf("rows=%d/branches=%d/binary=%v", rows, branches, binary), func(b *testing.B) {
+					fixture := newProxyHTTPFixture(b, rows, branches, binary)
+					benchmarkProxyHTTP(b, fixture)
+				})
+			}
+		}
+	}
+}
+
+func BenchmarkProxyHTTPWide(b *testing.B) {
+	for _, fields := range []int{16, 128} {
+		for _, rows := range []int{1, 128} {
+			for _, branches := range []int{0, 2} {
+				for _, binary := range []bool{false, true} {
+					b.Run(fmt.Sprintf("fields=%d/rows=%d/branches=%d/binary=%v", fields, rows, branches, binary), func(b *testing.B) {
+						fixture := newProxyHTTPWideFixture(b, rows, branches, fields, binary)
+						benchmarkProxyHTTP(b, fixture)
+					})
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkProxyHTTP2(b *testing.B) {
+	for _, sample := range proxyHTTP2Shapes() {
+		b.Run(sample.name(), func(b *testing.B) {
+			fixture := newProxyHTTPTransportFixture(b, sample.rows, sample.branches, sample.fields, sample.binary, true)
+			benchmarkProxyHTTP(b, fixture)
+		})
+	}
+}
+
+func benchmarkProxyHTTP(b *testing.B, fixture proxyHTTPFixture) {
+	b.Helper()
+	for range 32 {
+		if err := fixture.call(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(fixture.want)))
+	if err := fixture.checkConnectionReuse(); err != nil {
+		b.Fatal(err)
+	}
+	for b.Loop() {
+		if err := fixture.call(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := fixture.checkConnectionReuse(); err != nil {
+		b.Fatal(err)
+	}
+}
+
+func (f proxyHTTPFixture) checkConnectionReuse() error {
+	if len(f.connections) == 0 {
+		return fmt.Errorf("missing connection counters")
+	}
+	for index, counter := range f.connections {
+		if got := counter.Load(); got != 1 {
+			return fmt.Errorf("listener %d accepted %d connections, want exactly 1", index, got)
+		}
+	}
+	return nil
+}
+
+func newProxyHTTPFixture(t testing.TB, rows, branches int, binary bool) proxyHTTPFixture {
+	t.Helper()
+	return newProxyHTTPWideFixture(t, rows, branches, 1, binary)
+}
+
+func newProxyHTTPWideFixture(t testing.TB, rows, branches, columns int, binary bool) proxyHTTPFixture {
+	t.Helper()
+	return newProxyHTTPTransportFixture(t, rows, branches, columns, binary, false)
+}
+
+func newProxyHTTPTransportFixture(t testing.TB, rows, branches, columns int, binary, useHTTP2 bool) proxyHTTPFixture {
+	t.Helper()
+	s := proxyTestSchema(t, rows > 1, branches)
+	var extra []schema.Field
+	for fieldID := 4; fieldID < columns+3; fieldID++ {
+		extra = append(extra, schema.Field{ID: fieldID, Name: "field" + strconv.Itoa(fieldID), Type: schema.FieldInt})
+	}
+	if len(extra) > 0 {
+		proxyTestRequire(t, s.RegisterModel(&schema.Model{Name: "Parent", Fields: extra}))
+	}
+	primary, primaryConnections := proxyTestCountedRPC(t, s, map[string]api.HandlerFunc{"parent": proxyHTTPPrimaryHandler(t, rows, columns)})
+	connections := []*atomic.Int64{primaryConnections}
+	clients := make(map[string]*rpc.Client)
+	for _, target := range []struct{ module, model string }{{"child", "Child"}, {"other", "Other"}}[:branches] {
+		client, count := proxyTestCountedRPC(t, s, map[string]api.HandlerFunc{
+			"svc:resolve:" + target.model + ":parentId": proxyHTTPResolver(rows),
+		})
+		clients[target.module] = client
+		connections = append(connections, count)
+	}
+	router := api.NewRouter()
+	router.Schema = s
+	proxyTestRequire(t, router.Registry.RegisterSchemaAPIs(s))
+	router.Handle("parent", proxyHandler(primary, s, "parent", clients))
+	endpoint, client, httpConnections := proxyHTTPServer(t, router, useHTTP2)
+	connections = append(connections, httpConnections)
+	body := []byte(`{"$api":"parent","$select":`)
+	body = strconv.AppendQuote(body, proxyHTTPSelection(branches, columns))
+	body = append(body, '}')
+	want, kind := proxyHTTPJSON(rows, branches, columns), "application/json"
+	if binary {
+		var err error
+		body, err = api.EncodeBinaryRequest(1, proxyHTTPMask(t, branches, columns), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, kind = proxyHTTPBinary(rows, branches, columns), "application/x-luxo"
+	}
+	major := 1
+	if useHTTP2 {
+		major = 2
+	}
+	return proxyHTTPFixture{endpoint: endpoint, client: client, body: body, want: want, contentType: kind, binary: binary, protocolMajor: major, connections: connections}
+}
+
+func proxyHTTPServer(t testing.TB, router *api.Router, useHTTP2 bool) (string, *http.Client, *atomic.Int64) {
+	t.Helper()
+	var handler http.Handler = router
+	if useHTTP2 {
+		handler = h2c.NewHandler(router, &http2.Server{})
+	}
+	server := httptest.NewUnstartedServer(handler)
+	listener := &proxyCountingListener{Listener: server.Listener}
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	client := server.Client()
+	if useHTTP2 {
+		client.Transport = &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
+			},
+		}
+	}
+	client.Timeout = 5 * time.Second
+	t.Cleanup(client.CloseIdleConnections)
+	return server.URL + "/luvia", client, &listener.accepted
+}
+
+func (f proxyHTTPFixture) call() error {
+	request, err := http.NewRequest(http.MethodPost, f.endpoint, bytes.NewReader(f.body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", f.contentType)
+	if f.binary {
+		request.Header.Set("X-Luxo-Mode", "binary")
+	}
+	response, err := f.client.Do(request)
+	if err != nil {
+		return err
+	}
+	body, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	if readErr != nil {
+		return readErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if response.ProtoMajor != f.protocolMajor {
+		return fmt.Errorf("HTTP version: got %d, want %d", response.ProtoMajor, f.protocolMajor)
+	}
+	return f.validate(response.StatusCode, response.Header.Get("Content-Type"), body)
+}
+
+func (f proxyHTTPFixture) validate(status int, contentType string, body []byte) error {
+	if status != http.StatusOK {
+		return fmt.Errorf("HTTP %d: %s", status, body)
+	}
+	if contentType != f.contentType {
+		return fmt.Errorf("response mode: %q, want %q", contentType, f.contentType)
+	}
+	if !bytes.Equal(body, f.want) {
+		return fmt.Errorf("response mismatch: got %d bytes (%x), want %d bytes (%x)", len(body), body[:min(len(body), 64)], len(f.want), f.want[:min(len(f.want), 64)])
+	}
+	return nil
+}
+
+func proxyHTTPSelection(branches, columns int) string {
+	var selected strings.Builder
+	selected.WriteString("id")
+	for fieldID := 4; fieldID < columns+3; fieldID++ {
+		selected.WriteString(", field")
+		selected.WriteString(strconv.Itoa(fieldID))
+	}
+	if branches == 2 {
+		selected.WriteString(", children { id }, others { id }")
+	}
+	return selected.String()
+}
+
+func proxyHTTPMask(t testing.TB, branches, columns int) []byte {
+	fields, children, _ := codec.SplitSelectionMask(proxyTestMask(t, branches))
+	fields = bytes.Clone(fields)
+	for fieldID := 4; fieldID < columns+3; fieldID++ {
+		fields = testutil.Bytes(t)(codec.FieldMaskSet(fields, fieldID))
+	}
+	return append(testutil.Bytes(t)(codec.AppendSelectionMask(nil, fields, nil)), children...)
+}
+
+func proxyHTTPPrimaryHandler(t testing.TB, rows, columns int) api.HandlerFunc {
+	wantMask, body := proxyHTTPMask(t, 0, columns), proxyHTTPPrimary(rows, columns)
+	return func(_ context.Context, req *api.Request) error {
+		if !bytes.Equal(req.FieldMask, wantMask) {
+			return fmt.Errorf("primary field selection mismatch: got %x, want %x", req.FieldMask, wantMask)
+		}
+		req.Buf.B = append(req.Buf.B, body...)
+		return nil
+	}
+}
+
+func proxyHTTPPrimary(rows, columns int) []byte {
+	var body []byte
+	if rows > 1 {
+		body = codec.AppendVarint(body, uint64(rows))
+	}
+	body = append(body, 0, 1)
+	for i := range rows {
+		body = codec.AppendSvarint(body, math.MaxInt64-int64(i))
+	}
+	for fieldID := 4; fieldID < columns+3; fieldID++ {
+		body = codec.AppendVarint(body, uint64(fieldID))
+		for i := range rows {
+			body = codec.AppendSvarint(body, int64(fieldID*1000+i))
+		}
+	}
+	return append(body, 0)
+}
+
+func proxyHTTPResolver(rows int) api.HandlerFunc {
+	return func(_ context.Context, req *api.Request) error {
+		keys, err := req.ParamIntArray("keys")
+		if err != nil || len(keys) != rows {
+			return fmt.Errorf("resolver keys: %v, %v", keys, err)
+		}
+		shape, err := req.ParamInt("shape")
+		if err != nil || shape != 1 {
+			return fmt.Errorf("resolver shape: %v, %v", shape, err)
+		}
+		req.Buf.B = codec.AppendVarint(req.Buf.B, uint64(rows))
+		for i, key := range keys {
+			if key != math.MaxInt64-int64(i) {
+				return fmt.Errorf("resolver key %d lost precision", i)
+			}
+			req.Buf.B = codec.AppendBytes(req.Buf.B, proxyHTTPChild(key))
+		}
+		return nil
+	}
+}
+
+func proxyHTTPChild(key int64) []byte {
+	body := codec.AppendSvarint([]byte{1, 0, 1}, key)
+	return append(body, 0)
+}
+
+// Golden wire is assembled independently of the gateway merge implementation.
+func proxyHTTPBinary(rows, branches, columns int) []byte {
+	body := proxyHTTPPrimary(rows, columns)
+	if branches == 0 {
+		return body
+	}
+	body = body[:len(body)-1]
+	for field := 2; field <= branches+1; field++ {
+		body = codec.AppendVarint(body, uint64(field))
+		for i := range rows {
+			body = codec.AppendBytes(body, proxyHTTPChild(math.MaxInt64-int64(i)))
+		}
+	}
+	return append(body, 0)
+}
+
+func proxyHTTPJSON(rows, branches, columns int) []byte {
+	body := []byte(`{"data":`)
+	if rows > 1 {
+		body = append(body, '[')
+	}
+	for i := range rows {
+		if i > 0 {
+			body = append(body, ',')
+		}
+		key := math.MaxInt64 - int64(i)
+		body = append(body, `{"id":`...)
+		body = strconv.AppendInt(body, key, 10)
+		for fieldID := 4; fieldID < columns+3; fieldID++ {
+			body = append(body, `,"field`...)
+			body = strconv.AppendInt(body, int64(fieldID), 10)
+			body = append(body, `":`...)
+			body = strconv.AppendInt(body, int64(fieldID*1000+i), 10)
+		}
+		for _, name := range []string{"children", "others"}[:branches] {
+			body = append(body, ',')
+			body = strconv.AppendQuote(body, name)
+			body = append(body, `:[{"id":`...)
+			body = strconv.AppendInt(body, key, 10)
+			body = append(body, '}', ']')
+		}
+		body = append(body, '}')
+	}
+	if rows > 1 {
+		body = append(body, ']')
+	}
+	return append(body, '}')
+}

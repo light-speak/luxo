@@ -1,9 +1,20 @@
 package queue
 
 import (
-	"os"
 	"testing"
 )
+
+func TestConfigDefaultsDoNotHideNegativeValues(t *testing.T) {
+	for _, original := range []Config{{MaxRetries: -1}, {RetryDelay: -1}, {Concurrency: -1}} {
+		cfg := original
+		cfg.SetDefaults()
+		if original.MaxRetries < 0 && cfg.MaxRetries >= 0 ||
+			original.RetryDelay < 0 && cfg.RetryDelay >= 0 ||
+			original.Concurrency < 0 && cfg.Concurrency >= 0 {
+			t.Errorf("negative configuration was silently defaulted: %+v -> %+v", original, cfg)
+		}
+	}
+}
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
@@ -20,7 +31,7 @@ func TestDefaultConfig(t *testing.T) {
 
 func TestConfigValidateDefaults(t *testing.T) {
 	cfg := Config{}
-	cfg.validate()
+	cfg.SetDefaults()
 	if cfg.MaxRetries != 3 || cfg.Concurrency != 4 || cfg.RetryDelay != 5e9 {
 		t.Errorf("validate did not fill defaults: %+v", cfg)
 	}
@@ -28,46 +39,54 @@ func TestConfigValidateDefaults(t *testing.T) {
 
 func TestConfigValidateKeepsExplicit(t *testing.T) {
 	cfg := Config{MaxRetries: 5, RetryDelay: 1e9, Concurrency: 8}
-	cfg.validate()
+	cfg.SetDefaults()
 	if cfg.MaxRetries != 5 || cfg.Concurrency != 8 || cfg.RetryDelay != 1e9 {
 		t.Errorf("validate overwrote explicit values: %+v", cfg)
 	}
 }
 
-func TestNewFromEnvMemory(t *testing.T) {
-	os.Unsetenv("NATS_URL")
-	q := NewFromEnv(DefaultConfig())
-	defer q.Close()
-
-	if _, ok := q.(*MemoryQueue); !ok {
-		t.Errorf("expected *MemoryQueue, got %T", q)
+func TestExplicitMemoryQueueIgnoresNATSAddress(t *testing.T) {
+	t.Setenv("NATS_URL", "nats://127.0.0.1:1")
+	q := mustMemoryQueue(t, DefaultConfig())
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestNewFromEnvNATSFallback(t *testing.T) {
-	// Bad NATS URL should fall back to MemoryQueue.
-	t.Setenv("NATS_URL", "nats://192.0.2.1:1")
-	q := NewFromEnv(DefaultConfig())
-	defer q.Close()
+func mustMemoryQueue(t testing.TB, cfg Config) *MemoryQueue {
+	t.Helper()
+	q, err := NewMemoryQueue(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return q
+}
 
-	if _, ok := q.(*MemoryQueue); !ok {
-		t.Errorf("expected *MemoryQueue fallback, got %T", q)
+func TestMemoryQueueRejectsNegativeConfiguration(t *testing.T) {
+	for _, cfg := range []Config{{MaxRetries: -1}, {RetryDelay: -1}, {Concurrency: -1}} {
+		q, err := NewMemoryQueue(cfg)
+		if q != nil {
+			_ = q.Close()
+		}
+		if q != nil || err != errNegativeConfig {
+			t.Errorf("negative configuration accepted: %+v, %v", cfg, err)
+		}
 	}
 }
 
-func TestStreamName(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"tasks", "luxo_q_tasks"},
-		{"email.send", "luxo_q_email_send"},
-		{"a.b.c", "luxo_q_a_b_c"},
-	}
-	for _, tt := range tests {
-		got := streamName(tt.input)
-		if got != tt.want {
-			t.Errorf("streamName(%q) = %q, want %q", tt.input, got, tt.want)
+func TestConfigValidation(t *testing.T) {
+	for _, cfg := range []Config{{}, DefaultConfig(), {MaxRetries: 1, RetryDelay: 1, Concurrency: 1}} {
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("valid configuration rejected: %+v, %v", cfg, err)
+		}
+		q := mustMemoryQueue(t, cfg)
+		want := cfg
+		want.SetDefaults()
+		if q.cfg != want {
+			t.Errorf("constructor changed explicit/default configuration: %+v != %+v", q.cfg, want)
+		}
+		if err := q.Close(); err != nil {
+			t.Fatal(err)
 		}
 	}
 }

@@ -1,0 +1,395 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/h2transport"
+)
+
+type depthCapture struct {
+	hostileEnabled            bool
+	peer                      depthPeer
+	mu                        sync.Mutex
+	calls                     map[string]int64
+	invoked                   map[string]int64
+	failed                    int64
+	h1, h2, ws                atomic.Int64
+	malformed                 atomic.Int64
+	guardedJSON               atomic.Int64
+	started, active, canceled atomic.Int64
+}
+
+func (c *depthCapture) Record(name string, _ time.Duration, failed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.calls == nil {
+		c.calls = make(map[string]int64)
+	}
+	c.calls[name]++
+	if failed {
+		c.failed++
+	}
+}
+func (c *depthCapture) snapshot() map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	calls := make(map[string]int64, len(c.calls))
+	for name, count := range c.calls {
+		calls[name] = count
+	}
+	invoked := make(map[string]int64, len(c.invoked))
+	for name, count := range c.invoked {
+		invoked[name] = count
+	}
+	return map[string]any{"calls": calls, "invoked": invoked, "failed": c.failed, "h1": c.h1.Load(), "h2": c.h2.Load(), "ws": c.ws.Load(),
+		"malformed": c.malformed.Load(), "guardedJSON": c.guardedJSON.Load(), "started": c.started.Load(), "active": c.active.Load(), "canceled": c.canceled.Load(), "hostile": c.peer.snapshot()}
+}
+
+func (c *depthCapture) handler(name string, fn api.HandlerFunc) api.HandlerFunc {
+	return func(ctx context.Context, req *api.Request) error {
+		c.mu.Lock()
+		if c.invoked == nil {
+			c.invoked = make(map[string]int64)
+		}
+		c.invoked[name]++
+		c.mu.Unlock()
+		return fn(ctx, req)
+	}
+}
+
+type depthResolver struct{ capture *depthCapture }
+
+func depthPayload(depth, jsonDepth int64) *json.RawMessage {
+	raw := json.RawMessage("0")
+	if depth == 1 {
+		raw = json.RawMessage(strings.Repeat("[", int(jsonDepth)) + "0" + strings.Repeat("]", int(jsonDepth)))
+	}
+	return &raw
+}
+func depthNode(depth int64, lists bool, jsonDepth int64) DepthNode {
+	value := DepthNode{Value: 1, Children: []DepthBranch{}, Payload: depthPayload(depth, jsonDepth)}
+	if depth > 1 {
+		child := depthBranch(depth-1, lists, jsonDepth)
+		if lists {
+			value.Children = []DepthBranch{child}
+		} else {
+			value.Child = &child
+		}
+	}
+	return value
+}
+func depthBranch(depth int64, lists bool, jsonDepth int64) DepthBranch {
+	value := DepthBranch{Value: 1, Children: []DepthNode{}, Payload: depthPayload(depth, jsonDepth)}
+	if depth > 1 {
+		child := depthNode(depth-1, lists, jsonDepth)
+		if lists {
+			value.Children = []DepthNode{child}
+		} else {
+			value.Child = &child
+		}
+	}
+	return value
+}
+func validatedDepthNode(depth int64, lists bool, jsonDepth int64) (DepthNode, error) {
+	if depth < 1 || depth > 65 || jsonDepth < 0 || jsonDepth > 129 {
+		return DepthNode{}, fmt.Errorf("fixture depth outside its bounded corpus")
+	}
+	return depthNode(depth, lists, jsonDepth), nil
+}
+func (r depthResolver) DepthOne(_ context.Context, depth int64, lists bool, jsonDepth int64) (DepthNode, error) {
+	return validatedDepthNode(depth, lists, jsonDepth)
+}
+func (r depthResolver) DepthMany(_ context.Context, depth int64, lists bool, jsonDepth int64) ([]DepthNode, error) {
+	node, err := validatedDepthNode(depth, lists, jsonDepth)
+	if err != nil {
+		return nil, err
+	}
+	return []DepthNode{node, node}, nil
+}
+func sendDepth[T any](ctx context.Context, c *depthCapture, stream *api.TypedStream[T], value T) error {
+	c.started.Add(1)
+	c.active.Add(1)
+	defer c.active.Add(-1)
+	if err := stream.Send(value); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	c.canceled.Add(1)
+	return ctx.Err()
+}
+func (r depthResolver) HandleDepthWatch(ctx context.Context, params *DepthWatchStreamParams, _ any, stream *api.TypedStream[DepthNode]) error {
+	node, err := validatedDepthNode(params.Depth, params.Lists, params.JsonDepth)
+	if err != nil {
+		return err
+	}
+	return sendDepth(ctx, r.capture, stream, node)
+}
+func (r depthResolver) HandleDepthWatchMany(ctx context.Context, params *DepthWatchManyStreamParams, _ any, stream *api.TypedStream[[]DepthNode]) error {
+	nodes, err := r.DepthMany(ctx, params.Depth, params.Lists, params.JsonDepth)
+	if err != nil {
+		return err
+	}
+	return sendDepth(ctx, r.capture, stream, nodes)
+}
+
+// This producer deliberately bypasses generated encoders for hostile-wire tests.
+// It is enabled only by the fixture's explicit -malformed-responses flag.
+func malformedDepthWire(depth int, lists bool) []byte {
+	enc := codec.NewEncoder(nil)
+	enc.WriteVarint(0)
+	enc.WriteFieldInt(1, 1)
+	var child []byte
+	if depth > 1 {
+		child = malformedDepthWire(depth-1, lists)
+	}
+	enc.WriteFieldHeader(2)
+	if depth > 1 && !lists {
+		enc.WritePresent()
+		enc.WriteBytes(child)
+	} else {
+		enc.WriteNull()
+	}
+	enc.WriteFieldHeader(3)
+	enc.WritePresent()
+	column := []byte{0, 0, 0}
+	if depth > 1 && lists {
+		column = append([]byte{1}, child...)
+	}
+	enc.WriteBytes(column)
+	enc.WriteFieldHeader(4)
+	enc.WritePresent()
+	enc.WriteString("0")
+	enc.WriteEnd()
+	return enc.Bytes()
+}
+func malformedDepthJSON(depth int, lists bool) []byte {
+	var child []byte
+	if depth > 1 {
+		child = malformedDepthJSON(depth-1, lists)
+	}
+	var b strings.Builder
+	b.WriteString(`{"value":1,"child":`)
+	if depth > 1 && !lists {
+		b.Write(child)
+	} else {
+		b.WriteString("null")
+	}
+	b.WriteString(`,"children":[`)
+	if depth > 1 && lists {
+		b.Write(child)
+	}
+	b.WriteString(`],"payload":0}`)
+	return []byte(b.String())
+}
+func (c *depthCapture) malformedHandler(fn api.HandlerFunc, many bool) api.HandlerFunc {
+	return func(ctx context.Context, req *api.Request) error {
+		depth, err := req.ParamInt("depth")
+		if err != nil {
+			return err
+		}
+		generic, err := req.ParamInt("jsonDepth")
+		if err != nil {
+			return err
+		}
+		if depth != 65 || generic != 0 {
+			return fn(ctx, req)
+		}
+		if !req.BinaryMode {
+			err := fn(ctx, req)
+			if err != nil {
+				c.guardedJSON.Add(1)
+			}
+			return err
+		}
+		lists, err := req.ParamBool("lists")
+		if err != nil {
+			return err
+		}
+		wire := malformedDepthWire(65, lists)
+		if many {
+			wire = append([]byte{1}, wire...)
+		}
+		c.malformed.Add(1)
+		req.Buf.B = append(req.Buf.B, wire...)
+		return nil
+	}
+}
+func malformedDepthStream(ctx context.Context, c *depthCapture, stream *api.Stream, lists, many bool) error {
+	c.started.Add(1)
+	c.active.Add(1)
+	defer c.active.Add(-1)
+	var wire []byte
+	if stream.Binary() {
+		wire = malformedDepthWire(65, lists)
+		if many {
+			wire = append([]byte{1}, wire...)
+		}
+	} else {
+		wire = malformedDepthJSON(65, lists)
+		if many {
+			wire = append(append([]byte{'['}, wire...), ']')
+		}
+	}
+	c.malformed.Add(1)
+	if err := stream.Send(wire); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	c.canceled.Add(1)
+	return ctx.Err()
+}
+func registerMalformedDepthStreams(router *api.Router, c *depthCapture, resolver depthResolver) {
+	router.HandleStreamPrepared("depthWatch", func(_ context.Context, req *api.Request, identity any) (api.PreparedStreamHandler, error) {
+		var params DepthWatchStreamParams
+		if err := params.readRequest(req); err != nil {
+			return nil, err
+		}
+		return func(ctx context.Context, stream *api.Stream) error {
+			if params.Depth == 65 && params.JsonDepth == 0 {
+				return malformedDepthStream(ctx, c, stream, params.Lists, false)
+			}
+			return handleStreamDepthWatch(ctx, &params, identity, stream, router, resolver)
+		}, nil
+	})
+	router.HandleStreamPrepared("depthWatchMany", func(_ context.Context, req *api.Request, identity any) (api.PreparedStreamHandler, error) {
+		var params DepthWatchManyStreamParams
+		if err := params.readRequest(req); err != nil {
+			return nil, err
+		}
+		return func(ctx context.Context, stream *api.Stream) error {
+			if params.Depth == 65 && params.JsonDepth == 0 {
+				return malformedDepthStream(ctx, c, stream, params.Lists, true)
+			}
+			return handleStreamDepthWatchMany(ctx, &params, identity, stream, router, resolver)
+		}, nil
+	})
+}
+
+func depthRouter(capture *depthCapture, malformed bool) (*api.Router, error) {
+	capture.hostileEnabled = malformed
+	router := api.NewRouter()
+	router.SetDevMode(false)
+	router.IntrospectionKey = "model-depth"
+	router.SetMetricsCollector(capture)
+	if err := RegisterSchema(router.Schema); err != nil {
+		return nil, err
+	}
+	if err := router.Registry.RegisterSchemaAPIs(router.Schema); err != nil {
+		return nil, err
+	}
+	resolver := depthResolver{capture}
+	app := &App{Resolver: resolver}
+	if err := RegisterHandlers(router, app); err != nil {
+		return nil, err
+	}
+	for name, fn := range map[string]api.HandlerFunc{
+		"depthOne": handleDepthOne(app), "depthMany": handleDepthMany(app),
+		"depthEcho": handleDepthEcho(app), "depthEchoMany": handleDepthEchoMany(app),
+	} {
+		if malformed && (name == "depthOne" || name == "depthMany") {
+			fn = capture.malformedHandler(fn, name == "depthMany")
+		}
+		router.HandleLocal(name, capture.handler(name, fn))
+	}
+	if err := RegisterStreams(router, nil, resolver); err != nil {
+		return nil, err
+	}
+	if malformed {
+		registerMalformedDepthStreams(router, capture, resolver)
+	}
+	if err := router.Prepare(); err != nil {
+		return nil, err
+	}
+	return router, nil
+}
+func depthHandler(router *api.Router, capture *depthCapture) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/stats" {
+			_ = json.NewEncoder(w).Encode(capture.snapshot())
+			return
+		}
+		if r.URL.Path == "/hostile" || r.URL.Path == "/hostile/ws" {
+			if !capture.hostileEnabled {
+				http.NotFound(w, r)
+				return
+			}
+			capture.peer.serveHTTP(w, r)
+			return
+		}
+		if api.IsWebSocketUpgrade(r) {
+			capture.ws.Add(1)
+		} else if r.ProtoMajor == 2 {
+			capture.h2.Add(1)
+		} else {
+			capture.h1.Add(1)
+		}
+		router.ServeHTTP(w, r)
+	})
+}
+func startDepthServer(ctx context.Context, handler http.Handler) (*httptest.Server, *h2transport.Server, error) {
+	engine, err := h2transport.NewServer(handler)
+	if err != nil {
+		return nil, nil, err
+	}
+	secure := httptest.NewUnstartedServer(handler)
+	secure.Config.BaseContext = func(_ net.Listener) context.Context { return ctx }
+	if err := engine.ConfigureHTTPServer(secure.Config); err != nil {
+		secure.Close()
+		engine.Close()
+		return nil, nil, err
+	}
+	secure.TLS = secure.Config.TLSConfig
+	secure.EnableHTTP2 = true
+	secure.StartTLS()
+	return secure, engine, nil
+}
+func serveDepthFixture(malformed bool) error {
+	capture := &depthCapture{}
+	router, err := depthRouter(capture, malformed)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handler := depthHandler(router, capture)
+	secure, engine, err := startDepthServer(ctx, handler)
+	if err != nil {
+		return err
+	}
+	defer engine.Close()
+	defer secure.Close()
+	plain := httptest.NewServer(handler)
+	defer plain.Close()
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: secure.Certificate().Raw})
+	if err := json.NewEncoder(os.Stdout).Encode(map[string]string{"url": secure.URL + "/luvia", "plain": plain.URL + "/luvia", "certificate": string(certificate)}); err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	cancel()
+	capture.peer.group.Wait()
+	return json.NewEncoder(os.Stdout).Encode(capture.snapshot())
+}
+func main() {
+	malformed := flag.Bool("malformed-responses", false, "inject explicit hostile depth65 wire in test-only negative responses")
+	flag.Parse()
+	if err := serveDepthFixture(*malformed); err != nil && !errors.Is(err, context.Canceled) {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}

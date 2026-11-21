@@ -24,7 +24,7 @@ func (p *Parser) currentPrec() int {
 	case token.DotDot:
 		return precRange
 	case token.ChanSend:
-		return precAdd
+		return precSend
 	case token.Plus, token.Minus:
 		return precAdd
 	case token.Star, token.Slash, token.Percent:
@@ -68,9 +68,9 @@ func (p *Parser) isTypeName(name string) bool {
 
 func (p *Parser) parseObjectConstruction(pos token.Position, typeName string) ast.Expr {
 	p.expect(token.LBrace)
-	obj := &ast.ObjectExpr{Pos: pos, TypeName: typeName}
+	var fields parsedArguments
 	for !p.check(token.RBrace) && !p.isEOF() {
-		arg := &ast.NamedArg{}
+		arg := ast.NamedArg{}
 		if p.check(token.Ident) && p.peekType() == token.Colon {
 			arg.Name = p.expectIdent()
 			p.expect(token.Colon)
@@ -82,11 +82,11 @@ func (p *Parser) parseObjectConstruction(pos token.Position, typeName string) as
 				arg.Name = ident.Name
 			}
 		}
-		obj.Fields = append(obj.Fields, arg)
+		fields.add(arg)
 		p.match(token.Comma)
 	}
 	p.expect(token.RBrace)
-	return obj
+	return &ast.ObjectExpr{Pos: pos, TypeName: typeName, Fields: fields.pointers()}
 }
 
 // expectIdentOrKeyword accepts an identifier or any keyword as a name.

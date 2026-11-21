@@ -20,6 +20,7 @@ const (
 	SymMiddleware
 	SymScope
 	SymEvent
+	SymQueryRow
 )
 
 var symbolKindNames = map[SymbolKind]string{
@@ -27,7 +28,8 @@ var symbolKindNames = map[SymbolKind]string{
 	SymSealed: "sealed", SymType: "type", SymApi: "api", SymFn: "fn",
 	SymError: "error", SymField: "field", SymParam: "param",
 	SymVariable: "variable", SymMiddleware: "middleware", SymScope: "scope",
-	SymEvent: "event",
+	SymEvent:    "event",
+	SymQueryRow: "query row",
 }
 
 func (k SymbolKind) String() string {
@@ -47,6 +49,8 @@ type Symbol struct {
 	Module  string // which module this belongs to
 	Mutable bool   // true for var, false for val
 	Used    bool   // true if referenced after declaration
+	// An RPC-only declaration keeps its boundary even if an API shares its name.
+	serviceFunction bool
 }
 
 // Scope represents a lexical scope with symbols.
@@ -65,31 +69,44 @@ func NewScope() *Scope {
 
 // Child creates a child scope.
 func (s *Scope) Child() *Scope {
-	return &Scope{
-		parent:  s,
-		symbols: make(map[string]*Symbol),
-	}
+	return &Scope{parent: s}
 }
 
 // Define adds a symbol to this scope. Returns false if already defined.
 func (s *Scope) Define(sym *Symbol) bool {
-	if _, exists := s.symbols[sym.Name]; exists {
+	if s.symbols == nil {
+		s.symbols = make(map[string]*Symbol)
+	} else if _, exists := s.symbols[sym.Name]; exists {
 		return false
 	}
 	s.symbols[sym.Name] = sym
+	if s.narrowed != nil {
+		delete(s.narrowed, sym.Name)
+	}
 	return true
 }
 
 // Lookup looks up a symbol by name, walking up the scope chain.
+// Successful lookup marks the resolved symbol as used.
 func (s *Scope) Lookup(name string) *Symbol {
-	if sym, ok := s.symbols[name]; ok {
+	sym := s.LookupReadOnly(name)
+	if sym != nil {
 		sym.Used = true
-		return sym
 	}
-	if s.parent != nil {
-		return s.parent.Lookup(name)
+	return sym
+}
+
+// LookupReadOnly resolves a name through its scope chain without marking usage.
+func (s *Scope) LookupReadOnly(name string) *Symbol {
+	for {
+		if sym := s.symbols[name]; sym != nil {
+			return sym
+		}
+		if s.parent == nil {
+			return nil
+		}
+		s = s.parent
 	}
-	return nil
 }
 
 // LookupLocal looks up a symbol in this scope only, not parents.
@@ -105,12 +122,25 @@ func (s *Scope) Narrow(name string, typ *ResolvedType) {
 	s.narrowed[name] = typ
 }
 
+// Assignment invalidates facts about the same binding, including outer guards.
+func (s *Scope) invalidateNarrowing(name string) {
+	for current := s; current != nil; current = current.parent {
+		delete(current.narrowed, name)
+		if _, owns := current.symbols[name]; owns {
+			return
+		}
+	}
+}
+
 // LookupNarrowed returns the narrowed type for a variable, if any.
 func (s *Scope) LookupNarrowed(name string) *ResolvedType {
 	if s.narrowed != nil {
 		if t, ok := s.narrowed[name]; ok {
 			return t
 		}
+	}
+	if _, shadows := s.symbols[name]; shadows {
+		return nil
 	}
 	if s.parent != nil {
 		return s.parent.LookupNarrowed(name)

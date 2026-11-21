@@ -1,0 +1,80 @@
+import 'dart:convert';
+
+import 'package:luxo_client/src/codec.dart' as current;
+import 'package:luxo_client/src/json.dart' as current;
+import 'package:luxo_client/src/error_codec.dart' as current;
+import '__BASELINE__/codec.dart' as previous;
+import '__BASELINE__/json.dart' as previous;
+import '__BASELINE__/error_codec.dart' as previous;
+import '__BENCHMARKS__/uint64_benchmark.dart' show compareBenchmarks;
+
+Object? _sink;
+
+void main() {
+  final texts = <String, String>{
+    'ascii16': 'abcdefghijklmnop',
+    'chinese24': '发布检查数据完整',
+    'chinese1026': List.filled(342, '文').join(),
+    'chinese72000': List.filled(24000, '文').join(),
+    'pairs128': List.filled(128, '\ud800\udc00').join(),
+    'literalEscapes128': List.filled(128, r'\uD800').join(),
+  };
+  for (final entry in texts.entries) {
+    final Object value = entry.value;
+    _compare('readString/${entry.key}', () => value as String,
+      () => current.luxoStringFromJSON(value), iterations: 20000);
+    _json(entry.key, {'value': value}, iterations: entry.key == 'chinese72000' ? 200 : 2000);
+    _binary(entry.key, entry.value);
+  }
+  final escaped = '{"value":"${List.filled(128, r'\uD800\uDC00').join()}"}';
+  _compare('decode/escapedPairs128', () => previous.decodeLuxoJSON(escaped), () => current.decodeLuxoJSON(escaped));
+  final rows = List.generate(128, (index) => {'name': 'row$index', 'label': '发布检查', 'valid': true});
+  _json('objects128', rows, iterations: 200);
+  final values = List<Object?>.filled(128, '发布检查');
+  _compare('readStringList128', () => previous.luxoStringListFromJSON(values),
+    () => current.luxoStringListFromJSON(values));
+  _errors();
+  print('sink=${_sink.runtimeType}; warmed local operations, not allocation or network measurements');
+}
+
+void _json(String name, Object value, {required int iterations}) {
+  final text = previous.encodeLuxoJSON(value);
+  _compare('decode/$name', () => previous.decodeLuxoJSON(text), () => current.decodeLuxoJSON(text), iterations: iterations);
+  _compare('encode/$name', () => previous.encodeLuxoJSON(value), () => current.encodeLuxoJSON(value), iterations: iterations);
+  _compare('normalize/$name', () => previous.normalizeLuxoJSON(value), () => current.normalizeLuxoJSON(value), iterations: iterations);
+}
+
+void _binary(String name, String text) {
+  final old = previous.LuxoEncoder(), next = current.LuxoEncoder();
+  final iterations = name == 'chinese72000' ? 200 : 2000;
+  _compare('writeString/$name', () { old.reset(); old.writeString(text); return old.bytes(); },
+    () { next.reset(); next.writeString(text); return next.bytes(); }, iterations: iterations);
+  _compare('writeFieldString/$name', () { old.reset(); old.writeFieldString(1, text); return old.bytes(); },
+    () { next.reset(); next.writeFieldString(1, text); return next.bytes(); }, iterations: iterations);
+  if (name == 'chinese72000') return;
+  final values = List.filled(128, text);
+  _compare('writeStrings128/$name', () { old.reset(); old.writeFieldStringArray(1, values); return old.bytes(); },
+    () { next.reset(); next.writeFieldStringArray(1, values); return next.bytes(); }, iterations: 100);
+}
+
+void _errors() {
+  final value = <String, Object?>{'error': 'Rejected', 'code': 400, 'message': 'bad',
+    'traceId': 'trace', 'cause': 'detail', 'data': {'label': '发布检查'}};
+  final old = previous.decodeJSONError(value, 502), next = current.decodeJSONError(value, 502);
+  if (old.error != next.error || old.code != next.code || old.message != next.message ||
+      old.traceId != next.traceId || old.cause != next.cause || jsonEncode(old.data) != jsonEncode(next.data)) {
+    throw StateError('Error contents changed');
+  }
+  _compare('JSONError/withData', () => previous.decodeJSONError(value, 502),
+    () => current.decodeJSONError(value, 502), format: (value) => value.toString());
+}
+
+void _compare(String name, Object? Function() before, Object? Function() after,
+    {int iterations = 2000, String Function(Object?) format = jsonEncode}) {
+  if (format(before()) != format(after())) throw StateError('$name: unequal outputs');
+  int repeat(Object? Function() operation) {
+    for (var index = 0; index < iterations; index++) { _sink = operation(); }
+    return _sink == null ? 0 : iterations;
+  }
+  compareBenchmarks(name, () => repeat(before), () => repeat(after), iterations: iterations, includeRange: true);
+}

@@ -6,12 +6,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/selection"
 )
 
 func TestLoadSingle(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	var calls int32
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		atomic.AddInt32(&calls, 1)
@@ -22,7 +25,7 @@ func TestLoadSingle(t *testing.T) {
 		return result, nil
 	}, DefaultConfig())
 
-	val, err := loader.Load(context.Background(), 1, nil)
+	val, err := loader.Load(requestScope, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +41,7 @@ func TestLoadPreservesCallerContext(t *testing.T) {
 		return map[int]string{keys[0]: ctx.Value(key).(string)}, nil
 	}, DefaultConfig())
 
-	value, err := loader.Load(context.WithValue(context.Background(), key, "trace-1"), 1, nil)
+	value, err := loader.Load(testScope(t, context.WithValue(context.Background(), key, "trace-1")), 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,8 +68,8 @@ func TestLoadSeparatesConcurrentRequestScopes(t *testing.T) {
 	secondBase, cancelSecond := context.WithCancel(context.Background())
 	defer cancelSecond()
 	contexts := []context.Context{
-		context.WithValue(firstBase, key, "first"),
-		context.WithValue(secondBase, key, "second"),
+		testScope(t, context.WithValue(firstBase, key, "first")),
+		testScope(t, context.WithValue(secondBase, key, "second")),
 	}
 	want := []string{"first", "second"}
 	got := make([]string, len(contexts))
@@ -91,6 +94,8 @@ func TestLoadSeparatesConcurrentRequestScopes(t *testing.T) {
 }
 
 func TestLoadBatching(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	var calls int32
 	var batchSize int32
 
@@ -111,7 +116,7 @@ func TestLoadBatching(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			v, _ := loader.Load(context.Background(), idx+1, nil)
+			v, _ := loader.Load(requestScope, idx+1, nil)
 			results[idx] = v
 		}(i)
 	}
@@ -129,6 +134,8 @@ func TestLoadBatching(t *testing.T) {
 }
 
 func TestLoadFieldsMerge(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	var gotFields []*selection.Field
 
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
@@ -145,11 +152,11 @@ func TestLoadFieldsMerge(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		loader.Load(context.Background(), 1, []*selection.Field{{Name: "project", Children: []*selection.Field{{Name: "id"}}}})
+		loader.Load(requestScope, 1, []*selection.Field{{Name: "project", Children: []*selection.Field{{Name: "id"}}}})
 	}()
 	go func() {
 		defer wg.Done()
-		loader.Load(context.Background(), 2, []*selection.Field{{Name: "project", Children: []*selection.Field{{Name: "name"}}}, {Name: "title"}})
+		loader.Load(requestScope, 2, []*selection.Field{{Name: "project", Children: []*selection.Field{{Name: "name"}}}, {Name: "title"}})
 	}()
 	wg.Wait()
 
@@ -181,7 +188,73 @@ func TestSameSelection(t *testing.T) {
 	}
 }
 
+func TestBatchSelectionBecomesAllAfterPartial(t *testing.T) {
+	var requestScope context.Context = testScope(t, t.Context())
+
+	partial := []*selection.Field{{Name: "id"}}
+	batch := newBatch[int, string](requestScope)
+	batch.add(1, partial)
+	batch.add(2, nil)
+	batch.add(3, partial)
+	if batch.mergedSelection() != nil || !batch.selectsAll || batch.size() != 3 {
+		t.Fatal("internal full selection did not dominate earlier and later projections")
+	}
+	if len(partial) != 1 || partial[0].Name != "id" {
+		t.Fatal("merging mutated caller selection metadata")
+	}
+}
+
+func TestExpiredBatchTimerCannotFlushReplacement(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var requestScope context.Context = testScope(t, t.Context())
+
+		var calls atomic.Int32
+		loader := New(func(_ context.Context, keys []int, _ []*selection.Field) (map[int]int, error) {
+			calls.Add(1)
+			values := make(map[int]int, len(keys))
+			for _, key := range keys {
+				values[key] = key
+			}
+			return values, nil
+		}, Config{Wait: time.Second, MaxBatch: 2})
+		results := make(chan int, 3)
+		load := func(key int) {
+			value, err := loader.Load(requestScope, key, nil)
+			if err != nil {
+				t.Errorf("load %d: %v", key, err)
+			}
+			results <- value
+		}
+		go load(1)
+		synctest.Wait()
+		go load(2)
+		synctest.Wait()
+		first, second := <-results, <-results
+		if first+second != 3 || first == second || calls.Load() != 1 {
+			t.Fatal("full batch was not dispatched exactly once")
+		}
+		time.Sleep(500 * time.Millisecond)
+		go load(3)
+		synctest.Wait()
+		time.Sleep(500 * time.Millisecond)
+		synctest.Wait()
+		loader.mu.Lock()
+		pending := len(loader.batches)
+		loader.mu.Unlock()
+		if calls.Load() != 1 || len(results) != 0 || pending != 1 {
+			t.Fatal("old timer dispatched or removed the replacement batch")
+		}
+		time.Sleep(500 * time.Millisecond)
+		synctest.Wait()
+		if <-results != 3 || calls.Load() != 2 || len(loader.batches) != 0 {
+			t.Fatal("replacement batch lost its own timer or remained registered")
+		}
+	})
+}
+
 func TestLoadNoFields(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	var gotFields []*selection.Field
 
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
@@ -189,7 +262,7 @@ func TestLoadNoFields(t *testing.T) {
 		return map[int]string{1: "ok"}, nil
 	}, DefaultConfig())
 
-	loader.Load(context.Background(), 1, nil)
+	loader.Load(requestScope, 1, nil)
 
 	if gotFields != nil {
 		t.Errorf("nil fields should pass through as nil, got %v", gotFields)
@@ -197,6 +270,8 @@ func TestLoadNoFields(t *testing.T) {
 }
 
 func TestLoadSelectAllDominatesPartialSelection(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	var gotFields []*selection.Field
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		gotFields = fields
@@ -207,11 +282,11 @@ func TestLoadSelectAllDominatesPartialSelection(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = loader.Load(context.Background(), 1, nil)
+		_, _ = loader.Load(requestScope, 1, nil)
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = loader.Load(context.Background(), 2, []*selection.Field{{Name: "name"}})
+		_, _ = loader.Load(requestScope, 2, []*selection.Field{{Name: "name"}})
 	}()
 	wg.Wait()
 	if gotFields != nil {
@@ -220,6 +295,8 @@ func TestLoadSelectAllDominatesPartialSelection(t *testing.T) {
 }
 
 func TestLoadMaxBatch(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	var calls int32
 
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
@@ -236,7 +313,7 @@ func TestLoadMaxBatch(t *testing.T) {
 		wg.Add(1)
 		go func(k int) {
 			defer wg.Done()
-			loader.Load(context.Background(), k, nil)
+			loader.Load(requestScope, k, nil)
 		}(i)
 	}
 	wg.Wait()
@@ -249,11 +326,13 @@ func TestLoadMaxBatch(t *testing.T) {
 }
 
 func TestLoadError(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		return nil, fmt.Errorf("db error")
 	}, DefaultConfig())
 
-	_, err := loader.Load(context.Background(), 1, nil)
+	_, err := loader.Load(requestScope, 1, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -263,11 +342,13 @@ func TestLoadError(t *testing.T) {
 }
 
 func TestLoadMissingKey(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		return map[int]string{}, nil // return empty — key not found
 	}, DefaultConfig())
 
-	val, err := loader.Load(context.Background(), 999, nil)
+	val, err := loader.Load(requestScope, 999, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,6 +358,8 @@ func TestLoadMissingKey(t *testing.T) {
 }
 
 func TestLoadAll(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		result := make(map[int]string)
 		for _, k := range keys {
@@ -285,7 +368,7 @@ func TestLoadAll(t *testing.T) {
 		return result, nil
 	}, DefaultConfig())
 
-	results, err := loader.LoadAll(context.Background(), []int{1, 2, 3}, []*selection.Field{{Name: "name"}})
+	results, err := loader.LoadAll(requestScope, []int{1, 2, 3}, []*selection.Field{{Name: "name"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,12 +381,14 @@ func TestLoadAll(t *testing.T) {
 }
 
 func TestLoadAllEmpty(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		t.Fatal("should not be called for empty keys")
 		return nil, nil
 	}, DefaultConfig())
 
-	results, err := loader.LoadAll(context.Background(), []int{}, nil)
+	results, err := loader.LoadAll(requestScope, []int{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,17 +398,21 @@ func TestLoadAllEmpty(t *testing.T) {
 }
 
 func TestLoadAllError(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		return nil, fmt.Errorf("batch error")
 	}, DefaultConfig())
 
-	_, err := loader.LoadAll(context.Background(), []int{1, 2}, nil)
+	_, err := loader.LoadAll(requestScope, []int{1, 2}, nil)
 	if err == nil || err.Error() != "batch error" {
 		t.Errorf("expected batch error, got %v", err)
 	}
 }
 
 func TestLoadDedupKeys(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	var gotKeys []int
 
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
@@ -341,7 +430,7 @@ func TestLoadDedupKeys(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			loader.Load(context.Background(), 42, nil)
+			loader.Load(requestScope, 42, nil)
 		}()
 	}
 	wg.Wait()
@@ -353,12 +442,14 @@ func TestLoadDedupKeys(t *testing.T) {
 }
 
 func TestLoadContextCancel(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
 		time.Sleep(50 * time.Millisecond) // slow query
 		return map[int]string{1: "ok"}, nil
 	}, Config{Wait: 5 * time.Millisecond, MaxBatch: 100})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(requestScope)
 	cancel() // cancel immediately
 
 	_, err := loader.Load(ctx, 1, nil)
@@ -371,6 +462,8 @@ func TestLoadContextCancel(t *testing.T) {
 }
 
 func TestLoadContextCancelDoesNotKillOthers(t *testing.T) {
+	var requestScope context.Context = testScope(t, context.Background())
+
 	var calls int32
 
 	loader := New(func(ctx context.Context, keys []int, fields []*selection.Field) (map[int]string, error) {
@@ -382,7 +475,7 @@ func TestLoadContextCancelDoesNotKillOthers(t *testing.T) {
 		return result, nil
 	}, Config{Wait: 10 * time.Millisecond, MaxBatch: 100})
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancelCtx, cancel := context.WithCancel(requestScope)
 
 	var wg sync.WaitGroup
 	var cancelErr, normalErr error
@@ -399,7 +492,7 @@ func TestLoadContextCancelDoesNotKillOthers(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		normalVal, normalErr = loader.Load(context.Background(), 2, nil)
+		normalVal, normalErr = loader.Load(requestScope, 2, nil)
 	}()
 
 	// Cancel request 1 after a tiny delay
@@ -447,5 +540,88 @@ func TestNewNegativeWaitUsesDefault(t *testing.T) {
 
 	if loader.wait != 1*time.Millisecond {
 		t.Errorf("negative wait should default to 2ms, got %v", loader.wait)
+	}
+}
+
+func TestBatchStateIsAllocatedOnlyForLoad(t *testing.T) {
+	var requestScope context.Context = testScope(t, t.Context())
+
+	loader := New(func(_ context.Context, keys []int, _ []*selection.Field) (map[int]string, error) {
+		return map[int]string{keys[0]: "ok"}, nil
+	}, Config{Wait: time.Microsecond, MaxBatch: 2})
+	if loader.batches != nil {
+		t.Fatal("unused loader allocated batch state")
+	}
+	values, err := loader.LoadAll(requestScope, []int{1}, nil)
+	if err != nil || values[1] != "ok" || loader.batches != nil {
+		t.Fatalf("direct load initialized batching: values=%v err=%v", values, err)
+	}
+	for range 2 {
+		value, err := loader.Load(requestScope, 1, nil)
+		if err != nil || value != "ok" {
+			t.Fatalf("first/reused batch: value=%s err=%v", value, err)
+		}
+	}
+	loader.mu.Lock()
+	defer loader.mu.Unlock()
+	if loader.batches == nil || len(loader.batches) != 0 {
+		t.Fatal("batch state was not initialized or retained a completed batch")
+	}
+}
+
+func TestImmediateLoadDoesNotCreateBatch(t *testing.T) {
+	var requestScope context.Context = testScope(t, t.Context())
+
+	fields := []*selection.Field{{Name: "user", Children: []*selection.Field{{Name: "id"}}}}
+	loader := New(func(ctx context.Context, keys []int, selected []*selection.Field) (map[int]string, error) {
+		if len(keys) != 1 || keys[0] != 7 || &selected[0] != &fields[0] {
+			t.Fatal("immediate dispatch changed keys or field selection")
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > 30*time.Second {
+			t.Fatal("immediate dispatch lost its timeout")
+		}
+		return map[int]string{7: "value"}, nil
+	}, Config{Wait: time.Hour, MaxBatch: 1})
+	value, err := loader.Load(requestScope, 7, fields)
+	if err != nil || value != "value" || loader.batches != nil {
+		t.Fatalf("immediate load used batch state: value=%s err=%v", value, err)
+	}
+}
+
+func TestImmediateLoadErrors(t *testing.T) {
+	failure := fmt.Errorf("batch failed")
+	for _, scenario := range []string{"missing", "error", "cancel", "deadline"} {
+		t.Run(scenario, func(t *testing.T) {
+			var requestScope context.Context = testScope(t, t.Context())
+
+			ctx, cancel := context.WithCancel(requestScope)
+			defer cancel()
+			if scenario == "deadline" {
+				var release context.CancelFunc
+				ctx, release = context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				defer release()
+			}
+			loader := New(func(context.Context, []int, []*selection.Field) (map[int]string, error) {
+				switch scenario {
+				case "error":
+					return map[int]string{7: "not a success"}, failure
+				case "cancel":
+					cancel()
+				}
+				return nil, nil
+			}, Config{MaxBatch: 1})
+			want := ctx.Err()
+			if scenario == "error" {
+				want = failure
+			}
+			if scenario == "cancel" {
+				want = context.Canceled
+			}
+			value, err := loader.Load(ctx, 7, nil)
+			if err != want || value != "" {
+				t.Fatalf("got %q/%v, want zero/%v", value, err, want)
+			}
+		})
 	}
 }

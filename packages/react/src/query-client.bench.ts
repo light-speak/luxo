@@ -1,4 +1,4 @@
-import { bench, describe } from 'vitest'
+import { describe, test } from 'vitest'
 import { QueryClient } from './query-client'
 
 describe('QueryClient hot path', () => {
@@ -6,11 +6,15 @@ describe('QueryClient hot path', () => {
   const queryKey = ['project', 1, { range: '1h' }] as const
   client.setQueryData(queryKey, { requests: 42 })
 
-  bench('read cached query data', () => {
-    client.getQueryData(queryKey)
+  test('read cached query data', async ({ bench }) => {
+    await bench('read cached query data', () => {
+      client.getQueryData(queryKey)
+    }).run()
   })
 
-  bench('fetch fresh cached query', async () => {
-    await client.fetchQuery({ queryKey, queryFn: async () => ({ requests: 0 }) })
+  test('fetch fresh cached query', async ({ bench }) => {
+    await bench('fetch fresh cached query', async () => {
+      await client.fetchQuery({ queryKey, queryFn: async () => ({ requests: 0 }) })
+    }).run()
   })
 })

@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -8,6 +9,86 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+func TestWriteObjectArrayItemsPropagatesEncodingError(t *testing.T) {
+	var output strings.Builder
+	writeScalarArrayItems(&output, "Snapshot", false, "items", "\t")
+	for _, want := range []string{
+		"buf.WriteLuxoArrayHeader(len(items))",
+		"for i := range items",
+		"items[i].WriteLuxo(buf, nil)",
+		"return err",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("object array encoding missing %q: %s", want, output.String())
+		}
+	}
+}
+
+func TestBufferedBinaryAppendKeepsDirectAssignment(t *testing.T) {
+	var output strings.Builder
+	writeBufferedBinaryAppend(&output, "\t", "codec.AppendVarint(buf.B, 128)")
+	if got := output.String(); got != "\tbuf.B = codec.AppendVarint(buf.B, 128)\n" {
+		t.Fatalf("unsigned varint append changed: %q", got)
+	}
+}
+
+func TestWriteScalarEncodingPreservesOutput(t *testing.T) {
+	for _, scalar := range []struct{ name, call, value, pointer string }{
+		{"Int", "Int", "item.Value", "*item.Value"},
+		{"Float", "Float", "item.Value", "*item.Value"},
+		{"String", "String", "item.Value", "*item.Value"},
+		{"Boolean", "Bool", "item.Value", "*item.Value"},
+		{"DateTime", "DateTime", "item.Value", "*item.Value"},
+		{"Duration", "Int", "int64(item.Value)", "int64(*item.Value)"},
+		{"UUID", "UUID", "[16]byte(item.Value)", "[16]byte(*item.Value)"},
+		{"Decimal", "String", "lux.FormatDecimal(item.Value)", "lux.FormatDecimal(*item.Value)"},
+		{"Bytes", "Bytes", "item.Value", "*item.Value"},
+		{"JSON", "JSON", "item.Value", "*item.Value"},
+	} {
+		for _, nullable := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/nullable=%t", scalar.name, nullable), func(t *testing.T) {
+				value, indent := scalar.value, "\t"
+				want := "prefix\n\tbuf.AppendByte(7)\n"
+				if nullable {
+					value, indent = scalar.pointer, "\t\t"
+					condition := "item.Value != nil"
+					if scalar.name == "JSON" {
+						condition = "!(item.Value == nil || codec.IsJSONNull(*item.Value))"
+					}
+					want += "\tif " + condition + " {\n\t\tbuf.WriteLuxoPresent()\n"
+				}
+				call := fmt.Sprintf("buf.WriteLuxo%s(%s)", scalar.call, value)
+				switch scalar.name {
+				case "Float", "String", "DateTime", "Decimal", "JSON":
+					want += indent + "if err := " + call + "; err != nil { return err }\n"
+				default:
+					want += indent + call + "\n"
+				}
+				if nullable {
+					want += "\t} else {\n\t\tbuf.WriteLuxoNull()\n\t}\n"
+				}
+				var output strings.Builder
+				output.WriteString("prefix\n")
+				writeScalarEncoding(&output, scalar.name, nullable, 7, "item.Value", "\t")
+				if output.String() != want {
+					t.Fatalf("encoding changed:\ngot %q\nwant %q", output.String(), want)
+				}
+			})
+		}
+	}
+}
+
+func TestWriteScalarEncodingLeavesUnsupportedTypeUnchanged(t *testing.T) {
+	for _, nullable := range []bool{false, true} {
+		var output strings.Builder
+		output.WriteString("prefix")
+		writeScalarEncoding(&output, "NestedModel", nullable, 7, "item.Value", "\t")
+		if output.String() != "prefix" {
+			t.Fatal("non-scalar dispatch emitted a partial scalar")
+		}
+	}
+}
 
 func TestGenerateWriteJSONFileNoModels(t *testing.T) {
 	generator := defaultGenerator()
@@ -61,7 +142,7 @@ func TestReadLuxoAllocatesNonNullableNestedModel(t *testing.T) {
 	var builder strings.Builder
 	generator.generateReadLuxo(&builder, model, nil)
 	code := builder.String()
-	if !strings.Contains(code, "p.Owner = &User{}") || !strings.Contains(code, "p.Owner.ReadLuxo(dec)") {
+	if !strings.Contains(code, "p.Owner = &User{}; p.Owner.readLuxoDepth(_child, depth+1)") || !strings.Contains(code, "p.Owner = &User{}\np.Owner.readLuxoInputDepth(dec, depth+1)") {
 		t.Fatalf("non-nullable nested decoder must allocate its pointer before decoding:\n%s", code)
 	}
 }
@@ -99,13 +180,13 @@ func TestGenerateWriteLuxoWithFieldIDs(t *testing.T) {
 	if !strings.Contains(code, "func (u *User) WriteLuxo(buf *api.ResponseBuf, mask []byte)") {
 		t.Errorf("WriteLuxo method missing:\n%s", code)
 	}
-	// All-fields fast path
-	if !strings.Contains(code, "if len(mask) == 0") {
-		t.Errorf("fast path missing:\n%s", code)
+	// Empty masks select all fields in the compact model.
+	if !strings.Contains(code, "_fieldBits := byte(0xff)") {
+		t.Errorf("all-fields default missing:\n%s", code)
 	}
-	// Masked slow path
-	if !strings.Contains(code, "FieldMaskHas(mask,") {
-		t.Errorf("FieldMaskHas missing:\n%s", code)
+	// Registered field IDs select individual bits.
+	if !strings.Contains(code, "_fieldBits&1 != 0") {
+		t.Errorf("field selection missing:\n%s", code)
 	}
 	// Terminator
 	if !strings.Contains(code, "buf.B = append(buf.B, 0x00)") {
@@ -136,8 +217,8 @@ func TestGenerateWriteLuxoDateTimeField(t *testing.T) {
 	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
-	if !strings.Contains(code, ".Unix()") {
-		t.Errorf("DateTime should use .Unix():\n%s", code)
+	if !strings.Contains(code, "buf.WriteLuxoDateTime(") || strings.Contains(code, ".Unix()") {
+		t.Errorf("DateTime must preserve nanoseconds:\n%s", code)
 	}
 	if !strings.Contains(code, "int64(") {
 		t.Errorf("Duration should cast to int64:\n%s", code)
@@ -173,10 +254,10 @@ func TestGenerateWriteLuxoNullableFields(t *testing.T) {
 	code := string(src)
 
 	// Nullable should have AppendPresent/AppendNull pattern
-	if !strings.Contains(code, "AppendPresent") {
+	if !strings.Contains(code, "WriteLuxoPresent") {
 		t.Errorf("nullable field should have AppendPresent:\n%s", code)
 	}
-	if !strings.Contains(code, "AppendNull") {
+	if !strings.Contains(code, "WriteLuxoNull") {
 		t.Errorf("nullable field should have AppendNull:\n%s", code)
 	}
 }
@@ -298,7 +379,7 @@ func TestGenerateWriteLuxoRelationEncoded(t *testing.T) {
 		t.Errorf("default projection must not encode an unloaded relation:\n%s", code)
 	}
 	if !strings.Contains(code, "if len(selectionMask) > 0 && codec.FieldMaskHas(mask, 3)") ||
-		!strings.Contains(code, "p.User.WriteLuxo(buf, _childMask3)") {
+		!strings.Contains(code, "p.User.writeLuxoDepth(buf, _childMask3, depth+1)") {
 		t.Errorf("explicitly selected relation should use nested row encoding:\n%s", code)
 	}
 	// Non-relation fields should appear
@@ -367,9 +448,9 @@ func TestWriteMaskDirective_Default(t *testing.T) {
 func TestWriteColumnarMaskedStringField(t *testing.T) {
 	var b strings.Builder
 	field := &ast.FieldDecl{Name: "secret", Type: &ast.TypeRef{Name: "String"}, Directives: []*ast.Directive{{Name: "mask"}}}
-	writeColumnarMaskedStringField(&b, field, "Secret", 3)
+	writeDirectColumn(&b, directColumn{field: field, id: 3, stringValue: true}, nil, true)
 	code := b.String()
-	if !strings.Contains(code, "str.Mask(item.Secret, 3, 4)") || !strings.Contains(code, "WriteColumnString(3, vals)") {
+	if !strings.Contains(code, "str.Mask(items[_row].Secret, 3, 4)") || !strings.Contains(code, "buf.WriteLuxoString(v)") {
 		t.Fatalf("masked columnar field is incomplete:\n%s", code)
 	}
 }
@@ -383,9 +464,9 @@ func TestWriteColumnarMaskedStringFieldWithPattern(t *testing.T) {
 			{Value: &ast.Literal{Kind: token.String, Value: "###****####"}},
 		}}},
 	}
-	writeColumnarMaskedStringField(&b, field, "Phone", 3)
+	writeDirectColumn(&b, directColumn{field: field, id: 3, stringValue: true}, nil, true)
 	code := b.String()
-	if !strings.Contains(code, `str.MaskPattern(item.Phone, "###****####")`) || !strings.Contains(code, "WriteColumnString(3, vals)") {
+	if !strings.Contains(code, `str.MaskPattern(items[_row].Phone, "###****####")`) || !strings.Contains(code, "buf.WriteLuxoString(v)") {
 		t.Fatalf("pattern-masked columnar field is incomplete:\n%s", code)
 	}
 }
@@ -436,10 +517,10 @@ func TestGenerateWriteColumnarAppliesTransformBeforeMask(t *testing.T) {
 	generator.generateWriteColumnar(&b, model, nil)
 	code := b.String()
 
-	if !strings.Contains(code, "str.Mask(strings.ToUpper(item.Name), 3, 4)") {
+	if !strings.Contains(code, "str.Mask(strings.ToUpper(items[_row].Name), 3, 4)") {
 		t.Fatalf("columnar writer must transform before masking:\n%s", code)
 	}
-	if !strings.Contains(code, "w.WriteColumnString(1, vals)") {
+	if !strings.Contains(code, "buf.AppendByte(1)") || !strings.Contains(code, "_arenaSize += len(v)") {
 		t.Fatalf("transformed values must stay columnar:\n%s", code)
 	}
 }
@@ -459,10 +540,10 @@ func TestGenerateWriteColumnarNullableTransform(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{{Models: []*ast.ModelDecl{model}}}}
 	code := string(generator.generateWriteJSONFile(result, "app", nil))
 
-	if !strings.Contains(code, "if item.Nickname != nil { v := strings.TrimSpace(*item.Nickname); vals[i] = &v }") {
+	if !strings.Contains(code, "if items[_row].Nickname == nil { buf.WriteLuxoNull(); continue }") || !strings.Contains(code, "v := strings.TrimSpace(*items[_row].Nickname)") {
 		t.Fatalf("nullable transform must preserve nulls:\n%s", code)
 	}
-	if !strings.Contains(code, "w.WriteColumnStringPtr(1, vals)") {
+	if !strings.Contains(code, "buf.WriteLuxoPresent()") {
 		t.Fatalf("nullable transform must use the nullable column encoding:\n%s", code)
 	}
 	if !strings.Contains(code, "if u.Nickname != nil { nicknameTransformedValue := strings.TrimSpace(*u.Nickname)") {
@@ -488,11 +569,14 @@ func TestGenerateWriteColumnarHonorsVisible(t *testing.T) {
 	generator.generateWriteColumnar(&b, model, nil)
 	code := b.String()
 
-	condition := `if api.IdentityString(buf.Identity, "role") == "admin" {`
+	condition := `if func() bool { _identity := api.NewIdentityReader(buf.Identity); return _identity.Allowed(_identity.String("role") == "admin") }() {`
 	if !strings.Contains(code, condition) {
 		t.Fatalf("columnar writer must omit invisible columns:\n%s", code)
 	}
-	if !strings.Contains(code, "w.WriteColumnFloatPtr(1, vals)") {
+	if strings.Index(code, condition) > strings.Index(code, "buf.AppendByte(1)") {
+		t.Fatal("visibility was checked after writing the column")
+	}
+	if !strings.Contains(code, "if items[_row].Salary == nil { buf.WriteLuxoNull(); continue }") || !strings.Contains(code, "buf.WriteLuxoFloat(*items[_row].Salary)") {
 		t.Fatalf("visible nullable field must preserve nullable column encoding:\n%s", code)
 	}
 }
@@ -550,7 +634,7 @@ func TestWriteVisibleDirective_WithBody(t *testing.T) {
 	if !got {
 		t.Error("@visible with body should return true")
 	}
-	if !strings.Contains(b.String(), "IdentityString") {
+	if !strings.Contains(b.String(), `_identity.Allowed(_identity.String("role") == "admin")`) {
 		t.Errorf("should compile my.role: %s", b.String())
 	}
 }
@@ -604,6 +688,35 @@ func TestCompileVisibleExpr(t *testing.T) {
 	}
 }
 
+func TestVisibleEnumSourceFragmentCompilesAndExecutes(t *testing.T) {
+	const source = `
+enum Role { ADMIN MEMBER }
+type Snapshot {
+ allowed: String? @visible(Role.ADMIN == Role.ADMIN)
+ denied: String? @visible(Role.ADMIN == Role.MEMBER)
+}
+`
+	if checked := analyzePermissionFixture(t, source); len(checked.Errors) != 0 {
+		t.Fatal(checked.Errors)
+	}
+	// Fragment emitters also accept parser output before semantic annotations.
+	file := parseStreamEnumSource(t, "visible-fragment.luxo", source)
+	var body strings.Builder
+	body.WriteString("package generated\nimport \"github.com/light-speak/luxo/pkg/lux/codec\"\n")
+	generateEnum(&body, file.Enums[0])
+	for _, field := range file.Types[0].Fields {
+		expression := compileVisibleExprWithEnums(field.Directives[0].SingleExpression(), map[string]bool{"Role": true})
+		fmt.Fprintf(&body, "func visible_%s() bool { return %s }\n", field.Name, expression)
+	}
+	generated := &GenerateResult{Files: map[string][]byte{"visible.gen.go": []byte(body.String())}}
+	runGeneratedCompilation(t, generated, `package generated
+import "testing"
+func TestVisibleFragment(t *testing.T) {
+ if !visible_allowed() || visible_denied() { t.Fatal("enum fragment changed visibility") }
+}
+`)
+}
+
 func TestWriteTransformDirective_NoDirective(t *testing.T) {
 	var b strings.Builder
 	f := &ast.FieldDecl{Name: "name", Type: &ast.TypeRef{Name: "String"}}
@@ -644,10 +757,7 @@ func TestWriteVisibleDirective_EmptyBody(t *testing.T) {
 			{Name: "visible", Body: &ast.Block{}},
 		},
 	}
-	got := writeVisibleDirective(&b, f)
-	if got {
-		t.Error("empty body should return false")
-	}
+	assertInvalidVisibleDirective(t, &b, f)
 }
 
 func TestWriteVisibleDirective_NonExprStmt(t *testing.T) {
@@ -661,10 +771,7 @@ func TestWriteVisibleDirective_NonExprStmt(t *testing.T) {
 			}}},
 		},
 	}
-	got := writeVisibleDirective(&b, f)
-	if got {
-		t.Error("non-ExprStmt should return false")
-	}
+	assertInvalidVisibleDirective(t, &b, f)
 }
 
 func TestWriteTransformDirective_EmptyBody(t *testing.T) {
@@ -676,10 +783,7 @@ func TestWriteTransformDirective_EmptyBody(t *testing.T) {
 			{Name: "transform", Body: &ast.Block{}},
 		},
 	}
-	got := writeTransformDirective(&b, f, "u.Name")
-	if got != "u.Name" {
-		t.Errorf("empty body should return original, got %q", got)
-	}
+	assertInvalidTransformDirective(t, &b, f)
 }
 
 func TestWriteMaskDirective_Nullable(t *testing.T) {
@@ -749,10 +853,7 @@ func TestWriteTransformDirective_NonExprStmt(t *testing.T) {
 			{Name: "transform", Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}}},
 		},
 	}
-	got := writeTransformDirective(&b, f, "u.Name")
-	if got != "u.Name" {
-		t.Errorf("non-ExprStmt body should return original, got %q", got)
-	}
+	assertInvalidTransformDirective(t, &b, f)
 }
 
 func TestWriteTransformDirective_EmptyCompile(t *testing.T) {
@@ -762,14 +863,11 @@ func TestWriteTransformDirective_EmptyCompile(t *testing.T) {
 		Type: &ast.TypeRef{Name: "String"},
 		Directives: []*ast.Directive{
 			{Name: "transform", Body: &ast.Block{Stmts: []ast.Stmt{
-				&ast.ExprStmt{Expr: &ast.BinaryExpr{Left: &ast.Ident{Name: "a"}, Op: "+", Right: &ast.Ident{Name: "b"}}},
+				&ast.ExprStmt{Expr: &ast.BinaryExpr{Left: &ast.Ident{Name: "a"}, Op: "<-", Right: &ast.Ident{Name: "b"}}},
 			}}},
 		},
 	}
-	got := writeTransformDirective(&b, f, "u.Name")
-	if got != "u.Name" {
-		t.Errorf("unsupported expr should return original, got %q", got)
-	}
+	assertInvalidTransformDirective(t, &b, f)
 }
 
 func TestWriteMaskDirective_BadArgs(t *testing.T) {
@@ -813,10 +911,7 @@ func TestWriteVisibleDirective_UnsupportedExpr(t *testing.T) {
 			}}},
 		},
 	}
-	got := writeVisibleDirective(&b, f)
-	if got {
-		t.Error("unsupported expr should return false")
-	}
+	assertInvalidVisibleDirective(t, &b, f)
 }
 
 func TestGenerateTypeWriteLuxo(t *testing.T) {
@@ -842,10 +937,10 @@ func TestGenerateTypeWriteLuxo(t *testing.T) {
 	if strings.Contains(out, "*AuthPayload") {
 		t.Errorf("should NOT use pointer receiver: %s", out)
 	}
-	if !strings.Contains(out, "AppendString") {
+	if !strings.Contains(out, "WriteLuxoString") {
 		t.Errorf("should write String field: %s", out)
 	}
-	if !strings.Contains(out, "AppendSvarint") {
+	if !strings.Contains(out, "WriteLuxoInt") {
 		t.Errorf("should write Int field: %s", out)
 	}
 }
@@ -872,16 +967,16 @@ func TestGenerateTypeWriteColumnar(t *testing.T) {
 	if !strings.Contains(out, "func WriteColumnarServiceSummary(buf *api.ResponseBuf, items []ServiceSummary, mask []byte)") {
 		t.Errorf("should take value slice: %s", out)
 	}
-	if !strings.Contains(out, "w.WriteColumnString(1, vals)") {
+	if !strings.Contains(out, "v := items[_row].ServiceName") || !strings.Contains(out, "buf.WriteLuxoString(v)") {
 		t.Errorf("should write serviceName column: %s", out)
 	}
-	if !strings.Contains(out, "w.WriteColumnInt(2, vals)") {
+	if !strings.Contains(out, "buf.WriteLuxoInt(items[_row].ApiCount)") {
 		t.Errorf("should write apiCount column: %s", out)
 	}
-	if !strings.Contains(out, "WriteColumnStringPtr(3, vals)") {
+	if !strings.Contains(out, "if items[_row].Version == nil { buf.WriteLuxoNull(); continue }") {
 		t.Errorf("should write nullable version column: %s", out)
 	}
-	if !strings.Contains(out, "w.WriteColumnBytes(4, cells)") {
+	if !strings.Contains(out, "values := items[_row].Tags") || !strings.Contains(out, "buf.EndMessage(_frame)") {
 		t.Errorf("should write list tags column: %s", out)
 	}
 }
@@ -929,16 +1024,16 @@ func TestGenerateTypeOutputDirectives(t *testing.T) {
 	if !strings.Contains(code, "displayNameTransformed := strings.TrimSpace(p.DisplayName)") {
 		t.Fatalf("type row writer must apply @transform:\n%s", code)
 	}
-	if !strings.Contains(code, "vals[i] = strings.TrimSpace(item.DisplayName)") {
+	if !strings.Contains(code, "v := strings.TrimSpace(items[_row].DisplayName)") {
 		t.Fatalf("type columnar writer must apply @transform:\n%s", code)
 	}
-	if !strings.Contains(code, `if api.IdentityString(buf.Identity, "role") == "admin" {`) {
+	if !strings.Contains(code, `_identity.Allowed(_identity.String("role") == "admin")`) {
 		t.Fatalf("type writers must honor @visible:\n%s", code)
 	}
 	if !strings.Contains(code, "secretMaskedValue := str.Mask(*p.Secret, 3, 4)") {
 		t.Fatalf("type row writer must mask nullable strings:\n%s", code)
 	}
-	if strings.Contains(code, "p.Hidden") || strings.Contains(code, "item.Hidden") {
+	if strings.Contains(code, "p.Hidden") || strings.Contains(code, "items[_row].Hidden") {
 		t.Fatalf("type writers must omit hidden fields:\n%s", code)
 	}
 }
@@ -962,10 +1057,10 @@ func TestGenerateTypeWriteColumnarNestedList(t *testing.T) {
 	generator.generateTypeWriteColumnar(&b, m, nil)
 	out := b.String()
 
-	if !strings.Contains(out, "WriteColumnarMetricPoint(") {
+	if !strings.Contains(out, "writeColumnarMetricPointDepth(buf, items[_row].Points, _childMask2, depth+1)") {
 		t.Errorf("nested list cell should encode via nested columnar writer: %s", out)
 	}
-	if !strings.Contains(out, "w.WriteColumnBytes(2, vals)") {
+	if !strings.Contains(out, "_frame := buf.BeginMessage()") || !strings.Contains(out, "buf.EndMessage(_frame)") {
 		t.Errorf("nested list should be a blob column: %s", out)
 	}
 }
@@ -987,22 +1082,23 @@ func TestGenerateTypeWriteColumnarNestedSingle(t *testing.T) {
 	generator.generateTypeWriteColumnar(&b, m, nil)
 	out := b.String()
 
-	if !strings.Contains(out, ".WriteLuxo(") {
+	if !strings.Contains(out, "items[_row].Inner.writeLuxoDepth(buf, _childMask2, depth+1)") {
 		t.Errorf("nested single cell should encode via WriteLuxo: %s", out)
 	}
-	if !strings.Contains(out, "w.WriteColumnBytes(2, vals)") {
+	if !strings.Contains(out, "_frame := buf.BeginMessage()") || !strings.Contains(out, "buf.EndMessage(_frame)") {
 		t.Errorf("nested single should be a blob column: %s", out)
 	}
 }
 
 func TestGenerateTypeWriteColumnarNestedNullable(t *testing.T) {
 	var b strings.Builder
-	writeColumnarNestedBlobField(&b, "Child", 4, &ast.TypeRef{Name: "Child", Nullable: true}, "selectionMask")
+	field := &ast.FieldDecl{Name: "child", Type: &ast.TypeRef{Name: "Child", Nullable: true}}
+	writeDirectColumn(&b, directColumn{field: field, id: 4, relation: true}, nil, false)
 	code := b.String()
-	if !strings.Contains(code, "if items[i].Child != nil") || !strings.Contains(code, "items[i].Child.WriteLuxo") {
+	if !strings.Contains(code, "if items[_row].Child == nil { buf.WriteLuxoNull(); continue }") || !strings.Contains(code, "items[_row].Child.writeLuxoDepth(buf, _childMask4, depth+1)") {
 		t.Fatalf("nullable nested type must preserve null cells:\n%s", code)
 	}
-	if !strings.Contains(code, "w.WriteColumnBytesPtr(4, vals)") {
+	if !strings.Contains(code, "buf.WriteLuxoPresent()") || !strings.Contains(code, "buf.EndMessage(_frame)") {
 		t.Fatalf("nullable nested type must use canonical nullable column encoding:\n%s", code)
 	}
 }
@@ -1024,18 +1120,18 @@ func TestGenerateModelBinaryWritersIncludeRelations(t *testing.T) {
 	generator.generateWriteLuxo(&row, model, nil)
 	rowCode := row.String()
 	if !strings.Contains(rowCode, "_childMask2, _ := codec.SelectionMaskNested(selectionMask, 2)") ||
-		!strings.Contains(rowCode, "p.Child.WriteLuxo(buf, _childMask2)") ||
-		!strings.Contains(rowCode, "p.Children[i].WriteLuxo(buf, _childMask3)") {
+		!strings.Contains(rowCode, "p.Child.writeLuxoDepth(buf, _childMask2, depth+1)") ||
+		!strings.Contains(rowCode, "writeColumnarChildValuesDepth(buf, p.Children, _childMask3, depth+1)") {
 		t.Fatalf("model row writer must encode selected relations:\n%s", rowCode)
 	}
-	if strings.Contains(rowCode, "p.Children[i].WriteLuxo(buf, nil)") {
+	if strings.Contains(rowCode, "p.Children[i].writeLuxoDepth(buf, nil, depth+1)") {
 		t.Fatalf("model row writer must omit unloaded relations from its default projection:\n%s", rowCode)
 	}
 
 	var columnar strings.Builder
 	generator.generateWriteColumnar(&columnar, model, nil)
 	columnarCode := columnar.String()
-	if !strings.Contains(columnarCode, "WriteColumnarChildValues(&nb, items[i].Children, _childMask3)") {
+	if !strings.Contains(columnarCode, "writeColumnarChildValuesDepth(buf, items[_row].Children, _childMask3, depth+1)") {
 		t.Fatalf("model list relation must use canonical nested columnar encoding:\n%s", columnarCode)
 	}
 	if !strings.Contains(columnarCode, "if len(selectionMask) > 0 && codec.FieldMaskHas(mask, 3)") {
@@ -1044,7 +1140,7 @@ func TestGenerateModelBinaryWritersIncludeRelations(t *testing.T) {
 	if !strings.Contains(columnarCode, "mask = codec.SelectionMaskFields(mask)") {
 		t.Fatalf("columnar writer must decode the recursive selection node:\n%s", columnarCode)
 	}
-	if !strings.Contains(columnarCode, "w.WriteColumnBytesPtr(2, vals)") {
+	if !strings.Contains(columnarCode, "if items[_row].Child == nil { buf.WriteLuxoNull(); continue }") || !strings.Contains(columnarCode, "buf.EndMessage(_frame)") {
 		t.Fatalf("nullable model relation must use nullable byte cells:\n%s", columnarCode)
 	}
 	if !strings.Contains(columnarCode, "func WriteColumnarParentValues(") {
@@ -1065,34 +1161,22 @@ func TestGenerateTypeWriteColumnarNoFields(t *testing.T) {
 	}
 }
 
-func TestColumnarWritersIgnoreUnsupportedTypes(t *testing.T) {
-	var valueBuilder strings.Builder
-	writeColumnarValueField(&valueBuilder, "item.Value", 1, "Unsupported", false)
-	if valueBuilder.Len() != 0 {
-		t.Fatalf("unsupported scalar should not generate invalid code: %s", valueBuilder.String())
-	}
-
-	var nullableBuilder strings.Builder
-	writeColumnarNullableValueField(&nullableBuilder, "item.Value", "*item.Value", 1, "Unsupported", false)
-	if nullableBuilder.Len() != 0 {
-		t.Fatalf("unsupported nullable scalar should not generate invalid code: %s", nullableBuilder.String())
-	}
-}
-
 func TestWriteColumnarArrayFieldAllScalarTypes(t *testing.T) {
-	types := []string{"Float", "Boolean", "DateTime", "Duration", "Decimal", "Bytes", "JSON", "Unsupported"}
+	types := []string{"Float", "Boolean", "DateTime", "Duration", "Decimal", "Bytes", "JSON"}
 	var b strings.Builder
-	for id, typeName := range types {
-		writeColumnarArrayField(&b, "item.Values", id+1, typeName, false)
+	for _, typeName := range types {
+		field := &ast.FieldDecl{Name: "values", Type: &ast.TypeRef{Name: typeName, IsList: true}}
+		writeDirectArrayColumn(&b, field, "items[_row].Values", nil)
 	}
 	code := b.String()
 	checks := []string{
-		"codec.AppendFixed64(cb, v)",
-		"codec.AppendBool(cb, v)",
-		"codec.AppendSvarint(cb, v.Unix())",
-		"codec.AppendSvarint(cb, int64(v))",
-		"codec.AppendString(cb, v.String())",
-		"codec.AppendBytes(cb, v)",
+		"buf.WriteLuxoFloat(v)",
+		"buf.WriteLuxoBool(v)",
+		"buf.WriteLuxoDateTime(v)",
+		"buf.WriteLuxoInt(int64(v))",
+		"buf.WriteLuxoString(lux.FormatDecimal(v))",
+		"buf.WriteLuxoBytes(v)",
+		"buf.WriteLuxoJSON(v)",
 	}
 	for _, check := range checks {
 		if !strings.Contains(code, check) {
@@ -1132,14 +1216,17 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 	code := string(src)
 
 	// WriteLuxo checks
-	if !strings.Contains(code, "AppendUUID") {
+	if !strings.Contains(code, "WriteLuxoUUID") {
 		t.Errorf("UUID should use AppendUUID (16-byte fixed, per protocol):\n%s", code)
 	}
-	if !strings.Contains(code, ".String()") {
-		t.Errorf("Decimal should use .String():\n%s", code)
+	if !strings.Contains(code, "lux.FormatDecimal(") {
+		t.Errorf("Decimal should use bounded exact formatting:\n%s", code)
 	}
-	if !strings.Contains(code, "AppendBytes") {
-		t.Errorf("Bytes/JSON should use AppendBytes:\n%s", code)
+	if !strings.Contains(code, "WriteLuxoBytes") {
+		t.Errorf("Bytes should use AppendBytes:\n%s", code)
+	}
+	if !strings.Contains(code, "WriteLuxoJSON") || !strings.Contains(code, "ReadJSON()") || !strings.Contains(code, "ReadNullableJSON()") {
+		t.Errorf("JSON should use validated raw-value readers and writers:\n%s", code)
 	}
 
 	// ReadLuxo checks
@@ -1160,17 +1247,17 @@ func TestGenerateWriteLuxoUUIDDecimalBytesJSON(t *testing.T) {
 	}
 
 	// WriteColumnar checks
-	if !strings.Contains(code, "WriteColumnUUID") {
-		t.Errorf("UUID columnar should use WriteColumnUUID (16-byte fixed):\n%s", code)
+	if !strings.Contains(code, "buf.WriteLuxoUUID([16]byte(items[_row].Uuid))") {
+		t.Errorf("UUID columnar should use 16-byte fixed encoding:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteColumnUUIDPtr") {
-		t.Errorf("nullable UUID columnar should use WriteColumnUUIDPtr:\n%s", code)
+	if !strings.Contains(code, "if items[_row].OptUuid == nil { buf.WriteLuxoNull(); continue }") {
+		t.Errorf("nullable UUID columnar should preserve null cells:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteColumnString") {
-		t.Errorf("Decimal columnar should use WriteColumnString:\n%s", code)
+	if !strings.Contains(code, "v := lux.FormatDecimal(items[_row].Price)") {
+		t.Errorf("Decimal columnar should encode a string:\n%s", code)
 	}
-	if !strings.Contains(code, "WriteColumnBytes") {
-		t.Errorf("Bytes columnar should use WriteColumnBytes:\n%s", code)
+	if !strings.Contains(code, "buf.WriteLuxoBytes(items[_row].Data)") {
+		t.Errorf("Bytes columnar should encode bytes directly:\n%s", code)
 	}
 }
 
@@ -1201,21 +1288,21 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 
 	checks := []string{
 		// WriteLuxo: array header + per-type item append
-		"codec.AppendArrayHeader(buf.B, len(t.Tags))",
-		"codec.AppendUUID(buf.B, [16]byte(v))", // [UUID]
-		"codec.AppendString(buf.B, string(v))", // [Role] enum
+		"buf.WriteLuxoArrayHeader(len(t.Tags))",
+		"buf.WriteLuxoUUID([16]byte(v))", // [UUID]
+		"Role(v).AppendLuxo(buf.B)",      // [Role] enum
 		// ReadLuxo: array readers + conversions
 		"dec.ReadStringArray()",
 		"dec.ReadIntArray()",
 		"dec.ReadUUIDArray()",
-		"uuid.UUID(v)",
+		"uuid.UUID(_item)",
 		"make([]Role, len(_a))",
 		"make([]decimal.Decimal, len(_a))",
 		// Columnar: array field encoded as a Bytes column of inline-array cells
-		"w.WriteColumnBytes",
-		"cells := make([][]byte, len(items))",
-		"values := item.Tags",
-		"cb = codec.AppendArrayHeader(cb, len(values))",
+		"_frame := buf.BeginMessage()",
+		"buf.EndMessage(_frame)",
+		"values := items[_row].Tags",
+		"if err := buf.WriteLuxoArrayHeader(len(values)); err != nil { return err }",
 	}
 	for _, c := range checks {
 		if !strings.Contains(code, c) {
@@ -1224,7 +1311,7 @@ func TestGenerateScalarArrayFields(t *testing.T) {
 	}
 }
 
-func TestGenerateNestedModelListUsesCanonicalArrayHeader(t *testing.T) {
+func TestGenerateNestedModelListSeparatesResponseAndInput(t *testing.T) {
 	generator := generatorWithModelFieldIDs(map[string]map[string]int{
 		"User": {"id": 1, "posts": 2},
 		"Post": {"id": 1},
@@ -1241,13 +1328,13 @@ func TestGenerateNestedModelListUsesCanonicalArrayHeader(t *testing.T) {
 	}}}}
 
 	code := string(generator.generateWriteJSONFile(result, "app", nil))
-	if !strings.Contains(code, "codec.AppendArrayHeader(buf.B, len(u.Posts))") {
-		t.Fatalf("nested model list must use the canonical unsigned array header:\n%s", code)
+	if !strings.Contains(code, "writeColumnarPostValuesDepth(buf, u.Posts, _childMask2, depth+1)") || !strings.Contains(code, "buf.EndMessage(_frame2)") {
+		t.Fatalf("nested response list must be length-delimited columnar data:\n%s", code)
 	}
 	if !strings.Contains(code, "_n := dec.ReadArrayLength()") {
-		t.Fatalf("nested model list must read the canonical unsigned array header:\n%s", code)
+		t.Fatalf("nested input list must retain its canonical unsigned array header:\n%s", code)
 	}
-	if strings.Contains(code, "codec.AppendSvarint(buf.B, int64(len(u.Posts)))") {
+	if strings.Contains(code, "buf.WriteLuxoInt(int64(len(u.Posts)))") {
 		t.Fatalf("nested model list must not zigzag-encode its length:\n%s", code)
 	}
 }
@@ -1294,7 +1381,7 @@ func TestWriteLuxoArenaHeader(t *testing.T) {
 		t.Errorf("should not include len for Int field:\n%s", code)
 	}
 	// Should write arena len to buf
-	if !strings.Contains(code, "AppendVarint(buf.B, uint64(_arenaLen))") {
+	if !strings.Contains(code, "WriteLuxoVarint(uint64(_arenaLen))") {
 		t.Errorf("should write _arenaLen as varint:\n%s", code)
 	}
 }
@@ -1393,6 +1480,271 @@ func TestWriteLuxoArenaHeaderNoStringFields(t *testing.T) {
 		t.Errorf("no string fields should not declare _arenaLen:\n%s", code)
 	}
 }
+
+func TestGeneratedScalarOnlyArenaFrames(t *testing.T) {
+	runGeneratedFixture(t, `
+model Counter @noTime {
+ id: Int @id
+ number: Int
+ active: Boolean
+}
+type Scalars {
+ number: Int
+ active: Boolean
+}
+type Box { value: Scalars }
+type OptionalBox { value: Scalars? }
+type ModelBox { value: Counter }
+type Ordered { first: Scalars mark: Int }
+event ScalarChanged(value: Scalars)
+fn wrap(value: Scalars): Box { return Box { value: value } }
+fn rewrap(value: Box): Box { return Box { value: value.value } }
+fn readValue(value: Box): Scalars { return value.value }
+fn wrapCall(value: Box): Box { return Box { value: readValue(value) } }
+fn localValue(value: Box): Scalars { val inner = value.value return inner }
+fn stamp(value: Box): Int { value.value.number = 99 return 1 }
+fn ordered(value: Box): Ordered { return Ordered { first: value.value, mark: stamp(value) } }
+fn optional(value: Scalars?): OptionalBox { return OptionalBox { value: value } }
+fn optionalLiteral(): Scalars? { return Scalars { number: 42, active: true } }
+fn modelBox(): ModelBox { return ModelBox { value: Counter { id: 7, number: 42, active: true } } }
+fn emitScalars(value: Scalars): Int { emit ScalarChanged(value: value) return 1 }
+fn emitField(value: Box): Int { emit ScalarChanged(value: value.value) return 1 }
+api counter(): Counter { return Counter { id: 7, number: 42, active: true } }
+api scalars(): Scalars { return Scalars { number: 42, active: true } }
+api box(): Box { return Box { value: Scalars { number: 42, active: true } } }
+`, scalarOnlyArenaAssertions, StableIDs{
+		APIs: map[string]int{"counter": 1, "scalars": 2, "box": 3},
+		ModelFields: map[string]map[string]int{
+			"Counter":     {"id": 1, "number": 2, "active": 3},
+			"Scalars":     {"number": 1, "active": 2},
+			"Box":         {"value": 1},
+			"OptionalBox": {"value": 1},
+			"ModelBox":    {"value": 1},
+			"Ordered":     {"first": 1, "mark": 2},
+		},
+		EventFields: map[string]map[string]int{"ScalarChanged": {"value": 1}},
+	})
+}
+
+const scalarOnlyArenaAssertions = `package generated
+
+import (
+ "bytes"
+ "context"
+ "net/http/httptest"
+ "testing"
+
+ "github.com/light-speak/luxo/pkg/lux/api"
+ "github.com/light-speak/luxo/pkg/lux/codec"
+ "github.com/light-speak/luxo/pkg/lux/event"
+)
+
+func TestScalarOnlyArenaFrames(t *testing.T) {
+ t.Run("model", func(t *testing.T) {
+  counter := &Counter{Id: 7, Number: 42, Active: true}
+  checkScalarArenaFrame(t, counter.WriteLuxo, func(dec *codec.Decoder) bool {
+   var value Counter
+   value.ReadLuxo(dec)
+   return value.Id == 7 && value.Number == 42 && value.Active
+  }, []byte{0, 1, 14, 2, 84, 3, 1, 0}, []byte{0, 1, 14, 0})
+ })
+ t.Run("type", func(t *testing.T) {
+  scalars := Scalars{Number: 42, Active: true}
+  checkScalarArenaFrame(t, scalars.WriteLuxo, func(dec *codec.Decoder) bool {
+   var value Scalars
+   value.ReadLuxo(dec)
+   return value.Number == 42 && value.Active
+  }, []byte{0, 1, 84, 2, 1, 0}, []byte{0, 1, 84, 0})
+ })
+ t.Run("nested_type", func(t *testing.T) {
+  box := Box{Value: &Scalars{Number: 42, Active: true}}
+  checkScalarArenaFrame(t, box.WriteLuxo, func(dec *codec.Decoder) bool {
+   var value Box
+   value.ReadLuxo(dec)
+   return value.Value != nil && value.Value.Number == 42 && value.Value.Active
+  }, []byte{0, 1, 6, 0, 1, 84, 2, 1, 0, 0}, nil)
+ })
+}
+
+func TestCompiledObjectFieldRepresentations(t *testing.T) {
+ app := &App{}
+ value := Scalars{Number: 42, Active: true}
+ box, err := app.wrap(t.Context(), value)
+ if err != nil || box.Value == nil || *box.Value != value {
+  t.Fatal("value field", box, err)
+ }
+ again, err := app.rewrap(t.Context(), box)
+ if err != nil || again.Value == nil || *again.Value != value {
+  t.Fatal("reference field", again, err)
+ }
+ called, err := app.wrapCall(t.Context(), box)
+ if err != nil || called.Value == nil || *called.Value != value { t.Fatal("call field", called, err) }
+ for _, read := range []func(context.Context, Box) (Scalars, error){app.readValue, app.localValue} {
+  got, err := read(t.Context(), box)
+  if err != nil || got != value {
+   t.Fatal("field value", got, err)
+  }
+ }
+ optional, err := app.optional(t.Context(), &value)
+ if err != nil || optional.Value != &value {
+  t.Fatal("nullable field", optional, err)
+ }
+ optional, err = app.optional(t.Context(), nil)
+ if err != nil || optional.Value != nil {
+  t.Fatal("null field", optional, err)
+ }
+ literal, err := app.optionalLiteral(t.Context())
+ if err != nil || literal == nil || *literal != value { t.Fatal("nullable literal", literal, err) }
+ model, err := app.modelBox(t.Context())
+ if err != nil || model.Value == nil || model.Value.Id != 7 {
+  t.Fatal("model field", model, err)
+ }
+ ordered, err := app.ordered(t.Context(), box)
+ if err != nil || ordered.First == nil || *ordered.First != value || ordered.Mark != 1 || box.Value.Number != 99 {
+  t.Fatal("field evaluation order", ordered, box, err)
+ }
+}
+
+func TestObjectFieldsThroughHTTP(t *testing.T) {
+ router := api.NewRouter()
+ if err := RegisterSchema(router.Schema); err != nil { t.Fatal(err) }
+ if err := RegisterHandlers(router, &App{}); err != nil { t.Fatal(err) }
+ if err := router.Prepare(); err != nil { t.Fatal(err) }
+ for _, tc := range []struct { name, selectFields, json string; id, fields int; binary []byte }{
+  {"counter", "id,number,active", "{\"id\":7,\"number\":42,\"active\":true}", 1, 3, []byte{0,1,14,2,84,3,1,0}},
+  {"scalars", "number,active", "{\"number\":42,\"active\":true}", 2, 2, []byte{0,1,84,2,1,0}},
+  {"box", "value{number,active}", "{\"value\":{\"number\":42,\"active\":true}}", 3, 1, []byte{0,1,6,0,1,84,2,1,0,0}},
+ } {
+  for _, binary := range []bool{false, true} {
+   body := []byte("{\"$api\":\"" + tc.name + "\",\"$select\":\"" + tc.selectFields + "\"}")
+   if binary {
+    fields, err := codec.FieldMaskAll(tc.fields); if err != nil { t.Fatal(err) }
+    var children []codec.SelectionMaskChild
+    if tc.name == "box" {
+     childFields, err := codec.FieldMaskAll(2); if err != nil { t.Fatal(err) }
+     child, err := codec.AppendSelectionMask(nil, childFields, nil); if err != nil { t.Fatal(err) }
+     children = []codec.SelectionMaskChild{{FieldID:1, Mask:child}}
+    }
+    mask, err := codec.AppendSelectionMask(nil, fields, children); if err != nil { t.Fatal(err) }
+    body, err = api.EncodeBinaryRequest(tc.id, mask, nil, router.Registry.ParamOrder(tc.name)); if err != nil { t.Fatal(err) }
+   }
+   req := httptest.NewRequest("POST", "/", bytes.NewReader(body))
+   if binary { req.Header.Set("X-Luxo-Mode", "binary") }
+   response := httptest.NewRecorder()
+   router.ServeHTTP(response, req)
+   valid := bytes.Contains(response.Body.Bytes(), []byte(tc.json))
+   if binary { valid = bytes.Equal(response.Body.Bytes(), tc.binary) }
+   if response.Code != 200 || !valid { t.Fatalf("%s binary=%v status=%d body=%x", tc.name, binary, response.Code, response.Body.Bytes()) }
+  }
+ }
+}
+
+func TestStructuredEventFields(t *testing.T) {
+ bus := event.NewChanBus(2)
+ defer bus.Close()
+ var got []Scalars
+ if err := event.OnDecode(bus, "ScalarChanged", func([]byte, any) error {
+  t.Error("in-memory event unexpectedly decoded wire data")
+  return nil
+ }, func(_ context.Context, value ScalarChangedEvent) error {
+  got = append(got, value.Value)
+  return nil
+ }); err != nil { t.Fatal(err) }
+ app := &App{EventBus:bus}
+ value := Scalars{Number:42, Active:true}
+ if _, err := app.emitScalars(t.Context(), value); err != nil { t.Fatal(err) }
+ if _, err := app.emitField(t.Context(), Box{Value:&value}); err != nil { t.Fatal(err) }
+ bus.Close()
+ if len(got) != 2 || got[0] != value || got[1] != value { t.Fatal("event field changed", got) }
+}
+
+var structuredBoxSink Box
+var structuredValueSink Scalars
+
+func (app *App) referenceWrap(_ context.Context, value Scalars) (Box, error) {
+ return Box{Value:&value}, nil
+}
+
+func (app *App) referenceRead(_ context.Context, value Box) (Scalars, error) {
+ return *value.Value, nil
+}
+
+func BenchmarkGeneratedStructuredFields(b *testing.B) {
+ app := &App{}
+ value := Scalars{Number:42, Active:true}
+ box := Box{Value:&value}
+ for _, tc := range []struct { name string; call func(context.Context, Scalars) (Box, error) }{
+  {"wrap_generated",app.wrap}, {"wrap_reference",app.referenceWrap},
+ } {
+  b.Run(tc.name,func(b *testing.B) {
+   b.ReportAllocs()
+   for b.Loop() {
+    var err error
+    structuredBoxSink, err = tc.call(b.Context(),value)
+    if err != nil || structuredBoxSink.Value == nil || *structuredBoxSink.Value != value { b.Fatal(structuredBoxSink, err) }
+   }
+  })
+ }
+ for _, tc := range []struct { name string; call func(context.Context, Box) (Scalars, error) }{
+  {"read_generated",app.readValue}, {"read_reference",app.referenceRead},
+ } {
+  b.Run(tc.name,func(b *testing.B) {
+   b.ReportAllocs()
+   for b.Loop() {
+    var err error
+    structuredValueSink, err = tc.call(b.Context(),box)
+    if err != nil || structuredValueSink != value { b.Fatal(structuredValueSink, err) }
+   }
+  })
+ }
+}
+
+func checkScalarArenaFrame(t *testing.T, write func(*api.ResponseBuf, []byte) error, read func(*codec.Decoder) bool, want, masked []byte) {
+ t.Helper()
+ buf := &api.ResponseBuf{}
+ if err := write(buf, nil); err != nil {
+  t.Fatal(err)
+ }
+ if !bytes.Equal(buf.B, want) {
+  t.Fatalf("arena frame=%x want=%x", buf.B, want)
+ }
+ dec := codec.NewDecoder(buf.B)
+ valid := read(dec)
+ if err := dec.Finish(); err != nil {
+  t.Fatal(err)
+ }
+ if !valid {
+  t.Fatal("decoded value changed")
+ }
+ if masked != nil {
+  checkScalarArenaMask(t, buf, write, masked)
+ }
+ dec = codec.NewDecoder(want[1:])
+ read(dec)
+ if dec.Finish() == nil {
+  t.Fatal("omitted arena prefix accepted")
+ }
+}
+
+func checkScalarArenaMask(t *testing.T, buf *api.ResponseBuf, write func(*api.ResponseBuf, []byte) error, want []byte) {
+ t.Helper()
+ fields, err := codec.FieldMaskSet(nil, 1)
+ if err != nil {
+  t.Fatal(err)
+ }
+ mask, err := codec.AppendSelectionMask(nil, fields, nil)
+ if err != nil {
+  t.Fatal(err)
+ }
+ buf.B = buf.B[:0]
+ if err := write(buf, mask); err != nil {
+  t.Fatal(err)
+ }
+ if !bytes.Equal(buf.B, want) {
+  t.Fatalf("masked arena frame=%x want=%x", buf.B, want)
+ }
+}
+`
 
 func TestReadLuxoArenaDecoding(t *testing.T) {
 
@@ -1527,8 +1879,8 @@ func TestReadLuxoAllFieldTypes(t *testing.T) {
 	code := string(src)
 
 	// ReadLuxo should handle DateTime, Duration, Bytes, nullable String, nullable Float
-	if !strings.Contains(code, "time.Unix(dec.ReadInt(), 0)") {
-		t.Errorf("DateTime ReadLuxo missing time.Unix:\n%s", code)
+	if !strings.Contains(code, "dec.ReadDateTime()") {
+		t.Errorf("DateTime ReadLuxo missing precise timestamp reader:\n%s", code)
 	}
 	if !strings.Contains(code, "time.Duration(dec.ReadInt())") {
 		t.Errorf("Duration ReadLuxo missing:\n%s", code)
@@ -1567,11 +1919,11 @@ func TestWriteLuxoArenaHeaderMaskedPath(t *testing.T) {
 	src := generator.generateWriteJSONFile(result, "app", nil)
 	code := string(src)
 
-	// Masked path should check FieldMaskHas for arena len
-	if !strings.Contains(code, "FieldMaskHas(mask, 2) { _arenaLen += len(u.Name)") {
+	// Arena length uses the same selected bits as the row writer.
+	if !strings.Contains(code, "_fieldBits&2 != 0 { _arenaLen += len(u.Name)") {
 		t.Errorf("masked path should check mask for name arena len:\n%s", code)
 	}
-	if !strings.Contains(code, "FieldMaskHas(mask, 3) && u.Bio != nil") {
+	if !strings.Contains(code, "_fieldBits&4 != 0 && u.Bio != nil") {
 		t.Errorf("masked path should check mask + nil for nullable arena len:\n%s", code)
 	}
 }
@@ -1589,8 +1941,45 @@ func TestGenerateWriteJSONExtendStubIncludesDeclaredPrimaryKey(t *testing.T) {
 		}},
 	}}}
 
-	code := string(generator.generateWriteJSONFile(result, "app", nil))
-	if !strings.Contains(code, "case 7: p.Sku = dec.ReadStringArena") {
-		t.Fatalf("extend codec does not decode the declared primary key:\n%s", code)
-	}
+	generated := &GenerateResult{Files: map[string][]byte{
+		"model.gen.go":     []byte("package generated\ntype Product struct { Sku string; Name string }\n"),
+		"writejson.gen.go": generator.generateWriteJSONFile(result, "generated", nil),
+	}}
+	runGeneratedCompilation(t, generated, `package generated
+import("testing";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec")
+func TestExtendedPrimaryKeyRoundTrip(t *testing.T){
+ value:=Product{Sku:"sku-42",Name:"product"};buf:=&api.ResponseBuf{}
+ mask,err:=codec.FieldMaskSet(nil,7);if err!=nil{t.Fatal(err)}
+ mask,err=codec.AppendSelectionMask(nil,mask,nil);if err!=nil{t.Fatal(err)}
+ if err:=value.WriteLuxo(buf,mask);err!=nil{t.Fatal(err)}
+ var got Product;dec:=codec.NewDecoder(buf.B);got.ReadLuxo(dec)
+ if err:=dec.Finish();err!=nil||got.Sku!=value.Sku||got.Name!=""{t.Fatalf("declared primary key selection/decoder mismatch: value=%+v err=%v",got,err)}
+}
+`)
+}
+
+func assertInvalidVisibleDirective(t *testing.T, b *strings.Builder, field *ast.FieldDecl) {
+	t.Helper()
+	defer func() {
+		if _, ok := recover().(*InternalCompilerError); !ok {
+			t.Fatal("invalid visibility must stop generation")
+		}
+		if b.Len() != 0 {
+			t.Fatal("invalid visibility wrote partial output")
+		}
+	}()
+	writeVisibleDirective(b, field)
+}
+
+func assertInvalidTransformDirective(t *testing.T, b *strings.Builder, field *ast.FieldDecl) {
+	t.Helper()
+	defer func() {
+		if _, ok := recover().(*InternalCompilerError); !ok {
+			t.Fatal("invalid transform must stop generation")
+		}
+		if b.Len() != 0 {
+			t.Fatal("invalid transform wrote partial output")
+		}
+	}()
+	writeTransformDirective(b, field, "value")
 }

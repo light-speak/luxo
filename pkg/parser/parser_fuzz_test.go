@@ -17,6 +17,7 @@ func FuzzParser(f *testing.F) {
 		"sealed Result { Ok(v: String) Failed(e: String) }",
 		"type Page<T> { items: [T] total: Int }",
 		"extend User { posts: [Post] }",
+		"model Post { authorId: Int author: User @by(id, authorId) }",
 		"use common.{ Base }",
 		"error NotFound { code: 404 message: error.not_found }",
 		"middleware auth @native",
@@ -38,6 +39,11 @@ func FuzzParser(f *testing.F) {
 		"val = = = =",
 		"@@@@@",
 		"model User : : : { }",
+		"model Post { author: User(key: authorId) } model Recovered { id: Int }",
+		"model Post { authors: [User(key: authorId)] }",
+		"api lookup(): Page<User(key: authorId)> @native",
+		"api lookup(): [User] { User.findMany(order: ) 0 } fn recovered(): Int { 1 }",
+		"fn lookup(): Int { outer(inner(value: ), keep: 7) 0 } fn recovered(): Int { 1 }",
 	}
 
 	for _, s := range seeds {

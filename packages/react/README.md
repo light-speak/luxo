@@ -26,28 +26,27 @@
 
 The path from database to screen should be short. With Luxo, it is.
 
-Write a React component. Access `user.name` and `user.email`. At compile time, Luxo traces those field accesses and injects `$select: "name, email"` into the API call. The server only serializes those two fields. The SQL only queries those two columns.
+Use the generated, strongly typed client inside React hooks. Luxo carries explicit field selections through the transport to server-side projection. The server may also load primary keys, relationship keys and fields required by business logic; those internal requirements are not extra public response fields.
 
 ```tsx
-// You write:
-function Profile({ id }) {
-  const { data: user } = useLuxoQuery(
-    () => transport.call('getUser', { id }),
+import { useLuxoQuery } from '@luxojs/react'
+import { LuxoClient } from './luxo/client.js'
+
+const client = LuxoClient.create('http://localhost:4000/luvia')
+
+export function Profile({ id }: { id: bigint }) {
+  const { data: user, loading, error } = useLuxoQuery(
+    ({ signal }) => client.getUser({ id, $select: 'id, name' }, { signal }),
     [id],
+    { queryKey: ['user', id, 'id, name'] },
   )
-  return <h1>{user.name}</h1>  // ← Luxo sees this at compile time
+  if (loading) return <p>Loading...</p>
+  if (error) return <p>{error.message}</p>
+  return <h1>{user?.name ?? 'No user'}</h1>
 }
-
-// What actually runs:
-// → API: getUser(id: 1, $select: "name")
-// → SQL: SELECT name FROM users WHERE id = 1
-
-// Not SELECT * — just the one column you used.
 ```
 
-No manual optimization. No over-fetching. No `useCallback` wrapper around field lists.
-
-**Every layer knows exactly what the next layer needs, because the compiler already figured it out.**
+The Vite plugin infers selections for supported, locally analyzable generated-client calls. It does not perform whole-program data-flow analysis through arbitrary hooks, callbacks or JSX. At those boundaries, use an explicit `$select` as above. Raw `transport.call(...)` does not provide generated API signatures or model decoding.
 
 ## Install
 
@@ -55,31 +54,40 @@ No manual optimization. No over-fetching. No `useCallback` wrapper around field 
 pnpm add @luxojs/react @luxojs/client
 ```
 
+Use TypeScript 7. Luxo `Int` and `Duration` values are `bigint`, including IDs and pagination metadata. Do not convert them to `number`. Unselected output fields are `undefined`; selected nullable values remain `null`.
+
 ## Quick Start
 
+These examples assume your generated schema exposes `getUser(id: Int): User` and a paginated `listUsers`, with `User.id: Int` and `User.name: String`. The Vite plugin writes the generated client to `src/luxo`; the examples live beside that directory.
+
 ```tsx
-import { FetchTransport } from '@luxojs/client'
 import { useLuxoQuery } from '@luxojs/react'
+import { LuxoClient } from './luxo/client.js'
 
-const transport = new FetchTransport('http://localhost:4000/luvia', {
-  token: localStorage.getItem('token'),
-})
+const client = LuxoClient.create('http://localhost:4000/luvia')
 
-function UserList() {
+export function UserList() {
   const { data: users, loading, error, refetch } = useLuxoQuery(
-    () => transport.call('listUsers', { page: 1 }),
+    ({ signal }) => client.listUsers({ page: 1n, pageSize: 20n, $select: 'id, name' }, { signal }),
     [],
-    { queryKey: ['users', 1] },
+    { queryKey: ['users', 1n, 20n, 'id, name'] },
   )
 
   if (loading) return <p>Loading...</p>
   if (error) return <p>Error: {error.message}</p>
+  if (!users) return <p>No data</p>
 
   return (
-    <ul>
-      {users.map(u => <li key={u.id}>{u.name}</li>)}
-      <button onClick={refetch}>Refresh</button>
-    </ul>
+    <section>
+      <p>Total: {users.total.toString()}</p>
+      <ul>
+        {users.items.map(user => {
+          if (user.id === undefined) throw new Error('The response omitted a selected user ID')
+          return <li key={user.id.toString()}>{user.name}</li>
+        })}
+      </ul>
+      <button type="button" onClick={() => { void refetch() }}>Refresh</button>
+    </section>
   )
 }
 ```
@@ -91,18 +99,18 @@ function UserList() {
 **Declarative** — auto-executes on mount, re-fetches when `deps` change. Concurrent requests with the same key share one Promise. React StrictMode effect replay never duplicates a request.
 
 ```tsx
-const { data, loading, error, refetch } = useLuxoQuery<User[]>(
-  () => transport.call('listUsers', { page }),
+const { data, loading, error, refetch } = useLuxoQuery(
+  ({ signal }) => client.listUsers({ page, $select: 'id, name' }, { signal }),
   [page],
   {
-    queryKey: ['users', page],
+    queryKey: ['users', page, 'id, name'],
     staleTime: 5_000,
     gcTime: 60_000,
   },
 )
 ```
 
-Without a `queryKey`, the hook still deduplicates its own StrictMode replay. Add a structural key to share in-flight or fresh data across components. Object key order does not affect identity.
+Here `page` is a `bigint`, and `data` is a paginated result rather than a plain array. Without a `queryKey`, the hook still deduplicates its own StrictMode replay. Add a structural key to share in-flight or fresh data across components. Include inputs and field selection in shared keys so different projections cannot share an incomplete cached response. Object key order does not affect identity; distinct `bigint` IDs stay distinct.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -124,13 +132,13 @@ Without a `queryKey`, the hook still deduplicates its own StrictMode replay. Add
 **Imperative** — only runs when you call `mutate()`. For writes: create, update, delete, login.
 
 ```tsx
-const { mutate, loading, error, reset } = useLuxoMutation<Project, CreateProject>(
-  (params) => client.createProject(params),
+const { mutate, loading, error, reset } = useLuxoMutation(
+  (params: { name: string }) => client.createProject({ ...params, $select: 'id, name' }),
   { invalidateQueries: [['projects']] },
 )
 ```
 
-Mutations are never deduplicated or cached. `loading` remains true until every concurrent mutation settles. `invalidateQueries` accepts static keys or a function derived from the mutation result.
+This example assumes `createProject(name: String)` returns a project with `id` and `name`. Mutations are never deduplicated or cached. `loading` remains true until every concurrent mutation settles. `invalidateQueries` accepts static keys or a function derived from the mutation result. The hook names describe React execution behavior; Luxo does not split its API protocol into GraphQL query/mutation operation types.
 
 | Return | Type | Description |
 |--------|------|-------------|
@@ -193,13 +201,23 @@ pnpm add -D @luxojs/vite-plugin
 ```ts
 // vite.config.ts
 import { luxo } from '@luxojs/vite-plugin'
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react(), luxo({ schema: './luxo.schema.json' })],
 })
 ```
 
-Now every `useLuxoQuery` call automatically gets `$select` based on which fields your JSX renders. Zero config, zero manual work.
+The plugin generates the client and injects explicit selections for supported local access patterns. Returning a model through a callback may require a bounded default projection because JSX usage outside that callback cannot be inferred reliably. Use explicit selections in hook callbacks when you want a specific projection; do not rely on implicit server-side all-field selection.
+
+## Package verification
+
+`pnpm build` emits JavaScript with tsdown and generates declarations from implementation source using the TypeScript 7 CLI. The published package contains `dist`, not a separately maintained handwritten declaration file. Tests install actual client/React tarballs, compile strict ESM/CJS consumers and check full-width integer cache keys and values. They reuse already installed third-party React/TypeScript tooling, but never link Luxo source into the consuming project. The profile and quick-start examples are also compiled against a generated client. Build `../client` before building this package from the repository.
+
+`pnpm typecheck` checks production source, tests, benchmarks and tool configuration without `skipLibCheck`. Node and React DOM declarations are development-only dependencies; they are not bundled into runtime JavaScript. Run cache benchmarks separately with `pnpm exec vitest bench --run`. Results from different Vitest/Tinybench versions are not interchangeable performance baselines.
+
+Hook tests explicitly select jsdom with per-file environment directives. Pure cache tests, package consumers and cache benchmarks run in Node without a global DOM environment.
 
 ## Ecosystem
 

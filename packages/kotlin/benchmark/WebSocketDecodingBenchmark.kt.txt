@@ -1,0 +1,133 @@
+package com.luxo.client
+
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.*
+import java.util.function.LongSupplier
+
+/** Generated only for the explicitly supplied pre-isolation snapshot; no runtime test hooks. */
+object WebSocketDecodingBenchmark {
+    @JvmStatic
+    fun main(args: Array<String>) {
+        println("JDK ${System.getProperty("java.version")}; 12 warmup pairs, 20 alternating samples; ns/op and B/op")
+        if (args.contentEquals(arrayOf("--unary-only"))) {
+            compareUnary(TransportMode.BINARY)
+            return
+        }
+        for (mode in TransportMode.entries) {
+            compareData(mode, typed = false, value = 7)
+            compareData(mode, typed = true, value = 7)
+            compareData(mode, typed = true, value = Long.MAX_VALUE)
+            compareLifecycle(mode)
+            compareUnary(mode)
+        }
+        println("sink=${PairedJvmBenchmark.sink}")
+    }
+
+    private fun compareData(mode: TransportMode, typed: Boolean, value: Long) = runBlocking {
+        Fixture(false, mode, value).use { before -> Fixture(true, mode, value).use { after ->
+            val stopBefore = before.subscribe(typed)
+            val stopAfter = after.subscribe(typed)
+            before.deliver(); after.deliver()
+            check(before.received == value && after.received == value)
+            PairedJvmBenchmark.compare("$mode data typed=$typed value=$value", LongSupplier {
+                before.deliver(); before.received
+            }, LongSupplier {
+                after.deliver(); after.received
+            }, iterations = 100_000)
+            check(before.received == after.received)
+            stopBefore(); stopAfter()
+        } }
+    }
+
+    private fun compareLifecycle(mode: TransportMode) {
+        Fixture(false, mode).use { before -> Fixture(true, mode).use { after ->
+            PairedJvmBenchmark.compare("$mode setup ACK cancel typed=true", LongSupplier {
+                runBlocking { before.subscribe(typed = true).invoke() }
+                before.client.socket.sent.toLong()
+            }, LongSupplier {
+                runBlocking { after.subscribe(typed = true).invoke() }
+                after.client.socket.sent.toLong()
+            }, iterations = 20_000)
+            check(before.client.socket.sent == after.client.socket.sent)
+        } }
+    }
+
+    private fun compareUnary(mode: TransportMode) {
+        Fixture(false, mode).use { before -> Fixture(true, mode).use { after ->
+            PairedJvmBenchmark.compare("$mode unary fake roundtrip", LongSupplier {
+                runBlocking { decodeInteger(before.transport.call("watch")) }
+            }, LongSupplier {
+                runBlocking { decodeInteger(after.transport.call("watch")) }
+            }, iterations = 20_000)
+        } }
+    }
+
+    private fun decodeInteger(value: Any): Long = if (value is ByteArray) {
+        val decoder = LuxoDecoder(value)
+        decoder.readInt().also { decoder.checkComplete() }
+    } else decodeLuxoJsonInt(value as JsonElement)
+
+    private class Fixture(current: Boolean, private val mode: TransportMode, private val value: Long = 7) : AutoCloseable {
+        val client = TestSocketClient()
+        private val modern = if (current) LuxoWebSocket("ws://localhost/luvia", client, 0u, 30_000) else null
+        private val baseline = if (current) null else BeforeDecodingWebSocket("ws://localhost/luvia", client, 0u, 30_000)
+        val transport: Transport = modern ?: requireNotNull(baseline)
+        var received = 0L
+            private set
+        private val dataText = """{"${'$'}stream":1,"data":$value}"""
+        private val dataBytes = frame(0x12, 1, LuxoEncoder().apply { writeSvarint(value) }.bytes())
+        private val observer = StreamObserver(onError = { error("Unexpected error: $it") })
+
+        init {
+            transport.setMode(mode)
+            transport.setSchema(mapOf("watch" to APISchemaEntry(77)))
+            modern?.connect() ?: baseline?.connect()
+            client.socket.open()
+            client.socket.onText = { text ->
+                val json = Json.parseToJsonElement(text).jsonObject
+                if (json.containsKey("\$sub")) {
+                    client.socket.receive("""{"${'$'}sub":${json.getValue("\$id")},"ok":true}""")
+                } else if (json.containsKey("\$api")) {
+                    client.socket.receive("""{"${'$'}id":${json.getValue("\$id")},"data":7}""")
+                }
+            }
+            client.socket.onBinary = { bytes ->
+                val decoder = LuxoDecoder(bytes.toByteArray())
+                when (decoder.readVarint()) {
+                    0x10L -> client.socket.receive(frame(0x13, decoder.readVarint()))
+                    0x01L -> client.socket.receive(frame(2, decoder.readVarint(), byteArrayOf(14)))
+                }
+            }
+        }
+
+        suspend fun subscribe(typed: Boolean): () -> Unit {
+            if (typed) {
+                val onData: (Long) -> Unit = { received = it }
+                // Match the generated client's old combined decoder/callback, not an inlined primitive-only shortcut.
+                return if (modern != null) modern.subscribe("watch", { decodeInteger(it) }, observer = observer, handler = onData)
+                else requireNotNull(baseline).subscribeRaw("watch", emptyMap(), observer) { onData(decodeInteger(it)) }
+            }
+            // Both arms observe the same raw payload without running a model decoder.
+            return if (modern != null) modern.subscribe("watch", { it }, observer = observer) { acceptRaw(it) }
+            else requireNotNull(baseline).subscribeRaw("watch", emptyMap(), observer) { acceptRaw(it) }
+        }
+
+        private fun acceptRaw(value: Any) {
+            received = if (value is ByteArray) (value[0].toInt() ushr 1).toLong() else (value as JsonPrimitive).long
+        }
+
+        fun deliver() {
+            if (mode == TransportMode.JSON) client.socket.receive(dataText) else client.socket.receive(dataBytes)
+        }
+
+        override fun close() {
+            modern?.close() ?: baseline?.close()
+            client.dispatcher.executorService.shutdownNow()
+            client.connectionPool.evictAll()
+        }
+    }
+
+    private fun frame(type: Long, id: Long, payload: ByteArray = byteArrayOf()): ByteArray = LuxoEncoder().apply {
+        writeVarint(type); writeVarint(id); writeRawBytes(payload)
+    }.bytes()
+}

@@ -1,0 +1,106 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"net"
+	"os"
+
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/luvia"
+	"github.com/light-speak/luxo/pkg/lux/rpc"
+)
+
+func serveFixture() error {
+	if err := configureFixtureAuth(); err != nil {
+		return err
+	}
+	switch {
+	case len(os.Args) == 1:
+		router, err := serviceRouter()
+		if err != nil {
+			return err
+		}
+		return serveHTTP(router)
+	case len(os.Args) == 2 && os.Args[1] == "-rpc":
+		router, err := serviceRouter()
+		if err != nil {
+			return err
+		}
+		return serveRPC(router)
+	case len(os.Args) == 3 && os.Args[1] == "-gateway":
+		return serveGateway(os.Args[2])
+	default:
+		return fmt.Errorf("invalid fixture process role")
+	}
+}
+
+func fixtureRouter() (*api.Router, error) {
+	// Selection isolation sends 16 groups of three concurrent calls.
+	router := luvia.NewWithOptions(api.RouterOptions{
+		WebSocket: api.WebSocketLimits{CallsPerConnection: 64},
+	}).Router
+	// Verify production error redaction. Introspection has its own explicit key.
+	router.SetDevMode(false)
+	router.IntrospectionKey = "sdk-interop"
+	if err := RegisterSchema(router.Schema); err != nil {
+		return nil, err
+	}
+	if err := router.Registry.RegisterSchemaAPIs(router.Schema); err != nil {
+		return nil, err
+	}
+	return router, nil
+}
+
+func serviceRouter() (*api.Router, error) {
+	router, err := fixtureRouter()
+	if err != nil {
+		return nil, err
+	}
+	app := &App{Resolver: streamResolver{}}
+	if err := RegisterHandlers(router, app); err != nil {
+		return nil, err
+	}
+	if err := RegisterStreams(router, nil, app.Resolver); err != nil {
+		return nil, err
+	}
+	return router, nil
+}
+
+func serveRPC(router *api.Router) error {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	server := rpc.NewServer(router)
+	defer server.Close()
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(listener) }()
+	fmt.Printf("tcp://%s\n", listener.Addr())
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	server.Close()
+	return <-done
+}
+
+func serveGateway(address string) error {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || host != "127.0.0.1" || port == "" {
+		return fmt.Errorf("invalid fixture RPC address %q", address)
+	}
+	client := rpc.NewNamedClient("precision", address)
+	defer client.Close()
+	router, err := fixtureRouter()
+	if err != nil {
+		return err
+	}
+	clients := map[string]*rpc.Client{"precision": client}
+	// The gateway has schema and generated proxies only, never local handlers.
+	for name, definition := range router.Schema.APIs {
+		if definition.Stream {
+			router.HandleStreamForwarded(name, rpcStreamProxy(client, router, name))
+		} else {
+			router.Handle(name, proxyHandler(client, router.Schema, name, clients))
+		}
+	}
+	return serveHTTP(router)
+}

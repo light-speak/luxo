@@ -1,0 +1,336 @@
+{
+  "version": 1,
+  "status": "Normative test inputs; actual Go/SDK producer results must be asserted separately.",
+  "dsl": "sealed Outcome {\n Success(value: Int)\n Failure(reason: String = \"failed\")\n Pending\n Nested(child: Outcome? = null, history: [Outcome]? = null)\n}\nfn identity(value: Outcome): Outcome { return value }\napi echo(value: Outcome): Outcome { return identity(value) }\n\nsealed EmptyOutcome {}\napi echoEmpty(value: EmptyOutcome?): EmptyOutcome? { return value }\napi echoEmptyList(values: [EmptyOutcome]): [EmptyOutcome] { return values }\n",
+  "schema": {
+    "models": {},
+    "apis": {
+      "echo": {
+        "id": 1,
+        "name": "echo",
+        "module": "sealed",
+        "returnType": "Outcome",
+        "params": [
+          {
+            "id": 1,
+            "name": "value",
+            "type": "Sealed",
+            "typeName": "Outcome"
+          }
+        ]
+      },
+      "echoEmpty": {
+        "id": 2,
+        "name": "echoEmpty",
+        "module": "sealed",
+        "returnType": "EmptyOutcome",
+        "returnNullable": true,
+        "params": [
+          {
+            "id": 1,
+            "name": "value",
+            "type": "Sealed",
+            "typeName": "EmptyOutcome",
+            "nullable": true
+          }
+        ]
+      },
+      "echoEmptyList": {
+        "id": 3,
+        "name": "echoEmptyList",
+        "module": "sealed",
+        "returnType": "EmptyOutcome",
+        "returnList": true,
+        "params": [
+          {
+            "id": 1,
+            "name": "values",
+            "type": "Sealed",
+            "typeName": "EmptyOutcome",
+            "isList": true
+          }
+        ]
+      }
+    },
+    "enums": {},
+    "types": {},
+    "sealeds": {
+      "Outcome": {
+        "name": "Outcome",
+        "module": "sealed",
+        "usage": "inputOutput",
+        "variants": [
+          {
+            "id": 1,
+            "name": "Success",
+            "fields": [
+              {
+                "id": 1,
+                "name": "value",
+                "type": "Int"
+              }
+            ]
+          },
+          {
+            "id": 2,
+            "name": "Failure",
+            "fields": [
+              {
+                "id": 1,
+                "name": "reason",
+                "type": "String",
+                "hasDefault": true
+              }
+            ]
+          },
+          {
+            "id": 3,
+            "name": "Pending",
+            "fields": []
+          },
+          {
+            "id": 4,
+            "name": "Nested",
+            "fields": [
+              {
+                "id": 1,
+                "name": "child",
+                "type": "Sealed",
+                "typeName": "Outcome",
+                "nullable": true,
+                "hasDefault": true
+              },
+              {
+                "id": 2,
+                "name": "history",
+                "type": "Sealed",
+                "typeName": "Outcome",
+                "nullable": true,
+                "isList": true,
+                "hasDefault": true
+              }
+            ]
+          }
+        ]
+      },
+      "EmptyOutcome": {
+        "name": "EmptyOutcome",
+        "module": "sealed",
+        "usage": "inputOutput",
+        "variants": []
+      }
+    }
+  },
+  "vectors": [
+    {
+      "name": "success7",
+      "json": {
+        "Success": {
+          "value": 7
+        }
+      },
+      "raw": [
+        1,
+        4,
+        0,
+        1,
+        14,
+        0
+      ],
+      "input": "accept",
+      "output": "accept"
+    },
+    {
+      "name": "pending",
+      "json": {
+        "Pending": {}
+      },
+      "raw": [
+        3,
+        2,
+        0,
+        0
+      ],
+      "input": "accept",
+      "output": "accept"
+    },
+    {
+      "name": "successTagOnly",
+      "json": {
+        "Success": {}
+      },
+      "raw": [
+        1,
+        2,
+        0,
+        0
+      ],
+      "input": "reject missing value",
+      "output": "accept value unselected"
+    },
+    {
+      "name": "rootList",
+      "json": [
+        {
+          "Success": {
+            "value": 7
+          }
+        },
+        {
+          "Pending": {}
+        }
+      ],
+      "raw": [
+        2,
+        6,
+        1,
+        4,
+        0,
+        1,
+        14,
+        0,
+        4,
+        3,
+        2,
+        0,
+        0
+      ],
+      "input": "accept",
+      "output": "accept"
+    },
+    {
+      "name": "nullableNull",
+      "json": null,
+      "raw": [
+        0
+      ],
+      "input": "only when nullable",
+      "output": "only when nullable"
+    },
+    {
+      "name": "nullablePresentSuccess",
+      "json": {
+        "Success": {
+          "value": 7
+        }
+      },
+      "raw": [
+        1,
+        1,
+        4,
+        0,
+        1,
+        14,
+        0
+      ],
+      "input": "only when nullable",
+      "output": "only when nullable"
+    },
+    {
+      "name": "unknownTag",
+      "raw": [
+        99,
+        2,
+        0,
+        0
+      ],
+      "input": "reject",
+      "output": "reject"
+    },
+    {
+      "name": "zeroTag",
+      "raw": [
+        0,
+        2,
+        0,
+        0
+      ],
+      "input": "reject as raw sealed (not nullable)",
+      "output": "reject as raw sealed"
+    },
+    {
+      "name": "truncatedPayload",
+      "raw": [
+        1,
+        4,
+        0,
+        1,
+        14
+      ],
+      "input": "reject",
+      "output": "reject"
+    },
+    {
+      "name": "multipleFrames",
+      "raw": [
+        1,
+        4,
+        0,
+        1,
+        14,
+        0,
+        3,
+        2,
+        0,
+        0
+      ],
+      "input": "reject trailing frame",
+      "output": "reject trailing frame"
+    },
+    {
+      "name": "emptyJSON",
+      "rawJSON": "{}",
+      "input": "reject",
+      "output": "reject"
+    },
+    {
+      "name": "duplicateCaseJSON",
+      "rawJSON": "{\"Pending\":{},\"Pending\":{}}",
+      "input": "reject",
+      "output": "reject"
+    },
+    {
+      "name": "multipleCaseJSON",
+      "rawJSON": "{\"Pending\":{},\"Success\":{\"value\":7}}",
+      "input": "reject",
+      "output": "reject"
+    },
+    {
+      "name": "emptySumNullableNull",
+      "owner": "EmptyOutcome",
+      "nullable": true,
+      "json": null,
+      "raw": [
+        0
+      ],
+      "input": "accept",
+      "output": "accept"
+    },
+    {
+      "name": "emptySumEmptyList",
+      "owner": "EmptyOutcome",
+      "isList": true,
+      "json": [],
+      "raw": [
+        0
+      ],
+      "input": "accept",
+      "output": "accept"
+    },
+    {
+      "name": "emptySumPresent",
+      "owner": "EmptyOutcome",
+      "json": {
+        "Future": {}
+      },
+      "raw": [
+        1,
+        2,
+        0,
+        0
+      ],
+      "input": "reject uninhabited present value",
+      "output": "reject uninhabited present value"
+    }
+  ]
+}

@@ -5,7 +5,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"strings"
 	"testing"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestSHA256(t *testing.T) {
@@ -141,6 +144,22 @@ func TestHashPassword(t *testing.T) {
 	hash2, _ := HashPassword("secret123")
 	if hash == hash2 {
 		t.Error("should produce different hashes (different salt)")
+	}
+}
+
+func TestHashPasswordRejectsOverlongUTF8Input(t *testing.T) {
+	password := strings.Repeat("界", 25)
+	hash, err := HashPassword(password)
+	if hash != "" || !errors.Is(err, bcrypt.ErrPasswordTooLong) {
+		t.Fatalf("overlong password must fail without a partial hash: hash=%q err=%v", hash, err)
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Fatal("hashing error leaked the password")
+	}
+	password = strings.Repeat("界", 24)
+	hash, err = HashPassword(password)
+	if err != nil || !VerifyPassword(password, hash) {
+		t.Fatalf("valid 72-byte UTF-8 password failed: %v", err)
 	}
 }
 

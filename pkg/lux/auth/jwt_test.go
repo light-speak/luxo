@@ -2,6 +2,7 @@ package auth
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -17,7 +18,7 @@ func testConfig() *Config {
 
 func TestSignAndVerify(t *testing.T) {
 	cfg := testConfig()
-	data := map[string]any{"id": float64(1), "role": "admin"}
+	data := testClaims(1, "admin")
 
 	token, err := Sign(cfg, data)
 	if err != nil {
@@ -33,17 +34,17 @@ func TestSignAndVerify(t *testing.T) {
 		t.Fatalf("Verify failed: %v", err)
 	}
 
-	if result["id"] != float64(1) {
-		t.Errorf("id = %v, want 1", result["id"])
+	if result.ID() != 1 {
+		t.Errorf("id = %v, want 1", result.ID())
 	}
-	if result["role"] != "admin" {
-		t.Errorf("role = %v, want admin", result["role"])
+	if result.String("role") != "admin" {
+		t.Errorf("role = %v, want admin", result.String("role"))
 	}
 }
 
 func TestVerifyExpired(t *testing.T) {
 	cfg := testConfig()
-	data := map[string]any{"id": float64(1)}
+	data := testClaims(1, "")
 
 	token, _ := SignWithExpiry(cfg, data, -time.Hour)
 
@@ -55,14 +56,22 @@ func TestVerifyExpired(t *testing.T) {
 
 func TestVerifyBadSignature(t *testing.T) {
 	cfg := testConfig()
-	data := map[string]any{"id": float64(1)}
+	data := testClaims(1, "")
 
-	token, _ := Sign(cfg, data)
+	token, err := Sign(cfg, data)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// Tamper with token
-	_, err := Verify(cfg, token+"x")
-	if err == nil {
-		t.Fatal("should reject tampered token")
+	end := strings.LastIndexByte(token, '.') + 1
+	replacement := "A"
+	if token[end] == 'A' {
+		replacement = "B"
+	}
+	for _, invalid := range []string{token + "x", token + "=", token + "\n", token[:end] + replacement + token[end+1:]} {
+		if _, err := Verify(cfg, invalid); err == nil || err.Error() != "invalid signature" {
+			t.Fatalf("expected invalid signature, got %v", err)
+		}
 	}
 }
 
@@ -77,6 +86,22 @@ func TestVerifyBadFormat(t *testing.T) {
 	_, err = Verify(cfg, "onlyonepart")
 	if err == nil {
 		t.Fatal("should reject single part")
+	}
+}
+
+func TestVerifyDoesNotAllocateTokenParts(t *testing.T) {
+	cfg := cacheTestConfig()
+	token, err := Sign(cfg, testClaims(42, "ADMIN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocations := testing.AllocsPerRun(20, func() {
+		if _, err := Verify(cfg, token); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocations >= 32 {
+		t.Fatalf("Verify with the fixed two-claim token allocated %.0f objects per call", allocations)
 	}
 }
 
@@ -96,18 +121,18 @@ func TestVerifyBadPayload(t *testing.T) {
 
 func TestSignRefresh(t *testing.T) {
 	cfg := testConfig()
-	data := map[string]any{"id": float64(1)}
+	data := testClaims(1, "")
 
 	token, err := SignRefresh(cfg, data)
 	if err != nil {
 		t.Fatalf("SignRefresh failed: %v", err)
 	}
 
-	result, err := Verify(cfg, token)
+	result, err := VerifyRefresh(cfg, token)
 	if err != nil {
 		t.Fatalf("Verify refresh token failed: %v", err)
 	}
-	if result["id"] != float64(1) {
+	if result.ID() != 1 {
 		t.Error("refresh token should contain same data")
 	}
 }
@@ -116,7 +141,7 @@ func TestSignRefreshDisabled(t *testing.T) {
 	cfg := testConfig()
 	cfg.RefreshEnabled = false
 
-	_, err := SignRefresh(cfg, map[string]any{})
+	_, err := SignRefresh(cfg, testClaims(0, ""))
 	if err == nil {
 		t.Fatal("should error when refresh disabled")
 	}
@@ -211,8 +236,14 @@ func TestLoadConfigRejectsInvalidSecuritySettings(t *testing.T) {
 	}{
 		{name: "empty secret", key: "JWT_SECRET", value: ""},
 		{name: "non-positive expiry", key: "JWT_EXPIRES", value: "0s"},
+		{name: "negative mixed expiry", key: "JWT_EXPIRES", value: "-1h1d"},
+		{name: "overflow expiry", key: "JWT_EXPIRES", value: "100000d100000d100000d"},
+		{name: "malformed expiry", key: "JWT_EXPIRES", value: "1..2d"},
 		{name: "invalid refresh flag", key: "JWT_REFRESH", value: "yes"},
 		{name: "non-positive refresh expiry", key: "JWT_REFRESH_EXPIRES", value: "-1s"},
+		{name: "negative mixed refresh expiry", key: "JWT_REFRESH_EXPIRES", value: "-1d48h"},
+		{name: "overflow refresh expiry", key: "JWT_REFRESH_EXPIRES", value: "106752d"},
+		{name: "malformed refresh expiry", key: "JWT_REFRESH_EXPIRES", value: "1.2.3w"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -241,6 +272,7 @@ func TestParseDuration(t *testing.T) {
 		{"7d", 7 * 24 * time.Hour, false},
 		{"2w", 2 * 7 * 24 * time.Hour, false},
 		{"1d12h", 36 * time.Hour, false},
+		{"2*24h+12h", 60 * time.Hour, false},
 		{"30m", 30 * time.Minute, false},
 		{"168h", 168 * time.Hour, false},
 		{"500ms", 500 * time.Millisecond, false},

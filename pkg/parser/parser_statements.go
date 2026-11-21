@@ -1,6 +1,8 @@
 package parser
 
 import (
+	"slices"
+
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -13,32 +15,56 @@ func (p *Parser) parseLambdaExpr() *ast.LambdaExpr {
 	pos := p.current().Pos
 	p.expect(token.LBrace)
 	params := p.tryParseLambdaParams()
-	block := &ast.Block{Pos: pos}
-	for !p.check(token.RBrace) && !p.isEOF() {
-		stmt := p.parseStmt()
-		if stmt != nil {
-			block.Stmts = append(block.Stmts, stmt)
-		}
-	}
-	block.EndPos = p.current().Pos
-	p.expect(token.RBrace)
-	return &ast.LambdaExpr{Pos: pos, Params: params, Body: block}
+	return &ast.LambdaExpr{Pos: pos, Params: params, Body: p.parseBlockBody(pos)}
 }
 
 func (p *Parser) parseBlock() *ast.Block {
 	pos := p.current().Pos
 	p.expect(token.LBrace)
-	block := &ast.Block{Pos: pos}
+	return p.parseBlockBody(pos)
+}
 
+func (p *Parser) parseBlockBody(pos token.Position) *ast.Block {
+	statements := p.parseBlockStatements()
+	end := p.current().Pos
+	p.expect(token.RBrace)
+	return &ast.Block{Pos: pos, EndPos: end, Stmts: statements}
+}
+
+func (p *Parser) parseBlockStatements() []ast.Stmt {
+	var statements parsedList[ast.Stmt]
 	for !p.check(token.RBrace) && !p.isEOF() {
-		stmt := p.parseStmt()
-		if stmt != nil {
-			block.Stmts = append(block.Stmts, stmt)
+		if stmt := p.parseStmt(); stmt != nil {
+			statements.add(stmt)
 		}
 	}
-	block.EndPos = p.current().Pos
-	p.expect(token.RBrace)
-	return block
+	return statements.values()
+}
+
+type parsedList[T any] struct {
+	local    [8]T
+	count    int
+	overflow []T
+}
+
+func (list *parsedList[T]) add(value T) {
+	if list.count < len(list.local) {
+		list.local[list.count] = value
+		list.count++
+		return
+	}
+	if list.overflow == nil {
+		list.overflow = make([]T, list.count, 2*list.count)
+		copy(list.overflow, list.local[:])
+	}
+	list.overflow = append(list.overflow, value)
+}
+
+func (list *parsedList[T]) values() []T {
+	if list.overflow != nil {
+		return list.overflow
+	}
+	return append([]T(nil), list.local[:list.count]...)
 }
 
 // ========== Statements ==========
@@ -75,7 +101,7 @@ func (p *Parser) parseStmt() ast.Stmt {
 		p.advance()
 		return nil
 	default:
-		return p.parseExprStmt()
+		return p.parseExprOrAssignStmt()
 	}
 }
 
@@ -106,7 +132,14 @@ func (p *Parser) parseAssignStmt() *ast.AssignStmt {
 func (p *Parser) parseExprOrAssignStmt() ast.Stmt {
 	pos := p.current().Pos
 	// parse the left side as an expression (handles member access chains)
+	startPos := p.pos
 	expr := p.parseExpr(precNone)
+	// prevent infinite loop if no tokens consumed
+	if p.pos == startPos {
+		p.error("unexpected token in statement: %s", p.current().Val)
+		p.advance()
+		return nil
+	}
 
 	// check if followed by assign op
 	if p.isAssignOp(p.current().Type) {
@@ -185,10 +218,10 @@ func (p *Parser) parseForStmt() *ast.ForStmt {
 	if p.check(token.Ident) && p.peekType() == token.In {
 		stmt.VarName = p.expectIdent()
 		p.expect(token.In)
-		stmt.Collection = p.parseForCondition()
+		stmt.Collection = p.parseConditionExpr()
 	} else {
 		// conditional loop: for condition { ... }
-		stmt.Collection = p.parseForCondition()
+		stmt.Collection = p.parseConditionExpr()
 	}
 
 	stmt.Body = p.parseBlock()
@@ -213,15 +246,34 @@ func (p *Parser) parseThrowStmt() *ast.ThrowStmt {
 	}
 }
 
-func (p *Parser) parseExprStmt() *ast.ExprStmt {
-	pos := p.current().Pos
-	startPos := p.pos
-	expr := p.parseExpr(precNone)
-	// prevent infinite loop if no tokens consumed
-	if p.pos == startPos {
-		p.error("unexpected token in statement: %s", p.current().Val)
-		p.advance()
-		return nil
+// Allocate arguments in bounded groups so list growth only copies pointers.
+type parsedArguments struct {
+	local     [8]ast.NamedArg
+	count     int
+	arguments []*ast.NamedArg
+}
+
+func (a *parsedArguments) add(argument ast.NamedArg) {
+	if a.count == len(a.local) {
+		a.flush()
 	}
-	return &ast.ExprStmt{Pos: pos, Expr: expr}
+	a.local[a.count] = argument
+	a.count++
+}
+
+func (a *parsedArguments) flush() {
+	if a.count == 0 {
+		return
+	}
+	owned := append([]ast.NamedArg(nil), a.local[:a.count]...)
+	a.arguments = slices.Grow(a.arguments, len(owned))
+	for index := range owned {
+		a.arguments = append(a.arguments, &owned[index])
+	}
+	a.count = 0
+}
+
+func (a *parsedArguments) pointers() []*ast.NamedArg {
+	a.flush()
+	return a.arguments
 }

@@ -1,41 +1,68 @@
 package semantic
 
 import (
+	"slices"
+
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
 // ========== Pass 1: Collect Declarations ==========
 
+// A source pointer distinguishes rejected declarations even when positions coincide.
+type typeDeclarationKey struct {
+	model     *ast.ModelDecl
+	contract  *ast.InterfaceDecl
+	valueType *ast.TypeDecl
+}
+
+func (a *Analyzer) declareSourceType(name string, kind TypeKind, pos token.Position, doc, module string, source typeDeclarationKey) *ResolvedType {
+	typ := a.declareType(name, kind, pos, doc)
+	if typ != nil {
+		if module != "" {
+			a.typeOwners.register(name, module)
+		}
+		return typ
+	}
+	if source != (typeDeclarationKey{}) {
+		if a.rejectedTypeDeclarations == nil {
+			a.rejectedTypeDeclarations = make(map[typeDeclarationKey]bool)
+		}
+		a.rejectedTypeDeclarations[source] = true
+	}
+	return nil
+}
+
 func (a *Analyzer) collectDeclarations(file *ast.File) {
 	modName := a.fileModule(file.Name)
 
 	for _, m := range file.Models {
-		a.declareType(m.Name, TypeModel, m.Pos, m.Doc)
-		a.typeOwners.register(m.Name, modName)
+		a.declareSourceType(m.Name, TypeModel, m.Pos, m.Doc, modName, typeDeclarationKey{model: m})
 	}
 	for _, i := range file.Interfaces {
-		a.declareType(i.Name, TypeInterface, i.Pos, i.Doc)
-		a.typeOwners.register(i.Name, modName)
+		a.declareSourceType(i.Name, TypeInterface, i.Pos, i.Doc, modName, typeDeclarationKey{contract: i})
 	}
 	for _, e := range file.Enums {
-		typ := a.declareType(e.Name, TypeEnum, e.Pos, e.Doc)
+		typ := a.declareSourceType(e.Name, TypeEnum, e.Pos, e.Doc, modName, typeDeclarationKey{})
 		if typ != nil {
 			typ.EnumValues = e.Values
 		}
-		a.typeOwners.register(e.Name, modName)
 	}
 	for _, s := range file.Sealeds {
-		typ := a.declareType(s.Name, TypeSealed, s.Pos, s.Doc)
+		typ := a.declareSourceType(s.Name, TypeSealed, s.Pos, s.Doc, modName, typeDeclarationKey{})
 		if typ != nil {
+			a.ensureValueTypes().sealed = true
 			a.collectSealedVariants(typ, s.Variants)
 		}
-		a.typeOwners.register(s.Name, modName)
 	}
 	for _, t := range file.Types {
-		a.declareType(t.Name, TypeCustom, t.Pos, t.Doc)
-		a.registerTypeParams(t.TypeParams)
-		a.typeOwners.register(t.Name, modName)
+		if a.declareSourceType(t.Name, TypeCustom, t.Pos, t.Doc, modName, typeDeclarationKey{valueType: t}) != nil && len(t.TypeParams) != 0 {
+			state := a.ensureValueTypes()
+			if state.templates == nil {
+				state.templates = make(map[string]*ast.TypeDecl)
+			}
+			state.templates[t.Name] = t
+		}
 	}
 	for _, api := range file.APIs {
 		a.scope.Define(&Symbol{
@@ -46,20 +73,17 @@ func (a *Analyzer) collectDeclarations(file *ast.File) {
 		})
 	}
 	for _, fn := range file.Functions {
-		a.scope.Define(&Symbol{
-			Name: fn.Name,
-			Kind: SymFn,
-			Pos:  fn.Pos,
-			Doc:  fn.Doc,
-		})
+		symbol := &Symbol{Name: fn.Name, Kind: SymFn, Pos: fn.Pos, Doc: fn.Doc,
+			serviceFunction: hasNamedDirective(fn.Directives, "service")}
+		if !a.scope.Define(symbol) {
+			if previous := a.scope.LookupLocal(fn.Name); previous.Kind == SymApi || previous.Kind == SymSealed {
+				// Source calls bind to fn; API names separately identify wire routes.
+				*previous = *symbol
+			}
+		}
 	}
 	for _, e := range file.Errors {
-		a.scope.Define(&Symbol{
-			Name: e.Name,
-			Kind: SymError,
-			Pos:  e.Pos,
-			Doc:  e.Doc,
-		})
+		a.collectErrorDeclaration(e)
 	}
 	for _, mw := range file.Middlewares {
 		a.scope.Define(&Symbol{
@@ -70,12 +94,36 @@ func (a *Analyzer) collectDeclarations(file *ast.File) {
 		})
 	}
 	for _, ev := range file.Events {
+		if a.events == nil {
+			a.events = make(map[string]*ast.EventDecl)
+		}
+		if _, exists := a.events[ev.Name]; exists {
+			a.addError(ev.Pos, "event '%s' already declared / 事件 '%s' 已声明", ev.Name, ev.Name)
+			continue
+		}
+		a.events[ev.Name] = ev
 		a.scope.Define(&Symbol{
 			Name: ev.Name,
 			Kind: SymEvent,
 			Pos:  ev.Pos,
 		})
 	}
+}
+
+// Error names identify generated constructors and wire errors across modules.
+func (a *Analyzer) collectErrorDeclaration(declaration *ast.ErrorDecl) {
+	if declaration.Code < 400 || declaration.Code > 599 {
+		a.addError(declaration.Pos, "error status code must be between 400 and 599 / 错误状态码必须介于 400 和 599")
+	}
+	if a.errorConstructors == nil {
+		a.errorConstructors = make(map[string]*ast.ErrorDecl)
+	}
+	if _, exists := a.errorConstructors[declaration.Name]; exists {
+		a.addError(declaration.Pos, "error '%s' already declared / 错误 '%s' 已声明", declaration.Name, declaration.Name)
+		return
+	}
+	a.errorConstructors[declaration.Name] = declaration
+	a.scope.Define(&Symbol{Name: declaration.Name, Kind: SymError, Pos: declaration.Pos, Doc: declaration.Doc})
 }
 
 // fileModule returns the module name for a file. Returns "" when module isolation is disabled.
@@ -94,8 +142,12 @@ func (a *Analyzer) fileModule(filename string) string {
 func (a *Analyzer) collectExtendVisibility() {
 	for _, file := range a.files {
 		modName := a.fileModule(file.Name)
-		if modName == "" {
+		if modName == "" || len(file.Extends) == 0 {
 			continue
+		}
+		if a.extendVisible == nil {
+			a.extendVisible = make(map[string]map[string]bool)
+			a.extendFieldVisible = make(map[string]map[string]map[string]bool)
 		}
 		for _, ext := range file.Extends {
 			if a.extendVisible[modName] == nil {
@@ -209,7 +261,7 @@ func (a *Analyzer) checkModelTypeRefs(file *ast.File, mi *ModuleInfo) {
 	}
 	for _, t := range file.Types {
 		for _, f := range t.Fields {
-			a.checkTypeRefVisibility(f.Type, mi, f.Pos)
+			a.checkTypeRefVisibilityInScope(f.Type, mi, f.Pos, t.TypeParams)
 		}
 	}
 }
@@ -217,20 +269,17 @@ func (a *Analyzer) checkModelTypeRefs(file *ast.File, mi *ModuleInfo) {
 func (a *Analyzer) checkDeclTypeRefs(file *ast.File, mi *ModuleInfo) {
 	for _, api := range file.APIs {
 		a.checkTypeRefVisibility(api.ReturnType, mi, api.Pos)
-		for _, p := range api.Params {
-			a.checkTypeRefVisibility(p.Type, mi, p.Pos)
-		}
+		a.checkParameterTypeRefs(api.Params, mi)
 	}
 	for _, fn := range file.Functions {
 		a.checkTypeRefVisibility(fn.ReturnType, mi, fn.Pos)
-		for _, p := range fn.Params {
-			a.checkTypeRefVisibility(p.Type, mi, p.Pos)
-		}
+		a.checkParameterTypeRefs(fn.Params, mi)
 	}
 	for _, ev := range file.Events {
-		for _, p := range ev.Params {
-			a.checkTypeRefVisibility(p.Type, mi, p.Pos)
-		}
+		a.checkParameterTypeRefs(ev.Params, mi)
+	}
+	for _, declaration := range file.Errors {
+		a.checkParameterTypeRefs(declaration.Fields, mi)
 	}
 	// sealed variant fields
 	for _, s := range file.Sealeds {
@@ -242,19 +291,31 @@ func (a *Analyzer) checkDeclTypeRefs(file *ast.File, mi *ModuleInfo) {
 	}
 }
 
+func (a *Analyzer) checkParameterTypeRefs(params []*ast.ParamDecl, mi *ModuleInfo) {
+	for _, param := range params {
+		a.checkTypeRefVisibility(param.Type, mi, param.Pos)
+	}
+}
+
 // checkTypeRefVisibility checks if a type reference is visible from the given module.
 func (a *Analyzer) checkTypeRefVisibility(ref *ast.TypeRef, mi *ModuleInfo, pos token.Position) {
+	a.checkTypeRefVisibilityInScope(ref, mi, pos, nil)
+}
+
+func (a *Analyzer) checkTypeRefVisibilityInScope(ref *ast.TypeRef, mi *ModuleInfo, pos token.Position, parameters []string) {
 	if ref == nil {
 		return
 	}
-	a.checkNameVisibility(ref.Name, mi, pos)
+	if !slices.Contains(parameters, ref.Name) {
+		a.checkNameVisibility(ref.Name, mi, pos)
+	}
 	// check generic args
 	for _, arg := range ref.TypeArgs {
-		a.checkTypeRefVisibility(arg, mi, pos)
+		a.checkTypeRefVisibilityInScope(arg, mi, pos, parameters)
 	}
 	// check tuple elements
 	for _, t := range ref.Tuple {
-		a.checkTypeRefVisibility(t, mi, pos)
+		a.checkTypeRefVisibilityInScope(t, mi, pos, parameters)
 	}
 }
 
@@ -305,24 +366,21 @@ func (a *Analyzer) isCommonModule(modName string) bool {
 
 // collectSealedVariants populates a sealed type with its variant information.
 func (a *Analyzer) collectSealedVariants(typ *ResolvedType, variants []*ast.SealedVariant) {
+	seen := make(map[string]bool, len(variants))
 	for _, v := range variants {
-		vi := &SealedVariantInfo{Name: v.Name}
+		if seen[v.Name] {
+			a.addError(typ.Pos, "duplicate sealed variant '%s' in '%s' / sealed 类型 '%s' 中变体 '%s' 重复", v.Name, typ.Name, typ.Name, v.Name)
+			continue
+		}
+		seen[v.Name] = true
+		vi := &SealedVariantInfo{Name: v.Name, source: v}
 		for _, f := range v.Fields {
 			vi.Fields = append(vi.Fields, &FieldInfo{
 				Name: f.Name,
-				Pos:  token.Position{},
+				Pos:  f.Pos,
 			})
 		}
 		typ.Variants = append(typ.Variants, vi)
-	}
-}
-
-// registerTypeParams registers generic type parameters as types if not already declared.
-func (a *Analyzer) registerTypeParams(params []string) {
-	for _, tp := range params {
-		if _, exists := a.types[tp]; !exists {
-			a.types[tp] = &ResolvedType{Kind: TypeGeneric, Name: tp, Fields: make(map[string]*FieldInfo)}
-		}
 	}
 }
 

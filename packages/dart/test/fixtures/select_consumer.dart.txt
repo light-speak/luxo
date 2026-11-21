@@ -1,0 +1,28 @@
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:luxo_client/luxo_client.dart';
+import 'package:fixture/src/luxo/client.dart';
+import 'package:fixture/label.dart';
+import 'package:fixture/identifier.dart';
+
+Future<void> main() async {
+  var calls = 0;
+  final transport = HttpTransport('https://example.test/luvia', client: MockClient((request) async {
+    final body = decodeLuxoJSON(request.body) as Map<String, dynamic>;
+    final expected = calls++ == 1 ? 'id' : 'name';
+    if (body[r'$select'] != expected) throw StateError('selection: $body');
+    return http.Response(expected == 'name'
+        ? '{"data":{"name":"Ada"}}'
+        : '{"data":{"id":9223372036854775807,"name":"Ada"}}', 200);
+  }));
+  final client = LuxoClient(transport);
+  try {
+    if (await label(client) != 'Ada') throw StateError('label');
+    if (await identifier(client) != '9223372036854775807') throw StateError('integer precision');
+    final selected = await client.getUser(select: 'name');
+    if (selected.id.isSelected || selected.name.value != 'Ada') throw StateError('explicit selection');
+    if (calls != 3) throw StateError('request count');
+  } finally {
+    client.close();
+  }
+}

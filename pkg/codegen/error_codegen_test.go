@@ -47,13 +47,20 @@ func TestGenerateErrorFileWithParams(t *testing.T) {
 		`"github.com/light-speak/luxo/pkg/lux/errors"`,
 		"func NewOutOfStock(productId int64, available int64) *errors.AppError",
 		`errors.New("OutOfStock", 409, "error.out_of_stock")`,
-		`.WithData(errors.MapData{`,
-		`"productId": productId,`,
-		`"available": available,`,
+		`.WithData(&OutOfStockErrorData{`,
+		`field0: productId,`,
+		`field1: available,`,
+		`func (data *OutOfStockErrorData) AppendJSON(dst []byte) ([]byte, error)`,
+		`func (data *OutOfStockErrorData) AppendText(dst []byte, field string) ([]byte, bool)`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(code, check) {
 			t.Errorf("missing %q in:\n%s", check, code)
+		}
+	}
+	for _, forbidden := range []string{"map[string]any", "json.Marshal", "fmt.Sprint", "reflect."} {
+		if strings.Contains(code, forbidden) {
+			t.Errorf("dynamic error writer: %s", forbidden)
 		}
 	}
 }

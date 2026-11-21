@@ -1,10 +1,10 @@
 package luxolog
 
 import (
-	"fmt"
+	"errors"
 	"os"
 	"strings"
-	"time"
+	"sync/atomic"
 )
 
 // ANSI colors
@@ -18,15 +18,34 @@ const (
 	magenta = "\033[35m"
 )
 
-// Level controls minimum log level. Set via LOG_LEVEL env (debug/info/warn/error).
-// Lazy-initialized so .env is loaded before reading.
-var Level = -1
+// Zero means uninitialized; configured levels are stored as level + 1.
+var levelState atomic.Int32
 
-func level() int {
-	if Level == -1 {
-		Level = parseLevel(os.Getenv("LOG_LEVEL"))
+var errInvalidLevel = errors.New("luxolog: level must be Debug, Info, Warn or Error")
+
+// GetLevel returns the minimum log level. LOG_LEVEL is read on first use,
+// after application environment loading, unless SetLevel was called first.
+func GetLevel() int {
+	if state := levelState.Load(); state != 0 {
+		return int(state - 1)
 	}
-	return Level
+	return initializeLevel(int32(parseLevel(os.Getenv("LOG_LEVEL"))) + 1)
+}
+
+func initializeLevel(state int32) int {
+	// A concurrent explicit update must take precedence over environment loading.
+	levelState.CompareAndSwap(0, state)
+	return int(levelState.Load() - 1)
+}
+
+// SetLevel changes the minimum log level safely during concurrent logging.
+// Invalid values return an error without changing the current state.
+func SetLevel(value int) error {
+	if value < LevelDebug || value > LevelError {
+		return errInvalidLevel
+	}
+	levelState.Store(int32(value) + 1)
+	return nil
 }
 
 const (
@@ -51,36 +70,29 @@ func parseLevel(s string) int {
 
 // Debug prints a debug message (blue).
 func Debug(msg string) string {
-	if level() <= LevelDebug {
-		ts := time.Now().Format("15:04:05")
-		fmt.Fprintf(os.Stderr, "%s%s%s %sDEBUG%s %s\n", dim, ts, reset, blue, reset, msg)
-	}
-	return msg
+	return message(LevelDebug, msg)
 }
 
 // Info prints an info message (cyan).
 func Info(msg string) string {
-	if level() <= LevelInfo {
-		ts := time.Now().Format("15:04:05")
-		fmt.Fprintf(os.Stderr, "%s%s%s %sINFO%s  %s\n", dim, ts, reset, cyan, reset, msg)
-	}
-	return msg
+	return message(LevelInfo, msg)
 }
 
 // Warn prints a warning message (yellow).
 func Warn(msg string) string {
-	if level() <= LevelWarn {
-		ts := time.Now().Format("15:04:05")
-		fmt.Fprintf(os.Stderr, "%s%s%s %sWARN%s  %s\n", dim, ts, reset, yellow, reset, msg)
-	}
-	return msg
+	return message(LevelWarn, msg)
 }
 
 // Error prints an error message (red).
 func Error(msg string) string {
-	if level() <= LevelError {
-		ts := time.Now().Format("15:04:05")
-		fmt.Fprintf(os.Stderr, "%s%s%s %sERROR%s %s\n", dim, ts, reset, red, reset, msg)
+	return message(LevelError, msg)
+}
+
+func message(level int, msg string) string {
+	if GetLevel() <= level {
+		r := NewRecord()
+		r.Text(msg)
+		r.write(level)
 	}
 	return msg
 }

@@ -108,3 +108,30 @@ func TestAsModel_EmptyFields(t *testing.T) {
 		t.Error("empty type should have no fields")
 	}
 }
+
+func TestAsModelOwnsAllMutableMetadata(t *testing.T) {
+	td := &TypeDecl{
+		Name: "Payload", Usage: TypeUsageOutput, Directives: []string{"doc"},
+		Fields: []Field{{ID: 1, Name: "value", Directives: []string{"visible"}, JSONPrefix: []byte(`"old":`)}},
+	}
+	first, second := td.AsModel(), td.AsModel()
+	if first.Usage != td.Usage {
+		t.Errorf("usage = %q, want %q", first.Usage, td.Usage)
+	}
+	first.Directives[0] = "changed"
+	first.Fields[0].Directives[0] = "changed"
+	first.Fields[0].Name = "changed"
+	first.Fields[0].JSONPrefix[1] = 'X'
+	if td.Directives[0] != "doc" || second.Directives[0] != "doc" {
+		t.Error("model directives share mutable storage")
+	}
+	if td.Fields[0].Directives[0] != "visible" || second.Fields[0].Directives[0] != "visible" {
+		t.Error("field directives share mutable storage")
+	}
+	if td.Fields[0].Name != "value" || second.FieldByName("value").Name != "value" {
+		t.Error("field copies share mutable storage")
+	}
+	if string(td.Fields[0].JSONPrefix) != `"old":` || string(second.Fields[0].JSONPrefix) != `"value":` {
+		t.Error("JSON prefixes share mutable storage")
+	}
+}

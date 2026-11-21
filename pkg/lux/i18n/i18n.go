@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 
@@ -87,7 +88,7 @@ func flatten(prefix string, m map[string]any, out map[string]string) {
 
 // Translate looks up a message key for the given locale and substitutes
 // template variables from data. Fallback chain: locale → fallback → raw key.
-func (t *Translator) Translate(locale, key string, data map[string]any) string {
+func (t *Translator) Translate(locale, key string, data Data) string {
 	tmpl := t.lookup(locale, key)
 	if tmpl == "" {
 		return key
@@ -116,31 +117,85 @@ func (t *Translator) lookup(locale, key string) string {
 }
 
 // substitute replaces ${varName} with values from data.
-func substitute(tmpl string, data map[string]any) string {
-	if len(data) == 0 || !strings.Contains(tmpl, "${") {
+func substitute(tmpl string, data Data) string {
+	if data == nil || !strings.Contains(tmpl, "${") {
 		return tmpl
 	}
-	var b strings.Builder
-	b.Grow(len(tmpl))
-	i := 0
-	for i < len(tmpl) {
+	buf := interpolationBuffers.Get().(*interpolationBuffer)
+	b, changed := appendSubstitution(slices.Grow(buf.bytes[:0], len(tmpl)), tmpl, data)
+	result := tmpl
+	if changed {
+		result = string(b)
+	}
+	buf.bytes = b
+	buf.reset()
+	interpolationBuffers.Put(buf)
+	return result
+}
+
+// appendSubstitution visits each placeholder once. A missing field preserves
+// its original text, even if an implementation appended before returning false.
+func appendSubstitution(b []byte, tmpl string, data Data) ([]byte, bool) {
+	changed := false
+	for i := 0; i < len(tmpl); {
 		if i+1 < len(tmpl) && tmpl[i] == '$' && tmpl[i+1] == '{' {
 			end := strings.IndexByte(tmpl[i+2:], '}')
-			if end >= 0 {
-				varName := tmpl[i+2 : i+2+end]
-				if val, ok := data[varName]; ok {
-					fmt.Fprint(&b, val)
-				} else {
-					b.WriteString(tmpl[i : i+2+end+1])
-				}
-				i = i + 2 + end + 1
-				continue
+			if end < 0 {
+				return append(b, tmpl[i:]...), changed
 			}
+			end += i + 2
+			prefix := len(b)
+			var found bool
+			b, found = data.AppendText(b, tmpl[i+2:end])
+			changed = changed || found
+			if !found {
+				clear(b[prefix:])
+				b = append(b[:prefix], tmpl[i:end+1]...)
+			}
+			i = end + 1
+			continue
 		}
-		b.WriteByte(tmpl[i])
+		start := i
 		i++
+		for i < len(tmpl) && tmpl[i] != '$' {
+			i++
+		}
+		b = append(b, tmpl[start:i]...)
 	}
-	return b.String()
+	return b, changed
+}
+
+const maxInterpolationCapacity = 4096
+
+type interpolationBuffer struct{ bytes []byte }
+
+var interpolationBuffers = sync.Pool{
+	New: func() any { return new(interpolationBuffer) },
+}
+
+// reset prevents oversized or sensitive error data from staying in the pool.
+func (b *interpolationBuffer) reset() {
+	if cap(b.bytes) > maxInterpolationCapacity {
+		b.bytes = nil
+		return
+	}
+	clear(b.bytes)
+	b.bytes = b.bytes[:0]
+}
+
+// Data supplies only the text of a requested field, without building a map or
+// using fmt to inspect arbitrary runtime values.
+// AppendText must preserve the prefix and must not retain dst after returning.
+type Data interface {
+	AppendText(dst []byte, field string) ([]byte, bool)
+}
+
+// Values is a convenience adapter for already-formatted translation strings.
+type Values map[string]string
+
+func (v Values) AppendText(dst []byte, field string) ([]byte, bool) {
+	value, found := v[field]
+	return append(dst, value...), found
 }
 
 // ParseAcceptLanguage extracts the preferred locale from an Accept-Language header.

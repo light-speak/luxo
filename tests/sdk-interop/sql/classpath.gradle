@@ -1,0 +1,22 @@
+allprojects {
+    plugins.withId('org.jetbrains.kotlin.jvm') {
+        if (project == rootProject) {
+            tasks.register('sqlConsumerClasspath') {
+                dependsOn tasks.named('classes')
+                if (System.getenv('LUXO_SQL_INFERRED') == '1') {
+                    dependsOn tasks.named('jar')
+                }
+                doLast {
+                    def destination = System.getenv('LUXO_SQL_CLASSPATH')
+                    if (!destination) throw new GradleException('Missing LUXO_SQL_CLASSPATH')
+                    def entries = sourceSets.main.runtimeClasspath + configurations.testRuntimeClasspath
+                    file(destination).text = entries.files.findAll { it.exists() }.join(File.pathSeparator)
+                    def compilerPlugin = System.getenv('LUXO_SQL_COMPILER_PLUGIN')
+                    if (compilerPlugin) {
+                        file(compilerPlugin).text = tasks.named('jar').get().archiveFile.get().asFile.absolutePath
+                    }
+                }
+            }
+        }
+    }
+}

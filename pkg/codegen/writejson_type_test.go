@@ -57,24 +57,24 @@ func TestGenerateTypeWriteLuxo_AllScalarTypes(t *testing.T) {
 	}
 
 	// Non-nullable Int
-	if !strings.Contains(code, "AppendSvarint(buf.B, p.IntField)") {
+	if !strings.Contains(code, "buf.WriteLuxoInt(p.IntField)") {
 		t.Errorf("missing non-nullable Int write:\n%s", code)
 	}
 	// Non-nullable String
-	if !strings.Contains(code, "AppendString(buf.B, p.StrField)") {
+	if !strings.Contains(code, "buf.WriteLuxoString(p.StrField)") {
 		t.Errorf("missing non-nullable String write:\n%s", code)
 	}
 	// Non-nullable Float
-	if !strings.Contains(code, "AppendFixed64(buf.B, p.FloatField)") {
+	if !strings.Contains(code, "buf.WriteLuxoFloat(p.FloatField)") {
 		t.Errorf("missing non-nullable Float write:\n%s", code)
 	}
 	// Non-nullable Boolean
-	if !strings.Contains(code, "AppendBool(buf.B, p.BoolField)") {
+	if !strings.Contains(code, "buf.WriteLuxoBool(p.BoolField)") {
 		t.Errorf("missing non-nullable Boolean write:\n%s", code)
 	}
-	// Non-nullable DateTime (.Unix())
-	if !strings.Contains(code, "p.DtField.Unix()") {
-		t.Errorf("missing non-nullable DateTime .Unix():\n%s", code)
+	// Non-nullable DateTime preserves fractional seconds.
+	if !strings.Contains(code, "buf.WriteLuxoDateTime(p.DtField)") {
+		t.Errorf("missing non-nullable DateTime pair:\n%s", code)
 	}
 	// Non-nullable Duration (int64 cast)
 	if !strings.Contains(code, "int64(p.DurField)") {
@@ -82,10 +82,10 @@ func TestGenerateTypeWriteLuxo_AllScalarTypes(t *testing.T) {
 	}
 
 	// Nullable fields should have AppendPresent/AppendNull patterns
-	if !strings.Contains(code, "AppendPresent") {
+	if !strings.Contains(code, "WriteLuxoPresent") {
 		t.Errorf("missing AppendPresent for nullable:\n%s", code)
 	}
-	if !strings.Contains(code, "AppendNull") {
+	if !strings.Contains(code, "WriteLuxoNull") {
 		t.Errorf("missing AppendNull for nullable:\n%s", code)
 	}
 
@@ -105,9 +105,9 @@ func TestGenerateTypeWriteLuxo_AllScalarTypes(t *testing.T) {
 	if !strings.Contains(code, "*p.BoolNullable") {
 		t.Errorf("missing nullable Boolean deref:\n%s", code)
 	}
-	// Nullable DateTime: p.DtNullable.Unix()
-	if !strings.Contains(code, "p.DtNullable.Unix()") {
-		t.Errorf("missing nullable DateTime Unix:\n%s", code)
+	// Nullable DateTime preserves fractional seconds.
+	if !strings.Contains(code, "buf.WriteLuxoDateTime(*p.DtNullable)") {
+		t.Errorf("missing nullable DateTime pair:\n%s", code)
 	}
 	// Nullable Duration: int64(*p.DurNullable)
 	if !strings.Contains(code, "int64(*p.DurNullable)") {
@@ -134,7 +134,7 @@ func TestGenerateTypeWriteLuxo_NestedModel(t *testing.T) {
 	code := b.String()
 
 	// Nested model should use inline WriteLuxo
-	if !strings.Contains(code, "a.Member.WriteLuxo(buf, _childMask2)") {
+	if !strings.Contains(code, "a.Member.writeLuxoDepth(buf, _childMask2, depth+1)") {
 		t.Errorf("nested model should call WriteLuxo inline:\n%s", code)
 	}
 }
@@ -157,12 +157,12 @@ func TestGenerateTypeWriteLuxo_ListRelation(t *testing.T) {
 	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
-	// List relation: loop with WriteLuxo
-	if !strings.Contains(code, "len(r.Items)") {
-		t.Errorf("list relation should append count:\n%s", code)
+	// List relation: one length-delimited columnar child response.
+	if !strings.Contains(code, "buf.BeginMessage()") || !strings.Contains(code, "buf.EndMessage(_frame1)") {
+		t.Errorf("list relation should be framed:\n%s", code)
 	}
-	if !strings.Contains(code, "r.Items[i].WriteLuxo(buf, _childMask1)") {
-		t.Errorf("list relation should call WriteLuxo per item:\n%s", code)
+	if !strings.Contains(code, "writeColumnarUserDepth(buf, r.Items, _childMask1, depth+1)") {
+		t.Errorf("list relation should use its columnar writer:\n%s", code)
 	}
 }
 
@@ -184,13 +184,13 @@ func TestGenerateTypeWriteLuxo_NullableRelation(t *testing.T) {
 	code := b.String()
 
 	// Nullable relation: nil check + WriteLuxo or AppendNull
-	if !strings.Contains(code, "w.Nested != nil") {
+	if !strings.Contains(code, "w.Nested == nil") {
 		t.Errorf("nullable relation should have nil check:\n%s", code)
 	}
-	if !strings.Contains(code, "w.Nested.WriteLuxo(buf, _childMask1)") {
+	if !strings.Contains(code, "w.Nested.writeLuxoDepth(buf, _childMask1, depth+1)") {
 		t.Errorf("nullable relation should call WriteLuxo when present:\n%s", code)
 	}
-	if !strings.Contains(code, "AppendNull") {
+	if !strings.Contains(code, "WriteLuxoNull") {
 		t.Errorf("nullable relation should AppendNull when nil:\n%s", code)
 	}
 }
@@ -335,7 +335,7 @@ func TestWriteTypeListScalarField_StringList(t *testing.T) {
 	if !strings.Contains(code, "len(t.Names)") {
 		t.Errorf("should append list length:\n%s", code)
 	}
-	if !strings.Contains(code, "AppendString(buf.B, v)") {
+	if !strings.Contains(code, "buf.WriteLuxoString(v)") {
 		t.Errorf("should AppendString for each element:\n%s", code)
 	}
 }
@@ -357,7 +357,7 @@ func TestWriteTypeListScalarField_IntList(t *testing.T) {
 	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
-	if !strings.Contains(code, "AppendSvarint(buf.B, v)") {
+	if !strings.Contains(code, "buf.WriteLuxoInt(v)") {
 		t.Errorf("should AppendSvarint for each element:\n%s", code)
 	}
 }
@@ -379,7 +379,7 @@ func TestWriteTypeListScalarField_BooleanList(t *testing.T) {
 	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
-	if !strings.Contains(code, "AppendBool(buf.B, v)") {
+	if !strings.Contains(code, "buf.WriteLuxoBool(v)") {
 		t.Errorf("should AppendBool for each element:\n%s", code)
 	}
 }
@@ -401,7 +401,7 @@ func TestWriteTypeListScalarField_FloatList(t *testing.T) {
 	generator.generateTypeWriteLuxo(&b, pseudo, nil)
 	code := b.String()
 
-	if !strings.Contains(code, "AppendFixed64(buf.B, v)") {
+	if !strings.Contains(code, "buf.WriteLuxoFloat(v)") {
 		t.Errorf("should AppendFixed64 for each element:\n%s", code)
 	}
 }
@@ -424,8 +424,8 @@ func TestWriteTypeListScalarField_EnumList(t *testing.T) {
 	generator.generateTypeWriteLuxo(&b, pseudo, enums)
 	code := b.String()
 
-	if !strings.Contains(code, "string(v)") {
-		t.Errorf("should convert enum to string:\n%s", code)
+	if !strings.Contains(code, "Role(v).AppendLuxo(buf.B)") {
+		t.Errorf("should validate and encode enum:\n%s", code)
 	}
 }
 

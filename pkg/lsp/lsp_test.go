@@ -11,6 +11,50 @@ import (
 
 // ========== Transport Tests ==========
 
+func BenchmarkTransportReadMessage(b *testing.B) {
+	for _, sample := range []struct{ name, body string }{
+		{"initialize", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`},
+		{"unicode-document", `{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"text":"` + strings.Repeat("字段选择", 1024) + `"}}`},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			input := fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(sample.body), sample.body)
+			reader := strings.NewReader(input)
+			transport := NewTransport(reader, io.Discard)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				reader.Reset(input)
+				transport.reader.Reset(reader)
+				message, err := transport.ReadMessage()
+				if err != nil || message.Method == "" {
+					b.Fatalf("invalid read: %v / %v", message, err)
+				}
+			}
+		})
+	}
+}
+
+func FuzzTransportContentLength(f *testing.F) {
+	for _, value := range []int64{-9223372036854775808, -1, 0, 1, 2, 4096, 52428801, 9223372036854775807} {
+		f.Add(value)
+	}
+	f.Fuzz(func(t *testing.T, length int64) {
+		// Exercise both rejection boundaries without repeated large valid allocations.
+		if length > 4096 && length <= 50*1024*1024 {
+			t.Skip()
+		}
+		input := fmt.Sprintf("Content-Length: %d\r\n\r\n{}", length)
+		message, err := NewTransport(strings.NewReader(input), io.Discard).ReadMessage()
+		if length == 2 {
+			if err != nil || message == nil {
+				t.Fatalf("valid empty object: %v / %v", message, err)
+			}
+		} else if err == nil || message != nil {
+			t.Fatalf("invalid length %d: %v / %v", length, message, err)
+		}
+	})
+}
+
 func TestTransportRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	transport := NewTransport(strings.NewReader(""), &buf)
@@ -133,6 +177,26 @@ func TestTransportSendMarshalError(t *testing.T) {
 	err := transport.send(make(chan int))
 	if err == nil {
 		t.Error("expected error when marshaling a channel")
+	}
+}
+
+func TestReadMessageRejectsNegativeContentLength(t *testing.T) {
+	for _, value := range []string{"-1", "-52428800", "-9223372036854775808"} {
+		t.Run(value, func(t *testing.T) {
+			transport := NewTransport(strings.NewReader("Content-Length: "+value+"\r\n\r\n"), io.Discard)
+			message, err := transport.ReadMessage()
+			if message != nil || err == nil || !strings.Contains(err.Error(), "invalid Content-Length") {
+				t.Fatalf("message=%v error=%v", message, err)
+			}
+		})
+	}
+}
+
+func TestReadMessageRejectsOversizedContentLength(t *testing.T) {
+	transport := NewTransport(strings.NewReader("Content-Length: 52428801\r\n\r\n"), io.Discard)
+	message, err := transport.ReadMessage()
+	if message != nil || err == nil || !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("message=%v error=%v", message, err)
 	}
 }
 

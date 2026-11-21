@@ -1,9 +1,6 @@
 package semantic
 
-import (
-	"strings"
-	"testing"
-)
+import "testing"
 
 // ========== Collection Method Tests ==========
 
@@ -33,12 +30,34 @@ api test(): Int {
 	expectNoErrors(t, result)
 }
 
+func TestCollectionLengthPropertiesAreReadOnly(t *testing.T) {
+	for _, source := range []string{
+		`fn value(values: [Int]): Int { return values.size }`,
+		`fn value(values: [Int]): Boolean { return values.isEmpty }`,
+		`fn value(values: [Int]): Int { return values.size() }`,
+		`fn value(values: [Int]): Boolean { return values.isEmpty() }`,
+		`type Box { size: Int } fn value(box: Box): Int { box.size = 7 return box.size }`,
+	} {
+		expectNoErrors(t, analyze(t, source))
+	}
+	for _, source := range []string{
+		`fn value(values: [Int]) { values.size = 1 }`,
+		`fn value(values: [Int]) { values.size += 1 }`,
+		`fn value(values: [Int]) { values.isEmpty = false }`,
+		`fn value(text: String) { text.size = 1 }`,
+		`fn value(text: String) { text.length = 1 }`,
+		`fn value(text: String) { text.isEmpty = false }`,
+	} {
+		expectError(t, analyze(t, source), "not writable")
+	}
+}
+
 func TestCollectionMethodAny(t *testing.T) {
 	result := analyze(t, `
 model Item { name: String }
 api test(): Boolean {
   val items = Item.find(where: name == "x")
-  items.any
+  items.any { it.name == "x" }
 }
 `)
 	expectNoErrors(t, result)
@@ -53,14 +72,7 @@ api test(): Item? {
   first
 }
 `)
-	// firstOrNull returns nullable, which matches the declared API contract.
-	if len(result.Errors) > 0 {
-		for _, err := range result.Errors {
-			if !strings.Contains(err.Message, "undefined") {
-				t.Errorf("unexpected error: %v", err)
-			}
-		}
-	}
+	expectError(t, result, "has no field")
 }
 
 func TestCollectionMethodFilter(t *testing.T) {
@@ -78,8 +90,8 @@ func TestCollectionMethodSumOf(t *testing.T) {
 	result := analyze(t, `
 model Item { price: Float }
 api test(): Float {
-  val items = Item.find(where: price > 0)
-  items.sumOf
+  val items = Item.find(where: price > 0.0)
+  items.sumOf { it.price }
 }
 `)
 	expectNoErrors(t, result)
@@ -90,7 +102,7 @@ func TestCollectionMethodJoinToString(t *testing.T) {
 model Item { name: String }
 api test(): String {
   val items = Item.find(where: name == "x")
-  items.joinToString
+  items.map { it.name }.joinToString(",")
 }
 `)
 	expectNoErrors(t, result)
@@ -104,7 +116,7 @@ api test(): Boolean {
   items.contains
 }
 `)
-	expectNoErrors(t, result)
+	expectError(t, result, "has no field")
 }
 
 func TestCollectionMethodIsEmpty(t *testing.T) {
@@ -126,7 +138,7 @@ api test(): Int {
   items.count
 }
 `)
-	expectNoErrors(t, result)
+	expectError(t, result, "has no field")
 }
 
 func TestCollectionMethodSortBy(t *testing.T) {
@@ -134,7 +146,7 @@ func TestCollectionMethodSortBy(t *testing.T) {
 model Item { name: String }
 api test(): [Item] {
   val items = Item.find(where: name == "x")
-  items.sortBy
+  items.sortBy { it.name }
 }
 `)
 	expectNoErrors(t, result)
@@ -148,7 +160,7 @@ api test(): [Item] {
   items.take
 }
 `)
-	expectNoErrors(t, result)
+	expectError(t, result, "has no field")
 }
 
 func TestCollectionMethodTakeLast(t *testing.T) {
@@ -159,7 +171,7 @@ api test(): [Item] {
   items.takeLast
 }
 `)
-	expectNoErrors(t, result)
+	expectError(t, result, "has no field")
 }
 
 func TestCollectionMethodGroupBy(t *testing.T) {
@@ -171,7 +183,7 @@ api test(): Int {
   0
 }
 `)
-	expectNoErrors(t, result)
+	expectError(t, result, "has no field")
 }
 
 func TestCollectionMethodFlatMap(t *testing.T) {
@@ -183,7 +195,7 @@ api test(): Int {
   0
 }
 `)
-	expectNoErrors(t, result)
+	expectError(t, result, "has no field")
 }
 
 func TestCollectionMethodForEach(t *testing.T) {
@@ -206,9 +218,7 @@ api test(): [Post] {
   items.reversed
 }
 `)
-	if result == nil {
-		t.Fatal("expected non-nil result")
-	}
+	expectError(t, result, "has no field")
 }
 
 func TestCollectionMethodDistinct(t *testing.T) {
@@ -219,9 +229,7 @@ api test(): [Post] {
   items.distinct
 }
 `)
-	if result == nil {
-		t.Fatal("expected non-nil result")
-	}
+	expectError(t, result, "has no field")
 }
 
 func TestCollectionMethodChunked(t *testing.T) {
@@ -232,9 +240,7 @@ api test(): [Post] {
   items.chunked
 }
 `)
-	if result == nil {
-		t.Fatal("expected non-nil result")
-	}
+	expectError(t, result, "has no field")
 }
 
 func TestListFieldAccessNonCollectionMethod(t *testing.T) {

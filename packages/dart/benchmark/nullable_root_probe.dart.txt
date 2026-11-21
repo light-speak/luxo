@@ -1,0 +1,317 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:luxo_client/luxo_client.dart';
+
+import '../../benchmark/uint64_benchmark.dart' show compareBenchmarks;
+import 'client.dart';
+import 'types.dart';
+
+typedef RootDecoder = Object? Function(Object?);
+typedef RootCase = ({
+  String name,
+  String kind,
+  Uint8List binary,
+  Object json,
+  Object expected,
+});
+const _iterations = 2000;
+Object? _sink;
+
+Future<void> main(List<String> arguments) async {
+  final transport = _Transport();
+  final client = LuxoClient(transport);
+  // __REGISTER_DECODERS__
+  final samples = [..._scalarCases(), ..._modelCases()];
+  _verify(transport.decoders, samples);
+  if (arguments.contains('--verify')) {
+    print('verified 11 generated nullable root fixtures');
+    return;
+  }
+  for (final sample in samples) {
+    final plain = transport.decoders['${sample.kind}Plain']!;
+    final nullable = transport.decoders['${sample.kind}Nullable']!;
+    final bytes = _envelope(sample.binary);
+    _compare(
+      'nullable binary ${sample.name}',
+      () => plain(sample.binary),
+      () => nullable(bytes),
+    );
+    _compare(
+      'nullable json ${sample.name}',
+      () => plain(sample.json),
+      () => nullable(sample.json),
+    );
+  }
+  for (final kind in [
+    'integer',
+    'boolean',
+    'text',
+    'bytes',
+    'integers',
+    'object',
+    'objects',
+  ]) {
+    final nullable = transport.decoders['${kind}Nullable']!;
+    final bytes = Uint8List.fromList([0]);
+    _compare(
+      'null absolute json/binary $kind',
+      () => nullable(null),
+      () => nullable(bytes),
+    );
+  }
+  print(
+    'Generated decoding only; null costs are absolute; allocations/network not measured. sink=$_sink',
+  );
+}
+
+void _compare(
+  String name,
+  Object? Function() before,
+  Object? Function() after,
+) {
+  _equal(before(), after(), name);
+  compareBenchmarks(
+    name,
+    () => _batch(before),
+    () => _batch(after),
+    iterations: _iterations,
+    includeRange: true,
+  );
+}
+
+int _batch(Object? Function() operation) {
+  for (var index = 0; index < _iterations; index++) {
+    _sink = operation();
+  }
+  return _sink == null ? 0 : 1;
+}
+
+Uint8List _encoded(void Function(LuxoEncoder) write) {
+  final encoder = LuxoEncoder();
+  write(encoder);
+  return Uint8List.fromList(encoder.bytes());
+}
+
+Uint8List _envelope(Uint8List body) => Uint8List(body.length + 1)
+  ..[0] = 1
+  ..setRange(1, body.length + 1, body);
+
+List<RootCase> _scalarCases() {
+  final values = [
+    LuxoInt64.zero,
+    LuxoInt64.fromInt(42),
+    LuxoInt64.parse('9223372036854775807'),
+  ];
+  final samples = <RootCase>[
+    for (final value in values)
+      (
+        name: 'integer-$value',
+        kind: 'integer',
+        binary: _encoded((e) => e.writeSvarint(value)),
+        json: decodeLuxoJSON(value.toString())!,
+        expected: value,
+      ),
+    (
+      name: 'false',
+      kind: 'boolean',
+      binary: Uint8List.fromList([0]),
+      json: false,
+      expected: false,
+    ),
+  ];
+  for (final text in ['', List.filled(350, '发布冻结').join()]) {
+    samples.add((
+      name: 'text-${utf8.encode(text).length}',
+      kind: 'text',
+      binary: _encoded((e) => e.writeString(text)),
+      json: text,
+      expected: text,
+    ));
+  }
+  final bytes = Uint8List(4096)..fillRange(0, 4096, 7);
+  samples.add((
+    name: 'bytes-4096',
+    kind: 'bytes',
+    binary: _encoded((e) => e.writeBytes(bytes)),
+    json: base64Encode(bytes),
+    expected: bytes,
+  ));
+  for (final count in [0, 128]) {
+    final values = List.generate(count, LuxoInt64.fromInt);
+    samples.add((
+      name: 'integers-$count',
+      kind: 'integers',
+      json: List.generate(count, (index) => index),
+      expected: values,
+      binary: _encoded((e) {
+        e.writeVarint(count);
+        for (final value in values) {
+          e.writeSvarint(value);
+        }
+      }),
+    ));
+  }
+  return samples;
+}
+
+List<RootCase> _modelCases() {
+  final object = <String, dynamic>{'id': LuxoInt64.fromInt(42), 'label': '发布'};
+  final objects = List.generate(
+    128,
+    (index) => <String, dynamic>{'id': LuxoInt64.fromInt(index), 'label': '发布'},
+  );
+  final row = _encoded(
+    (e) => e
+      ..writeVarint(6)
+      ..writeFieldInt(1, LuxoInt64.fromInt(42))
+      ..writeFieldString(2, '发布')
+      ..writeEnd(),
+  );
+  final columns = _encoded((e) {
+    e.writeVarint(128);
+    e.writeVarint(128 * 6);
+    e.writeVarint(1);
+    for (var index = 0; index < 128; index++) {
+      e.writeSvarint(LuxoInt64.fromInt(index));
+    }
+    e.writeVarint(2);
+    for (var index = 0; index < 128; index++) {
+      e.writeString('发布');
+    }
+    e.writeEnd();
+  });
+  return [
+    (
+      name: 'object',
+      kind: 'object',
+      binary: row,
+      json: <String, dynamic>{'id': 42, 'label': '发布'},
+      expected: object,
+    ),
+    (
+      name: 'objects-128',
+      kind: 'objects',
+      binary: columns,
+      json: List.generate(
+        128,
+        (index) => <String, dynamic>{'id': index, 'label': '发布'},
+      ),
+      expected: objects,
+    ),
+  ];
+}
+
+void _verify(Map<String, RootDecoder> decoders, List<RootCase> samples) {
+  for (final sample in samples) {
+    final plain = decoders['${sample.kind}Plain']!;
+    final nullable = decoders['${sample.kind}Nullable']!;
+    final bytes = _envelope(sample.binary);
+    final original = Uint8List.fromList(bytes);
+    final padded = Uint8List(bytes.length + 13)
+      ..fillRange(0, bytes.length + 13, 255)
+      ..setRange(7, 7 + bytes.length, bytes);
+    for (final input in [
+      bytes,
+      Uint8List.sublistView(padded, 7, 7 + bytes.length),
+      sample.json,
+    ]) {
+      _equal(nullable(input), sample.expected, sample.name);
+    }
+    _equal(plain(sample.binary), sample.expected, sample.name);
+    _equal(plain(sample.json), sample.expected, sample.name);
+    _equal(bytes, original, 'input mutation');
+    _equal(nullable(null), null, 'JSON null');
+    _equal(nullable(Uint8List.fromList([0])), null, 'Binary null');
+    for (final bad in <List<int>>[
+      [],
+      [1],
+      [2],
+      [0, 0],
+      [...bytes, 0],
+    ]) {
+      _reject(() => nullable(Uint8List.fromList(bad)));
+    }
+    if (sample.binary.length > 1) {
+      _reject(
+        () => nullable(Uint8List.sublistView(bytes, 0, bytes.length - 1)),
+      );
+    }
+  }
+}
+
+void _equal(Object? actual, Object? expected, String context) {
+  if (actual is Snapshot) {
+    _equal(
+      {'id': actual.id.value, 'label': actual.label.value},
+      expected,
+      context,
+    );
+    return;
+  }
+  if (expected is Snapshot) {
+    _equal(actual, {
+      'id': expected.id.value,
+      'label': expected.label.value,
+    }, context);
+    return;
+  }
+  if (actual is List && expected is List && actual.length == expected.length) {
+    for (var index = 0; index < actual.length; index++) {
+      _equal(actual[index], expected[index], context);
+    }
+    return;
+  }
+  if (actual is Map && expected is Map && actual.length == expected.length) {
+    for (final key in expected.keys) {
+      if (!actual.containsKey(key)) throw StateError('$context missing $key');
+      _equal(actual[key], expected[key], context);
+    }
+    return;
+  }
+  if (actual != expected) throw StateError('$context: $actual != $expected');
+}
+
+void _reject(Object? Function() operation) {
+  try {
+    operation();
+  } on FormatException {
+    return;
+  }
+  throw StateError('Accepted malformed nullable root');
+}
+
+class _Transport extends Transport {
+  final decoders = <String, RootDecoder>{};
+  @override
+  Future<T> call<T>(
+    String api, {
+    Map<String, dynamic>? params,
+    GeneratedRequest? request,
+    T Function(dynamic)? decoder,
+  }) => throw StateError('Unexpected unary call');
+  @override
+  Future<void Function()> subscribe<T>(
+    String api,
+    Map<String, dynamic> params,
+    void Function(T) onData, {
+    required T Function(Object?) decoder,
+    GeneratedRequest? request,
+    void Function(LuxoError)? onError,
+    void Function()? onDone,
+  }) async {
+    if (decoders.containsKey(api))
+      throw StateError('Duplicate subscription $api');
+    decoders[api] = decoder;
+    return () {};
+  }
+
+  @override
+  void setSchema(Map<String, APISchemaEntry> schema) {}
+  @override
+  void setMode(TransportMode mode) {}
+  @override
+  void setToken(String token) {}
+  @override
+  void close() {}
+}

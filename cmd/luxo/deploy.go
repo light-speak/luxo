@@ -16,8 +16,8 @@ var deployCmd = &cobra.Command{
 为指定目标生成部署配置文件。
 
 Targets / 目标:
-  compose    Generate docker-compose.yml + Dockerfile + init-db.sh
-  helm       Generate Helm Charts + helmfile.yaml (coming soon)
+  compose    Generate Dockerfile + docker-compose.yml
+  helm       Generate Helm Chart in deploy/helm/
 
 Example / 示例:
   luxo deploy compose
@@ -57,7 +57,10 @@ func runDeployCompose() error {
 		return err
 	}
 
-	modulePath, _ := readModulePath()
+	modulePath, err := goModulePath()
+	if err != nil {
+		return err
+	}
 	projectName := modulePath
 	if idx := strings.LastIndex(projectName, "/"); idx >= 0 {
 		projectName = projectName[idx+1:]
@@ -105,7 +108,10 @@ func runDeployHelm() error {
 		return err
 	}
 
-	modulePath, _ := readModulePath()
+	modulePath, err := goModulePath()
+	if err != nil {
+		return err
+	}
 	projectName := modulePath
 	if idx := strings.LastIndex(projectName, "/"); idx >= 0 {
 		projectName = projectName[idx+1:]

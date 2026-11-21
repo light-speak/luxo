@@ -37,7 +37,9 @@ func Load(path string) error {
 
 		// Do not override existing environment variables
 		if _, exists := os.LookupEnv(key); !exists {
-			os.Setenv(key, value)
+			if err := os.Setenv(key, value); err != nil {
+				return fmt.Errorf("env: %s:%d: set variable: %w", path, lineNum, err)
+			}
 		}
 	}
 	return scanner.Err()

@@ -1,0 +1,167 @@
+package probe
+
+import com.luxo.client.*
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.*
+
+private val failures = mutableListOf<String>()
+private fun verify(valid: Boolean, label: String, limit: Int = 64, operation: () -> Unit) {
+    val result = runCatching(operation)
+    if (valid && result.isFailure) failures += "$label rejected: ${result.exceptionOrNull()}"
+    if (!valid && (result.isSuccess || result.exceptionOrNull()?.message?.contains(limit.toString()) != true)) {
+        failures += "$label did not reject with an explicit $limit-layer error: ${result.exceptionOrNull()}"
+    }
+}
+private fun json(depth: Int, lists: Boolean, generic: JsonElement = JsonNull): JsonObject = buildJsonObject {
+    put("value", 1)
+    put("payload", generic)
+    put("child", if (depth > 1 && !lists) json(depth - 1, lists, generic) else JsonNull)
+    put("children", JsonArray(if (depth > 1 && lists) listOf(json(depth - 1, lists, generic)) else emptyList()))
+}
+private fun inputNode(depth: Int, lists: Boolean, generic: JsonElement = JsonNull): NodeInput = NodeInput(
+    1L, if (depth > 1 && !lists) inputBranch(depth - 1, lists, generic) else null,
+    if (depth > 1 && lists) listOf(inputBranch(depth - 1, lists, generic)) else emptyList(), generic)
+private fun inputBranch(depth: Int, lists: Boolean, generic: JsonElement = JsonNull): BranchInput = BranchInput(
+    1L, if (depth > 1 && !lists) inputNode(depth - 1, lists, generic) else null,
+    if (depth > 1 && lists) listOf(inputNode(depth - 1, lists, generic)) else emptyList(), generic)
+
+private fun row(depth: Int, lists: Boolean, generic: String = "null"): ByteArray = LuxoEncoder().apply {
+    writeVarint(0)
+    writeVarint(1); writeSvarint(1)
+    writeVarint(2); writeBool(depth > 1 && !lists)
+    if (depth > 1 && !lists) writeBytes(row(depth - 1, lists, generic))
+    writeVarint(3); writeBytes(if (depth > 1 && lists) column(depth - 1, lists, generic) else emptyColumn())
+    writeVarint(4); writeBool(true); writeString(generic)
+    writeEnd()
+}.bytes()
+private fun emptyColumn(): ByteArray = LuxoEncoder().apply { writeVarint(0); writeVarint(0); writeEnd() }.bytes()
+private fun column(depth: Int, lists: Boolean, generic: String = "null", page: Boolean = false): ByteArray = LuxoEncoder().apply {
+    writeVarint(1); writeVarint(0)
+    writeVarint(1); writeSvarint(1)
+    writeVarint(2); writeBool(depth > 1 && !lists)
+    if (depth > 1 && !lists) writeBytes(row(depth - 1, lists, generic))
+    writeVarint(3); writeBytes(if (depth > 1 && lists) column(depth - 1, lists, generic) else emptyColumn())
+    writeVarint(4); writeBool(true); writeBytes(generic.toByteArray())
+    writeEnd()
+    if (page) { writeSvarint(1); writeSvarint(1); writeSvarint(1) }
+}.bytes()
+
+private class Probe(var payload: Any, var currentMode: TransportMode = TransportMode.BINARY) : Transport {
+    var encoded = 0
+    private var schema = emptyMap<String, APISchemaEntry>()
+    override suspend fun call(api: String, params: Map<String, Any?>): Any = error("generated request required")
+    override suspend fun call(api: String, request: GeneratedRequest): Any {
+        if (currentMode == TransportMode.BINARY) request.writeParameters(LuxoEncoder())
+        else (request.toJSONParameters()["value"] as? NodeInput)?.toLuxoJson()
+        encoded++
+        return payload
+    }
+    override suspend fun <T> subscribe(api: String, decoder: (Any) -> T, request: GeneratedRequest,
+        observer: StreamObserver?, handler: (T) -> Unit): () -> Unit {
+        handler(decoder(payload)); return {}
+    }
+    override fun setSchema(schema: Map<String, APISchemaEntry>) { this.schema = schema }
+    override fun setMode(mode: TransportMode) { this.currentMode = mode }
+    override fun setToken(token: String) {}
+}
+
+private fun checkDirect(depth: Int, lists: Boolean) {
+    val valid = depth <= 64
+    val label = "depth=$depth lists=$lists"
+    verify(valid, "$label JSON read") { check(decodeJSONNode(json(depth, lists)).value.value() == 1L) }
+    verify(valid, "$label row read") { check(decodeNode(LuxoDecoder(row(depth, lists))).value.value() == 1L) }
+    verify(valid, "$label column read") { check(decodeColumnarNode(column(depth, lists)).single().value.value() == 1L) }
+    verify(valid, "$label page read") { check(decodePaginatedNode(column(depth, lists, page = true)).items.size == 1) }
+    val input = inputNode(depth, lists)
+    verify(valid, "$label JSON write") { input.toLuxoJson() }
+    verify(valid, "$label Binary write") { input.writeLuxo(LuxoEncoder()) }
+    // The exported unary references retain their existing types.
+    val read: (JsonObject) -> Node = ::decodeJSONNode
+    verify(valid, "$label function reference") { read(json(depth, lists)) }
+}
+
+private suspend fun checkClient(depth: Int, lists: Boolean, binary: Boolean) {
+    val valid = depth <= 64
+    val probe = Probe(if (binary) row(depth, lists) else json(depth, lists),
+        if (binary) TransportMode.BINARY else TransportMode.JSON)
+    val client = LuxoClient(probe)
+    val label = "client depth=$depth lists=$lists binary=$binary"
+    verify(valid, "$label one") { runBlocking { client.one(inputNode(1, false)) } }
+    probe.payload = if (binary) column(depth, lists) else JsonArray(listOf(json(depth, lists)))
+    verify(valid, "$label many") { runBlocking { check(client.many().size == 1) } }
+    probe.payload = if (binary) column(depth, lists, page = true) else buildJsonObject {
+        put("items", JsonArray(listOf(json(depth, lists)))); put("total", 1); put("page", 1); put("pageSize", 1)
+    }
+    verify(valid, "$label page") { runBlocking { check(client.page().items.size == 1) } }
+    probe.payload = if (binary) row(depth, lists) else json(depth, lists)
+    var delivered = false
+    verify(valid, "$label stream") { runBlocking { client.subscribeWatch { delivered = true } } }
+    if (delivered != valid) failures += "$label stream delivery mismatch"
+    probe.payload = if (binary) row(1, false) else json(1, false)
+    val before = probe.encoded
+    verify(valid, "$label request") { runBlocking { client.one(inputNode(depth, lists)) } }
+    if (probe.encoded != before + if (valid) 1 else 0) failures += "$label request was encoded after rejection"
+    check(client.one(inputNode(1, false)).value.value() == 1L)
+}
+
+private fun checkIndependentJSON() {
+    val generic = "[".repeat(128) + "0" + "]".repeat(128)
+    val value = Json.parseToJsonElement(generic)
+    verify(true, "64model with128JSON") { decodeJSONNode(json(64, true, value)) }
+    verify(true, "64model row with128JSON") { decodeNode(LuxoDecoder(row(64, true, generic))) }
+    verify(true, "64model column with128JSON") { decodeColumnarNode(column(64, true, generic)) }
+    verify(true, "64model JSON write with128JSON") { inputNode(64, true, value).toLuxoJson() }
+    verify(true, "64model binary write with128JSON") { inputNode(64, true, value).writeLuxo(LuxoEncoder()) }
+    val excessive = "[$generic]"
+    val tooDeep = Json.parseToJsonElement(excessive)
+    verify(false, "JSON129 in model64", 128) { decodeJSONNode(json(64, true, tooDeep)) }
+    verify(false, "JSON129 in model64 row", 128) { decodeNode(LuxoDecoder(row(64, true, excessive))) }
+    verify(false, "JSON129 in model64 column", 128) { decodeColumnarNode(column(64, true, excessive)) }
+    verify(false, "JSON129 model64 JSON write", 128) { inputNode(64, true, tooDeep).toLuxoJson() }
+    verify(false, "JSON129 model64 binary write", 128) { inputNode(64, true, tooDeep).writeLuxo(LuxoEncoder()) }
+    val children = mutableListOf<BranchInput>()
+    val parent = NodeInput(1L, null, children, JsonNull)
+    children += BranchInput(1L, parent, emptyList(), JsonNull)
+    verify(false, "cycle JSON write") { parent.toLuxoJson() }
+    verify(false, "cycle Binary write") { parent.writeLuxo(LuxoEncoder()) }
+}
+
+private fun repeatedColumn(field: Int, previous: ByteArray, page: Boolean): ByteArray = LuxoEncoder().apply {
+    writeVarint(1); writeVarint(0); writeVarint(1); writeSvarint(1)
+    writeVarint(field.toLong())
+    if (field != 3) writeBool(true)
+    writeBytes(previous)
+    writeVarint(field.toLong())
+    if (field == 3) writeBytes(emptyColumn()) else writeBool(false)
+    writeEnd()
+    if (page) { writeSvarint(1); writeSvarint(1); writeSvarint(1) }
+}.bytes()
+private fun checkRepeatedColumns() {
+    for (page in listOf(false, true)) for (valid in listOf(false, true)) {
+        val depth = if (valid) 63 else 64
+        val genericDepth = if (valid) 128 else 129
+        val values = listOf(2 to row(depth, false), 3 to column(depth, true),
+            4 to ("[".repeat(genericDepth) + "0" + "]".repeat(genericDepth)).toByteArray())
+        for ((field, previous) in values) {
+            verify(valid, "discarded column field=$field page=$page", if (field == 4) 128 else 64) {
+                val bytes = repeatedColumn(field, previous, page)
+                val value = if (page) decodePaginatedNode(bytes).items.single() else decodeColumnarNode(bytes).single()
+                if (field == 2) check(value.child.value() == null)
+                if (field == 3) check(value.children.value().isEmpty())
+                if (field == 4) check(value.payload.value() == null)
+            }
+        }
+    }
+}
+
+fun main(args: Array<String>) = runBlocking {
+    if (args.firstOrNull() == "--benchmark") { benchmarkModelDepth(); return@runBlocking }
+    for (depth in listOf(1, 63, 64, 65)) for (lists in listOf(false, true)) {
+        checkDirect(depth, lists)
+        for (binary in listOf(false, true)) checkClient(depth, lists, binary)
+    }
+    checkIndependentJSON()
+    checkRepeatedColumns()
+    check(failures.isEmpty()) { failures.joinToString("\n") }
+    println("verified model64 static JSON/Binary row/column/page/stream/input and independent JSON128")
+}

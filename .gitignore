@@ -5,6 +5,8 @@
 *.swo
 
 # Go
+/go.work
+/go.work.sum
 /bin/
 vendor/
 
@@ -20,7 +22,14 @@ Thumbs.db
 
 # Examples (local testing only)
 examples/
+!editors/vscode/examples/
+editors/vscode/examples/*
+!editors/vscode/examples/luxo.cache.json
 /luxo
 cover.out
 .tmp/
 packages/*/dist/
+
+# Kotlin integration consumer caches
+/tests/sdk-interop/kotlin/.gradle/
+/tests/sdk-interop/kotlin/.kotlin/

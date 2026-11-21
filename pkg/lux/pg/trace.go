@@ -33,6 +33,10 @@ func (t *pgxTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.T
 	if sink == nil && !t.debugSQL {
 		return ctx
 	}
+	return t.startTracedQuery(ctx, data, sink)
+}
+
+func (t *pgxTracer) startTracedQuery(ctx context.Context, data pgx.TraceQueryStartData, sink lux.DatabaseTraceSink) context.Context {
 	statement := ""
 	truncated := false
 	metadataStatement := data.SQL
@@ -63,7 +67,14 @@ func (t *pgxTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.T
 }
 
 func (t *pgxTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
-	if sink := lux.DatabaseTraceSinkFromContext(ctx); sink != nil {
+	sink := lux.DatabaseTraceSinkFromContext(ctx)
+	if sink != nil || t.debugSQL {
+		t.finishTracedQuery(ctx, data, sink)
+	}
+}
+
+func (t *pgxTracer) finishTracedQuery(ctx context.Context, data pgx.TraceQueryEndData, sink lux.DatabaseTraceSink) {
+	if sink != nil {
 		command := sqlOperation(data.CommandTag.String())
 		sink.FinishDatabaseQuery(ctx, lux.DatabaseTraceResult{
 			Command: command, ErrorCode: postgresErrorCode(data.Err), RowsAffected: data.CommandTag.RowsAffected(),

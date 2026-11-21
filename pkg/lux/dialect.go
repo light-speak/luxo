@@ -2,6 +2,18 @@ package lux
 
 // Dialect defines database-specific SQL generation for migrations.
 type Dialect interface {
+	// GeneratedIdentifier bounds framework-owned names; raw table/column names are never rewritten.
+	GeneratedIdentifier(name string) string
+
+	// ValidateIdentifier rejects names the backend cannot preserve exactly.
+	ValidateIdentifier(name string) error
+
+	// UniqueConstraintName is the name used by generated unique migrations.
+	UniqueConstraintName(table, column string) string
+
+	// QuoteIdentifier quotes one raw name, without parsing SQL expressions or qualified paths.
+	QuoteIdentifier(name string) string
+
 	// ColumnType maps a Luxo type name + directives to a SQL column type.
 	ColumnType(luxoType string, serial bool, directives []DirectiveInfo) string
 
@@ -9,6 +21,9 @@ type Dialect interface {
 	// field ([T]). PG uses native arrays (e.g. TEXT[]); other backends (MySQL,
 	// SQLite) may store JSON.
 	ArrayColumnType(luxoType string) string
+
+	// DefaultSQL renders a typed constant without changing its value.
+	DefaultSQL(value ColumnDefault) (string, error)
 
 	// ColumnDef produces a full column definition.
 	ColumnDef(name string, col ColumnInfo) string
@@ -32,6 +47,7 @@ type Dialect interface {
 	// AddUnique / DropUnique
 	AddUnique(table, column string) string
 	DropUnique(table, column string) string
+	RenameUnique(table, oldColumn, newColumn string) string
 
 	// CreateIndexSQL produces CREATE INDEX for any index type.
 	CreateIndexSQL(idx IndexInfo, table string) string
@@ -66,6 +82,29 @@ type ColumnInfo struct {
 type ColumnEntry struct {
 	Name string
 	Info ColumnInfo
+}
+
+// DefaultKind identifies the scalar domain of a migration default.
+type DefaultKind uint8
+
+const (
+	DefaultNull DefaultKind = iota
+	DefaultString
+	DefaultInt
+	DefaultFloat
+	DefaultBoolean
+	DefaultDuration
+	DefaultJSONNull
+)
+
+// ColumnDefault keeps SQL NULL separate from string and JSON null values.
+// Int stores nanoseconds for DefaultDuration; Text is unescaped string content.
+type ColumnDefault struct {
+	Kind  DefaultKind
+	Text  string
+	Int   int64
+	Float float64
+	Bool  bool
 }
 
 // IndexKind distinguishes index types.

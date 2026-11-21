@@ -31,3 +31,17 @@ func BenchmarkLimiterAllowShardedKeys(b *testing.B) {
 		}
 	})
 }
+
+func BenchmarkLimiterRefill(b *testing.B) {
+	now := time.Unix(1000, 0)
+	limiter := New(100, time.Second)
+	limiter.now = func() time.Time { return now }
+	limiter.Allow("client")
+	b.ReportAllocs()
+	for b.Loop() {
+		now = now.Add(10 * time.Millisecond)
+		if !limiter.Allow("client") {
+			b.Fatal("refilled request denied")
+		}
+	}
+}

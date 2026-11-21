@@ -45,6 +45,127 @@ func TestConcurrentAnalysesAreIsolated(t *testing.T) {
 	}
 }
 
+func TestFunctionIndexIsBuiltOnlyForDeclaredCalls(t *testing.T) {
+	fn := &ast.FnDecl{Name: "helper"}
+	file := &ast.File{Functions: []*ast.FnDecl{fn}}
+	a := New()
+	a.files = []*ast.File{file}
+	a.collectDeclarations(file)
+	if a.functions != nil {
+		t.Fatal("unused function declarations must not allocate a second index")
+	}
+	a.checkDeclaredFunctionCall(&ast.CallExpr{Func: &ast.Ident{Name: "unknown"}}, nil)
+	if a.functions != nil {
+		t.Fatal("unknown calls must not initialize the function index")
+	}
+	call := &ast.CallExpr{Func: &ast.Ident{Name: "helper"}}
+	a.checkDeclaredFunctionCall(call, nil)
+	if a.functions["helper"] != fn {
+		t.Fatal("declared calls must resolve their function declaration")
+	}
+	allocations := testing.AllocsPerRun(100, func() {
+		a.checkDeclaredFunctionCall(call, nil)
+	})
+	if allocations != 0 {
+		t.Fatalf("repeated zero-argument checks allocated %v times", allocations)
+	}
+}
+
+func TestRejectedTypeTrackingIsLazyAndReused(t *testing.T) {
+	a := New()
+	valid := parseFileWithName(t, `model Entry { keep: Int } interface Label { keep: Int } type Packet { keep: Int }`, "valid.luxo")
+	a.collectDeclarations(valid)
+	if a.rejectedTypeDeclarations != nil {
+		t.Fatal("valid declarations allocated a rejection index")
+	}
+	duplicates := parseFileWithName(t, `model Entry { bad: String } interface Label { bad: String } type Packet { bad: String }`, "duplicates.luxo")
+	a.collectDeclarations(duplicates)
+	if len(a.rejectedTypeDeclarations) != 3 {
+		t.Fatalf("expected three rejected declarations in the same index: %v", a.rejectedTypeDeclarations)
+	}
+	a.resolveFields(valid)
+	a.resolveFields(duplicates)
+	for _, name := range []string{"Entry", "Label", "Packet"} {
+		if a.types[name].Fields["keep"] == nil || a.types[name].Fields["bad"] != nil {
+			t.Fatal("rejected declaration changed accepted fields", name)
+		}
+	}
+}
+
+func TestFunctionArgumentTypeCheckDoesNotAllocate(t *testing.T) {
+	a := New()
+	argument := &ast.NamedArg{Value: &ast.Ident{Name: "value"}}
+	for _, ref := range []*ast.TypeRef{{Name: "Int"}, {Name: "Int", Nullable: true}, {Name: "Int", IsList: true}} {
+		param := &ast.ParamDecl{Name: "value", Type: ref}
+		actual := a.resolveTypeRef(ref, token.Position{})
+		allocations := testing.AllocsPerRun(100, func() {
+			a.checkFunctionArgumentType(argument, actual, param)
+		})
+		if allocations != 0 {
+			t.Errorf("argument type %v allocated %v times", ref, allocations)
+		}
+	}
+	if len(a.errors) != 0 {
+		t.Fatalf("valid arguments rejected: %v", a.errors)
+	}
+}
+
+func TestLazyFunctionIndexPreservesAcceptedDeclarations(t *testing.T) {
+	first := &ast.FnDecl{Name: "helper"}
+	duplicate := &ast.FnDecl{Name: "helper", Params: []*ast.ParamDecl{{Name: "required", Type: &ast.TypeRef{Name: "Int"}}}}
+	shadowed := &ast.FnDecl{Name: "endpoint", Params: duplicate.Params}
+	a := New()
+	file := &ast.File{APIs: []*ast.ApiDecl{{Name: "endpoint"}}, Functions: []*ast.FnDecl{first, duplicate, shadowed}}
+	a.files = []*ast.File{file}
+	a.collectDeclarations(file)
+	a.checkDeclaredFunctionCall(&ast.CallExpr{Func: &ast.Ident{Name: "helper"}}, nil)
+	a.checkDeclaredFunctionCall(&ast.CallExpr{Func: &ast.Ident{Name: "endpoint"}, Args: []*ast.NamedArg{{Value: &ast.Literal{Kind: token.Int, Value: "1"}}}}, []*ResolvedType{a.types["Int"]})
+	if a.functions["helper"] != first || a.functions["endpoint"] != shadowed || len(a.errors) != 0 {
+		t.Fatalf("index must retain the first fn and resolve local calls independently of API names: %v", a.errors)
+	}
+}
+
+func TestFunctionCallWithLargeParameterList(t *testing.T) {
+	fn := &ast.FnDecl{Name: "many"}
+	call := &ast.CallExpr{Func: &ast.Ident{Name: fn.Name}}
+	a := New()
+	var types []*ResolvedType
+	for index := range 17 {
+		name := fmt.Sprintf("p%d", index)
+		fn.Params = append(fn.Params, &ast.ParamDecl{Name: name, Type: &ast.TypeRef{Name: "Int"}})
+		call.Args = append(call.Args, &ast.NamedArg{Name: name, Value: &ast.Literal{Kind: token.Int, Value: "1"}})
+		types = append(types, a.types["Int"])
+	}
+	file := &ast.File{Functions: []*ast.FnDecl{fn}}
+	a.files = []*ast.File{file}
+	a.collectDeclarations(file)
+	a.checkDeclaredFunctionCall(call, types)
+	if len(a.errors) != 0 {
+		t.Fatalf("large argument list rejected: %v", a.errors)
+	}
+}
+
+func TestFunctionArgumentComplexTypeResolution(t *testing.T) {
+	for _, ref := range []*ast.TypeRef{
+		nil,
+		{Name: "Channel", TypeArgs: []*ast.TypeRef{{Name: "Int"}}},
+		{Tuple: []*ast.TypeRef{{Name: "Int"}, {Name: "String"}}},
+	} {
+		a := New()
+		argument := &ast.NamedArg{Value: &ast.Ident{Name: "value"}}
+		actual := a.resolveTypeRef(ref, token.Position{})
+		a.checkFunctionArgumentType(argument, actual, &ast.ParamDecl{Name: "value", Type: ref})
+		if len(a.errors) != 0 {
+			t.Errorf("matching complex type rejected: %v", a.errors)
+		}
+	}
+	a := New()
+	a.checkFunctionArgumentType(&ast.NamedArg{Value: &ast.Ident{Name: "value"}}, nil, &ast.ParamDecl{Type: &ast.TypeRef{Name: "Missing"}})
+	if len(a.errors) != 1 || !strings.Contains(a.errors[0].Message, "unknown type") {
+		t.Fatalf("unknown parameter type was not diagnosed: %v", a.errors)
+	}
+}
+
 func analyze(t *testing.T, input string) *Result {
 	t.Helper()
 	l := lexer.New(input, "test.luxo")
@@ -159,7 +280,7 @@ model User : Base {
   name: String
   role: Role
 }
-api getUser(id: Int): User
+api getUser(id: Int): User @native
 `, "user.luxo")
 	tokens2, _ := l2.Tokenize()
 	p2 := parser.New(tokens2)
@@ -183,8 +304,8 @@ api getUser(id: Int): User
 func TestApiDeclaration(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
-api getUser(id: Int): User
-api listUsers(limit: Int): [User]
+api getUser(id: Int): User @native
+api listUsers(limit: Int): [User] @native
 `)
 	expectNoErrors(t, result)
 
@@ -213,7 +334,7 @@ func TestFnDeclaration(t *testing.T) {
 // ========== Complex Schema Test ==========
 
 func TestComplexSchema(t *testing.T) {
-	result := analyze(t, `
+	result := analyzeCached(t, `
 model Base {
   id: Int
   createdAt: DateTime
@@ -242,7 +363,7 @@ type AuthResult {
   user: User
 }
 
-api getUser(id: Int): User @cache(ttl: 60)
+api getUser(id: Int): User @cache(policy: "preview") { return User.find(id: id) }
 
 api register(input: AuthResult): AuthResult {
   val user = User.create(name: "test")
@@ -453,7 +574,7 @@ func TestDestructuringNonTuple(t *testing.T) {
 	// destructuring from a non-tuple — all variables get the same type
 	result := analyze(t, `
 model User { name: String }
-fn getPair(): User @native @service
+fn getPair(): User { User { name: "pair" } }
 api test(): User {
   val (a, b) = getPair()
   a
@@ -512,7 +633,7 @@ api test(id: Int): User {
 func TestCRUDUpdateReturnType(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
-api test(id: Int): User {
+api test(id: Int): Int {
   val user = User.find(id: id)
   val updated = user.update(name: "new")
   updated
@@ -639,7 +760,7 @@ func TestCRUDItDisambiguation(t *testing.T) {
 	result := analyze(t, `
 model Room { roomId: Int  name: String }
 api test(roomId: Int): Room {
-  val room = Room.find(where: it.roomId == roomId).firstOrNull
+  val room = Room.findFirst(where: it.roomId == roomId)
     ?: throw error.not_found
   room
 }
@@ -651,7 +772,7 @@ func TestCRUDItNoAmbiguity(t *testing.T) {
 	result := analyze(t, `
 model User { name: String  email: String }
 api test(input: String): User {
-  val user = User.find(where: email == input).firstOrNull
+  val user = User.findFirst(where: email == input)
     ?: throw error.not_found
   user
 }
@@ -869,6 +990,101 @@ api test(): Int {
 
 // ========== Circular Event Dependency Tests ==========
 
+func TestNestedCircularEventDependency(t *testing.T) {
+	for _, body := range []string{
+		`if true { emit Second(id: 1) }`,
+		`transaction { emit Second(id: 1) }`,
+		`async { emit Second(id: 1) }`,
+		`for id in [1, 2] { emit Second(id: id) }`,
+		`transaction { if true { async { emit Second(id: 1) } } }`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			source := `event First(id: Int)
+event Second(id: Int)
+on First { ` + body + ` }
+on Second { emit First(id: 1) }`
+			// Prove the nested source is otherwise valid and acyclic chains work.
+			expectNoErrors(t, analyze(t, strings.Replace(source, "emit First(id: 1)", "", 1)))
+			expectError(t, analyze(t, source), "circular event dependency")
+		})
+	}
+}
+
+func TestCollectEmitsNestedExpressions(t *testing.T) {
+	block := &ast.Block{Stmts: []ast.Stmt{
+		&ast.EmitStmt{EventName: "Outer", Args: []*ast.NamedArg{{Value: &ast.AwaitExpr{
+			Body: &ast.Block{Stmts: []ast.Stmt{&ast.EmitStmt{EventName: "Nested"}}},
+		}}}},
+	}}
+	if got, _ := collectReachableEmits(block, "", nil, nil); strings.Join(got, ",") != "Outer,Nested" {
+		t.Fatalf("emitted events = %v, want Outer,Nested", got)
+	}
+}
+
+func TestEventHelpersIgnoreModelMethodsAndNativeBodies(t *testing.T) {
+	expectNoErrors(t, analyze(t, `model User { id: Int @id }
+event Changed(id: Int)
+fn count(): Int { emit Changed(id: 1)
+return 0 }
+fn inspect(): Result<Int> @native
+on Changed { User.count()
+val result = inspect()? }`))
+}
+
+func TestEventCollectorEmptyDoesNotAllocate(t *testing.T) {
+	block := &ast.Block{}
+	for _, bodies := range []map[callableKey]*ast.Block{nil, {{name: "unused"}: block}} {
+		allocations := testing.AllocsPerRun(100, func() {
+			if events, _ := collectReachableEmits(block, "", bodies, nil); len(events) != 0 {
+				t.Fatal(events)
+			}
+		})
+		if allocations != 0 {
+			t.Fatalf("empty listener used %.0f allocations", allocations)
+		}
+	}
+}
+
+func TestEventCycleThroughHelpers(t *testing.T) {
+	for _, declarations := range []string{
+		`fn relay() { emit Second(id: 1) }`,
+		`fn relay() { nested() }
+fn nested() { transaction { emit Second(id: 1) } }`,
+		`fn relay() { nested() }
+fn nested() { relay()
+emit Second(id: 1) }`,
+	} {
+		source := `event First(id: Int)
+event Second(id: Int)
+` + declarations + `
+on First { relay() }
+on Second { emit First(id: 1) }`
+		expectNoErrors(t, analyze(t, strings.Replace(source, "emit First(id: 1)", "", 1)))
+		expectError(t, analyze(t, source), "circular event dependency")
+	}
+}
+
+func TestEventHelpersRemainModuleLocal(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		common := parseFileWithName(t, `event First(id: Int)
+event Second(id: Int)
+event Terminal(id: Int)
+fn publish() { emit Second(id: 1) }`, "origin/common/events.luxo")
+		first := parseFileWithName(t, `fn relay() { emit Terminal(id: 1) }
+on First { relay() }`, "origin/first/events.luxo")
+		second := parseFileWithName(t, `fn relay() { emit First(id: 1) }
+on Second { relay() }`, "origin/second/events.luxo")
+		files := []*ast.File{common, first, second}
+		if reverse {
+			files[1], files[2] = files[2], files[1]
+		}
+		expectNoErrors(t, analyzeModules(t, files))
+		// First -> common.publish -> Second -> local.relay -> First.
+		first = parseFileWithName(t, `on First { publish() }`, "origin/first/events.luxo")
+		expectError(t, analyzeModules(t, []*ast.File{common, first, second}), "circular event dependency")
+	}
+}
+
 func TestCircularEventDependency(t *testing.T) {
 	file := &ast.File{
 		Name: "test.luxo",
@@ -983,7 +1199,7 @@ func TestCollectAmbiguousIdentsDifferentNames(t *testing.T) {
 	result := analyze(t, `
 model User { userId: Int  name: String }
 api test(id: Int): User {
-  val user = User.find(where: userId == id).firstOrNull
+  val user = User.findFirst(where: userId == id)
     ?: throw error.not_found
   user
 }
@@ -1003,7 +1219,7 @@ func TestCheckBinaryAmbiguityDisambiguated(t *testing.T) {
 	result := analyze(t, `
 model User { email: String  name: String }
 api test(email: String): User {
-  val user = User.find(where: it.email == email).firstOrNull
+  val user = User.findFirst(where: it.email == email)
     ?: throw error.not_found
   user
 }
@@ -1413,9 +1629,9 @@ func TestCheckBodiesListenerWithBody(t *testing.T) {
 	result := analyze(t, `
 event OrderPlaced(orderId: Int, userId: Int)
 on OrderPlaced {
-  orderId, userId ->
-  val x = orderId
-  val y = userId
+  payload ->
+  val x = payload.orderId
+  val y = payload.userId
 }
 `)
 	expectNoErrors(t, result)
@@ -1656,7 +1872,7 @@ api test(): Int {
   0
 }
 `)
-	expectNoErrors(t, result)
+	expectError(t, result, "explicit type projection")
 }
 
 func TestPaginateOperation(t *testing.T) {
@@ -1687,6 +1903,8 @@ api test(): Int {
 func TestWithAuthDirective(t *testing.T) {
 	result := analyze(t, `
 model User @withAuth(stores: [id, role]) {
+  id: Int @id
+  role: String
   name: String
   email: String
 }
@@ -1703,6 +1921,9 @@ model User @withAuth(stores: [id, role]) {
 	} else if f.Doc == "" {
 		t.Error("createToken field missing Doc string")
 	}
+	if f, ok := userType.Fields["createRefreshToken"]; !ok || !f.IsMethod || f.Doc == "" {
+		t.Error("createRefreshToken method or description missing")
+	}
 	if f, ok := userType.Fields["verify"]; !ok {
 		t.Error("verify field not injected")
 	} else if f.Doc == "" {
@@ -1713,6 +1934,8 @@ model User @withAuth(stores: [id, role]) {
 func TestWithAuthDirectiveRefreshTokenDoc(t *testing.T) {
 	result := analyze(t, `
 model User @withAuth(stores: [id, role]) {
+  id: Int @id
+  role: String
   name: String
   email: String
 }
@@ -1922,6 +2145,8 @@ func TestMethodWithCallOK(t *testing.T) {
 	// user.createToken() with () should be fine
 	result := analyze(t, `
 model User @withAuth(stores: [id, role]) {
+  id: Int @id
+  role: String
   name: String
   email: String
 }
@@ -1932,6 +2157,64 @@ api test(): String {
 }
 `)
 	expectNoErrors(t, result)
+}
+
+func TestAuthMethodArguments(t *testing.T) {
+	for _, sample := range []struct{ call, errorText string }{
+		{"user.createToken()", ""},
+		{"user.createToken(5m)", ""},
+		{"user.createToken(expires: 5m)", ""},
+		{"user.createRefreshToken()", ""},
+		{"user.createRefreshToken(5m)", "expects at most 0"},
+		{"user.createRefreshToken(expires: 5m)", "unknown argument 'expires'"},
+		{`user.refreshToken("signed")`, ""},
+		{`user.refreshToken(token: "signed")`, ""},
+		{`user.createToken("5m")`, "expects 'Duration'"},
+		{"user.createToken(null)", "expects 'Duration'"},
+		{"user.createToken(1)", "expects 'Duration'"},
+		{"user.createToken(ttl: 5m)", "unknown argument 'ttl'"},
+		{"user.createToken(5m, 10m)", "expects at most 1"},
+		{"user.createToken(expires: 5m, expires: 10m)", "duplicate argument 'expires'"},
+		{"user.refreshToken()", "missing required argument 'token'"},
+		{"user.refreshToken(1)", "expects 'String'"},
+		{`user.refreshToken(plain: "signed")`, "unknown argument 'plain'"},
+	} {
+		t.Run(sample.call, func(t *testing.T) {
+			result := analyze(t, `model User @withAuth(stores: [name]) { name: String }
+fn token(user: User): String { `+sample.call+` }`)
+			if sample.errorText == "" {
+				expectNoErrors(t, result)
+			} else {
+				expectError(t, result, sample.errorText)
+			}
+		})
+	}
+}
+
+func TestAuthArgumentChecksIgnoreOtherReceivers(t *testing.T) {
+	a := New()
+	a.types["Plain"] = &ResolvedType{Kind: TypeModel, Name: "Plain", Fields: map[string]*FieldInfo{
+		"createToken": {Name: "createToken", Type: a.types["String"]},
+	}}
+	for _, sample := range []struct {
+		typeName, method string
+		list             bool
+	}{
+		{"", "createToken", false},
+		{"Unknown", "createToken", false},
+		{"String", "createToken", false},
+		{"Plain", "createToken", true},
+		{"Plain", "createToken", false},
+		{"Plain", "refreshToken", false},
+	} {
+		object := &ast.Ident{Name: "value"}
+		object.SetTypeTag(sample.typeName)
+		object.SetListType(sample.list)
+		a.checkAuthMethodArguments(&ast.CallExpr{Func: &ast.MemberExpr{Object: object, Field: sample.method}}, nil)
+	}
+	if len(a.errors) != 0 {
+		t.Fatalf("auth checks interpreted unrelated values: %v", a.errors)
+	}
 }
 
 func TestMethodVerifyWithoutCallError(t *testing.T) {
@@ -1970,6 +2253,8 @@ func TestWithAuthIsMethodFlag(t *testing.T) {
 	// verify that IsMethod flag is set on injected auth methods
 	result := analyze(t, `
 model User @withAuth(stores: [id, role]) {
+  id: Int @id
+  role: String
   name: String
   email: String
 }
@@ -2732,6 +3017,28 @@ func TestChainCRUDAggregateReturnType(t *testing.T) {
 	}
 }
 
+func TestChainCRUDFallbackReturnTypes(t *testing.T) {
+	a := New()
+	a.declareType("User", TypeModel, token.Position{}, "")
+	for _, test := range []struct {
+		method, name   string
+		list, nullable bool
+	}{
+		{"create", "User", false, false},
+		{"all", "User", true, false},
+		{"first", "User", false, true},
+		{"count", "Int", false, false},
+	} {
+		t.Run(test.method, func(t *testing.T) {
+			call := &ast.CallExpr{Func: &ast.MemberExpr{Object: &ast.Ident{Name: "User"}, Field: test.method}}
+			result := a.inferCheckedCallReturnType(call, nil)
+			if result == nil || result.Name != test.name || result.IsList != test.list || result.Nullable != test.nullable {
+				t.Fatalf("unexpected fallback type: %+v", result)
+			}
+		})
+	}
+}
+
 // ========== isAutoManagedField Edge Cases ==========
 
 func TestCreateMissingFieldWithIdDirective(t *testing.T) {
@@ -2949,7 +3256,7 @@ func TestResolveQueryMethodCRUDChain(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.method, func(t *testing.T) {
-			got := a.resolveQueryMethod(tt.method, orderType)
+			got := a.resolveQueryMethod(tt.method, orderType, nil, nil)
 			if tt.wantNil {
 				if got != nil {
 					t.Errorf("resolveQueryMethod(%q) = %v, want nil", tt.method, got)
@@ -3100,9 +3407,19 @@ func TestHasSearchDirectiveEmptyDirectives(t *testing.T) {
 	a.scope.Define(&Symbol{Name: "post", Kind: SymVariable, Type: postType})
 
 	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "post"}, Field: "title"}
+	a.types["Post"] = postType
+	expr.Object.SetTypeTag("Post")
 	got := a.hasSearchDirective(expr)
 	if got {
 		t.Error("expected false for field with no directives")
+	}
+}
+
+func TestHasSearchDirectiveUnresolvedReceiver(t *testing.T) {
+	a := New()
+	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "missing"}, Field: "title"}
+	if a.hasSearchDirective(expr) {
+		t.Fatal("unresolved receiver cannot establish a search directive")
 	}
 }
 
@@ -3120,6 +3437,8 @@ func TestHasSearchDirectiveDirectLoopNoSearch(t *testing.T) {
 
 	// hasSearchDirective(post.title) — should return false because no "search" directive
 	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "post"}, Field: "title"}
+	a.types["Post"] = postType
+	expr.Object.SetTypeTag("Post")
 	got := a.hasSearchDirective(expr)
 	if got {
 		t.Error("expected false for field without @search")
@@ -3139,6 +3458,8 @@ func TestHasSearchDirectiveDirectLoopWithSearch(t *testing.T) {
 	a.scope.Define(&Symbol{Name: "post", Kind: SymVariable, Type: postType})
 
 	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "post"}, Field: "title"}
+	a.types["Post"] = postType
+	expr.Object.SetTypeTag("Post")
 	got := a.hasSearchDirective(expr)
 	if !got {
 		t.Error("expected true for field with @search")
@@ -3311,7 +3632,7 @@ api test(): [Post] {
 }
 
 func TestQueryModifierMethodGroupBy(t *testing.T) {
-	// Model.groupBy(field) — exercises isQueryModifierMethod returning true
+	// A grouping operation is not an executable result without a typed projection.
 	result := analyze(t, `
 model Post {
   title: String
@@ -3322,7 +3643,7 @@ api test(): Int {
   0
 }
 `)
-	expectNoErrors(t, result)
+	expectError(t, result, "explicit type projection")
 }
 
 // ========== isAutoManagedField — IsMethod field ==========
@@ -3522,6 +3843,10 @@ func TestHasSearchDirectiveFieldNilDirect(t *testing.T) {
 
 	// MemberExpr "obj.ghost" — obj resolves, "ghost" does not exist → field == nil
 	expr := &ast.MemberExpr{Object: &ast.Ident{Name: "obj"}, Field: "ghost"}
+	a.types["Obj"] = objType
+	if resolved := a.checkExpr(expr.Object, a.scope); resolved != objType {
+		t.Fatalf("receiver did not resolve: %+v", resolved)
+	}
 	if a.hasSearchDirective(expr) {
 		t.Error("expected false for non-existent field")
 	}
@@ -3614,6 +3939,24 @@ api watch(): Int @stream {
 	expectError(t, result, "@stream without an event source requires @native")
 }
 
+func TestNullableStreamMessages(t *testing.T) {
+	for _, typ := range []string{"Int", "[Int]", "Snapshot", "[Snapshot]"} {
+		for _, source := range []string{"@stream @native", "@stream(Changed) { true }", "@stream(Changed) @native"} {
+			if strings.HasPrefix(typ, "[") && source != "@stream @native" {
+				continue // Event snapshots still prohibit nullable lists.
+			}
+			t.Run(typ+source, func(t *testing.T) {
+				declaration := "type Snapshot { value: Int }\n"
+				if source != "@stream @native" {
+					declaration += "event Changed(value: " + typ + "?)\n"
+				}
+				result := analyze(t, declaration+"api watch(): "+typ+"? "+source)
+				expectNoErrors(t, result)
+			})
+		}
+	}
+}
+
 func TestStreamContractValidation(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -3651,9 +3994,9 @@ func TestStreamContractValidation(t *testing.T) {
 			want:  "must contain exactly one payload parameter of type 'Int'",
 		},
 		{
-			name:  "nullable return",
-			input: `event Changed(value: Int?)\napi watch: Int? @stream(Changed)`,
-			want:  "@stream return type must be non-nullable",
+			name:  "non-nullable payload mismatch",
+			input: `event Changed(value: Int)\napi watch: Int? @stream(Changed)`,
+			want:  "must contain exactly one payload parameter of type 'Int?'",
 		},
 		{
 			name:  "native body",
@@ -3742,4 +4085,97 @@ on UserCreated {
 }
 `)
 	expectNoErrors(t, result)
+}
+
+func TestPasswordVerificationArguments(t *testing.T) {
+	for _, method := range []string{"verify", "verifyPassword"} {
+		for _, sample := range []struct{ args, diagnostic string }{
+			{`"secret"`, ""}, {`plain: "secret"`, ""},
+			{``, "missing required argument 'plain'"},
+			{`1`, "expects 'String'"}, {`null`, "expects 'String'"},
+			{`"one", "two"`, "expects at most 1"},
+			{`password: "secret"`, "unknown argument 'password'"},
+			{`plain: "one", plain: "two"`, "duplicate argument 'plain'"},
+		} {
+			t.Run(method+"("+sample.args+")", func(t *testing.T) {
+				result := analyze(t, `model User @withAuth(stores: [id]) { id: Int @id password: String @hash }
+fn check(user: User): Boolean { return user.`+method+`(`+sample.args+`) }`)
+				if sample.diagnostic == "" {
+					expectNoErrors(t, result)
+				} else {
+					expectError(t, result, sample.diagnostic)
+				}
+			})
+		}
+	}
+}
+
+func TestHashVerificationFieldContract(t *testing.T) {
+	for _, sample := range []struct{ name, source, diagnostic string }{
+		{"named", `model User { id: Int @id secret: String @hash } fn check(u: User): Boolean { return u.verifySecret(plain: "ok") }`, ""},
+		{"wrong-name", `model User { id: Int @id secret: String @hash } fn check(u: User): Boolean { return u.verifyPassword("ok") }`, "verifyPassword"},
+		{"wrong-argument", `model User { id: Int @id secret: String @hash } fn check(u: User): Boolean { return u.verifySecret(1) }`, "expects 'String'"},
+		{"multiple-explicit", `model User { id: Int @id secret: String @hash password: String @hash } fn check(u: User): Boolean { return u.verifySecret("ok") && u.verifyPassword("ok") }`, ""},
+		{"single-short", `model User @withAuth(stores: [id]) { id: Int @id secret: String @hash } fn check(u: User): Boolean { return u.verify("ok") }`, ""},
+		{"no-hash", `model User @withAuth(stores: [id]) { id: Int @id } fn check(u: User): Boolean { return u.verify("ok") }`, "exactly one @hash field"},
+		{"ambiguous", `model User @withAuth(stores: [id]) { id: Int @id secret: String @hash password: String @hash } fn check(u: User): Boolean { return u.verify("ok") }`, "exactly one @hash field"},
+		{"inherited", `model User: Base @withAuth(stores: [id]) { label: String } model Base { id: Int @id secret: String @hash } fn check(u: User): Boolean { return u.verifySecret("ok") && u.verify("ok") }`, ""},
+		{"collision", `model User { id: Int @id secret: String @hash verifySecret: Boolean }`, "conflicts with @hash"},
+		{"inherited-collision", `model User: Base { secret: String @hash } model Base { id: Int @id verifySecret: Boolean }`, "conflicts with @hash"},
+		{"shadowed-hash", `model Base { id: Int @id secret: String @hash } model User: Base { secret: String } fn check(u: User): Boolean { return u.verifySecret("ok") }`, "no matching @hash field"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			result := analyze(t, sample.source)
+			if sample.diagnostic == "" {
+				expectNoErrors(t, result)
+			} else {
+				expectError(t, result, sample.diagnostic)
+			}
+		})
+	}
+}
+
+func TestInstanceMutationReturnTypes(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		source  string
+		invalid bool
+	}{
+		{"delete", "fn remove(user: User): Int { return user.delete() }", false},
+		{"update", "fn rename(user: User): Int { return user.update(name: \"new\") }", false},
+		{"local", "fn remove(user: User): Int { val target = user return target.delete() }", false},
+		{"nullableDelete", "fn remove(user: User?): Int? { return user?.delete() }", false},
+		{"nullableUpdate", "fn rename(user: User?): Int? { return user?.update(name: \"new\") }", false},
+		{"rejectModel", "fn remove(user: User): User { return user.delete() }", true},
+		{"rejectNullableModel", "fn rename(user: User?): User? { return user?.update(name: \"new\") }", true},
+		{"rejectUnsafeNull", "fn remove(user: User?): Int { return user.delete() }", true},
+		{"modelDelete", "fn remove(): User { return User.delete(id: 1) }", false},
+		{"modelUpdate", "fn rename(): User { return User.update(id: 1, name: \"new\") }", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := analyze(t, "model User @noTime { id: Int @id name: String }\n"+test.source)
+			if (len(result.Errors) != 0) != test.invalid {
+				t.Fatalf("invalid=%v, errors=%v", test.invalid, result.Errors)
+			}
+		})
+	}
+}
+
+func TestStringNumericConversionRequiresPropagation(t *testing.T) {
+	for _, method := range []string{"toInt", "toFloat"} {
+		kind := "Int"
+		if method == "toFloat" {
+			kind = "Float"
+		}
+		for _, propagate := range []bool{false, true} {
+			suffix := ""
+			if propagate {
+				suffix = "?"
+			}
+			result := analyze(t, "fn parse(value: String): "+kind+" { return value."+method+"()"+suffix+" }")
+			if (len(result.Errors) == 0) != propagate {
+				t.Errorf("%s%s: %v", method, suffix, result.Errors)
+			}
+		}
+	}
 }

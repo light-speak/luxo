@@ -1,10 +1,13 @@
 package semantic
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/lexer"
+	"github.com/light-speak/luxo/pkg/parser"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
@@ -150,13 +153,37 @@ func TestDirectiveCorrectContextMiddleware(t *testing.T) {
 	expectNoErrors(t, result)
 }
 
-func TestDirectiveFnAuth(t *testing.T) {
-	// @auth on fn (correct — allowed on fn)
+func TestDirectivePrivateFnAuthRequiresServiceBoundary(t *testing.T) {
 	result := analyze(t, `fn secureOp(): Result<Int> @auth @native`)
-	expectNoErrors(t, result)
+	expectError(t, result, "@auth on fn 'secureOp' requires @service")
 }
 
 // ========== Directive Type Constraint ==========
+
+func TestFilterableRejectsUnsupportedTypes(t *testing.T) {
+	for _, typeName := range []string{"JSON", "Bytes", "Duration", "[Int]", "[String]", "[State]", "[JSON]?", "[Bytes]?", "[Duration]", "JSON?", "Bytes?", "Duration?", "Child", "Input", "Missing"} {
+		t.Run(typeName, func(t *testing.T) {
+			result := analyze(t, "enum State { OPEN CLOSED }\nmodel Child { id: Int @id }\ntype Input { value: Int }\nmodel Probe { value: "+typeName+" @filterable }")
+			expectError(t, result, "@filterable requires a supported scalar or enum")
+			for _, diagnostic := range result.Errors {
+				if strings.Contains(diagnostic.Message, "@filterable") && diagnostic.Pos.Line != 4 {
+					t.Fatalf("wrong annotation position: %v", diagnostic.Pos)
+				}
+			}
+		})
+	}
+}
+
+func TestFilterableSupportedScalarTypes(t *testing.T) {
+	for _, typeName := range []string{"Int", "Float", "String", "Boolean", "DateTime", "UUID", "Decimal", "State"} {
+		for _, nullable := range []string{"", "?"} {
+			t.Run(typeName+nullable, func(t *testing.T) {
+				result := analyze(t, "enum State { OPEN CLOSED }\nmodel Probe { value: "+typeName+nullable+" @filterable }")
+				expectNoErrors(t, result)
+			})
+		}
+	}
+}
 
 func TestDirectiveTypeConstraintHash(t *testing.T) {
 	// @hash on Int (should be on String)
@@ -446,7 +473,7 @@ func TestMultipleDirectivesOnModel(t *testing.T) {
 }
 
 func TestMultipleDirectivesOnApi(t *testing.T) {
-	result := analyze(t, `api getUser(): Int @auth @cache(ttl: 60)`)
+	result := analyzeCached(t, `api getUser(): Int @auth @cache(policy: "preview")`)
 	expectNoErrors(t, result)
 }
 
@@ -485,6 +512,18 @@ func TestTransformDirectiveResultTypeMustMatchField(t *testing.T) {
   name: String @transform { it.length }
 }`)
 	expectError(t, result, "@transform result type 'Int' does not match field type 'String'")
+}
+
+func TestTransformDirectiveReportsUnknownExpressionWithoutTypeCascade(t *testing.T) {
+	result := analyze(t, `model User {
+  name: String @transform { missingTransformValue }
+}`)
+	expectError(t, result, "undefined: 'missingTransformValue'")
+	for _, diagnostic := range result.Errors {
+		if strings.Contains(diagnostic.Message, "@transform result type") {
+			t.Fatalf("unknown expression produced a secondary type mismatch: %s", diagnostic.Message)
+		}
+	}
 }
 
 func TestTransformDirectiveSupportsNullableValue(t *testing.T) {
@@ -536,8 +575,8 @@ func TestDirectiveAuthRole(t *testing.T) {
 	expectNoErrors(t, result)
 }
 
-func TestDirectiveCacheTtl(t *testing.T) {
-	result := analyze(t, `api cached(): Int @cache(ttl: 5m)`)
+func TestDirectiveCachePolicy(t *testing.T) {
+	result := analyzeCached(t, `api cached(): Int @cache(policy: "preview")`)
 	expectNoErrors(t, result)
 }
 
@@ -760,6 +799,8 @@ func TestDirectiveWithAuthStores(t *testing.T) {
 	// @withAuth with stores — should work
 	result := analyze(t, `
 model User @withAuth(stores: [id, role]) {
+  id: Int @id
+  role: String
   name: String
   email: String
 }
@@ -771,6 +812,7 @@ func TestDirectiveWithAuthDefault(t *testing.T) {
 	// @withAuth(stores: ..., default: true) — marks this model as the default auth subject
 	result := analyze(t, `
 model User @withAuth(stores: [id], default: true) {
+  id: Int @id
   name: String
   email: String
 }
@@ -1066,4 +1108,529 @@ func TestDirectiveUploadTooManyArgs(t *testing.T) {
 func TestDirectiveUploadOnModel(t *testing.T) {
 	result := analyze(t, `model User @upload { name: String }`)
 	expectError(t, result, "@upload cannot be used on model")
+}
+
+func TestAuthDirectiveRejectsIgnoredArguments(t *testing.T) {
+	for _, args := range []string{`role: 1`, `role: null`, `role: ""`, `role: ["admin"]`, `roles: "admin"`, `own: 1`, `own: ""`, `permission: true`, `42`} {
+		t.Run(args, func(t *testing.T) {
+			expectError(t, analyze(t, `api restricted(): Int @auth(`+args+`) { return 42 }`), "@auth")
+		})
+	}
+}
+
+func TestAuthPermissionConditionTypes(t *testing.T) {
+	for _, condition := range []string{``, `42`, `"admin"`, `null`, `[]`, `missing`, `my.unknown == "admin"`, `my.role + "admin"`} {
+		for _, declaration := range []string{
+			`api restricted(): Int @auth(permission: { %s }) { return 42 }`,
+			`fn restricted(): Int @service @auth(permission: { %s }) { return 42 }`,
+			`model User @auth(permission: { %s }) { id: Int @id }`,
+		} {
+			t.Run(condition+declaration, func(t *testing.T) {
+				input := strings.Replace(declaration, "%s", condition, 1)
+				result := analyze(t, input)
+				if len(result.Errors) == 0 {
+					t.Fatal("invalid permission condition accepted")
+				}
+			})
+		}
+	}
+}
+
+func TestAuthPermissionPreservesTypedConditions(t *testing.T) {
+	for _, source := range []string{
+		`api restricted(): Int @auth(permission: { my.role == "admin" }) { return 42 }`,
+		`fn restricted(): Int @service @auth(permission: { my.role == "admin" }) @native`,
+		`model User @auth(permission: { my.role == "admin" }) { id: Int @id }`,
+		`enum Role { ADMIN MEMBER }
+model User @withAuth(stores: [role]) {
+ id: Int @id
+ role: Role
+}
+api restricted(): Int @auth(permission: { my.role == Role.ADMIN }) { return 42 }`,
+	} {
+		expectNoErrors(t, analyze(t, source))
+	}
+}
+
+func TestAuthDirectiveRejectsDuplicateConstraints(t *testing.T) {
+	for _, source := range []string{
+		`api restricted(): Int @auth @auth(role: "admin") { return 42 }`,
+		`fn restricted(): Int @service @auth @auth(role: "admin") { return 42 }`,
+		`model User @auth @auth(role: "admin") { id: Int @id }`,
+		`api restricted(): Int @auth(role: "admin", role: "member") { return 42 }`,
+		`api restricted(id: Int): Int @auth(own: "id", own: "other") { return 42 }`,
+		`api restricted(): Int @auth(permission: { my.role == "admin" }, permission: { my.role == "member" }) { return 42 }`,
+	} {
+		t.Run(source, func(t *testing.T) { expectError(t, analyze(t, source), "duplicate @auth") })
+	}
+	expectNoErrors(t, analyze(t, `api restricted(id: Int): Int @auth(Admin, Moderator, own: "id") { return 42 }`))
+}
+
+func TestAuthOwnershipRequiresDeclaredIntegerParameter(t *testing.T) {
+	for _, source := range []string{
+		`api restricted(id: Int): Int @auth(own: "missing") { return 42 }`,
+		`api restricted(id: String): Int @auth(own: "id") { return 42 }`,
+		`api restricted(id: [Int]): Int @auth(own: id) { return 42 }`,
+		`fn restricted(id: Int): Int @service @auth(own: "missing") { return 42 }`,
+	} {
+		t.Run(source, func(t *testing.T) { expectError(t, analyze(t, source), "@auth own") })
+	}
+	for _, source := range []string{
+		`api restricted(id: Int): Int @auth(own: "id") { return 42 }`,
+		`fn restricted(id: Int): Int @service @auth(own: id) { return 42 }`,
+		`api restricted(id: Int?): Int @auth(Admin, own: "id") { return 42 }`,
+	} {
+		expectNoErrors(t, analyze(t, source))
+	}
+}
+
+func TestBeforeSaveRejectsInvalidStatements(t *testing.T) {
+	for _, body := range []string{``, `1`, `it = 1`, `other = it`, `return it`, `val ignored = it`, `null`, `it -= "x"`} {
+		t.Run(body, func(t *testing.T) {
+			expectError(t, analyze(t, `model User { name: String @beforeSave { `+body+` } }`), "@beforeSave")
+		})
+	}
+	for _, source := range []string{
+		`model User { name: String @beforeSave { it = it.trim() it += "!" } }`,
+		`model Counter { amount: Int @beforeSave { it += 2 it *= 3 } }`,
+		`fn normalize(value: String): String { return value.trim() } model User { name: String @beforeSave { normalize(it) } }`,
+	} {
+		expectNoErrors(t, analyze(t, source))
+	}
+}
+
+func TestTransformStringMethodNames(t *testing.T) {
+	expectError(t, analyze(t, `model Article { slug: String @transform { it.lower().replace(" ", "-") } }`), "lower")
+	expectNoErrors(t, analyze(t, `model Article { slug: String @transform { it.trim().lowercase().replace(" ", "-") } }`))
+}
+
+func TestTransformRejectsAmbiguousDeclarations(t *testing.T) {
+	for _, declaration := range []string{
+		`@transform { it.trim() } @transform { it.uppercase() }`,
+		`@transform(true) { it.trim() }`,
+		`@transform(mode: "read") { it.trim() }`,
+	} {
+		t.Run(declaration, func(t *testing.T) {
+			expectError(t, analyze(t, `model User { name: String `+declaration+` }`), "@transform")
+		})
+	}
+	for _, source := range []string{
+		`type User { name: String @transform { it.trim() } @transform { it.uppercase() } }`,
+		`interface User { name: String @transform { it.trim() } @transform { it.uppercase() } }`,
+		`model User { id: Int @id } extend User { name: String @transform { it.trim() } @transform { it.uppercase() } }`,
+	} {
+		expectError(t, analyze(t, source), "duplicate @transform")
+	}
+	expectNoErrors(t, analyze(t, `model User { name: String @transform { it.trim().uppercase() } }`))
+}
+
+func TestTransformUsesResolvedFunctionResult(t *testing.T) {
+	if got := typeDisplayName(&ResolvedType{Name: "String", Nullable: true}); got != "String?" {
+		t.Fatalf("nullable diagnostic type = %q", got)
+	}
+	for _, source := range []string{
+		`fn normalize(): Int { return 1 } model User { name: String @transform { normalize() } }`,
+		`fn normalize(): String? { return null } model User { name: String @transform { normalize() } }`,
+	} {
+		expectError(t, analyze(t, source), "@transform")
+	}
+	expectNoErrors(t, analyze(t, `fn normalize(value: String): String { return value.trim() } model User { name: String @transform { normalize(it) } }`))
+}
+
+func TestSoftDeleteTimestampType(t *testing.T) {
+	for _, field := range []string{"deletedAt: String?", "deletedAt: DateTime", "deletedAt: [DateTime]?"} {
+		for _, inherited := range []bool{false, true} {
+			source := "model Entry @soft @noTime { " + field + " }"
+			if inherited {
+				source = "model Base @noTime { " + field + " }\nmodel Entry : Base @soft @noTime {}"
+			}
+			t.Run(source, func(t *testing.T) {
+				result := analyze(t, source)
+				expectError(t, result, "soft-delete field 'Entry.deletedAt' must be a persisted DateTime? scalar")
+				if len(result.Errors) != 1 || result.Errors[0].Pos.Line != 1 || result.Errors[0].Pos.Col != strings.Index(source, "deletedAt")+1 {
+					t.Fatalf("diagnostic did not identify the original field: %+v", result.Errors)
+				}
+			})
+		}
+	}
+	for _, source := range []string{
+		"model Entry @soft @noTime { id: Int }",
+		"model Entry @soft @noTime { deletedAt: DateTime? }",
+		"model Entry @noTime { deletedAt: String? }",
+		"model Base @noTime { deletedAt: DateTime? }\nmodel Entry : Base @soft @noTime {}",
+	} {
+		t.Run(source, func(t *testing.T) { expectNoErrors(t, analyze(t, source)) })
+	}
+}
+
+func TestModelAuthOwnershipRequiresStoredIntegerField(t *testing.T) {
+	for _, source := range []string{
+		`model User @auth(own: "missing") { id: Int @id name: Int }`,
+		`model User @auth(own: name) { id: Int @id name: String }`,
+		`model User @auth(own: "name") { id: Int @id name: [Int] }`,
+	} {
+		t.Run(source, func(t *testing.T) { expectError(t, analyze(t, source), "@auth own") })
+	}
+	for _, source := range []string{
+		`model User @auth(own: "name") { id: Int @id name: Int }`,
+		`model User @auth(Admin, own: name) { id: Int @id name: Int? }`,
+		`model User @auth(own: id) { id: Int @id }`,
+	} {
+		expectNoErrors(t, analyze(t, source))
+	}
+}
+
+func TestModelAuthOwnershipRejectsNonStoredField(t *testing.T) {
+	for _, field := range []*ast.FieldDecl{
+		{Name: "owner"},
+		{Name: "owner", Type: &ast.TypeRef{Name: "Int"}, Computed: &ast.ComputedField{}},
+	} {
+		analyzer := newAnalyzer()
+		analyzer.checkModelAuthOwnership(&ast.ModelDecl{Name: "User", Fields: []*ast.FieldDecl{field}, Directives: []*ast.Directive{{Name: "auth", Args: []*ast.NamedArg{{Name: "own", Value: &ast.Ident{Name: "owner"}}}}}})
+		if len(analyzer.errors) != 1 {
+			t.Fatal(analyzer.errors)
+		}
+	}
+	if authOwnershipName(&ast.Literal{Kind: token.Int, Value: "1"}) != "" || authOwnershipName(nil) != "" {
+		t.Fatal("invalid ownership syntax accepted")
+	}
+}
+
+func TestDefaultIdentityUsesDeclaredSubject(t *testing.T) {
+	primary := `model User @withAuth(stores: [id, label], default: true) { id: String @id label: String }`
+	secondary := `model Admin @withAuth(stores: [id, adminFlag]) { id: Int @id adminFlag: Boolean }`
+	for _, source := range []string{primary + "\n" + secondary, secondary + "\n" + primary} {
+		result := analyze(t, source+"\napi current(): String @auth { return my.id }")
+		expectNoErrors(t, result)
+		identity := result.Types["Identity"]
+		if identity.Fields["id"].Type.Name != "String" {
+			t.Fatal("default identity ignored")
+		}
+		if _, ok := identity.Fields["adminFlag"]; ok {
+			t.Fatal("other subject field entered default identity")
+		}
+	}
+}
+
+func TestDefaultIdentityDeclarationErrors(t *testing.T) {
+	expectError(t, analyze(t, `model User @withAuth(stores: [id], default: true) { id: Int @id }
+model Admin @withAuth(stores: [id], default: true) { id: Int @id }`), "default")
+	for _, value := range []string{`"true"`, `1`, `null`} {
+		expectError(t, analyze(t, `model User @withAuth(stores: [id], default: `+value+`) { id: Int @id }`), "Boolean")
+	}
+	expectNoErrors(t, analyze(t, `model User @withAuth(stores: [id], default: false) { id: Int @id }
+api current(): Int @auth { return my.id }`))
+}
+
+func TestDefaultIdentityAcrossFiles(t *testing.T) {
+	for _, reverse := range []bool{false, true} {
+		var files []*ast.File
+		for _, source := range []string{
+			`model User @withAuth(stores: [id], default: true) { id: String @id }`,
+			`model Admin @withAuth(stores: [id, flag], default: false) { id: Int @id flag: Boolean }`,
+			`api current(): String @auth { return my.id }`,
+		} {
+			tokens, errors := lexer.New(source, "identity.luxo").Tokenize()
+			if len(errors) != 0 {
+				t.Fatal(errors)
+			}
+			file, parseErrors := parser.New(tokens).Parse("identity.luxo")
+			if len(parseErrors) != 0 {
+				t.Fatal(parseErrors)
+			}
+			files = append(files, file)
+		}
+		if reverse {
+			files[0], files[1] = files[1], files[0]
+		}
+		result := Analyze(files)
+		expectNoErrors(t, result)
+		identity := result.Types["Identity"]
+		if identity.Fields["id"].Type.Name != "String" || identity.Fields["flag"] != nil {
+			t.Fatal("cross-file default identity is not isolated")
+		}
+		load := identity.Fields["load"]
+		if load.Type != identity || !load.IsMethod || !strings.Contains(load.Doc, "Lazy load") {
+			t.Fatal("default identity lost builtin method metadata")
+		}
+	}
+}
+
+func TestWithAuthRejectsAmbiguousArguments(t *testing.T) {
+	for _, args := range []string{
+		`stores: [id], stores: [name]`,
+		`stores: [id], defualt: true`,
+		`stores: [id], unknown: false`,
+	} {
+		t.Run(args, func(t *testing.T) {
+			result := analyze(t, `model User @withAuth(`+args+`) { id: Int @id name: String }`)
+			expectError(t, result, "@withAuth")
+		})
+	}
+}
+
+func TestDefaultIdentityUsesInheritedFields(t *testing.T) {
+	result := analyze(t, `model Base { label: String }
+model Admin @withAuth(stores: [label]) { label: Int }
+model User : Base @withAuth(stores: [label], default: true) { name: String }
+api current(): String @auth { return my.label }`)
+	expectNoErrors(t, result)
+	if result.Types["Identity"].Fields["label"].Type.Name != "String" {
+		t.Fatal("default identity lost inherited field type")
+	}
+	expectError(t, analyze(t, `model User @withAuth(default: true) { name: String }`), "stores")
+}
+
+func TestSingleIdentityInheritedFieldsIgnoreDeclarationOrder(t *testing.T) {
+	parent := `model Base { label: String }`
+	for _, flag := range []string{"", ", default: false"} {
+		child := `model User : Base @withAuth(stores: [label]` + flag + `) { name: String }`
+		for _, source := range []string{parent + "\n" + child, child + "\n" + parent} {
+			result := analyze(t, source+"\napi current(): String @auth { return my.label }")
+			expectNoErrors(t, result)
+			if result.Types["Identity"].Fields["label"].Type.Name != "String" {
+				t.Fatal("inherited identity type changed")
+			}
+		}
+	}
+}
+
+func TestWithAuthStoresShapeMatchesGenerator(t *testing.T) {
+	for _, stores := range []string{"id", "null", `"id"`, `["id"]`, `[id, 1]`, `[id, id]`, `[[id]]`} {
+		t.Run(stores, func(t *testing.T) {
+			result := analyze(t, `model User @withAuth(stores: `+stores+`) { id: Int @id }`)
+			expectError(t, result, "stores")
+		})
+	}
+	for _, stores := range []string{"[]", "[id]", "[id, name]"} {
+		expectNoErrors(t, analyze(t, `model User @withAuth(stores: `+stores+`) { id: Int @id name: String }`))
+	}
+}
+
+func TestWithAuthStoresRejectsUnknownFieldsAndMethods(t *testing.T) {
+	for _, name := range []string{"missing", "createToken", "refreshToken", "verify"} {
+		t.Run(name, func(t *testing.T) {
+			expectError(t, analyze(t, `model User @withAuth(stores: [`+name+`]) { id: Int @id }`), "stores")
+		})
+	}
+}
+
+func TestAuthMethodsRejectInheritedFieldCollision(t *testing.T) {
+	for _, name := range []string{"createToken", "createRefreshToken", "refreshToken", "verify"} {
+		t.Run(name, func(t *testing.T) {
+			for _, reverse := range []bool{false, true} {
+				var files []*ast.File
+				for _, source := range []string{
+					"model Base { " + name + ": Int }",
+					"model User: Base @withAuth(stores: [id]) { id: Int @id }",
+				} {
+					tokens, errs := lexer.New(source, "inherited-auth.luxo").Tokenize()
+					if len(errs) != 0 {
+						t.Fatal(errs)
+					}
+					file, parseErrors := parser.New(tokens).Parse("inherited-auth.luxo")
+					if len(parseErrors) != 0 {
+						t.Fatal(parseErrors)
+					}
+					files = append(files, file)
+				}
+				if reverse {
+					files[0], files[1] = files[1], files[0]
+				}
+				result := Analyze(files)
+				expectError(t, result, "conflicts with @withAuth")
+				field := result.Types["User"].LookupField(name)
+				if field == nil || field.IsMethod || field.Type.Kind != TypeInt {
+					t.Fatal("inherited field replaced by auth method")
+				}
+			}
+		})
+	}
+}
+
+func TestAuthMethodsRequireReceiverDeclaration(t *testing.T) {
+	for _, method := range []string{"createToken()", "createRefreshToken()", `refreshToken("token")`} {
+		for _, explicit := range []bool{false, true} {
+			t.Run(method+"/explicit="+strconv.FormatBool(explicit), func(t *testing.T) {
+				directive := ""
+				if explicit {
+					directive = " @withAuth(stores: [id])"
+				}
+				result := analyze(t, `model Base @withAuth(stores: [id]) { id: Int @id }
+model Child: Base`+directive+` { label: String }
+fn issue(value: Child): String { return value.`+method+` }`)
+				if explicit {
+					expectNoErrors(t, result)
+				} else {
+					expectError(t, result, "requires @withAuth on model 'Child'")
+				}
+			})
+		}
+	}
+}
+
+func TestAuthSubjectBinding(t *testing.T) {
+	for _, source := range []string{
+		`model User @withAuth(stores: [id]) { id: Int @id }`,
+		`model User @withAuth(stores: [id], default: true) { id: Int @id }
+model Admin @withAuth(stores: [id]) { id: Int @id }`,
+	} {
+		result := analyze(t, source+` api current(): Int @auth { return my.id }`)
+		expectNoErrors(t, result)
+		for _, d := range result.Files[0].APIs[0].Directives {
+			if d.Name == "auth" && d.AuthSubject != "User" {
+				t.Fatalf("subject=%q", d.AuthSubject)
+			}
+		}
+	}
+	expectError(t, analyze(t, `model User @withAuth(stores: [id]) { id: Int @id }
+model Admin @withAuth(stores: [id]) { id: Int @id }
+api current(): Int @auth { return my.id }`), "ambiguous auth subject")
+}
+
+func TestExplicitAuthSubjectScopes(t *testing.T) {
+	models := `model User @withAuth(stores: [id, name], default: true) { id: Int @id name: String }
+model Admin @withAuth(stores: [id, enabled]) { id: String @id enabled: Boolean }
+`
+	result := analyze(t, models+`api user(): Int @auth { return my.id }
+api admin(): String @auth(subject: Admin, permission: { my.enabled }) { return my.id }
+api again(): Int @auth { return my.id }`)
+	expectNoErrors(t, result)
+	expectError(t, analyze(t, models+`api admin(): String @auth(subject: Admin) { return my.name }`), "name")
+	for _, subject := range []string{"Missing", "String", `"Admin"`, "null"} {
+		expectError(t, analyze(t, models+`api admin(): Int @auth(subject: `+subject+`) { return 1 }`), "subject")
+	}
+	expectError(t, analyze(t, models+`api admin(): Int @auth(subject: Admin, subject: User) { return 1 }`), "duplicate")
+	expectNoErrors(t, analyze(t, `model User @withAuth(stores: [id]) { id: Int @id }
+model Admin @withAuth(stores: [id]) { id: String @id }
+api admin(): String @auth(subject: Admin) { return my.id }`))
+}
+
+func TestVisibleSubjectBinding(t *testing.T) {
+	for _, kind := range []string{"model", "type"} {
+		source := `model User @withAuth(stores: [id, role], default: true) { id: Int @id role: String }
+model Admin @withAuth(stores: [id, role]) { id: Int @id role: String }
+` + kind + ` Record { secret: String? @visible(my.role == "member") }`
+		result := analyze(t, source)
+		expectNoErrors(t, result)
+		var fields []*ast.FieldDecl
+		if kind == "model" {
+			fields = result.Files[0].Models[2].Fields
+		} else {
+			fields = result.Files[0].Types[0].Fields
+		}
+		if fields[0].Directives[0].AuthSubject != "User" {
+			t.Fatal("visibility subject missing")
+		}
+	}
+	models := `model User @withAuth(stores: [id]) { id: Int @id }
+model Admin @withAuth(stores: [id]) { id: Int @id }
+`
+	expectError(t, analyze(t, models+`type Record { secret: String? @visible(my.id == 42) }`), "ambiguous auth subject")
+	expectNoErrors(t, analyze(t, models+`type Record { secret: String? @visible(true) }`))
+}
+
+func TestByDirectiveRequiresPositionalFieldNames(t *testing.T) {
+	for _, directive := range []string{
+		"@by", "@by()", `@by("id")`, "@by(1)", "@by(id, null)",
+		"@by(id, authorId + 1)", "@by(id, authorId, userId)", "@by(remote: id)",
+		"@by(id, authorId) @by(id, userId)",
+	} {
+		t.Run(directive, func(t *testing.T) {
+			result := analyze(t, `model User @noTime { id: Int @id }
+model Post @noTime { id: Int @id authorId: Int userId: Int author: User `+directive+` }`)
+			expectError(t, result, "@by")
+		})
+	}
+	for _, directive := range []string{"@by(id)", "@by(id, authorId)"} {
+		result := analyze(t, `model User @noTime { id: Int @id }
+model Post @noTime { id: Int @id authorId: Int author: User `+directive+` }`)
+		if len(result.Errors) != 0 {
+			t.Fatal(directive, result.Errors)
+		}
+	}
+}
+
+func TestByDirectiveRejectsEmptyIdentifier(t *testing.T) {
+	for _, value := range []ast.Expr{nil, (*ast.Ident)(nil), &ast.Ident{}} {
+		analyzer := New()
+		analyzer.checkByArguments(&ast.Directive{Name: "by", Args: []*ast.NamedArg{{Value: value}}})
+		if len(analyzer.errors) != 1 {
+			t.Fatal("invalid field identifier was accepted", analyzer.errors)
+		}
+	}
+}
+
+func TestByDirectiveRequiresModelRelation(t *testing.T) {
+	for _, fieldType := range []string{"Int", "String", "JSON", "[Int]", "State", "Detail", "Unknown"} {
+		t.Run(fieldType, func(t *testing.T) {
+			result := analyze(t, `enum State { OPEN CLOSED }
+type Detail { level: Int }
+model Post @noTime { id: Int @id value: `+fieldType+` @by(id) }`)
+			expectError(t, result, "@by requires a model relation")
+		})
+	}
+}
+
+func TestByDirectiveChecksRelationKeys(t *testing.T) {
+	for _, sample := range []struct{ remote, local, args string }{
+		{"id: Int @id", "ownerId: Int", "missing, ownerId"},
+		{"id: Int @id", "ownerId: Int", "id, missing"},
+		{"id: Int @id", "ownerId: String", "id, ownerId"},
+		{"id: Int @id", "ownerId: [Int]", "id, ownerId"},
+		{"id: Int @id codes: [Int]", "ownerId: Int", "codes, ownerId"},
+		{"id: Int @id code: Float", "ownerId: Float", "code, ownerId"},
+	} {
+		source := "model Target @noTime { " + sample.remote + " }\nmodel Source @noTime { id: Int @id " + sample.local + " target: Target @by(" + sample.args + ") }"
+		result := analyze(t, source)
+		expectError(t, result, "@by")
+	}
+	for _, source := range []string{
+		`model Target @noTime { key: String @id } model Source @noTime { id: Int @id ownerId: String? target: Target? @by(key, ownerId) }`,
+		`model Target @noTime { id: Int @id sourceId: UUID? } model Source @noTime { key: UUID @id targets: [Target] @by(sourceId) }`,
+		`model Base @noTime { key: String @id } model Source : Base { targets: [Target] @by(sourceKey) } model Target @noTime { id: Int @id sourceKey: String }`,
+	} {
+		expectNoErrors(t, analyze(t, source))
+	}
+}
+
+func TestRelationKeyValidationSkipsUnresolvedDeclarations(t *testing.T) {
+	analyzer := New()
+	analyzer.types["Owner"] = &ResolvedType{Name: "Owner", Kind: TypeModel}
+	for _, sample := range []struct{ owner, target string }{
+		{"Missing", "Int"}, {"Owner", "Missing"}, {"Owner", "Int"},
+	} {
+		analyzer.validateRelationKeyPair(&ast.ModelDecl{Name: sample.owner},
+			&ast.FieldDecl{Type: &ast.TypeRef{Name: sample.target}}, &ast.Directive{Name: "by"})
+	}
+	if len(analyzer.errors) != 0 {
+		t.Fatal("secondary key errors obscured invalid declarations", analyzer.errors)
+	}
+}
+
+func TestImplicitRelationKeysRejectBrokenMappings(t *testing.T) {
+	for _, sample := range []struct{ name, source string }{
+		{"missing_list_foreign_key", `model Source @noTime { id: Int @id targets: [Target] } model Target @noTime { id: Int @id }`},
+		{"missing_single_foreign_key", `model Source @noTime { id: Int @id target: Target? } model Target @noTime { id: Int @id }`},
+		{"belongs_to_type_mismatch", `model Source @noTime { id: Int @id targetId: String target: Target } model Target @noTime { id: Int @id }`},
+		{"list_key_type_mismatch", `model Source @noTime { id: Int @id targets: [Target] } model Target @noTime { id: Int @id sourceId: UUID }`},
+		{"list_as_local_key", `model Source @noTime { id: Int @id targetId: [Int] target: Target } model Target @noTime { id: Int @id }`},
+		{"list_as_remote_key", `model Source @noTime { id: Int @id target: Target? } model Target @noTime { id: Int @id sourceId: [Int] }`},
+		{"enum_as_remote_key", `enum State { OPEN } model Source @noTime { id: String @id targets: [Target] } model Target @noTime { id: Int @id sourceId: State }`},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			expectError(t, analyze(t, sample.source), "relation")
+		})
+	}
+}
+
+func TestImplicitRelationKeysPreserveValidMappings(t *testing.T) {
+	for _, source := range []string{
+		`model Source @noTime { id: Int @id targets: [Target] target: Target? } model Target @noTime { id: Int @id sourceId: Int? }`,
+		`model Source @noTime { id: Int @id targetKey: String? target: Target? } model Target @noTime { key: String @id }`,
+		`model Base @noTime { key: String @id } model Source : Base { targets: [Target] } model Target @noTime { id: Int @id sourceKey: String }`,
+		`model Base @noTime { key: UUID @id } model Target : Base { name: String } model Source @noTime { id: Int @id targetKey: UUID? target: Target? }`,
+	} {
+		expectNoErrors(t, analyze(t, source))
+	}
 }

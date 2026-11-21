@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/light-speak/luxo/internal/builtin"
+	"github.com/light-speak/luxo/internal/builtinerror"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
 )
@@ -20,21 +22,20 @@ func (a *Analyzer) injectSealedVariantFields(scope *Scope, sealedType *ResolvedT
 	// find the variant
 	for _, v := range sealedType.Variants {
 		if v.Name == variantName {
-			// create a narrowed type with the variant's fields
-			narrowed := &ResolvedType{
-				Kind:   TypeModel,
-				Name:   sealedType.Name,
-				Fields: make(map[string]*FieldInfo),
-			}
+			// Narrow the payload view without changing the whole sum's identity.
+			narrowed := *sealedType
+			narrowed.Nullable = false
+			narrowed.Fields = make(map[string]*FieldInfo, len(v.Fields))
 			for _, f := range v.Fields {
 				narrowed.Fields[f.Name] = f
 			}
 			child := scope.Child()
-			child.Define(&Symbol{
-				Name: ident.Name,
-				Kind: SymVariable,
-				Type: narrowed,
-			})
+			symbol := Symbol{Name: ident.Name, Kind: SymVariable, Type: &narrowed}
+			if original := scope.Lookup(ident.Name); original != nil {
+				symbol = *original
+			}
+			child.Define(&symbol)
+			child.Narrow(ident.Name, &narrowed)
 			return child
 		}
 	}
@@ -42,6 +43,57 @@ func (a *Analyzer) injectSealedVariantFields(scope *Scope, sealedType *ResolvedT
 }
 
 // ========== @withAuth Method Injection ==========
+
+func (a *Analyzer) checkAuthMethodArguments(call *ast.CallExpr, argTypes []*ResolvedType) {
+	member, ok := call.Func.(*ast.MemberExpr)
+	if !ok {
+		return
+	}
+	switch member.Field {
+	case "createToken", "createRefreshToken", "refreshToken", "verify":
+	default:
+		if !strings.HasPrefix(member.Field, "verify") {
+			return
+		}
+	}
+	model := a.types[member.Object.GetTypeTag()]
+	if model == nil || model.Kind != TypeModel || member.Object.IsListType() {
+		return
+	}
+	field := model.LookupField(member.Field)
+	if field == nil || !field.IsMethod {
+		return
+	}
+	if hasDirective(field.Directives, "hash") {
+		if model.Fields[member.Field] == nil {
+			a.addError(call.Pos, "method '%s' has no matching @hash field on model '%s'", member.Field, model.Name)
+			return
+		}
+		a.checkFunctionArguments(call, hashVerificationParameters(member.Field), argTypes)
+		return
+	}
+	// Model inheritance expands fields, not the parent authentication directive.
+	if model.Fields[member.Field] == nil {
+		a.addError(call.Pos, "method '%s' requires @withAuth on model '%s'", member.Field, model.Name)
+		return
+	}
+	var parameters []*ast.ParamDecl
+	switch member.Field {
+	case "createToken":
+		// Only marks omission as valid here; generated code reads the configured
+		// duration at runtime instead of compiling this marker as a default.
+		parameters = []*ast.ParamDecl{{Name: "expires", Type: &ast.TypeRef{Name: "Duration"}, Default: &ast.Literal{}}}
+	case "refreshToken":
+		parameters = []*ast.ParamDecl{{Name: "token", Type: &ast.TypeRef{Name: "String"}}}
+	case "verify":
+		if len(effectiveHashFields(model)) != 1 {
+			a.addError(call.Pos, "verify requires exactly one @hash field; use a field-specific verification method")
+			return
+		}
+		parameters = hashVerificationParameters(member.Field).Params
+	}
+	a.checkFunctionArguments(call, &ast.FnDecl{Name: member.Field, Params: parameters}, argTypes)
+}
 
 func hasModelDirective(directives []*ast.Directive, name string) bool {
 	for _, d := range directives {
@@ -96,30 +148,49 @@ func (a *Analyzer) injectStreamIt(api *ast.ApiDecl, scope *Scope, file *ast.File
 	})
 }
 
-func (a *Analyzer) injectWithAuthMethods(typ *ResolvedType, directives []*ast.Directive) {
-	typ.Fields["createToken"] = &FieldInfo{
+func (a *Analyzer) injectWithAuthMethods(typ *ResolvedType) {
+	a.injectAuthMethod(typ, &FieldInfo{
 		Name:     "createToken",
 		Type:     a.types["String"],
 		IsMethod: true,
-		Doc:      ".createToken(expires?: Duration): String — Generate JWT token / 生成 JWT 令牌",
-	}
-	typ.Fields["verify"] = &FieldInfo{
+		Doc:      ".createToken(expires?: Duration): String — Generate access token / 生成访问令牌",
+	})
+	a.injectAuthMethod(typ, &FieldInfo{
+		Name:     "createRefreshToken",
+		Type:     a.types["String"],
+		IsMethod: true,
+		Doc:      ".createRefreshToken(): String — Generate refresh token when enabled / 启用刷新时签发刷新令牌",
+	})
+	a.injectAuthMethod(typ, &FieldInfo{
 		Name:     "verify",
 		Type:     a.types["Boolean"],
 		IsMethod: true,
-		Doc:      ".verify(plain: String): Boolean — Verify password against @hash field / 校验 @hash 字段的密码",
-	}
+		Doc:      ".verify(plain: String): Boolean — Verify the single @hash field / 仅校验唯一的 @hash 字段",
+	})
 	// refreshToken always injected — whether refresh is enabled is controlled
 	// by JWT_REFRESH env var at runtime, not at compile time.
-	typ.Fields["refreshToken"] = &FieldInfo{
+	a.injectAuthMethod(typ, &FieldInfo{
 		Name:     "refreshToken",
 		Type:     a.types["String"],
 		IsMethod: true,
-		Doc:      ".refreshToken(token: String): String — Refresh JWT token / 刷新 JWT 令牌",
-	}
+		Doc:      ".refreshToken(token: String): String — Exchange refresh for access token / 使用刷新令牌换取访问令牌",
+	})
 
-	// Inject stores fields into Identity type so my.<field> works for all stored fields
-	identityType := a.types["Identity"]
+}
+
+func (a *Analyzer) injectAuthMethod(typ *ResolvedType, method *FieldInfo) {
+	if existing := typ.LookupField(method.Name); existing != nil && !existing.IsMethod {
+		a.addError(existing.Pos, "field '%s' conflicts with @withAuth injected method", method.Name)
+		return
+	}
+	typ.Fields[method.Name] = method
+}
+
+func (a *Analyzer) injectStoredIdentityFields(typ *ResolvedType, directives []*ast.Directive) {
+	injectIdentityStores(a.types["Identity"], typ, directives)
+}
+
+func injectIdentityStores(identityType, typ *ResolvedType, directives []*ast.Directive) {
 	for _, d := range directives {
 		if d.Name != "withAuth" {
 			continue
@@ -137,13 +208,13 @@ func (a *Analyzer) injectWithAuthMethods(typ *ResolvedType, directives []*ast.Di
 				if !ok {
 					continue
 				}
-				// skip fields already defined with type (id, load)
-				// but override nil-typed defaults (role) with actual type
+				// Preserve declared fields and methods; resolve untyped defaults
+				// (id and role) from the stored field's actual type.
 				if existing, exists := identityType.Fields[ident.Name]; exists && existing.Type != nil {
 					continue
 				}
 				// resolve type from the model's fields, skip methods
-				fieldType := typ.Fields[ident.Name]
+				fieldType := typ.LookupField(ident.Name)
 				if fieldType != nil && !fieldType.IsMethod {
 					identityType.Fields[ident.Name] = &FieldInfo{
 						Name: ident.Name,
@@ -159,7 +230,7 @@ func (a *Analyzer) injectWithAuthMethods(typ *ResolvedType, directives []*ast.Di
 
 // checkUnusedVariables warns about variables declared but never used.
 func (a *Analyzer) checkUnusedVariables(scope *Scope) {
-	for _, sym := range scope.AllSymbols() {
+	for _, sym := range scope.symbols {
 		if sym.Kind != SymVariable {
 			continue
 		}
@@ -195,29 +266,20 @@ func (a *Analyzer) checkEventCycles() {
 // and returns an adjacency map: event → list of emitted events.
 func (a *Analyzer) buildEventGraph() map[string][]string {
 	graph := map[string][]string{}
+	var bodies map[callableKey]*ast.Block
 	for _, file := range a.files {
 		for _, on := range file.Listeners {
 			if on.Body == nil {
 				continue
 			}
-			emitted := collectEmits(on.Body)
+			emitted, nextBodies := collectReachableEmits(on.Body, a.fileModule(file.Name), bodies, a)
+			bodies = nextBodies
 			if len(emitted) > 0 {
 				graph[on.EventName] = append(graph[on.EventName], emitted...)
 			}
 		}
 	}
 	return graph
-}
-
-// collectEmits recursively collects all event names from EmitStmt in a block.
-func collectEmits(block *ast.Block) []string {
-	var result []string
-	for _, stmt := range block.Stmts {
-		if emit, ok := stmt.(*ast.EmitStmt); ok {
-			result = append(result, emit.EventName)
-		}
-	}
-	return result
 }
 
 // detectCycles runs DFS on the event graph to find and report cycles.
@@ -277,7 +339,14 @@ func (a *Analyzer) buildCyclePath(cycleStart, cycleEnd string, parent map[string
 // ========== Directive Validation ==========
 
 func (a *Analyzer) checkDirectives(directives []*ast.Directive, ctx DirectiveContext) {
+	seenAuth := false
 	for _, d := range directives {
+		if d.Name == "auth" {
+			if seenAuth {
+				a.addError(d.Pos, "duplicate @auth directive / @auth 不能重复声明")
+			}
+			seenAuth = true
+		}
 		a.validateDirective(d, ctx, "")
 	}
 }
@@ -287,14 +356,53 @@ func (a *Analyzer) checkFieldDirectives(f *ast.FieldDecl) {
 		return
 	}
 	typeName := f.Type.Name
+	seenVisible := false
+	seenBy := false
 	for _, d := range f.Directives {
+		if d.Name == "by" {
+			target := a.types[typeName]
+			if target == nil || target.Kind != TypeModel {
+				a.addError(d.Pos, "@by requires a model relation / @by 只能用于模型关系字段")
+			}
+			if seenBy {
+				a.addError(d.Pos, "duplicate @by directive / @by 不能重复声明")
+			}
+			seenBy = true
+		}
+		if d.Name == "visible" {
+			if seenVisible {
+				a.addError(d.Pos, "duplicate @visible directive / @visible 不能重复声明；请在一个条件表达式中明确组合规则")
+			} else if !f.Type.Nullable {
+				// @visible requires nullable field — non-nullable fields can't be conditionally hidden
+				a.addError(f.Pos, "@visible requires nullable field (use %s? instead of %s) / @visible 字段必须可空", f.Type.Name, f.Type.Name)
+			}
+			seenVisible = true
+		}
 		a.validateDirective(d, OnField, typeName)
+		if d.Name == "filterable" && !a.supportsFilterableType(f.Type) {
+			a.addError(d.Pos, "@filterable requires a supported scalar or enum (Int, Float, String, Boolean, DateTime, UUID, Decimal); lists, JSON, Bytes, Duration and structured types are not implemented / @filterable 仅支持已实现的标量和枚举；列表、JSON、Bytes、Duration及结构类型尚未实现")
+		}
 	}
 	// computed field directives (@count, @sum, @avg, etc.)
 	if f.Computed != nil {
 		for _, d := range f.Computed.Directives {
 			a.validateDirective(d, OnComputed, typeName)
 		}
+	}
+}
+
+// Keep unsupported query declarations out of generated public schemas. Nullable
+// scalar fields retain ordinary comparison semantics; no null operator is added.
+func (a *Analyzer) supportsFilterableType(ref *ast.TypeRef) bool {
+	if ref.IsList {
+		return false
+	}
+	switch ref.Name {
+	case "Int", "Float", "String", "Boolean", "DateTime", "UUID", "Decimal":
+		return true
+	default:
+		typ := a.types[ref.Name]
+		return typ != nil && typ.Kind == TypeEnum
 	}
 }
 
@@ -349,14 +457,14 @@ func (a *Analyzer) addFieldError(pos token.Position, objType *ResolvedType, fiel
 }
 
 func (a *Analyzer) findClosest(name string) string {
-	var candidates []string
+	match := closestSpelling{target: name, distance: 3}
 	for typeName := range a.types {
-		candidates = append(candidates, typeName)
+		match.consider(typeName)
 	}
-	for _, sym := range a.scope.AllSymbols() {
-		candidates = append(candidates, sym.Name)
+	for _, sym := range a.scope.symbols {
+		match.consider(sym.Name)
 	}
-	return findClosestString(name, candidates)
+	return match.name
 }
 
 func fieldNames(t *ResolvedType) []string {
@@ -368,16 +476,29 @@ func fieldNames(t *ResolvedType) []string {
 }
 
 func findClosestString(target string, candidates []string) string {
-	best := ""
-	bestDist := 3 // max edit distance to suggest
-	for _, c := range candidates {
-		d := editDistance(target, c)
-		if d < bestDist {
-			bestDist = d
-			best = c
-		}
+	match := closestSpelling{target: target, distance: 3}
+	for _, candidate := range candidates {
+		match.consider(candidate)
 	}
-	return best
+	return match.name
+}
+
+type closestSpelling struct {
+	target   string
+	name     string
+	distance int
+}
+
+func (match *closestSpelling) consider(candidate string) {
+	// Length difference is a lower bound; ties cannot replace the first match.
+	lengthDelta := len(candidate) - len(match.target)
+	if lengthDelta >= match.distance || lengthDelta <= -match.distance {
+		return
+	}
+	if distance := spellingDistanceBelow(match.target, candidate, match.distance); distance < match.distance {
+		match.distance = distance
+		match.name = candidate
+	}
 }
 
 // hasSearchDirective checks if the expression's underlying field has @search directive.
@@ -386,7 +507,9 @@ func (a *Analyzer) hasSearchDirective(expr ast.Expr) bool {
 	if !ok {
 		return false
 	}
-	objType := a.checkExpr(member.Object, a.scope)
+	// Member resolution already checked the receiver in its lexical scope.
+	// Rechecking it at the root would lose collection and function parameters.
+	objType := a.resolvedExprType(member.Object)
 	if objType == nil {
 		return false
 	}
@@ -403,11 +526,7 @@ func (a *Analyzer) hasSearchDirective(expr ast.Expr) bool {
 }
 
 func isDebugMethod(name string) bool {
-	switch name {
-	case "d", "i", "w", "e":
-		return true
-	}
-	return false
+	return builtin.DebugMethod(name) != ""
 }
 
 // isQueryMethod returns true if the name is a chain query method on models.
@@ -426,17 +545,7 @@ func isQueryMethod(name string) bool {
 }
 
 func isCollectionMethod(name string) bool {
-	switch name {
-	case "map", "filter", "sumOf", "count", "any", "firstOrNull",
-		"sortBy", "groupBy", "forEach", "flatMap", "joinToString",
-		"take", "takeLast", "size", "isEmpty", "contains",
-		"first", "last", "lastOrNull", "reversed", "shuffled",
-		"distinct", "distinctBy", "drop", "dropLast",
-		"indexOf", "zip", "chunked", "windowed", "all", "none",
-		"minOf", "maxOf", "sortByDesc", "isNotEmpty", "let":
-		return true
-	}
-	return false
+	return builtin.CollectionMethod(name) != builtin.NotCollectionMethod
 }
 
 func (a *Analyzer) resolveCollectionMethod(method string, listType *ResolvedType) *ResolvedType {
@@ -445,59 +554,40 @@ func (a *Analyzer) resolveCollectionMethod(method string, listType *ResolvedType
 	stringType := a.types["String"]
 
 	switch method {
-	case "size", "count":
+	case "size":
 		return intType
-	case "isEmpty", "any", "contains":
+	case "isEmpty", "any":
 		return boolType
 	case "joinToString":
 		return stringType
-	case "filter", "sortBy", "take", "takeLast":
+	case "filter", "sortBy":
 		return listType // returns same list type
-	case "map", "flatMap", "groupBy":
-		return nil // type depends on lambda, can't infer here
-	case "forEach":
-		return nil // void
-	case "firstOrNull":
-		// returns single element, nullable
-		return &ResolvedType{
-			Kind:     listType.Kind,
-			Name:     listType.Name,
-			Nullable: true,
-			Fields:   listType.Fields,
-			Parents:  listType.Parents,
-		}
-	case "sumOf":
-		return a.types["Float"]
 	default:
-		// distinct, reversed, shuffled, drop, dropLast, zip, chunked, windowed, indexOf, etc.
+		// Lambda-dependent results are resolved by checkCollectionCall.
 		return nil
 	}
 }
 
 // resolveQueryMethod resolves the return type for a chain query method on a model.
 // modelType is the underlying model type (not the query builder).
-func (a *Analyzer) resolveQueryMethod(method string, modelType *ResolvedType) *ResolvedType {
-	qb := &ResolvedType{
-		Kind:      TypeQueryBuilder,
-		Name:      modelType.Name + "QueryBuilder",
-		Fields:    modelType.Fields,
-		ModelType: modelType,
+func (a *Analyzer) resolveQueryMethod(method string, receiver *ResolvedType, member *ast.MemberExpr, scope *Scope) *ResolvedType {
+	modelType := receiver
+	if receiver.Kind == TypeQueryBuilder {
+		modelType = receiver.ModelType
 	}
-
 	switch method {
-	case "where", "groupBy", "orderBy", "limit", "offset":
-		// chaining methods — return a query builder
-		return qb
-	case "sum", "avg":
-		return a.types["Float"]
+	case "where", "groupBy", "orderBy", "limit", "offset", "select":
+		return &ResolvedType{
+			Kind:      TypeQueryBuilder,
+			Name:      modelType.Name + "QueryBuilder",
+			Fields:    modelType.Fields,
+			ModelType: modelType,
+		}
+	case "sum", "avg", "min", "max":
+		// The call's selected field determines its result type.
+		return nil
 	case "count":
 		return a.types["Int"]
-	case "min", "max":
-		// could be any numeric type; Float is a safe approximation
-		return a.types["Float"]
-	case "select":
-		// select { ... } — return type depends on the lambda; can't infer here
-		return nil
 	case "first":
 		return modelType.AsNullable()
 	case "all":
@@ -510,7 +600,19 @@ func (a *Analyzer) resolveQueryMethod(method string, modelType *ResolvedType) *R
 		return modelType.AsNullable()
 	case "findMany", "createMany":
 		return modelType.AsList()
-	case "create", "update", "upsert", "delete", "save":
+	case "save":
+		if member != nil && a.rejectSaveQueryReceiver(member, receiver, scope) {
+			return nil
+		}
+		if member != nil && a.callTarget != member {
+			if receiver.LookupField(member.Field) != nil {
+				return a.resolveFieldAccess(member, receiver)
+			}
+			a.addError(member.Pos, "save requires an invocation; callable values are not supported / save 必须显式调用，不能作为函数值使用")
+			return nil
+		}
+		return modelType
+	case "create", "update", "upsert", "delete":
 		return modelType
 	case "deleteMany", "updateMany":
 		return a.types["Int"]
@@ -523,32 +625,30 @@ func (a *Analyzer) resolveQueryMethod(method string, modelType *ResolvedType) *R
 	}
 }
 
-func editDistance(a, b string) int {
-	m, n := len(a), len(b)
-	if m == 0 {
-		return n
+// Spelling suggestions consider fewer than three edits. Search only paths
+// that can improve the current distance, preserving byte-wise comparisons.
+func spellingDistanceBelow(left, right string, limit int) int {
+	delta := len(left) - len(right)
+	if delta >= limit || -delta >= limit {
+		return limit
 	}
-	if n == 0 {
-		return m
+	for len(left) != 0 && len(right) != 0 && left[0] == right[0] {
+		left, right = left[1:], right[1:]
 	}
-	// Two-row DP: O(n) space instead of O(m*n).
-	prev := make([]int, n+1)
-	curr := make([]int, n+1)
-	for j := 0; j <= n; j++ {
-		prev[j] = j
+	if len(left) == 0 || len(right) == 0 {
+		return len(left) + len(right)
 	}
-	for i := 1; i <= m; i++ {
-		curr[0] = i
-		for j := 1; j <= n; j++ {
-			cost := 0
-			if a[i-1] != b[j-1] {
-				cost = 1
-			}
-			curr[j] = min(curr[j-1]+1, min(prev[j]+1, prev[j-1]+cost))
-		}
-		prev, curr = curr, prev
+	if limit == 1 {
+		return limit
 	}
-	return prev[n]
+	best := spellingDistanceBelow(left[1:], right[1:], limit-1)
+	if best > 0 {
+		best = spellingDistanceBelow(left[1:], right, best)
+	}
+	if best > 0 {
+		best = spellingDistanceBelow(left, right[1:], best)
+	}
+	return 1 + best
 }
 
 func isBuiltinOp(name string) bool {
@@ -583,5 +683,118 @@ func kindToSymbol(kind TypeKind) SymbolKind {
 		return SymSealed
 	default:
 		return SymType
+	}
+}
+
+func isBuiltinErrorName(name string) bool {
+	return builtinerror.GoName(name) != ""
+}
+
+// Resolve identity stores only after every model's fields are available.
+// An explicit default excludes other subjects before body analysis.
+func (a *Analyzer) selectDefaultIdentity(files []*ast.File) {
+	var selected *ast.ModelDecl
+	var sole *ast.ModelDecl
+	count := 0
+	for _, file := range files {
+		for _, model := range file.Models {
+			if hasModelDirective(model.Directives, "withAuth") {
+				sole = model
+				count++
+			}
+			// Parent fields must be resolved before injected methods can check conflicts.
+			if typ := a.types[model.Name]; typ != nil {
+				a.injectHashMethods(typ)
+				if hasModelDirective(model.Directives, "withAuth") {
+					a.injectWithAuthMethods(typ)
+				}
+			}
+			if !a.isDefaultIdentity(model) {
+				continue
+			}
+			if selected != nil {
+				a.addError(model.Pos, "multiple default auth subjects: '%s' and '%s' / 存在多个默认认证主体", selected.Name, model.Name)
+				continue
+			}
+			selected = model
+		}
+	}
+	if selected == nil && count == 1 {
+		selected = sole
+	}
+	a.prepareAuthIdentities(files)
+	a.bindDefaultAuthSubject(files, selected, count > 1)
+	if selected != nil {
+		a.injectStoredIdentityFields(a.types[selected.Name], selected.Directives)
+		return
+	}
+}
+
+func (a *Analyzer) isDefaultIdentity(model *ast.ModelDecl) bool {
+	selected := false
+	for _, directive := range model.Directives {
+		if directive.Name != "withAuth" {
+			continue
+		}
+		a.checkWithAuthArgumentNames(directive, a.types[model.Name])
+		for _, arg := range directive.Args {
+			if arg.Name != "default" {
+				continue
+			}
+			literal, ok := arg.Value.(*ast.Literal)
+			if !ok || (literal.Kind != token.True && literal.Kind != token.False) {
+				a.addError(directive.Pos, "@withAuth default requires a Boolean literal / @withAuth default 必须是 Boolean 字面量")
+				continue
+			}
+			selected = literal.Kind == token.True
+		}
+	}
+	return selected
+}
+
+func (a *Analyzer) checkWithAuthArgumentNames(directive *ast.Directive, model *ResolvedType) {
+	var seen uint8
+	for _, arg := range directive.Args {
+		var bit uint8
+		switch arg.Name {
+		case "stores":
+			bit = 1
+			a.checkAuthStoreList(directive, arg.Value, model)
+		case "default":
+			bit = 2
+		default:
+			a.addError(directive.Pos, "unknown @withAuth argument '%s' / 未知 @withAuth 参数 '%s'", arg.Name, arg.Name)
+			continue
+		}
+		if seen&bit != 0 {
+			a.addError(directive.Pos, "duplicate @withAuth argument '%s' / @withAuth 参数 '%s' 不能重复声明", arg.Name, arg.Name)
+		}
+		seen |= bit
+	}
+}
+
+func (a *Analyzer) checkAuthStoreList(directive *ast.Directive, value ast.Expr, model *ResolvedType) {
+	list, ok := value.(*ast.ListExpr)
+	if !ok {
+		a.addError(directive.Pos, "@withAuth stores requires an explicit field list / @withAuth stores 必须是显式字段列表")
+		return
+	}
+	seen := make(map[string]bool, len(list.Items))
+	for _, item := range list.Items {
+		field, ok := item.(*ast.Ident)
+		if !ok {
+			a.addError(directive.Pos, "@withAuth stores requires field names / @withAuth stores 只允许字段名")
+			continue
+		}
+		if seen[field.Name] {
+			a.addError(directive.Pos, "@withAuth stores repeats field '%s' / @withAuth stores 重复字段 '%s'", field.Name, field.Name)
+		}
+		seen[field.Name] = true
+		if model != nil {
+			stored := model.LookupField(field.Name)
+			if stored == nil || stored.Type == nil || stored.IsMethod {
+				a.addError(directive.Pos, "@withAuth stores references unknown or non-data field '%s' / @withAuth stores 引用了不存在或非数据字段 '%s'", field.Name, field.Name)
+			}
+		}
 	}
 }

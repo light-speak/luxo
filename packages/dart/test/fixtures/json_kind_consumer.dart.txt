@@ -1,0 +1,168 @@
+part of 'int64_consumer_test.dart';
+
+void verifyJSONKinds() {
+  test('generated DateTime responses enforce precision and UTC bounds', () async {
+    final transport = _ResponseTransport();
+    final client = LuxoClient(transport);
+    for (final text in [
+      '2000-01-01T00:00:00.1234567890Z', '2001-02-29T00:00:00Z',
+      '0000-01-01T00:00:00+00:01', '9999-12-31T23:59:59-00:01',
+      '2000-01-01T00:00:00',
+    ]) {
+      transport.response = text;
+      await expectLater(client.scalarDateTime(), throwsFormatException);
+      transport.response = [text];
+      await expectLater(client.arrayDateTime(), throwsFormatException);
+      expect(() => ScalarArrays.fromJson({'dates': [text]}), throwsFormatException);
+      expect(
+        () => ScalarArraysInput.fromJson(_scalarArrayJSON()..['dates'] = [text]),
+        throwsFormatException,
+      );
+    }
+  });
+  test('generated scalar and model strings reject incomplete Unicode', () async {
+    final transport = _ResponseTransport();
+    final client = LuxoClient(transport);
+    for (final text in ['\ud800', '\udfff', '\ud800x', '\udc00\ud800']) {
+      transport.response = text;
+      await expectLater(client.scalarString(), throwsFormatException);
+      transport.response = ['valid', text];
+      await expectLater(client.arrayString(), throwsFormatException);
+      expect(() => ScalarArrays.fromJson({'strings': [text]}), throwsFormatException);
+      expect(() => OptionalArrays.fromJson({'texts': [text]}), throwsFormatException);
+      expect(() => Child.fromJson({'name': text}), throwsFormatException);
+      expect(() => ChildInput.fromJson({'name': text}), throwsFormatException);
+      expect(() => Payload.fromJson({'child': {'name': text}}), throwsFormatException);
+    }
+  });
+  test(
+    'JSON scalar lists reject wrong kinds before return or callback',
+    _verifyScalarLists,
+  );
+  test(
+    'JSON model and input arrays validate nested selected fields',
+    _verifyModelLists,
+  );
+  test(
+    'nullable JSON arrays preserve selection and validate elements',
+    _verifyNullableLists,
+  );
+  test(
+    'validated JSON lists stay growable and independent of source lists',
+    _verifyMaterializedLists,
+  );
+}
+
+void _verifyMaterializedLists() {
+  final texts = <Object?>['发布', 'false', '9007199254740993'];
+  final flags = <Object?>[false, true];
+  final value = OptionalArrays.fromJson({'texts': texts, 'flags': flags});
+  texts[0] = null;
+  flags[0] = 'false';
+  value.texts.value!.add('new');
+  value.flags.value!.add(false);
+  expect(value.texts.value, ['发布', 'false', '9007199254740993', 'new']);
+  expect(value.flags.value, [false, true, false]);
+  final empty = OptionalArrays.fromJson({'texts': [], 'flags': []});
+  empty.texts.value!.add('first');
+  empty.flags.value!.add(true);
+  expect(empty.texts.value, ['first']);
+  expect(empty.flags.value, [true]);
+}
+
+Future<void> _verifyScalarLists() async {
+  final transport = _ResponseTransport();
+  final client = LuxoClient(transport);
+  final calls = [
+    client.arrayString,
+    client.arrayBoolean,
+    client.arrayDateTime,
+    client.arrayUUID,
+    client.arrayDecimal,
+    client.arrayEnum,
+    client.namedEnums,
+  ];
+  final subscribers = _streamSubscribers(client, array: true);
+  final indexes = [3, 4, 5, 6, 8, 9, 11];
+  for (var kind = 0; kind < calls.length; kind++) {
+    var delivered = 0;
+    final cancel = await subscribers[indexes[kind]]((_) {
+      delivered++;
+    });
+    for (final invalid in _wrongJSONKinds(boolean: kind == 1)) {
+      // Do not read the result: a lazy cast must not defer failure to the caller.
+      transport.response = [invalid];
+      await _expectEagerFailure(calls[kind]);
+      expect(() => transport.emit([invalid]), throwsA(isA<TypeError>()));
+      expect(delivered, 0);
+    }
+    cancel();
+  }
+}
+
+void _verifyModelLists() {
+  final fields = ['strings', 'booleans', 'dates', 'uuids', 'decimals', 'enums'];
+  for (final field in fields) {
+    for (final invalid in _wrongJSONKinds(boolean: field == 'booleans')) {
+      final partial = <String, dynamic>{
+        field: [invalid],
+      };
+      expect(() => ScalarArrays.fromJson(partial), throwsA(isA<TypeError>()));
+      expect(
+        () => ScalarArraysInput.fromJson(_scalarArrayJSON()..addAll(partial)),
+        throwsA(isA<TypeError>()),
+      );
+      expect(
+        () => OptionalArrays.fromJson({'child': partial}),
+        throwsA(isA<TypeError>()),
+      );
+    }
+  }
+}
+
+void _verifyNullableLists() {
+  final nullable = OptionalArrays.fromJson({
+    'texts': null,
+    'flags': null,
+    'child': null,
+  });
+  expect(nullable.texts.value, isNull);
+  expect(nullable.flags.value, isNull);
+  expect(nullable.child.value, isNull);
+  expect(nullable.nullableIntegers.isSelected, isFalse);
+  for (final field in ['texts', 'flags']) {
+    for (final invalid in _wrongJSONKinds(boolean: field == 'flags')) {
+      expect(
+        () => OptionalArrays.fromJson({
+          field: [invalid],
+        }),
+        throwsA(isA<TypeError>()),
+      );
+    }
+  }
+}
+
+List<Object?> _wrongJSONKinds({required bool boolean}) => [
+  0,
+  1,
+  BigInt.parse('9007199254740993'),
+  sdk.LuxoJSONNumber.parse('1.0'),
+  null,
+  [],
+  {},
+  if (boolean) ...['true', 'false', ''] else ...[true, false],
+];
+
+Future<void> _expectEagerFailure(Future<Object> Function() call) async {
+  var rejected = false;
+  try {
+    await call();
+  } on TypeError {
+    rejected = true;
+  }
+  expect(
+    rejected,
+    isTrue,
+    reason: 'The decoder must reject before the caller reads any element',
+  );
+}

@@ -6,6 +6,7 @@ import (
 
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lexer"
+	"github.com/light-speak/luxo/pkg/token"
 )
 
 // ========== Deep Nesting Tests ==========
@@ -532,20 +533,108 @@ api test(): Int {
 // ========== parseCallArgs — named arg with no value before RParen ==========
 
 func TestParseCallArgsIncompleteNamedArg(t *testing.T) {
-	// This is a parse-error-tolerant case: User.find(where: )
-	l := lexer.New(`model User { name: String }
-api test(): Int {
-  User.find(where: )
-  0
-}`, "test.luxo")
-	tokens, _ := l.Tokenize()
-	p := New(tokens)
-	file, errs := p.Parse("test.luxo")
-	// should not crash even with incomplete named arg
-	if file == nil {
-		t.Fatal("expected non-nil file")
+	for _, sample := range []struct {
+		name, call, argument string
+		retained             []string
+	}{
+		{"where", "User.find(where: )", "where", nil},
+		{"method-find", "Item.findMany(order: )", "order", nil},
+		{"function-find", "findMany(Item, order: )", "order", []string{""}},
+		{"function", "helper(value: )", "value", nil},
+		{"method", "value.run(input: )", "input", nil},
+		{"previous-args", "helper(1, mode: true, count: )", "count", []string{"", "mode"}},
+		{"multiline", "helper(\n    payload:\n  )", "payload", nil},
+		{"nested", "outer(inner(value: ), keep: 7)", "value", []string{"", "keep"}},
+		{"trailing-lambda", "User.find(where: ) { it.id }", "where", []string{""}},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			source := "fn first(): Int {\n  " + sample.call + "\n  val recovered = 7\n  recovered\n}\nfn next(): Int { 9 }"
+			file := parseMissingNamedCallValue(t, source, sample.argument)
+			assertMissingNamedCallRecovery(t, file, sample.retained)
+		})
 	}
-	_ = errs // errors expected
+}
+
+func parseMissingNamedCallValue(t *testing.T, source, argument string) *ast.File {
+	t.Helper()
+	tokens, lexErrors := lexer.New(source, "named-args.luxo").Tokenize()
+	if len(lexErrors) != 0 {
+		t.Fatal(lexErrors)
+	}
+	file, errors := New(tokens).Parse("named-args.luxo")
+	if len(errors) != 1 {
+		t.Fatalf("expected one missing-value diagnostic, got %v", errors)
+	}
+	want := "expected expression for named argument \"" + argument + "\""
+	if errors[0].Message != want {
+		t.Fatalf("diagnostic = %q, want %q", errors[0].Message, want)
+	}
+	for i, tok := range tokens {
+		if tok.Type == token.Colon && tokens[i+1].Type == token.RParen {
+			if errors[0].Pos != tokens[i+1].Pos {
+				t.Fatalf("diagnostic position = %+v, want %+v", errors[0].Pos, tokens[i+1].Pos)
+			}
+			return file
+		}
+	}
+	t.Fatal("missing-value token boundary not found")
+	return nil
+}
+
+func assertMissingNamedCallRecovery(t *testing.T, file *ast.File, retained []string) {
+	t.Helper()
+	if len(file.Functions) != 2 || file.Functions[1].Name != "next" {
+		t.Fatalf("subsequent declaration was lost: %+v", file.Functions)
+	}
+	stmts := file.Functions[0].Body.Stmts
+	if len(stmts) != 3 {
+		t.Fatalf("expected call and two subsequent statements, got %v", stmts)
+	}
+	call := stmts[0].(*ast.ExprStmt).Expr.(*ast.CallExpr)
+	if len(call.Args) != len(retained) {
+		t.Fatalf("retained args = %v, want names %v", call.Args, retained)
+	}
+	for i, argument := range call.Args {
+		if argument.Name != retained[i] || argument.Value == nil {
+			t.Fatalf("retained arg %d = %+v, want name %q and a value", i, argument, retained[i])
+		}
+	}
+	value := stmts[1].(*ast.ValStmt)
+	if value.Name != "recovered" || value.Value.(*ast.Literal).Value != "7" {
+		t.Fatalf("subsequent assignment was lost: %+v", value)
+	}
+	if final := stmts[2].(*ast.ExprStmt).Expr.(*ast.Ident); final.Name != "recovered" {
+		t.Fatalf("subsequent expression was lost: %+v", final)
+	}
+}
+
+func TestParseCallArgsNamedValueControls(t *testing.T) {
+	for _, sample := range []struct {
+		name, call string
+		arguments  []string
+	}{
+		{"empty", "helper()", nil},
+		{"positional", "helper(1)", []string{""}},
+		{"explicit-null", "helper(value: null)", []string{"value"}},
+		{"named", "helper(value: 1)", []string{"value"}},
+		{"trailing-comma", "helper(value: 1,)", []string{"value"}},
+		{"mixed", `helper(1, label: "x", active: true)`, []string{"", "label", "active"}},
+		{"nested", "helper(value: other(1))", []string{"value"}},
+		{"trailing-lambda", "helper(value: 1) { it.id }", []string{"value", ""}},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			file := parse(t, "fn run(): Int { "+sample.call+" }")
+			call := file.Functions[0].Body.Stmts[0].(*ast.ExprStmt).Expr.(*ast.CallExpr)
+			if len(call.Args) != len(sample.arguments) {
+				t.Fatalf("arguments = %v, want names %v", call.Args, sample.arguments)
+			}
+			for i, argument := range call.Args {
+				if argument.Name != sample.arguments[i] || argument.Value == nil {
+					t.Fatalf("arg %d = %+v, want name %q and a value", i, argument, sample.arguments[i])
+				}
+			}
+		})
+	}
 }
 
 // ========== parseForCondition — iterating over collection ==========

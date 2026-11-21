@@ -1,9 +1,9 @@
 /** Paginated list response */
 export interface Page<T> {
   items: T[]
-  total: number
-  page: number
-  pageSize: number
+  total: bigint
+  page: bigint
+  pageSize: bigint
 }
 
 export type FilterOperator = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'contains' | 'startswith' | 'endswith' | 'match'
@@ -11,7 +11,7 @@ export type FilterOperator = 'eq' | 'ne' | 'gt' | 'gte' | 'lt' | 'lte' | 'contai
 export interface Filter {
   field: string
   op: FilterOperator
-  value: string | number | boolean
+  value: string | number | bigint | boolean
 }
 
 export interface Sorter {
@@ -34,12 +34,19 @@ export interface LuxoSchema {
   apis: Record<string, LuxoAPI>
   enums?: Record<string, LuxoEnum>
   types?: Record<string, LuxoTypeDecl>
+  sealeds?: Record<string, LuxoSealed>
 }
 
 export interface LuxoModel {
   name: string
   usage?: TypeUsage
   fields: LuxoField[]
+  computedSources?: Record<string, LuxoComputedSource>
+}
+
+export interface LuxoComputedSource {
+  model: string
+  module?: string
 }
 
 export interface LuxoField {
@@ -64,16 +71,36 @@ export interface LuxoTypeDecl {
   fields: LuxoField[]
 }
 
+export interface LuxoSealed {
+  name: string
+  module?: string
+  usage?: TypeUsage
+  description?: string
+  variants: LuxoSealedVariant[]
+}
+
+export interface LuxoSealedVariant {
+  id: number
+  name: string
+  fields: LuxoParam[]
+}
+
 export interface LuxoAPI {
   id: number
   name: string
   module: string
+  internal?: boolean
   returnType?: string
   returnList?: boolean
+  returnNullable?: boolean
   paginated?: boolean
   defaultPageSize?: number
   stream?: boolean
   params?: LuxoParam[]
+  query?: {
+    filters?: { field: string; type: string; operators: FilterOperator[] }[]
+    sorters?: string[]
+  }
 }
 
 export interface LuxoParam {
@@ -84,4 +111,5 @@ export interface LuxoParam {
   isList?: boolean // true for array params (in/notIn → [T])
   nullable?: boolean
   hasDefault?: boolean
+  description?: string
 }

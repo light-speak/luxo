@@ -20,8 +20,32 @@ import (
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux"
+	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/auth"
+	"github.com/light-speak/luxo/pkg/lux/cache"
+	"github.com/light-speak/luxo/pkg/lux/schema"
 )
+
+func TestGatewayExplicitResponseCache(t *testing.T) {
+	binding, err := api.NewResponseCache(cache.Nop{}, api.CacheNamespace{Project: "p", Environment: "e", Service: "s", Revision: "r"}, api.ResponseOriginOptions{MaxConcurrent: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := NewWithOptions(api.RouterOptions{ResponseCache: binding})
+	gateway.Router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "cached", ReturnType: "Int", CacheDependencies: &schema.CacheDependencies{}, CachePolicy: &schema.CachePolicy{Mode: "ttl", TTL: time.Minute, Scope: "private"}})
+	gateway.Router.RequireCache("cached")
+	if err := gateway.Router.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if gateway.Router.IdentityExtractor == nil || gateway.Router.InternalRequestContext == nil {
+		t.Fatal("cache options lost identity hooks")
+	}
+	missing := New()
+	missing.Router.RequireCache("cached")
+	if err := missing.Serve("test"); err == nil || !strings.Contains(err.Error(), "cache") {
+		t.Fatalf("unconfigured cached gateway started: %v", err)
+	}
+}
 
 func TestMaskDSN(t *testing.T) {
 	tests := []struct {
@@ -254,7 +278,7 @@ func TestBuildMux(t *testing.T) {
 	gw := New()
 	gw.AddModule("user")
 
-	mux, port := gw.buildMux("test-version")
+	mux, port := buildTestMux(t, gw, "test-version")
 
 	if port != "4000" {
 		t.Errorf("expected default port 4000, got %q", port)
@@ -276,7 +300,7 @@ func TestBuildMuxCustomPort(t *testing.T) {
 	t.Setenv("APP_PORT", "8080")
 
 	gw := New()
-	_, port := gw.buildMux("v1")
+	_, port := buildTestMux(t, gw, "v1")
 
 	if port != "8080" {
 		t.Errorf("expected port 8080, got %q", port)
@@ -289,7 +313,7 @@ func TestBuildMuxWithAuth(t *testing.T) {
 	defer auth.ResetConfig()
 
 	gw := New()
-	mux, _ := gw.buildMux("v1")
+	mux, _ := buildTestMux(t, gw, "v1")
 
 	// Verify /luvia route goes through auth middleware
 	r := httptest.NewRequest("POST", "/luvia", strings.NewReader(`{"api":"test"}`))
@@ -304,7 +328,7 @@ func TestBuildMuxWithAuth(t *testing.T) {
 
 func TestBuildMuxLuviaRoute(t *testing.T) {
 	gw := New()
-	mux, _ := gw.buildMux("v1")
+	mux, _ := buildTestMux(t, gw, "v1")
 
 	// Verify /luvia route is registered (should return non-404)
 	r := httptest.NewRequest("POST", "/luvia", strings.NewReader(`{"api":"test"}`))
@@ -319,7 +343,7 @@ func TestBuildMuxLuviaRoute(t *testing.T) {
 }
 
 func TestCORSPreflightOptions(t *testing.T) {
-	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := testCORSMiddleware(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("OPTIONS should not reach inner handler")
 	}))
 
@@ -342,7 +366,7 @@ func TestCORSCustomOrigin(t *testing.T) {
 	os.Setenv("CORS_ORIGIN", "https://example.com")
 	defer os.Unsetenv("CORS_ORIGIN")
 
-	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	handler := testCORSMiddleware(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 
 	r := httptest.NewRequest(http.MethodPost, "/luvia", nil)
 	w := httptest.NewRecorder()
@@ -354,7 +378,7 @@ func TestCORSCustomOrigin(t *testing.T) {
 }
 
 func TestSecurityHeaders(t *testing.T) {
-	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	handler := testCORSMiddleware(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 
 	r := httptest.NewRequest(http.MethodPost, "/luvia", nil)
 	w := httptest.NewRecorder()
@@ -383,7 +407,7 @@ func TestBuildMuxIntrospectionKey(t *testing.T) {
 	t.Setenv("INTROSPECTION_KEY", "my-secret-key")
 
 	gw := New()
-	gw.buildMux("v1")
+	buildTestMux(t, gw, "v1")
 
 	if gw.Router.IntrospectionKey != "my-secret-key" {
 		t.Errorf("IntrospectionKey = %q, want my-secret-key", gw.Router.IntrospectionKey)
@@ -394,7 +418,7 @@ func TestBuildMuxDevMode(t *testing.T) {
 	t.Setenv("APP_ENV", "development")
 
 	gw := New()
-	gw.buildMux("v1")
+	buildTestMux(t, gw, "v1")
 
 	// In dev mode, router should be in dev mode
 	// We can't easily check this without exposing state, but ensure no crash
@@ -402,26 +426,27 @@ func TestBuildMuxDevMode(t *testing.T) {
 
 func TestBuildMuxUsesCORSOriginForWebSocket(t *testing.T) {
 	t.Setenv("CORS_ORIGIN", "https://studio.example.com:8443")
-
-	gw := New()
-	gw.buildMux("v1")
-
-	if len(gw.Router.WSOrigins) != 1 || gw.Router.WSOrigins[0] != "studio.example.com:8443" {
-		t.Fatalf("WebSocket origins = %v", gw.Router.WSOrigins)
-	}
-	if gw.Router.WSAllowAllOrigins {
-		t.Fatal("specific CORS origin must not allow every WebSocket origin")
+	mux, _ := buildTestMux(t, New(), "v1")
+	for _, origin := range []string{"https://studio.example.com:8443", "http://studio.example.com:8443"} {
+		request := httptest.NewRequest(http.MethodOptions, "/luvia", nil)
+		request.Header.Set("Origin", origin)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if (response.Code == http.StatusNoContent) != (origin == "https://studio.example.com:8443") {
+			t.Fatal(origin, response.Code)
+		}
 	}
 }
 
 func TestBuildMuxUsesWildcardCORSForWebSocket(t *testing.T) {
 	t.Setenv("CORS_ORIGIN", "*")
-
-	gw := New()
-	gw.buildMux("v1")
-
-	if !gw.Router.WSAllowAllOrigins {
-		t.Fatal("wildcard CORS must apply to WebSocket origin checks")
+	mux, _ := buildTestMux(t, New(), "v1")
+	request := httptest.NewRequest(http.MethodOptions, "/luvia", nil)
+	request.Header.Set("Origin", "https://arbitrary.example")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatal(response.Code)
 	}
 }
 
@@ -468,6 +493,23 @@ func TestStartGatewayServerRejectsInvalidTimeoutsBeforeListening(t *testing.T) {
 	}
 }
 
+func TestStartGatewayServerRejectsInvalidAddress(t *testing.T) {
+	server, serveErr, err := startGatewayServer("invalid-listen-address", http.NewServeMux(), "", "")
+	if err == nil || !strings.Contains(err.Error(), "listen invalid-listen-address") || server != nil || serveErr != nil {
+		t.Fatalf("invalid listener address started gateway: %v, %v, %v", server, serveErr, err)
+	}
+}
+
+func TestConfigureWebSocketOriginsRejectsMalformedOrigins(t *testing.T) {
+	for _, origin := range []string{"", "relative/path", "https://", "://bad", "https://user:password@example.com"} {
+		router := api.NewRouter()
+		policy, err := configureWebSocketOrigins(router, origin)
+		if err == nil || policy != nil {
+			t.Fatalf("invalid origin %q enabled cross-origin access", origin)
+		}
+	}
+}
+
 func TestBuildBannerDatabaseDisplay(t *testing.T) {
 	// With full DATABASE_* fields
 	t.Setenv("DATABASE_HOST", "localhost")
@@ -478,7 +520,7 @@ func TestBuildBannerDatabaseDisplay(t *testing.T) {
 	gw := New()
 	gw.AddModule("user")
 	// buildMux constructs DB display from env
-	_, _ = gw.buildMux("v1")
+	_, _ = buildTestMux(t, gw, "v1")
 }
 
 func TestServe_H2C(t *testing.T) {
@@ -487,42 +529,14 @@ func TestServe_H2C(t *testing.T) {
 
 	// Use a random high port
 	t.Setenv("APP_PORT", "0")
-
-	// Start Serve in goroutine and stop with signal
-	done := make(chan error, 1)
-	go func() {
-		done <- gw.Serve("test-v1")
-	}()
-
-	// Give server time to start then send interrupt
-	time.Sleep(50 * time.Millisecond)
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(syscall.SIGINT)
-
-	err := <-done
-	if err != nil {
-		t.Errorf("Serve should shut down cleanly, got: %v", err)
-	}
+	serveWithPendingShutdown(t, gw, "test-v1")
 }
 
 func TestServe_CustomShutdownTimeout(t *testing.T) {
 	t.Setenv("GRACEFUL_TIMEOUT", "1s")
 	t.Setenv("APP_PORT", "0")
 
-	gw := New()
-	done := make(chan error, 1)
-	go func() {
-		done <- gw.Serve("test-v1")
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(syscall.SIGINT)
-
-	err := <-done
-	if err != nil {
-		t.Errorf("got: %v", err)
-	}
+	serveWithPendingShutdown(t, New(), "test-v1")
 }
 
 func TestServe_TLS(t *testing.T) {
@@ -532,25 +546,26 @@ func TestServe_TLS(t *testing.T) {
 	t.Setenv("APP_TLS_KEY", keyFile)
 	t.Setenv("APP_PORT", "0")
 
-	gw := New()
-	done := make(chan error, 1)
-	go func() {
-		done <- gw.Serve("test-tls")
-	}()
+	serveWithPendingShutdown(t, New(), "test-tls")
+}
 
-	time.Sleep(100 * time.Millisecond)
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(syscall.SIGINT)
-
-	err := <-done
-	if err != nil {
-		t.Errorf("TLS Serve should shut down cleanly, got: %v", err)
+func serveWithPendingShutdown(t *testing.T, gw *Gateway, version string) {
+	t.Helper()
+	// Queue shutdown before startup, without signalling the entire test process.
+	quit := make(chan os.Signal, 1)
+	quit <- syscall.SIGINT
+	if err := gw.serve(version, quit); err != nil {
+		t.Fatalf("Serve should shut down cleanly: %v", err)
+	}
+	if gw.server == nil {
+		t.Fatal("Serve did not start the HTTP server")
 	}
 }
 
 func TestServeReturnsTLSLoadError(t *testing.T) {
-	t.Setenv("APP_TLS_CERT", filepath.Join(t.TempDir(), "missing-cert.pem"))
-	t.Setenv("APP_TLS_KEY", filepath.Join(t.TempDir(), "missing-key.pem"))
+	dir := gatewayTestDir(t)
+	t.Setenv("APP_TLS_CERT", filepath.Join(dir, "missing-cert.pem"))
+	t.Setenv("APP_TLS_KEY", filepath.Join(dir, "missing-key.pem"))
 	t.Setenv("APP_PORT", "0")
 
 	err := New().Serve("test-invalid-tls")
@@ -561,7 +576,7 @@ func TestServeReturnsTLSLoadError(t *testing.T) {
 
 func generateTestCert(t *testing.T) (certFile, keyFile string) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := gatewayTestDir(t)
 	certPath := filepath.Join(dir, "cert.pem")
 	keyPath := filepath.Join(dir, "key.pem")
 
@@ -587,8 +602,12 @@ func generateTestCert(t *testing.T) (certFile, keyFile string) {
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
-	os.WriteFile(certPath, certPEM, 0600)
-	os.WriteFile(keyPath, keyPEM, 0600)
+	if err := os.WriteFile(certPath, certPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
 	return certPath, keyPath
 }
 
@@ -646,7 +665,7 @@ func TestBuildMuxWithI18nDir(t *testing.T) {
 	os.WriteFile(filepath.Join(i18nDir, "en.json"), []byte(`{"hello": "Hello"}`), 0644)
 
 	gw := New()
-	mux, _ := gw.buildMux("v1")
+	mux, _ := buildTestMux(t, gw, "v1")
 	if mux == nil {
 		t.Fatal("mux should not be nil")
 	}
@@ -661,21 +680,13 @@ func TestServeWithMetricsAndRegistrar(t *testing.T) {
 
 	t.Setenv("LUXO_STUDIO_URL", srv.URL)
 	t.Setenv("LUXO_API_KEY", "test-key")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
 	t.Setenv("APP_PORT", "0")
 
 	gw := New()
-	done := make(chan error, 1)
-	go func() {
-		done <- gw.Serve("test-v1")
-	}()
-
-	time.Sleep(100 * time.Millisecond)
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(syscall.SIGINT)
-
-	err := <-done
-	if err != nil {
-		t.Errorf("Serve should shut down cleanly, got: %v", err)
+	serveWithPendingShutdown(t, gw, "test-v1")
+	if gw.metrics == nil || gw.registrar == nil {
+		t.Fatal("Studio integrations were not initialized")
 	}
 }
 
@@ -683,26 +694,19 @@ func TestWaitForShutdown_NilMetricsAndRegistrar(t *testing.T) {
 	// Test waitForShutdown with nil metrics and registrar (already covered
 	// by the basic Serve tests, but explicitly verify the nil guard paths)
 	t.Setenv("APP_PORT", "0")
+	t.Setenv("LUXO_STUDIO_URL", "")
+	t.Setenv("LUXO_API_KEY", "")
 
 	gw := New()
-	done := make(chan error, 1)
-	go func() {
-		done <- gw.Serve("test-v1")
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	proc, _ := os.FindProcess(os.Getpid())
-	proc.Signal(syscall.SIGINT)
-
-	err := <-done
-	if err != nil {
-		t.Errorf("got: %v", err)
+	serveWithPendingShutdown(t, gw, "test-v1")
+	if gw.metrics != nil || gw.registrar != nil {
+		t.Fatal("Studio integrations must stay disabled without configuration")
 	}
 }
 
 func TestCORSPassThroughNonOptions(t *testing.T) {
 	called := false
-	handler := corsMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := testCORSMiddleware(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		w.WriteHeader(http.StatusOK)
 	}))

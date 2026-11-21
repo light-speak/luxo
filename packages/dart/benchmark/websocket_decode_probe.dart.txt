@@ -1,0 +1,62 @@
+Future<void> main() async {
+  for (final mode in TransportMode.values) {
+    final options = TransportOptions(mode: mode);
+    final before = _BeforeTransport('ws://unused', options: options, autoReconnect: false);
+    final after = WsTransport('ws://unused', options: options, autoReconnect: false);
+    final oldSocket = _ProbeSocket(), newSocket = _ProbeSocket();
+    before._ws = oldSocket; after._ws = newSocket;
+    before._listenWs(oldSocket); after._listenWs(newSocket);
+    const schema = {'echo': APISchemaEntry(7)};
+    before.setSchema(schema); after.setSchema(schema);
+    try {
+      await _compareAsync('$mode unary fake-socket',
+        () => _unary(() => before.call<Object>('echo')),
+        () => _unary(() => after.call<Object>('echo')));
+      await _compareAsync('$mode subscribe ACK cancel fake-socket',
+        () => _subscribe(() => before.subscribe('echo', {}, (_) => throw StateError('Unexpected data'))),
+        () => _subscribe(() => after.subscribe('echo', {}, (_) => throw StateError('Unexpected data'), decoder: (value) => value)));
+      for (final typed in [false, true]) {
+        await _dispatch(mode, before, after, oldSocket, newSocket, typed);
+      }
+      if (oldSocket.calls != newSocket.calls || oldSocket.starts != newSocket.starts ||
+          oldSocket.cancels != newSocket.cancels || oldSocket.starts != oldSocket.cancels ||
+          before._subscriptions.isNotEmpty || after._subscriptions.isNotEmpty) {
+        throw StateError('Lifecycle counts differ');
+      }
+    } finally { before.close(); after.close(); }
+  }
+  print('Frozen original interface versus required decoder, through actual registered subscriptions.');
+  print('No network, handshake, allocation, browser-device or full generated model measurement.');
+}
+
+Future<void> _dispatch(TransportMode mode, _BeforeTransport before, WsTransport after,
+  _ProbeSocket oldSocket, _ProbeSocket newSocket, bool typed) async {
+  Object? oldValue, newValue;
+  var oldCount = 0, newCount = 0;
+  Object? decode(Object? data) => !typed ? data : data is Uint8List
+    ? LuxoDecoder(data).readIntChecked() : luxoInt64FromJSON(data);
+  final stopBefore = await before.subscribe('echo', {}, (value) { oldValue = decode(value); oldCount++; });
+  final stopAfter = await after.subscribe('echo', {}, (value) { newValue = value; newCount++; }, decoder: decode);
+  final oldID = before._subscriptions.keys.single, newID = after._subscriptions.keys.single;
+  final oldFrame = _dataFrame(mode, oldID), newFrame = _dataFrame(mode, newID);
+  int run(_ProbeSocket socket, Object frame, int Function() count) {
+    for (var i = 0; i < 5000; i++) socket.deliver(frame);
+    return count();
+  }
+  benchmark.compareBenchmarks('$mode data typed=$typed',
+    () => run(oldSocket, oldFrame, () => oldCount), () => run(newSocket, newFrame, () => newCount),
+    iterations: 5000, includeRange: true);
+  if (oldCount != newCount || (oldValue is Uint8List
+      ? (oldValue as Uint8List).single != (newValue as Uint8List).single : oldValue != newValue)) {
+    throw StateError('Decoded values or counts differ');
+  }
+  stopBefore(); stopAfter();
+}
+
+Object _dataFrame(TransportMode mode, Object id) {
+  if (mode == TransportMode.json) return '{"\$stream":$id,"data":42}';
+  final encoder = LuxoEncoder()..writeVarint(0x12);
+  _writeSequence(encoder, id);
+  encoder.writeRawBytes(Uint8List.fromList([84]));
+  return encoder.bytes();
+}

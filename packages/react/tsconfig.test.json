@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "declaration": false,
+    "emitDeclarationOnly": false,
+    "noEmit": true,
+    "types": ["node", "react"]
+  },
+  "include": ["src/**/*.ts", "tsdown.config.mts"],
+  "exclude": []
+}

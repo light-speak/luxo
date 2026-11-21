@@ -1,0 +1,33 @@
+// Append to the actual compiled regression consumer; setup stays outside measured operations.
+private var benchmarkSink: Any? = null
+// Keep the Java 8 thread identifier API available to generated test consumers.
+@Suppress("DEPRECATION")
+private fun benchmarkModelDepth() {
+    val bean = java.lang.management.ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
+    check(bean.isThreadAllocatedMemorySupported)
+    bean.isThreadAllocatedMemoryEnabled = true
+    val thread = Thread.currentThread().id
+    for (depth in listOf(1, 64)) {
+        val source = json(depth, true)
+        val input = inputNode(depth, true)
+        val rowBytes = row(depth, true)
+        val columnBytes = column(depth, true)
+        val cases: Map<String, () -> Any?> = linkedMapOf(
+            "jsonRead" to { decodeJSONNode(source) },
+            "rowRead" to { decodeNode(LuxoDecoder(rowBytes)) },
+            "columnRead" to { decodeColumnarNode(columnBytes) },
+            "jsonWrite" to { input.toLuxoJson() },
+            "binaryWrite" to { LuxoEncoder().also { input.writeLuxo(it) }.bytes() },
+        )
+        val iterations = if (depth == 1) 30000 else 2000
+        for ((name, operation) in cases) {
+            repeat(iterations * 2) { benchmarkSink = operation() }
+            val allocated = bean.getThreadAllocatedBytes(thread)
+            val start = System.nanoTime()
+            repeat(iterations) { benchmarkSink = operation() }
+            val elapsed = System.nanoTime() - start
+            val bytes = bean.getThreadAllocatedBytes(thread) - allocated
+            println("{\"case\":\"$name\",\"depth\":$depth,\"iterations\":$iterations,\"nsPerOp\":${elapsed.toDouble() / iterations},\"bytesPerOp\":${bytes.toDouble() / iterations}}")
+        }
+    }
+}

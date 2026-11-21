@@ -1,0 +1,64 @@
+import 'dart:convert';
+import 'dart:io';
+import 'package:luxo_client/luxo_client.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:test/test.dart';
+import 'client.dart';
+import 'types.dart';
+
+void main() {
+ test('closed generic types retain nested and nullable selections', () async {
+  final driver=Platform.environment['LUXO_GENERIC_HTTP_CONSUMER'];
+  final capture=Platform.environment['LUXO_GENERIC_CAPTURE'];
+  final scratch=Directory('.tmp')..createSync(recursive:true);
+  final own=scratch.createTempSync('generic-go-');
+  addTearDown(() { own.deleteSync(recursive:true); });
+  var sent=0;
+  for(final mode in driver==null?[TransportMode.json]:[TransportMode.json,TransportMode.binary]) {
+   final transport=HttpTransport('http://generic.fixture.invalid',options:TransportOptions(mode:mode),client:MockClient((request) async {
+    sent++;
+    final input=mode==TransportMode.json
+     ? {'mode':'json','request':jsonDecode(request.body)}
+     : {'mode':'binary','bytes':request.bodyBytes.toList()};
+    if(driver==null) {
+     final body=input['request'] as Map<String,dynamic>;
+     final data=switch(body[r'$api']) {
+      'readPage'=>{'items':[{'value':{'value':42}}],'total':1,'page':1,'pageSize':20},
+      'readCursor'=>{'items':[{'value':{'value':43}}],'nextCursor':'next','hasMore':true},
+      _=>body['value'],
+     };
+     return http.Response(jsonEncode({'data':data}),200);
+    }
+    final file=File('${own.path}/request.jsonl')..writeAsStringSync('${jsonEncode(input)}\n');
+    final process=await Process.run(driver,[file.absolute.path]);
+    expect(process.exitCode,0,reason:process.stderr.toString());
+    final response=jsonDecode(process.stdout.toString()) as Map<String,dynamic>;
+    if(capture!=null) File(capture).writeAsStringSync('${jsonEncode({'request':input,'response':response})}\n',mode:FileMode.append);
+    expect(response['status'],200,reason:response.toString());
+    return mode==TransportMode.json
+     ? http.Response(jsonEncode(response['json']),200)
+     : http.Response.bytes((response['bytes'] as List).cast<int>(),200);
+   }));
+   final client=LuxoClient(transport);
+   try {
+    final page=await client.readPage();
+    expect(page.items.value.first.value.value.value.value, LuxoInt64.fromInt(42));
+    expect(page.total.value, LuxoInt64.fromInt(1));
+    expect(page.page.value, LuxoInt64.fromInt(1));
+    expect(page.pageSize.value, LuxoInt64.fromInt(20));
+    final cursor=await client.readCursor();
+    expect(cursor.items.value.first.value.value.value.value, LuxoInt64.fromInt(43));
+    expect(cursor.nextCursor.value,'next');
+    expect(cursor.hasMore.value,isTrue);
+    final nested=await client.echoNested(value:LuxoBox_d1dc0a950b2f5e29Input(value:LuxoPage_5411031e24da9aefInput(
+     items:[CounterInput(value:LuxoInt64.fromInt(44))],total:LuxoInt64.fromInt(1),page:LuxoInt64.fromInt(1),pageSize:LuxoInt64.fromInt(20))));
+    expect(nested.value.value.items.value.first.value.value, LuxoInt64.fromInt(44));
+    final values=await client.echoLists(value:[LuxoBox_847cd3e6a7855432Input(value:null),LuxoBox_847cd3e6a7855432Input(value:LuxoInt64.fromInt(45))]);
+    expect(values.first.value.value==null,isTrue);
+    expect(values.last.value.value, LuxoInt64.fromInt(45));
+   } finally { client.close(); }
+  }
+  expect(sent,driver==null?4:8);
+ });
+}

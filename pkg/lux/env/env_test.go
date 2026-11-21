@@ -1,10 +1,31 @@
 package env
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 )
+
+func TestLoadReportsSetenvFailure(t *testing.T) {
+	for _, line := range []string{"LUXO_INVALID\x00KEY=value", "LUXO_INVALID_VALUE=private\x00value"} {
+		t.Run(strings.SplitN(line, "=", 2)[0], func(t *testing.T) {
+			path := writeEnvFile(t, "# header\n"+line+"\n")
+			err := Load(path)
+			if !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("Load error = %v, want EINVAL", err)
+			}
+			if !strings.Contains(err.Error(), path+":2:") {
+				t.Fatalf("missing file and line: %v", err)
+			}
+			if strings.Contains(err.Error(), "private") {
+				t.Fatalf("error exposes environment value: %v", err)
+			}
+		})
+	}
+}
 
 func writeEnvFile(t *testing.T, content string) string {
 	t.Helper()

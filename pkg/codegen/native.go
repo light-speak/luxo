@@ -20,53 +20,75 @@ type nativeAPI struct {
 // Returns nil if there are no @native APIs.
 func GenerateNativeFile(result *semantic.Result, packageName string) []byte {
 	apis := collectNativeAPIs(result)
+	models, _ := collectInferredAPIs(result)
 	hasNativeStreams := resultHasNativeStreams(result)
 	if len(apis) == 0 && !hasNativeStreams {
 		return nil
 	}
 
 	var b strings.Builder
-	writeHeader(&b, packageName, "native.gen.go")
-	// Scan for time import need (DateTime params/return)
-	needsTime := false
-	for _, api := range apis {
-		for _, p := range api.Params {
-			if p.Type != nil && p.Type.Name == "DateTime" {
-				needsTime = true
-			}
-		}
-		if api.ReturnType != nil && api.ReturnType.Name == "DateTime" {
-			needsTime = true
-		}
-	}
-	if needsTime {
-		b.WriteString("import (\n\t\"context\"\n\t\"time\"\n)\n\n")
-	} else if len(apis) > 0 {
-		b.WriteString("import \"context\"\n\n")
-	}
-
 	b.WriteString("// NativeResolver is the interface for @native API implementations.\n")
 	b.WriteString("// Implement this interface in your resolver package.\n")
 	b.WriteString("type NativeResolver interface {\n")
 	if hasNativeStreams {
 		b.WriteString("\tStreamResolver\n")
 	}
-	for _, api := range apis {
+	seen := make(map[string]int, len(apis))
+	for index, api := range apis {
+		if previous, exists := seen[api.Name]; exists && sameNativeSignature(apis[previous], api) {
+			continue
+		}
+		seen[api.Name] = index
+		bindings := parameterBindings(api.Params, nil)
 		fmt.Fprintf(&b, "\t%s(ctx context.Context", str.Capitalize(api.Name))
 		for _, p := range api.Params {
-			goType := resolveGoType(p.Type)
-			fmt.Fprintf(&b, ", %s %s", p.Name, goType)
+			goType := nativeGoType(p.Type, models)
+			if p.Spread {
+				fmt.Fprintf(&b, ", %s ...%s", bindings.name(p.Name), goType)
+				continue
+			}
+			fmt.Fprintf(&b, ", %s %s", bindings.name(p.Name), goType)
 		}
 		returnType := unwrapResultType(api.ReturnType)
 		if returnType == nil {
 			b.WriteString(") error\n")
 		} else {
-			fmt.Fprintf(&b, ") (%s, error)\n", resolveGoType(returnType))
+			fmt.Fprintf(&b, ") (%s, error)\n", nativeGoType(returnType, models))
 		}
 	}
 	b.WriteString("}\n")
 
-	return []byte(b.String())
+	body := b.String()
+	var out strings.Builder
+	writeHeader(&out, packageName, "native.gen.go")
+	writeNativeImports(&out, body)
+	out.WriteString(body)
+	return []byte(out.String())
+}
+
+// A same-named API and native function may share one exact implementation contract.
+func sameNativeSignature(left, right nativeAPI) bool {
+	if len(left.Params) != len(right.Params) {
+		return false
+	}
+	for index, param := range left.Params {
+		other := right.Params[index]
+		if param.Spread != other.Spread || !sameTypeRef(param.Type, other.Type) {
+			return false
+		}
+	}
+	a, b := unwrapResultType(left.ReturnType), unwrapResultType(right.ReturnType)
+	return a == b || sameTypeRef(a, b)
+}
+
+// Derive imports from emitted signatures, including nullable/list/Result wrappers.
+func writeNativeImports(b *strings.Builder, body string) {
+	if !strings.Contains(body, "context.Context") {
+		return
+	}
+	b.WriteString("import (\n\t\"context\"\n")
+	writeScalarTypeImports(b, body)
+	b.WriteString(")\n\n")
 }
 
 func unwrapResultType(ref *luxoast.TypeRef) *luxoast.TypeRef {
@@ -114,4 +136,12 @@ func resultHasNativeStreams(result *semantic.Result) bool {
 		}
 	}
 	return false
+}
+
+// Native model lists use the same reference representation as compiled functions.
+func nativeGoType(ref *luxoast.TypeRef, models map[string]*luxoast.ModelDecl) string {
+	if ref != nil && ref.IsList && models[ref.Name] != nil {
+		return compiledFunctionGoType(ref, models)
+	}
+	return resolveGoType(ref)
 }

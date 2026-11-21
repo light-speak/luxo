@@ -1,12 +1,14 @@
 package codegen
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 
+	"github.com/light-speak/luxo/internal/inferred"
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/lux"
 	"github.com/light-speak/luxo/pkg/lux/str"
@@ -48,6 +50,12 @@ func LoadState(path string) (*SchemaState, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, err
 	}
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil, fmt.Errorf("migration state must be an object")
+	}
+	if err := validateSchemaState(&s); err != nil {
+		return nil, err
+	}
 	if s.Models == nil {
 		s.Models = make(map[string]*ModelState)
 	}
@@ -56,106 +64,136 @@ func LoadState(path string) (*SchemaState, error) {
 
 // SaveState writes the schema state to a file.
 func SaveState(path string, s *SchemaState) error {
-	data, err := json.MarshalIndent(s, "", "  ")
+	data, err := MarshalState(s)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0644)
+	return os.WriteFile(path, data, 0644)
+}
+
+// MarshalState validates and encodes migration metadata with a trailing newline.
+func MarshalState(s *SchemaState) ([]byte, error) {
+	if err := validateSchemaState(s); err != nil {
+		return nil, err
+	}
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		// Unreachable for the validated, non-recursive state types; retain encoder error propagation.
+		return nil, err
+	}
+	return append(data, '\n'), nil
+}
+
+func validateSchemaState(s *SchemaState) error {
+	if s == nil {
+		return fmt.Errorf("migration state must be an object")
+	}
+	for name, model := range s.Models {
+		if model == nil {
+			return fmt.Errorf("migration state model %q must be an object", name)
+		}
+		for field, column := range model.Columns {
+			if column == nil {
+				return fmt.Errorf("migration state column %q.%q must be an object", name, field)
+			}
+		}
+	}
+	return nil
 }
 
 // ComputeState builds the desired schema state from the current AST.
-func ComputeState(result *semantic.Result, enums map[string]bool, dialect lux.Dialect) *SchemaState {
+func ComputeState(result *semantic.Result, enums map[string]bool, dialect lux.Dialect) (*SchemaState, error) {
+	if result == nil || len(result.Errors) != 0 {
+		return nil, fmt.Errorf("migration state requires successful semantic analysis")
+	}
+	if err := validateDatabaseIdentifiers(result, enums, dialect); err != nil {
+		return nil, err
+	}
 	s := &SchemaState{Models: make(map[string]*ModelState)}
-
-	for _, file := range result.Files {
+	for _, file := range inferred.ExpandedFiles(result.Files) {
 		for _, m := range file.Models {
-			ms := &ModelState{
-				Table:   str.ToSnakeCase(m.Name) + "s",
-				Columns: make(map[string]*ColumnState),
+			ms, err := computeModelState(m, enums, dialect)
+			if err != nil {
+				return nil, err
 			}
-
-			for _, f := range m.Fields {
-				if f.Computed != nil || isRelationField(f, enums) {
-					continue
-				}
-				col := buildColumnState(f, dialect)
-				if col != nil {
-					ms.Columns[str.ToSnakeCase(f.Name)] = col
-				}
-			}
-
-			// Auto timestamps
-			tsType := dialect.ColumnType("DateTime", false, nil)
-			if !hasDirective(m.Directives, "noTime") {
-				if _, ok := ms.Columns["created_at"]; !ok {
-					ms.Columns["created_at"] = &ColumnState{Type: tsType, Default: "NOW()"}
-				}
-				if _, ok := ms.Columns["updated_at"]; !ok {
-					ms.Columns["updated_at"] = &ColumnState{Type: tsType, Default: "NOW()"}
-				}
-			}
-
-			// Soft delete
-			if isSoftDelete(m) {
-				if _, ok := ms.Columns["deleted_at"]; !ok {
-					ms.Columns["deleted_at"] = &ColumnState{Type: tsType, Nullable: true}
-				}
-			}
-
-			// Indexes — all types
-			ms.Indexes = collectIndexes(m, ms.Table)
-
 			s.Models[m.Name] = ms
 		}
 	}
+	return s, nil
+}
 
-	return s
+func computeModelState(m *ast.ModelDecl, enums map[string]bool, dialect lux.Dialect) (*ModelState, error) {
+	ms := &ModelState{Table: modelTableName(m.Name), Columns: make(map[string]*ColumnState)}
+	for _, f := range m.Fields {
+		if f.Computed != nil || isRelationField(f, enums) {
+			continue
+		}
+		col, err := buildColumnState(f, dialect)
+		if err != nil {
+			return nil, fmt.Errorf("%s: default for %s.%s: %w", f.Pos, m.Name, f.Name, err)
+		}
+		if col != nil {
+			ms.Columns[str.ToSnakeCase(f.Name)] = col
+		}
+	}
+	// Managed timestamps remain database expressions, not field constants.
+	tsType := dialect.ColumnType("DateTime", false, nil)
+	if !hasDirective(m.Directives, "noTime") {
+		if _, ok := ms.Columns["created_at"]; !ok {
+			ms.Columns["created_at"] = &ColumnState{Type: tsType, Default: "NOW()"}
+		}
+		if _, ok := ms.Columns["updated_at"]; !ok {
+			ms.Columns["updated_at"] = &ColumnState{Type: tsType, Default: "NOW()"}
+		}
+	}
+	if isSoftDelete(m) {
+		if _, ok := ms.Columns["deleted_at"]; !ok {
+			ms.Columns["deleted_at"] = &ColumnState{Type: tsType, Nullable: true}
+		}
+	}
+	ms.Indexes = collectIndexes(m, ms.Table, dialect)
+	return ms, nil
 }
 
 // buildColumnState creates a ColumnState from a field declaration.
-func buildColumnState(f *ast.FieldDecl, dialect lux.Dialect) *ColumnState {
+func buildColumnState(f *ast.FieldDecl, dialect lux.Dialect) (*ColumnState, error) {
 	if f.Type == nil {
-		return nil
+		return nil, nil
 	}
 	// Scalar array field ([T]) → native array / JSON column (per dialect).
 	// Relation lists never reach here (ComputeState skips relation fields).
 	// Array columns are always nullable at the DB level: a nil Go slice maps to
-	// SQL NULL, and NULL / empty array are treated alike (the wire encodes both
-	// as count 0). The `?` on [T] carries no extra semantics.
+	// SQL NULL. Non-nullable lists normalize nil to empty on the wire; nullable
+	// lists preserve the distinction between NULL and an empty array.
+	cs := &ColumnState{}
 	if f.Type.IsList {
-		return &ColumnState{
-			Type:     dialect.ArrayColumnType(f.Type.Name),
-			Nullable: true,
-		}
+		cs.Type, cs.Nullable = dialect.ArrayColumnType(f.Type.Name), true
+	} else {
+		cs.Serial = hasDirective(f.Directives, "serial")
+		cs.Type = dialect.ColumnType(f.Type.Name, cs.Serial, extractDirectiveInfos(f.Directives))
+		cs.Nullable = f.Type.Nullable
+		cs.PK = cs.Serial || hasDirective(f.Directives, "id")
+		cs.Unique = hasDirective(f.Directives, "unique")
 	}
-
-	isSerial := hasDirective(f.Directives, "serial")
-	dirs := extractDirectiveInfos(f.Directives)
-	sqlType := dialect.ColumnType(f.Type.Name, isSerial, dirs)
-
-	cs := &ColumnState{
-		Type:     sqlType,
-		Nullable: f.Type.Nullable,
-		PK:       isSerial || hasDirective(f.Directives, "id"),
-		Unique:   hasDirective(f.Directives, "unique"),
-		Serial:   isSerial,
-	}
+	// A database constant cannot execute Go transforms or produce a fresh hash.
+	// Generated creates prepare these defaults before calling the database.
 	if f.Default != nil {
-		if lit, ok := f.Default.(*ast.Literal); ok {
-			cs.Default = defaultSQL(f.Type.Name, lit.Value)
-		} else if ident, ok := f.Default.(*ast.Ident); ok {
-			// Enum default: USER → 'USER'
-			cs.Default = "'" + ident.Name + "'"
-		} else if member, ok := f.Default.(*ast.MemberExpr); ok {
-			// Enum default: Role.USER → 'USER'
-			cs.Default = "'" + member.Field + "'"
+		value, err := columnDefault(f)
+		if err != nil {
+			return nil, err
+		}
+		if !preparedMutationField(f) {
+			cs.Default, err = dialect.DefaultSQL(value)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
-	return cs
+	return cs, nil
 }
 
 // collectIndexes extracts all index definitions from a model.
-func collectIndexes(m *ast.ModelDecl, table string) []lux.IndexInfo {
+func collectIndexes(m *ast.ModelDecl, table string, dialect lux.Dialect) []lux.IndexInfo {
 	var indexes []lux.IndexInfo
 
 	// Model-level @index(fields: [...]) → composite index
@@ -193,6 +231,10 @@ func collectIndexes(m *ast.ModelDecl, table string) []lux.IndexInfo {
 		}
 	}
 
+	for index := range indexes {
+		indexes[index].Name = dialect.GeneratedIdentifier(indexes[index].Name)
+	}
+
 	return indexes
 }
 
@@ -212,21 +254,6 @@ func extractIndexFields(d *ast.Directive) []string {
 		}
 	}
 	return nil
-}
-
-// defaultSQL converts a Luxo default value to SQL representation.
-func defaultSQL(luxoType, value string) string {
-	switch luxoType {
-	case "String":
-		return "'" + strings.ReplaceAll(value, "'", "''") + "'"
-	case "Boolean":
-		if value == "true" {
-			return "TRUE"
-		}
-		return "FALSE"
-	default:
-		return value
-	}
 }
 
 // extractDirectiveInfos converts AST directives to the dialect-layer DirectiveInfo.
@@ -280,22 +307,32 @@ type FieldIDMap struct {
 
 // Diff compares two schema states and returns the operations needed.
 // fieldIDs is optional — when provided, enables rename detection via luxo.lock.
-func Diff(current, desired *SchemaState, fieldIDs map[string]*FieldIDMap) []DiffOp {
+func Diff(current, desired *SchemaState, fieldIDs map[string]*FieldIDMap) ([]DiffOp, error) {
+	if err := validateSchemaState(current); err != nil {
+		return nil, fmt.Errorf("current migration state: %w", err)
+	}
+	if err := validateSchemaState(desired); err != nil {
+		return nil, fmt.Errorf("desired migration state: %w", err)
+	}
 	var ops []DiffOp
+	desiredNames := sortedMigrationKeys(desired.Models)
 
-	for name, dm := range desired.Models {
+	for _, name := range desiredNames {
+		dm := desired.Models[name]
 		if _, ok := current.Models[name]; !ok {
 			ops = append(ops, DiffOp{Kind: CreateTable, Model: name, Table: dm.Table})
 		}
 	}
 
-	for name, cm := range current.Models {
+	for _, name := range sortedMigrationKeys(current.Models) {
+		cm := current.Models[name]
 		if _, ok := desired.Models[name]; !ok {
 			ops = append(ops, DiffOp{Kind: DropTable, Model: name, Table: cm.Table})
 		}
 	}
 
-	for name, dm := range desired.Models {
+	for _, name := range desiredNames {
+		dm := desired.Models[name]
 		cm, ok := current.Models[name]
 		if !ok {
 			continue
@@ -304,24 +341,65 @@ func Diff(current, desired *SchemaState, fieldIDs map[string]*FieldIDMap) []Diff
 		if fieldIDs != nil {
 			fim = fieldIDs[name]
 		}
-		ops = append(ops, diffColumns(name, dm.Table, cm, dm, fim)...)
+		if cm.Table != dm.Table {
+			return nil, fmt.Errorf("model %s changes table identity; use an explicit migration", name)
+		}
+		columns, err := diffColumns(name, dm.Table, cm, dm, fim)
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, columns...)
 		ops = append(ops, diffIndexes(name, dm.Table, cm, dm)...)
 	}
 
-	return addSafetyWarnings(ops)
+	// Remove obsolete indexes before column changes, and build new indexes last.
+	// The reverse migration can then restore original column names before indexes.
+	slices.SortStableFunc(ops, func(left, right DiffOp) int {
+		return migrationIndexPhase(left.Kind) - migrationIndexPhase(right.Kind)
+	})
+	return addSafetyWarnings(ops), nil
+}
+
+func migrationIndexPhase(kind DiffKind) int {
+	switch kind {
+	case DropIndex:
+		return 0
+	case AddIndex:
+		return 2
+	default:
+		return 1
+	}
 }
 
 // diffColumns compares columns between current and desired model states.
-func diffColumns(model, table string, current, desired *ModelState, fim *FieldIDMap) []DiffOp {
+func diffColumns(model, table string, current, desired *ModelState, fim *FieldIDMap) ([]DiffOp, error) {
 	renames := detectRenames(current, desired, fim)
 	renamedOld, renamedNew := renamesSets(renames)
 
-	var ops []DiffOp
-	ops = append(ops, diffRenamedColumns(model, table, renames, current, desired)...)
-	ops = append(ops, diffAddedColumns(model, table, current, desired, renamedNew)...)
-	ops = append(ops, diffDroppedColumns(model, table, current, desired, renamedOld)...)
-	ops = append(ops, diffChangedColumns(model, table, current, desired, renamedNew)...)
-	return ops
+	ops, err := diffRenamedColumns(model, table, renames, current, desired)
+	if err != nil {
+		return nil, err
+	}
+	added, err := diffAddedColumns(model, table, current, desired, renamedOld, renamedNew)
+	if err != nil {
+		return nil, err
+	}
+	dropped, err := diffDroppedColumns(model, table, current, desired, renamedOld)
+	if err != nil {
+		return nil, err
+	}
+	ops = append(ops, added...)
+	ops = append(ops, dropped...)
+	for _, name := range sortedMigrationKeys(desired.Columns) {
+		next := desired.Columns[name]
+		if old, exists := current.Columns[name]; exists && !renamedOld[name] && !renamedNew[name] {
+			if err := validateColumnTransition(model, name, old, next); err != nil {
+				return nil, err
+			}
+		}
+	}
+	ops = append(ops, diffChangedColumns(model, table, current, desired, renamedOld, renamedNew)...)
+	return ops, nil
 }
 
 func renamesSets(renames map[string]string) (old, new_ map[string]bool) {
@@ -334,45 +412,70 @@ func renamesSets(renames map[string]string) (old, new_ map[string]bool) {
 	return
 }
 
-func diffRenamedColumns(model, table string, renames map[string]string, current, desired *ModelState) []DiffOp {
-	var ops []DiffOp
-	for oldName, newName := range renames {
-		oldCS, newCS := current.Columns[oldName], desired.Columns[newName]
-		ops = append(ops, DiffOp{Kind: RenameColumn, Model: model, Table: table, Column: newName, OldName: oldName, OldColumn: oldCS, NewColumn: newCS})
-		if columnChanged(oldCS, newCS) {
-			ops = append(ops, DiffOp{Kind: AlterColumn, Model: model, Table: table, Column: newName, OldColumn: oldCS, NewColumn: newCS})
+func diffRenamedColumns(model, table string, renames map[string]string, current, desired *ModelState) ([]DiffOp, error) {
+	if len(renames) == 0 {
+		return nil, nil
+	}
+	for _, old := range sortedMigrationKeys(renames) {
+		if err := validateColumnTransition(model, old, current.Columns[old], desired.Columns[renames[old]]); err != nil {
+			return nil, err
 		}
 	}
-	return ops
+	planner, err := newColumnRenamePlanner(model, table, renames, current, desired)
+	if err != nil {
+		return nil, err
+	}
+	ops, err := planner.plan()
+	if err != nil {
+		return nil, err
+	}
+	// All identities move before type/default changes can observe final names.
+	for _, old := range planner.keys {
+		next := renames[old]
+		oldCS, newCS := current.Columns[old], desired.Columns[next]
+		if columnChanged(oldCS, newCS) {
+			ops = append(ops, DiffOp{Kind: AlterColumn, Model: model, Table: table, Column: next, OldColumn: oldCS, NewColumn: newCS})
+		}
+	}
+	return ops, nil
 }
 
-func diffAddedColumns(model, table string, current, desired *ModelState, renamedNew map[string]bool) []DiffOp {
+func diffAddedColumns(model, table string, current, desired *ModelState, renamedOld, renamedNew map[string]bool) ([]DiffOp, error) {
 	var ops []DiffOp
-	for col, dc := range desired.Columns {
-		if _, ok := current.Columns[col]; ok || renamedNew[col] {
+	for _, col := range sortedMigrationKeys(desired.Columns) {
+		dc := desired.Columns[col]
+		if _, ok := current.Columns[col]; ok && !renamedOld[col] || renamedNew[col] {
 			continue
+		}
+		if dc.PK || dc.Serial {
+			return nil, columnIdentityError(model, col)
 		}
 		ops = append(ops, DiffOp{Kind: AddColumn, Model: model, Table: table, Column: col, NewColumn: dc})
 	}
-	return ops
+	return ops, nil
 }
 
-func diffDroppedColumns(model, table string, current, desired *ModelState, renamedOld map[string]bool) []DiffOp {
+func diffDroppedColumns(model, table string, current, desired *ModelState, renamedOld map[string]bool) ([]DiffOp, error) {
 	var ops []DiffOp
-	for col, cc := range current.Columns {
+	for _, col := range sortedMigrationKeys(current.Columns) {
+		cc := current.Columns[col]
 		if _, ok := desired.Columns[col]; ok || renamedOld[col] {
 			continue
 		}
+		if cc.PK || cc.Serial {
+			return nil, columnIdentityError(model, col)
+		}
 		ops = append(ops, DiffOp{Kind: DropColumn, Model: model, Table: table, Column: col, OldColumn: cc})
 	}
-	return ops
+	return ops, nil
 }
 
-func diffChangedColumns(model, table string, current, desired *ModelState, renamedNew map[string]bool) []DiffOp {
+func diffChangedColumns(model, table string, current, desired *ModelState, renamedOld, renamedNew map[string]bool) []DiffOp {
 	var ops []DiffOp
-	for col, dc := range desired.Columns {
+	for _, col := range sortedMigrationKeys(desired.Columns) {
+		dc := desired.Columns[col]
 		cc, ok := current.Columns[col]
-		if !ok || renamedNew[col] {
+		if !ok || renamedOld[col] || renamedNew[col] {
 			continue
 		}
 		if columnChanged(cc, dc) {
@@ -423,13 +526,15 @@ func diffIndexes(model, table string, current, desired *ModelState) []DiffOp {
 		desiredIdx[desired.Indexes[i].Name] = &desired.Indexes[i]
 	}
 
-	for name, idx := range desiredIdx {
-		if _, ok := currentIdx[name]; !ok {
+	for _, name := range sortedMigrationKeys(desiredIdx) {
+		idx := desiredIdx[name]
+		if previous, ok := currentIdx[name]; !ok || !sameIndexDefinition(previous, idx) {
 			ops = append(ops, DiffOp{Kind: AddIndex, Model: model, Table: table, Index: idx})
 		}
 	}
-	for name, idx := range currentIdx {
-		if _, ok := desiredIdx[name]; !ok {
+	for _, name := range sortedMigrationKeys(currentIdx) {
+		idx := currentIdx[name]
+		if next, ok := desiredIdx[name]; !ok || !sameIndexDefinition(idx, next) {
 			ops = append(ops, DiffOp{Kind: DropIndex, Model: model, Table: table, Index: idx})
 		}
 	}
@@ -437,13 +542,44 @@ func diffIndexes(model, table string, current, desired *ModelState) []DiffOp {
 	return ops
 }
 
-// GenerateMigrationSQL generates up/down SQL from diff operations using the given dialect.
-func GenerateMigrationSQL(ops []DiffOp, desired *SchemaState, dialect lux.Dialect) (up, down string) {
-	var upB, downB strings.Builder
-	for _, op := range ops {
-		generateOpSQL(&upB, &downB, op, desired, dialect)
+func sameIndexDefinition(left, right *lux.IndexInfo) bool {
+	return left.Kind == right.Kind && left.Lang == right.Lang && slices.Equal(left.Columns, right.Columns)
+}
+
+// GenerateMigrationSQL validates all operations before emission and reverses rollback blocks.
+func GenerateMigrationSQL(ops []DiffOp, desired *SchemaState, dialect lux.Dialect) (up, down string, err error) {
+	if err := validateMigrationSQL(ops, desired, dialect); err != nil {
+		return "", "", err
 	}
-	return upB.String(), downB.String()
+	var upB, downB strings.Builder
+	var boundaries []int
+	if len(ops) > 1 {
+		boundaries = make([]int, len(ops))
+	}
+	for index, op := range ops {
+		generateOpSQL(&upB, &downB, op, desired, dialect)
+		if boundaries != nil {
+			boundaries[index] = downB.Len()
+		}
+	}
+	if len(ops) <= 1 {
+		return upB.String(), downB.String(), nil
+	}
+	return upB.String(), reverseMigrationSQL(downB.String(), boundaries), nil
+}
+
+// Reverse complete operation blocks, retaining statement order inside each block.
+func reverseMigrationSQL(sql string, boundaries []int) string {
+	var b strings.Builder
+	b.Grow(len(sql))
+	for index := len(boundaries) - 1; index >= 0; index-- {
+		start := 0
+		if index > 0 {
+			start = boundaries[index-1]
+		}
+		b.WriteString(sql[start:boundaries[index]])
+	}
+	return b.String()
 }
 
 func generateOpSQL(upB, downB *strings.Builder, op DiffOp, desired *SchemaState, d lux.Dialect) {
@@ -451,19 +587,23 @@ func generateOpSQL(upB, downB *strings.Builder, op DiffOp, desired *SchemaState,
 	case CreateTable:
 		ms := desired.Models[op.Model]
 		upB.WriteString(generateCreateTableSQL(ms, d))
-		fmt.Fprintf(downB, "DROP TABLE IF EXISTS %s;\n", op.Table) // down is always real DROP (reverting a CREATE)
+		fmt.Fprintf(downB, "DROP TABLE IF EXISTS %s;\n", d.QuoteIdentifier(op.Table)) // down is always real DROP (reverting a CREATE)
 	case DropTable:
 		upB.WriteString(d.DropTable(op.Table))
 		fmt.Fprintf(downB, "-- Recreate %s table manually if needed\n", op.Table)
 	case AddColumn:
-		upB.WriteString(d.AddColumn(op.Table, d.ColumnDef(op.Column, toColumnInfo(op.NewColumn))))
-		fmt.Fprintf(downB, "ALTER TABLE %s DROP COLUMN %s;\n", op.Table, op.Column) // down reverts ADD, always real DROP
+		generateAddColumnSQL(upB, op.Table, op.Column, op.NewColumn, d)
+		fmt.Fprintf(downB, "ALTER TABLE %s DROP COLUMN %s;\n", d.QuoteIdentifier(op.Table), d.QuoteIdentifier(op.Column)) // down reverts ADD, always real DROP
 	case DropColumn:
 		upB.WriteString(d.DropColumn(op.Table, op.Column))
-		downB.WriteString(d.AddColumn(op.Table, d.ColumnDef(op.Column, toColumnInfo(op.OldColumn))))
+		generateAddColumnSQL(downB, op.Table, op.Column, op.OldColumn, d)
 	case RenameColumn:
-		fmt.Fprintf(upB, "ALTER TABLE %s RENAME COLUMN %s TO %s;\n", op.Table, op.OldName, op.Column)
-		fmt.Fprintf(downB, "ALTER TABLE %s RENAME COLUMN %s TO %s;\n", op.Table, op.Column, op.OldName)
+		fmt.Fprintf(upB, "ALTER TABLE %s RENAME COLUMN %s TO %s;\n", d.QuoteIdentifier(op.Table), d.QuoteIdentifier(op.OldName), d.QuoteIdentifier(op.Column))
+		if op.OldColumn.Unique {
+			upB.WriteString(d.RenameUnique(op.Table, op.OldName, op.Column))
+			downB.WriteString(d.RenameUnique(op.Table, op.Column, op.OldName))
+		}
+		fmt.Fprintf(downB, "ALTER TABLE %s RENAME COLUMN %s TO %s;\n", d.QuoteIdentifier(op.Table), d.QuoteIdentifier(op.Column), d.QuoteIdentifier(op.OldName))
 	case AlterColumn:
 		generateAlterColumnSQL(upB, downB, op, d)
 	case AddIndex:
@@ -475,40 +615,55 @@ func generateOpSQL(upB, downB *strings.Builder, op DiffOp, desired *SchemaState,
 	}
 }
 
+func generateAddColumnSQL(b *strings.Builder, table, name string, column *ColumnState, d lux.Dialect) {
+	info := toColumnInfo(column)
+	info.Unique = false
+	b.WriteString(d.AddColumn(table, d.ColumnDef(name, info)))
+	if column.Unique {
+		b.WriteString(d.AddUnique(table, name))
+	}
+}
+
 func generateAlterColumnSQL(upB, downB *strings.Builder, op DiffOp, d lux.Dialect) {
-	if op.OldColumn.Type != op.NewColumn.Type {
-		upB.WriteString(d.AlterColumnType(op.Table, op.Column, op.NewColumn.Type))
-		downB.WriteString(d.AlterColumnType(op.Table, op.Column, op.OldColumn.Type))
+	writeAlterColumnSQL(upB, op.Table, op.Column, op.OldColumn, op.NewColumn, d)
+	writeAlterColumnSQL(downB, op.Table, op.Column, op.NewColumn, op.OldColumn, d)
+}
+
+func writeAlterColumnSQL(b *strings.Builder, table, column string, old, next *ColumnState, d lux.Dialect) {
+	typeChanged := old.Type != next.Type
+	defaultDropped := typeChanged && old.Default != ""
+	if old.Unique && !next.Unique {
+		b.WriteString(d.DropUnique(table, column))
 	}
-	if op.OldColumn.Nullable != op.NewColumn.Nullable {
-		if op.NewColumn.Nullable {
-			upB.WriteString(d.DropNotNull(op.Table, op.Column))
-			downB.WriteString(d.SetNotNull(op.Table, op.Column))
-		} else {
-			upB.WriteString(d.SetNotNull(op.Table, op.Column))
-			downB.WriteString(d.DropNotNull(op.Table, op.Column))
+	if defaultDropped {
+		writeColumnDefaultSQL(b, d.QuoteIdentifier(table), d.QuoteIdentifier(column), "")
+	}
+	if !old.Nullable && next.Nullable {
+		b.WriteString(d.DropNotNull(table, column))
+	}
+	if typeChanged {
+		b.WriteString(d.AlterColumnType(table, column, next.Type))
+	}
+	if old.Nullable && !next.Nullable {
+		b.WriteString(d.SetNotNull(table, column))
+	}
+	if !old.Unique && next.Unique {
+		b.WriteString(d.AddUnique(table, column))
+	}
+	if old.Default != next.Default || typeChanged && next.Default != "" {
+		if next.Default != "" || !defaultDropped {
+			writeColumnDefaultSQL(b, d.QuoteIdentifier(table), d.QuoteIdentifier(column), next.Default)
 		}
 	}
-	if !op.OldColumn.Unique && op.NewColumn.Unique {
-		upB.WriteString(d.AddUnique(op.Table, op.Column))
-		downB.WriteString(d.DropUnique(op.Table, op.Column))
+}
+
+// writeColumnDefaultSQL preserves the SQL expression and accepts quoted names.
+func writeColumnDefaultSQL(b *strings.Builder, table, column, value string) {
+	if value == "" {
+		fmt.Fprintf(b, "ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;\n", table, column)
+		return
 	}
-	if op.OldColumn.Unique && !op.NewColumn.Unique {
-		upB.WriteString(d.DropUnique(op.Table, op.Column))
-		downB.WriteString(d.AddUnique(op.Table, op.Column))
-	}
-	if op.OldColumn.Default != op.NewColumn.Default {
-		if op.NewColumn.Default != "" {
-			fmt.Fprintf(upB, "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;\n", op.Table, op.Column, op.NewColumn.Default)
-		} else {
-			fmt.Fprintf(upB, "ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;\n", op.Table, op.Column)
-		}
-		if op.OldColumn.Default != "" {
-			fmt.Fprintf(downB, "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;\n", op.Table, op.Column, op.OldColumn.Default)
-		} else {
-			fmt.Fprintf(downB, "ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT;\n", op.Table, op.Column)
-		}
-	}
+	fmt.Fprintf(b, "ALTER TABLE %s ALTER COLUMN %s SET DEFAULT %s;\n", table, column, value)
 }
 
 // generateCreateTableSQL produces CREATE TABLE using dialect.
@@ -522,11 +677,14 @@ func generateCreateTableSQL(ms *ModelState, d lux.Dialect) string {
 	for name, cs := range ms.Columns {
 		entries = append(entries, colEntry{name, cs})
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].cs.PK != entries[j].cs.PK {
-			return entries[i].cs.PK
+	slices.SortFunc(entries, func(left, right colEntry) int {
+		if left.cs.PK != right.cs.PK {
+			if left.cs.PK {
+				return -1
+			}
+			return 1
 		}
-		return entries[i].name < entries[j].name
+		return strings.Compare(left.name, right.name)
 	})
 
 	columns := make([]lux.ColumnEntry, 0, len(entries))
@@ -713,4 +871,14 @@ func BuildFieldIDMaps(oldLock, newLock map[string]map[string]int) map[string]*Fi
 		result[model] = fim
 	}
 	return result
+}
+
+// sortedMigrationKeys reserves exact key capacity before deterministic traversal.
+func sortedMigrationKeys[V any](values map[string]V) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return keys
 }
