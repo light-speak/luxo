@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -14,6 +15,105 @@ import (
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 )
+
+func TestDebugTraceVersionUsesMatchingByteBudget(t *testing.T) {
+	for version := byte(1); version < debugTraceVersion; version++ {
+		if err := validateDebugTraceByteBudget(version, MaxDebugResponseTraceBytes+1); err != nil {
+			t.Fatalf("historical version %d lost support: %v", version, err)
+		}
+	}
+	if err := validateDebugTraceByteBudget(debugTraceVersion, MaxDebugResponseTraceBytes); err != nil {
+		t.Fatal("the inclusive byte limit was rejected", err)
+	}
+	if err := validateDebugTraceByteBudget(debugTraceVersion, MaxDebugResponseTraceBytes+1); err == nil {
+		t.Fatal("the current decoder accepted a size its encoder rejects")
+	}
+}
+
+func TestDebugTraceKeepsPublicSnapshotSpanCounts(t *testing.T) {
+	span := DebugSpan{DebugSpanMeta: DebugSpanMeta{Name: "table", Category: "db"}}
+	spans := make([]DebugSpan, maxDebugTraceSpans+1)
+	for index := range spans {
+		spans[index] = span
+		spans[index].ID = uint32(index + 1)
+	}
+	snapshot := DebugTraceSnapshot{TraceID: "public-trace", Spans: spans}
+	value, err := EncodeDebugTraceHeader(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeDebugTraceHeader(value)
+	if err != nil || len(got.Spans) != len(spans) || got.Spans[len(spans)-1] != spans[len(spans)-1] {
+		t.Fatalf("public snapshot did not round trip: spans=%d, error=%v", len(got.Spans), err)
+	}
+}
+
+func TestDebugTraceHeaderKeepsCurrentBoundaryAndHistoricalValues(t *testing.T) {
+	snapshot := DebugTraceSnapshot{TraceID: strings.Repeat("t", MaxDebugResponseTraceBytes-32)}
+	raw, err := EncodeDebugTrace(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.TraceID += strings.Repeat("t", MaxDebugResponseTraceBytes-len(raw))
+	value, err := EncodeDebugTraceHeader(snapshot)
+	if err != nil || len(value) != base64.RawURLEncoding.EncodedLen(MaxDebugResponseTraceBytes) {
+		t.Fatalf("invalid boundary fixture: size=%d, error=%v", len(value), err)
+	}
+	decoded, err := DecodeDebugTraceHeader(value + "\r\n")
+	if err != nil || decoded.TraceID != snapshot.TraceID {
+		t.Fatalf("exact boundary lost through header: size=%d, error=%v", len(decoded.TraceID), err)
+	}
+
+	snapshot.TraceID += " historical"
+	legacy := encodeDebugTraceBeforeTextErrors(snapshot)
+	decoded, err = DecodeDebugTraceHeader(base64.RawURLEncoding.EncodeToString(legacy))
+	if err != nil || decoded.TraceID != snapshot.TraceID {
+		t.Fatalf("historical header was rejected: size=%d, error=%v", len(decoded.TraceID), err)
+	}
+}
+
+func TestDebugTraceRejectsOutOfBudgetInputBeforeParsing(t *testing.T) {
+	data := make([]byte, MaxDebugResponseTraceBytes+1)
+	data[0] = debugTraceVersion
+	if _, err := DecodeDebugTrace(data); !errors.Is(err, errDebugTraceByteBudget) {
+		t.Fatal("raw trace did not apply the byte budget first", err)
+	}
+	value := base64.RawURLEncoding.EncodeToString(data)
+	if _, err := DecodeDebugTraceHeader(value); !errors.Is(err, errDebugTraceByteBudget) {
+		t.Fatal("trace header did not apply the byte budget first", err)
+	}
+}
+
+func TestDebugTraceLargeHeaderValidatesBase64AndVersion(t *testing.T) {
+	padding := strings.Repeat("\n", base64.RawURLEncoding.EncodedLen(MaxDebugResponseTraceBytes)+1)
+	valid, err := EncodeDebugTraceHeader(DebugTraceSnapshot{TraceID: strings.Repeat("p", 2048)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, prefix := range map[string]string{
+		"empty": "", "invalid alphabet": "!", "invalid version": "AAA", "invalid suffix": valid + "!",
+	} {
+		if _, err := DecodeDebugTraceHeader(prefix + padding); err == nil {
+			t.Errorf("accepted invalid header %s", name)
+		}
+	}
+}
+
+func TestDebugTraceSpanListRejectsTruncatedValues(t *testing.T) {
+	var encoder codec.Encoder
+	encoder.WriteFieldHeader(3)
+	if err := encoder.WriteArrayHeader(1); err != nil {
+		t.Fatal(err)
+	}
+	length := len(encoder.Bytes())
+	encoder.WriteBytes([]byte("span"))
+	for _, end := range []int{length, len(encoder.Bytes()) - 1} {
+		data := append([]byte{debugTraceVersion}, encoder.Bytes()[:end]...)
+		if _, err := DecodeDebugTrace(data); err == nil {
+			t.Fatal("accepted truncated span framing")
+		}
+	}
+}
 
 func TestDebugTraceRejectsOversizedSpanArray(t *testing.T) {
 	snapshot := DebugTraceSnapshot{TraceID: "test", Spans: make([]DebugSpan, codec.MaxArrayElements+1)}
