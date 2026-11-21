@@ -80,20 +80,28 @@ func splitSelectionMask(mask []byte, depth int) (fields, children []byte, ok boo
 	}
 	end := n + int(fieldLen)
 	fields = mask[n:end]
-	if !validSelectionBitmap(fields) || !validSelectionChildren(mask[end:], depth) {
+	children = mask[end:]
+	if !validSelectionBitmap(fields) || (len(children) > 0 && !validSelectionChildren(fields, children, depth)) {
 		return nil, nil, false
 	}
-	return fields, mask[end:], true
+	return fields, children, true
 }
 
-func validSelectionChildren(children []byte, depth int) bool {
+func validSelectionChildren(fields, children []byte, depth int) bool {
 	previousID := uint64(0)
 	for off := 0; off < len(children); {
 		if depth >= MaxSelectionDepth-1 {
 			return false
 		}
 		fieldID, n := ReadVarint(children, off)
-		if n <= 0 || fieldID == 0 || fieldID > MaxSelectionFieldID || fieldID <= previousID {
+		if n <= 0 || fieldID <= previousID {
+			return false
+		}
+		// The validated parent bitmap excludes the reserved high bit. Checking
+		// membership with an unsigned index also bounds the wire ID before narrowing.
+		bit := fieldID - 1
+		index := bit >> 3
+		if index >= uint64(len(fields)) || fields[index]&(1<<(bit&7)) == 0 {
 			return false
 		}
 		off += n

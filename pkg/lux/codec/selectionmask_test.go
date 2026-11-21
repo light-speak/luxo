@@ -108,16 +108,39 @@ func TestSelectionMaskRejectsMalformedNodes(t *testing.T) {
 	tests := [][]byte{
 		{2, 1},                   // truncated bitmap
 		{1, 1, 0},                // child field ID 0
-		{1, 1, 2},                // missing child length
-		{1, 1, 2, 2, 1},          // truncated child
-		{1, 1, 2, 1, 0},          // invalid empty-bitmap child node
-		{1, 1, 2, 2, 1, 0},       // child contains trailing malformed data
+		{1, 1, 1},                // missing child length
+		{1, 1, 1, 2, 1},          // truncated child
+		{1, 1, 1, 1, 0},          // invalid empty-bitmap child node
+		{1, 1, 1, 2, 1, 0},       // child contains trailing malformed data
 		{1, 1, 0x80, 0x80, 0x80}, // truncated child field ID varint
 	}
 	for _, data := range tests {
 		if _, _, ok := SplitSelectionMask(data); ok {
 			t.Errorf("SplitSelectionMask(%v) unexpectedly succeeded", data)
 		}
+	}
+}
+
+func TestSelectionMaskRejectsUnselectedChildren(t *testing.T) {
+	leaf := rawSelectionMask([]byte{1})
+	unselected := rawSelectionMask([]byte{1}, SelectionMaskChild{FieldID: 2, Mask: leaf})
+	for _, mask := range [][]byte{
+		unselected,
+		rawSelectionMask([]byte{1}, SelectionMaskChild{FieldID: 1, Mask: unselected}),
+	} {
+		if _, _, ok := SplitSelectionMask(mask); ok {
+			t.Fatal("accepted child of an unselected field")
+		}
+		if _, found := SelectionMaskNested(mask, 2); found {
+			t.Fatal("exposed child of an unselected field")
+		}
+	}
+	backing := bytes.Repeat([]byte{42}, 32)
+	if out, err := AppendSelectionMask(backing[:1], []byte{1}, []SelectionMaskChild{{FieldID: 1, Mask: unselected}}); out != nil || err != ErrInvalidSelectionMask {
+		t.Fatalf("appended invalid descendant: %v", err)
+	}
+	if !bytes.Equal(backing, bytes.Repeat([]byte{42}, 32)) {
+		t.Fatal("invalid descendant changed destination")
 	}
 }
 
@@ -139,6 +162,7 @@ func TestSelectionMaskClassifiedFieldLimit(t *testing.T) {
 		"unused final bit":       rawSelectionMask(unusedBit),
 		"oversized bitmap":       rawSelectionMask(oversized),
 		"child ID overflow":      rawSelectionMask([]byte{1}, SelectionMaskChild{FieldID: MaxSelectionFieldID + 1, Mask: child}),
+		"reserved child bit":     rawSelectionMask(maxFields, SelectionMaskChild{FieldID: MaxSelectionFieldID + 1, Mask: child}),
 		"nested bitmap overflow": rawSelectionMask([]byte{1}, SelectionMaskChild{FieldID: 1, Mask: rawSelectionMask(oversized)}),
 	}
 	for name, wire := range cases {
