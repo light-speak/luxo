@@ -1,12 +1,26 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:luxo_client/src/builder/artifact_publish.dart';
 import 'package:luxo_client/src/builder/selection_build.dart';
 import 'package:test/test.dart';
 
 import 'select_fixture.dart';
 
 const _minimal = {'lib/main.dart': 'void main() {}', 'asset.txt': 'original'};
+
+class _SourceDirectoryWithTrailingSeparator implements Directory {
+  final Directory source;
+
+  _SourceDirectoryWithTrailingSeparator(this.source);
+
+  @override
+  Future<String> resolveSymbolicLinks() async =>
+      '${await source.resolveSymbolicLinks()}${Platform.pathSeparator}';
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
 
 void main() {
   test('generated aggregate sources retain fields over real HTTP', () async {
@@ -364,6 +378,52 @@ Future<void> main() async {
       }
     },
   );
+  test('build ownership accepts a trailing directory separator', () async {
+    const asset = 'lib/路径 with space.dart';
+    const contents = 'void extra() {}';
+    final fixture = await SelectFixture.create({..._minimal, asset: contents});
+    addTearDown(fixture.close);
+    expect((await fixture.unit(asset)).content, contents);
+    expect(fixture.sources[asset], contents);
+    final source = _SourceDirectoryWithTrailingSeparator(fixture.root);
+    final build = await SelectionBuild.prepare(source);
+    addTearDown(build.close);
+    final destination = await build.prepareOutput('build/release');
+    expect(destination.uri, fixture.root.uri.resolve('build/release'));
+    await build.close();
+    expect(await build.directory.exists(), isFalse);
+    expect(await fixture.root.exists(), isTrue);
+  });
+  test(
+    'release publication preserves an output created after validation',
+    () async {
+      final fixture = await SelectFixture.create(_minimal);
+      SelectionBuild? build;
+      try {
+        build = await SelectionBuild.prepare(fixture.root);
+        final artifact = File('${build.directory.path}/staged');
+        await artifact.writeAsString('compiled executable');
+        final destination = await build.prepareOutput('.tmp/release/应用');
+        await destination.writeAsString('another build');
+
+        expect(
+          () => publishBuildArtifact(artifact, destination),
+          throwsStateError,
+        );
+        expect(await destination.readAsString(), 'another build');
+        expect(await artifact.readAsString(), 'compiled executable');
+
+        final unused = await build.prepareOutput('.tmp/release/另一个应用');
+        publishBuildArtifact(artifact, unused);
+        await build.close();
+        build = null;
+        expect(await unused.readAsString(), 'compiled executable');
+      } finally {
+        await build?.close();
+        await fixture.close();
+      }
+    },
+  );
   test('source links and path traversal are rejected without touching outside files', () async {
     final fixture = await SelectFixture.create(_minimal);
     try {
@@ -543,6 +603,9 @@ Future<void> main() async {
           .readAsString();
       final fixture = await _generatedFixture(source);
       try {
+        final output = Platform.isWindows
+            ? '.tmp/release/verify.exe'
+            : '.tmp/release/verify';
         final compiled = await Process.run(Platform.resolvedExecutable, [
           File('bin/build.dart').absolute.path,
           '--project',
@@ -552,14 +615,14 @@ Future<void> main() async {
           '--compile',
           'exe',
           '--output',
-          '.tmp/release/verify',
+          output,
         ]);
         expect(
           compiled.exitCode,
           0,
           reason: '${compiled.stdout}\n${compiled.stderr}',
         );
-        final artifact = File('${fixture.root.path}/.tmp/release/verify');
+        final artifact = File.fromUri(fixture.root.uri.resolve(output));
         expect(await artifact.exists(), isTrue);
         final release = await Process.run(artifact.path, []);
         expect(
