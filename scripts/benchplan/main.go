@@ -38,7 +38,7 @@ func run(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	shards, err := makePlan(groups, 8)
+	shards, err := makePlan(groups, workflowShardLimit(groups))
 	if err != nil {
 		return err
 	}
