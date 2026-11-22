@@ -148,6 +148,8 @@ func TestJWTDurationScaledDecimalPrecision(t *testing.T) {
 		{"0.29*100ns", 29},
 		{"-0.29*100ns", -29},
 		{"0.29*100ns+0.29*100ns", 58},
+		{"2*1h+3d", 74 * time.Hour},
+		{"3d+2*1h", 74 * time.Hour},
 		{"0.999999999999999999*1ns", 0},
 		{"0x1_0p-3*5ns", 10},
 		{"0x1p-1*3ns", 1},
@@ -232,6 +234,7 @@ func TestJWTDurationRejectsOverflowAndMalformedNumbers(t *testing.T) {
 		"100000d100000d100000d", "106752d", "106751d23h47m16.854775808s",
 		"1..2d", "1.2.3w", "d", ".*1ns", "9223372036854775808.000001*1ns",
 		"1e_1*1ns", "9e19*1ns", "0X12*1ns", "0x1p_1*1ns",
+		"2*1d",
 	} {
 		t.Run(input, func(t *testing.T) {
 			if duration, err := parseDuration(input); err == nil {

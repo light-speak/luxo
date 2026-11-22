@@ -87,11 +87,17 @@ func BenchmarkStaticJWT(b *testing.B) {
 		b.Fatal(err)
 	}
 	for _, phase := range []string{"Sign", "Verify", "Identity"} {
-		for _, revision := range []string{"Before", "After"} {
-			b.Run(phase+"/"+revision, func(b *testing.B) {
-				benchmarkStaticJWTPhase(b, cfg, data, writer, token, phase, revision == "Before")
-			})
+		legacyName := "Before"
+		if phase != "Identity" {
+			// Distinguish the frozen HMAC workload from the old Before fixture.
+			legacyName = "LegacyHMAC"
 		}
+		b.Run(phase+"/"+legacyName, func(b *testing.B) {
+			benchmarkStaticJWTPhase(b, cfg, data, writer, token, phase, true)
+		})
+		b.Run(phase+"/After", func(b *testing.B) {
+			benchmarkStaticJWTPhase(b, cfg, data, writer, token, phase, false)
+		})
 	}
 }
 

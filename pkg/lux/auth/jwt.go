@@ -313,23 +313,32 @@ func base64Decode(s string) ([]byte, error) {
 // Examples: "7d" → 168h, "2w" → 336h, "1d12h" → 36h, "30m" → 30m.
 func parseDuration(s string) (time.Duration, error) {
 	s = strings.TrimSuffix(s, "+")
-	unit := strings.IndexAny(s, "dw")
-	if unit >= 0 {
-		if unit == len(s)-1 {
-			scale := 24 * time.Hour
-			if s[unit] == 'w' {
-				scale *= 7
-			}
-			if duration, err := scaleDuration(s[:unit], scale, s); err != errInvalidDurationMultiplier {
-				return duration, err
-			}
+	hasMultiplier := false
+	for i := range len(s) {
+		switch s[i] {
+		case 'd', 'w':
+			return parseDayWeekDuration(s, i)
+		case '*':
+			hasMultiplier = true
 		}
-		return parseExtendedDuration(s)
 	}
-	if strings.Contains(s, "*") {
+	if hasMultiplier {
 		return parseDurationWithMultiplier(s)
 	}
 	return time.ParseDuration(s)
+}
+
+func parseDayWeekDuration(s string, unit int) (time.Duration, error) {
+	if unit == len(s)-1 {
+		scale := 24 * time.Hour
+		if s[unit] == 'w' {
+			scale *= 7
+		}
+		if duration, err := scaleDuration(s[:unit], scale, s); err != errInvalidDurationMultiplier {
+			return duration, err
+		}
+	}
+	return parseExtendedDuration(s)
 }
 
 func parseExtendedDuration(s string) (time.Duration, error) {
