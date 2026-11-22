@@ -40,6 +40,42 @@ void main() {
     );
   });
 
+  test('unsupported request URIs return a client exception', () async {
+    final client = LuxoHttp2Client(Uri.parse('https://localhost:1'));
+    addTearDown(client.close);
+    for (final url in [
+      Uri(path: '/items'),
+      Uri(scheme: 'https', path: '/items'),
+      Uri.file('/items'),
+      Uri.parse('http://localhost:1/items'),
+      Uri.parse('https://user@localhost:1/items'),
+    ]) {
+      await expectLater(
+        client.send(http.Request('GET', url)),
+        throwsA(
+          isA<http.ClientException>().having((error) => error.uri, 'uri', url),
+        ),
+      );
+    }
+  });
+
+  test('accepts equivalent HTTPS origins with default ports', () async {
+    final client = LuxoHttp2Client(Uri.parse('https://[::1]'));
+    addTearDown(client.close);
+    final abort = Completer<void>()..complete();
+    for (final url in [
+      Uri.parse('https://[::1]:443/items'),
+      Uri.parse('https://@[::1]:443/items'),
+    ]) {
+      await expectLater(
+        client.send(
+          http.AbortableRequest('GET', url, abortTrigger: abort.future),
+        ),
+        throwsA(isA<http.RequestAbortedException>()),
+      );
+    }
+  });
+
   test('cancelled requests do not open a connection', () async {
     final client = LuxoHttp2Client(Uri.parse('https://localhost:1'));
     addTearDown(client.close);
