@@ -46,6 +46,28 @@ func TestAppendSelectionMaskCountsParentDepthBeforeWriting(t *testing.T) {
 	}
 }
 
+func TestSelectionMaskCountsDepthForEachSibling(t *testing.T) {
+	deep := rawSelectionMaskDepth(MaxSelectionDepth - 1)
+	root := testutil.Bytes(t)(AppendSelectionMask(nil, []byte{3}, []SelectionMaskChild{
+		{FieldID: 1, Mask: deep},
+		{FieldID: 2, Mask: deep},
+	}))
+	for _, id := range []int{1, 2} {
+		mask, ok := SelectionMaskNested(root, id)
+		if !ok || !bytes.Equal(mask, deep) {
+			t.Fatalf("sibling %d lost its full-depth selection", id)
+		}
+	}
+	overDepth := rawSelectionMaskDepth(MaxSelectionDepth)
+	root = rawSelectionMask([]byte{3},
+		SelectionMaskChild{FieldID: 1, Mask: overDepth},
+		SelectionMaskChild{FieldID: 2, Mask: deep},
+	)
+	if _, _, ok := SplitSelectionMask(root); ok {
+		t.Fatal("over-depth first sibling was accepted")
+	}
+}
+
 // Construct receiver fixtures independently of the checked production encoder.
 func rawSelectionMaskDepth(depth int) []byte {
 	mask := []byte{1, 1}
@@ -141,6 +163,18 @@ func TestSelectionMaskRejectsUnselectedChildren(t *testing.T) {
 	}
 	if !bytes.Equal(backing, bytes.Repeat([]byte{42}, 32)) {
 		t.Fatal("invalid descendant changed destination")
+	}
+}
+
+func TestSelectionMaskBitmapLengthEncodingBoundary(t *testing.T) {
+	for _, size := range []int{127, 128} {
+		fields := make([]byte, size)
+		fields[size-1] = 1
+		wire := testutil.Bytes(t)(AppendSelectionMask(nil, fields, nil))
+		got, children, ok := SplitSelectionMask(wire)
+		if !ok || !bytes.Equal(fields, got) || len(children) != 0 {
+			t.Fatalf("invalid %d-byte bitmap round trip", size)
+		}
 	}
 }
 
