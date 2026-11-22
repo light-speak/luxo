@@ -328,6 +328,35 @@ func parseDuration(s string) (time.Duration, error) {
 	return time.ParseDuration(s)
 }
 
+// A hexadecimal significand can contain d. Look for its exponent marker
+// before treating that byte as a unit suffix.
+func durationHexExponent(s string, prefix int) int {
+	if prefix == 0 || s[prefix-1] != '0' {
+		return prefix
+	}
+	for i := prefix + 1; i < len(s); i++ {
+		c := s[i] | 0x20
+		if c == 'p' {
+			return i
+		}
+		if c-'0' > 9 && c-'a' > 5 && c != '.' && s[i] != '_' {
+			break
+		}
+	}
+	return prefix
+}
+
+func durationExponentEnd(s string, marker int) int {
+	end := marker + 1
+	if end < len(s) && (s[end] == '+' || s[end] == '-') {
+		end++
+	}
+	for end < len(s) && (s[end]-'0' <= 9 || s[end] == '_') {
+		end++
+	}
+	return end
+}
+
 func parseDayWeekDuration(s string, unit int) (time.Duration, error) {
 	if unit == len(s)-1 {
 		scale := 24 * time.Hour
@@ -347,9 +376,22 @@ func parseExtendedDuration(s string) (time.Duration, error) {
 	for i := 0; i < len(s); i++ {
 		unit := s[i]
 		if unit != 'd' && unit != 'w' {
-			if (unit < '0' || unit > '9') && unit != '.' {
-				numberStart = i + 1
+			if unit-'0' <= 9 || unit == '.' {
+				continue
 			}
+			switch unit {
+			case 'x', 'X':
+				if marker := durationHexExponent(s, i); marker != i {
+					i = durationExponentEnd(s, marker) - 1
+					continue
+				}
+			case 'e', 'E':
+				if end := durationExponentEnd(s, i); i > numberStart && end > i+1 {
+					i = end - 1
+					continue
+				}
+			}
+			numberStart = i + 1
 			continue
 		}
 		// Ordinary Go duration units end in h, m, or s. Separate that
@@ -367,13 +409,18 @@ func parseExtendedDuration(s string) (time.Duration, error) {
 		}
 		start, numberStart = i+1, i+1
 	}
+	if start == 0 {
+		return parseDurationWithMultiplier(s)
+	}
 	normalized.WriteString(s[start:])
 	return parseDurationWithMultiplier(strings.TrimSuffix(normalized.String(), "+"))
 }
 
 func parseDurationWithMultiplier(s string) (time.Duration, error) {
 	var total time.Duration
-	for part := range strings.SplitSeq(s, "+") {
+	for remaining := s; remaining != ""; {
+		var part string
+		part, remaining = cutDurationTerm(remaining)
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
@@ -406,6 +453,27 @@ func parseDurationWithMultiplier(s string) (time.Duration, error) {
 		total += duration
 	}
 	return total, nil
+}
+
+func cutDurationTerm(s string) (part, rest string) {
+	separator := strings.IndexByte(s, '+')
+	if separator < 0 {
+		return s, ""
+	}
+	// Only the numeric multiplier can have an exponent sign, and a valid
+	// number has at most one. The numeric parser validates the full operand.
+	if separator > 0 {
+		marker := s[separator-1] | 0x20
+		if (marker == 'e' || marker == 'p') && separator+1 < len(s) && s[separator+1]-'0' <= 9 &&
+			strings.IndexByte(s[:separator], '*') < 0 {
+			next := strings.IndexByte(s[separator+1:], '+')
+			if next < 0 {
+				return s, ""
+			}
+			separator += next + 1
+		}
+	}
+	return s[:separator], s[separator+1:]
 }
 
 var errInvalidDurationMultiplier = errors.New("invalid duration multiplier")

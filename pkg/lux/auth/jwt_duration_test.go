@@ -177,6 +177,35 @@ func TestJWTDurationScaledDecimalPrecision(t *testing.T) {
 	}
 }
 
+func TestJWTDurationExponentSignsAndHexUnits(t *testing.T) {
+	for _, sample := range []struct {
+		input string
+		want  time.Duration
+	}{
+		{"1e+2*1ns", 100 * time.Nanosecond},
+		{"0x1p+2*1ns", 4 * time.Nanosecond},
+		{"1E+2*1ns+3ns+0x1dp+1*1ns", 161 * time.Nanosecond},
+		{"0x1dp0d", 29 * 24 * time.Hour},
+		{"0x1Dp0d", 29 * 24 * time.Hour},
+		{"0x1dp0*1ns", 29 * time.Nanosecond},
+		{"0x1Dp0*1ns", 29 * time.Nanosecond},
+		{"0x1dp+0d+12h", 29*24*time.Hour + 12*time.Hour},
+		{"1h0x1dp0d12h", 29*24*time.Hour + 13*time.Hour},
+		{"1e+0d12h", 36 * time.Hour},
+		{"0x1dp0w", 29 * 168 * time.Hour},
+		{"1d12h", 36 * time.Hour},
+		{"2*3h+1d", 30 * time.Hour},
+		{"30m", 30 * time.Minute},
+		{"1.25µs", 1250 * time.Nanosecond},
+		{"-1h15m", -75 * time.Minute},
+	} {
+		got, err := parseDuration(sample.input)
+		if err != nil || got != sample.want {
+			t.Errorf("%q = %v, %v; want %v", sample.input, got, err, sample.want)
+		}
+	}
+}
+
 func TestJWTDurationCompactMultiplierAllocations(t *testing.T) {
 	for _, input := range []string{"1e-1*10s", "0x1p-1*24h"} {
 		allocations := testing.AllocsPerRun(20, func() {
@@ -234,7 +263,7 @@ func TestJWTDurationRejectsOverflowAndMalformedNumbers(t *testing.T) {
 		"100000d100000d100000d", "106752d", "106751d23h47m16.854775808s",
 		"1..2d", "1.2.3w", "d", ".*1ns", "9223372036854775808.000001*1ns",
 		"1e_1*1ns", "9e19*1ns", "0X12*1ns", "0x1p_1*1ns",
-		"2*1d",
+		"2*1d", "1e++2*1ns", "0x1p+*1ns", "1e+2", "0x1dep+1*1ns+1e+ns", "0x1d*1ns",
 	} {
 		t.Run(input, func(t *testing.T) {
 			if duration, err := parseDuration(input); err == nil {
