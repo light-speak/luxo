@@ -43,7 +43,7 @@ jobs:
           cp scripts/diagnose-dart-prepared-native.json "$stage/evidence/manifest.json"
           base="$(python -c 'import json; print(json.load(open("scripts/diagnose-dart-prepared-native.json"))["base"])')"
           git show -s --format='%H %T' "$base" | tee "$stage/evidence/base.txt"
-          git archive "$base" | tar -xf - -C "$stage/source"
+          git -c core.autocrlf=false archive "$base" | tar -xf - -C "$stage/source"
           git init -q "$stage/source"
           python - before <<'PY'
           import hashlib, json, sys
@@ -60,8 +60,8 @@ jobs:
               assert digest == row[sys.argv[1] + "Sha256"], row["path"]
           PY
           patch="$stage/candidate.patch"
-          git -C "$stage/source" apply --check --whitespace=error "$patch"
-          git -C "$stage/source" apply --whitespace=error "$patch"
+          git -C "$stage/source" -c core.autocrlf=false apply --check --whitespace=error "$patch"
+          git -C "$stage/source" -c core.autocrlf=false apply --whitespace=error "$patch"
           python - after <<'PY'
           import hashlib, json, sys
           from pathlib import Path
@@ -72,7 +72,7 @@ jobs:
               path = source / row["path"]
               assert hashlib.sha256(path.read_bytes()).hexdigest() == row[sys.argv[1] + "Sha256"], row["path"]
           PY
-          git -C "$stage/source" apply -R --check "$patch"
+          git -C "$stage/source" -c core.autocrlf=false apply -R --check "$patch"
 
       - name: Resolve the existing Dart dependencies
         working-directory: .tmp/dart-prepared-native/source/packages/dart
