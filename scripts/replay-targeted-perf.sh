@@ -6,6 +6,15 @@ base_revision=65f1892e175487503aa36caa86d1eb8a0805f073
 head_revision=0a5dc510b726b9078c462b0907138786adf223ed
 package=pkg/lux/h2transport
 filter='^BenchmarkTaskDeadlineReplacement$'
+inventory_only=false
+allocation_control=false
+for flag in "$@"; do
+  case "$flag" in
+    --inventory-only) inventory_only=true ;;
+    --allocation-control) allocation_control=true ;;
+    *) printf 'unknown option: %s\n' "$flag" >&2; exit 2 ;;
+  esac
+done
 
 workspace="$PWD/.tmp/targeted-replay"
 mkdir -p "${workspace%/*}"
@@ -18,7 +27,35 @@ cd "$workspace"
 export GITHUB_WORKSPACE="$workspace"
 export GOWORK=off
 printf 'tools %s\nbase %s\nhead %s\n' "$tool_revision" "$base_revision" "$head_revision" > .tmp/replay-revisions.txt
+printf 'allocation control %s\n' "$allocation_control" >> .tmp/replay-revisions.txt
 go version >> .tmp/replay-revisions.txt
+
+if "$allocation_control"; then
+  python3 - <<'PYTHON'
+from pathlib import Path
+
+header = "func BenchmarkTaskDeadlineReplacement(b *testing.B) {"
+call = '\n\tb.Run("diagnostic-allocation", benchmarkReplayAllocation)'
+for side, expression in (("base", "replayStorage[:]"), ("head", "make([]byte, 64)")):
+    path = Path(f".tmp/{side}/pkg/lux/h2transport/scheduling_test.go")
+    source = path.read_text()
+    if source.count(header) != 1:
+        raise SystemExit(f"missing or repeated deadline benchmark in {side}")
+    control = f"""
+var replayStorage [64]byte
+var replayAllocated []byte
+
+func benchmarkReplayAllocation(b *testing.B) {{
+    b.ReportAllocs()
+    for b.Loop() {{
+        replayAllocated = {expression}
+    }}
+}}
+"""
+    path.write_text(source.replace(header, header + call) + control)
+PYTHON
+  shasum -a 256 .tmp/{base,head}/pkg/lux/h2transport/scheduling_test.go >> .tmp/replay-revisions.txt
+fi
 
 # Extract the pinned workflow's literal shell blocks for execution unchanged.
 python3 - <<'PYTHON'
@@ -72,7 +109,7 @@ cp .tmp/replay-plan/shard-01.tsv .tmp/benchmark-batch.tsv
 cp .tmp/replay-plan/shard-01.json .tmp/benchmark-expected.json
 
 # Local verification can stop after producing the exact inventory and plan.
-if [[ ${1:-} == --inventory-only ]]; then
+if "$inventory_only"; then
   cat .tmp/benchmark-expected.json
   exit 0
 fi
@@ -90,9 +127,10 @@ case "$gate_status" in
   *) exit "$gate_status" ;;
 esac
 
-python3 - <<'PYTHON'
+python3 - "$allocation_control" "$gate_status" <<'PYTHON' | tee .tmp/replay-verdict.txt
 import json
 from pathlib import Path
+import sys
 
 def cases(file):
     data = json.loads(Path(file).read_text())
@@ -108,15 +146,27 @@ expected = {
     for count in (1, 8, 128)
     for method in ("scan", "conditional")
 }
+allocation_control = sys.argv[1] == "true"
+control = ("pkg/lux/h2transport", "BenchmarkTaskDeadlineReplacement/diagnostic-allocation-2")
+if allocation_control:
+    expected.add(control)
 if primary != expected:
     raise SystemExit(f"unexpected primary inventory: {sorted(primary)}")
 targets = {
     tuple(line.split("\t"))
     for line in Path(".tmp/benchmark-confirmation-targets.tsv").read_text().splitlines()
 }
+if not targets and not allocation_control:
+    print(f"Hosted replay sampled {len(primary)} primary cases and selected no confirmation cases.")
+    raise SystemExit(0)
 if not targets or not targets < primary:
     raise SystemExit(f"the hosted run must select a nonempty strict subset, got {sorted(targets)}")
 if cases(".tmp/benchmark-confirmation-expected.json") != targets:
     raise SystemExit("confirmation inventory differs from selected targets")
+if allocation_control:
+    verdict = Path(".tmp/replay-gate.log").read_text()
+    confirmed = "confirmed performance regression: github.com/light-speak/luxo/pkg/lux/h2transport/TaskDeadlineReplacement/diagnostic-allocation-2"
+    if control not in targets or sys.argv[2] != "1" or confirmed not in verdict:
+        raise SystemExit("expected the original gate to reject the allocation control")
 print(f"Hosted replay sampled {len(primary)} primary cases and {len(targets)} confirmation cases.")
 PYTHON

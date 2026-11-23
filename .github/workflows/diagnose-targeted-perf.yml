@@ -28,7 +28,7 @@ jobs:
       - name: Run the pinned production sampling and enforcement steps
         env:
           GOTOOLCHAIN: local
-        run: bash scripts/replay-targeted-perf.sh
+        run: bash scripts/replay-targeted-perf.sh --allocation-control
       - name: Upload scoped replay evidence
         if: always()
         uses: actions/upload-artifact@v7.0.1
