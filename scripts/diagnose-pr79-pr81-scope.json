@@ -1,0 +1,302 @@
+{
+  "pr79": {
+    "head": "e04c586e491b8b215308d10f7228636e38547f5b",
+    "priorRun": 45203124989,
+    "historicalHosts": {
+      "02": "AMD EPYC 9V45",
+      "04": "AMD EPYC 7763",
+      "05": "AMD EPYC 9V74",
+      "06": "AMD EPYC 7763"
+    },
+    "cases": [
+      {
+        "package": "pkg/lux/rpc",
+        "variant": "default",
+        "filter": "^BenchmarkHandlerPanicFormatting$/^StringPanic$/^Before$",
+        "leaves": [
+          "BenchmarkHandlerPanicFormatting/StringPanic/Before-2"
+        ]
+      },
+      {
+        "package": "pkg/lux/h2transport",
+        "variant": "default",
+        "filter": "^BenchmarkRequestHead$",
+        "leaves": [
+          "BenchmarkRequestHead-2"
+        ]
+      },
+      {
+        "package": "pkg/lux/rpc",
+        "variant": "default",
+        "filter": "^BenchmarkRPCHandlerCompletion$/^unobserved$/^(success|error)$",
+        "leaves": [
+          "BenchmarkRPCHandlerCompletion/unobserved/success-2",
+          "BenchmarkRPCHandlerCompletion/unobserved/error-2"
+        ]
+      },
+      {
+        "package": "pkg/lux/h2transport",
+        "variant": "default",
+        "filter": "^BenchmarkReserveData$",
+        "leaves": [
+          "BenchmarkReserveData-2"
+        ]
+      },
+      {
+        "package": "pkg/lux/luvia",
+        "variant": "default",
+        "filter": "^BenchmarkObservationExport$/^trace128$",
+        "leaves": [
+          "BenchmarkObservationExport/trace128-2"
+        ]
+      },
+      {
+        "package": "pkg/lux/luvia",
+        "variant": "default",
+        "filter": "^BenchmarkAuthMiddlewareIsolation$/^anonymous$/^(before|after)$",
+        "leaves": [
+          "BenchmarkAuthMiddlewareIsolation/anonymous/before-2",
+          "BenchmarkAuthMiddlewareIsolation/anonymous/after-2"
+        ]
+      },
+      {
+        "package": "pkg/lux/luvia",
+        "variant": "default",
+        "filter": "^BenchmarkAuthMiddlewareIsolation$/^(invalid|inherited-missing)$/^before$",
+        "leaves": [
+          "BenchmarkAuthMiddlewareIsolation/invalid/before-2",
+          "BenchmarkAuthMiddlewareIsolation/inherited-missing/before-2"
+        ]
+      },
+      {
+        "package": "pkg/lux/luvia",
+        "variant": "tls",
+        "filter": "^BenchmarkDiagnosticGatewayTLS$",
+        "leaves": [
+          "BenchmarkDiagnosticGatewayTLS/start-stop-2",
+          "BenchmarkDiagnosticGatewayTLS/fresh-request-2"
+        ]
+      }
+    ],
+    "unchanged": [
+      "pkg/lux/rpc/handler_panic_bench_test.go",
+      "pkg/lux/rpc/handler_abnormal_bench_test.go",
+      "pkg/lux/rpc/server.go",
+      "pkg/lux/h2transport/receive_bench_test.go",
+      "pkg/lux/h2transport/window_test.go",
+      "pkg/lux/luvia/metrics_export_bench_test.go",
+      "pkg/lux/luvia/middleware_bench_test.go"
+    ],
+    "changed": [
+      "pkg/lux/h2transport/http_server.go",
+      "pkg/lux/h2transport/http_server_test.go",
+      "pkg/lux/luvia/luvia.go",
+      "pkg/lux/luvia/http_transport_test.go"
+    ],
+    "historical": [
+      {
+        "shard": "02",
+        "package": "pkg/lux/rpc",
+        "leaf": "BenchmarkHandlerPanicFormatting/StringPanic/Before-2",
+        "timingPercent": [
+          "+5.03%",
+          "+6.30%"
+        ]
+      },
+      {
+        "shard": "04",
+        "package": "pkg/lux/h2transport",
+        "leaf": "BenchmarkRequestHead-2",
+        "timingPercent": [
+          "+7.55%",
+          "+8.37%"
+        ]
+      },
+      {
+        "shard": "04",
+        "package": "pkg/lux/rpc",
+        "leaf": "BenchmarkRPCHandlerCompletion/unobserved/success-2",
+        "timingPercent": [
+          "+5.40%",
+          "+5.93%"
+        ]
+      },
+      {
+        "shard": "04",
+        "package": "pkg/lux/rpc",
+        "leaf": "BenchmarkRPCHandlerCompletion/unobserved/error-2",
+        "timingPercent": [
+          "+6.32%",
+          "+6.59%"
+        ]
+      },
+      {
+        "shard": "05",
+        "package": "pkg/lux/h2transport",
+        "leaf": "BenchmarkReserveData-2",
+        "timingPercent": [
+          "+15.95%",
+          "+16.19%"
+        ]
+      },
+      {
+        "shard": "06",
+        "package": "pkg/lux/luvia",
+        "leaf": "BenchmarkObservationExport/trace128-2",
+        "timingPercent": [
+          "+9.81%",
+          "+7.33%"
+        ]
+      },
+      {
+        "shard": "06",
+        "package": "pkg/lux/luvia",
+        "leaf": "BenchmarkAuthMiddlewareIsolation/anonymous/before-2",
+        "timingPercent": [
+          "+6.08%",
+          "+5.25%"
+        ]
+      },
+      {
+        "shard": "06",
+        "package": "pkg/lux/luvia",
+        "leaf": "BenchmarkAuthMiddlewareIsolation/anonymous/after-2",
+        "timingPercent": [
+          "+14.51%",
+          "+15.43%"
+        ]
+      },
+      {
+        "shard": "06",
+        "package": "pkg/lux/luvia",
+        "leaf": "BenchmarkAuthMiddlewareIsolation/invalid/before-2",
+        "timingPercent": [
+          "+9.21%",
+          "+8.90%"
+        ]
+      },
+      {
+        "shard": "06",
+        "package": "pkg/lux/luvia",
+        "leaf": "BenchmarkAuthMiddlewareIsolation/inherited-missing/before-2",
+        "timingPercent": [
+          "+5.70%",
+          "+6.06%"
+        ]
+      }
+    ],
+    "controls": [
+      {
+        "package": "pkg/lux/luvia",
+        "leaf": "BenchmarkDiagnosticGatewayTLS/fresh-request-2"
+      },
+      {
+        "package": "pkg/lux/luvia",
+        "leaf": "BenchmarkDiagnosticGatewayTLS/start-stop-2"
+      }
+    ],
+    "tlsFixtureSHA256": "b04a8c9907db0afd69912a20c10c4abd0b5f9e9a73f301bd830d602ffcfba954"
+  },
+  "pr81": {
+    "head": "33ce49477379143a8e3bfcd34a3628ec6a9bc626",
+    "priorRun": 45204001836,
+    "historicalHosts": {
+      "03": "AMD EPYC 7763",
+      "07": "AMD EPYC 7763"
+    },
+    "cases": [
+      {
+        "package": "pkg/lux/luvia",
+        "variant": "default",
+        "filter": "^BenchmarkHistoricalGroupedResponse$",
+        "leaves": [
+          "BenchmarkHistoricalGroupedResponse-2"
+        ]
+      },
+      {
+        "package": "pkg/lux/luvia",
+        "variant": "default",
+        "filter": "^BenchmarkTraceEncodingComparison$/^true$/^reservation-candidate$",
+        "leaves": [
+          "BenchmarkTraceEncodingComparison/true/reservation-candidate-2"
+        ]
+      },
+      {
+        "package": "pkg/lux/rpc",
+        "variant": "default",
+        "filter": "^BenchmarkRPCErrorPanicIsolation$/^(NoData|Internal)$/^Before$",
+        "leaves": [
+          "BenchmarkRPCErrorPanicIsolation/NoData/Before-2",
+          "BenchmarkRPCErrorPanicIsolation/Internal/Before-2"
+        ]
+      },
+      {
+        "package": "pkg/lux/rpc",
+        "variant": "default",
+        "filter": "^BenchmarkRPC_Echo$",
+        "leaves": [
+          "BenchmarkRPC_Echo-2"
+        ]
+      }
+    ],
+    "unchanged": [
+      "pkg/lux/luvia/grouped_response_bench_test.go",
+      "pkg/lux/luvia/metrics_json_test.go",
+      "pkg/lux/luvia/metrics_json.go",
+      "pkg/lux/rpc/error_data_bench_test.go",
+      "pkg/lux/rpc/rpc_test.go",
+      "pkg/lux/rpc/error_write.go"
+    ],
+    "changed": [
+      "pkg/lux/rpc/client.go",
+      "pkg/lux/rpc/pool_conn.go",
+      "pkg/lux/rpc/frame_buffered_test.go",
+      "pkg/lux/rpc/pool_lifecycle_test.go",
+      "pkg/lux/rpc/text_write_test.go"
+    ],
+    "historical": [
+      {
+        "shard": "03",
+        "package": "pkg/lux/luvia",
+        "leaf": "BenchmarkHistoricalGroupedResponse-2",
+        "timingPercent": [
+          "+9.52%",
+          "+8.87%"
+        ]
+      },
+      {
+        "shard": "07",
+        "package": "pkg/lux/luvia",
+        "leaf": "BenchmarkTraceEncodingComparison/true/reservation-candidate-2",
+        "timingPercent": [
+          "+5.91%",
+          "+6.36%"
+        ]
+      },
+      {
+        "shard": "07",
+        "package": "pkg/lux/rpc",
+        "leaf": "BenchmarkRPCErrorPanicIsolation/NoData/Before-2",
+        "timingPercent": [
+          "+18.29%",
+          "+18.68%"
+        ]
+      },
+      {
+        "shard": "07",
+        "package": "pkg/lux/rpc",
+        "leaf": "BenchmarkRPCErrorPanicIsolation/Internal/Before-2",
+        "timingPercent": [
+          "+15.36%",
+          "+15.28%"
+        ]
+      }
+    ],
+    "controls": [
+      {
+        "package": "pkg/lux/rpc",
+        "leaf": "BenchmarkRPC_Echo-2"
+      }
+    ]
+  }
+}

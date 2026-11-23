@@ -1,0 +1,123 @@
+package luvia
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"golang.org/x/net/http2"
+)
+
+func BenchmarkDiagnosticGatewayTLS(b *testing.B) {
+	b.Setenv("APP_HTTP_TRANSPORT", "luxo")
+	cert, key, roots := diagnosticGatewayTLSCredentials(b)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor != 2 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	b.Run("start-stop", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			server, done, err := startGatewayServer("127.0.0.1:0", handler, cert, key)
+			if err != nil {
+				b.Fatal(err)
+			}
+			closeDiagnosticGatewayTLS(b, server, done)
+		}
+	})
+	b.Run("fresh-request", func(b *testing.B) {
+		server, done, err := startGatewayServer("127.0.0.1:0", handler, cert, key)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { closeDiagnosticGatewayTLS(b, server, done) })
+		config := &tls.Config{RootCAs: roots, NextProtos: []string{"h2"}}
+		dialer := &tls.Dialer{Config: config}
+		transport := &http2.Transport{}
+		b.ReportAllocs()
+		for b.Loop() {
+			if err := oneDiagnosticGatewayTLSRequest(b.Context(), server.Addr, dialer, transport); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+func diagnosticGatewayTLSCredentials(b *testing.B) (certFile, keyFile string, roots *x509.CertPool) {
+	b.Helper()
+	local := httptest.NewTLSServer(http.NotFoundHandler())
+	cert := local.TLS.Certificates[0]
+	roots = x509.NewCertPool()
+	roots.AddCert(local.Certificate())
+	local.Close()
+	encodedKey, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
+	if err != nil {
+		b.Fatal(err)
+	}
+	dir := b.TempDir()
+	certFile, keyFile = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0600); err != nil {
+		b.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: encodedKey}), 0600); err != nil {
+		b.Fatal(err)
+	}
+	return certFile, keyFile, roots
+}
+
+func closeDiagnosticGatewayTLS(b *testing.B, server *gatewayHTTPServer, done <-chan error) {
+	b.Helper()
+	if err := server.Close(); err != nil {
+		b.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, http.ErrServerClosed) {
+			b.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		b.Fatal("gateway did not stop")
+	}
+}
+
+func oneDiagnosticGatewayTLSRequest(parent context.Context, addr string, dialer *tls.Dialer, transport *http2.Transport) error {
+	ctx, cancel := context.WithTimeout(parent, 3*time.Second)
+	defer cancel()
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if conn.(*tls.Conn).ConnectionState().NegotiatedProtocol != "h2" {
+		return errors.New("expected TLS h2 ALPN")
+	}
+	peer, err := transport.NewClientConn(conn)
+	if err != nil {
+		return err
+	}
+	defer peer.Close()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+addr, nil)
+	if err != nil {
+		return err
+	}
+	response, err := peer.RoundTrip(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent || response.ProtoMajor != 2 {
+		return errors.New("expected a successful HTTP/2 response")
+	}
+	return nil
+}
