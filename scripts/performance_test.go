@@ -176,3 +176,39 @@ func TestPerformancePlanArtifactUsesProducingAttempt(t *testing.T) {
 	}
 	t.Fatal("missing benchmark plan loading")
 }
+
+func TestPerformancePreparesScratchWithinBothRevisions(t *testing.T) {
+	for _, stage := range []struct{ job, step string }{
+		{"performance-scope", "Discover and plan benchmark batches"},
+		{"performance-samples", "Compile benchmark binaries"},
+	} {
+		t.Run(stage.job, func(t *testing.T) {
+			fixture := newQualityFixture(t)
+			for _, revision := range []string{"base", "head"} {
+				fixture.write(t, ".tmp/"+revision+"/go.mod", "")
+			}
+			fixture.write(t, "bin/mkdir", "#!/bin/sh\nexec /bin/mkdir \"$@\"\n")
+			fixture.write(t, "scripts/setup-modules.sh", "#!/bin/sh\nexit 0\n")
+			fixture.write(t, ".tmp/benchmark-packages.txt", "pkg/lux/pg\n")
+			fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/lux/pg\t^BenchmarkPendingMigrationFiles$\n")
+			fixture.write(t, ".tmp/bin/benchrun", `#!/bin/sh
+set -eu
+printf '%s %s\n' "$1" "$2" >> "$QUALITY_LOG"
+if [ ! -d "$2/.tmp" ]; then
+    printf 'missing benchmark scratch: %s/.tmp\n' "$2" >&2
+    exit 1
+fi
+`)
+			script := "export GITHUB_OUTPUT=.tmp/outputs RUN_ATTEMPT=1\n" + performanceStep(t, stage.job, stage.step)
+			output, log, err := fixture.run(t, script)
+			if err != nil {
+				t.Fatalf("benchmark setup failed: %v\n%s", err, output)
+			}
+			for _, revision := range []string{"base", "head"} {
+				if !strings.Contains(log, "compile .tmp/"+revision+"\n") {
+					t.Errorf("revision %s did not reach compilation:\n%s", revision, log)
+				}
+			}
+		})
+	}
+}
