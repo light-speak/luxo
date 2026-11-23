@@ -16,11 +16,124 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/httputil"
 	"github.com/light-speak/luxo/pkg/lux/schema"
+	"github.com/spf13/cobra"
 )
+
+func TestCLICallHonorsCommandContext(t *testing.T) {
+	for _, mode := range []string{"json", "binary"} {
+		t.Run(mode, func(t *testing.T) {
+			enterCacheGenerationScratch(t)
+			writeCLIResponseReadSchema(t)
+			var requests atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				_, _ = io.WriteString(w, `{"data":42}`)
+			}))
+			defer server.Close()
+			useCLICallHost(t, server.URL)
+			oldJSON := callJSON
+			callJSON = mode == "json"
+			t.Cleanup(func() { callJSON = oldJSON })
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			cmd := newCLICallCommand(ctx)
+			output, err := captureCLIResponse(t, func() error { return runCall(cmd, []string{"echo"}) })
+			if !errors.Is(err, context.Canceled) || requests.Load() != 0 || output != "" {
+				t.Fatalf("cancelled command contacted server or printed output: requests=%d output=%q err=%v", requests.Load(), output, err)
+			}
+		})
+	}
+}
+
+func newCLICallCommand(ctx context.Context) *cobra.Command {
+	var cmd cobra.Command
+	cmd.SetContext(ctx)
+	return &cmd
+}
+
+func TestCLICallEnforcesResponseBodyLimit(t *testing.T) {
+	for _, mode := range []string{"json", "binary"} {
+		t.Run(mode, func(t *testing.T) {
+			enterCacheGenerationScratch(t)
+			writeCLIResponseReadSchema(t)
+			oldJSON, oldLimit := callJSON, callResponseMaxBytes
+			callJSON = mode == "json"
+			t.Cleanup(func() { callJSON, callResponseMaxBytes = oldJSON, oldLimit })
+			payload, expected := []byte(`{"data":900}`), "{\"data\":900}\n"
+			if !callJSON {
+				payload, expected = codec.AppendSvarint(nil, 900), "900\n"
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if mode == "binary" {
+					w.Header().Set("X-Luxo-Mode", "binary")
+				}
+				_, _ = w.Write(payload)
+			}))
+			defer server.Close()
+			useCLICallHost(t, server.URL)
+			call := func() (string, error) {
+				return captureCLIResponse(t, func() error { return runCall(newCLICallCommand(t.Context()), []string{"echo"}) })
+			}
+			callResponseMaxBytes = int64(len(payload))
+			if out, err := call(); err != nil || out != expected {
+				t.Fatalf("response at the limit failed: %q %v", out, err)
+			}
+			callResponseMaxBytes--
+			out, err := call()
+			var limitErr *httputil.ResponseBodyLimitError
+			if out != "" || !errors.As(err, &limitErr) || limitErr.Limit != callResponseMaxBytes {
+				t.Fatalf("response over the limit printed data or returned an unrelated error: %q %v", out, err)
+			}
+		})
+	}
+}
+
+func TestCLICallTimeoutIncludesResponseBody(t *testing.T) {
+	requestDone := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(requestDone)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(3 * time.Second):
+			_, _ = io.WriteString(w, `{"data":42}`)
+		}
+	}))
+	defer server.Close()
+	useCLICallHost(t, server.URL)
+	oldJSON, oldTimeout := callJSON, callTimeout
+	callJSON, callTimeout = true, 300*time.Millisecond
+	t.Cleanup(func() { callJSON, callTimeout = oldJSON, oldTimeout })
+	output, err := captureCLIResponse(t, func() error { return runCall(newCLICallCommand(t.Context()), []string{"echo"}) })
+	if output != "" || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("body read exceeded the deadline or returned partial output: %q %v", output, err)
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not observe the cancellation")
+	}
+}
+
+func TestCLICallRejectsInvalidResponseSettings(t *testing.T) {
+	oldTimeout, oldLimit := callTimeout, callResponseMaxBytes
+	t.Cleanup(func() { callTimeout, callResponseMaxBytes = oldTimeout, oldLimit })
+	cmd := newCLICallCommand(t.Context())
+	callTimeout = 0
+	if err := runCall(cmd, []string{"echo"}); err == nil || !strings.Contains(err.Error(), "--timeout") {
+		t.Fatalf("invalid timeout: %v", err)
+	}
+	callTimeout, callResponseMaxBytes = oldTimeout, 0
+	if err := runCall(cmd, []string{"echo"}); err == nil || !strings.Contains(err.Error(), "--max-response-bytes") {
+		t.Fatalf("invalid response budget: %v", err)
+	}
+}
 
 func TestCLIJSONCallKeepsRequestedAPI(t *testing.T) {
 	router, requested, unexpected := newCLIAPIAuthorityRouter(t)
@@ -37,7 +150,7 @@ func TestCLIJSONCallKeepsRequestedAPI(t *testing.T) {
 			before := requested.Load()
 			beforeUnexpected := unexpected.Load()
 			output, err := captureCLIResponse(t, func() error {
-				return runCall(nil, append([]string{"requested"}, params...))
+				return runCall(newCLICallCommand(t.Context()), append([]string{"requested"}, params...))
 			})
 			var response struct {
 				Data int64 `json:"data"`
@@ -95,7 +208,7 @@ func TestCLIJSONAPIAuthorityPreservesNestedJSONAndSelection(t *testing.T) {
 	callHost, callSelect = server.URL, "id,name"
 	defer func() { callHost, callSelect = oldHost, oldSelect }()
 	output, err := captureCLIResponse(t, func() error {
-		return callJSONMode("requested", []string{"$api=unexpected", "payload=" + payload})
+		return callJSONMode(t.Context(), "requested", []string{"$api=unexpected", "payload=" + payload})
 	})
 	if err != nil || output != "{\"data\":42}\n" {
 		t.Fatalf("JSON call failed: %v %q", err, output)
@@ -193,7 +306,7 @@ func TestCLIJSONModePreservesNumericTokens(t *testing.T) {
 	t.Cleanup(func() { callHost = previous })
 	for _, token := range cliNumberTokens(t) {
 		for _, value := range []string{token, `{"n":` + token + `}`, `[` + token + `,null]`} {
-			if err := callJSONMode("echoJSON", []string{"value=" + value}); err != nil {
+			if err := callJSONMode(t.Context(), "echoJSON", []string{"value=" + value}); err != nil {
 				t.Fatal(err)
 			}
 			if actual := string(<-received); actual != value {
@@ -442,9 +555,9 @@ func TestCLICallRejectsIncompleteHTTPBody(t *testing.T) {
 					useCLICallHost(t, server.URL)
 					output, err := captureCLIResponse(t, func() error {
 						if mode == "binary" {
-							return callBinaryMode("echo", nil)
+							return callBinaryMode(t.Context(), "echo", nil)
 						}
-						return callJSONMode("echo", nil)
+						return callJSONMode(t.Context(), "echo", nil)
 					})
 					if sample.extra != 0 || sample.short {
 						if !errors.Is(err, io.ErrUnexpectedEOF) || output != "" {
@@ -491,9 +604,9 @@ func TestCLICallReportsJSONHTTPFailure(t *testing.T) {
 					useCLICallHost(t, server.URL)
 					output, err := captureCLIResponse(t, func() error {
 						if mode == "binary_fallback" {
-							return callBinaryMode("echo", nil)
+							return callBinaryMode(t.Context(), "echo", nil)
 						}
-						return callJSONMode("echo", nil)
+						return callJSONMode(t.Context(), "echo", nil)
 					})
 					if (err != nil) != (status >= 300) || output != body+"\n" {
 						t.Fatalf("status %d: output=%q error=%v", status, output, err)
@@ -526,7 +639,7 @@ func TestCLICallPreservesBinaryHTTPError(t *testing.T) {
 	}))
 	defer server.Close()
 	useCLICallHost(t, server.URL)
-	output, err := captureCLIResponse(t, func() error { return callBinaryMode("echo", nil) })
+	output, err := captureCLIResponse(t, func() error { return callBinaryMode(t.Context(), "echo", nil) })
 	var remote *api.BinaryError
 	if !errors.As(err, &remote) || remote.Code != 404 || remote.Name != "NotFound" || remote.Message != "missing" || output != "" {
 		t.Fatalf("binary error changed: output=%q err=%v", output, err)
@@ -593,7 +706,9 @@ func TestCLIBinaryRequestReachesRouterWithStableIDs(t *testing.T) {
 	previousJSON := callJSON
 	callJSON, callSelect = false, "id"
 	t.Cleanup(func() { callJSON = previousJSON })
-	output, err := captureCLIResponse(t, func() error { return runCall(nil, []string{"read", "value=9007199254740993"}) })
+	output, err := captureCLIResponse(t, func() error {
+		return runCall(newCLICallCommand(t.Context()), []string{"read", "value=9007199254740993"})
+	})
 	if err != nil || output != "{\"id\":9007199254740993}\n" || calls.Load() != 1 {
 		t.Fatalf("binary Router result: output=%q err=%v calls=%d", output, err, calls.Load())
 	}
@@ -634,7 +749,7 @@ func TestCLIBinaryInvalidRequestsNeverReachTransport(t *testing.T) {
 	} {
 		t.Run(sample.name, func(t *testing.T) {
 			callSelect = sample.selectText
-			output, err := captureCLIResponse(t, func() error { return callBinaryMode(sample.api, sample.params) })
+			output, err := captureCLIResponse(t, func() error { return callBinaryMode(t.Context(), sample.api, sample.params) })
 			if err == nil || !strings.Contains(err.Error(), sample.diagnostic) || output != "" || transport.calls != 0 {
 				t.Fatalf("invalid input reached network or lost error: %q %v calls=%d", output, err, transport.calls)
 			}
@@ -658,14 +773,14 @@ func TestCLICallPreservesTransportFailure(t *testing.T) {
 			if mode == "binary" {
 				invoke = callBinaryMode
 			}
-			output, err := captureCLIResponse(t, func() error { return invoke("scalar", nil) })
+			output, err := captureCLIResponse(t, func() error { return invoke(t.Context(), "scalar", nil) })
 			if !errors.Is(err, cause) || output != "" || transport.calls != before+1 {
 				t.Fatalf("transport failure changed: %q %v calls=%d", output, err, transport.calls)
 			}
 		})
 	}
 	callHost = "http://["
-	output, err := captureCLIResponse(t, func() error { return callBinaryMode("scalar", nil) })
+	output, err := captureCLIResponse(t, func() error { return callBinaryMode(t.Context(), "scalar", nil) })
 	if err == nil || output != "" || transport.calls != 2 {
 		t.Fatalf("malformed host reached transport: %q %v calls=%d", output, err, transport.calls)
 	}
@@ -673,7 +788,7 @@ func TestCLICallPreservesTransportFailure(t *testing.T) {
 
 func TestCLIBinaryCallReportsSchemaFailure(t *testing.T) {
 	enterCacheGenerationScratch(t)
-	output, err := captureCLIResponse(t, func() error { return callBinaryMode("read", nil) })
+	output, err := captureCLIResponse(t, func() error { return callBinaryMode(t.Context(), "read", nil) })
 	if !errors.Is(err, os.ErrNotExist) || output != "" {
 		t.Fatalf("missing schema changed: %q %v", output, err)
 	}
@@ -689,7 +804,7 @@ func TestCLIBinaryCallRejectsMalformedRemoteError(t *testing.T) {
 	}))
 	defer server.Close()
 	useCLICallHost(t, server.URL)
-	output, err := captureCLIResponse(t, func() error { return callBinaryMode("scalar", nil) })
+	output, err := captureCLIResponse(t, func() error { return callBinaryMode(t.Context(), "scalar", nil) })
 	var remote *api.BinaryError
 	if err == nil || errors.As(err, &remote) || output != "" {
 		t.Fatalf("malformed remote error was accepted or printed: %q %v", output, err)
