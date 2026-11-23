@@ -1,0 +1,91 @@
+name: Diagnose rooted Windows rename for Dart
+
+on:
+  push:
+    branches: [diagnostics/hosted-perf-pr71-pr72]
+    paths:
+      - .github/workflows/diagnose-dart-windows-rename-abi.yml
+      - scripts/diagnose-dart-windows-rename-abi.ps1
+
+permissions:
+  contents: read
+
+jobs:
+  windows-rename-abi:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
+    runs-on: windows-latest
+    timeout-minutes: 5
+    env:
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: core.autocrlf
+      GIT_CONFIG_VALUE_0: 'false'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Probe native rooted rename variants
+        timeout-minutes: 2
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:GITHUB_WORKSPACE '.tmp/windows-rename-abi/evidence'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $log = Join-Path $evidence 'probe.log'
+          $raw = Join-Path $evidence 'rename-results.json'
+          $workflow = '.github/workflows/diagnose-dart-windows-rename-abi.yml'
+          $probe = 'scripts/diagnose-dart-windows-rename-abi.ps1'
+          $checkout = git rev-parse HEAD
+          "head=$checkout expected=$env:GITHUB_SHA powershell=$($PSVersionTable.PSVersion)" |
+            Set-Content -LiteralPath $log -Encoding utf8
+          if ($LASTEXITCODE -ne 0 -or $checkout -ne $env:GITHUB_SHA) {
+            throw 'Expected the exact push revision in the Windows checkout.'
+          }
+          Get-FileHash -Algorithm SHA256 -LiteralPath $workflow, $probe | Format-List | Out-String |
+            Add-Content -LiteralPath $log -Encoding utf8
+          try {
+            & "./$probe" -ProjectRoot $env:GITHUB_WORKSPACE 1> $raw 2>> $log
+          } catch {
+            $_ | Out-String | Add-Content -LiteralPath $log -Encoding utf8
+            throw
+          }
+
+      - name: Verify and print the diagnostic verdict
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:GITHUB_WORKSPACE '.tmp/windows-rename-abi/evidence'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $log = Join-Path $evidence 'probe.log'
+          $raw = Join-Path $evidence 'rename-results.json'
+          if (-not (Test-Path -LiteralPath $raw) -or (Get-Item -LiteralPath $raw).Length -eq 0) {
+            '{"Verdict":"probe-unavailable","Rows":[]}' | Set-Content -LiteralPath $raw -Encoding utf8
+            'verdict=probe-unavailable' | Add-Content -LiteralPath $log -Encoding utf8
+            throw 'The native probe returned no raw observations.'
+          }
+          try {
+            $result = Get-Content -LiteralPath $raw -Raw | ConvertFrom-Json
+          } catch {
+            'verdict=invalid-json' | Add-Content -LiteralPath $log -Encoding utf8
+            throw
+          }
+          ("verdict={0} observations={1}/{2} original-fresh-error-87={3} candidates={4}" -f
+            $result.Verdict, $result.Rows.Count, $result.ExpectedRows, $result.OriginalWin32FreshError87,
+            ($result.CandidateLabels -join ',')) | Add-Content -LiteralPath $log -Encoding utf8
+          Get-Content -LiteralPath $log
+          if ($result.Verdict -notin @('rooted-candidate-observed', 'no-rooted-candidate-observed') -or
+              $result.Rows.Count -ne $result.ExpectedRows -or $result.ExpectedRows -ne 80 -or
+              $result.UnverifiedRows -ne 0 -or $result.UnstableGroups.Count -ne 0) {
+            throw "Invalid native observations ($($result.Verdict))."
+          }
+
+      - name: Preserve the raw JSON and native diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: dart-windows-rename-abi-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/windows-rename-abi/evidence/
+          if-no-files-found: error
+          retention-days: 14
