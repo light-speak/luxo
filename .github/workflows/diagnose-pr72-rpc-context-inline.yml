@@ -1,4 +1,4 @@
-name: Validate PR 72 RPC early-return timing
+name: Validate PR 72 RPC error paths and array header timing
 
 on:
   push:
