@@ -1,0 +1,5 @@
+pkg/codegen	^BenchmarkAuditScalarProjectionAnalysis$/^(single|await-single|fanout-2|fanout-16|await-tuple|alias-reused)$
+pkg/codegen	^BenchmarkAuditScalarPaginationPlan$/^(selected-alias|destructured-query|repeated-builder-alias|consumed-alias)$
+pkg/codegen	^BenchmarkSelectedQueryObjectGeneration$/^(copy|ordinary)$/^(1|32)$
+pkg/codegen	^BenchmarkPaginationCandidate$/^(selected-alias|object-copy)$/^Generate$
+pkg/codegen	^BenchmarkGenerateStandaloneAwaitBindings$/^(nullable-query|shadow)$

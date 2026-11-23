@@ -1,0 +1,64 @@
+{
+  "base": "65f1892e175487503aa36caa86d1eb8a0805f073",
+  "baseTree": "7a051ccbdd2ddbf9c341fd7906cd3c5f3e88dc44",
+  "candidateFiles": {
+    "internal/inferred/pagination.go": "3f1003dc70f0865aaefa27299b4958e9152df0f0f915d53141bffa6bb2a1b2cc",
+    "internal/inferred/pagination_contract_test.go": "a6ef9a646333ad45a8d31dd859ead6889b88c8db95eff1079336907476c4927c",
+    "pkg/codegen/await_dependencies.go": "e1b0e254ffc33d862b1665eb42426c2947dad74539fc7b071d86777b29919df3",
+    "pkg/codegen/compile.go": "eb4270e73baae8885ea12ad50b3b7306787e1ebb5e9a2758e226f57b285807fb",
+    "pkg/codegen/compile_await.go": "6cc28372b3d5cde74f05c73780807f5d02258e64518f2283e75887fcd9344262",
+    "pkg/codegen/compile_pagination_test.go": "9e7c0c3e504981d05363f5af44a22433b8eea2d71792eb90efc759af0adf27dc",
+    "pkg/codegen/load_selection.go": "90c6672e9b5cf6169ed4fd61da03d015af5c2900bcea6c0ddc91a52fc9f32600",
+    "pkg/codegen/load_selection_object.go": "30d3e007ba54f72550f96c8aeec76df779a9f9c288b850ab0b07056d57b7743e",
+    "pkg/codegen/load_selection_object_test.go": "35c539e8fbca84f5f068eb32bfc62fb9b1d622c3cef1073494223f05194d6fc1",
+    "pkg/codegen/pagination_destructuring_test.go": "b0d08fd5048cb88f837903b5425d44dc8ab91aa4373378237756eeba000bdaf8",
+    "pkg/codegen/sealed_mutation_test.go": "44cad25b8e869c9007ed3086cb31472f488dae3c44d1ceb8a8722ba8121a1ad9"
+  },
+  "candidateOverlaySHA256": "dc77f08650ca2fcbfffa734b7bc7127e06c2303a7f55a2af7c633f9881dd0cd3",
+  "fixture": {
+    "source": "audit_scalar_projection_native_test.go.txt",
+    "copyToBothSides": "pkg/codegen/audit_scalar_projection_native_test.go",
+    "sha256": "eebd67f86bbd156db69c0cd1a7f49ffc317df7f9b49f51620c5dbbbbebf48d2f"
+  },
+  "replay": {
+    "benchmarkBatch": "benchmark-batch.tsv",
+    "expected": "benchmark-expected.json",
+    "harness": ".github/workflows/test.yml at base commit, step Run adaptive interleaved benchmark samples",
+    "prepare": "Materialize Git archive twice and overlay only candidateFiles on head. Verify SHA-256 and add the shared fixture to both checkouts. Use scripts/setup-modules.sh per checkout, then base scripts/benchrun compile for each pkg/codegen.",
+    "compilerFlags": "Go 1.27.1 native, -trimpath, default linker, identical native Go/CGO settings on both arms; unset GOFLAGS and additional linker overrides.",
+    "timing": "Use an isolated native runner and the existing AB/BA workflow loop with 10 pairs and -test.benchmem -test.benchtime=200ms -test.cpu=2. Preserve independent confirmation for a flagged primary. Keep A/A same runner if diagnosing noisy default layout.",
+    "gate": "Existing benchplan --normalize and --verify, pinned benchstat alpha .01, existing benchgate with the exact baseline. Preserve ns/op, B/op and allocs/op and per-leaf diagnostics. No cost approval inherited.",
+    "semanticallyChanged": [
+      "BenchmarkAuditScalarProjectionAnalysis/await-single-2",
+      "BenchmarkAuditScalarProjectionAnalysis/fanout-2-2",
+      "BenchmarkAuditScalarProjectionAnalysis/fanout-16-2",
+      "BenchmarkAuditScalarProjectionAnalysis/await-tuple-2",
+      "BenchmarkAuditScalarProjectionAnalysis/alias-reused-2",
+      "BenchmarkAuditScalarPaginationPlan/destructured-query-2"
+    ],
+    "outcomeDifference": "Interpret changed rows as compiler work for restored correctness. They do not cancel other costs. Full Generate of the leading-discard case is a correctness test only since the baseline exits with a Go formatting error."
+  },
+  "smoke": {
+    "go": "go version go1.27.1 darwin/arm64",
+    "mode": "Native default-linker, Go benchmark 1x. Functional smoke with no statistical performance conclusion.",
+    "benchmarksPerArm": 18,
+    "completedProcessesPerArm": 5,
+    "benchmarkBinariesSHA256": {
+      "baseline": "327e7f05c0dcf4e756f4e4a86db8732c490f970d169088abd1d37a2ec37ded20",
+      "candidate": "8c9854f2fba565fd56a1d8e955d17c210542496edceb426fb0a83b85827e5755"
+    },
+    "destructuredPagingSQLWindows": {
+      "baseline": 0,
+      "candidate": 1
+    },
+    "destructuredFullGenerate": {
+      "baseline": "format handler.gen.go: handler.gen.go:39:3: expected statement, found ','",
+      "candidate": "TestGeneratedScalarDestructuringPreservesPagination query_alias and shadow_with_manual_list pass"
+    },
+    "rejection": "consumed-alias semantic error and PlanPagination diagnostic asserted on both arms",
+    "candidateFocusedSubtests": 18,
+    "candidateVet": "./pkg/codegen ./internal/inferred passed",
+    "fixtureLint": "gofmt -s and gocyclo -over 25 clean",
+    "verifierSmoke": "Synthetic repetition of the real completed 1x output to test framing only. Both expected sets pass and a removed leaf is rejected at 9/10. No sample repetition may be used for real runs."
+  }
+}

@@ -1,0 +1,150 @@
+{
+  "Base": [
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarPaginationPlan/consumed-alias-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarPaginationPlan/destructured-query-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarPaginationPlan/repeated-builder-alias-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarPaginationPlan/selected-alias-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarProjectionAnalysis/alias-reused-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarProjectionAnalysis/await-single-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarProjectionAnalysis/await-tuple-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarProjectionAnalysis/fanout-16-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarProjectionAnalysis/fanout-2-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarProjectionAnalysis/single-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateStandaloneAwaitBindings/nullable-query-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateStandaloneAwaitBindings/shadow-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkPaginationCandidate/object-copy/Generate-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkPaginationCandidate/selected-alias/Generate-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkSelectedQueryObjectGeneration/copy/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkSelectedQueryObjectGeneration/copy/32-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkSelectedQueryObjectGeneration/ordinary/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkSelectedQueryObjectGeneration/ordinary/32-2"
+    }
+  ],
+  "Head": [
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarPaginationPlan/consumed-alias-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarPaginationPlan/destructured-query-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarPaginationPlan/repeated-builder-alias-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarPaginationPlan/selected-alias-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarProjectionAnalysis/alias-reused-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarProjectionAnalysis/await-single-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarProjectionAnalysis/await-tuple-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarProjectionAnalysis/fanout-16-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarProjectionAnalysis/fanout-2-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkAuditScalarProjectionAnalysis/single-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateStandaloneAwaitBindings/nullable-query-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateStandaloneAwaitBindings/shadow-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkPaginationCandidate/object-copy/Generate-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkPaginationCandidate/selected-alias/Generate-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkSelectedQueryObjectGeneration/copy/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkSelectedQueryObjectGeneration/copy/32-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkSelectedQueryObjectGeneration/ordinary/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkSelectedQueryObjectGeneration/ordinary/32-2"
+    }
+  ]
+}

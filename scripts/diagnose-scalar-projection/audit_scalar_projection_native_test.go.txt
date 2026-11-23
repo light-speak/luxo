@@ -1,0 +1,85 @@
+package codegen
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/light-speak/luxo/internal/inferred"
+	"github.com/light-speak/luxo/pkg/ast"
+)
+
+func BenchmarkAuditScalarProjectionAnalysis(b *testing.B) {
+	const declarations = "model Node @noTime { id: Int @id name: String }\ntype Box { rows: [Node] }\n"
+	longAliases := make([]string, 16)
+	for index := range longAliases {
+		longAliases[index] = fmt.Sprintf("alias%d", index)
+	}
+	samples := []struct {
+		name, body string
+		queries    int
+	}{
+		{"single", "val box = Box { rows: Node.select().all() } return box.rows", 1},
+		{"await-single", "val rows = await { Node.select().all() } return rows", 1},
+		{"fanout-2", "val (first, second) = Box { rows: Node.select().all() } first.rows = [] return second.rows", 1},
+		{"fanout-16", "val (" + strings.Join(longAliases, ", ") + ") = Box { rows: Node.select().all() } alias0.rows = [] return alias15.rows", 1},
+		{"await-tuple", "val (rows, _) = await { Node.select().all() 42 } return rows", 1},
+		{"alias-reused", `val box = Box { rows: Node.select().all() } val (first, second) = box first.rows = Node.select().all() val names = second.rows.map { it.name } return first.rows`, 2},
+	}
+	for _, sample := range samples {
+		b.Run(sample.name, func(b *testing.B) {
+			input := analyzePermissionFixture(b, declarations+"api lookup(): [Node] { "+sample.body+" }")
+			if len(input.Errors) != 0 {
+				b.Fatal(input.Errors)
+			}
+			models, _ := collectInferredAPIs(input)
+			declaration := input.Files[0].APIs[0]
+			b.ReportAllocs()
+			for b.Loop() {
+				if len(analyzeSelectedQueryProjections(declaration.Body, models, declaration.ReturnType)) != sample.queries {
+					b.Fatalf("expected %d selected queries", sample.queries)
+				}
+			}
+		})
+	}
+}
+
+// The destructured baseline may leave the window in memory; re-run the
+// formal A-batch test to distinguish correctness from this compile-time cost.
+func BenchmarkAuditScalarPaginationPlan(b *testing.B) {
+	const model = "model Node @noTime { id: Int @id name: String }\n"
+	for _, sample := range []struct {
+		name, body string
+		reject     bool
+	}{
+		{"selected-alias", `val query = Node.select() return query.all()`, false},
+		{"destructured-query", `val (_, rows) = Node.orderBy(id.asc).all() return rows`, false},
+		{"repeated-builder-alias", `val query = Node.select() val old = query.all() val alias = query return alias.all()`, false},
+		{"consumed-alias", `val rows = Node.all() val alias = rows val count = alias.size return rows`, true},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			input := analyzePermissionFixture(b, model+"api lookup(): [Node] @paginate {"+sample.body+"}")
+			file := input.Files[0]
+			models := map[string]*ast.ModelDecl{"Node": file.Models[0]}
+			var plan *inferred.PaginationPlan
+			var err error
+			b.ReportAllocs()
+			for b.Loop() {
+				plan, err = inferred.PlanPagination(file.APIs[0], models, nil)
+			}
+			if sample.reject {
+				if plan != nil || err == nil || !strings.Contains(err.Error(), "cannot safely push down pagination") || len(input.Errors) == 0 {
+					b.Fatalf("expected pagination rejection, got plan=%v err=%v semantic=%v", plan, err, input.Errors)
+				}
+				return
+			}
+			if plan == nil || err != nil || len(input.Errors) != 0 {
+				b.Fatalf("expected a valid plan, got plan=%v err=%v semantic=%v", plan, err, input.Errors)
+			}
+			if sample.name != "destructured-query" && len(plan.Queries) != 1 {
+				b.Fatalf("expected a single pushed window, got %d", len(plan.Queries))
+			}
+			b.Logf("pushed windows=%d", len(plan.Queries))
+		})
+	}
+}
