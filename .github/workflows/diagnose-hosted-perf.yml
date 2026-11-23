@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [pr74, pr78]
+        suite: [pr78]
     steps:
       - uses: actions/checkout@v7
         with:
