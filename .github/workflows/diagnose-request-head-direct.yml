@@ -1,0 +1,47 @@
+name: Measure HTTP/2 request-head parsing
+
+on:
+  push:
+    branches: [diagnostics/hosted-perf-pr71-pr72]
+    paths:
+      - .github/workflows/diagnose-request-head-direct.yml
+      - scripts/diagnose-request-head-direct.sh
+      - scripts/diagnose-request-head-direct.go.txt
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-request-head-direct
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Verify the wire contract and measure exact A/A and A/B
+        timeout-minutes: 18
+        run: bash scripts/diagnose-request-head-direct.sh
+      - name: Preserve sample and source evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: hosted-request-head-direct-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-request-head-direct/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Clean diagnostic evidence after upload
+        if: always()
+        run: rm -rf -- .tmp/hosted-request-head-direct

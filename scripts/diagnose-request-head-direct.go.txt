@@ -1,0 +1,127 @@
+package h2transport
+
+import (
+	"bytes"
+	"crypto/tls"
+	"crypto/x509"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+)
+
+func BenchmarkDiagnosticRequestHeadRegular(b *testing.B) {
+	fields := requestFields(
+		hpack.HeaderField{Name: "content-length", Value: "4096"},
+		hpack.HeaderField{Name: "content-type", Value: "application/octet-stream"},
+		hpack.HeaderField{Name: "x-benchmark-request", Value: "fixture"},
+	)
+	frame := &http2.MetaHeadersFrame{
+		HeadersFrame: &http2.HeadersFrame{FrameHeader: http2.FrameHeader{StreamID: 1}},
+		Fields:       fields,
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		head, err := parseRequestHead(frame)
+		if err != nil || head.contentLength != 4096 || len(head.fields) != 3 ||
+			head.fields[2] != fields[len(fields)-1] {
+			b.Fatalf("request head changed: %+v, %v", head, err)
+		}
+	}
+}
+
+const diagnosticRequestTarget = "/a%20b?tag=fixture"
+
+func BenchmarkDiagnosticRequestHeadPublic(b *testing.B) {
+	b.Run("h2c", func(b *testing.B) { benchmarkDiagnosticRequestHeadPublic(b, false) })
+	b.Run("tls", func(b *testing.B) { benchmarkDiagnosticRequestHeadPublic(b, true) })
+}
+
+func benchmarkDiagnosticRequestHeadPublic(b *testing.B, secure bool) {
+	b.Helper()
+	payload := bytes.Repeat([]byte("0123456789abcdef"), 256)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ProtoMajor != 2 || (r.TLS != nil) != secure || r.RequestURI != diagnosticRequestTarget ||
+			r.Method != http.MethodPost || r.ContentLength != int64(len(payload)) ||
+			r.Header.Get("X-Benchmark-Request") != "fixture" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("X-Benchmark-Response", "echo")
+		_, _ = io.Copy(w, r.Body)
+	})
+	peer, address := diagnosticRequestHeadPeer(b, handler, secure)
+	call := func() {
+		request, err := http.NewRequestWithContext(b.Context(), http.MethodPost, address+diagnosticRequestTarget, bytes.NewReader(payload))
+		if err != nil {
+			b.Fatal(err)
+		}
+		request.Header.Set("X-Benchmark-Request", "fixture")
+		response, err := peer.RoundTrip(request)
+		if err != nil {
+			b.Fatal(err)
+		}
+		body, readErr := io.ReadAll(response.Body)
+		closeErr := response.Body.Close()
+		if readErr != nil || closeErr != nil || response.StatusCode != http.StatusOK || response.ProtoMajor != 2 ||
+			response.Header.Get("X-Benchmark-Response") != "echo" || !bytes.Equal(body, payload) {
+			b.Fatalf("unexpected HTTP/2 echo: status %d, length %d, read %v, close %v", response.StatusCode, len(body), readErr, closeErr)
+		}
+	}
+	for range 32 {
+		call()
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		call()
+	}
+}
+
+func diagnosticRequestHeadPeer(b *testing.B, handler http.Handler, secure bool) (*http2.ClientConn, string) {
+	b.Helper()
+	server, err := NewServer(handler)
+	if err != nil {
+		b.Fatal(err)
+	}
+	public := httptest.NewUnstartedServer(nil)
+	if err := server.ConfigureHTTPServer(public.Config); err != nil {
+		_ = public.Listener.Close()
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = server.Close(); public.Close() })
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	var conn net.Conn
+	if secure {
+		public.TLS = public.Config.TLSConfig.Clone()
+		public.TLS.MinVersion = tls.VersionTLS13
+		public.StartTLS()
+		roots := x509.NewCertPool()
+		roots.AddCert(public.Certificate())
+		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: &tls.Config{
+			RootCAs: roots, MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"},
+		}}
+		conn, err = tlsDialer.DialContext(b.Context(), "tcp", public.Listener.Addr().String())
+	} else {
+		public.Start()
+		conn, err = dialer.DialContext(b.Context(), "tcp", public.Listener.Addr().String())
+	}
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = conn.Close() })
+	if secure && conn.(*tls.Conn).ConnectionState().NegotiatedProtocol != "h2" {
+		b.Fatal("TLS did not negotiate HTTP/2")
+	}
+	transport := &http2.Transport{}
+	peer, err := transport.NewClientConn(conn)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = peer.Close() })
+	return peer, public.URL
+}
