@@ -224,3 +224,56 @@ func BenchmarkTaskDeadlineReplacement(b *testing.B) {
 		})
 	}
 }
+
+func TestTaskDeadlineRepresentationTies(t *testing.T) {
+	now := time.Now()
+	utc := time.Unix(100, 123).UTC()
+	for _, sample := range []struct {
+		name        string
+		left, right time.Time
+	}{
+		{"location", utc, utc.In(time.FixedZone("same-offset", 0))},
+		{"monotonic", now, now.Round(0)},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			if sample.left == sample.right || !sample.left.Equal(sample.right) {
+				t.Fatal("fixture must have equal instants with different representations")
+			}
+			assertDeadlineRepresentationTie(t, sample.left, sample.right)
+		})
+	}
+}
+
+func assertDeadlineRepresentationTie(t *testing.T, left, right time.Time) {
+	t.Helper()
+	first, second := &requestTask{deadline: left}, &requestTask{deadline: right}
+	later := &requestTask{deadline: left.Add(time.Second)}
+	c := &candidateConnection{tasks: map[uint32]*requestTask{1: first, 3: second, 5: later}}
+	c.refreshDeadline()
+	selected, tied := first, second
+	if c.deadline == second.deadline {
+		selected, tied = second, first
+	}
+	cached, restoredTie := c.deadline, tied.deadline
+	c.replaceTaskDeadline(tied, left.Add(2*time.Second))
+	if c.deadline != cached {
+		t.Fatal("replacing an unselected tie changed the selected minimum")
+	}
+	c.replaceTaskDeadline(tied, restoredTie)
+	c.replaceTaskDeadline(selected, left.Add(3*time.Second))
+	if c.deadline != restoredTie {
+		t.Fatal("replacing the selected minimum lost the other representation")
+	}
+	c.replaceTaskDeadline(tied, time.Time{})
+	if c.deadline != later.deadline {
+		t.Fatal("clearing the tied minimum did not select the next task")
+	}
+	c.replaceTaskDeadline(later, time.Time{})
+	if c.deadline != selected.deadline {
+		t.Fatal("clearing the next minimum lost the remaining task")
+	}
+	c.replaceTaskDeadline(selected, time.Time{})
+	if !c.deadline.IsZero() {
+		t.Fatal("cleared deadlines retained a minimum")
+	}
+}
