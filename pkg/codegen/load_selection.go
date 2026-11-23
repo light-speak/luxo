@@ -288,12 +288,7 @@ func (a *loadDemandAnalysis) lookup(name string) ([]loadOrigin, bool) {
 func (a *loadDemandAnalysis) statement(statement ast.Stmt, publicReturn bool) []loadOrigin {
 	switch value := statement.(type) {
 	case *ast.ValStmt:
-		origins := a.bindObject(a.expression(value.Value), value.Value, value.Type)
-		scope := a.scopes[len(a.scopes)-1]
-		scope[value.Name] = origins
-		for _, name := range value.Names {
-			scope[name] = origins
-		}
+		a.declaration(value)
 	case *ast.AssignStmt:
 		a.assignment(value)
 	case *ast.ReturnStmt:
@@ -319,6 +314,61 @@ func (a *loadDemandAnalysis) statement(statement ast.Stmt, publicReturn bool) []
 		return a.loop(value, false, publicReturn)
 	}
 	return nil
+}
+
+func (a *loadDemandAnalysis) declaration(declaration *ast.ValStmt) {
+	scope := a.scopes[len(a.scopes)-1]
+	if await, ok := declaration.Value.(*ast.AwaitExpr); ok {
+		a.bindAwaitResults(scope, declaration, await)
+		return
+	}
+	origins := a.expression(declaration.Value)
+	if len(declaration.Names) == 0 {
+		scope[declaration.Name] = a.bindObject(origins, declaration.Value, declaration.Type)
+		return
+	}
+	a.bindLoadAliases(scope, declaration.Names, origins, declaration.Value, declaration.Type)
+}
+
+type loadAwaitResult struct {
+	expression ast.Expr
+	origins    []loadOrigin
+}
+
+func (a *loadDemandAnalysis) bindAwaitResults(scope map[string][]loadOrigin, declaration *ast.ValStmt, await *ast.AwaitExpr) {
+	names := declaration.Names
+	if len(names) == 0 {
+		names = []string{declaration.Name}
+	}
+
+	// The tasks read the surrounding scope before any result is bound.
+	var inline [2]loadAwaitResult
+	results := inline[:0]
+	if await.Body != nil {
+		a.controlDepth++
+		for _, statement := range await.Body.Stmts {
+			if value, ok := statement.(*ast.ExprStmt); ok && value.Expr != nil {
+				results = append(results, loadAwaitResult{value.Expr, a.expression(value.Expr)})
+			}
+		}
+		a.controlDepth--
+	}
+	if len(results) == 1 {
+		result := results[0]
+		a.bindLoadAliases(scope, names, result.origins, result.expression, declaration.Type)
+		return
+	}
+	for index, name := range names {
+		if name == "_" {
+			continue
+		}
+		var bound []loadOrigin
+		if index < len(results) {
+			result := results[index]
+			bound = a.bindObject(result.origins, result.expression, declaration.Type)
+		}
+		scope[name] = bound
+	}
 }
 
 func (a *loadDemandAnalysis) assignment(value *ast.AssignStmt) {

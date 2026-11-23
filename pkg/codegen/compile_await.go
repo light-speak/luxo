@@ -39,8 +39,12 @@ func (c *compiler) compileAwaitBindings(expr *ast.AwaitExpr, names []string, exp
 	c.emitAwaitTasks(tasks)
 	for _, alias := range aliases {
 		task := tasks[alias.taskIndex]
-		c.write("%s := %s", c.bindings.name(alias.name), c.bindings.name(task.varName))
-		c.vars[alias.name] = task.valueType
+		c.compileLocalAlias(alias.name, task.varName)
+	}
+	if len(tasks) == 1 {
+		for _, name := range names[1:] {
+			c.compileLocalAlias(name, names[0])
+		}
 	}
 }
 
@@ -102,6 +106,7 @@ func (c *compiler) prepareAwaitBinding(destination string, statement *ast.ValStm
 	initialType := task.goType
 	local := *statement
 	local.Name = c.discardedBindingName()
+	local.Names = nil
 	sub := c.errorCompiler()
 	sub.indent = c.indent + "\t\t"
 	sub.compileVal(&local)
