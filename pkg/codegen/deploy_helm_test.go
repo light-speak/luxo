@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
 	"text/template"
@@ -11,6 +12,80 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 	"gopkg.in/yaml.v3"
 )
+
+func TestHelmReferencesExistingJWTSecretForApplicationServices(t *testing.T) {
+	helm := GenerateHelmFiles(makeHelmResult("user", "post"), "myapp")
+	var values struct {
+		JWT struct {
+			ExistingSecret *string `yaml:"existingSecret"`
+		} `yaml:"jwt"`
+	}
+	if err := yaml.Unmarshal(helm.Files["values.yaml"], &values); err != nil {
+		t.Fatal(err)
+	}
+	if values.JWT.ExistingSecret == nil || *values.JWT.ExistingSecret != "" {
+		t.Fatal("the JWT Secret must be opt-in")
+	}
+	for _, name := range []string{"gateway", "module-user", "module-post"} {
+		deployment := string(helm.Files["templates/"+name+"-deployment.yaml"])
+		if !strings.Contains(deployment, "include \"luxo.jwtEnvironment\" . | nindent 12 }}\n          envFrom:") {
+			t.Errorf("%s does not use the JWT Secret helper in the container environment", name)
+		}
+	}
+	if bytes.Contains(helm.Files["templates/secret.yaml"], []byte("JWT_SECRET")) {
+		t.Fatal("the chart must not create its own JWT signing key")
+	}
+	const definition = "{{- define \"luxo.jwtEnvironment\" -}}"
+	_, body, found := strings.Cut(string(helm.Files["templates/_helpers.tpl"]), definition)
+	if !found {
+		t.Fatal("missing the JWT Secret helper definition")
+	}
+	tmpl, err := template.New("auth").Funcs(template.FuncMap{"quote": strconv.Quote}).Parse(definition + body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkHelmJWTEnvironment(t, tmpl, "")
+	checkHelmJWTEnvironment(t, tmpl, "application-jwt")
+}
+
+func checkHelmJWTEnvironment(t *testing.T, tmpl *template.Template, secret string) {
+	t.Helper()
+	var rendered bytes.Buffer
+	values := map[string]any{"Values": map[string]any{"jwt": map[string]string{"existingSecret": secret}}}
+	if err := tmpl.ExecuteTemplate(&rendered, "luxo.jwtEnvironment", values); err != nil {
+		t.Fatal(err)
+	}
+	var environment []struct {
+		Name      string
+		ValueFrom struct {
+			SecretKeyRef struct {
+				Name     string
+				Key      string
+				Optional bool
+			} `yaml:"secretKeyRef"`
+		} `yaml:"valueFrom"`
+	}
+	if err := yaml.Unmarshal(rendered.Bytes(), &environment); err != nil {
+		t.Fatal(err)
+	}
+	if secret == "" {
+		if len(environment) != 0 {
+			t.Fatalf("JWT is disabled, found env: %s", rendered.String())
+		}
+		return
+	}
+	keys := []string{"JWT_SECRET", "JWT_EXPIRES", "JWT_REFRESH", "JWT_REFRESH_EXPIRES"}
+	if len(environment) != len(keys) {
+		t.Fatalf("incorrect JWT env: %s", rendered.String())
+	}
+	for i, key := range keys {
+		entry := environment[i]
+		ref := entry.ValueFrom.SecretKeyRef
+		if entry.Name != key || ref.Key != key || ref.Name != secret || ref.Optional != (key != "JWT_SECRET") {
+			t.Errorf("incorrect Secret reference for %s: %+v", key, entry)
+		}
+	}
+}
 
 func TestHelmConditionalResourceHeader(t *testing.T) {
 	helm := GenerateHelmFiles(makeHelmResult("user"), "probe")
