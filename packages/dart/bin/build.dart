@@ -2,6 +2,7 @@
 import 'dart:io';
 import 'dart:async';
 
+import 'package:luxo_client/src/builder/artifact_publish.dart';
 import 'package:luxo_client/src/builder/selection_build.dart';
 
 Future<void> main(List<String> arguments) async {
@@ -68,13 +69,7 @@ Future<int> _compile(SelectionBuild build, File entry, String output) async {
     '-o',
     artifact.path,
   ]);
-  if (status == 0) {
-    if (await FileSystemEntity.type(destination.path, followLinks: false) !=
-        FileSystemEntityType.notFound) {
-      throw StateError('Output appeared during compilation: $output');
-    }
-    await artifact.rename(destination.path);
-  }
+  if (status == 0) publishBuildArtifact(artifact, destination);
   return status;
 }
 
