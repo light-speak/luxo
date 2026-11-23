@@ -48,7 +48,7 @@ func BenchmarkCLIJSONAPIAuthority(b *testing.B) {
 			b.Cleanup(func() { http.DefaultClient, callHost, callSelect = previousClient, previousHost, previousSelect })
 			b.ReportAllocs()
 			for b.Loop() {
-				if err := callJSONMode("requested", sample.params); err != nil {
+				if err := callJSONMode(b.Context(), "requested", sample.params); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -163,7 +163,7 @@ func setupCLIResponseReadBenchmark(b *testing.B, mode, framing string) func() er
 	if mode == "binary" {
 		invoke = callBinaryMode
 	}
-	return func() error { return invoke("echo", nil) }
+	return func() error { return invoke(b.Context(), "echo", nil) }
 }
 
 func quietCLIOutput(b *testing.B) {

@@ -1,11 +1,14 @@
 package httputil
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -57,6 +60,57 @@ func TestGetRejectsTruncatedResponseBody(t *testing.T) {
 	response, err := Get(t.Context(), server.URL)
 	if response != nil || !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("truncated HTTP body returned success: response=%+v err=%v", response, err)
+	}
+}
+
+func TestDoEnforcesResponseBodyLimit(t *testing.T) {
+	for _, sample := range []struct {
+		transfer string
+		payload  string
+	}{{"fixed", "hello"}, {"chunked", "chunk"}, {"gzip", "world"}} {
+		t.Run(sample.transfer, func(t *testing.T) {
+			t.Parallel()
+			transfer, payload := sample.transfer, sample.payload
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if transfer == "gzip" {
+					w.Header().Set("Content-Encoding", "gzip")
+					compressor := gzip.NewWriter(w)
+					_, _ = io.WriteString(compressor, payload)
+					_ = compressor.Close()
+					return
+				}
+				if transfer == "chunked" {
+					w.(http.Flusher).Flush()
+				}
+				_, _ = io.WriteString(w, payload)
+			}))
+			defer server.Close()
+			atLimit, err := DoWithResponseLimit(t.Context(), http.MethodGet, server.URL, "", nil, int64(len(payload)))
+			if err != nil || atLimit == nil || atLimit.Body != payload {
+				t.Fatalf("response at the limit failed: %+v %v", atLimit, err)
+			}
+			overLimit, err := DoWithResponseLimit(t.Context(), http.MethodGet, server.URL, "", nil, int64(len(payload)-1))
+			var limitErr *ResponseBodyLimitError
+			if overLimit != nil || !errors.As(err, &limitErr) || limitErr.Limit != int64(len(payload)-1) {
+				t.Fatalf("response over the limit returned data or an unrelated error: %+v %v", overLimit, err)
+			}
+			if got := limitErr.Error(); got != "HTTP response body exceeds 4 bytes" {
+				t.Fatalf("incorrect diagnostic: %q", got)
+			}
+		})
+	}
+}
+
+func TestDoValidatesResponseBodyLimitBeforeSending(t *testing.T) {
+	response, err := DoWithResponseLimit(t.Context(), http.MethodGet, "://bad", "", nil, 0)
+	if response != nil || !errors.Is(err, errInvalidResponseBodyLimit) {
+		t.Fatalf("unknown error for an invalid limit: %+v %v", response, err)
+	}
+	if data, err := ReadResponseBody(http.NoBody, -1); data != nil || !errors.Is(err, errInvalidResponseBodyLimit) {
+		t.Fatalf("unknown error for an invalid read limit: %v %v", data, err)
+	}
+	if data, err := ReadResponseBody(strings.NewReader("hello"), math.MaxInt64); string(data) != "hello" || err != nil {
+		t.Fatalf("valid limit overflowed the reader: %q %v", data, err)
 	}
 }
 
