@@ -13,10 +13,14 @@ import (
 )
 
 const (
-	confirmationFlag  = "--requires-confirmation"
-	maxTimeRegression = 5.0
-	minimumSamples    = 10
+	confirmationFlag         = "--requires-confirmation"
+	confirmationTargetsFlag  = "--confirmation-targets"
+	targetedConfirmationFlag = "--targeted-confirmation"
+	maxTimeRegression        = 5.0
+	minimumSamples           = 10
 )
+
+var comparisonUnits = [...]string{"sec/op", "B/op", "allocs/op"}
 
 type evaluation struct {
 	GOOS                  string
@@ -68,24 +72,30 @@ func run(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if options.confirmation {
+	if options.confirmation || options.confirmationTargets {
 		if len(paths) != 1 {
 			return usageError()
 		}
+		if options.confirmationTargets {
+			return reportConfirmationTargets(paths[0], output)
+		}
 		return reportConfirmationRequirement(paths[0], output)
+	}
+	if options.targetedConfirmation && len(paths) != 2 {
+		return usageError()
 	}
 	switch len(paths) {
 	case 1:
 		return evaluatePrimary(paths[0], output)
 	case 2:
-		return evaluateConfirmation(paths[0], paths[1], output, options.costs)
+		return evaluateConfirmation(paths[0], paths[1], output, options)
 	default:
 		return usageError()
 	}
 }
 
 func usageError() error {
-	return errors.New("usage: benchgate [--requires-confirmation] [--approved-costs policy.json --base-sha SHA] <primary.csv> [confirmation.csv]")
+	return errors.New("usage: benchgate [--requires-confirmation | --confirmation-targets | --targeted-confirmation] [--approved-costs policy.json --base-sha SHA] <primary.csv> [confirmation.csv]")
 }
 
 func reportConfirmationRequirement(path string, output io.Writer) error {
@@ -112,7 +122,7 @@ func evaluatePrimary(path string, output io.Writer) error {
 	return nil
 }
 
-func evaluateConfirmation(primaryPath, confirmationPath string, output io.Writer, costs map[costKey]approvedCost) error {
+func evaluateConfirmation(primaryPath, confirmationPath string, output io.Writer, options gateOptions) error {
 	primary, err := evaluateFile(primaryPath)
 	if err != nil {
 		return err
@@ -121,11 +131,15 @@ func evaluateConfirmation(primaryPath, confirmationPath string, output io.Writer
 	if err != nil {
 		return err
 	}
-	result, err := confirmEvaluations(primary, confirmation)
+	confirm := confirmEvaluations
+	if options.targetedConfirmation {
+		confirm = confirmTargetedEvaluations
+	}
+	result, err := confirm(primary, confirmation)
 	if err != nil {
 		return err
 	}
-	if err := applyApprovedCosts(&result, primary, confirmation, costs, output); err != nil {
+	if err := applyApprovedCosts(&result, primary, confirmation, options.costs, output); err != nil {
 		return err
 	}
 	for _, unconfirmed := range result.Unconfirmed {
@@ -136,6 +150,10 @@ func evaluateConfirmation(primaryPath, confirmationPath string, output io.Writer
 	}
 	if len(result.Regressions) > 0 {
 		return fmt.Errorf("performance gate rejected %d regression(s)", len(result.Regressions))
+	}
+	if options.targetedConfirmation {
+		_, err := fmt.Fprintf(output, "performance gate passed: primary %d time and %d allocation comparisons; targeted confirmation %d time and %d allocation comparisons\n", result.TimeComparisons, result.AllocationComparisons, confirmation.TimeComparisons, confirmation.AllocationComparisons)
+		return err
 	}
 	fmt.Fprintf(output, "performance gate passed: %d time and %d allocation comparisons confirmed across two sample groups\n", result.TimeComparisons, result.AllocationComparisons)
 	return nil
@@ -184,7 +202,7 @@ func evaluate(input io.Reader) (evaluation, error) {
 
 func validateComparisonMetrics(comparisons map[comparisonKey]struct{}) error {
 	for key := range comparisons {
-		for _, unit := range [...]string{"sec/op", "B/op", "allocs/op"} {
+		for _, unit := range comparisonUnits {
 			required := key
 			required.Unit = unit
 			if _, exists := comparisons[required]; !exists {
@@ -252,6 +270,10 @@ func confirmEvaluations(primary, confirmation evaluation) (evaluation, error) {
 	if !matchingComparisons(primary.Comparisons, confirmation.Comparisons) {
 		return evaluation{}, errors.New("benchmark comparison sets differ between sample groups")
 	}
+	return combineConfirmation(primary, confirmation), nil
+}
+
+func combineConfirmation(primary, confirmation evaluation) evaluation {
 	result := evaluation{
 		TimeComparisons:       primary.TimeComparisons,
 		AllocationComparisons: primary.AllocationComparisons,
@@ -275,7 +297,7 @@ func confirmEvaluations(primary, confirmation evaluation) (evaluation, error) {
 	}
 	sortRegressions(result.Regressions)
 	sortRegressions(result.Unconfirmed)
-	return result, nil
+	return result
 }
 
 func matchingComparisons(first, second map[comparisonKey]struct{}) bool {
