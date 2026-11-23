@@ -12,6 +12,9 @@ pr72_rpc_context_write_plan() {
 07	pkg/lux/codec	default	SelectionMaskLimits	^BenchmarkSelectionMaskLimits$/^(empty|small|64-children)$/^after$
 08	pkg/lux/luvia	default	PlanSelection	^BenchmarkPlanSelection$/^(all|nested)$
 09	pkg/lux/codec	default	ArrayHeaderWrite	^BenchmarkArrayHeaderWrite$/^(0|128|1000000)$
+10	pkg/lux/codec	default	InvalidArrayHeaderWrite	^BenchmarkArrayHeaderWrite$/^(1000001|-1)$
+11	pkg/lux/codec	default	FiniteFloatArray	^BenchmarkFiniteFloatArray$/^checked$
+12	pkg/lux/api	default	TraceArrayEncoding	^BenchmarkDebugTraceTextEncoding$/^spans=(1|16)$/^text=0$/^binary$/^before=false$
 CASES
   printf '%s\n' BenchmarkDateTimePair/epoch/pair_read-2 > "$evidence/01.names"
   printf 'BenchmarkDateTimePair/current/%s-2\n' pair_read pair_write > "$evidence/02.names"
@@ -22,6 +25,9 @@ CASES
   printf 'BenchmarkSelectionMaskLimits/%s/after-2\n' empty small 64-children > "$evidence/07.names"
   printf 'BenchmarkPlanSelection/%s-2\n' all nested > "$evidence/08.names"
   printf 'BenchmarkArrayHeaderWrite/%s-2\n' 0 128 1000000 > "$evidence/09.names"
+  printf 'BenchmarkArrayHeaderWrite/%s-2\n' 1000001 -1 > "$evidence/10.names"
+  printf '%s\n' BenchmarkFiniteFloatArray/checked-2 > "$evidence/11.names"
+  printf 'BenchmarkDebugTraceTextEncoding/spans=%s/text=0/binary/before=false-2\n' 1 16 > "$evidence/12.names"
   python3 - "$evidence" <<'PYTHON'
 import json
 from pathlib import Path
@@ -33,15 +39,15 @@ for line in (evidence / "cases.tsv").read_text().splitlines():
     case, package, _, _, _ = line.split("\t")
     for name in (evidence / f"{case}.names").read_text().splitlines():
         rows.append({"Package": package, "Name": name})
-if len(rows) != 21 or len({(r["Package"], r["Name"]) for r in rows}) != 21:
-    raise SystemExit("expected exactly twenty-one distinct leaves")
+if len(rows) != 26 or len({(r["Package"], r["Name"]) for r in rows}) != 26:
+    raise SystemExit("expected exactly twenty-six distinct leaves")
 (evidence / "expected.json").write_text(json.dumps({"Base": rows, "Head": rows}, indent=2) + "\n")
 PYTHON
 }
 
 pr72_rpc_context_verify_process() {
   local raw="$1" case_id="$2" package
-  case "$case_id" in 01|02|03|04|07|09) package=pkg/lux/codec ;; 05|06) package=pkg/lux/rpc ;; 08) package=pkg/lux/luvia ;; *) return 1 ;; esac
+  case "$case_id" in 01|02|03|04|07|09|10|11) package=pkg/lux/codec ;; 05|06) package=pkg/lux/rpc ;; 08) package=pkg/lux/luvia ;; 12) package=pkg/lux/api ;; *) return 1 ;; esac
   awk -v expected="$evidence/$case_id.names" -v os="$probe_goos" -v arch="$probe_goarch" -v pkg="github.com/light-speak/luxo/$package" '
     BEGIN {
       while (getline name < expected) names[++count] = name
@@ -73,8 +79,8 @@ pr72_rpc_context_verify_process() {
 
 pr72_rpc_context_record_layout() {
   local revision="$1" package binary
-  local pattern='[.](ReadDateTime|AppendDateTime|ReadSvarint|AppendSvarint|ReadBytes|Finish|requestContext|verifyRequestContext|WriteArrayHeader|SplitSelectionMask|Plan|benchmarkJSONRead|Benchmark(DateTimePair|RawJSONBoundary|RPCNilContextGuard|SelectionMaskLimits|PlanSelection|ArrayHeaderWrite).*)$'
-  for package in codec rpc luvia; do
+  local pattern='[.](ReadDateTime|AppendDateTime|ReadSvarint|AppendSvarint|ReadBytes|Finish|requestContext|verifyRequestContext|WriteArrayHeader|SplitSelectionMask|Plan|benchmarkJSONRead|Benchmark(DateTimePair|RawJSONBoundary|RPCNilContextGuard|SelectionMaskLimits|PlanSelection|ArrayHeaderWrite|FiniteFloatArray|DebugTraceTextEncoding).*)$'
+  for package in codec rpc luvia api; do
     binary="$scratch/bin/$revision/pkg-lux-$package.test"
     go tool nm -size "$binary" | awk -v pattern="$pattern" '$4 ~ pattern' > "$evidence/symbols-$revision-$package.nm"
     test -s "$evidence/symbols-$revision-$package.nm"
@@ -95,10 +101,10 @@ import sys
 
 bundle, output = map(Path, sys.argv[1:])
 patch = json.loads(bundle.read_text())["patch"].encode()
-if sha256(patch).hexdigest() != "1c4095184a105d65541a19b723f415d4df690fbd94978e93ac8690fe5c9a0ffb":
+if sha256(patch).hexdigest() != "2c1c6f47e3e62118e847177c12b76f33eafbe7252ce31cc5b78c521c26ad2039":
     raise SystemExit("frozen RPC context overlay SHA-256 mismatch")
 paths = re.findall(rb"^diff --git a/(\S+) b/(\S+)$", patch, re.M)
-expected_paths = (b"pkg/lux/rpc/rpc_test.go", b"pkg/lux/rpc/server.go")
+expected_paths = (b'pkg/lux/codec/wire.go', b'pkg/lux/codec/array_write_test.go', b'pkg/lux/rpc/rpc_test.go', b'pkg/lux/rpc/server.go')
 if paths != [(path, path) for path in expected_paths]:
     raise SystemExit("RPC context overlay scope mismatch")
 output.write_bytes(patch)
@@ -109,14 +115,24 @@ PYTHON
     printf '%s  %s\n' \
       313870a1f66bbde4e83bfcd88841ccaf70135855ddd5f8d80d308b968736da0a pkg/lux/rpc/server.go \
       03720eec126d79f07dc0410a6fc4e5a399a270dd3900e9016f80f5f90909a86d pkg/lux/rpc/rpc_test.go | sha256sum -c -
-    sha256sum pkg/lux/rpc/server.go pkg/lux/rpc/rpc_test.go > "$evidence/rpc-source-before.sha256"
+    printf '%s  %s\n' \
+      cac2dd90bdf4e61ebd4c83cbe5df5bfc31e10df9e0a5f7a2b8e9d027cff8562c pkg/lux/codec/wire.go \
+      63c1e136a50371db768100ba8965612de9921081d087179c4ab253a091ab25b8 pkg/lux/codec/array_write_test.go \
+      03720eec126d79f07dc0410a6fc4e5a399a270dd3900e9016f80f5f90909a86d pkg/lux/rpc/rpc_test.go \
+      313870a1f66bbde4e83bfcd88841ccaf70135855ddd5f8d80d308b968736da0a pkg/lux/rpc/server.go | sha256sum -c -
+    sha256sum pkg/lux/codec/wire.go pkg/lux/codec/array_write_test.go pkg/lux/rpc/rpc_test.go pkg/lux/rpc/server.go > "$evidence/overlay-source-before.sha256"
     git apply --check --whitespace=error "$patch"
     git apply --whitespace=error "$patch"
     git apply -R --check "$patch"
     printf '%s  %s\n' \
       c6588964660d9807e7da103fe3b66646d1849ae0416d5ab7ae702ce91f165a50 pkg/lux/rpc/server.go \
       0073d259ce97a9b1131d602d4ca53a330533f8109dd54d56fd1b78f27999445c pkg/lux/rpc/rpc_test.go | sha256sum -c -
-    sha256sum pkg/lux/rpc/server.go pkg/lux/rpc/rpc_test.go > "$evidence/rpc-source-after.sha256"
+    printf '%s  %s\n' \
+      c8cab050daf5809e968b196888fed1f459fb9575392b44e08faa430ed88c9c54 pkg/lux/codec/wire.go \
+      cf469513e09fff2ab49211c17476d4a6ee5e6d960b9184ce8403d2335b939e36 pkg/lux/codec/array_write_test.go \
+      0073d259ce97a9b1131d602d4ca53a330533f8109dd54d56fd1b78f27999445c pkg/lux/rpc/rpc_test.go \
+      c6588964660d9807e7da103fe3b66646d1849ae0416d5ab7ae702ce91f165a50 pkg/lux/rpc/server.go | sha256sum -c -
+    sha256sum pkg/lux/codec/wire.go pkg/lux/codec/array_write_test.go pkg/lux/rpc/rpc_test.go pkg/lux/rpc/server.go > "$evidence/overlay-source-after.sha256"
   )
   sha256sum "$patch" > "$evidence/rpc-overlay.sha256"
 }
@@ -164,7 +180,8 @@ pr72_rpc_context_archive() {
   git -C "$repo" show -s --format="$revision %H %T" "$commit" >> "$evidence/revisions.txt"
   (
     cd "$source"
-    sha256sum go.mod go.sum pkg/lux/codec/{datetime_bench_test.go,datetime.go,json_bench_test.go,decoder.go,selectionmask.go,selectionmask_bench_test.go,encoder.go,array_write_bench_test.go} \
+    sha256sum go.mod go.sum pkg/lux/codec/{datetime_bench_test.go,datetime.go,json_bench_test.go,decoder.go,selectionmask.go,selectionmask_bench_test.go,wire.go,encoder.go,array_write_test.go,array_write_bench_test.go,finite_float_bench_test.go} \
+      pkg/lux/api/trace_encoding_bench_test.go \
       pkg/lux/rpc/{auth_context_bench_test.go,rpc_test.go,server.go} pkg/lux/luvia/{planner.go,planner_test.go}
   ) > "$evidence/sources-$revision.sha256"
   sh "$source/scripts/setup-modules.sh" "$source"
@@ -182,18 +199,18 @@ pr72_rpc_context_find_inventory() {
       pr72_rpc_context_verify_process "$output" "$case_id"
     done < "$evidence/cases.tsv"
   done
-  printf 'Exact 1x inventory passed for all twenty-one leaves on both revisions.\n'
+  printf 'Exact 1x inventory passed for all twenty-six leaves on both revisions.\n'
 }
 
 pr72_rpc_context_verify_samples() {
   local group sample comparison case_id side revision variant filename count=0
   while IFS=$'\t' read -r group sample comparison case_id side revision variant filename; do
     if [[ "$group" == group ]]; then continue; fi
-    [[ "$case_id" =~ ^0[1-9]$ ]] || return 1
+    [[ "$case_id" =~ ^(0[1-9]|1[0-2])$ ]] || return 1
     pr72_rpc_context_verify_process "$evidence/$filename" "$case_id" || return 1
     count=$((count+1))
   done < "$evidence/order.tsv"
-  [[ "$count" -eq 720 ]]
+  [[ "$count" -eq 960 ]]
 }
 
 pr72_rpc_context_require_gates() {
@@ -253,6 +270,7 @@ The original five process contexts from run 45230006287 retain all ten leaves.
 A separate process compares the three token-present After paths, preserving no-token process context.
 Three valid SplitSelectionMask leaves and two valid Planner leaves cover direct product scope.
 Three ArrayHeaderWrite leaves retain late failures observed on multiple runner CPU models.
+Five additional controls cover invalid counts, a shared array writer and two real trace encoders.
 The base archive adds the identical head Planner benchmark function in a test-only source file.
 Performance groups cover equivalent successful or error outcomes. Malformed selection fixtures are excluded.
 A/A uses the same base binary on both sides. A/B uses base and the verified head overlay, including a regression for the two static authentication errors.
@@ -271,7 +289,7 @@ PROTOCOL
   ) > "$evidence/compile-tools.log" 2>&1
   for revision in base head; do
     (
-      for package in pkg/lux/codec pkg/lux/rpc pkg/lux/luvia; do
+      for package in pkg/lux/codec pkg/lux/rpc pkg/lux/luvia pkg/lux/api; do
         "$scratch/bin/benchrun" compile "$scratch/source/$revision" "$scratch/bin/$revision" "$package"
       done
     ) > "$evidence/compile-$revision.log" 2>&1
@@ -282,6 +300,10 @@ PROTOCOL
     -test.run='^TestRPCReusesStaticAuthenticationErrors$' -test.v -test.timeout=90s \
     > "$evidence/rpc-static-authentication-errors.log"
   grep -q '^--- PASS: TestRPCReusesStaticAuthenticationErrors ' "$evidence/rpc-static-authentication-errors.log"
+  "$scratch/bin/benchrun" run "$scratch/source/head" "$scratch/bin/head" pkg/lux/codec \
+    -test.run='^Test(ArrayHeaderWriteBounds|ArrayHeaderWriteCapacity|FiniteFloatBenchmarkParity)$' \
+    -test.v -test.timeout=90s > "$evidence/array-header-test.log"
+  grep -q '^--- PASS: TestArrayHeaderWriteCapacity ' "$evidence/array-header-test.log"
   pr72_rpc_context_find_inventory
   if "$inventory_only"; then return 0; fi
 

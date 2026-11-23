@@ -1,4 +1,4 @@
-name: Validate PR 72 RPC error paths and array header timing
+name: Validate PR 72 optimized array header timing
 
 on:
   push:
@@ -19,7 +19,7 @@ jobs:
   diagnose-pr72-rpc-context-inline:
     if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
@@ -31,7 +31,7 @@ jobs:
           check-latest: false
           cache: false
       - name: Collect default-link A/A and A/B measurements
-        timeout-minutes: 13
+        timeout-minutes: 18
         env:
           GOTOOLCHAIN: local
         run: bash scripts/diagnose-pr72-rpc-context-inline.sh
