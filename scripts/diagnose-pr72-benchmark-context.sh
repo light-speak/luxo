@@ -2,7 +2,7 @@
 set -euo pipefail
 
 context_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-source "$context_script_dir/diagnose-hosted-perf.sh"
+context_helper_revision=31cfa0a4da7e1b8e7f5d6436eaee2e696291369f
 
 base=65f1892e175487503aa36caa86d1eb8a0805f073
 head=f86453bc03d6ef7d0210aeb414c5e9a7dd540ed0
@@ -188,12 +188,18 @@ analyze_contexts() {
   fi
 }
 
+load_context_helper() {
+  git -C "$repo" show "$context_helper_revision:scripts/diagnose-hosted-perf.sh" > "$evidence/compile-helper.sh"
+  source "$evidence/compile-helper.sh"
+}
+
 context_main() {
   local revision
   repo=$(git rev-parse --show-toplevel)
   evidence="$repo/.tmp/hosted-perf-pr72-context"
   mkdir -p "$repo/.tmp"
   mkdir "$evidence"
+  load_context_helper
   scratch=$(mktemp -d "$repo/.tmp/pr72-context.XXXXXX")
   trap cleanup EXIT
   trap 'exit 130' INT
@@ -209,7 +215,8 @@ context_main() {
     [[ "$(git -C "$repo" cat-file -t "$revision")" == commit ]]
   done
   git -C "$repo" merge-base --is-ancestor "$base" "$head"
-  sha256sum "$context_script_dir/diagnose-hosted-perf.sh" "$context_script_dir/diagnose-pr72-benchmark-context.sh" > "$evidence/runner-sha256.txt"
+  printf '%s\n' "$context_helper_revision" > "$evidence/compile-helper-revision.txt"
+  sha256sum "$evidence/compile-helper.sh" "$context_script_dir/diagnose-pr72-benchmark-context.sh" > "$evidence/runner-sha256.txt"
   cat > "$evidence/protocol.txt" <<'PROTOCOL'
 One Linux amd64 runner and two default-link test binaries. Prefix and isolated modes each run A/A and A/B.
 Two groups of 10 alternating pairs per arm, benchmem, 200ms, count=1, CPU=2, benchstat alpha=0.01.
