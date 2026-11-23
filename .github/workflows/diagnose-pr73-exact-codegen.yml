@@ -1,0 +1,48 @@
+name: Attribute PR 73 exact codegen timing
+
+on:
+  push:
+    branches: [diagnostics/hosted-perf-pr71-pr72]
+    paths:
+      - .github/workflows/diagnose-pr73-exact-codegen.yml
+      - scripts/diagnose-pr73-exact-codegen.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-pr73-exact-codegen
+  cancel-in-progress: false
+
+jobs:
+  diagnose-pr73-exact-codegen:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Measure control, exact merge and restored test roots
+        timeout-minutes: 18
+        env:
+          GOTOOLCHAIN: local
+        run: bash scripts/diagnose-pr73-exact-codegen.sh
+      - name: Preserve exact source, scope, symbols, measurements and verdicts
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: hosted-pr73-exact-codegen-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr73-exact-codegen/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove local evidence after upload
+        if: always()
+        run: rm -rf -- .tmp/hosted-pr73-exact-codegen
