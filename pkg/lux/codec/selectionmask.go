@@ -67,21 +67,24 @@ func checkedSelectionChildren(fields []byte, children []SelectionMaskChild) ([]S
 // SplitSelectionMask returns the current node's bitmap and encoded child area.
 // An empty mask means select all. Malformed or over-depth nodes return ok=false.
 func SplitSelectionMask(mask []byte) (fields, children []byte, ok bool) {
-	return splitSelectionMask(mask, 0)
+	if len(mask) == 0 {
+		return nil, nil, true
+	}
+	fields, children, ok = splitSelectionMask(mask, 0)
+	return
 }
 
 func splitSelectionMask(mask []byte, depth int) (fields, children []byte, ok bool) {
 	fields, children, ok = selectionMaskParts(mask)
-	if !ok || (len(children) > 0 && !validSelectionChildren(fields, children, depth)) {
+	if len(children) > 0 && !validSelectionChildren(fields, children, depth) {
 		return nil, nil, false
 	}
-	return fields, children, true
+	return
 }
 
+// selectionMaskParts decodes a nonempty node. Callers handle an empty root
+// or verify a positive child length first. Malformed nodes expose no slices.
 func selectionMaskParts(mask []byte) (fields, children []byte, ok bool) {
-	if len(mask) == 0 {
-		return nil, nil, true
-	}
 	fieldLen, n := uint64(mask[0]), 1
 	if fieldLen >= 0x80 {
 		fieldLen, n = ReadVarint(mask, 0)

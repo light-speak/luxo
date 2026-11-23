@@ -111,9 +111,16 @@ func TestSelectionMaskRoundTrip(t *testing.T) {
 }
 
 func TestSelectionMaskEmptyMeansAll(t *testing.T) {
-	fields, children, ok := SplitSelectionMask(nil)
-	if !ok || fields != nil || children != nil {
-		t.Fatalf("empty selection = (%v, %v, %v), want all", fields, children, ok)
+	leaf := []byte{1, 1}
+	for _, mask := range [][]byte{nil, leaf[:0], nil} {
+		fields, children, ok := SplitSelectionMask(mask)
+		if !ok || fields != nil || children != nil {
+			t.Fatalf("empty selection (nil=%v) = (%v, %v, %v), want all", mask == nil, fields, children, ok)
+		}
+		fields, children, ok = SplitSelectionMask(leaf)
+		if !ok || !bytes.Equal(fields, leaf[1:]) || len(children) != 0 {
+			t.Fatalf("leaf selection after empty = (%v, %v, %v)", fields, children, ok)
+		}
 	}
 	if child, found := SelectionMaskNested(nil, 1); found || child != nil {
 		t.Fatalf("empty selection child = (%v, %v)", child, found)
@@ -131,6 +138,7 @@ func TestSelectionMaskRejectsMalformedNodes(t *testing.T) {
 		{2, 1},                   // truncated bitmap
 		{1, 1, 0},                // child field ID 0
 		{1, 1, 1},                // missing child length
+		{1, 1, 1, 0},             // empty child payload
 		{1, 1, 1, 2, 1},          // truncated child
 		{1, 1, 1, 1, 0},          // invalid empty-bitmap child node
 		{1, 1, 1, 2, 1, 0},       // child contains trailing malformed data
@@ -231,12 +239,14 @@ func TestAppendSelectionMaskSortsChildren(t *testing.T) {
 
 func TestAppendSelectionMaskRejectsInvalidChildren(t *testing.T) {
 	child := testutil.Bytes(t)(AppendSelectionMask(nil, []byte{1}, nil))
-	root, err := AppendSelectionMask(nil, []byte{1}, []SelectionMaskChild{
+	for _, invalid := range []SelectionMaskChild{
 		{FieldID: 0, Mask: child},
 		{FieldID: 1},
-	})
-	if err == nil || root != nil {
-		t.Fatalf("invalid children silently ignored: %v", err)
+	} {
+		root, err := AppendSelectionMask(nil, []byte{1}, []SelectionMaskChild{invalid})
+		if err != ErrInvalidSelectionMask || root != nil {
+			t.Fatalf("invalid child (%v) accepted: %v", invalid, err)
+		}
 	}
 }
 
