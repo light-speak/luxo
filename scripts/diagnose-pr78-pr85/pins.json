@@ -1,0 +1,48 @@
+{
+  "revisions": {
+    "base": "65f1892e175487503aa36caa86d1eb8a0805f073",
+    "pr78": "397af9c8c6fc6dc807e1dbcbe2e05d8913f58944",
+    "pr85": "99194f1d7ef5c9745fba2dd8b782cfd1ca5b1aff"
+  },
+  "sourceSHA256": {
+    "pkg/lux/luvia/middleware.go": {
+      "base": "16104944640bd72d4e15e4fbae6c4920b8d005cc5c0cf11ca0d19ba5b9f88374",
+      "pr78": "16104944640bd72d4e15e4fbae6c4920b8d005cc5c0cf11ca0d19ba5b9f88374",
+      "pr85": "16104944640bd72d4e15e4fbae6c4920b8d005cc5c0cf11ca0d19ba5b9f88374"
+    },
+    "pkg/lux/luvia/middleware_bench_test.go": {
+      "base": "a5a5cd5191827423e07bf382d572614207c3e7fb5b7df27452963c3136bb2d8e",
+      "pr78": "a5a5cd5191827423e07bf382d572614207c3e7fb5b7df27452963c3136bb2d8e",
+      "pr85": "a5a5cd5191827423e07bf382d572614207c3e7fb5b7df27452963c3136bb2d8e"
+    },
+    "pkg/lux/luvia/middleware_test.go": {
+      "base": "a284f6673c86a90ed916099ac82a6ffb0e9b190161c946989957839252b07034",
+      "pr78": "a284f6673c86a90ed916099ac82a6ffb0e9b190161c946989957839252b07034",
+      "pr85": "a284f6673c86a90ed916099ac82a6ffb0e9b190161c946989957839252b07034"
+    },
+    "pkg/lux/luvia/luvia.go": {
+      "base": "08af1d81676f4edca4be64178a8e8e9af525b0851f9880a56a6351007cd34aec",
+      "pr78": "08af1d81676f4edca4be64178a8e8e9af525b0851f9880a56a6351007cd34aec",
+      "pr85": "08af1d81676f4edca4be64178a8e8e9af525b0851f9880a56a6351007cd34aec"
+    },
+    "pkg/lux/api/router.go": {
+      "base": "da7cb4ee3f9d4899ad2047709c43213916eb30f0daa2b51b2b1225914db1da08",
+      "pr78": "da7cb4ee3f9d4899ad2047709c43213916eb30f0daa2b51b2b1225914db1da08",
+      "pr85": "cd1c12633cd495e98f4b2bb55fe58a1905f2f94d6794c76d5480ebdb3f2e5cc6"
+    },
+    "pkg/lux/h2transport/server.go": {
+      "base": "2bd6032367a50c4f2f59809719bddfc4d2478347c3a535cc9c1ccbd7daf7ea39",
+      "pr78": "6edfaf7a70df6d71e56ef6021cfe4f6d7b161a7a7775dec836ca690e77b5cf72",
+      "pr85": "2bd6032367a50c4f2f59809719bddfc4d2478347c3a535cc9c1ccbd7daf7ea39"
+    },
+    "pkg/lux/h2transport/protection.go": {
+      "base": "56ce43527c3c5486171764165e0e0551e87a1002112c21cdf417f507da0a1c23",
+      "pr78": "c11b089972a7cef5cbc49d0bab38310416137f3fedc5140d385467a03d2aa0e6",
+      "pr85": "56ce43527c3c5486171764165e0e0551e87a1002112c21cdf417f507da0a1c23"
+    }
+  },
+  "requestHeadSHA256": {
+    "before": "d2bb0b68f56b0b5a647b2b3104a4c8e193f7bda209d82d0ed8f9779620fb9e0e",
+    "after": "3956c63ae1795051b6cc54c94856ec8dfb1149c270242cdb1717e7d6fffca6ca"
+  }
+}
