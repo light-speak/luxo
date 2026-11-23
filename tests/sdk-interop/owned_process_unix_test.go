@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -53,7 +54,39 @@ child.arguments = ["30"]
 try child.run()
 FileHandle.standardOutput.write(Data("\(ProcessInfo.processInfo.processIdentifier) \(child.processIdentifier)\n".utf8))
 child.waitUntilExit()`
-	testFixtureOwnedProcess(t, "cancel", exec.Command("swift", "-e", source))
+	root, err := filepath.Abs("../../.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatal("Swift helper scratch must be a project directory")
+	}
+	work, err := os.MkdirTemp(root, "sdk-swift-owner-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(work); err != nil {
+			t.Error(err)
+		}
+	})
+	input, binary := filepath.Join(work, "Helper.swift"), filepath.Join(work, "helper")
+	if err := os.WriteFile(input, []byte(source), 0600); err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("swiftc", input, "-o", binary)
+	build.Stdout, build.Stderr = os.Stdout, os.Stderr
+	if err := runOwnedFixtureCommand(t.Context(), build); err != nil {
+		t.Fatal(err)
+	}
+	testFixtureOwnedProcess(t, "cancel", exec.Command(binary))
 }
 
 func testFixtureOwnedProcess(t *testing.T, mode string, command *exec.Cmd) {
@@ -72,7 +105,15 @@ func testFixtureOwnedProcess(t *testing.T, mode string, command *exec.Cmd) {
 	defer writer.Close()
 	command.Stdout, command.Stderr = writer, os.Stderr
 	done := make(chan error, 1)
-	go func() { done <- runOwnedFixtureCommand(ctx, command) }()
+	go func() {
+		defer close(done)
+		done <- runOwnedFixtureCommand(ctx, command)
+	}()
+	defer func() {
+		cancel()
+		// The command can still be inheriting writer if readiness fails.
+		<-done
+	}()
 	children := readFixtureChildren(t, output)
 	if mode == "cancel" {
 		cancel()
@@ -105,22 +146,22 @@ func testFixtureOwnedProcess(t *testing.T, mode string, command *exec.Cmd) {
 	}
 }
 
-func readFixtureChildren(t *testing.T, output io.Reader) []int {
+func readFixtureChildren(t *testing.T, output *os.File) []int {
 	t.Helper()
-	line := make(chan string, 1)
-	go func() { text, _ := bufio.NewReader(output).ReadString('\n'); line <- text }()
+	if err := output.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	text, err := bufio.NewReader(output).ReadString('\n')
+	if err != nil {
+		t.Fatalf("helper did not become ready: %v", err)
+	}
 	var children []int
-	select {
-	case text := <-line:
-		for _, value := range strings.Fields(text) {
-			pid, err := strconv.Atoi(value)
-			if err != nil || pid <= 1 {
-				t.Fatalf("invalid owned PID %q", value)
-			}
-			children = append(children, pid)
+	for _, value := range strings.Fields(text) {
+		pid, err := strconv.Atoi(value)
+		if err != nil || pid <= 1 {
+			t.Fatalf("invalid owned PID %q", value)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("helper did not become ready")
+		children = append(children, pid)
 	}
 	if len(children) != 2 {
 		t.Fatalf("expected child and grandchild, got %v", children)
