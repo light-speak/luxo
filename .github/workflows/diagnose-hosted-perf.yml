@@ -7,6 +7,8 @@ on:
       - .github/workflows/diagnose-hosted-perf.yml
       - scripts/diagnose-hosted-perf.sh
       - scripts/diagnose-h2-shutdown-opening.go.txt
+      - scripts/diagnose-json-int.go.txt
+      - scripts/diagnose-optimization-patches.json
 
 permissions:
   contents: read

@@ -13,12 +13,20 @@ write_cases() {
 01	pkg/lux/api	default	BenchmarkStaticValueParams/Duration/JSON/static-2	^BenchmarkStaticValueParams$/^Duration$/^JSON$/^static$
 02	pkg/lux/api	default	BenchmarkStaticValueParams/Duration/Binary/static-2	^BenchmarkStaticValueParams$/^Duration$/^Binary$/^static$
 CASES
+    local case_id=3 label
+    for label in short-positive short-negative large-positive large-negative max-int64 min-int64 syntax-error positive-overflow negative-overflow leading-zero; do
+      printf '%02d\tpkg/lux/jsonutil\tjson-int\tBenchmarkDiagnosticParseInt64/%s-2\t^BenchmarkDiagnosticParseInt64$/^%s$\n' \
+        "$case_id" "$label" "$label" >> "$evidence/cases.tsv"
+      case_id=$((case_id + 1))
+    done
   else
     cat > "$evidence/cases.tsv" <<'CASES'
 01	pkg/lux/h2transport	default	BenchmarkTaskDeadlineReplacement/1/conditional-2	^BenchmarkTaskDeadlineReplacement$/^1$/^conditional$
 02	pkg/lux/luvia	default	BenchmarkGatewayIdentity/anonymous/before-2	^BenchmarkGatewayIdentity$/^anonymous$/^before$
 03	pkg/lux/luvia	default	BenchmarkGatewayIdentity/anonymous/after-2	^BenchmarkGatewayIdentity$/^anonymous$/^after$
 04	pkg/lux/h2transport	shutdown	BenchmarkShutdownOneOpeningConnection-2	^BenchmarkShutdownOneOpeningConnection$
+05	pkg/lux/h2transport	default	BenchmarkTaskDeadlineReplacement/8/conditional-2	^BenchmarkTaskDeadlineReplacement$/^8$/^conditional$
+06	pkg/lux/h2transport	default	BenchmarkTaskDeadlineReplacement/128/conditional-2	^BenchmarkTaskDeadlineReplacement$/^128$/^conditional$
 CASES
   fi
   python3 - "$evidence" <<'PYTHON'
@@ -41,6 +49,9 @@ compile_revision() {
   mkdir -p "$scratch/source/$revision" "$scratch/bin/$revision"
   git -C "$repo" archive "$commit" | tar -xf - -C "$scratch/source/$revision"
   git -C "$repo" show -s --format="$revision %H %T" "$commit" >> "$evidence/revisions.txt"
+  if [[ "$revision" == head ]]; then
+    apply_optimization
+  fi
   (
     set -x
     sh "$scratch/source/base/scripts/setup-modules.sh" "$scratch/source/$revision"
@@ -60,15 +71,47 @@ compile_revision() {
   record_binaries "$revision"
 }
 
-compile_shutdown_fixture() {
-  local revision="$1" overlay="$scratch/shutdown-$1.json" source="$scratch/source/$1"
-  python3 - "$source" "$evidence/shutdown-fixture.go.txt" <<'PYTHON' > "$overlay"
+apply_optimization() {
+  python3 - "$repo/scripts/diagnose-optimization-patches.json" "$suite" "$scratch/source/head" "$evidence" <<'PYTHON'
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+bundle, suite, source, evidence = sys.argv[1:]
+source, evidence = Path(source), Path(evidence)
+asset = json.loads(Path(bundle).read_text())[suite]
+patch = asset["patch"].encode()
+if hashlib.sha256(patch).hexdigest() != asset["sha256"]:
+    raise SystemExit("optimization patch SHA-256 changed")
+patch_path = evidence / "optimization.patch"
+patch_path.write_bytes(patch)
+target = source / asset["source"]
+original = hashlib.sha256(target.read_bytes()).hexdigest()
+env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(source.parent))
+for flags in (["--check"], []):
+    subprocess.run(["git", "-C", str(source), "apply", *flags, str(patch_path)], env=env, check=True)
+applied = hashlib.sha256(target.read_bytes()).hexdigest()
+if original == applied:
+    raise SystemExit("optimization did not change its target source")
+(evidence / "optimization.json").write_text(json.dumps({
+    "suite": suite, "patchSHA256": asset["sha256"], "source": asset["source"],
+    "originalSHA256": original, "appliedSHA256": applied,
+}, indent=2) + "\n")
+PYTHON
+}
+
+compile_diagnostic_fixture() {
+  local revision="$1" variant="$2" package="$3" virtual_name="$4" fixture_name="$5"
+  local overlay="$scratch/$variant-$revision.json" source="$scratch/source/$revision"
+  python3 - "$source/$package/$virtual_name" "$evidence/$fixture_name" <<'PYTHON' > "$overlay"
 import json
 from pathlib import Path
 import sys
 
-folder, fixture = (Path(value) for value in sys.argv[1:])
-virtual = folder / "pkg/lux/h2transport/shutdown_opening_diagnostic_test.go"
+virtual, fixture = (Path(value) for value in sys.argv[1:])
 if virtual.exists():
     raise SystemExit(f"diagnostic overlay must add a new file: {virtual}")
 print(json.dumps({"Replace": {str(virtual): str(fixture)}}))
@@ -76,10 +119,10 @@ PYTHON
   (
     set -x
     GOFLAGS="-overlay=$overlay" "$scratch/bin/benchrun" compile \
-      "$source" "$scratch/bin/$revision-shutdown" pkg/lux/h2transport
-  ) > "$evidence/compile-$revision-shutdown.log" 2>&1
-  cp "$overlay" "$evidence/shutdown-$revision-overlay.json"
-  record_binaries "$revision-shutdown"
+      "$source" "$scratch/bin/$revision-$variant" "$package"
+  ) > "$evidence/compile-$revision-$variant.log" 2>&1
+  cp "$overlay" "$evidence/$variant-$revision-overlay.json"
+  record_binaries "$revision-$variant"
 }
 
 record_binaries() {
@@ -99,8 +142,8 @@ run_leg() {
   local group="$1" sample="$2" comparison="$3" side="$4" revision="$5"
   local case_id="$6" package="$7" variant="$8" filter="$9" filename
   local binaries="$scratch/bin/$revision"
-  if [[ "$variant" == shutdown ]]; then
-    binaries+="-shutdown"
+  if [[ "$variant" != default ]]; then
+    binaries+="-$variant"
   fi
   filename="raw/$group.$sample.$comparison.$case_id.$side.txt"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -240,7 +283,9 @@ main() {
   git -C "$repo" merge-base --is-ancestor "$base" "$head"
   cat > "$evidence/protocol.txt" <<'PROTOCOL'
 Same runner, two groups (primary, confirmation), 10 alternating pairs per group for each case in A/A and A/B.
-A/A uses the same baseline binary for both legs. A/B compares baseline with the case's pinned PR.
+A/A uses the same baseline binary for both legs. A/B compares baseline with the pinned PR archive plus its exact optimization patch.
+The copied optimization patch and original/applied source SHA-256 are retained. Native default linking is unchanged.
+JSON integer diagnostics use the identical overlay on both revisions; all ten cases check values and error classes.
 benchmem, 200ms, count=1, cpu=2, test timeout=90s, benchstat alpha=0.01.
 benchgate: significant time increase >5%, significant bytes or allocations increase >0%, same unit flagged in both groups.
 A/B uses that revision's scoped approved-cost policy. A/A has no approved costs.
@@ -258,8 +303,15 @@ PROTOCOL
   if [[ "$suite" == pr78 ]]; then
     cp "$repo/scripts/diagnose-h2-shutdown-opening.go.txt" "$evidence/shutdown-fixture.go.txt"
     sha256sum "$evidence/shutdown-fixture.go.txt" > "$evidence/shutdown-fixture-sha256.txt"
-    compile_shutdown_fixture base
-    compile_shutdown_fixture head
+    for revision in base head; do
+      compile_diagnostic_fixture "$revision" shutdown pkg/lux/h2transport shutdown_opening_diagnostic_test.go shutdown-fixture.go.txt
+    done
+  else
+    cp "$repo/scripts/diagnose-json-int.go.txt" "$evidence/json-int-fixture.go.txt"
+    sha256sum "$evidence/json-int-fixture.go.txt" > "$evidence/json-int-fixture-sha256.txt"
+    for revision in base head; do
+      compile_diagnostic_fixture "$revision" json-int pkg/lux/jsonutil integer_diagnostic_test.go json-int-fixture.go.txt
+    done
   fi
   date -u '+sampling_start=%Y-%m-%dT%H:%M:%SZ' >> "$evidence/environment.txt"
   sample_groups

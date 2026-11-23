@@ -1,0 +1,43 @@
+package jsonutil
+
+import (
+	"errors"
+	"strconv"
+	"testing"
+)
+
+func BenchmarkDiagnosticParseInt64(b *testing.B) {
+	for _, sample := range []struct {
+		name, raw string
+		value     int64
+		err       error
+	}{
+		{"short-positive", "7", 7, nil},
+		{"short-negative", "-7", -7, nil},
+		{"large-positive", "123456789012345678", 123456789012345678, nil},
+		{"large-negative", "-123456789012345678", -123456789012345678, nil},
+		{"max-int64", "9223372036854775807", 1<<63 - 1, nil},
+		{"min-int64", "-9223372036854775808", -1 << 63, nil},
+		{"syntax-error", "12x", 0, strconv.ErrSyntax},
+		{"positive-overflow", "9223372036854775808", 1<<63 - 1, strconv.ErrRange},
+		{"negative-overflow", "-9223372036854775809", -1 << 63, strconv.ErrRange},
+		{"leading-zero", "01", 0, errExpectedInteger},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			raw := []byte(sample.raw)
+			value, err := ParseInt64(raw)
+			check := func() {
+				b.Helper()
+				if value != sample.value || !errors.Is(err, sample.err) {
+					b.Fatalf("ParseInt64(%q) = %d, %v; want %d, %v", sample.raw, value, err, sample.value, sample.err)
+				}
+			}
+			check()
+			b.ReportAllocs()
+			for b.Loop() {
+				value, err = ParseInt64(raw)
+			}
+			check()
+		})
+	}
+}

@@ -1,0 +1,12 @@
+{
+  "pr74": {
+    "source": "pkg/lux/jsonutil/scalar.go",
+    "sha256": "af6012a3dd656a37894848d4e8e78266cd2bf1f02975ad1e4752a3df1fc1debe",
+    "patch": "--- a/pkg/lux/jsonutil/scalar.go\n+++ b/pkg/lux/jsonutil/scalar.go\n@@ -55,11 +55,28 @@\n \t\traw = bytes.Trim(raw, \" \\t\\r\\n\")\n \t}\n \tdigits := raw\n-\tif len(digits) > 0 && digits[0] == '-' {\n+\tnegative := len(digits) > 0 && digits[0] == '-'\n+\tif negative {\n \t\tdigits = digits[1:]\n \t}\n \tif len(digits) == 0 || digits[0] < '0' || digits[0] > '9' || (digits[0] == '0' && len(digits) != 1) {\n \t\treturn 0, errExpectedInteger\n+\t}\n+\t// Eighteen decimal digits fit in int64. Preserve strconv's syntax and\n+\t// range errors for malformed tokens and boundary-sized values.\n+\tif len(digits) <= 18 {\n+\t\tvar value int64\n+\t\tfor _, unit := range digits {\n+\t\t\tdigit := unit - '0'\n+\t\t\tif digit > 9 {\n+\t\t\t\treturn strconv.ParseInt(string(raw), 10, 64)\n+\t\t\t}\n+\t\t\tvalue = value*10 + int64(digit)\n+\t\t}\n+\t\tif negative {\n+\t\t\tvalue = -value\n+\t\t}\n+\t\treturn value, nil\n \t}\n \treturn strconv.ParseInt(string(raw), 10, 64)\n }\n"
+  },
+  "pr78": {
+    "source": "pkg/lux/h2transport/protection.go",
+    "sha256": "396e62e890deb64fd165a38d8c26e1072a53fc1e7954ca649ed91a396256ccf7",
+    "patch": "--- a/pkg/lux/h2transport/protection.go\n+++ b/pkg/lux/h2transport/protection.go\n@@ -74,12 +74,13 @@\n // Called under c.mu for a registered task. Only changing the current minimum\n // can invalidate the cached deadline; later tasks do not require a map scan.\n func (c *candidateConnection) replaceTaskDeadline(task *requestTask, next time.Time) {\n-\tprevious := task.deadline\n-\ttask.deadline = next\n \tif len(c.tasks) == 1 {\n+\t\ttask.deadline = next\n \t\tc.deadline = next\n \t\treturn\n \t}\n+\tprevious := task.deadline\n+\ttask.deadline = next\n \tif !next.IsZero() && (c.deadline.IsZero() || next.Before(c.deadline)) {\n \t\tc.deadline = next\n \t\treturn\n"
+  }
+}
