@@ -1,4 +1,4 @@
-name: Diagnose hosted performance for PRs 71 and 72
+name: Diagnose hosted performance for PR 73
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: hosted-perf-pr71-pr72
+  group: hosted-perf-pr73
   cancel-in-progress: false
 
 jobs:
@@ -40,7 +40,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: hosted-perf-pr71-pr72-${{ github.run_id }}-${{ github.run_attempt }}
+          name: hosted-perf-pr73-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/hosted-perf-evidence/
           include-hidden-files: true
           if-no-files-found: error

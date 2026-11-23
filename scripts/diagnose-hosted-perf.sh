@@ -2,20 +2,16 @@
 set -euo pipefail
 
 base=65f1892e175487503aa36caa86d1eb8a0805f073
-pr71=e79e2a2930213e317eb6e0f1a77e27f22c4502e7
-pr72=f86453bc03d6ef7d0210aeb414c5e9a7dd540ed0
+pr73=d8b686b516ed5ab89e185093ca836756901fb56c
 benchstat_version=v0.0.0-20260825160852-19be9d8e6c70
 benchtime=200ms
 
 write_cases() {
   cat > "$evidence/cases.tsv" <<'CASES'
-01	pr71	pkg/lux/api	BenchmarkEventSnapshotDispatch/subscribers=128/typed-2	^BenchmarkEventSnapshotDispatch$/^subscribers=128$/^typed$
-02	pr71	pkg/lux/api	BenchmarkModuleColorWarm-2	^BenchmarkModuleColorWarm$
-03	pr71	pkg/lux/luvia	BenchmarkMergeDestination/columnar=true/rows=1/direct=true-2	^BenchmarkMergeDestination$/^columnar=true$/^rows=1$/^direct=true$
-04	pr72	pkg/lux/api	BenchmarkBinaryListPayload/String/count=0/version=0-2	^BenchmarkBinaryListPayload$/^String$/^count=0$/^version=0$
-05	pr72	pkg/lux/api	BenchmarkBinaryListPayload/Model/count=0/version=0-2	^BenchmarkBinaryListPayload$/^Model$/^count=0$/^version=0$
-06	pr72	pkg/lux/codec	BenchmarkStringWriteUTF8/nullable/ascii16/after-2	^BenchmarkStringWriteUTF8$/^nullable$/^ascii16$/^after$
-07	pr72	pkg/lux/codec	BenchmarkSelectionMaskLimits/empty/after-2	^BenchmarkSelectionMaskLimits$/^empty$/^after$
+01	pr73	pkg/codegen	BenchmarkQueryFacadeSource/R/1-2	^BenchmarkQueryFacadeSource$/^R$/^1$
+02	pr73	pkg/codegen	BenchmarkQueryFacadeSource/R/128-2	^BenchmarkQueryFacadeSource$/^R$/^128$
+03	pr73	pkg/codegen	BenchmarkQueryFacadeSource/User/1-2	^BenchmarkQueryFacadeSource$/^User$/^1$
+04	pr73	pkg/codegen	BenchmarkDurationScannerGeneration/[Duration]-2	^BenchmarkDurationScannerGeneration$/^\[Duration\]$
 CASES
   python3 - "$evidence" <<'PY'
 import json
@@ -23,7 +19,7 @@ from pathlib import Path
 import sys
 
 evidence = Path(sys.argv[1])
-expected = {"aa": [], "pr71": [], "pr72": []}
+expected = {"aa": [], "pr73": []}
 for line in (evidence / "cases.tsv").read_text().splitlines():
     _, head, package, name, _ = line.split("\t")
     row = {"Package": package, "Name": name}
@@ -143,7 +139,7 @@ analyze_groups() {
   local comparison status
   local -a gate_args
   printf 'comparison\tbenchgate_exit\n' > "$evidence/verdicts.tsv"
-  for comparison in aa pr71 pr72; do
+  for comparison in aa pr73; do
     normalize_group "$comparison" primary
     normalize_group "$comparison" confirmation
     gate_args=("$evidence/$comparison.primary.csv" "$evidence/$comparison.confirmation.csv")
@@ -195,24 +191,22 @@ main() {
   [[ "$(go version)" == 'go version go1.27.1 linux/amd64' ]]
   [[ "$(go env GOOS GOARCH GOAMD64)" == $'linux\namd64\nv1' ]]
   collect_host > "$evidence/environment.txt"
-  for revision in "$base" "$pr71" "$pr72"; do
+  for revision in "$base" "$pr73"; do
     [[ "$(git -C "$repo" cat-file -t "$revision")" == commit ]]
   done
-  git -C "$repo" merge-base --is-ancestor "$base" "$pr71"
-  git -C "$repo" merge-base --is-ancestor "$base" "$pr72"
+  git -C "$repo" merge-base --is-ancestor "$base" "$pr73"
   cat > "$evidence/protocol.txt" <<'PROTOCOL'
 Same runner, two groups (primary, confirmation), 10 alternating pairs per group for each case in A/A and A/B.
 A/A uses the same baseline binary for both legs. A/B compares baseline with the case's pinned PR.
 benchmem, 200ms, count=1, cpu=2, test timeout=90s, benchstat alpha=0.01.
 benchgate: significant time increase >5%, significant bytes or allocations increase >0%, same unit flagged in both groups.
 A/B uses that revision's scoped approved-cost policy. A/A has no approved costs.
-The before/after benchmark path component belongs to the fixture. Left/right identifies the binary comparison.
+The benchmark names are exact Go output identities. Left/right identifies the binary comparison.
 A threshold failure is recorded for diagnosis. A missing case or invalid sample fails this workflow.
 PROTOCOL
   write_cases
-  compile_revision base "$base" pkg/lux/api pkg/lux/codec pkg/lux/luvia
-  compile_revision pr71 "$pr71" pkg/lux/api pkg/lux/luvia
-  compile_revision pr72 "$pr72" pkg/lux/api pkg/lux/codec
+  compile_revision base "$base" pkg/codegen
+  compile_revision pr73 "$pr73" pkg/codegen
   date -u '+sampling_start=%Y-%m-%dT%H:%M:%SZ' >> "$evidence/environment.txt"
   sample_groups
   date -u '+sampling_end=%Y-%m-%dT%H:%M:%SZ' >> "$evidence/environment.txt"
