@@ -260,6 +260,7 @@ type TypeTagged struct {
 	EnumTypeTag         bool
 	NarrowedTag         bool // Identifier read narrowed from a nullable lexical binding.
 	ResultValueNullable bool // Result<T> payload nullability before '?' lifts a nullable call.
+	NoAwaitResult       bool // An intrinsic Void await, distinct from a business type named Void.
 }
 
 func (t *TypeTagged) GetTypeTag() string  { return t.TypeTag }
