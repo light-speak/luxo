@@ -34,9 +34,8 @@ class SelectionBuild {
         throw ArgumentError('Invalid output parent');
       ancestor = ancestor.parent;
     }
-    final parent = await ancestor.resolveSymbolicLinks();
-    if (parent != source.path &&
-        !parent.startsWith('${source.path}${Platform.pathSeparator}')) {
+    final parent = Uri.directory(await ancestor.resolveSymbolicLinks());
+    if (!parent.toString().startsWith(source.uri.toString())) {
       throw ArgumentError('Output escapes the project');
     }
     await destination.parent.create(recursive: true);
@@ -47,11 +46,15 @@ class SelectionBuild {
     Directory source, {
     String clientPath = 'lib/src/luxo/client.dart',
   }) async {
-    final root = Directory(await source.resolveSymbolicLinks());
+    var root = Directory(await source.resolveSymbolicLinks());
+    final path = root.path;
+    if (path.endsWith(Platform.pathSeparator) && root.parent.path != path) {
+      root = Directory(path.substring(0, path.length - 1));
+    }
     _relativePath(clientPath);
-    final temp = Directory('${root.path}/.tmp');
+    final temp = Directory.fromUri(root.uri.resolve('.tmp'));
     await temp.create(recursive: true);
-    if (await temp.resolveSymbolicLinks() != temp.absolute.path) {
+    if (!await _resolvesToOwnPath(temp)) {
       throw StateError('The build directory must not be a symlink');
     }
     final output = await temp.createTemp('luxo-selection-');
@@ -78,7 +81,7 @@ class SelectionBuild {
   }
 
   Future<void> _refresh() async {
-    if (await directory.resolveSymbolicLinks() != directory.absolute.path) {
+    if (!await _resolvesToOwnPath(directory)) {
       throw StateError('Build output was replaced by a symlink');
     }
     final files = await _sourceFiles(source);
@@ -210,14 +213,20 @@ class SelectionBuild {
   Future<void> close() async {
     if (_refreshing) throw StateError('Cannot close while preparing a build');
     if (_closed) return;
-    final expectedParent = Directory('${source.path}/.tmp');
-    if (directory.parent.path != expectedParent.path ||
-        await directory.resolveSymbolicLinks() != directory.absolute.path) {
+    final expectedParent = source.uri.resolve('.tmp/');
+    if (directory.parent.uri != expectedParent ||
+        !await _resolvesToOwnPath(directory)) {
       throw StateError('Refusing to remove an unowned build directory');
     }
     await directory.delete(recursive: true);
     _closed = true;
   }
+}
+
+Future<bool> _resolvesToOwnPath(Directory directory) async {
+  final resolved = await directory.resolveSymbolicLinks();
+  return resolved == directory.absolute.path ||
+      Uri.directory(resolved) == directory.uri;
 }
 
 const _excludedDirectories = {
