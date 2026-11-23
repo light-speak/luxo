@@ -1,4 +1,4 @@
-name: Diagnose hosted binary layout for PR 73
+name: Diagnose hosted performance for PRs 74 and 78
 
 on:
   push:
@@ -6,19 +6,24 @@ on:
     paths:
       - .github/workflows/diagnose-hosted-perf.yml
       - scripts/diagnose-hosted-perf.sh
+      - scripts/diagnose-h2-shutdown-opening.go.txt
 
 permissions:
   contents: read
 
 concurrency:
-  group: hosted-perf-pr73-layout
+  group: hosted-perf-pr74-pr78
   cancel-in-progress: false
 
 jobs:
   diagnose-hosted-perf:
     if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [pr74, pr78]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -31,16 +36,17 @@ jobs:
           check-latest: false
           cache: false
 
-      - name: Compare default and aligned test binaries
+      - name: Collect paired A/A and A/B measurements
         env:
           GOTOOLCHAIN: local
-        run: bash scripts/diagnose-hosted-perf.sh
+          BENCHMARK_SUITE: ${{ matrix.suite }}
+        run: bash scripts/diagnose-hosted-perf.sh "$BENCHMARK_SUITE"
 
       - name: Preserve measurements and provenance
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: hosted-perf-pr73-layout-${{ github.run_id }}-${{ github.run_attempt }}
+          name: hosted-perf-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/hosted-perf-evidence/
           include-hidden-files: true
           if-no-files-found: error
