@@ -478,6 +478,7 @@ jobs:
           }
           run_group() {
             local group="$1"
+            local batch="$2"
             local base_output="${GITHUB_WORKSPACE}/.tmp/benchmark-raw-${group}-base.txt"
             local head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-raw-${group}-head.txt"
             : > "${base_output}"
@@ -491,20 +492,23 @@ jobs:
                   run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${filter}"
                   run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${filter}"
                 fi
-              done < "${GITHUB_WORKSPACE}/.tmp/benchmark-batch.tsv"
+              done < "${batch}"
             done
             GOWORK=off go run ./scripts/benchplan --normalize "${base_output}" ".tmp/benchmark-${group}-base.txt"
             GOWORK=off go run ./scripts/benchplan --normalize "${head_output}" ".tmp/benchmark-${group}-head.txt"
           }
-          run_group primary
+          run_group primary .tmp/benchmark-batch.tsv
           GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-expected.json .tmp/benchmark-primary-base.txt .tmp/benchmark-primary-head.txt
           .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt
           .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt > .tmp/benchstat-primary.csv 2> .tmp/benchstat-primary-warnings.txt
-          confirmation_required=$(GOWORK=off go run ./scripts/benchgate --requires-confirmation .tmp/benchstat-primary.csv)
-          if [[ "${confirmation_required}" == "true" ]]; then
-            echo "Primary samples found a regression candidate; running confirmation samples."
-            run_group confirmation
-            GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-expected.json .tmp/benchmark-confirmation-base.txt .tmp/benchmark-confirmation-head.txt
+          GOWORK=off go run ./scripts/benchgate --confirmation-targets .tmp/benchstat-primary.csv > .tmp/benchmark-confirmation-targets.tsv
+          if [[ -s .tmp/benchmark-confirmation-targets.tsv ]]; then
+            echo "Primary samples found regression candidates. Running targeted confirmation samples."
+            GOWORK=off go run ./scripts/benchplan --confirmation-plan .tmp/benchmark-expected.json .tmp/benchmark-confirmation-targets.tsv .tmp/benchmark-confirmation-batch.tsv .tmp/benchmark-confirmation-expected.json
+            test -s .tmp/benchmark-confirmation-batch.tsv
+            test -s .tmp/benchmark-confirmation-expected.json
+            run_group confirmation .tmp/benchmark-confirmation-batch.tsv
+            GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-confirmation-expected.json .tmp/benchmark-confirmation-base.txt .tmp/benchmark-confirmation-head.txt
             .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt
             .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt > .tmp/benchstat-confirmation.csv 2> .tmp/benchstat-confirmation-warnings.txt
           else
@@ -516,9 +520,13 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
-          if [[ -s .tmp/benchstat-confirmation.csv ]]; then
-            GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
+          test -s .tmp/benchstat-primary.csv
+          test -f .tmp/benchmark-confirmation-targets.tsv
+          if [[ -s .tmp/benchmark-confirmation-targets.tsv ]]; then
+            test -s .tmp/benchstat-confirmation.csv
+            GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" --targeted-confirmation .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
           else
+            test ! -s .tmp/benchstat-confirmation.csv
             GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" .tmp/benchstat-primary.csv
           fi
 
@@ -535,6 +543,9 @@ jobs:
             .tmp/benchstat-*-warnings.txt
             .tmp/benchmark-batch.tsv
             .tmp/benchmark-expected.json
+            .tmp/benchmark-confirmation-targets.tsv
+            .tmp/benchmark-confirmation-batch.tsv
+            .tmp/benchmark-confirmation-expected.json
 
   performance:
     needs: [performance-scope, performance-samples]
