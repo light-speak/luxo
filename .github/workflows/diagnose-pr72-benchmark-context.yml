@@ -1,0 +1,52 @@
+name: Diagnose PR 72 benchmark process context
+
+on:
+  push:
+    branches: [diagnostics/hosted-perf-pr71-pr72]
+    paths:
+      - .github/workflows/diagnose-pr72-benchmark-context.yml
+      - scripts/diagnose-pr72-benchmark-context.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-perf-pr72-context
+  cancel-in-progress: false
+
+jobs:
+  diagnose-pr72-context:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+
+      - name: Compare historical prefix and single-leaf process
+        timeout-minutes: 22
+        env:
+          GOTOOLCHAIN: local
+        run: bash scripts/diagnose-pr72-benchmark-context.sh
+
+      - name: Preserve raw process output and results
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: hosted-perf-pr72-context-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-perf-pr72-context/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove local evidence after upload
+        if: always()
+        run: rm -rf -- .tmp/hosted-perf-pr72-context
