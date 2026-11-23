@@ -1,4 +1,4 @@
-name: Diagnose PR 73 relation and numeric emission optimizations
+name: Validate PR 73 corrected emission and numeric fixture
 
 on:
   push:

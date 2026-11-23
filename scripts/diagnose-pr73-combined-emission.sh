@@ -17,7 +17,7 @@ import sys
 
 bundle, output = map(Path, sys.argv[1:])
 patch = json.loads(bundle.read_text())["patch"].encode()
-if sha256(patch).hexdigest() != "d27ec33e5625686e42c374cf809a4db85dd355b86d25570af6d53d3fbd5748fb":
+if sha256(patch).hexdigest() != "159c279f83106b3c4dae60b00e6ca3f45b0f5b46ed24e0238be0051df5f75d46":
     raise SystemExit("PR 73 numeric emission patch SHA-256 mismatch")
 paths = re.findall(rb"^diff --git a/(\S+) b/(\S+)$", patch, re.M)
 expected = [b"pkg/codegen/handler.go", b"pkg/codegen/numeric_range_test.go"]
@@ -38,7 +38,7 @@ PYTHON
   )
   (cd "$source" && sha256sum "$handler" "$tests" "$benchmark") > "$evidence/numeric-source-after.sha256"
   [[ "$(pr73_overlay_digest "$source/$handler")" == cea600bd0343f772d6561e9759638e2333bf6c9ba7530c8998105d28a8e9a059 ]]
-  [[ "$(pr73_overlay_digest "$source/$tests")" == 9f341a6d8b88333756c883fb31c842e4e143045baa7d4dc963d305baea91c112 ]]
+  [[ "$(pr73_overlay_digest "$source/$tests")" == 11c48589c6606dc7d4f4b492274401adc49a8626567be0172cc52875dbdec696 ]]
   [[ "$(pr73_overlay_digest "$source/$benchmark")" == e5068c469e3d1a2dd2472dc048ed2a6b19f2cfbecb7a351677e34229a2bda666 ]]
 }
 
