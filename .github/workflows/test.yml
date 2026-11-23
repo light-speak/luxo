@@ -368,6 +368,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          mkdir -p .tmp/base/.tmp .tmp/head/.tmp
           mkdir -p .tmp/bin .tmp/test-tmp .tmp/benchmark-inventory/base .tmp/benchmark-inventory/head
           while IFS= read -r package; do
             for revision in base head; do
@@ -452,6 +453,7 @@ jobs:
       - name: Compile benchmark binaries
         run: |
           set -euo pipefail
+          mkdir -p .tmp/base/.tmp .tmp/head/.tmp
           mkdir -p .tmp/bin/base .tmp/bin/head .tmp/test-tmp
           sh scripts/setup-modules.sh .tmp/base
           sh scripts/setup-modules.sh .tmp/head
