@@ -1,0 +1,62 @@
+package luvia
+
+import (
+	"bytes"
+	"testing"
+
+	"github.com/light-speak/luxo/pkg/lux/codec"
+)
+
+func TestDiagnosticMergeSelectedNullable(t *testing.T) {
+	t.Run("row", func(t *testing.T) { checkDiagnosticMergeSelectedNullable(t, 1, false) })
+	t.Run("columnar-128", func(t *testing.T) { checkDiagnosticMergeSelectedNullable(t, 128, true) })
+}
+
+func checkDiagnosticMergeSelectedNullable(t *testing.T, rows int, columnar bool) {
+	t.Helper()
+	primary, model, registry := primaryKeysBenchmarkFixture(rows, 16, columnar, true)
+	var keys BinaryKeys
+	var ok bool
+	if columnar {
+		keys, ok = ExtractPrimaryKeyColumn(primary, model.PrimaryKeyField(), model)
+	} else {
+		keys, ok = ExtractPrimaryKeys(primary, model.PrimaryKeyField(), model, registry)
+	}
+	if !ok || keys.Len() != rows || keys.fieldEnd != len(primary)-1 {
+		t.Fatal("invalid benchmark fixture: expected key as the last field")
+	}
+	reply := codec.AppendVarint(nil, uint64(rows))
+	replyHeader := len(reply)
+	for row := range rows {
+		if row%2 == 1 {
+			reply = append(reply, 0)
+			continue
+		}
+		reply = append(reply, 1)
+		reply = codec.AppendBytes(reply, []byte{0, 1, 84, 0})
+	}
+	columns := []ExtendColumnResult{{FieldID: 17, Blobs: ParseGroupedResponse(reply, true)}}
+	if len(columns[0].Blobs) != rows {
+		t.Fatal("nullable grouped responses did not decode")
+	}
+	beforePrimary, beforeReply := bytes.Clone(primary), bytes.Clone(reply)
+	for _, includeKey := range []bool{true, false} {
+		end := len(primary) - 1
+		if !includeKey {
+			end = keys.fieldStart
+		}
+		want := append([]byte{0x77}, primary[:end]...)
+		want = append(want, 17)
+		want = append(want, reply[replyHeader:]...)
+		want = append(want, 0)
+		dst := make([]byte, 1, len(want))
+		dst[0] = 0x77
+		got := AppendMergedSelected(dst, primary, columns, keys, includeKey)
+		if !bytes.Equal(got, want) || &got[0] != &dst[0] {
+			t.Fatalf("includeKey=%v: merged wire or destination ownership changed (got %d bytes, want %d)", includeKey, len(got), len(want))
+		}
+	}
+	if !bytes.Equal(primary, beforePrimary) || !bytes.Equal(reply, beforeReply) {
+		t.Fatal("merge modified borrowed wire")
+	}
+}
