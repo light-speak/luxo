@@ -1,4 +1,4 @@
-name: Validate PR 72 optimized array header timing
+name: Validate PR 72 codec reads and RPC verifier timing
 
 on:
   push:
