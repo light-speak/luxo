@@ -1,0 +1,51 @@
+name: Diagnose hosted performance for PRs 71 and 72
+
+on:
+  push:
+    branches: [diagnostics/hosted-perf-pr71-pr72]
+    paths:
+      - .github/workflows/diagnose-hosted-perf.yml
+      - scripts/diagnose-hosted-perf.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-perf-pr71-pr72
+  cancel-in-progress: false
+
+jobs:
+  diagnose-hosted-perf:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+
+      - name: Collect paired A/A and A/B measurements
+        env:
+          GOTOOLCHAIN: local
+        run: bash scripts/diagnose-hosted-perf.sh
+
+      - name: Preserve measurements and provenance
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: hosted-perf-pr71-pr72-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-perf-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove local evidence after upload
+        if: always()
+        run: rm -rf -- .tmp/hosted-perf-evidence
