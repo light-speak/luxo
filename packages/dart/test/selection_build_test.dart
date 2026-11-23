@@ -424,6 +424,24 @@ Future<void> main() async {
       }
     },
   );
+  test('release publication reports a missing artifact error', () async {
+    final fixture = await SelectFixture.create(_minimal);
+    addTearDown(fixture.close);
+    final artifact = File('${fixture.root.path}/missing-executable');
+    final destination = File('${fixture.root.path}/release');
+
+    expect(
+      () => publishBuildArtifact(artifact, destination),
+      throwsA(
+        isA<FileSystemException>().having(
+          (error) => error.osError?.errorCode,
+          'OS error code',
+          2,
+        ),
+      ),
+    );
+    expect(await destination.exists(), isFalse);
+  });
   test('source links and path traversal are rejected without touching outside files', () async {
     final fixture = await SelectFixture.create(_minimal);
     try {

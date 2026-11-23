@@ -163,5 +163,15 @@ late final _moveFile = _kernel
       Int32 Function(Pointer<Uint16>, Pointer<Uint16>, Uint32),
       int Function(Pointer<Uint16>, Pointer<Uint16>, int)
     >('MoveFileExW');
-late final _windowsLastError = _kernel
-    .lookupFunction<Uint32 Function(), int Function()>('GetLastError');
+late final _windowsLastError = _bindWindowsLastError();
+
+int Function() _bindWindowsLastError() {
+  final getLastError = _kernel
+      .lookupFunction<Uint32 Function(), int Function()>(
+        'GetLastError',
+        isLeaf: true,
+      );
+  // Resolve the first invocation before MoveFileExW sets the thread's error.
+  getLastError();
+  return getLastError;
+}

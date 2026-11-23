@@ -41,4 +41,4 @@ jobs:
       - name: Verify release artifact ownership and publication
         run: >-
           dart test --concurrency=1 --reporter expanded test/selection_build_test.dart
-          --name '^(build ownership accepts a trailing directory separator|release publication preserves an output created after validation|AOT artifact retains call-site selections after snapshot cleanup)$'
+          --name '^(build ownership accepts a trailing directory separator|release publication preserves an output created after validation|release publication reports a missing artifact error|AOT artifact retains call-site selections after snapshot cleanup)$'
