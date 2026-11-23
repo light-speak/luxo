@@ -48,7 +48,7 @@ func parseGateOptions(args []string) (gateOptions, []string, error) {
 	flags.SetOutput(io.Discard)
 	flags.BoolVar(&options.confirmation, strings.TrimPrefix(confirmationFlag, "--"), false, "require a second sample group")
 	flags.BoolVar(&options.confirmationTargets, strings.TrimPrefix(confirmationTargetsFlag, "--"), false, "list benchmark cases requiring confirmation")
-	flags.BoolVar(&options.targetedConfirmation, strings.TrimPrefix(targetedConfirmationFlag, "--"), false, "validate confirmation of only the flagged benchmark cases")
+	flags.BoolVar(&options.targetedConfirmation, strings.TrimPrefix(targetedConfirmationFlag, "--"), false, "validate confirmation of flagged benchmark cases and their fixture context")
 	flags.StringVar(&path, "approved-costs", "", "reviewed sample cost policy")
 	flags.StringVar(&base, "base-sha", "", "exact benchmark baseline commit")
 	if err := flags.Parse(args); err != nil {
