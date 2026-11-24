@@ -260,9 +260,35 @@ func TestPerformanceOverlayReportsFixtureResolutionFailure(t *testing.T) {
 	}
 }
 
+func TestBenchmarkRunTreeCreatesMissingTempParent(t *testing.T) {
+	parent := filepath.Join(newBenchmarkRunTree(t), "checkout", ".tmp")
+	t.Run("fresh checkout", func(t *testing.T) {
+		root := newBenchmarkRunTreeIn(t, parent)
+		if filepath.Dir(root) != parent {
+			t.Fatalf("benchmark tree %q is outside %q", root, parent)
+		}
+	})
+	entries, err := os.ReadDir(parent)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("benchmark tree cleanup left %v: %v", entries, err)
+	}
+}
+
 func newBenchmarkRunTree(t *testing.T) string {
 	t.Helper()
-	root, err := os.MkdirTemp("../../.tmp", "bench-rpc-compile-")
+	return newBenchmarkRunTreeIn(t, filepath.Join("..", "..", ".tmp"))
+}
+
+func newBenchmarkRunTreeIn(t *testing.T, parent string) string {
+	t.Helper()
+	parent, err := filepath.Abs(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp(parent, "bench-rpc-compile-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,10 +297,6 @@ func newBenchmarkRunTree(t *testing.T) string {
 			t.Error(err)
 		}
 	})
-	root, err = filepath.Abs(root)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := os.Mkdir(filepath.Join(root, ".tmp"), 0755); err != nil {
 		t.Fatal(err)
 	}

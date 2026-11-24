@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -138,5 +139,264 @@ func TestAPIAndLuviaIsolatedInventoriesMatchOnlyRoutedRoots(t *testing.T) {
 				t.Fatal("accepted the ordinary profile as isolated")
 			}
 		})
+	}
+}
+
+func TestCodegenLiteralProfileKeepsExactlyFourLeaves(t *testing.T) {
+	const pkg = "pkg/codegen"
+	const profile = "codegen-integer-literals"
+	const literals = "BenchmarkCompileDecimalIntegerLiterals"
+	const other = "BenchmarkGenerateNumericLiteralBindings"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	const ordinaryBenchmark = other + "/plain" + measurement
+	const restricted = literals + "/duration_leading_zero" + measurement +
+		literals + "/duration_plain" + measurement + literals + "/int_leading_zero" + measurement +
+		literals + "/int_plain" + measurement
+	const extra = literals + "/unverified" + measurement
+	substituted := strings.Replace(restricted, literals+"/duration_plain"+measurement, extra, 1)
+	wrongCPU := strings.ReplaceAll(restricted, "-2 1 3", "-4 1 3")
+	root := benchmarkTempDir(t)
+	ordinary, isolated := root+"/ordinary.log", root+"/isolated.log"
+	args := []string{"--verify-profile-inventory", pkg, profile, ordinary, isolated}
+	for _, tc := range []struct {
+		name, ordinary, isolated string
+		valid                    bool
+	}{
+		{"exact", restricted, restricted, true},
+		{"missing on isolated", restricted, literals + "/int_plain" + measurement, false},
+		{"extra on both", restricted + extra, restricted + extra, false},
+		{"unverified replacement on both", substituted, substituted, false},
+		{"wrong CPU suffix", wrongCPU, wrongCPU, false},
+		{"unrelated root", restricted, restricted + ordinaryBenchmark, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+ordinaryBenchmark+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			if err := run(args, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("literal inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+	primary := formatShard(benchShard{Groups: []benchGroup{{Package: pkg, Name: literals}, {Package: pkg, Name: other}}})
+	confirmation := formatConfirmationBatch([]sampleKey{{pkg, literals + "/duration_plain-2"}, {pkg, other + "/plain-2"}})
+	for _, tc := range []struct{ batch, selected, sibling string }{
+		{primary, "^(" + literals + ")$", "^(" + other + ")$"},
+		{confirmation, "^" + literals + "$/^duration_plain$", "^" + other + "$/^plain$"},
+	} {
+		if !strings.Contains(tc.batch, pkg+"\t"+profile+"\t"+tc.selected+"\n") ||
+			!strings.Contains(tc.batch, pkg+"\tdefault\t"+tc.sibling+"\n") {
+			t.Fatalf("literal profile routes the wrong benchmarks:\n%s", tc.batch)
+		}
+	}
+}
+
+func TestCodegenReceiverInventoryAndIndependentRouting(t *testing.T) {
+	const pkg = "pkg/codegen"
+	const profile = "codegen-global-receiver"
+	const receiver = "BenchmarkGlobalReceiverName"
+	const literal = "BenchmarkCompileDecimalIntegerLiterals"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	const selected = receiver + "/User" + measurement + receiver + "/_Record" + measurement + receiver + "/用户" + measurement
+	const literalMeasurement = literal + "/int_plain" + measurement
+	const extra = receiver + "/Other" + measurement
+	root := benchmarkTempDir(t)
+	ordinary, isolated := root+"/ordinary.log", root+"/isolated.log"
+	for _, tc := range []struct {
+		name, ordinary, isolated string
+		valid                    bool
+	}{
+		{"exact", selected, selected, true},
+		{"missing unicode", selected, strings.ReplaceAll(selected, receiver+"/用户"+measurement, ""), false},
+		{"same wrong name", strings.ReplaceAll(selected, "用户", "Other"), strings.ReplaceAll(selected, "用户", "Other"), false},
+		{"same extra leaf", selected + extra, selected + extra, false},
+		{"literal in isolation", selected, selected + literalMeasurement, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+literalMeasurement+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			if err := run([]string{"--verify-profile-inventory", pkg, profile, ordinary, isolated}, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("receiver inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+	primary := formatShard(benchShard{Groups: []benchGroup{{Package: pkg, Name: receiver}, {Package: pkg, Name: literal}}})
+	confirmation := formatConfirmationBatch([]sampleKey{{pkg, receiver + "/用户-2"}, {pkg, literal + "/int_plain-2"}})
+	for _, tc := range []struct{ batch, a, b string }{
+		{primary, "^(" + receiver + ")$", "^(" + literal + ")$"},
+		{confirmation, "^" + receiver + "$/^用户$", "^" + literal + "$/^int_plain$"},
+	} {
+		if !strings.Contains(tc.batch, pkg+"\t"+profile+"\t"+tc.a+"\n") ||
+			!strings.Contains(tc.batch, pkg+"\tcodegen-integer-literals\t"+tc.b+"\n") {
+			t.Fatalf("codegen profiles must go to separate binaries:\n%s", tc.batch)
+		}
+	}
+	expected, batch := root+"/expected.json", root+"/batch.tsv"
+	const items = `[{"Package":"pkg/codegen","Name":"BenchmarkGlobalReceiverName/用户-2"},{"Package":"pkg/codegen","Name":"BenchmarkCompileDecimalIntegerLiterals/int_plain-2"}]`
+	writeFixture(t, expected, `{"Base":`+items+`,"Head":`+items+"}")
+	writeFixture(t, batch, confirmation)
+	args := []string{"--verify-profile-batch", "confirmation", expected, batch}
+	if err := run(args, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, batch, strings.NewReplacer(profile, "codegen-integer-literals", "codegen-integer-literals", profile).Replace(confirmation))
+	if err := run(args, io.Discard); err == nil {
+		t.Fatal("accepted swapped codegen profiles")
+	}
+}
+
+func TestCodegenMigrationStateInventoryRequiresNativeCohort(t *testing.T) {
+	const pkg, profile = "pkg/codegen", "codegen-migration-state"
+	const migration, receiver = "BenchmarkMigrationStateValidation", "BenchmarkGlobalReceiverName"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	const receiverRows = receiver + "/User" + measurement + receiver + "/_Record" + measurement + receiver + "/用户" + measurement
+	const unrelated = "BenchmarkCompileDecimalIntegerLiterals/int_plain" + measurement
+	var migrationRows strings.Builder
+	for _, size := range []string{"empty", "small", "large"} {
+		for _, op := range []string{"validate", "load/reference", "load/strict", "save/reference", "save/strict"} {
+			migrationRows.WriteString(migration + "/" + size + "/" + op + measurement)
+		}
+	}
+	cohort := migrationRows.String() + receiverRows
+	missingMigration := strings.ReplaceAll(cohort, migration+"/large/save/strict"+measurement, "")
+	missingReceiver := strings.ReplaceAll(cohort, receiver+"/用户"+measurement, "")
+	work := benchmarkTempDir(t)
+	ordinary, isolated := work+"/ordinary.log", work+"/isolated.log"
+	for _, tc := range []struct {
+		label, ordinary, isolated string
+		valid                     bool
+	}{
+		{"exact cohort", cohort, cohort, true},
+		{"migration leaf omitted", missingMigration, missingMigration, false},
+		{"receiver leaf omitted", missingReceiver, missingReceiver, false},
+		{"receiver root omitted", migrationRows.String(), migrationRows.String(), false},
+		{"unexpected isolated leaf", cohort, cohort + unrelated, false},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+unrelated+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			if err := run([]string{"--verify-profile-inventory", pkg, profile, ordinary, isolated}, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("migration inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+	primary := formatShard(benchShard{Groups: []benchGroup{{Package: pkg, Name: migration}, {Package: pkg, Name: receiver}}})
+	confirmation := formatConfirmationBatch([]sampleKey{{pkg, migration + "/small/load/strict-2"}, {pkg, receiver + "/用户-2"}})
+	for _, tc := range []struct{ batch, migrationFilter, receiverFilter string }{
+		{primary, "^(" + migration + ")$", "^(" + receiver + ")$"},
+		{confirmation, "^" + migration + "$/^small$/^load$/^strict$", "^" + receiver + "$/^用户$"},
+	} {
+		if !strings.Contains(tc.batch, pkg+"\t"+profile+"\t"+tc.migrationFilter+"\n") ||
+			!strings.Contains(tc.batch, pkg+"\tcodegen-global-receiver\t"+tc.receiverFilter+"\n") {
+			t.Fatalf("migration and receiver must use separate measured binaries:\n%s", tc.batch)
+		}
+	}
+}
+
+func TestLuviaGatewayIdentityHasSixSeparateLeaves(t *testing.T) {
+	const pkg, profile = "pkg/lux/luvia", "luvia-gateway-identity"
+	const root, primaryKeys = "BenchmarkGatewayIdentity", "BenchmarkPrimaryKeys"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	var six strings.Builder
+	for _, kind := range []string{"anonymous", "authenticated", "typed-nil"} {
+		for _, stage := range []string{"before", "after"} {
+			six.WriteString(root + "/" + kind + "/" + stage + measurement)
+		}
+	}
+	all := six.String()
+	missing := strings.ReplaceAll(all, root+"/typed-nil/before"+measurement, "")
+	changed := strings.ReplaceAll(all, "/before-2", "/previous-2")
+	const trace = primaryKeys + "/rows" + measurement
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	for _, tc := range []struct {
+		name, ordinary, isolated string
+		valid                    bool
+	}{
+		{"exact", all, all, true},
+		{"missing in isolation", all, missing, false},
+		{"missing on both", missing, missing, false},
+		{"same renamed leaves", changed, changed, false},
+		{"primary trace included", all, all + trace, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+trace+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			if err := run([]string{"--verify-profile-inventory", pkg, profile, ordinary, isolated}, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("GatewayIdentity inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+	primary := formatShard(benchShard{Groups: []benchGroup{{Package: pkg, Name: root}, {Package: pkg, Name: primaryKeys}}})
+	if !strings.Contains(primary, pkg+"\t"+profile+"\t^("+root+")$\n") ||
+		!strings.Contains(primary, pkg+"\tluvia-primary-trace\t^("+primaryKeys+")$\n") {
+		t.Fatalf("Luvia profiles must go to separate binaries:\n%s", primary)
+	}
+	required := []sampleKey{{pkg, root + "/authenticated/before-2"}, {pkg, root + "/authenticated/after-2"}, {pkg, primaryKeys + "/rows-2"}}
+	confirmation := formatConfirmationBatch(required)
+	expected, batch := dir+"/expected.json", dir+"/batch.tsv"
+	data, err := json.Marshal(expectedSamples{Base: required, Head: required})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, expected, string(data))
+	writeFixture(t, batch, confirmation)
+	args := []string{"--verify-profile-batch", "confirmation", expected, batch}
+	if err := run(args, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, batch, strings.NewReplacer(profile, "luvia-primary-trace", "luvia-primary-trace", profile).Replace(confirmation))
+	if err := run(args, io.Discard); err == nil {
+		t.Fatal("accepted swapped Luvia profiles")
+	}
+}
+
+func TestLuxShortPathPreservesAllNativeLeaves(t *testing.T) {
+	const pkg, profile = "pkg/lux", "lux-short-path"
+	const strict, decimal, sibling = "BenchmarkStrictFilterContract", "BenchmarkDecimalAlignment", "BenchmarkFormatDecimal"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	var selected strings.Builder
+	for _, kind := range []string{"Bool", "Contains", "Float", "Int", "Search", "String", "String1KiB", "Time"} {
+		for _, stage := range []string{"Before", "After"} {
+			selected.WriteString(strict + "/" + kind + "/" + stage + measurement)
+		}
+	}
+	for _, op := range []string{"Add", "Sub"} {
+		for _, mode := range []string{"near", "same", "zero"} {
+			for _, stage := range []string{"before", "after"} {
+				selected.WriteString(decimal + "/" + op + "/" + mode + "/" + stage + measurement)
+			}
+		}
+	}
+	all := selected.String()
+	missingStrict := strings.ReplaceAll(all, strict+"/Time/After"+measurement, "")
+	missingDecimal := strings.ReplaceAll(all, decimal+"/Add/zero/after"+measurement, "")
+	const untouched = sibling + "/example" + measurement
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	for _, tc := range []struct {
+		name, normal, projected string
+		valid                   bool
+	}{
+		{"exact", all, all, true},
+		{"missing strict", missingStrict, missingStrict, false},
+		{"missing decimal", missingDecimal, missingDecimal, false},
+		{"sibling joined isolation", all, all + untouched, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.normal+untouched+"PASS\n")
+			writeFixture(t, isolated, tc.projected+"PASS\n")
+			if err := run([]string{"--verify-profile-inventory", pkg, profile, ordinary, isolated}, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("Lux short-path inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+	confirmation := formatConfirmationBatch([]sampleKey{{pkg, strict + "/Time/After-2"}, {pkg, decimal + "/Add/zero/after-2"}, {pkg, sibling + "/example-2"}})
+	for _, route := range []string{
+		pkg + "\t" + profile + "\t^" + strict + "$/^Time$/^After$|^" + decimal + "$/^Add$/^zero$/^after$\n",
+		pkg + "\tdefault\t^" + sibling + "$/^example$\n",
+	} {
+		if !strings.Contains(confirmation, route) {
+			t.Fatalf("Lux confirmation did not preserve route %q in:\n%s", route, confirmation)
+		}
 	}
 }
