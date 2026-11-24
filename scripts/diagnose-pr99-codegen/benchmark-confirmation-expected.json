@@ -1,0 +1,14 @@
+{
+  "Base": [
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/empty/validate-2"
+    }
+  ],
+  "Head": [
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/empty/validate-2"
+    }
+  ]
+}

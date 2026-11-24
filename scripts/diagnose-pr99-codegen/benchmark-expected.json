@@ -1,0 +1,422 @@
+{
+  "Base": [
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/empty/load/reference-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/empty/load/strict-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/empty/save/reference-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/empty/save/strict-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/empty/validate-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/large/load/reference-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/large/load/strict-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/large/save/reference-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/large/save/strict-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/large/validate-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/small/load/reference-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/small/load/strict-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/small/save/reference-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/small/save/strict-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/small/validate-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkCheckedEntryFormattingComparison/embedded/current-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkCheckedEntryFormattingComparison/embedded/previous-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkCheckedEntryFormattingComparison/gateway/current-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkCheckedEntryFormattingComparison/gateway/previous-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkCheckedEntryFormattingComparison/module/current-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkCheckedEntryFormattingComparison/module/previous-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelAuthImportGeneration/auth-decimal/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelAuthImportGeneration/auth-decimal/128-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelAuthImportGeneration/auth/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelAuthImportGeneration/auth/128-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelAuthImportGeneration/ordinary/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelAuthImportGeneration/ordinary/128-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateNominalBindings/enum-shadow-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateNominalBindings/model-ordinary-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateNominalBindings/model-shadow-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateNominalBindings/scalar-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateNominalBindings/type-shadow-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGeneratorIdentifierValidation/1/active-parameters-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGeneratorIdentifierValidation/1/assignments-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGeneratorIdentifierValidation/128/active-parameters-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGeneratorIdentifierValidation/128/assignments-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkQueryValueGeneration/for-query-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkQueryValueGeneration/literal-query-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkQueryValueGeneration/load-literal-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkQueryValueGeneration/mixed-literal-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkEnumSymbolValidation/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkEnumSymbolValidation/128-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkEnumSymbolValidation/16-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelIdentityGeneration/model-control-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelIdentityGeneration/model-literals-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelIdentityGeneration/scalar-control-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkFieldIdentifierValidation/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkFieldIdentifierValidation/128-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkStringFieldExpression/named-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkStringFieldExpression/positional-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerate-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkPureQueryGeneration-2"
+    }
+  ],
+  "Head": [
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/empty/load/reference-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/empty/load/strict-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/empty/save/reference-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/empty/save/strict-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/empty/validate-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/large/load/reference-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/large/load/strict-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/large/save/reference-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/large/save/strict-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/large/validate-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/small/load/reference-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/small/load/strict-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/small/save/reference-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/small/save/strict-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkMigrationStateValidation/small/validate-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkCheckedEntryFormattingComparison/embedded/current-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkCheckedEntryFormattingComparison/embedded/previous-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkCheckedEntryFormattingComparison/gateway/current-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkCheckedEntryFormattingComparison/gateway/previous-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkCheckedEntryFormattingComparison/module/current-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkCheckedEntryFormattingComparison/module/previous-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelAuthImportGeneration/auth-decimal/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelAuthImportGeneration/auth-decimal/128-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelAuthImportGeneration/auth/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelAuthImportGeneration/auth/128-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelAuthImportGeneration/ordinary/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelAuthImportGeneration/ordinary/128-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateNominalBindings/enum-shadow-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateNominalBindings/model-ordinary-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateNominalBindings/model-shadow-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateNominalBindings/scalar-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerateNominalBindings/type-shadow-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGeneratorIdentifierValidation/1/active-parameters-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGeneratorIdentifierValidation/1/assignments-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGeneratorIdentifierValidation/128/active-parameters-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGeneratorIdentifierValidation/128/assignments-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkQueryValueGeneration/for-query-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkQueryValueGeneration/literal-query-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkQueryValueGeneration/load-literal-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkQueryValueGeneration/mixed-literal-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkEnumSymbolValidation/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkEnumSymbolValidation/128-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkEnumSymbolValidation/16-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelIdentityGeneration/model-control-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelIdentityGeneration/model-literals-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkModelIdentityGeneration/scalar-control-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkFieldIdentifierValidation/1-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkFieldIdentifierValidation/128-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkStringFieldExpression/named-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkStringFieldExpression/positional-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkGenerate-2"
+    },
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkPureQueryGeneration-2"
+    }
+  ]
+}

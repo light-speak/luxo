@@ -1,0 +1,53 @@
+name: Diagnose PR 99 migration state validation timing
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [diagnostics/hosted-perf-pr71-pr72]
+    paths:
+      - .github/workflows/diagnose-pr99-codegen.yml
+      - scripts/diagnose-pr99-codegen.sh
+      - scripts/diagnose-pr99-codegen.py
+      - scripts/diagnose-pr99-codegen/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-pr99-codegen
+  cancel-in-progress: false
+
+jobs:
+  diagnose-pr99-codegen:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Replay the original codegen shard on a single runner
+        timeout-minutes: 27
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+        run: bash scripts/diagnose-pr99-codegen.sh
+      - name: Preserve raw benchmark output, binary layout and verdicts
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: hosted-pr99-codegen-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr99-codegen/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove the owned evidence directory after upload
+        if: always()
+        run: rm -rf -- .tmp/hosted-pr99-codegen
