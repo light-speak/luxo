@@ -64,7 +64,7 @@ jobs:
               artifact=14924072511
               formal_run=45397856587
               digest=67c6414b54e7410188c0227b7266c30a16c9c0863fea7a1b8433c281feaddb25
-              evidence='.tmp/native-cpu-worktree/.tmp/pr72-boxed-json-evidence-c.*/'
+              evidence='.tmp/native-cpu-worktree/.tmp/pr72-boxed-json-evidence-p.*/'
               ;;
             'AMD EPYC 7763 64-CORE PROCESSOR')
               suite=pr71-columnar
@@ -149,6 +149,18 @@ jobs:
               fc2ad58b3a9ca44addf3585f1d0b73c8db1745f64d77f9e675db1c5af1fad6a0 "$root/$sampler" \
               c5dbcaf4134fcc76805f190dfeb489cc9bb5a09c4d7f24dee370db633f91e9cb "$root/scripts/diagnose-pr72-boxed-json/causal-order.py" |
               sha256sum -c - > "$receipt/header-driver-output.txt"
+            wrapper="$receipt/wrapper-driver.patch"
+            base64 -d "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr72-boxed-json-r/wrapper-driver.patch.b64" > "$wrapper"
+            printf '%s  %s\n' 4b6cab9a8b3e925d35468af73b4b4f5d17923b9defc1d4b8521efed2ca90c893 "$wrapper" |
+              sha256sum -c - > "$receipt/wrapper-driver-input.txt"
+            git -C "$root" apply --check --index --whitespace=error-all "$wrapper"
+            git -C "$root" apply --index --whitespace=error-all "$wrapper"
+            test "$(git -C "$root" write-tree)" = a4498dabf40d30e3b8609c8ac0f8c38c084435f7
+            printf '%s  %s\n' \
+              46d6dc3e011fa26692f3b7f32dc8e49d488e86f2f4e48ddd10f5ce13b5df0be1 "$root/$sampler" \
+              ae494d7c3d6cd1d53eb3517b45fa3cf7d2480c5687acb821b554941e6c4b443e "$root/scripts/diagnose-pr72-boxed-json/causal-order.py" \
+              522436aa467d4a88a950613e9d41df488d06e76c1c8207e9921be4ec4af53d70 "$root/scripts/diagnose-pr72-boxed-json/candidate-p.patch.b64" |
+              sha256sum -c - > "$receipt/wrapper-driver-output.txt"
           fi
           mkdir -p "$root/.tmp"
           gh api "repos/light-speak/luxo/actions/artifacts/$FORMAL_ARTIFACT" > "$receipt/artifact-metadata.json"
@@ -194,7 +206,7 @@ jobs:
               exec bash scripts/diagnose-pr71-static-jwt.sh run
               ;;
             pr72-boxed-json-header-causal)
-              exec bash scripts/diagnose-pr72-boxed-json/diagnose-native.sh . c .tmp/pr72-formal-shard-12.zip
+              exec bash scripts/diagnose-pr72-boxed-json/diagnose-native.sh . p .tmp/pr72-formal-shard-12.zip
               ;;
             pr71-columnar)
               exec bash "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr71-columnar.sh" . .tmp/pr71-columnar-formal-08.zip
