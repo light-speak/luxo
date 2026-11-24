@@ -1,0 +1,113 @@
+name: Qualify PR 82 PostgreSQL boundaries on current main
+
+on:
+  push:
+    branches: [diagnostics/qualify-pr82-go]
+    paths: [.github/workflows/qualify-pr82-go.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    if: ${{ github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/qualify-pr82-go' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: luxo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d luxo_test"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=5
+    env:
+      PRODUCT_BASE: 925f30ee1dcd45882b29130b8ed02836ed88317e
+      PRODUCT_HEAD: d5ae1f81c8af2872c862d3e2507909f994fb0d07
+      PRODUCT_TREE: 6a37c2f1ffd8a8dcf66058d3f50dea6972e9316f
+      SQL_COMMIT: 00030a1f46facb9251a23dcad7e00980d6ee63f0
+      DATABASE_HOST: localhost
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_PREFIX: luxo_test
+      DATABASE_SSL: disable
+      LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_AUDIT_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_TRANSACTION_RACE: '1'
+      NATS_URL: nats://127.0.0.1:4222
+      GOTOOLCHAIN: local
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+
+      - name: Restore the exact merge tree and verify the SQL files
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$PRODUCT_BASE" "$PRODUCT_HEAD"
+          test "$(git merge-tree --write-tree "$PRODUCT_BASE" "$PRODUCT_HEAD")" = "$PRODUCT_TREE"
+          git worktree add --detach .tmp/candidate "$PRODUCT_BASE"
+          mkdir -p .tmp/evidence .tmp/candidate/.tmp
+          git diff --binary "$PRODUCT_BASE" "$PRODUCT_TREE" | git -C .tmp/candidate apply --index
+          test "$(git -C .tmp/candidate write-tree)" = "$PRODUCT_TREE"
+          git -C .tmp/candidate diff --cached --check
+          paths=$'internal/sqllex/lex.go\ninternal/sqllex/lex_test.go\npkg/lux/condition.go\npkg/lux/condition_test.go'
+          test "$(git -C .tmp/candidate diff --cached --name-only)" = "$paths"
+          git -C .tmp/candidate diff --cached --exit-code "$SQL_COMMIT" -- internal/sqllex pkg/lux/condition.go pkg/lux/condition_test.go
+          printf 'base=%s\nhead=%s\ntree=%s\n' "$PRODUCT_BASE" "$PRODUCT_HEAD" "$PRODUCT_TREE" > .tmp/evidence/revision.txt
+          go version | tee .tmp/evidence/go-version.txt
+          test "$(cat .tmp/evidence/go-version.txt)" = 'go version go1.27.1 linux/amd64'
+          sh .tmp/candidate/scripts/setup-modules.sh .tmp/candidate
+
+      - name: Start NATS and wait for JetStream
+        run: |
+          set -euo pipefail
+          docker run --detach --name luxo-pr82-nats --publish 127.0.0.1:4222:4222 \
+            --publish 127.0.0.1:8222:8222 nats:2-alpine -js -m 8222
+          curl --fail --silent --show-error --retry 20 --retry-all-errors \
+            --retry-delay 1 --connect-timeout 2 --max-time 5 http://127.0.0.1:8222/healthz
+          curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8222/jsz | jq -e '.disabled != true and .config.max_memory > 0'
+
+      - name: Verify full Go coverage and targeted race, CLI, vet and complexity
+        working-directory: .tmp/candidate
+        run: |
+          set -euo pipefail
+          export GOWORK="$PWD/go.work" TMPDIR="$PWD/.tmp"
+          evidence="$PWD/../evidence"
+          sh scripts/check-go.sh format pkg/ cmd/ scripts/ internal/
+          sh scripts/check-go.sh complexity pkg/ cmd/ scripts/ internal/
+          go vet ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/...
+          go test ./pkg/... ./internal/... ./scripts/... -cover -timeout=45m -json \
+            -coverprofile="$evidence/root.cover" | tee "$evidence/root.jsonl"
+          go test -race -cover ./internal/sqllex ./pkg/lux ./pkg/lux/pg/... ./cmd/luxo/... \
+            -timeout=15m | tee "$evidence/targeted-race.txt"
+          test "$(git write-tree)" = "$PRODUCT_TREE"
+          git diff --exit-code
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pr82-go-${{ github.run_attempt }}
+          path: .tmp/evidence
+          if-no-files-found: error
+
+      - name: Clean up NATS
+        if: always()
+        run: |
+          if docker container inspect luxo-pr82-nats >/dev/null 2>&1; then
+            docker rm --force luxo-pr82-nats
+          fi
