@@ -53,7 +53,7 @@ func TestPerformanceCIKeepsSamplingAndEvidenceGates(t *testing.T) {
 
 func TestPerformanceSummaryFailsClosed(t *testing.T) {
 	job := readQualityWorkflow(t).Jobs["performance"]
-	if job.If != "always() && github.event_name == 'pull_request'" || len(job.Needs.Content) != 2 {
+	if job.If != "always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')" || len(job.Needs.Content) != 2 {
 		t.Fatal("stable performance check must aggregate both jobs even after failure")
 	}
 	script := performanceStep(t, "performance", "Require every selected benchmark batch")
@@ -79,6 +79,11 @@ func TestPerformanceSummaryFailsClosed(t *testing.T) {
 func samplingFixture(t *testing.T, confirmation bool) qualityFixture {
 	t.Helper()
 	fixture := newQualityFixture(t)
+	tee, err := exec.LookPath("tee")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.write(t, "bin/tee", "#!/bin/sh\nexec "+shellQualityQuote(tee)+" \"$@\"\n")
 	fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/a\tdefault\t^(BenchmarkA|BenchmarkB)$\npkg/control\tdefault\t^BenchmarkC$\n")
 	fixture.write(t, ".tmp/benchmark-expected.json", "primary expectations\n")
 	for _, revision := range []string{"base", "head"} {
@@ -92,6 +97,7 @@ set -eu
 test "$1" = run-performance
 benchmark_bin=$3
 benchmark_package=$4
+test "$2" = "$GITHUB_WORKSPACE/.tmp/${benchmark_bin##*/}"
 test "$5" = default
 shift 5
 case "$benchmark_package" in
@@ -138,6 +144,7 @@ case "$1 $2 $3" in
     esac
     ;;
   "run ./scripts/benchgate --confirmation-targets")
+    if [ "$4" = --advisory-timing ]; then shift; fi
     test "$4" = .tmp/benchstat-primary.csv
     test -s "$4"
     test "${FAIL_STAGE:-}" != targets
@@ -159,6 +166,14 @@ case "$1 $2 $3" in
     printf 'confirmation expectations\n' > "$7"
     ;;
   "run ./scripts/benchgate --approved-costs") ;;
+  "run ./scripts/benchgate .tmp/benchstat-control.csv")
+    test -s "$3"
+    test "${FAIL_STAGE:-}" != control
+    ;;
+  "run ./scripts/benchgate .tmp/benchstat-control-reversed.csv")
+    test -s "$3"
+    test "${FAIL_STAGE:-}" != control-reversed
+    ;;
   *) exit 42 ;;
 esac
 `
@@ -522,6 +537,78 @@ func TestPerformanceResolvesSyntheticMergeBaseline(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPerformanceResolvesQualificationBaseline(t *testing.T) {
+	script := performanceStep(t, "performance-scope", "Resolve benchmark revisions")
+	for _, tc := range []struct {
+		name, baseline, tested, scope string
+		valid                         bool
+	}{
+		{"full", "$actual_base", "$merge", "full", true},
+		{"affected", "$actual_base", "$merge", "affected", true},
+		{"invalid-baseline", "main", "$merge", "full", false},
+		{"non-ancestor", "$octopus", "$merge", "full", false},
+		{"same-commit", "$merge", "$merge", "full", false},
+		{"wrong-tested-checkout", "$actual_base", "$pr_head", "full", false},
+		{"invalid-scope", "$actual_base", "$merge", "other", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := performanceGitFixture(t)
+			prefix := performanceReadGitGraph + fmt.Sprintf(
+				"git update-ref --no-deref HEAD \"$merge\"\nexport GITHUB_EVENT_NAME=workflow_dispatch QUALIFICATION_BASE_SHA=\"%s\" TESTED_SHA=\"%s\" PERFORMANCE_SCOPE=%s\n",
+				tc.baseline, tc.tested, tc.scope,
+			)
+			suffix := "\ngrep -Fxq \"base_sha=$actual_base\" \"$GITHUB_OUTPUT\"\ngrep -Fxq \"tested_sha=$merge\" \"$GITHUB_OUTPUT\"\n"
+			output, _, err := fixture.run(t, prefix+script+suffix)
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v err=%v\n%s", tc.valid, err, output)
+			}
+			if !tc.valid && readQualityFile(t, filepath.Join(string(fixture), "github-output")) != "" {
+				t.Fatal("invalid qualification published a revision")
+			}
+		})
+	}
+}
+
+func TestPerformanceQualificationChecksSameBinaryControl(t *testing.T) {
+	script := performanceStep(t, "performance-samples", "Run adaptive interleaved benchmark samples")
+	for _, failure := range []string{"control-reversed", "", "control"} {
+		fixture := samplingFixture(t, true)
+		output, log, err := fixture.run(t, samplingPrefix(fixture, failure)+"export PERFORMANCE_MODE=qualification\n"+script)
+		if (err != nil) != (failure != "") {
+			t.Fatalf("control=%q err=%v\n%s", failure, err, output)
+		}
+		if strings.Count(log, "base -test.run=^$ -test.bench=^BenchmarkB$") != 30 ||
+			strings.Count(log, "head -test.run=^$ -test.bench=^BenchmarkB$") != 10 {
+			t.Fatalf("qualification must compare the baseline with itself using 10 pairs\n%s", log)
+		}
+		if !strings.Contains(log, "base=.tmp/benchmark-control-base.txt head=.tmp/benchmark-control-head.txt") ||
+			!strings.Contains(log, "base=.tmp/benchmark-control-head.txt head=.tmp/benchmark-control-base.txt") ||
+			!strings.Contains(log, "./scripts/benchgate .tmp/benchstat-control.csv") ||
+			!strings.Contains(log, "./scripts/benchgate .tmp/benchstat-control-reversed.csv") {
+			t.Fatalf("qualification must score both directions of the same measurements\n%s", log)
+		}
+	}
+}
+
+func TestSharedPerformanceUsesAdvisoryTimingInSelectionAndGate(t *testing.T) {
+	sample := performanceStep(t, "performance-samples", "Run adaptive interleaved benchmark samples")
+	gate := performanceStep(t, "performance-samples", "Enforce performance baseline")
+	for _, confirmation := range []bool{false, true} {
+		fixture := samplingFixture(t, confirmation)
+		output, log, err := fixture.run(t, samplingPrefix(fixture, "")+"export PERFORMANCE_MODE=advisory\n"+sample+"\n"+gate)
+		if err != nil {
+			t.Fatalf("advisory with confirmation=%v: %v\n%s", confirmation, err, output)
+		}
+		if !strings.Contains(log, "--confirmation-targets --advisory-timing .tmp/benchstat-primary.csv") ||
+			!strings.Contains(log, "--base-sha expected-main --advisory-timing") {
+			t.Fatalf("both shared phases must select advisory timing\n%s", log)
+		}
+		if strings.Contains(log, "benchmark-control") {
+			t.Fatal("only a strict qualification should run same-binary controls")
+		}
 	}
 }
 
