@@ -1,0 +1,53 @@
+name: Qualify the empty migration state fast path
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [diagnostics/hosted-perf-pr71-pr72]
+    paths:
+      - .github/workflows/diagnose-migration-state-empty.yml
+      - scripts/diagnose-migration-state-empty.sh
+      - scripts/diagnose-migration-state-empty.py
+      - scripts/diagnose-migration-state-empty.patch.b64
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-migration-state-empty
+  cancel-in-progress: false
+
+jobs:
+  qualify-migration-state-empty:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Pair the exact validator revisions on one native runner
+        timeout-minutes: 17
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+        run: bash scripts/diagnose-migration-state-empty.sh
+      - name: Preserve the samples and qualification verdict
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: hosted-migration-state-empty-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-migration-state-empty/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove the owned evidence directory after upload
+        if: always()
+        run: rm -rf -- .tmp/hosted-migration-state-empty
