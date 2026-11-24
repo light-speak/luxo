@@ -26,9 +26,10 @@ func writeNestedComputedResolve(b *strings.Builder, relation Relation, resultExp
 func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relation, modelRels map[string]bool, computedSets ...map[string]bool) {
 	name := m.Name
 	computedModels := firstBoolSet(computedSets)
-	fmt.Fprintf(b, "// resolve%sRelations loads selected relations using all known keys.\n", name)
+	writeStringParts(b, "// resolve", name, "Relations loads selected relations using all known keys.\n")
 	b.WriteString("// depth limits recursive resolution to prevent infinite loops.\n")
-	fmt.Fprintf(b, "func resolve%sRelations(ctx context.Context, app *App, value *%s, fields []*selection.Field, depth ...int) error {\n", name, name)
+	writeStringParts(b, "func resolve", name, "Relations(ctx context.Context, app *App, value *",
+		name, ", fields []*selection.Field, depth ...int) error {\n")
 	b.WriteString("\tif value == nil { return nil }\n\td := MaxRelationDepth\n\tif len(depth) > 0 { d = depth[0] }\n")
 	for _, relation := range rels {
 		b.WriteString("\tfor _, f := range fields {\n")
@@ -41,18 +42,21 @@ func generateRelationResolver(b *strings.Builder, m *ast.ModelDecl, rels []Relat
 
 func writeSingleRelationResult(b *strings.Builder, name string, relation Relation, modelRels, computedModels map[string]bool) {
 	indent := "\t\t\t"
-	key := "value." + str.Capitalize(relation.LocalKey)
+	key := str.Capitalize(relation.LocalKey)
+	keyPrefix := "value."
 	field := str.Capitalize(relation.FieldName)
 	if relation.FKNullable {
-		fmt.Fprintf(b, "%sif %s != nil {\n", indent, key)
-		indent += "\t"
-		key = "*" + key
+		writeStringParts(b, indent, "if value.", key, " != nil {\n")
+		indent = "\t\t\t\t"
+		keyPrefix = "*value."
 	}
 	writeRelationDepthCheck(b, indent, false)
-	fmt.Fprintf(b, "%skey := %s\n", indent, key)
-	fmt.Fprintf(b, "%sresultMap, err := app.loaders.%s.LoadAll(ctx, []%s{key}, f.Children)\n", indent, loaderFieldName(name, relation), relation.KeyGoType)
-	fmt.Fprintf(b, "%sif err != nil { return err }\n", indent)
-	fmt.Fprintf(b, "%sresult := resultMap[key]\n%svalue.%s = result\n", indent, indent, field)
+	writeStringParts(b, indent, "key := ", keyPrefix, key, "\n")
+	writeStringParts(b, indent, "resultMap, err := app.loaders.", loaderFieldName(name, relation),
+		".LoadAll(ctx, []", relation.KeyGoType, "{key}, f.Children)\n")
+	writeStringParts(b, indent, "if err != nil { return err }\n",
+		indent, "result := resultMap[key]\n",
+		indent, "value.", field, " = result\n")
 	writeNestedComputedResolve(b, relation, "result", indent, computedModels)
 	writeNestedRelationResolve(b, relation, "result", indent, modelRels)
 	if relation.FKNullable {
@@ -65,14 +69,14 @@ func writeRelationDepthCheck(b *strings.Builder, indent string, keys bool) {
 	if keys {
 		condition = "d <= 0 && len(keys) > 0"
 	}
-	fmt.Fprintf(b, "%sif %s { return errors.RelationDepthExceeded }\n", indent, condition)
+	writeStringParts(b, indent, "if ", condition, " { return errors.RelationDepthExceeded }\n")
 }
 
 func writeNestedRelationResolve(b *strings.Builder, relation Relation, resultExpr, indent string, modelRels map[string]bool) {
 	if !modelRels[relation.TargetName] {
 		return
 	}
-	fmt.Fprintf(b, "%sif has%sSelectedRelations(f.Children) {\n", indent, relation.TargetName)
+	writeStringParts(b, indent, "if has", relation.TargetName, "SelectedRelations(f.Children) {\n")
 	outerIndent := indent
 	indent += "\t"
 	b.WriteString(indent)

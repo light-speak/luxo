@@ -2239,9 +2239,8 @@ func generateNumericValidation(b *strings.Builder, f *ast.FieldDecl, varName, in
 			minimum, minLabel, minOk := numericValidationBound(d.Args[0].Value)
 			maximum, maxLabel, maxOk := numericValidationBound(d.Args[1].Value)
 			if minOk && maxOk {
-				writeValidationCheck(b, indent, f.Name,
-					fmt.Sprintf("%s < %s || %s > %s", varName, minimum, varName, maximum),
-					"out of range ["+minLabel+", "+maxLabel+"]")
+				writeValidationCheckParts(b, indent, f.Name, "out of range ["+minLabel+", "+maxLabel+"]",
+					varName, " < ", minimum, " || ", varName, " > ", maximum)
 			}
 		}
 	}
@@ -2265,9 +2264,29 @@ func numericValidationBound(expression ast.Expr) (value, label string, ok bool) 
 }
 
 func writeValidationCheck(b *strings.Builder, indent, field, cond, errMsg string) {
-	fmt.Fprintf(b, "%sif %s {\n", indent, cond)
-	fmt.Fprintf(b, "%s\treturn errors.BadRequest.WithData(errors.ParamError{Param: %q, Error: %q})\n", indent, field, errMsg)
-	fmt.Fprintf(b, "%s}\n", indent)
+	writeValidationCheckParts(b, indent, field, errMsg, cond)
+}
+
+// Quote once and reserve the full check without joining its condition.
+func writeValidationCheckParts(b *strings.Builder, indent, field, errMsg string, conditionParts ...string) {
+	const failure = "\treturn errors.BadRequest.WithData(errors.ParamError{Param: "
+	var scratch [128]byte
+	quoted := strconv.AppendQuote(scratch[:0], field)
+	fieldEnd := len(quoted)
+	quoted = strconv.AppendQuote(quoted, errMsg)
+	size := 3*len(indent) + len("if ") + len(" {\n") + len(failure) +
+		len(", Error: ") + len("})\n") + len("}\n") + len(quoted)
+	for _, part := range conditionParts {
+		size += len(part)
+	}
+	b.Grow(size)
+	writeStringParts(b, indent, "if ")
+	writeStringParts(b, conditionParts...)
+	writeStringParts(b, " {\n", indent, failure)
+	b.Write(quoted[:fieldEnd])
+	b.WriteString(", Error: ")
+	b.Write(quoted[fieldEnd:])
+	writeStringParts(b, "})\n", indent, "}\n")
 }
 
 // scanModelsForValidation checks if any CRUD model has validation directives.
