@@ -124,7 +124,9 @@ def restore(repo, scratch):
     require(git(repo, *binding, "write-tree") == BASE_TREE, "reverse projection failed")
 
     archive_path = scratch / "source.zip"
-    git(repo, *binding, "archive", "--format=zip", "-o", str(archive_path),
+    # Git archive can apply the runner's worktree line-ending settings.
+    git(repo, "-c", "core.autocrlf=false", "-c", "core.eol=lf", *binding,
+        "archive", "--format=zip", "-o", str(archive_path),
         actual, "--", "packages/dart", RELEASE_WORKFLOW)
     source = scratch / "src"
     with zipfile.ZipFile(archive_path) as archive:
