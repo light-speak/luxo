@@ -11,10 +11,10 @@ main_tree=3ddf747cccd83c2110b3dbeb5ce6c099c4de7c8e
 previous=1117eb9ffcc0beef977abceec656a351b0988389
 pr_head=12e7743153a02a5c1cfc997e84ff5b6993a267bd
 pr_tree=3dcde2a43cd604846985abd590aaa1950549929e
-candidate_tree=e3fd039c3c24e1137c8a11f596df4f7ede6604f6
+candidate_tree=02b4b982734de14b9928f8ed8d2234b60df562c2
 sampler_revision=cbf4cfb383d944ceb38f700e19cf79c4c54d3c58
 sampler_digest=9e0a5f421f2e76674b819f81074a3d416a51174e0f93b858a63d20c27d64e072
-patch_digest=47a0ebe1b04654ee3f2957766ac8f4021d1d11fad2c9bd333f01047181cb6161
+patch_digest=08ac50751e13756c896fd2d5ea96177da10842f6edc3ed76703274b9abd633d7
 package=pkg/lux/rpc
 profile=default
 cpu='AMD EPYC 9V74 80-Core Processor'
@@ -137,19 +137,38 @@ for role in base head candidate; do
   "$scratch/bin/benchrun" "$command" "$scratch/source/$role" "$scratch/bin/$role" "$package" "$profile" > "$evidence/compile-$role.log" 2>&1
   record_binaries "$role"
   binary="$scratch/bin/$role/pkg-lux-rpc.test"
-  symbols='[.]((BenchmarkRPCTraceLocal|BenchmarkRPC_Echo)([.]func[0-9]+)*|[(][*]Client[)][.](callRequest|exchangeRequest|releaseReply)|[(][*]poolConn[)][.]readResponse|[(][*]Pool[)][.]Put|decodeCallResponse|readClientFrame)$'
+  symbols='[.]((BenchmarkRPCTraceLocal|BenchmarkRPC_Echo)([.]func[0-9]+)*|[(][*]Client[)][.](callRequest|exchangeRequest|releaseReply|CallWithMaskTargetContext|finishUnaryError)|[(][*]poolConn[)][.]readResponse|[(][*]Pool[)][.]Put|decodeCallResponse|decodeCallError|readClientFrame)$'
   go tool nm -size "$binary" | awk -v pattern="$symbols" '$4 ~ pattern' > "$evidence/symbols-$role.nm"
-  for name in BenchmarkRPCTraceLocal BenchmarkRPC_Echo callRequest exchangeRequest; do
+  for name in BenchmarkRPCTraceLocal BenchmarkRPC_Echo exchangeRequest CallWithMaskTargetContext; do
     grep -Eq "[.]$name$" "$evidence/symbols-$role.nm"
   done
   go tool objdump -s "$symbols" "$binary" > "$evidence/symbols-$role.objdump"
   test -s "$evidence/symbols-$role.objdump"
-  checks='^Test(TraceLocalClientResponseAndReuse|ClientExchangeDeadlineFailuresDoNotRecycleConnections|ReusedRequestsKeepResponsesOwned)$'
+  if grep -Eq '[.]callRequest$' "$evidence/symbols-$role.nm"; then
+    printf 'callRequest=standalone-symbol\n' > "$evidence/call-layout-$role.txt"
+  else
+    [[ "$role" == candidate ]] || exit 1
+    awk '
+      /^TEXT / { entry = index($2, "(*Client).CallWithMaskTargetContext(SB)") != 0 }
+      entry && index($0, "(*Client).exchangeRequest(SB)") { direct = 1 }
+      END { exit !direct }
+    ' "$evidence/symbols-$role.objdump" || exit 1
+    printf 'callRequest=inlined-into-context-call\n' > "$evidence/call-layout-$role.txt"
+  fi
+  checks=(TraceLocalClientResponseAndReuse ClientExchangeDeadlineFailuresDoNotRecycleConnections ReusedRequestsKeepResponsesOwned)
+  if [[ "$role" == candidate ]]; then
+    checks+=(ClientCallStatusOnlyReusesConnection)
+  fi
+  selector="^Test($(IFS='|'; printf '%s' "${checks[*]}"))$"
   "$scratch/bin/benchrun" run-performance "$path" "$scratch/bin/$role" "$package" "$profile" \
-    -test.run="$checks" -test.count=1 -test.cpu=2 -test.timeout=90s -test.v > "$evidence/tests-$role.txt" 2>&1
-  for name in TraceLocalClientResponseAndReuse ClientExchangeDeadlineFailuresDoNotRecycleConnections ReusedRequestsKeepResponsesOwned; do
-    grep -Eq "^--- PASS: Test$name " "$evidence/tests-$role.txt"
+    -test.run="$selector" -test.count=1 -test.cpu=2 -test.timeout=90s -test.v > "$evidence/tests-$role.txt" 2>&1
+  for name in "${checks[@]}"; do
+    grep -Eq "^--- PASS: Test$name " "$evidence/tests-$role.txt" || exit 1
   done
+  if [[ "$role" == candidate ]]; then
+    grep -Fq -- '--- PASS: TestClientExchangeDeadlineFailuresDoNotRecycleConnections/application_error_while_resetting_deadline ' \
+      "$evidence/tests-$role.txt" || exit 1
+  fi
 done
 
 pair() {
