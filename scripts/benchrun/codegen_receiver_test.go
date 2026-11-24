@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,21 +34,28 @@ func TestCodegenReceiverOverlayMatchesNativeProjection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, baseline := range []bool{true, false} {
-		file, cleanup, err := compileOverlay(root, benchlayout.CodegenPackage, baseline, benchlayout.CodegenReceiverProfile)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			if err := cleanup(); err != nil {
-				t.Error(err)
+	for _, tc := range []struct{ profile, keptFixture string }{
+		{benchlayout.CodegenReceiverProfile, ""},
+		{"codegen-migration-state", "migrate_state_bench_test.go"},
+	} {
+		t.Run(tc.profile, func(t *testing.T) {
+			for _, baseline := range []bool{true, false} {
+				file, cleanup, err := compileOverlay(root, benchlayout.CodegenPackage, baseline, tc.profile)
+				if err != nil || file == "" {
+					t.Fatalf("compile overlay: %q, %v", file, err)
+				}
+				t.Cleanup(func() {
+					if err := cleanup(); err != nil {
+						t.Error(err)
+					}
+				})
+				verifyReceiverOverlay(t, file, tc.keptFixture, actualFiles)
 			}
 		})
-		verifyReceiverOverlay(t, file, actualFiles)
 	}
 }
 
-func verifyReceiverOverlay(t *testing.T, file string, actualFiles []string) {
+func verifyReceiverOverlay(t *testing.T, file, keptFixture string, actualFiles []string) {
 	t.Helper()
 	var overlay struct{ Replace map[string]string }
 	data, err := os.ReadFile(file)
@@ -56,17 +65,57 @@ func verifyReceiverOverlay(t *testing.T, file string, actualFiles []string) {
 	if err := json.Unmarshal(data, &overlay); err != nil {
 		t.Fatal(err)
 	}
-	if len(overlay.Replace) != len(actualFiles) {
-		t.Fatalf("got %d replacements for %d files", len(overlay.Replace), len(actualFiles))
+	want := len(actualFiles)
+	if keptFixture != "" {
+		want--
+	}
+	if len(overlay.Replace) != want {
+		t.Fatalf("got %d replacements, want %d", len(overlay.Replace), want)
 	}
 	for _, path := range actualFiles {
 		replacement, okay := overlay.Replace[path]
+		if filepath.Base(path) == keptFixture {
+			if okay {
+				t.Fatalf("migration fixture must use its original source: %q", replacement)
+			}
+			continue
+		}
 		if !okay || (replacement != "") != (filepath.Base(path) == codegenReceiverFixture) {
 			t.Fatalf("unexpected receiver overlay for %q: %q", path, replacement)
 		}
 		if replacement != "" {
 			checkReceiverProjection(t, replacement)
 		}
+	}
+}
+
+func TestCodegenMigrationProfileBindsBothFixtureDigests(t *testing.T) {
+	const want = "codegen-migration-state-overlay-v1 migrate_state_bench_test.go=08bf4e4e370167fd7f5d91cc0e420ecb09302576a76dbb9e767202316cf8ce50 global_value_bench_test.go=330fc5c6785cae1fd2e89810a1ec945e9384669a9efaa3af47cc5e3a2bf74da3"
+	var output bytes.Buffer
+	if err := run([]string{"performance-profile"}, nil, &output, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains("\n"+output.String(), "\n"+want+"\n") {
+		t.Fatalf("migration fixtures not bound in %q", output.String())
+	}
+}
+
+func TestCodegenMigrationOverlayRejectsMissingAndChangedSource(t *testing.T) {
+	root := newBenchmarkRunTree(t)
+	const profile = "codegen-migration-state"
+	name := filepath.Join(benchlayout.CodegenPackage, "migrate_state_bench_test.go")
+	receiver := filepath.Join(benchlayout.CodegenPackage, codegenReceiverFixture)
+	receiverSource, err := os.ReadFile(filepath.Join("../..", receiver))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeBenchmarkRunFixture(t, root, receiver, string(receiverSource))
+	if _, _, err := compileOverlay(root, benchlayout.CodegenPackage, false, profile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected missing migration fixture, got %v", err)
+	}
+	writeBenchmarkRunFixture(t, root, name, "package codegen\n")
+	if _, _, err := compileOverlay(root, benchlayout.CodegenPackage, true, profile); err == nil || !strings.Contains(err.Error(), "verified migration fixture") {
+		t.Fatalf("expected changed migration fixture rejection, got %v", err)
 	}
 }
 

@@ -25,6 +25,9 @@ const (
 	CodegenPackage                = "pkg/codegen"
 	CodegenLiteralBenchmark       = "BenchmarkCompileDecimalIntegerLiterals"
 	CodegenReceiverBenchmark      = "BenchmarkGlobalReceiverName"
+
+	CodegenMigrationStateProfile   = "codegen-migration-state"
+	CodegenMigrationStateBenchmark = "BenchmarkMigrationStateValidation"
 )
 
 var apiIdentityRoots = []string{
@@ -62,6 +65,8 @@ func ProfileForBenchmark(pkg, name string) string {
 			return CodegenLiteralProfile
 		case CodegenReceiverBenchmark:
 			return CodegenReceiverProfile
+		case CodegenMigrationStateBenchmark:
+			return CodegenMigrationStateProfile
 		}
 	}
 	return DefaultProfile
@@ -90,6 +95,7 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 		return []IsolationSpec{
 			{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"},
 			{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"},
+			{CodegenMigrationStateProfile, "^" + CodegenReceiverBenchmark + "$|^" + CodegenMigrationStateBenchmark + "$"},
 		}
 	default:
 		return nil

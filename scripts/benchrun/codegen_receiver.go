@@ -16,9 +16,28 @@ const (
 	codegenReceiverFixture       = "global_value_bench_test.go"
 	codegenReceiverLine          = 46
 	codegenReceiverProjectionSHA = "330fc5c6785cae1fd2e89810a1ec945e9384669a9efaa3af47cc5e3a2bf74da3"
+
+	codegenMigrationStateFixture    = "migrate_state_bench_test.go"
+	codegenMigrationStateFixtureSHA = "08bf4e4e370167fd7f5d91cc0e420ecb09302576a76dbb9e767202316cf8ce50"
 )
 
 func writeCodegenReceiverOverlay(pkg, workspace string) (string, error) {
+	return writeCodegenReceiverFixtures(pkg, workspace, "")
+}
+
+func writeCodegenMigrationStateOverlay(pkg, workspace string) (string, error) {
+	data, err := readRegularTestFixture(filepath.Join(pkg, codegenMigrationStateFixture))
+	if err != nil {
+		return "", fmt.Errorf("codegen migration state fixture: %w", err)
+	}
+	if fmt.Sprintf("%x", sha256.Sum256(data)) != codegenMigrationStateFixtureSHA {
+		return "", errors.New("source does not match the verified migration fixture")
+	}
+	// The verified binary compiled the original migration file alongside the receiver projection.
+	return writeCodegenReceiverFixtures(pkg, workspace, codegenMigrationStateFixture)
+}
+
+func writeCodegenReceiverFixtures(pkg, workspace, keptFixture string) (string, error) {
 	entries, err := os.ReadDir(pkg)
 	if err != nil {
 		return "", err
@@ -26,7 +45,7 @@ func writeCodegenReceiverOverlay(pkg, workspace string) (string, error) {
 	replacements := make(map[string]string)
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasSuffix(name, "_test.go") {
+		if name == keptFixture || !strings.HasSuffix(name, "_test.go") {
 			continue
 		}
 		path := filepath.Join(pkg, name)
