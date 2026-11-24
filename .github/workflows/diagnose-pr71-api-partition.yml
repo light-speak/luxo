@@ -1,4 +1,4 @@
-name: Diagnose PR 71 API signer linkage on current main
+name: Diagnose PR 71 API and Luvia linkage on AMD EPYC 7763
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/diagnose-pr71-api-partition.yml
       - scripts/diagnose-pr71-api-partition.sh
+      - scripts/diagnose-pr71-linked-fixtures.py
 
 permissions:
   contents: read
@@ -23,14 +24,14 @@ jobs:
       - name: Fetch the exact main and PR 71 source commits
         run: >-
           git fetch --no-tags origin
-          a79928f9673744f6c7020466272acea2fc4dbb5d
+          925f30ee1dcd45882b29130b8ed02836ed88317e
           ec041a07b105c9caf9e327a2cbf73de772582d00
       - uses: actions/setup-go@v7
         with:
           go-version: '1.27.1'
           check-latest: false
           cache: false
-      - name: Verify exact partitions and sample both link conditions
+      - name: Verify the runner model and sample both fixtures on that host
         env:
           GOTOOLCHAIN: local
           GOAMD64: v1
@@ -40,7 +41,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: hosted-pr71-api-partition-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .tmp/hosted-pr71-api-partition/
+          name: hosted-pr71-linked-fixtures-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr71-linked-fixtures/
           if-no-files-found: error
           retention-days: 14
