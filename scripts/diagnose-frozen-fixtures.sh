@@ -4,12 +4,13 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo=$(git -C "$script_dir" rev-parse --show-toplevel)
 source "$script_dir/diagnose-hosted-perf.sh"
-suite="${1:?usage: diagnose-frozen-fixtures.sh pr71|pr72|pr72-array-header [--plan-only|--layout-only|--compare-alignment|--compare-split|--check-split-inventory]}"
+suite="${1:?usage: diagnose-frozen-fixtures.sh pr71|pr72|pr72-array-header [mode]}"
 mode="${2:-run}"
 [[ $# -le 2 ]] || exit 2
 case "$mode" in
   run|--plan-only) ;;
   --layout-only|--compare-alignment|--compare-split|--check-split-inventory) [[ "$suite" == pr72-array-header ]] || exit 2;;
+  --compare-reader-capsule|--check-reader-capsule) [[ "$suite" == pr72-array-header ]] || exit 2;;
   *) exit 2;;
 esac
 array_candidate=
@@ -42,6 +43,8 @@ if [[ "$mode" == --layout-only ]]; then evidence="$repo/.tmp/hosted-pr72-referen
 if [[ "$mode" == --compare-alignment ]]; then evidence="$repo/.tmp/hosted-pr72-reference-alignment"; fi
 if [[ "$mode" == --compare-split ]]; then evidence="$repo/.tmp/hosted-pr72-reference-split"; fi
 if [[ "$mode" == --check-split-inventory ]]; then evidence="$repo/.tmp/hosted-pr72-reference-split-inventory"; fi
+if [[ "$mode" == --compare-reader-capsule ]]; then evidence="$repo/.tmp/hosted-pr72-reference-reader"; fi
+if [[ "$mode" == --check-reader-capsule ]]; then evidence="$repo/.tmp/hosted-pr72-reference-reader-inventory"; fi
 cleanup_fixture_shadow() {
   local code=$?
   trap - EXIT
@@ -54,13 +57,14 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 mkdir "$evidence"
 
-python3 - "$suite" "$evidence" <<'PYTHON'
+python3 - "$suite" "$evidence" "$mode" <<'PYTHON'
 import json
 from pathlib import Path
 import re
 import sys
 
 suite, output = sys.argv[1], Path(sys.argv[2])
+reader_only = sys.argv[3] in ("--compare-reader-capsule", "--check-reader-capsule")
 if suite == "pr71":
     groups = [
         ("pkg/lux/auth", [f"StaticJWT/Identity/{stage}" for stage in ("Before", "After")]),
@@ -74,6 +78,8 @@ elif suite == "pr72-array-header":
         (codec, [f"ElementPayload/{kind}-nullable/column=true/count=128/version={version}"
                  for kind in ("float", "int") for version in (0, 1)]),
     ]
+    if reader_only:
+        groups = groups[1:]
 else:
     codec = "pkg/lux/codec"
     groups = [
@@ -89,7 +95,8 @@ for index, (package, names) in enumerate(groups, 1):
     filters = ["/".join("^" + re.escape(part) + "$" for part in name.split("/")) for name in names]
     cases.append(f"{index:02d}\t{package}\tdefault\t{suite}\t" + "|".join(filters))
     expected.extend({"Package": package, "Name": name + "-2"} for name in names)
-if len(expected) != (17 if suite == "pr72" else 8):
+expected_count = 4 if reader_only else (17 if suite == "pr72" else 8)
+if len(expected) != expected_count:
     raise SystemExit("unexpected benchmark inventory")
 (output / "cases.tsv").write_text("\n".join(cases) + "\n")
 (output / "expected.json").write_text(json.dumps({"Base": expected, "Head": expected}, indent=2) + "\n")
@@ -128,7 +135,7 @@ fi
 export TMPDIR="$scratch/tmp" GOWORK=off GOTOOLCHAIN=local
 mkdir -p "$TMPDIR" "$scratch/source/base" "$scratch/source/head" "$scratch/bin/base" "$scratch/bin/head" "$evidence/pairs"
 [[ -z "$(go env GOFLAGS GOEXPERIMENT | tr -d '\n')" ]]
-if [[ "$mode" == --check-split-inventory ]]; then
+if [[ "$mode" == --check-split-inventory || "$mode" == --check-reader-capsule ]]; then
   test "$(go env GOVERSION)" = go1.27.1
   {
     uname -s -m
@@ -160,7 +167,7 @@ done
 (
   cd "$repo"
   go build -o "$scratch/bin/benchrun" ./scripts/benchrun
-  if [[ "$mode" != --layout-only && "$mode" != --check-split-inventory ]]; then
+  if [[ "$mode" != --layout-only && "$mode" != --check-split-inventory && "$mode" != --check-reader-capsule ]]; then
     cd "$scratch/source/base"
     for name in benchplan benchgate; do go build -o "$scratch/bin/$name" "./scripts/$name"; done
     GOBIN="$scratch/bin" go install "golang.org/x/perf/cmd/benchstat@$benchstat_version"
@@ -332,6 +339,57 @@ if [[ "$mode" == --compare-split || "$mode" == --check-split-inventory ]]; then
   if [[ "$mode" == --check-split-inventory ]]; then exit 0; fi
 fi
 
+prepare_reader_capsule() {
+  local role side frozen overlay source profile binary_dir config
+  local helper="$script_dir/diagnose-pr72-reader-capsule.py"
+  local case_id package unused label filter
+  IFS=$'\t' read -r case_id package unused label filter < "$evidence/cases.tsv"
+  test "$case_id" = 01
+  test "$package" = pkg/lux/codec
+  for role in base candidate; do
+    source="$scratch/source/$role"
+    side=base
+    if [[ "$role" == candidate ]]; then side=head; fi
+    frozen="$scratch/candidate-pkg-lux-codec/fixtures/pkg/lux/codec/$side.json"
+    overlay="$scratch/reader-$role/overlay.json"
+    python3 "$helper" make-overlay "$source/$package" "$frozen" "$overlay" "$evidence/reader-fixtures-$role.json"
+    binary_dir="$scratch/bin/$role-capsule"
+    mkdir "$binary_dir"
+    (
+      cd "$source"
+      export GOWORK="$PWD/go.work"
+      go test -trimpath -c "-overlay=$overlay" ./pkg/lux/codec -o "$binary_dir/pkg-lux-codec.test"
+    ) > "$evidence/compile-$role-capsule.log" 2>&1
+    record_binaries "$role-capsule"
+    "$scratch/bin/benchrun" run "$source" "$binary_dir" "$package" -test.list '.*' > "$evidence/reader-roots-$role.txt"
+    "$scratch/bin/benchrun" run "$source" "$binary_dir" "$package" \
+      -test.run='^$' -test.bench='^BenchmarkElementPayload$' -test.benchmem \
+      -test.benchtime=1x -test.count=1 -test.cpu=2 -test.timeout=90s > "$evidence/reader-all-$role.txt"
+    for profile in default capsule; do
+      config="$frozen"
+      binary_dir="$scratch/bin/$role"
+      if [[ "$profile" == capsule ]]; then config="$overlay"; binary_dir+="-capsule"; fi
+      (
+        cd "$source"
+        GOWORK="$PWD/go.work" go list -json "-overlay=$config" ./pkg/lux/codec
+      ) > "$evidence/reader-files-$role-$profile.json"
+      "$scratch/bin/benchrun" run "$source" "$binary_dir" "$package" \
+        -test.run='^$' -test.bench="$filter" -test.benchmem \
+        -test.benchtime=1x -test.count=1 -test.cpu=2 -test.timeout=90s > "$evidence/reader-targets-$role-$profile.txt"
+    done
+  done
+  python3 "$helper" verify-inventory "$evidence"
+}
+
+if [[ "$mode" == --compare-reader-capsule || "$mode" == --check-reader-capsule ]]; then
+  if [[ "$mode" == --compare-reader-capsule ]]; then
+    python3 "$script_dir/diagnose-pr72-reference-layout.py" "$evidence" "$scratch/bin"
+  fi
+  prepare_reader_capsule
+  if [[ "$mode" == --check-reader-capsule ]]; then exit 0; fi
+  python3 "$script_dir/diagnose-pr72-reader-capsule.py" verify-closures "$evidence" "$scratch/bin"
+fi
+
 # The two Planner leaves were introduced by PR 72. Preserve native head-only observations
 # separately. They have no matched historical series and are outside the paired verdict.
 if [[ "$suite" == pr72 ]]; then
@@ -350,6 +408,7 @@ else
   comparisons+=(ap)
   if [[ "$mode" == --compare-alignment ]]; then comparisons=(aa ap aligned-aa aligned-ap); fi
   if [[ "$mode" == --compare-split ]]; then comparisons=(aa ap split-aa split-ap); fi
+  if [[ "$mode" == --compare-reader-capsule ]]; then comparisons=(aa ap capsule-aa capsule-ap); fi
   comparison_count="${#comparisons[@]}"
   mkdir "$evidence/raw"
   printf 'group\tpair\tcomparison\tcase\tside\trevision\tvariant\traw\n' > "$evidence/order.tsv"
@@ -371,6 +430,8 @@ else
             aligned-ap) other=candidate; link_variant=align64;;
             split-aa) other=base; link_variant="$(split_variant "$case_id")";;
             split-ap) other=candidate; link_variant="$(split_variant "$case_id")";;
+            capsule-aa) other=base; link_variant=capsule;;
+            capsule-ap) other=candidate; link_variant=capsule;;
           esac
           run_pair "$group" "$sample" "$comparison" "$other" "$first" "$case_id" "$package" "$link_variant" "$filter"
         done
@@ -381,6 +442,9 @@ fi
 test "$(( $(wc -l < "$evidence/order.tsv") - 1 ))" = "$(( 40 * ${#comparisons[@]} * $(wc -l < "$evidence/cases.tsv") ))"
 if [[ "$mode" == --compare-split ]]; then
   python3 "$script_dir/diagnose-pr72-codec-split.py" verify-samples "$evidence"
+fi
+if [[ "$mode" == --compare-reader-capsule ]]; then
+  python3 "$script_dir/diagnose-pr72-reader-capsule.py" verify-samples "$evidence"
 fi
 printf 'comparison\tgate_exit\n' > "$evidence/verdicts.tsv"
 status=0
@@ -397,7 +461,7 @@ for comparison in "${comparisons[@]}"; do
     # Only a failed baseline or tested candidate contributes to its verdict.
     if [[ "$mode" == --compare-alignment ]]; then
       if [[ "$comparison" == aa || "$comparison" == aligned-aa ]]; then status=1; fi
-    elif [[ "$mode" == --compare-split ]]; then
+    elif [[ "$mode" == --compare-split || "$mode" == --compare-reader-capsule ]]; then
       if [[ "$comparison" != ap ]]; then status=1; fi
     elif [[ -z "$array_candidate" || "$comparison" != ab ]]; then
       status=1
@@ -414,17 +478,24 @@ if [[ "$mode" == --compare-alignment ]]; then
     fi
   done
 fi
-if [[ "$mode" == --compare-split ]]; then
+if [[ "$mode" == --compare-split || "$mode" == --compare-reader-capsule ]]; then
   for kind in int float; do
     leaf="github.com/light-speak/luxo/pkg/lux/codec/ElementPayload/$kind-nullable/column=true/count=128/version=0-2"
     if ! grep -Fq "confirmed performance regression: $leaf sec/op " "$evidence/ap.benchgate.log"; then
-      printf 'Fixture split comparison inconclusive: default comparison did not reproduce %s\n' "$leaf" >&2
+      printf 'Fixture comparison inconclusive: default comparison did not reproduce %s\n' "$leaf" >&2
       status=1
     fi
   done
   if [[ "$(grep -c '^confirmed performance regression: ' "$evidence/ap.benchgate.log")" != 2 ]]; then
-    printf 'Fixture split comparison inconclusive: expected only the two historical V0 timing reports\n' >&2
+    printf 'Fixture comparison inconclusive: expected only the two historical V0 timing reports\n' >&2
     status=1
+  fi
+fi
+if [[ "$mode" == --compare-reader-capsule ]]; then
+  cat "$evidence/reader-scope.json"
+  if ! grep -q '"exactOriginalModel": true' "$evidence/reader-scope.json" && (( status == 0 )); then
+    printf '%s\n' 'Different runner model, measurements retained as observations.' >&2
+    status=3
   fi
 fi
 exit "$status"

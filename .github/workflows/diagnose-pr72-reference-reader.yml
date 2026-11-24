@@ -1,0 +1,56 @@
+name: Compare PR 72 codec timings in a reader-only benchmark
+
+on:
+  push:
+    branches: [diagnostics/pr72-reference-reader]
+    paths:
+      - .github/workflows/diagnose-pr72-reference-reader.yml
+      - scripts/diagnose-pr72-reference-layout.py
+      - scripts/diagnose-pr72-codec-split.py
+      - scripts/diagnose-pr72-reader-capsule.py
+      - scripts/diagnose-frozen-fixtures.sh
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr72-reference-reader'
+    runs-on: ubuntu-latest
+    timeout-minutes: 32
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Fetch the exact inputs from the original build
+        run: >-
+          git fetch --no-tags origin
+          ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+          5e4c9d1b3813cc95f98d4088a10c242dca47b8de
+      - name: Verify the disassembly reader
+        run: python3 scripts/diagnose-pr72-reference-layout.py --self-test
+      - name: Compare full and reader-only fixtures with the default linker
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: 1
+        run: |
+          git diff --exit-code eb735edc90c7caa810262b77e5f7a9a6a659976a -- \
+            scripts/benchrun scripts/diagnose-hosted-perf.sh scripts/setup-modules.sh \
+            internal/benchlayout .github/qualification/pr72-array-header-unroll.patch.b64
+          bash scripts/diagnose-frozen-fixtures.sh pr72-array-header --compare-reader-capsule
+      - name: Preserve sample groups and binary bindings
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr72-reference-reader-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr72-reference-reader/
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: true
