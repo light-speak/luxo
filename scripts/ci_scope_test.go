@@ -8,7 +8,7 @@ import (
 )
 
 const requiresProductChecks = "(needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only')"
-const productCheckScope = "${{ !cancelled() && " + requiresProductChecks + " }}"
+const productCheckScope = "${{ !cancelled() && github.event_name != 'workflow_dispatch' && " + requiresProductChecks + " }}"
 
 func TestCIScopeRequiresOnlyOrdinaryBenchmarkToolFiles(t *testing.T) {
 	record := func(mode, status, path string) string {
@@ -123,7 +123,16 @@ func TestCIScopeLeavesCoreAndPerformanceChecksRequired(t *testing.T) {
 		"sdk-kotlin", swiftNativeCIJob} {
 		job := workflow.Jobs[name]
 		if job.Needs.Value != "pr-test-scope" || job.If != productCheckScope || job.ContinueOnError {
-			t.Errorf("%s must skip only when the verified output is explicitly benchmark-only", name)
+			t.Errorf("%s must run for ordinary events unless the verified output is benchmark-only", name)
+		}
+	}
+}
+
+func TestManualPerformanceQualificationDoesNotRepeatCoreChecks(t *testing.T) {
+	workflow := readQualityWorkflow(t)
+	for _, name := range []string{"test", "lint"} {
+		if workflow.Jobs[name].If != "github.event_name != 'workflow_dispatch'" {
+			t.Errorf("%s must run on ordinary push and PR events", name)
 		}
 	}
 }

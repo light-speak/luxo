@@ -382,7 +382,7 @@ func TestSwiftCIRequiresNativeResult(t *testing.T) {
 	job := readQualityWorkflow(t).Jobs[swiftConformanceCIJob]
 	var dependencies []string
 	if err := job.Needs.Decode(&dependencies); err != nil || !slices.Equal(dependencies, []string{"pr-test-scope", swiftNativeCIJob}) ||
-		job.If != "${{ always() && "+requiresProductChecks+" }}" || job.ContinueOnError || job.Permissions == nil || len(job.Permissions) != 0 ||
+		job.If != "${{ always() && github.event_name != 'workflow_dispatch' && "+requiresProductChecks+" }}" || job.ContinueOnError || job.Permissions == nil || len(job.Permissions) != 0 ||
 		len(job.Steps) != 1 {
 		t.Fatalf("the stable Swift check must require the native result without permissions: %v", err)
 	}

@@ -16,8 +16,8 @@ import (
 
 const benchmarkPackagePrefix = "github.com/light-speak/luxo/"
 
-func reportConfirmationTargets(path string, output io.Writer) error {
-	primary, err := evaluateFile(path)
+func reportConfirmationTargets(path string, output io.Writer, advisoryTiming bool) error {
+	primary, err := evaluateFile(path, advisoryTiming)
 	if err != nil {
 		return err
 	}

@@ -5,12 +5,24 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      performance_baseline:
+        description: Exact baseline commit SHA for this qualification
+        required: true
+        type: string
+      performance_scope:
+        description: Full release matrix or only affected packages
+        required: true
+        type: choice
+        default: full
+        options: [full, affected]
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && 'qualification' || 'checks' }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -56,6 +68,7 @@ jobs:
           printf 'Test scope: %s\n' "$kind"
 
   test:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -231,6 +244,7 @@ jobs:
           docker rm --force luxo-ci-nats || true
 
   lint:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -262,7 +276,7 @@ jobs:
 
   race:
     needs: pr-test-scope
-    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -286,7 +300,7 @@ jobs:
 
   runtime-race:
     needs: pr-test-scope
-    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -335,7 +349,7 @@ jobs:
         run: go test -race ./pkg/lux/... -count=1 -timeout=240s
 
   performance-scope:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -359,27 +373,46 @@ jobs:
           TESTED_SHA: ${{ github.sha }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          QUALIFICATION_BASE_SHA: ${{ inputs.performance_baseline }}
+          PERFORMANCE_SCOPE: ${{ inputs.performance_scope }}
         run: |
           set -euo pipefail
-          for sha in "$TESTED_SHA" "$EVENT_HEAD_SHA" "$EVENT_BASE_SHA"; do
-            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-              echo "Invalid benchmark event revision" >&2
+          is_commit_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
+          is_commit_sha "$TESTED_SHA"
+          test "$(git rev-parse HEAD)" = "$TESTED_SHA"
+          case "${GITHUB_EVENT_NAME:-pull_request}" in
+            pull_request)
+              is_commit_sha "$EVENT_HEAD_SHA"
+              is_commit_sha "$EVENT_BASE_SHA"
+              parents=$(git rev-list --parents --max-count=1 HEAD)
+              read -r merge_sha base_sha pr_sha extra <<< "$parents"
+              if [[ "$merge_sha" != "$TESTED_SHA" || -z "$base_sha" || "$pr_sha" != "$EVENT_HEAD_SHA" || -n "$extra" ]]; then
+                echo "Benchmark checkout must be the event merge with the PR head as second parent" >&2
+                exit 1
+              fi
+              # The event's base can predate the main revision used to build the merge.
+              if ! git merge-base --is-ancestor "$EVENT_BASE_SHA" "$base_sha"; then
+                echo "PR event base is not an ancestor of the tested merge base" >&2
+                exit 1
+              fi
+              ;;
+            workflow_dispatch)
+              base_sha="$QUALIFICATION_BASE_SHA"
+              if ! is_commit_sha "$base_sha" || [[ "$base_sha" == "$TESTED_SHA" ]] || ! git merge-base --is-ancestor "$base_sha" "$TESTED_SHA"; then
+                echo "Qualification requires the exact SHA of an earlier baseline ancestor" >&2
+                exit 1
+              fi
+              case "$PERFORMANCE_SCOPE" in
+                full|affected) ;;
+                *) exit 1 ;;
+              esac
+              ;;
+            *)
               exit 1
-            fi
-          done
-          parents=$(git rev-list --parents --max-count=1 HEAD)
-          read -r merge_sha base_sha pr_sha extra <<< "$parents"
-          if [[ "$merge_sha" != "$TESTED_SHA" || -z "$base_sha" || "$pr_sha" != "$EVENT_HEAD_SHA" || -n "$extra" ]]; then
-            echo "Benchmark checkout must be the event merge with the PR head as second parent" >&2
-            exit 1
-          fi
-          # The event's base can predate the main revision used to build the merge.
-          if ! git merge-base --is-ancestor "$EVENT_BASE_SHA" "$base_sha"; then
-            echo "PR event base is not an ancestor of the tested merge base" >&2
-            exit 1
-          fi
+              ;;
+          esac
           mkdir -p .tmp
-          printf 'base_sha=%s\ntested_sha=%s\n' "$base_sha" "$merge_sha" > .tmp/benchmark-revisions.txt
+          printf 'base_sha=%s\ntested_sha=%s\n' "$base_sha" "$TESTED_SHA" > .tmp/benchmark-revisions.txt
           cat .tmp/benchmark-revisions.txt >> "$GITHUB_OUTPUT"
 
       - name: Check out benchmark baseline
@@ -401,6 +434,7 @@ jobs:
         env:
           BASE_SHA: ${{ steps.benchmark_revisions.outputs.base_sha }}
           TESTED_SHA: ${{ steps.benchmark_revisions.outputs.tested_sha }}
+          PERFORMANCE_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.performance_scope || 'affected' }}
         run: |
           set -euo pipefail
           benchmark_packages() {
@@ -427,11 +461,16 @@ jobs:
           ) | .tmp/bin/benchrun canonical > .tmp/head-benchmark-packages.txt
           comm -12 .tmp/base-benchmark-packages.txt .tmp/head-benchmark-packages.txt > .tmp/common-benchmark-packages.txt
           git -c core.quotePath=false diff --no-renames --name-only "${BASE_SHA}" "${TESTED_SHA}" > .tmp/changed-files.txt
-          GOWORK=off go run ./scripts/benchscope \
-            .tmp/base \
-            .tmp/head \
-            .tmp/changed-files.txt \
-            .tmp/common-benchmark-packages.txt > .tmp/benchmark-packages.txt
+          if [[ "${PERFORMANCE_SCOPE:-affected}" == full ]]; then
+            test -s .tmp/common-benchmark-packages.txt
+            cp .tmp/common-benchmark-packages.txt .tmp/benchmark-packages.txt
+          else
+            GOWORK=off go run ./scripts/benchscope \
+              .tmp/base \
+              .tmp/head \
+              .tmp/changed-files.txt \
+              .tmp/common-benchmark-packages.txt > .tmp/benchmark-packages.txt
+          fi
           if [[ -s .tmp/benchmark-packages.txt ]]; then
             echo "run=true" >> "${GITHUB_OUTPUT}"
             echo "Affected benchmark packages:"
@@ -520,7 +559,7 @@ jobs:
   performance-samples:
     needs: performance-scope
     if: needs.performance-scope.outputs.run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -620,11 +659,24 @@ jobs:
             .tmp/bin/benchrun compile-performance .tmp/head .tmp/bin/head "${package}" "${profile}"
           done < .tmp/benchmark-batch.tsv
 
+      - name: Record qualification environment
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          test "$(go env GOHOSTOS GOHOSTARCH)" = $'linux\namd64'
+          { uname -a; lscpu; go env -json GOVERSION GOOS GOARCH GOAMD64 CGO_ENABLED; } > .tmp/benchmark-environment.txt
+
       - name: Run adaptive interleaved benchmark samples
         env:
           TMPDIR: ${{ github.workspace }}/.tmp/test-tmp
+          PERFORMANCE_MODE: ${{ github.event_name == 'workflow_dispatch' && 'qualification' || 'advisory' }}
         run: |
           set -euo pipefail
+          target_options=(--confirmation-targets)
+          if [[ "${PERFORMANCE_MODE:-strict}" == advisory ]]; then target_options+=(--advisory-timing); fi
           run_package() {
             local source_root="$1"
             local binary_root="$2"
@@ -639,6 +691,8 @@ jobs:
           run_group() {
             local group="$1"
             local batch="$2"
+            local right_revision=head
+            if [[ "$group" == control ]]; then right_revision=base; fi
             local base_output="${GITHUB_WORKSPACE}/.tmp/benchmark-raw-${group}-base.txt"
             local head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-raw-${group}-head.txt"
             : > "${base_output}"
@@ -647,9 +701,9 @@ jobs:
               while IFS=$'\t' read -r package profile filter; do
                 if (( sample % 2 == 1 )); then
                   run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${profile}" "${filter}"
-                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${profile}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/${right_revision}" "${GITHUB_WORKSPACE}/.tmp/bin/${right_revision}" "${head_output}" "${package}" "${profile}" "${filter}"
                 else
-                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${profile}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/${right_revision}" "${GITHUB_WORKSPACE}/.tmp/bin/${right_revision}" "${head_output}" "${package}" "${profile}" "${filter}"
                   run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${profile}" "${filter}"
                 fi
               done < "${batch}"
@@ -661,7 +715,7 @@ jobs:
           GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-expected.json .tmp/benchmark-primary-base.txt .tmp/benchmark-primary-head.txt
           .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt
           .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt > .tmp/benchstat-primary.csv 2> .tmp/benchstat-primary-warnings.txt
-          GOWORK=off go run ./scripts/benchgate --confirmation-targets .tmp/benchstat-primary.csv > .tmp/benchmark-confirmation-targets.tsv
+          GOWORK=off go run ./scripts/benchgate "${target_options[@]}" .tmp/benchstat-primary.csv > .tmp/benchmark-confirmation-targets.tsv
           if [[ -s .tmp/benchmark-confirmation-targets.tsv ]]; then
             echo "Primary samples found regression candidates. Running targeted confirmation samples."
             GOWORK=off go run ./scripts/benchplan --confirmation-plan .tmp/benchmark-expected.json .tmp/benchmark-confirmation-targets.tsv .tmp/benchmark-confirmation-batch.tsv .tmp/benchmark-confirmation-expected.json
@@ -672,24 +726,51 @@ jobs:
             GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-confirmation-expected.json .tmp/benchmark-confirmation-base.txt .tmp/benchmark-confirmation-head.txt
             .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt
             .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt > .tmp/benchstat-confirmation.csv 2> .tmp/benchstat-confirmation-warnings.txt
+            if [[ "${PERFORMANCE_MODE:-strict}" == qualification ]]; then
+              run_group control .tmp/benchmark-confirmation-batch.tsv
+              GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-confirmation-expected.json .tmp/benchmark-control-base.txt .tmp/benchmark-control-head.txt
+              .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-control-base.txt head=.tmp/benchmark-control-head.txt > .tmp/benchstat-control.csv 2> .tmp/benchstat-control-warnings.txt
+              if ! GOWORK=off go run ./scripts/benchgate .tmp/benchstat-control.csv | tee .tmp/benchmark-control-gate.txt; then
+                echo "::error::Same-binary control failed. Qualification evidence is unstable."
+                exit 1
+              fi
+            fi
           else
-            echo "Primary samples are clean; confirmation samples are unnecessary."
+            echo "No blocking metric requires confirmation in this run."
           fi
 
       - name: Enforce performance baseline
         env:
           BASE_SHA: ${{ needs.performance-scope.outputs.base_sha }}
+          PERFORMANCE_MODE: ${{ github.event_name == 'workflow_dispatch' && 'qualification' || 'advisory' }}
         run: |
           set -euo pipefail
+          gate_options=(--approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}")
+          if [[ "${PERFORMANCE_MODE:-strict}" == advisory ]]; then gate_options+=(--advisory-timing); fi
           test -s .tmp/benchstat-primary.csv
           test -f .tmp/benchmark-confirmation-targets.tsv
           if [[ -s .tmp/benchmark-confirmation-targets.tsv ]]; then
             test -s .tmp/benchstat-confirmation.csv
-            GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" --targeted-confirmation .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
+            GOWORK=off go run ./scripts/benchgate "${gate_options[@]}" --targeted-confirmation .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv | tee .tmp/benchmark-gate.txt
           else
             test ! -s .tmp/benchstat-confirmation.csv
-            GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" .tmp/benchstat-primary.csv
+            GOWORK=off go run ./scripts/benchgate "${gate_options[@]}" .tmp/benchstat-primary.csv | tee .tmp/benchmark-gate.txt
           fi
+
+      - name: Summarize performance observations
+        if: always()
+        run: |
+          set -euo pipefail
+          [[ -s .tmp/benchmark-gate.txt ]] || exit 0
+          {
+            printf '### Benchmark results\n\n'
+            if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+              printf 'Review timing observations on affected hot paths with a separate qualification run.\n\n'
+            fi
+            printf '```text\n'
+            cat .tmp/benchmark-gate.txt
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Preserve performance evidence
         if: always()
@@ -710,7 +791,7 @@ jobs:
 
   performance:
     needs: [performance-scope, performance-samples]
-    if: always() && github.event_name == 'pull_request'
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -731,7 +812,7 @@ jobs:
 
   external-go-consumer:
     needs: pr-test-scope
-    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -760,7 +841,7 @@ jobs:
 
   fuzz:
     needs: pr-test-scope
-    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -809,7 +890,7 @@ jobs:
 
   sdk-ts:
     needs: pr-test-scope
-    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -875,7 +956,7 @@ jobs:
 
   sdk-dart:
     needs: pr-test-scope
-    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -940,7 +1021,7 @@ jobs:
 
   sdk-kotlin:
     needs: pr-test-scope
-    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -1005,7 +1086,7 @@ jobs:
 
   sdk-swift-native:
     needs: pr-test-scope
-    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: macos-26
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
@@ -1064,7 +1145,7 @@ jobs:
 
   sdk-swift-conformance:
     needs: [pr-test-scope, sdk-swift-native]
-    if: ${{ always() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
+    if: ${{ always() && github.event_name != 'workflow_dispatch' && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions: {}
