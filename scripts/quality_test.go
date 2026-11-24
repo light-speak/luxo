@@ -25,6 +25,7 @@ type qualityWorkflow struct {
 		Needs          yaml.Node
 		TimeoutMinutes int `yaml:"timeout-minutes"`
 		Env            map[string]string
+		Outputs        map[string]string
 		Strategy       struct {
 			FailFast *bool `yaml:"fail-fast"`
 			Matrix   struct{ Dart []string }

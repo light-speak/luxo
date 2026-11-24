@@ -2,6 +2,8 @@ package scripts_test
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -360,6 +362,173 @@ fi
 				if !strings.Contains(log, "compile .tmp/"+revision+"\n") {
 					t.Errorf("revision %s did not reach compilation:\n%s", revision, log)
 				}
+			}
+		})
+	}
+}
+
+// The workflow must compare the exact tree being tested to its actual main parent.
+func TestPerformanceResolvesSyntheticMergeBaseline(t *testing.T) {
+	script := performanceStep(t, "performance-scope", "Resolve benchmark revisions")
+	fixture := performanceGitFixture(t)
+	for _, test := range []struct {
+		name, checkout, eventBase, eventHead, tested string
+		valid                                        bool
+	}{
+		{"stale-event-base", "merge", "event_base", "pr_head", "merge", true},
+		{"current-event-base", "merge", "actual_base", "pr_head", "merge", true},
+		{"unrelated-event-base", "merge", "pr_head", "pr_head", "merge", false},
+		{"wrong-pr-head", "merge", "event_base", "actual_base", "merge", false},
+		{"wrong-tested-sha", "merge", "event_base", "pr_head", "actual_base", false},
+		{"nonmerge-checkout", "actual_base", "event_base", "pr_head", "actual_base", false},
+		{"octopus-checkout", "octopus", "event_base", "pr_head", "octopus", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prefix := performanceReadGitGraph + fmt.Sprintf(
+				"git update-ref --no-deref HEAD \"$%s\"\nexport EVENT_BASE_SHA=\"$%s\" EVENT_HEAD_SHA=\"$%s\" TESTED_SHA=\"$%s\"\n",
+				test.checkout, test.eventBase, test.eventHead, test.tested,
+			)
+			suffix := ""
+			if test.valid {
+				suffix = "\ngrep -Fxq \"base_sha=$actual_base\" \"$GITHUB_OUTPUT\"\n" +
+					"grep -Fxq \"tested_sha=$merge\" \"$GITHUB_OUTPUT\"\n" +
+					"cmp \"$GITHUB_OUTPUT\" .tmp/benchmark-revisions.txt\n"
+			}
+			output, _, err := fixture.run(t, prefix+script+suffix)
+			if (err == nil) != test.valid {
+				t.Fatalf("valid=%v err=%v\n%s", test.valid, err, output)
+			}
+			if !test.valid {
+				if got := readQualityFile(t, filepath.Join(string(fixture), "github-output")); got != "" {
+					t.Fatalf("published revisions after rejecting checkout: %q", got)
+				}
+			}
+		})
+	}
+}
+
+const performanceGitGraph = `set -euo pipefail
+export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
+export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
+git init -q
+empty=$(git mktree </dev/null)
+event_base=$(git commit-tree "$empty" -m "event base")
+actual_base=$(git commit-tree "$empty" -p "$event_base" -m "advanced base")
+pr_head=$(git commit-tree "$empty" -p "$event_base" -m "PR head")
+extra=$(git commit-tree "$empty" -p "$event_base" -m "additional parent")
+payload=$(printf 'synthetic tree\n' | git hash-object -w --stdin)
+merged_tree=$(printf '100644 blob %s\tmerge-source.txt\n' "$payload" | git mktree)
+merge=$(git commit-tree "$merged_tree" -p "$actual_base" -p "$pr_head" -m "synthetic merge")
+octopus=$(git commit-tree "$empty" -p "$actual_base" -p "$pr_head" -p "$extra" -m "octopus merge")
+printf 'event_base=%s\nactual_base=%s\npr_head=%s\nmerge=%s\noctopus=%s\n' \
+    "$event_base" "$actual_base" "$pr_head" "$merge" "$octopus" > .git/benchmark-fixture-shas
+`
+
+const performanceReadGitGraph = `set -euo pipefail
+source .git/benchmark-fixture-shas
+export GITHUB_OUTPUT="$PWD/github-output"
+: > "$GITHUB_OUTPUT"
+`
+
+func TestPerformanceRoutesResolvedRevisions(t *testing.T) {
+	workflow := readQualityWorkflow(t)
+	scope, samples := workflow.Jobs["performance-scope"], workflow.Jobs["performance-samples"]
+	const base = "${{ needs.performance-scope.outputs.base_sha }}"
+	const tested = "${{ needs.performance-scope.outputs.tested_sha }}"
+	for _, name := range []string{"base_sha", "tested_sha"} {
+		want := "${{ steps.benchmark_revisions.outputs." + name + " }}"
+		if scope.Outputs[name] != want {
+			t.Errorf("scope output %s = %q, want %q", name, scope.Outputs[name], want)
+		}
+	}
+	for _, step := range scope.Steps {
+		switch step.Name {
+		case "Check out benchmark baseline":
+			if step.With["ref"] != "${{ steps.benchmark_revisions.outputs.base_sha }}" {
+				t.Errorf("scope baseline still uses %q", step.With["ref"])
+			}
+		case "Select affected benchmark packages":
+			if step.Env["BASE_SHA"] != "${{ steps.benchmark_revisions.outputs.base_sha }}" {
+				t.Errorf("scope diff still uses %q", step.Env["BASE_SHA"])
+			}
+		}
+	}
+	if len(samples.Steps) < 2 || samples.Steps[0].With["ref"] != tested ||
+		samples.Steps[1].With["ref"] != base || samples.Steps[1].With["path"] != ".tmp/base" {
+		t.Fatal("sampling must check out the scope job's tested merge and actual baseline")
+	}
+	for _, step := range samples.Steps {
+		switch step.Name {
+		case "Load benchmark batch":
+			if step.Env["BASE_SHA"] != base || step.Env["TESTED_SHA"] != tested {
+				t.Error("sample archive and plan must be bound to the same revisions")
+			}
+		case "Enforce performance baseline":
+			if step.Env["BASE_SHA"] != base {
+				t.Errorf("approvals still use %q", step.Env["BASE_SHA"])
+			}
+		}
+	}
+}
+
+func performanceGitFixture(t *testing.T) qualityFixture {
+	t.Helper()
+	fixture := newQualityFixture(t)
+	for _, tool := range []string{"git", "mkdir", "cat", "grep", "cmp", "cp", "tar"} {
+		path, err := exec.LookPath(tool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.write(t, "bin/"+tool, "#!/bin/sh\nexec "+shellQualityQuote(path)+" \"$@\"\n")
+	}
+	if output, _, err := fixture.run(t, performanceGitGraph); err != nil {
+		t.Fatalf("prepare fixture Git history: %v\n%s", err, output)
+	}
+	return fixture
+}
+
+func TestPerformanceSamplesRejectMismatchedRevisions(t *testing.T) {
+	script := performanceStep(t, "performance-samples", "Load benchmark batch")
+	fixture := performanceGitFixture(t)
+	prepare := performanceReadGitGraph + "git update-ref --no-deref HEAD \"$merge\"\ngit clone -q --no-checkout . .tmp/base\n"
+	if output, _, err := fixture.run(t, prepare); err != nil {
+		t.Fatalf("prepare sample checkout: %v\n%s", err, output)
+	}
+	fixture.tool(t, "gh", `set -eu
+test "$*" = "run download fixture-run --name fixture-plan --dir .tmp/plan"
+mkdir -p .tmp/plan/benchmark-plan
+printf 'base_sha=%s\ntested_sha=%s\n' "$RECEIPT_BASE" "$TESTED_SHA" > .tmp/plan/benchmark-revisions.txt
+printf 'fixture batch\n' > .tmp/plan/benchmark-plan/shard-01.tsv
+printf 'fixture expectations\n' > .tmp/plan/benchmark-plan/shard-01.json
+`, false)
+	for _, test := range []struct {
+		name, checkedBase, event, receiptBase string
+		load                                  bool
+		valid                                 bool
+	}{
+		{"stale-checkout", "event_base", "merge", "actual_base", false, false},
+		{"wrong-event-commit", "actual_base", "pr_head", "actual_base", false, false},
+		{"stale-plan", "actual_base", "merge", "event_base", true, false},
+		{"exact", "actual_base", "merge", "actual_base", true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prefix := performanceReadGitGraph + fmt.Sprintf(
+				": > \"$QUALITY_LOG\"\ngit -C .tmp/base update-ref --no-deref HEAD \"$%s\"\n"+
+					"export RUN_ID=fixture-run PLAN_ARTIFACT=fixture-plan SHARD=01 BASE_SHA=\"$actual_base\" "+
+					"TESTED_SHA=\"$merge\" GITHUB_SHA=\"$%s\" RECEIPT_BASE=\"$%s\"\n",
+				test.checkedBase, test.event, test.receiptBase,
+			)
+			output, log, err := fixture.run(t, prefix+script)
+			if (err == nil) != test.valid || strings.Contains(log, "gh run download") != test.load {
+				t.Fatalf("valid=%v fetch=%v err=%v\n%s\n%s", test.valid, test.load, err, output, log)
+			}
+			source := filepath.Join(string(fixture), ".tmp", "head", "merge-source.txt")
+			if test.valid {
+				if got := readQualityFile(t, source); got != "synthetic tree\n" {
+					t.Fatalf("sample archive = %q, want the tested merge's source", got)
+				}
+			} else if _, err := os.Stat(source); !os.IsNotExist(err) {
+				t.Fatalf("sample extraction after rejecting revisions: %v", err)
 			}
 		})
 	}
