@@ -1,0 +1,57 @@
+name: Attribute the PR 71 StaticJWT timing failure on AMD 9V45
+
+on:
+  push:
+    branches: [diagnostics/pr71-static-jwt]
+    paths:
+      - .github/workflows/diagnose-pr71-static-jwt.yml
+      - scripts/diagnose-pr71-static-jwt.sh
+      - scripts/diagnose-pr71-static-jwt.py
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  compare:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr71-static-jwt'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Require the formal CPU before fetching evidence or setting up Go
+        id: cpu
+        run: bash scripts/diagnose-pr71-static-jwt.sh --probe
+      - name: Fetch pinned formal sources and samples
+        if: steps.cpu.outputs.match == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/diagnose-pr71-static-jwt.sh --fetch
+      - uses: actions/setup-go@v7
+        if: steps.cpu.outputs.match == 'true'
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Compare ordinary and frozen-setup A/A and A/H
+        if: steps.cpu.outputs.match == 'true'
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+        run: bash scripts/diagnose-pr71-static-jwt.sh run
+      - name: Preserve the CPU receipt or complete diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr71-static-jwt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr71-static-jwt/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Report a runner mismatch as a diagnostic that did not run
+        if: always() && steps.cpu.outputs.match == 'false'
+        run: exit 3
