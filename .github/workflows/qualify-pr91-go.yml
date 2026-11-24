@@ -1,0 +1,195 @@
+name: Qualify the staged PR91 scalar projection and pagination fix
+
+on:
+  push:
+    branches: [diagnostics/hosted-perf-pr71-pr72]
+    paths:
+      - .github/workflows/qualify-pr91-go.yml
+      - .github/qualification/pr91.patch.b64
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-pr91-go
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: luxo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d luxo_test"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=5
+
+    env:
+      DATABASE_HOST: localhost
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_PREFIX: luxo_test
+      DATABASE_SSL: disable
+      LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_AUDIT_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_TRANSACTION_RACE: '1'
+      TESTCONTAINERS_SESSION_ID: luxo-qualify-pr91-${{ github.run_id }}-${{ github.run_attempt }}
+      TESTCONTAINERS_RYUK_DISABLED: 'true'
+      NATS_URL: nats://127.0.0.1:4222
+      GOTOOLCHAIN: local
+      QUALIFICATION_BASE: ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+      QUALIFICATION_TREE: c8333e7682bdac15b4faf0cc0f9ead198a7f6ccb
+      QUALIFICATION_PATCH_SHA256: 9acbcbfc04128df4473ff2132326c84919ec2e76919212eafa583e536beb359c
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+
+      - name: Restore and verify the exact staged product tree
+        run: |
+          set -euo pipefail
+          source="$PWD/.tmp/pr91-go-source"
+          evidence="$PWD/.tmp/pr91-go-evidence"
+          mkdir -p "$evidence"
+          patch="$evidence/candidate.patch"
+          base64 -d .github/qualification/pr91.patch.b64 > "$patch"
+          printf '%s  %s\n' "$QUALIFICATION_PATCH_SHA256" "$patch" | sha256sum -c
+          test "$(git rev-parse "$QUALIFICATION_BASE^{tree}")" = ba252c7cace8908cdfcd7c203bc9dc11bb2ba746
+          git worktree add --detach "$source" "$QUALIFICATION_BASE"
+          git -C "$source" apply --index --check --whitespace=error "$patch"
+          git -C "$source" apply --index --whitespace=error "$patch"
+          git -C "$source" apply --reverse --check "$patch"
+          git -C "$source" diff --cached --check
+          test "$(git -C "$source" write-tree)" = "$QUALIFICATION_TREE"
+          git -C "$source" diff --cached --name-only > "$evidence/paths.txt"
+          printf '%s\n' internal/inferred/pagination.go internal/inferred/pagination_contract_test.go pkg/codegen/await_dependencies.go pkg/codegen/compile.go pkg/codegen/compile_await.go pkg/codegen/compile_pagination_test.go pkg/codegen/load_selection.go pkg/codegen/load_selection_object.go pkg/codegen/load_selection_object_test.go pkg/codegen/pagination_destructuring_test.go pkg/codegen/param_contract_test.go pkg/codegen/sealed_mutation_test.go | diff - "$evidence/paths.txt"
+          printf '%s %s %s\n' "$QUALIFICATION_BASE" "$QUALIFICATION_TREE" "$QUALIFICATION_PATCH_SHA256" > "$evidence/revision.txt"
+          go version > "$evidence/go-version.txt"
+          test "$(cat "$evidence/go-version.txt")" = 'go version go1.27.1 linux/amd64'
+          (cd "$source" && printf '%s\n' "3f1003dc70f0865aaefa27299b4958e9152df0f0f915d53141bffa6bb2a1b2cc  internal/inferred/pagination.go" "a6ef9a646333ad45a8d31dd859ead6889b88c8db95eff1079336907476c4927c  internal/inferred/pagination_contract_test.go" "e1b0e254ffc33d862b1665eb42426c2947dad74539fc7b071d86777b29919df3  pkg/codegen/await_dependencies.go" "eb4270e73baae8885ea12ad50b3b7306787e1ebb5e9a2758e226f57b285807fb  pkg/codegen/compile.go" "6cc28372b3d5cde74f05c73780807f5d02258e64518f2283e75887fcd9344262  pkg/codegen/compile_await.go" "9e7c0c3e504981d05363f5af44a22433b8eea2d71792eb90efc759af0adf27dc  pkg/codegen/compile_pagination_test.go" "90c6672e9b5cf6169ed4fd61da03d015af5c2900bcea6c0ddc91a52fc9f32600  pkg/codegen/load_selection.go" "30d3e007ba54f72550f96c8aeec76df779a9f9c288b850ab0b07056d57b7743e  pkg/codegen/load_selection_object.go" "35c539e8fbca84f5f068eb32bfc62fb9b1d622c3cef1073494223f05194d6fc1  pkg/codegen/load_selection_object_test.go" "b0d08fd5048cb88f837903b5425d44dc8ab91aa4373378237756eeba000bdaf8  pkg/codegen/pagination_destructuring_test.go" "1a4fc6d43cc41b02a343024691e0acc3ee953a85da9ee682628f782f090cec81  pkg/codegen/param_contract_test.go" "44cad25b8e869c9007ed3086cb31472f488dae3c44d1ceb8a8722ba8121a1ad9  pkg/codegen/sealed_mutation_test.go" | sha256sum -c)
+          test -z "$(gofmt -s -l "$source/internal/inferred/pagination.go" "$source/internal/inferred/pagination_contract_test.go" "$source/pkg/codegen/await_dependencies.go" "$source/pkg/codegen/compile.go" "$source/pkg/codegen/compile_await.go" "$source/pkg/codegen/compile_pagination_test.go" "$source/pkg/codegen/load_selection.go" "$source/pkg/codegen/load_selection_object.go" "$source/pkg/codegen/load_selection_object_test.go" "$source/pkg/codegen/pagination_destructuring_test.go" "$source/pkg/codegen/param_contract_test.go" "$source/pkg/codegen/sealed_mutation_test.go")"
+          sh "$source/scripts/setup-modules.sh" "$source"
+
+      - name: Start the owned JetStream fixture
+        run: |
+          set -euo pipefail
+          owner="luxo-qualify-pr91-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker run --detach --name "$owner" --label "org.luxo.audit.owner=$owner" \
+            --publish 127.0.0.1:4222:4222 --publish 127.0.0.1:8222:8222 \
+            nats:2.15.3-alpine -js -m 8222
+          curl --fail --silent --show-error --retry 20 --retry-all-errors \
+            --retry-delay 1 --connect-timeout 2 --max-time 5 http://127.0.0.1:8222/healthz
+          curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8222/jsz | jq --exit-status \
+            '.disabled != true and .config.max_memory > 0 and .config.max_storage > 0'
+
+      - name: Verify root packages, CLI race, coverage and workspace vet
+        run: |
+          set -euo pipefail
+          evidence="$PWD/.tmp/pr91-go-evidence"
+          cd .tmp/pr91-go-source
+          export GOWORK="$PWD/go.work"
+          root=0
+          go test -p 2 ./pkg/... -cover -coverprofile="$evidence/root.coverage" -count=1 -timeout=95m -json \
+            > "$evidence/root.jsonl" 2>&1 || root=$?
+          printf 'root %s\n' "$root" >> "$evidence/phases.txt"
+          cli=0
+          go test -p 2 -race ./cmd/luxo/... -coverprofile="$evidence/cli.coverage" -count=1 -timeout=15m -json \
+            > "$evidence/cli.jsonl" 2>&1 || cli=$?
+          printf 'cli %s\n' "$cli" >> "$evidence/phases.txt"
+          vet=0
+          go vet -p 2 ./pkg/... ./cmd/... ./cmd/luxo/... ./pkg/lux/pg/... ./pkg/lux/nats/... \
+            ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/... > "$evidence/vet.log" 2>&1 || vet=$?
+          printf 'vet %s\n' "$vet" >> "$evidence/phases.txt"
+          if (( root != 0 || cli != 0 || vet != 0 )); then
+            tail -n 80 "$evidence/root.jsonl"
+            tail -n 80 "$evidence/cli.jsonl"
+            tail -n 80 "$evidence/vet.log"
+            exit 1
+          fi
+          go tool cover -func="$evidence/root.coverage" > "$evidence/root.coverage-summary"
+          # This is the exact previously missing changed block in the pinned compile.go.
+          grep -E '/pkg/codegen/compile.go:686\.3,687\.1[[:space:]]+1[[:space:]]+[1-9][0-9]*$' \
+            "$evidence/root.coverage" > "$evidence/empty-list-alias-covered.txt"
+          python3 - "$evidence/root.jsonl" <<'PYTHON'
+          import json
+          from pathlib import Path
+          import sys
+          root = "TestGeneratedDestructuredEmptyListBindings"
+          passed = False
+          for line in Path(sys.argv[1]).open():
+              try:
+                  event = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if event.get("Test") == root and event.get("Action") == "pass":
+                  passed = True
+          if not passed:
+              raise SystemExit("the permanent empty-list alias regression did not pass")
+          PYTHON
+          git diff --exit-code
+          test "$(git write-tree)" = "$QUALIFICATION_TREE"
+
+      - name: Remove only the owned source and labeled fixtures
+        if: always()
+        run: |
+          set -u
+          owner="luxo-qualify-pr91-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          evidence="$PWD/.tmp/pr91-go-evidence"
+          mkdir -p "$evidence"
+          status=0
+          : > "$evidence/owned-after-cleanup.txt"
+          for filter in "org.luxo.audit.owner=$owner" "org.testcontainers.sessionId=$owner"; do
+            for kind in container volume network; do
+              if [[ "$kind" == container ]]; then
+                listing=(docker ps -aq --filter "label=$filter")
+                removal=(docker rm -fv)
+              else
+                listing=(docker "$kind" ls -q --filter "label=$filter")
+                removal=(docker "$kind" rm)
+              fi
+              ids=$("${listing[@]}") || status=1
+              while IFS= read -r id; do
+                [[ -n "$id" ]] || continue
+                "${removal[@]}" "$id" >> "$evidence/cleanup.log" 2>&1 || status=1
+              done <<< "$ids"
+              ids=$("${listing[@]}") || status=1
+              if [[ -n "$ids" ]]; then
+                printf '%s %s\n' "$kind" "$ids" >> "$evidence/owned-after-cleanup.txt"
+                status=1
+              fi
+            done
+          done
+          if [[ -d .tmp/pr91-go-source ]]; then
+            git worktree remove --force .tmp/pr91-go-source || status=1
+          fi
+          printf '%s\n' "$status" > "$evidence/cleanup.exit"
+          exit "$status"
+
+      - name: Preserve exact coverage and test logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr91-go-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr91-go-evidence/
+          if-no-files-found: error
+          retention-days: 14
