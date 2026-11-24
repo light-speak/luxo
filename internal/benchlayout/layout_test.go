@@ -96,6 +96,10 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{APIPackage, "BenchmarkCanonicalJSONBytes", APINonIdentityProfile},
 		{LuviaPackage, "BenchmarkPrimaryKeys/row-small/keyLast=false/baseline=true-2", LuviaPrimaryTraceProfile},
 		{LuviaPackage, "BenchmarkTraceEncodingComparison", LuviaPrimaryTraceProfile},
+		{LuviaPackage, "BenchmarkGatewayIdentity", LuviaGatewayIdentityProfile},
+		{LuviaPackage, "BenchmarkGatewayIdentity/authenticated/after-2", LuviaGatewayIdentityProfile},
+		{LuviaPackage, "BenchmarkGatewayIdentitySibling", DefaultProfile},
+		{CodegenPackage, "BenchmarkGatewayIdentity", DefaultProfile},
 		{LuviaPackage, "BenchmarkStaticMetricsJSON", DefaultProfile},
 		{LuviaPackage, "BenchmarkConvenienceKeyParentValidation", DefaultProfile},
 	} {
@@ -105,13 +109,67 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 	}
 	for _, tc := range []struct{ pkg, profile, filter string }{
 		{APIPackage, APINonIdentityProfile, "."},
-		{LuviaPackage, LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"},
 		{CodecPackage, CodecReaderProfile, "."},
 		{"pkg/lux/rpc", "", ""},
 	} {
-		p, f := IsolationProfile(tc.pkg)
-		if p != tc.profile || f != tc.filter {
-			t.Fatalf("isolation of %s = %q %q, want %q %q", tc.pkg, p, f, tc.profile, tc.filter)
+		got := IsolationProfiles(tc.pkg)
+		if tc.profile == "" {
+			if len(got) != 0 {
+				t.Fatalf("unexpected isolation for %s: %v", tc.pkg, got)
+			}
+			continue
 		}
+		if len(got) != 1 || got[0] != (IsolationSpec{tc.profile, tc.filter}) {
+			t.Fatalf("isolation of %s = %v, want %q %q", tc.pkg, got, tc.profile, tc.filter)
+		}
+	}
+	profiles := IsolationProfiles(LuviaPackage)
+	if len(profiles) != 2 || profiles[0] != (IsolationSpec{LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"}) ||
+		profiles[1] != (IsolationSpec{LuviaGatewayIdentityProfile, "^BenchmarkGatewayIdentity$"}) ||
+		ValidPerformanceProfile(CodegenPackage, LuviaGatewayIdentityProfile) {
+		t.Fatalf("unexpected Luvia isolation: %v", profiles)
+	}
+}
+
+func TestCodegenProfilesRequirePackageAndExactRoots(t *testing.T) {
+	for _, tc := range []struct{ pkg, name, want string }{
+		{CodegenPackage, CodegenLiteralBenchmark, CodegenLiteralProfile},
+		{CodegenPackage, CodegenLiteralBenchmark + "/duration_plain-2", CodegenLiteralProfile},
+		{CodegenPackage, CodegenReceiverBenchmark, CodegenReceiverProfile},
+		{CodegenPackage, CodegenReceiverBenchmark + "/用户-2", CodegenReceiverProfile},
+		{CodegenPackage, CodegenReceiverBenchmark + "Sibling-2", DefaultProfile},
+		{CodegenPackage, "BenchmarkGenerateNumericLiteralBindings/plain-2", DefaultProfile},
+		{CodecPackage, CodegenLiteralBenchmark, DefaultProfile},
+		{CodecPackage, CodegenReceiverBenchmark, DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	profiles := IsolationProfiles(CodegenPackage)
+	if len(profiles) != 2 || profiles[0] != (IsolationSpec{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"}) ||
+		profiles[1] != (IsolationSpec{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"}) ||
+		ValidPerformanceProfile(CodecPackage, CodegenLiteralProfile) ||
+		ValidPerformanceProfile(CodecPackage, CodegenReceiverProfile) {
+		t.Fatalf("unexpected codegen isolation: %v", profiles)
+	}
+}
+
+func TestLuxShortPathProfileRequiresPackageAndExactRoots(t *testing.T) {
+	for _, tc := range []struct{ pkg, name, want string }{
+		{LuxPackage, LuxStrictFilterBenchmark, LuxShortPathProfile},
+		{LuxPackage, LuxDecimalAlignmentBenchmark + "/Add/zero/after-2", LuxShortPathProfile},
+		{LuxPackage, LuxStrictFilterBenchmark + "Sibling-2", DefaultProfile},
+		{LuxPackage, "BenchmarkDecimalPrecision-2", DefaultProfile},
+		{CodecPackage, LuxDecimalAlignmentBenchmark, DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	profiles := IsolationProfiles(LuxPackage)
+	want := []IsolationSpec{{LuxShortPathProfile, "^BenchmarkStrictFilterContract$|^BenchmarkDecimalAlignment$"}}
+	if !reflect.DeepEqual(profiles, want) || ValidPerformanceProfile(CodecPackage, LuxShortPathProfile) {
+		t.Fatalf("unexpected Lux isolation: %v", profiles)
 	}
 }

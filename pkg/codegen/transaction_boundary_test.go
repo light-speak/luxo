@@ -221,9 +221,14 @@ api nestedRollback(id: Int): Boolean {
 const transactionBoundaryAssertions = `package generated
 import (
   "context"
+  "crypto/rand"
+  "encoding/hex"
   "encoding/json"
   "errors"
+  "net/url"
+  "os"
   "testing"
+  "time"
   "github.com/light-speak/luxo/pkg/lux"
   "github.com/light-speak/luxo/pkg/lux/api"
   "github.com/light-speak/luxo/pkg/lux/dataloader"
@@ -248,19 +253,120 @@ func TestGeneratedEventKeepsAssignedField(t *testing.T) {
   if decoded.Id!=original.Id {t.Fatalf("event field lost on wire: %d",decoded.Id)}
 }
 
+const transactionFixtureTimeout = 10 * time.Second
+
 func transactionFixtureDB(t testing.TB) *pg.DB {
   t.Helper()
+  ctx := t.Context()
+  connection, schema := transactionFixtureConnection(t)
+  db, err := pg.NewDB(ctx, connection)
+  if err != nil {
+    t.Fatal(err)
+  }
+  t.Cleanup(db.Close)
+  if schema != "" {
+    current, err := db.QueryScalar[string](ctx, "SELECT current_schema()")
+    if err != nil || current != schema {
+      t.Fatalf("transaction fixture schema=%q, want %q: %v", current, schema, err)
+    }
+  }
+  if _, err := pg.Exec(ctx, db, "CREATE TABLE users(id bigint PRIMARY KEY,name text NOT NULL); INSERT INTO users VALUES(1,'original')"); err != nil {
+    t.Fatal(err)
+  }
+  return db
+}
+
+func transactionFixtureConnection(t testing.TB) (string, string) {
+  t.Helper()
+  if connection := os.Getenv("LUXO_TEST_DATABASE_URL"); connection != "" {
+    return isolatedTransactionFixture(t, connection)
+  }
+
   ctx:=t.Context()
   container,err:=postgres.Run(ctx,testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
   testcontainers.CleanupContainer(t,container)
   if err!=nil { t.Fatal(err) }
   connection,err:=container.ConnectionString(ctx,"sslmode=disable")
   if err!=nil {t.Fatal(err)}
-  db,err:=pg.NewDB(ctx,connection)
-  if err!=nil {t.Fatal(err)}
-  t.Cleanup(db.Close)
-  if _,err:=pg.Exec(ctx,db,"CREATE TABLE users(id bigint PRIMARY KEY,name text NOT NULL); INSERT INTO users VALUES(1,'original')");err!=nil {t.Fatal(err)}
-  return db
+  return connection, ""
+}
+
+func isolatedTransactionFixture(t testing.TB, connection string) (string, string) {
+  t.Helper()
+  parsed, err := url.Parse(connection)
+  if err != nil || parsed.Opaque != "" || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") {
+    t.Fatal("transaction fixture requires a PostgreSQL LUXO_TEST_DATABASE_URL")
+  }
+  query, err := url.ParseQuery(parsed.RawQuery)
+  if err != nil {
+    t.Fatal("transaction fixture URL has invalid query parameters")
+  }
+
+  setup, cancelSetup := context.WithTimeout(t.Context(), transactionFixtureTimeout)
+  defer cancelSetup()
+  admin, err := pg.NewDB(setup, connection)
+  if err != nil {
+    t.Fatalf("open transaction fixture database: %v", err)
+  }
+  t.Cleanup(admin.Close)
+
+  var random [12]byte
+  rand.Read(random[:])
+  schema := "luxo_tx_fixture_" + hex.EncodeToString(random[:])
+  if _, err := pg.Exec(setup, admin, "CREATE SCHEMA " + schema); err != nil {
+    t.Fatalf("create transaction fixture schema: %v", err)
+  }
+  // The business pool registers its cleanup after this one and closes first.
+  t.Cleanup(func() {
+    cleanup, cancelCleanup := context.WithTimeout(context.Background(), transactionFixtureTimeout)
+    defer cancelCleanup()
+    if _, err := pg.Exec(cleanup, admin, "DROP SCHEMA " + schema + " CASCADE"); err != nil {
+      t.Errorf("drop transaction fixture schema %s: %v", schema, err)
+    }
+  })
+  query.Set("search_path", schema)
+  parsed.RawQuery = query.Encode()
+  return parsed.String(), schema
+}
+
+func TestTransactionFixtureUsesConfiguredDatabase(t *testing.T) {
+  connection := os.Getenv("LUXO_TEST_DATABASE_URL")
+  if connection == "" {
+    t.Skip("requires an isolated LUXO_TEST_DATABASE_URL")
+  }
+  admin, err := pg.NewDB(t.Context(), connection)
+  if err != nil {
+    t.Fatal(err)
+  }
+  t.Cleanup(admin.Close)
+  const existsSQL = "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=$1)"
+
+  var schemas [2]string
+  if !t.Run("fixtures", func(t *testing.T) {
+    for i := range schemas {
+      db := transactionFixtureDB(t)
+      schema, err := db.QueryScalar[string](t.Context(), "SELECT current_schema()")
+      if err != nil {
+        t.Fatal(err)
+      }
+      schemas[i] = schema
+      exists, err := admin.QueryScalar[bool](t.Context(), existsSQL, schema)
+      if err != nil || !exists {
+        t.Fatalf("fixture schema %q missing from configured database: %v", schema, err)
+      }
+    }
+    if schemas[0] == schemas[1] {
+      t.Fatalf("fixtures share schema %q", schemas[0])
+    }
+  }) {
+    return
+  }
+  for _, schema := range schemas {
+    exists, err := admin.QueryScalar[bool](t.Context(), existsSQL, schema)
+    if err != nil || exists {
+      t.Errorf("fixture schema %q exists after cleanup=%t: %v", schema, exists, err)
+    }
+  }
 }
 
 func TestGeneratedTransactions(t *testing.T) {

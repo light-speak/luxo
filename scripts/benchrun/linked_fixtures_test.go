@@ -16,7 +16,11 @@ import (
 func TestIsolationProfileCommand(t *testing.T) {
 	for _, tc := range []struct{ pkg, want string }{
 		{"pkg/lux/api", "api-non-identity\t.\n"},
-		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n"},
+		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n" +
+			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n"},
+		{"pkg/codegen", "codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n" +
+			"codegen-global-receiver\t^BenchmarkGlobalReceiverName$\n"},
+		{"pkg/lux", "lux-short-path\t^BenchmarkStrictFilterContract$|^BenchmarkDecimalAlignment$\n"},
 		{"pkg/lux/rpc", ""},
 	} {
 		var output bytes.Buffer
@@ -24,9 +28,16 @@ func TestIsolationProfileCommand(t *testing.T) {
 			t.Fatalf("discovery profile for %s = %q, %v", tc.pkg, &output, err)
 		}
 	}
+	if err := run([]string{"isolation-profile", benchlayout.CodegenPackage}, nil, closedIsolationWriter{}, io.Discard); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("isolation output failure = %v", err)
+	}
 }
 
-func TestAPIAndLuviaOverlaysPreserveFixtureBoundaries(t *testing.T) {
+type closedIsolationWriter struct{}
+
+func (closedIsolationWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 	root, err := filepath.Abs("../..")
 	if err != nil {
 		t.Fatal(err)
@@ -36,7 +47,9 @@ func TestAPIAndLuviaOverlaysPreserveFixtureBoundaries(t *testing.T) {
 		assert       func(*testing.T, map[string]string, string)
 	}{
 		{benchlayout.APIPackage, benchlayout.APINonIdentityProfile, verifyAPIOverlay},
+		{benchlayout.LuxPackage, benchlayout.LuxShortPathProfile, verifyLuxShortPathOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaPrimaryTraceProfile, verifyLuviaOverlay},
+		{benchlayout.LuviaPackage, benchlayout.LuviaGatewayIdentityProfile, verifyLuviaGatewayIdentityOverlay},
 	} {
 		t.Run(tc.profile, func(t *testing.T) {
 			file, cleanup, err := compileOverlay(root, tc.pkg, false, tc.profile)

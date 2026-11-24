@@ -6,14 +6,25 @@ import (
 )
 
 const (
-	DefaultProfile           = "default"
-	CodecReaderProfile       = "codec-reader"
-	APINonIdentityProfile    = "api-non-identity"
-	LuviaPrimaryTraceProfile = "luvia-primary-trace"
-	CodecPackage             = "pkg/lux/codec"
-	CodecReaderBenchmark     = "BenchmarkElementPayload"
-	APIPackage               = "pkg/lux/api"
-	LuviaPackage             = "pkg/lux/luvia"
+	LuxShortPathProfile           = "lux-short-path"
+	LuxPackage                    = "pkg/lux"
+	LuxStrictFilterBenchmark      = "BenchmarkStrictFilterContract"
+	LuxDecimalAlignmentBenchmark  = "BenchmarkDecimalAlignment"
+	DefaultProfile                = "default"
+	CodecReaderProfile            = "codec-reader"
+	APINonIdentityProfile         = "api-non-identity"
+	LuviaPrimaryTraceProfile      = "luvia-primary-trace"
+	LuviaGatewayIdentityProfile   = "luvia-gateway-identity"
+	CodegenLiteralProfile         = "codegen-integer-literals"
+	CodegenReceiverProfile        = "codegen-global-receiver"
+	CodecPackage                  = "pkg/lux/codec"
+	CodecReaderBenchmark          = "BenchmarkElementPayload"
+	APIPackage                    = "pkg/lux/api"
+	LuviaPackage                  = "pkg/lux/luvia"
+	LuviaGatewayIdentityBenchmark = "BenchmarkGatewayIdentity"
+	CodegenPackage                = "pkg/codegen"
+	CodegenLiteralBenchmark       = "BenchmarkCompileDecimalIntegerLiterals"
+	CodegenReceiverBenchmark      = "BenchmarkGlobalReceiverName"
 )
 
 var apiIdentityRoots = []string{
@@ -26,6 +37,10 @@ var luviaIsolatedRoots = []string{"BenchmarkPrimaryKeys", "BenchmarkTraceEncodin
 func ProfileForBenchmark(pkg, name string) string {
 	root, _, _ := strings.Cut(strings.TrimSuffix(name, "-2"), "/")
 	switch pkg {
+	case LuxPackage:
+		if root == LuxStrictFilterBenchmark || root == LuxDecimalAlignmentBenchmark {
+			return LuxShortPathProfile
+		}
 	case CodecPackage:
 		if root == CodecReaderBenchmark {
 			return CodecReaderProfile
@@ -35,28 +50,57 @@ func ProfileForBenchmark(pkg, name string) string {
 			return APINonIdentityProfile
 		}
 	case LuviaPackage:
+		if root == LuviaGatewayIdentityBenchmark {
+			return LuviaGatewayIdentityProfile
+		}
 		if slices.Contains(luviaIsolatedRoots, root) {
 			return LuviaPrimaryTraceProfile
+		}
+	case CodegenPackage:
+		switch root {
+		case CodegenLiteralBenchmark:
+			return CodegenLiteralProfile
+		case CodegenReceiverBenchmark:
+			return CodegenReceiverProfile
 		}
 	}
 	return DefaultProfile
 }
 
-// IsolationProfile gives discovery the profile and exact root filter for a package.
-func IsolationProfile(pkg string) (profile, filter string) {
+// IsolationSpec pairs a benchmark compilation profile with its discovery filter.
+type IsolationSpec struct {
+	Name, Filter string
+}
+
+// IsolationProfiles gives discovery the isolated binaries for a package.
+func IsolationProfiles(pkg string) []IsolationSpec {
 	switch pkg {
+	case LuxPackage:
+		return []IsolationSpec{{LuxShortPathProfile, "^" + LuxStrictFilterBenchmark + "$|^" + LuxDecimalAlignmentBenchmark + "$"}}
 	case CodecPackage:
-		return CodecReaderProfile, "."
+		return []IsolationSpec{{CodecReaderProfile, "."}}
 	case APIPackage:
-		return APINonIdentityProfile, "."
+		return []IsolationSpec{{APINonIdentityProfile, "."}}
 	case LuviaPackage:
-		return LuviaPrimaryTraceProfile, "^" + strings.Join(luviaIsolatedRoots, "$|^") + "$"
+		return []IsolationSpec{
+			{LuviaPrimaryTraceProfile, "^" + strings.Join(luviaIsolatedRoots, "$|^") + "$"},
+			{LuviaGatewayIdentityProfile, "^" + LuviaGatewayIdentityBenchmark + "$"},
+		}
+	case CodegenPackage:
+		return []IsolationSpec{
+			{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"},
+			{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"},
+		}
 	default:
-		return "", ""
+		return nil
 	}
 }
 
 func ValidPerformanceProfile(pkg, profile string) bool {
-	isolation, _ := IsolationProfile(pkg)
-	return profile == DefaultProfile || (isolation != "" && profile == isolation)
+	if profile == DefaultProfile {
+		return true
+	}
+	return slices.ContainsFunc(IsolationProfiles(pkg), func(spec IsolationSpec) bool {
+		return spec.Name == profile
+	})
 }

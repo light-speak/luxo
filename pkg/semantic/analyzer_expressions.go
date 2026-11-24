@@ -250,15 +250,22 @@ func blockResultExpr(body *ast.Block) ast.Expr {
 }
 
 func (a *Analyzer) resolvedExprType(expr ast.Expr) *ResolvedType {
-	if expr == nil || expr.GetTypeTag() == "" {
+	if expr == nil {
 		return nil
+	}
+	tag := expr.GetTypeTag()
+	if tag == "" {
+		return nil
+	}
+	if tag == "Void" && hasNoAwaitResult(expr) {
+		return a.voidResultType()
 	}
 	if generic := a.genericExprTypes[expr]; generic != nil {
 		return generic
 	}
-	base := a.types[expr.GetTypeTag()]
+	base := a.types[tag]
 	if base == nil {
-		base = &ResolvedType{Kind: TypeUnknown, Name: expr.GetTypeTag()}
+		base = &ResolvedType{Kind: TypeUnknown, Name: tag}
 	}
 	nullable := expr.IsNullable()
 	isList := expr.IsListType()
@@ -386,6 +393,9 @@ func isTypeAssignable(expected, actual *ResolvedType) bool {
 		return false
 	}
 	if expected.Name == actual.Name {
+		if expected.Kind != actual.Kind && (expected.Kind == TypeVoid || actual.Kind == TypeVoid) {
+			return false
+		}
 		return typeArgsAssignable(expected.TypeArgs, actual.TypeArgs)
 	}
 	return actual.inheritsFrom(expected.Name)
