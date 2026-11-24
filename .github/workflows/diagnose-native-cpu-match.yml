@@ -35,6 +35,8 @@ jobs:
             exit 2
           fi
           printf 'cpu=%s\n' "${names[0]}" >> "$receipt/selection.txt"
+          base=925f30ee1dcd45882b29130b8ed02836ed88317e
+          evidence=
           case "${names[0]^^}" in
             'INTEL(R) XEON(R) 6975P-C')
               suite=pr82-lux-short-path
@@ -46,15 +48,17 @@ jobs:
               formal_run=45387275899
               digest=addc34c9a86d6f20a77b02321bfcb835b7de20ac1f9e7948d45935d6336adca3
               ;;
-            'AMD EPYC 7763 64-CORE PROCESSOR')
-              suite=pr93-duration-closure
-              diagnostic=feb1f59e5e75e42ee9d4d8a9eba08cce7aef231b
-              tree=99789fdc9f30873a8478ddab376fccb2815104ee
-              head=40153f3e18f9f32baca9f656986a5e696f392a2f
-              input=pr93-duration-official-45386469196-1.zip
-              artifact=14917073661
-              formal_run=45386469196
-              digest=e7ad88b0ebdf9baf9fe7ef49ee6645d489ab0be469e21d6b4ade4b0074d49d48
+            'AMD EPYC 9V74 80-CORE PROCESSOR')
+              suite=pr72-boxed-json
+              diagnostic=480240c33e49e914aa04e96047a1ac0bcd470f06
+              tree=a7e01c854083455a0d0cb79597220a08bab2c2e6
+              base=4a660a0bcdee1eeb3c7a9dddcc95324d7967bec0
+              head=8dcb6c8b97615f5148c43ff15e43b93320e1a342
+              input=pr72-formal-shard-12.zip
+              artifact=14924072511
+              formal_run=45397856587
+              digest=67c6414b54e7410188c0227b7266c30a16c9c0863fea7a1b8433c281feaddb25
+              evidence='.tmp/native-cpu-worktree/.tmp/pr72-boxed-json-evidence-a.*/'
               ;;
             'INTEL(R) XEON(R) PLATINUM 8573C')
               suite=pr103-short-paths
@@ -73,9 +77,9 @@ jobs:
               ;;
           esac
           {
-            printf 'suite=%s\ndiagnostic=%s\ntree=%s\nhead=%s\n' "$suite" "$diagnostic" "$tree" "$head"
+            printf 'suite=%s\ndiagnostic=%s\ntree=%s\nbase=%s\nhead=%s\n' "$suite" "$diagnostic" "$tree" "$base" "$head"
             printf 'artifact=%s\nformal_run=%s\ndigest=%s\ninput=%s\n' "$artifact" "$formal_run" "$digest" "$input"
-            printf 'evidence=.tmp/native-cpu-worktree/.tmp/hosted-%s/\n' "$suite"
+            printf 'evidence=%s\n' "${evidence:-.tmp/native-cpu-worktree/.tmp/hosted-$suite/}"
           } | tee -a "$receipt/selection.txt" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
@@ -88,21 +92,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DIAGNOSTIC: ${{ steps.cpu.outputs.diagnostic }}
           DIAGNOSTIC_TREE: ${{ steps.cpu.outputs.tree }}
+          PRODUCT_BASE: ${{ steps.cpu.outputs.base }}
           PRODUCT_HEAD: ${{ steps.cpu.outputs.head }}
           FORMAL_ARTIFACT: ${{ steps.cpu.outputs.artifact }}
           FORMAL_RUN: ${{ steps.cpu.outputs.formal_run }}
           FORMAL_DIGEST: ${{ steps.cpu.outputs.digest }}
           FORMAL_INPUT: ${{ steps.cpu.outputs.input }}
+          SUITE: ${{ steps.cpu.outputs.suite }}
         run: |
           set -euo pipefail
-          base=925f30ee1dcd45882b29130b8ed02836ed88317e
           root="$GITHUB_WORKSPACE/.tmp/native-cpu-worktree"
           receipt="$GITHUB_WORKSPACE/.tmp/native-cpu-selection"
-          git -C native-cpu-dispatch fetch --no-tags origin "$DIAGNOSTIC" "$base" "$PRODUCT_HEAD"
+          git -C native-cpu-dispatch fetch --no-tags origin "$DIAGNOSTIC" "$PRODUCT_BASE" "$PRODUCT_HEAD"
           git -C native-cpu-dispatch worktree add --detach "$root" "$DIAGNOSTIC"
           test "$(git -C "$root" rev-parse HEAD)" = "$DIAGNOSTIC"
           test "$(git -C "$root" rev-parse 'HEAD^{tree}')" = "$DIAGNOSTIC_TREE"
-          printf '%s  %s\n' 9e0a5f421f2e76674b819f81074a3d416a51174e0f93b858a63d20c27d64e072 "$root/scripts/diagnose-hosted-perf.sh" | sha256sum -c -
+          sampler=scripts/diagnose-hosted-perf.sh
+          sampler_digest=9e0a5f421f2e76674b819f81074a3d416a51174e0f93b858a63d20c27d64e072
+          if [[ "$SUITE" == pr72-boxed-json ]]; then
+            sampler=scripts/diagnose-pr72-boxed-json/diagnose-native.sh
+            sampler_digest=682270521e905a123429eb78a21980e16e7636b638c695fc35669833f7c9e513
+          fi
+          printf '%s  %s\n' "$sampler_digest" "$root/$sampler" | sha256sum -c -
           mkdir -p "$root/.tmp"
           gh api "repos/light-speak/luxo/actions/artifacts/$FORMAL_ARTIFACT" > "$receipt/artifact-metadata.json"
           jq -e --arg id "$FORMAL_ARTIFACT" --arg run "$FORMAL_RUN" --arg head "$PRODUCT_HEAD" --arg digest "sha256:$FORMAL_DIGEST" '
@@ -126,7 +137,10 @@ jobs:
         run: |
           set -euo pipefail
           case "$SUITE" in
-            pr82-lux-short-path|pr93-duration-closure)
+            pr72-boxed-json)
+              exec bash scripts/diagnose-pr72-boxed-json/diagnose-native.sh . a .tmp/pr72-formal-shard-12.zip
+              ;;
+            pr82-lux-short-path)
               exec bash "scripts/diagnose-$SUITE.sh"
               ;;
             pr103-short-paths)
