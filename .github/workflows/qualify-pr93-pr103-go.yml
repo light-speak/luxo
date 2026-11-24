@@ -1,0 +1,330 @@
+name: Qualify PR 93 await and PR 103 emission on current main
+
+on:
+  push:
+    branches: [diagnostics/qualify-pr93-pr103-go]
+    paths:
+      - .github/workflows/qualify-pr93-pr103-go.yml
+      - .github/qualification/pr93-await.patch.b64
+      - .github/qualification/pr103-emission.patch.b64
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-release-go-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/qualify-pr93-pr103-go'
+    name: Full Go qualification (${{ matrix.candidate }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - candidate: pr93-await
+            base: a79928f9673744f6c7020466272acea2fc4dbb5d
+            base_tree: d17eb6f305a92034f50b8ad174eb61829b100ed1
+            tree: 110bda6ef738ae6e1a0effa052b1b47c029717f3
+            patch_sha256: 585c46b01b6f66f96cf5b812866444228d421bc656f5035638f15a2da4679264
+            payload: .github/qualification/pr93-await.patch.b64
+            paths: '["pkg/ast/ast.go","pkg/semantic/analyzer.go","pkg/semantic/analyzer_bodies.go","pkg/semantic/analyzer_expressions.go","pkg/semantic/analyzer_test.go","pkg/semantic/analyzer_types.go","pkg/semantic/analyzer_types_test.go","pkg/semantic/analyzer_value.go"]'
+            tests: '[["github.com/light-speak/luxo/pkg/semantic","TestAwaitStatementKeepsVoidTypeLazy"],["github.com/light-speak/luxo/pkg/semantic","TestNestedAwaitStatementDoesNotChangeAwaitContext"],["github.com/light-speak/luxo/pkg/semantic","TestAwaitValueBindingRequiresResultShape"],["github.com/light-speak/luxo/pkg/semantic","TestAwaitWithoutResultCannotSupplyValue"],["github.com/light-speak/luxo/pkg/semantic","TestAwaitTupleRejectsVoidResultSlots"],["github.com/light-speak/luxo/pkg/semantic","TestParameterResolutionSingleFieldsKeepOwnedTypes"],["github.com/light-speak/luxo/pkg/semantic","TestParameterResolutionArityAndDefaults"],["github.com/light-speak/luxo/pkg/semantic","TestParameterResolutionDuplicateDiagnosticOrder"],["github.com/light-speak/luxo/pkg/codegen","TestGeneratedValuedAwaitExplicitTypes"],["github.com/light-speak/luxo/pkg/codegen","TestGeneratedValuedAwaitShadow"],["github.com/light-speak/luxo/pkg/codegen","TestGeneratedValuedAwaitNativeErrorsAndParallelism"]]'
+            coverage: '[["pkg/semantic/analyzer_bodies.go","rejectAwaitTupleBinding"],["pkg/semantic/analyzer_bodies.go","checkAwaitStatement"],["pkg/semantic/analyzer_bodies.go","checkAwaitExpr"],["pkg/semantic/analyzer_types.go","resolveParameterTypes"]]'
+            source_sha256: |
+              db6adbc5c1cf08bbafbdba042fd52d96567fbcea2b9cdbd97c0644b7775a05b4  pkg/ast/ast.go
+              9907bf86f7eed13ed924ca7ae5259b7e5bcf99300b129540ec4f66986f7a362f  pkg/semantic/analyzer.go
+              cdf4336221b162b856a110bfc5a66dd74cb73e68c36fc09bf5646fdfd44f72c6  pkg/semantic/analyzer_bodies.go
+              d599c26052f680943b899b4da6ccc75cbdeeeabb24cfabafbaa285738c1725c1  pkg/semantic/analyzer_expressions.go
+              877dc6f5a4db89bfe2c43b2d546f37d984f5dae5705b3f23a5229e87a71f9cb3  pkg/semantic/analyzer_test.go
+              92b01c88c28a5267f945f98105658ad210f0d8c926c9c69c9a4c7dfcbf15d236  pkg/semantic/analyzer_types.go
+              69dab4471b338b97ede91f0071c6306ea3d66f9b2bcf72b2e171256f5418f6ec  pkg/semantic/analyzer_types_test.go
+              3146c5e7a9fe6ea5fecf2f8a2d6137b33d1fb58a7cc62bb46f58ae8191c2be5b  pkg/semantic/analyzer_value.go
+          - candidate: pr103-emission
+            base: a79928f9673744f6c7020466272acea2fc4dbb5d
+            base_tree: d17eb6f305a92034f50b8ad174eb61829b100ed1
+            tree: 24021caaf6101d6c75374a76bfccdf53528c799a
+            patch_sha256: 6985e592cde7d49dacb79c354ced998ab206a05e87c26036ee728ec780aee8b8
+            payload: .github/qualification/pr103-emission.patch.b64
+            paths: '["pkg/codegen/deploy.go","pkg/codegen/deploy_helm.go","pkg/codegen/deploy_helm_test.go","pkg/codegen/deploy_test.go","pkg/codegen/handler.go","pkg/codegen/handler_test.go","pkg/codegen/numeric_range_test.go","pkg/codegen/relation_resolver.go","pkg/codegen/relation_resolver_test.go"]'
+            tests: '[["github.com/light-speak/luxo/pkg/codegen","TestHelmReferencesExistingJWTSecretForApplicationServices"],["github.com/light-speak/luxo/pkg/codegen","TestComposeInheritsJWTEnvironmentForApplicationServices"],["github.com/light-speak/luxo/pkg/codegen","TestWriteAPIRegistrationReservedOutput"],["github.com/light-speak/luxo/pkg/codegen","TestWriteRegistryRouteFormatsGoLiterals"],["github.com/light-speak/luxo/pkg/codegen","TestWriteAPIRegistrationLongIdentifiers"],["github.com/light-speak/luxo/pkg/codegen","TestNumericValidationBoundRejectsUnsupportedAST"],["github.com/light-speak/luxo/pkg/codegen","TestNumericValidationBoundKeepsLiteralLowering"],["github.com/light-speak/luxo/pkg/codegen","TestNumericValidationBoundSigns"],["github.com/light-speak/luxo/pkg/codegen","TestSignedNumericRangeEmitsValidation"],["github.com/light-speak/luxo/pkg/codegen","TestNumericRangeValidationSource"],["github.com/light-speak/luxo/pkg/codegen","TestValidationCheckSource"],["github.com/light-speak/luxo/pkg/codegen","TestNumericRangeGeneratedSource"],["github.com/light-speak/luxo/pkg/codegen","TestRelationResolverEmissionSource"],["github.com/light-speak/luxo/pkg/codegen","TestGeneratedNestedRelationsBatchAcrossParents"]]'
+            coverage: '[["pkg/codegen/handler.go","writeAPIRegistration"],["pkg/codegen/handler.go","writeAPIParameterRegistration"],["pkg/codegen/handler.go","writeRegistryRoute"],["pkg/codegen/handler.go","writeRegisteredParam"],["pkg/codegen/handler.go","generateNumericValidation"],["pkg/codegen/handler.go","numericValidationBound"],["pkg/codegen/handler.go","writeValidationCheck"],["pkg/codegen/handler.go","writeValidationCheckParts"],["pkg/codegen/relation_resolver.go","generateRelationResolver"],["pkg/codegen/relation_resolver.go","writeSingleRelationResult"],["pkg/codegen/relation_resolver.go","writeRelationDepthCheck"],["pkg/codegen/relation_resolver.go","writeNestedRelationResolve"]]'
+            source_sha256: |
+              bc67438450dcef24288cf6a1aaedbca4837ffef0675cb2fb7fcb9d28028cd8d3  pkg/codegen/deploy.go
+              822d444c162d88d534b9f29e286d5078f8743239b7bb23e29172645c472cdde8  pkg/codegen/deploy_helm.go
+              5ee233ee43d528ade3ba6d3e3a667951b62cbd92db742f4e77a91f75246b8638  pkg/codegen/deploy_helm_test.go
+              0b3b9741b196cf6652aa7e5116d6ae32baa376bbaa24777a38eb8bf25287f5d2  pkg/codegen/deploy_test.go
+              d02ef9cc4b03aa0bb4be4c5d21900cafd9aeb889ad8fb23f9ea08e699721e6b7  pkg/codegen/handler.go
+              898db0c8bbe0b59c070468586ac6bd91ec040ed5a7af38b145739ab1cfbe3082  pkg/codegen/handler_test.go
+              11c48589c6606dc7d4f4b492274401adc49a8626567be0172cc52875dbdec696  pkg/codegen/numeric_range_test.go
+              fd549b1fec7c70c67b36fdf90cc083ca0c4c607b634911eb7b192d9a24c7358a  pkg/codegen/relation_resolver.go
+              746258db42c2093ea317e2aa5d63ce60d916c5cd8383190eafb598a412d94993  pkg/codegen/relation_resolver_test.go
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: luxo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d luxo_test"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=5
+
+    env:
+      DATABASE_HOST: localhost
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_PREFIX: luxo_test
+      DATABASE_SSL: disable
+      LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_AUDIT_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_TRANSACTION_RACE: '1'
+      TESTCONTAINERS_SESSION_ID: luxo-qualify-${{ matrix.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}
+      TESTCONTAINERS_RYUK_DISABLED: 'true'
+      NATS_URL: nats://127.0.0.1:4222
+      GOTOOLCHAIN: local
+      QUALIFICATION_CANDIDATE: ${{ matrix.candidate }}
+      QUALIFICATION_BASE: ${{ matrix.base }}
+      QUALIFICATION_BASE_TREE: ${{ matrix.base_tree }}
+      QUALIFICATION_TREE: ${{ matrix.tree }}
+      QUALIFICATION_PATCH_SHA256: ${{ matrix.patch_sha256 }}
+      QUALIFICATION_PAYLOAD: ${{ matrix.payload }}
+      QUALIFICATION_PATHS: ${{ matrix.paths }}
+      QUALIFICATION_SOURCE_SHA256: ${{ matrix.source_sha256 }}
+      QUALIFICATION_TESTS: ${{ matrix.tests }}
+      QUALIFICATION_COVERAGE: ${{ matrix.coverage }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+
+      - name: Restore this matrix entry's exact candidate
+        id: restore
+        run: |
+          set -euo pipefail
+          case "$QUALIFICATION_CANDIDATE" in pr93-await|pr103-emission) ;; *) exit 2;; esac
+          source="$PWD/.tmp/candidate-go-source"
+          evidence="$PWD/.tmp/candidate-go-evidence"
+          test ! -e "$source"
+          mkdir -p "$evidence"
+          patch="$evidence/candidate.patch"
+          base64 -d < "$QUALIFICATION_PAYLOAD" > "$patch"
+          printf '%s  %s\n' "$QUALIFICATION_PATCH_SHA256" "$patch" | sha256sum -c -
+          if ! git cat-file -e "$QUALIFICATION_BASE^{commit}"; then
+            git fetch --no-tags origin "$QUALIFICATION_BASE"
+          fi
+          test "$(git rev-parse "$QUALIFICATION_BASE^{tree}")" = "$QUALIFICATION_BASE_TREE"
+          git worktree add --detach "$source" "$QUALIFICATION_BASE"
+          printf '%s\n' "$source" > "$evidence/owned-worktree.txt"
+          git -C "$source" apply --index --check --whitespace=error "$patch"
+          git -C "$source" apply --index --whitespace=error "$patch"
+          git -C "$source" apply --reverse --check "$patch"
+          git -C "$source" diff --cached --check
+          test "$(git -C "$source" write-tree)" = "$QUALIFICATION_TREE"
+          git -C "$source" diff --cached --name-only > "$evidence/paths.txt"
+          python3 - "$evidence/paths.txt" <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          expected = json.loads(os.environ["QUALIFICATION_PATHS"])
+          assert Path(sys.argv[1]).read_text().splitlines() == expected
+          PYTHON
+          printf '%s\n' "$QUALIFICATION_SOURCE_SHA256" > "$evidence/source.sha256"
+          (cd "$source" && sha256sum -c "$evidence/source.sha256")
+          printf 'candidate=%s\nbase=%s\nbase_tree=%s\ntree=%s\npatch_sha256=%s\nworkflow_commit=%s\n' \
+            "$QUALIFICATION_CANDIDATE" "$QUALIFICATION_BASE" "$QUALIFICATION_BASE_TREE" \
+            "$QUALIFICATION_TREE" "$QUALIFICATION_PATCH_SHA256" "$GITHUB_SHA" > "$evidence/revision.txt"
+          go version > "$evidence/go-version.txt"
+          test "$(cat "$evidence/go-version.txt")" = 'go version go1.27.1 linux/amd64'
+          go env -json GOOS GOARCH GOAMD64 CGO_ENABLED GOEXPERIMENT GOFLAGS GOWORK GOVERSION > "$evidence/go-env.json"
+          uname -a > "$evidence/host.txt"
+          lscpu >> "$evidence/host.txt"
+          paths=()
+          while IFS= read -r path; do paths+=("$path"); done < "$evidence/paths.txt"
+          (cd "$source" && test -z "$(gofmt -s -l "${paths[@]}")")
+          sh "$source/scripts/setup-modules.sh" "$source"
+          cp "$source/go.work" "$evidence/go.work.txt"
+
+      - name: Start and identify the owned JetStream fixture
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          evidence="$PWD/.tmp/candidate-go-evidence"
+          owner="$TESTCONTAINERS_SESSION_ID"
+          printf '%s\n' "$owner" > "$evidence/owner.txt"
+          docker run --detach --name "$owner" --label "org.luxo.audit.owner=$owner" \
+            --publish 127.0.0.1:4222:4222 --publish 127.0.0.1:8222:8222 \
+            nats:2.15.3-alpine -js -m 8222 > "$evidence/nats-container.txt"
+          curl --fail --silent --show-error --retry 20 --retry-all-errors \
+            --retry-delay 1 --connect-timeout 2 --max-time 5 http://127.0.0.1:8222/healthz > "$evidence/nats-health.json"
+          curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8222/jsz | jq --exit-status \
+            '.disabled != true and .config.max_memory > 0 and .config.max_storage > 0' > "$evidence/nats-jetstream.json"
+          docker inspect "$owner" "$POSTGRES_CONTAINER_ID" > "$evidence/service-containers.json"
+          docker image inspect nats:2.15.3-alpine postgres:17-alpine > "$evidence/service-images.json"
+
+      - name: Verify root coverage, affected and CLI race tests, vet and complexity
+        run: |
+          set -euo pipefail
+          evidence="$PWD/.tmp/candidate-go-evidence"
+          cd .tmp/candidate-go-source
+          export GOWORK="$PWD/go.work"
+          race_pattern="$(python3 -c 'import json, os, re; print("^(" + "|".join(re.escape(name) for _, name in json.loads(os.environ["QUALIFICATION_TESTS"])) + ")$")')"
+          race_packages=(./pkg/codegen)
+          if [[ "$QUALIFICATION_CANDIDATE" == pr93-await ]]; then race_packages+=(./pkg/semantic); fi
+          focused_race=0
+          go test -p 2 -race "${race_packages[@]}" -run "$race_pattern" -count=1 -timeout=10m -json \
+            > "$evidence/focused-race.jsonl" 2>&1 || focused_race=$?
+          printf 'focused-race %s\n' "$focused_race" >> "$evidence/phases.txt"
+          root=0
+          go test -p 2 ./pkg/... ./internal/... -cover -coverprofile="$evidence/root.coverage" -count=1 -timeout=95m -json \
+            > "$evidence/root.jsonl" 2>&1 || root=$?
+          printf 'root %s\n' "$root" >> "$evidence/phases.txt"
+          cli=0
+          go test -p 2 -race ./cmd/luxo/... -coverprofile="$evidence/cli.coverage" -count=1 -timeout=15m -json \
+            > "$evidence/cli.jsonl" 2>&1 || cli=$?
+          printf 'cli %s\n' "$cli" >> "$evidence/phases.txt"
+          vet=0
+          go vet -p 2 ./pkg/... ./internal/... ./cmd/... ./cmd/luxo/... ./pkg/lux/pg/... ./pkg/lux/nats/... \
+            ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/... > "$evidence/vet.log" 2>&1 || vet=$?
+          printf 'vet %s\n' "$vet" >> "$evidence/phases.txt"
+          mkdir -p "$PWD/.tmp/qualification-bin"
+          export GOBIN="$PWD/.tmp/qualification-bin"
+          export PATH="$GOBIN:$PATH"
+          go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
+          go version -m "$GOBIN/gocyclo" > "$evidence/gocyclo-version.txt"
+          complexity=0
+          sh scripts/check-go.sh complexity pkg/ cmd/ scripts/ internal/ > "$evidence/complexity.log" 2>&1 || complexity=$?
+          printf 'complexity %s\n' "$complexity" >> "$evidence/phases.txt"
+          if (( focused_race != 0 || root != 0 || cli != 0 || vet != 0 || complexity != 0 )); then
+            tail -n 80 "$evidence/focused-race.jsonl"
+            tail -n 80 "$evidence/root.jsonl"
+            tail -n 80 "$evidence/cli.jsonl"
+            tail -n 80 "$evidence/vet.log"
+            tail -n 80 "$evidence/complexity.log"
+            exit 1
+          fi
+          go tool cover -func="$evidence/root.coverage" > "$evidence/root.coverage-summary"
+          go tool cover -func="$evidence/cli.coverage" > "$evidence/cli.coverage-summary"
+          python3 - "$evidence" <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          evidence = Path(sys.argv[1])
+          required = {tuple(item) for item in json.loads(os.environ["QUALIFICATION_TESTS"])}
+          for filename in ("root.jsonl", "focused-race.jsonl"):
+              passed = set()
+              for line in (evidence / filename).open():
+                  try:
+                      event = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  if event.get("Action") == "pass":
+                      passed.add((event.get("Package"), event.get("Test")))
+              assert required <= passed, (filename, sorted(required - passed))
+          (evidence / "required-regressions.json").write_text(json.dumps(sorted(required), indent=2) + "\n")
+
+          functions = {tuple(item): [] for item in json.loads(os.environ["QUALIFICATION_COVERAGE"])}
+          module = "github.com/light-speak/luxo/"
+          for row in (evidence / "root.coverage-summary").read_text().splitlines():
+              parts = row.split()
+              if len(parts) != 3:
+                  continue
+              location, name, percentage = parts
+              path = location.rsplit(":", 2)[0].removeprefix(module)
+              if (path, name) in functions:
+                  functions[path, name].append(percentage)
+          missing = {(path, name): values for (path, name), values in functions.items()
+                     if not values or any(value != "100.0%" for value in values)}
+          assert not missing, missing
+          records = [[path, name, values] for (path, name), values in sorted(functions.items())]
+          (evidence / "required-coverage.json").write_text(json.dumps(records, indent=2) + "\n")
+          PYTHON
+          printf 'candidate-specific 0\n' >> "$evidence/phases.txt"
+
+      - name: Verify the final candidate source
+        if: always() && steps.restore.outcome == 'success'
+        run: |
+          set -euo pipefail
+          evidence="$PWD/.tmp/candidate-go-evidence"
+          cd .tmp/candidate-go-source
+          sha256sum -c "$evidence/source.sha256" > "$evidence/final-source-check.log"
+          git diff --exit-code
+          test "$(git write-tree)" = "$QUALIFICATION_TREE"
+          printf 'final-source 0\n' >> "$evidence/phases.txt"
+
+      - name: Remove only this entry's owned source and labeled fixtures
+        if: always()
+        run: |
+          set -u
+          owner="$TESTCONTAINERS_SESSION_ID"
+          evidence="$PWD/.tmp/candidate-go-evidence"
+          mkdir -p "$evidence"
+          status=0
+          : > "$evidence/owned-after-cleanup.txt"
+          for filter in "org.luxo.audit.owner=$owner" "org.testcontainers.sessionId=$owner"; do
+            for kind in container volume network; do
+              if [[ "$kind" == container ]]; then
+                listing=(docker ps -aq --filter "label=$filter")
+                removal=(docker rm -fv)
+              else
+                listing=(docker "$kind" ls -q --filter "label=$filter")
+                removal=(docker "$kind" rm)
+              fi
+              ids=$("${listing[@]}") || status=1
+              while IFS= read -r id; do
+                [[ -n "$id" ]] || continue
+                "${removal[@]}" "$id" >> "$evidence/cleanup.log" 2>&1 || status=1
+              done <<< "$ids"
+              ids=$("${listing[@]}") || status=1
+              if [[ -n "$ids" ]]; then
+                printf '%s %s\n' "$kind" "$ids" >> "$evidence/owned-after-cleanup.txt"
+                status=1
+              fi
+            done
+          done
+          if [[ -f "$evidence/owned-worktree.txt" ]]; then
+            expected="$PWD/.tmp/candidate-go-source"
+            test "$(cat "$evidence/owned-worktree.txt")" = "$expected" || status=1
+            if [[ -d "$expected" ]]; then git worktree remove --force "$expected" || status=1; fi
+          fi
+          printf '%s\n' "$status" > "$evidence/cleanup.exit"
+          exit "$status"
+
+      - name: Preserve candidate-specific immutable evidence
+        id: evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: go-qualification-${{ matrix.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/candidate-go-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record the uploaded artifact identity
+        if: always() && steps.evidence.outcome == 'success'
+        env:
+          ARTIFACT_ID: ${{ steps.evidence.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.evidence.outputs.artifact-digest }}
+        run: |
+          printf 'candidate=%s artifact_id=%s sha256=%s\n' "$QUALIFICATION_CANDIDATE" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
