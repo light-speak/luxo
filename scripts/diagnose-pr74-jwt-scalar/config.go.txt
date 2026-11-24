@@ -1,0 +1,70 @@
+package auth
+
+import (
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+func BenchmarkPR74ConfigBoundary(b *testing.B) {
+	for _, name := range []string{"valid", "valid-cached", "empty", "default-secret"} {
+		b.Run(name, func(b *testing.B) {
+			benchmarkPR74Config(b, name)
+		})
+	}
+}
+
+func benchmarkPR74Config(b *testing.B, name string) {
+	secret := "isolated-audit-test-config-key"
+	expectedError := ""
+	switch name {
+	case "empty":
+		secret = ""
+		expectedError = "JWT_SECRET is not set"
+	case "default-secret":
+		secret = "change-me"
+		switch os.Getenv("PR74_EXPECT_PLACEHOLDER_REJECTION") {
+		case "yes":
+			expectedError = "JWT_SECRET uses the default scaffold placeholder"
+		case "no":
+		default:
+			b.Fatal("expected scaffold policy must be specified")
+		}
+	}
+	b.Setenv("JWT_SECRET", secret)
+	b.Setenv("JWT_EXPIRES", "15m")
+	b.Setenv("JWT_REFRESH", "true")
+	b.Setenv("JWT_REFRESH_EXPIRES", "48h")
+
+	load := loadConfigFromEnv
+	if name == "valid-cached" {
+		ResetConfig()
+		b.Cleanup(ResetConfig)
+		if _, err := LoadConfig(); err != nil {
+			b.Fatal(err)
+		}
+		load = LoadConfig
+	}
+	config, err := load()
+	checkPR74Config(b, secret, expectedError, config, err)
+	b.ReportAllocs()
+	for b.Loop() {
+		config, err = load()
+	}
+	checkPR74Config(b, secret, expectedError, config, err)
+}
+
+func checkPR74Config(b *testing.B, secret, expectedError string, config *Config, err error) {
+	b.Helper()
+	if expectedError != "" {
+		if config != nil || err == nil || !strings.Contains(err.Error(), expectedError) {
+			b.Fatalf("expected configuration rejection %q, got %v", expectedError, err)
+		}
+		return
+	}
+	if err != nil || config == nil || config.Secret != secret || config.Expires != 15*time.Minute ||
+		!config.RefreshEnabled || config.RefreshExpires != 48*time.Hour {
+		b.Fatal("valid configuration was rejected or changed")
+	}
+}

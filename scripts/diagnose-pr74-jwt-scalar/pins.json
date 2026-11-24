@@ -1,0 +1,206 @@
+{
+  "base": "a75a0acce23b30e3f99d44b0c47f746901b82bb8",
+  "originalPR": "538dadd85ba2180505b4bb4a5a37ce66be9e8b10",
+  "trees": {
+    "base": "d119706aff9f4b3f0564f3725fa491953408a124",
+    "jwt": "f17cbe3647afac8511ea03b474e79259a3b4a9c1",
+    "scalar": "3160b535403b13c1798d7b9a7d31976d66620ae5",
+    "combined": "e565af58495c331848b11ecc714c9f6a31a41cda"
+  },
+  "patches": {
+    "jwt": {
+      "branch": "eea8d680fb411e650c15bc655632cf9041a2e964",
+      "sha256": "23fabe521f2cc16d07b156f93ad68162c10f9176bab600e7b33d552415620d6f",
+      "paths": {
+        "pkg/codegen/init.go": {
+          "before": "d2f4e8ac5cf739d0fbcbb0a7da9804e00cfc0ca6b50a9384af9c8303bc63f26e",
+          "after": "0c80006d81f4debc53e314435afd75f5c581c737470e6a251d5ce8fc7ffd2c04"
+        },
+        "pkg/codegen/init_test.go": {
+          "before": "03340cb86185748af361b025208584b93c317719e5689ab993212696d6ed4e43",
+          "after": "5c629351eb44d8b04a355299048068c93c5489c939b8f72ea599fd01c5836cf4"
+        },
+        "pkg/lux/auth/jwt.go": {
+          "before": "f2f1f2ea85c9612c854214528f5cb22988285abd821233a99342ea27cc12c190",
+          "after": "394eb180e453d15384a775ac0e63e5c41d72d35ca96d183c5ec0df2e228f8e04"
+        },
+        "pkg/lux/auth/jwt_test.go": {
+          "before": "6332908cb162638fa9172e88457a3fe8f32d5beddede6092396671a2cda4243a",
+          "after": "8fdc21241b129f3a51c9b6a24ca25f56f1f708051d638789e6de42ea504ef60d"
+        },
+        "pkg/lux/luvia/luvia_test.go": {
+          "before": "449ddee42832e7d568757ff89680e2cb81916e18410eb9a76089a314da58a19c",
+          "after": "9c7198c196e605685c39cb2b8821e61cf6803c3b9c522edb9590e5aab77345c9"
+        }
+      },
+      "text": "diff --git a/pkg/codegen/init.go b/pkg/codegen/init.go\nindex cd783ac6d0843788416babe93d7d6c8fd8e11744..0592950a02b2464e71d0ebfae58cc6abb19f9522 100644\n--- a/pkg/codegen/init.go\n+++ b/pkg/codegen/init.go\n@@ -167,7 +167,8 @@ AUTO_MIGRATE=true                                      # apply pending migration\n # DEBUG_SQL=true                                        # print all SQL queries with timing\n \n # ---- Auth (JWT) ----\n-JWT_SECRET=change-me                                   # HMAC signing key\n+# Set a unique random signing key to enable JWT authentication.\n+# JWT_SECRET=\n JWT_EXPIRES=7d                                         # token expiry\n JWT_REFRESH=true                                       # enable refresh tokens\n JWT_REFRESH_EXPIRES=30d                                # refresh token expiry\ndiff --git a/pkg/codegen/init_test.go b/pkg/codegen/init_test.go\nindex f34bf692fbc22d0a318bd46b17781f72d2ab9f94..63a0a4eb38e95b30d55a3dba0aeb56faaac18560 100644\n--- a/pkg/codegen/init_test.go\n+++ b/pkg/codegen/init_test.go\n@@ -70,7 +70,7 @@ func TestInitProjectEnvExample(t *testing.T) {\n \t\t\"DATABASE_DRIVER=pg\",\n \t\t\"DATABASE_USER=postgres\",\n \t\t\"DATABASE_PASSWORD=postgres\",\n-\t\t\"JWT_SECRET=change-me\",\n+\t\t\"# JWT_SECRET=\",\n \t\t\"DEPLOY_MODE=embedded\",\n \t\t\"LUXO_EVENT_BACKEND=none\",\n \t\t\"LUXO_QUEUE_BACKEND=none\",\n@@ -86,6 +86,12 @@ func TestInitProjectEnvExample(t *testing.T) {\n \t\t\tt.Errorf(\"missing %q in .env.example:\\n%s\", check, src)\n \t\t}\n \t}\n+\tfor _, line := range strings.Split(src, \"\\n\") {\n+\t\tkey, _, _ := strings.Cut(line, \"=\")\n+\t\tif strings.TrimSpace(key) == \"JWT_SECRET\" {\n+\t\t\tt.Error(\".env.example must leave JWT_SECRET unset\")\n+\t\t}\n+\t}\n \n \tunsupported := []string{\n \t\t\"APP_DEBUG=\",\ndiff --git a/pkg/lux/auth/jwt.go b/pkg/lux/auth/jwt.go\nindex ab5e7525c2577beb504ac5cf00cc0e296a67a234..f1066c5674103a4fc440977982512eacb5b9cef3 100644\n--- a/pkg/lux/auth/jwt.go\n+++ b/pkg/lux/auth/jwt.go\n@@ -64,6 +64,9 @@ func loadConfigFromEnv() (*Config, error) {\n \tif !ok || strings.TrimSpace(secret) == \"\" {\n \t\treturn nil, fmt.Errorf(\"JWT_SECRET is not set\")\n \t}\n+\tif secret == \"change-me\" {\n+\t\treturn nil, fmt.Errorf(\"JWT_SECRET uses the default scaffold placeholder, set a unique random signing key\")\n+\t}\n \n \texpires, err := jwtExpiryFromEnv(\"JWT_EXPIRES\", 7*24*time.Hour)\n \tif err != nil {\ndiff --git a/pkg/lux/auth/jwt_test.go b/pkg/lux/auth/jwt_test.go\nindex a30909e1b8ef6ce00bcb62226185e53ccd06bbba..bdae2e6b1549c4ab20d6e1ebf663569e584081ac 100644\n--- a/pkg/lux/auth/jwt_test.go\n+++ b/pkg/lux/auth/jwt_test.go\n@@ -184,6 +184,18 @@ func TestLoadConfigMissing(t *testing.T) {\n \t}\n }\n \n+func TestLoadConfigRejectsScaffoldSecret(t *testing.T) {\n+\tResetConfig()\n+\tt.Cleanup(ResetConfig)\n+\tt.Setenv(\"JWT_SECRET\", \"change-me\")\n+\tt.Setenv(\"JWT_EXPIRES\", \"1h\")\n+\tt.Setenv(\"JWT_REFRESH\", \"false\")\n+\tt.Setenv(\"JWT_REFRESH_EXPIRES\", \"24h\")\n+\tif cfg, err := LoadConfig(); cfg != nil || err == nil || !strings.Contains(err.Error(), \"JWT_SECRET uses the default scaffold placeholder\") {\n+\t\tt.Fatalf(\"expected the scaffold secret diagnostic, got %v\", err)\n+\t}\n+}\n+\n func TestLoadConfigBadExpires(t *testing.T) {\n \tResetConfig()\n \tos.Setenv(\"JWT_SECRET\", \"s\")\ndiff --git a/pkg/lux/luvia/luvia_test.go b/pkg/lux/luvia/luvia_test.go\nindex 6012b0cefe168662ff7d88a91904d93beda6de83..84081430d000069587ba655ba10841eaa217f2dc 100644\n--- a/pkg/lux/luvia/luvia_test.go\n+++ b/pkg/lux/luvia/luvia_test.go\n@@ -666,6 +666,26 @@ func TestServeRejectsInvalidJWTConfiguration(t *testing.T) {\n \t}\n }\n \n+func TestServeRejectsScaffoldJWTSecret(t *testing.T) {\n+\tauth.ResetConfig()\n+\tt.Cleanup(auth.ResetConfig)\n+\tt.Setenv(\"APP_ENV\", \"production\")\n+\tt.Setenv(\"DEPLOY_MODE\", \"embedded\")\n+\tt.Setenv(\"GRACEFUL_TIMEOUT\", \"30s\")\n+\tt.Setenv(\"JWT_SECRET\", \"change-me\")\n+\tt.Setenv(\"JWT_EXPIRES\", \"1h\")\n+\tt.Setenv(\"JWT_REFRESH\", \"false\")\n+\tt.Setenv(\"JWT_REFRESH_EXPIRES\", \"24h\")\n+\tt.Setenv(\"LUXO_STUDIO_URL\", \"\")\n+\t// Keep the test from opening a listener if JWT validation regresses.\n+\tt.Setenv(\"CORS_ORIGIN\", \"https://app.example/path\")\n+\tgateway := New()\n+\terr := gateway.Serve(\"test-v1\")\n+\tif err == nil || !strings.Contains(err.Error(), \"invalid JWT configuration: JWT_SECRET uses the default scaffold placeholder\") || gateway.server != nil {\n+\t\tt.Fatalf(\"expected startup to reject the scaffold JWT secret, got %v\", err)\n+\t}\n+}\n+\n func TestValidateJWTConfigurationAcceptsValidConfiguration(t *testing.T) {\n \tauth.ResetConfig()\n \tt.Cleanup(auth.ResetConfig)\n"
+    },
+    "scalar": {
+      "branch": "a50c5e5f47fd202147b5ee8461358cfd5cd2dd6d",
+      "sha256": "d105f67a47012e6828a9783f382275489ce5c402242e4090a40d0c576642f75a",
+      "paths": {
+        "pkg/lux/jsonutil/scalar.go": {
+          "before": "06f3dc61365f90288ff703605b27fbffed8cb1ee1e7e7c4aa91b7b9af1c407d4",
+          "after": "248b236bd7a03cd2aaa9e0c40ad6926669684aa7c30462c420cbf86e73c535f7"
+        }
+      },
+      "text": "diff --git a/pkg/lux/jsonutil/scalar.go b/pkg/lux/jsonutil/scalar.go\nindex 3f6102f53ab9ce1b5f334fe475c64376f21f92de..da574bfdf39e1ff94977083b6341a9230d6a8980 100644\n--- a/pkg/lux/jsonutil/scalar.go\n+++ b/pkg/lux/jsonutil/scalar.go\n@@ -55,12 +55,29 @@ func ParseInt64(raw []byte) (int64, error) {\n \t\traw = bytes.Trim(raw, \" \\t\\r\\n\")\n \t}\n \tdigits := raw\n-\tif len(digits) > 0 && digits[0] == '-' {\n+\tnegative := len(digits) > 0 && digits[0] == '-'\n+\tif negative {\n \t\tdigits = digits[1:]\n \t}\n \tif len(digits) == 0 || digits[0] < '0' || digits[0] > '9' || (digits[0] == '0' && len(digits) != 1) {\n \t\treturn 0, errExpectedInteger\n \t}\n+\t// Eighteen decimal digits fit in int64. Preserve strconv's syntax and\n+\t// range errors for malformed tokens and boundary-sized values.\n+\tif len(digits) <= 18 {\n+\t\tvar value int64\n+\t\tfor _, unit := range digits {\n+\t\t\tdigit := unit - '0'\n+\t\t\tif digit > 9 {\n+\t\t\t\treturn strconv.ParseInt(string(raw), 10, 64)\n+\t\t\t}\n+\t\t\tvalue = value*10 + int64(digit)\n+\t\t}\n+\t\tif negative {\n+\t\t\tvalue = -value\n+\t\t}\n+\t\treturn value, nil\n+\t}\n \treturn strconv.ParseInt(string(raw), 10, 64)\n }\n \n"
+    }
+  },
+  "historicalRuns": {
+    "priorOfficial": 45269810591,
+    "correctedOfficial": 45306776656,
+    "jwtOnly": 45208145755,
+    "combined": 45212584447
+  },
+  "fixtures": {
+    "pkg/lux/schema/json_encode_depth_bench_test.go": "2b1acaf6ee769a4a19aad0ad00fd2348910cfa7479f775265c9dc86bb17c05eb",
+    "pkg/lux/api/request_value_bench_test.go": "2ea96ad21f5f589de2c05897c969c1e6c7d21a854654f84b3d27b5a9b337406b",
+    "pkg/lux/api/binary_ids_bench_test.go": "8354526c8082f08dab3f6d72d133f3f92b96a6b10811a60dcb3a84a3301bd88d",
+    "pkg/lux/api/request_scalar_bench_test.go": "eb7a39707023f545fed880f7246e1a741acaae48129d2b2c111e6ee089440b8c",
+    "pkg/lux/api/json_unicode_bench_test.go": "5817035db9aa72c1fee7246fd54f2839b224fa932d2ae11a01682e9fc4c51c64",
+    "pkg/lux/rpc/frame_buffered_bench_test.go": "bdb6b3db5f804bfbe75586e0c18cb8c4796cb7df1b9efb69321068ae940f9f70",
+    "pkg/lux/luvia/middleware_upgrade_bench_test.go": "51a1221852e6c2488499172dbd5bb904ad157e268871ec06f9a365495b3a25aa",
+    "pkg/lux/auth/static_bench_test.go": "34c2a2f551c3a81016e2f6c95b4c970c5db278d06d0271003bcacb0636a553be"
+  },
+  "archivedControl": {
+    "scripts/diagnose-json-int.go.txt": "a4d7eca0d6e2d8de88a4eea21cd30b9b3f979cb1abb083ee2b6b65e56489b037",
+    "scripts/diagnose-pr74-jwt-scalar/config.go.txt": "d79fb23a1deb518a4088986143460ba360f6915e2fa54346cc83913a86c98591"
+  },
+  "sampler": {
+    "scripts/diagnose-hosted-perf.sh": "9e0a5f421f2e76674b819f81074a3d416a51174e0f93b858a63d20c27d64e072"
+  },
+  "cases": [
+    {
+      "origin": "official-repeat",
+      "package": "pkg/lux/schema",
+      "variant": "default",
+      "scope": "01",
+      "leaves": [
+        "BenchmarkSchemaDepthOutput/model1/listfalse/json0/row-2"
+      ]
+    },
+    {
+      "origin": "official-repeat",
+      "package": "pkg/lux/api",
+      "variant": "default",
+      "scope": "02",
+      "leaves": [
+        "BenchmarkStaticValueParams/BoolArray/0/JSON/static-2",
+        "BenchmarkStaticValueParams/DurationArray/0/JSON/static-2"
+      ]
+    },
+    {
+      "origin": "official-repeat",
+      "package": "pkg/lux/api",
+      "variant": "default",
+      "scope": "04",
+      "leaves": [
+        "BenchmarkBinaryRequestIDBounds/maximum/omitted-2",
+        "BenchmarkBinaryRequestIDBounds/one/omitted-2",
+        "BenchmarkRequestStaticJSONParams/IntArray/empty-2"
+      ]
+    },
+    {
+      "origin": "official-new",
+      "package": "pkg/lux/api",
+      "variant": "default",
+      "scope": "06",
+      "leaves": [
+        "BenchmarkRawJSONArrayPool/precision/encode-2"
+      ]
+    },
+    {
+      "origin": "official-new",
+      "package": "pkg/lux/rpc",
+      "variant": "default",
+      "scope": "06",
+      "leaves": [
+        "BenchmarkLRPCBufferedColdRead/direct-2"
+      ]
+    },
+    {
+      "origin": "official-auth",
+      "package": "pkg/lux/luvia",
+      "variant": "default",
+      "scope": "08",
+      "leaves": [
+        "BenchmarkAuthUpgradeHeaders/anonymous-get/current-2",
+        "BenchmarkAuthUpgradeHeaders/anonymous-http/current-2"
+      ]
+    },
+    {
+      "origin": "historical-duration",
+      "package": "pkg/lux/api",
+      "variant": "default",
+      "scope": "45208145755,45212584447",
+      "leaves": [
+        "BenchmarkStaticValueParams/Duration/JSON/static-2",
+        "BenchmarkStaticValueParams/Duration/Binary/static-2"
+      ]
+    },
+    {
+      "origin": "existing-jwt",
+      "package": "pkg/lux/auth",
+      "variant": "default",
+      "scope": "a75a0ac",
+      "leaves": [
+        "BenchmarkStaticJWT/Verify/After-2"
+      ]
+    },
+    {
+      "origin": "direct-integer",
+      "package": "pkg/lux/jsonutil",
+      "variant": "json-int",
+      "scope": "45212584447",
+      "leaves": [
+        "BenchmarkDiagnosticParseInt64/short-positive-2",
+        "BenchmarkDiagnosticParseInt64/large-positive-2",
+        "BenchmarkDiagnosticParseInt64/max-int64-2"
+      ]
+    },
+    {
+      "origin": "direct-config",
+      "package": "pkg/lux/auth",
+      "variant": "config",
+      "scope": "new-equivalent",
+      "leaves": [
+        "BenchmarkPR74ConfigBoundary/valid-2",
+        "BenchmarkPR74ConfigBoundary/valid-cached-2",
+        "BenchmarkPR74ConfigBoundary/empty-2"
+      ]
+    },
+    {
+      "origin": "behavior-config",
+      "package": "pkg/lux/auth",
+      "variant": "config",
+      "scope": "new-behavior",
+      "leaves": [
+        "BenchmarkPR74ConfigBoundary/default-secret-2"
+      ]
+    }
+  ],
+  "historicalSources": {
+    "historicalBaseline": "65f1892e175487503aa36caa86d1eb8a0805f073",
+    "historicalJWT": "eea8d680fb411e650c15bc655632cf9041a2e964",
+    "historicalCombined": "a50c5e5f47fd202147b5ee8461358cfd5cd2dd6d",
+    "previousSampleBaseline": "85603d65441051df65a152fd81581af4dfa97719",
+    "correctedSampleBaseline": "133f54d7722425b0344ec1eda73f954affa5ff5f"
+  },
+  "historicalProjections": {
+    "previous": {
+      "parents": [
+        "5d6448fed4b3ed9278c1f9b883354b8b5365da20",
+        "210579a2f1fe4f2e3f36a221831ddb8bfcecdd21"
+      ],
+      "tree": "a4e316467b809493ea0421789150314916d6f358"
+    },
+    "corrected": {
+      "parents": [
+        "133f54d7722425b0344ec1eda73f954affa5ff5f",
+        "538dadd85ba2180505b4bb4a5a37ce66be9e8b10"
+      ],
+      "tree": "4090dc0ba88aa0cc7178abfb46facefad8aa3118"
+    }
+  }
+}
