@@ -37,12 +37,8 @@ func verifyFiles(args []string) error {
 	if len(args) != 4 {
 		return errors.New("usage: benchplan --verify <expected.json> <base.txt> <head.txt>")
 	}
-	data, err := os.ReadFile(args[1])
+	expected, err := readExpectedSamples(args[1])
 	if err != nil {
-		return err
-	}
-	var expected expectedSamples
-	if err := json.Unmarshal(data, &expected); err != nil {
 		return err
 	}
 	for i, keys := range [][]sampleKey{expected.Base, expected.Head} {
@@ -54,6 +50,16 @@ func verifyFiles(args []string) error {
 		}
 	}
 	return nil
+}
+
+func readExpectedSamples(path string) (expectedSamples, error) {
+	var expected expectedSamples
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return expected, err
+	}
+	err = json.Unmarshal(data, &expected)
+	return expected, err
 }
 
 func verifySampleFile(path string, expected []sampleKey) error {

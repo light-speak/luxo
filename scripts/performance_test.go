@@ -2,6 +2,9 @@ package scripts_test
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -32,9 +35,11 @@ func TestPerformanceCIKeepsSamplingAndEvidenceGates(t *testing.T) {
 	script := performanceStep(t, "performance-samples", "Run adaptive interleaved benchmark samples")
 	for _, required := range []string{
 		"{1..10}", "-test.benchtime=200ms", "-test.cpu=2", "-test.benchmem",
-		`-test.bench="${filter}"`, "-alpha 0.01", "run_group confirmation",
+		`-test.bench="${filter}"`, "-alpha 0.01",
+		"run_group primary .tmp/benchmark-batch.tsv",
+		"run_group confirmation .tmp/benchmark-confirmation-batch.tsv",
 		"--verify .tmp/benchmark-expected.json .tmp/benchmark-primary-base.txt .tmp/benchmark-primary-head.txt",
-		"--verify .tmp/benchmark-expected.json .tmp/benchmark-confirmation-base.txt .tmp/benchmark-confirmation-head.txt",
+		"--verify .tmp/benchmark-confirmation-expected.json .tmp/benchmark-confirmation-base.txt .tmp/benchmark-confirmation-head.txt",
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("sampling lost %q", required)
@@ -74,50 +79,157 @@ func TestPerformanceSummaryFailsClosed(t *testing.T) {
 func samplingFixture(t *testing.T, confirmation bool) qualityFixture {
 	t.Helper()
 	fixture := newQualityFixture(t)
-	fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/a\t^(BenchmarkA|BenchmarkB)$\n")
+	fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/a\t^(BenchmarkA|BenchmarkB)$\npkg/control\t^BenchmarkC$\n")
+	fixture.write(t, ".tmp/benchmark-expected.json", "primary expectations\n")
 	for _, revision := range []string{"base", "head"} {
-		fixture.write(t, ".tmp/"+revision+"/pkg/a/keep", "")
-		fixture.write(t, ".tmp/bin/"+revision+"/pkg-a.test", "#!/bin/sh\nprintf '"+revision+" %s\\n' \"$*\" >> \"$QUALITY_LOG\"\n")
+		for _, binary := range []string{"pkg-a.test", "pkg-control.test"} {
+			fixture.write(t, ".tmp/bin/"+revision+"/"+binary, "#!/bin/sh\nrevision="+revision+"\n"+sampleEvidence)
+		}
 	}
-	fixture.write(t, ".tmp/bin/benchstat", "#!/bin/sh\nexit 0\n")
-	fixture.write(t, ".tmp/bin/benchrun", "#!/bin/sh\nset -eu\ntest \"$1\" = run\nbenchmark_bin=$3\nshift 4\nexec \"$benchmark_bin/pkg-a.test\" \"$@\"\n")
-	fixture.tool(t, "go", fmt.Sprintf(`case "$*" in *--requires-confirmation*) echo %t ;; esac`, confirmation), false)
+	fixture.write(t, ".tmp/bin/benchstat", "#!/bin/sh\nprintf 'benchstat %s\\n' \"$*\" >> \"$QUALITY_LOG\"\nprintf 'benchmark CSV\\n'\n")
+	fixture.write(t, ".tmp/bin/benchrun", `#!/bin/sh
+set -eu
+test "$1" = run
+benchmark_bin=$3
+benchmark_package=$4
+shift 4
+case "$benchmark_package" in
+  pkg/a) exec "$benchmark_bin/pkg-a.test" "$@" ;;
+  pkg/control) exec "$benchmark_bin/pkg-control.test" "$@" ;;
+  *) exit 42 ;;
+esac
+`)
+	fixture.tool(t, "go", fmt.Sprintf("confirmation=%t\n", confirmation)+samplingTools, false)
 	return fixture
+}
+
+const sampleEvidence = `set -eu
+printf '%s %s\n' "$revision" "$*" >> "$QUALITY_LOG"
+case "$*" in
+  *'-test.bench=^(BenchmarkA|BenchmarkB)$'*) printf 'BenchmarkA-2\nBenchmarkB-2\n' ;;
+  *'-test.bench=^BenchmarkC$'*) printf 'BenchmarkC-2\n' ;;
+  *'-test.bench=^BenchmarkB$'*)
+    test "${FAIL_STAGE:-}" != sample-confirmation
+    printf 'BenchmarkB-2\n'
+    ;;
+  *) exit 42 ;;
+esac
+`
+
+const samplingTools = `set -eu
+case "$1 $2 $3" in
+  "run ./scripts/benchplan --normalize")
+    /bin/cat "$4" > "$5"
+    ;;
+  "run ./scripts/benchplan --verify")
+    test -s "$4"
+    test -s "$5"
+    test -s "$6"
+    case "$4" in
+      .tmp/benchmark-expected.json) test "${FAIL_STAGE:-}" != verify-primary ;;
+      .tmp/benchmark-confirmation-expected.json) test "${FAIL_STAGE:-}" != verify-confirmation ;;
+      *) exit 42 ;;
+    esac
+    ;;
+  "run ./scripts/benchgate --confirmation-targets")
+    test "$4" = .tmp/benchstat-primary.csv
+    test -s "$4"
+    test "${FAIL_STAGE:-}" != targets
+    if [ "$confirmation" = true ]; then
+      printf 'pkg/a\tBenchmarkB-2\n'
+    fi
+    ;;
+  "run ./scripts/benchplan --confirmation-plan")
+    test "$4" = .tmp/benchmark-expected.json
+    test "$5" = .tmp/benchmark-confirmation-targets.tsv
+    test "$6" = .tmp/benchmark-confirmation-batch.tsv
+    test "$7" = .tmp/benchmark-confirmation-expected.json
+    test -s "$4"
+    test "$(/bin/cat "$5")" = "$(printf 'pkg/a\tBenchmarkB-2')"
+    test "${FAIL_STAGE:-}" != plan
+    if [ "${FAIL_STAGE:-}" != empty-plan ]; then
+      printf 'pkg/a\t^BenchmarkB$\n' > "$6"
+    fi
+    printf 'confirmation expectations\n' > "$7"
+    ;;
+  "run ./scripts/benchgate --approved-costs") ;;
+  *) exit 42 ;;
+esac
+`
+
+func samplingPrefix(fixture qualityFixture, failure string) string {
+	return "export GITHUB_WORKSPACE=" + shellQualityQuote(string(fixture)) +
+		" BASE_SHA=expected-main FAIL_STAGE=" + shellQualityQuote(failure) + "\n"
 }
 
 func TestPerformanceSamplingAlternatesBothRevisions(t *testing.T) {
 	script := performanceStep(t, "performance-samples", "Run adaptive interleaved benchmark samples")
+	gate := performanceStep(t, "performance-samples", "Enforce performance baseline")
 	for _, confirmation := range []bool{false, true} {
-		fixture := samplingFixture(t, confirmation)
-		output, log, err := fixture.run(t, "export GITHUB_WORKSPACE="+shellQualityQuote(string(fixture))+"\n"+script)
-		if err != nil {
-			t.Fatalf("sampling failed: %v\n%s", err, output)
+		t.Run(fmt.Sprintf("confirm=%t", confirmation), func(t *testing.T) {
+			fixture := samplingFixture(t, confirmation)
+			output, log, err := fixture.run(t, samplingPrefix(fixture, "")+script+"\n"+gate)
+			if err != nil {
+				t.Fatalf("sampling failed: %v\n%s\n%s", err, output, log)
+			}
+			var runs []string
+			for _, line := range strings.Split(log, "\n") {
+				if strings.HasPrefix(line, "base ") || strings.HasPrefix(line, "head ") {
+					runs = append(runs, line)
+				}
+			}
+			groups, totalRuns := 1, 40
+			gateArgs := ".tmp/benchstat-primary.csv\n"
+			targets := ""
+			if confirmation {
+				groups, totalRuns = 2, 60
+				gateArgs = "--targeted-confirmation .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv\n"
+				targets = "pkg/a\tBenchmarkB-2\n"
+			}
+			wantGate := "go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha expected-main " + gateArgs
+			if len(runs) != totalRuns || strings.Count(log, "./scripts/benchplan --verify") != groups || !strings.Contains(log, wantGate) {
+				t.Fatalf("sampling or gate changed; got %d runs, log:\n%s", len(runs), log)
+			}
+			assertSampleOrder(t, runs[:40], "^(BenchmarkA|BenchmarkB)$", "^BenchmarkC$")
+			if confirmation {
+				assertSampleOrder(t, runs[40:], "^BenchmarkB$")
+			}
+			if got := readQualityFile(t, filepath.Join(string(fixture), ".tmp/benchmark-confirmation-targets.tsv")); got != targets {
+				t.Fatalf("confirmation targets = %q, want %q", got, targets)
+			}
+			for _, revision := range []string{"base", "head"} {
+				assertSampleEvidence(t, fixture, "primary", revision, strings.Repeat("BenchmarkA-2\nBenchmarkB-2\nBenchmarkC-2\n", 10))
+				if confirmation {
+					assertSampleEvidence(t, fixture, "confirmation", revision, strings.Repeat("BenchmarkB-2\n", 10))
+				}
+			}
+		})
+	}
+}
+
+func assertSampleOrder(t *testing.T, runs []string, filters ...string) {
+	t.Helper()
+	for sample := range 10 {
+		order := []string{"base", "head"}
+		if sample%2 == 1 {
+			order[0], order[1] = order[1], order[0]
 		}
-		var runs []string
-		for _, line := range strings.Split(log, "\n") {
-			if strings.HasPrefix(line, "base ") || strings.HasPrefix(line, "head ") {
-				runs = append(runs, line)
+		for group, filter := range filters {
+			for leg, revision := range order {
+				line := runs[(sample*len(filters)+group)*2+leg]
+				if !strings.HasPrefix(line, revision+" ") || !strings.Contains(line, "-test.bench="+filter+" ") {
+					t.Fatalf("sample %d has unexpected order/filter %q, want %s %s", sample+1, line, revision, filter)
+				}
 			}
 		}
-		groups := 1
-		if confirmation {
-			groups = 2
-		}
-		if len(runs) != groups*20 {
-			t.Fatalf("got %d runs", len(runs))
-		}
-		for i, line := range runs {
-			want := "base"
-			if i%4 == 1 || i%4 == 2 {
-				want = "head"
-			}
-			if !strings.HasPrefix(line, want+" ") || !strings.Contains(line, "-test.bench=^(BenchmarkA|BenchmarkB)$") {
-				t.Fatalf("run %d lost order/filter: %s", i, line)
-			}
-		}
-		if strings.Count(log, "./scripts/benchplan --verify") != groups {
-			t.Fatal("each sample group must verify completeness")
-		}
+	}
+}
+
+func assertSampleEvidence(t *testing.T, fixture qualityFixture, group, revision, expected string) {
+	t.Helper()
+	path := filepath.Join(string(fixture), ".tmp", "benchmark-"+group+"-"+revision+".txt")
+	if data := readQualityFile(t, path); data != expected {
+		t.Fatalf("%s/%s evidence does not cover the expected samples:\n%s", group, revision, data)
 	}
 }
 
@@ -125,34 +237,76 @@ func TestPerformanceSamplingStopsOnProcessFailure(t *testing.T) {
 	fixture := samplingFixture(t, false)
 	fixture.write(t, ".tmp/bin/base/pkg-a.test", "#!/bin/sh\nexit 42\n")
 	script := performanceStep(t, "performance-samples", "Run adaptive interleaved benchmark samples")
-	_, log, err := fixture.run(t, "export GITHUB_WORKSPACE="+shellQualityQuote(string(fixture))+"\n"+script)
-	if err == nil || strings.Contains(log, "head ") || strings.Contains(log, "--requires-confirmation") {
+	_, log, err := fixture.run(t, samplingPrefix(fixture, "")+script)
+	if err == nil || strings.Contains(log, "head ") || strings.Contains(log, "--confirmation-targets") {
 		t.Fatalf("continued after failed benchmark: err=%v log=%s", err, log)
 	}
 }
 
 func TestPerformanceSamplingStopsOnEvidenceFailure(t *testing.T) {
 	script := performanceStep(t, "performance-samples", "Run adaptive interleaved benchmark samples")
-	for _, group := range []string{"primary", "confirmation"} {
-		t.Run(group, func(t *testing.T) {
+	gate := performanceStep(t, "performance-samples", "Enforce performance baseline")
+	for _, failure := range []struct{ stage, reached, forbidden string }{
+		{"verify-primary", "--verify .tmp/benchmark-expected.json .tmp/benchmark-primary-base.txt", "--confirmation-targets"},
+		{"targets", "--confirmation-targets .tmp/benchstat-primary.csv", "--confirmation-plan"},
+		{"plan", "--confirmation-plan .tmp/benchmark-expected.json", "-test.bench=^BenchmarkB$"},
+		{"empty-plan", "--confirmation-plan .tmp/benchmark-expected.json", "-test.bench=^BenchmarkB$"},
+		{"sample-confirmation", "-test.bench=^BenchmarkB$", "--verify .tmp/benchmark-confirmation-expected.json"},
+		{"verify-confirmation", "--verify .tmp/benchmark-confirmation-expected.json .tmp/benchmark-confirmation-base.txt", "base=.tmp/benchmark-confirmation-base.txt"},
+	} {
+		t.Run(failure.stage, func(t *testing.T) {
 			fixture := samplingFixture(t, true)
-			fixture.tool(t, "go", `case "$*" in
-*--verify*benchmark-"$FAIL_GROUP"-base.txt*) exit 42 ;;
-*--requires-confirmation*) echo true ;;
-esac`, false)
-			prefix := "export FAIL_GROUP=" + shellQualityQuote(group) + " GITHUB_WORKSPACE=" + shellQualityQuote(string(fixture)) + "\n"
-			output, log, err := fixture.run(t, prefix+script)
-			if err == nil {
-				t.Fatalf("continued after %s evidence failure: %s", group, output)
+			output, log, err := fixture.run(t, samplingPrefix(fixture, failure.stage)+script+"\n"+gate)
+			if err == nil || !strings.Contains(log, failure.reached) {
+				t.Fatalf("did not reach the %s failure: err=%v output=%s log=%s", failure.stage, err, output, log)
 			}
-			if group == "primary" && strings.Contains(log, "--requires-confirmation") {
-				t.Fatal("incomplete primary evidence reached the confirmation decision")
-			}
-			if !strings.Contains(log, "--verify .tmp/benchmark-expected.json .tmp/benchmark-"+group+"-base.txt") {
-				t.Fatalf("failure did not reach %s evidence verification: %s", group, log)
+			if strings.Contains(log, failure.forbidden) || strings.Contains(log, "--approved-costs") {
+				t.Fatalf("continued after %s failure: %s", failure.stage, log)
 			}
 		})
 	}
+}
+
+func TestPerformanceGateRejectsMissingOrUnexpectedEvidence(t *testing.T) {
+	gate := performanceStep(t, "performance-samples", "Enforce performance baseline")
+	for _, test := range []struct{ name, primary, targets, confirmation string }{
+		{"missing primary", "", "pkg/a\tBenchmarkB-2\n", "evidence"},
+		{"empty confirmation with targets", "evidence", "pkg/a\tBenchmarkB-2\n", ""},
+		{"unexpected confirmation", "evidence", "", "evidence"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := samplingFixture(t, false)
+			fixture.write(t, ".tmp/benchstat-primary.csv", test.primary)
+			fixture.write(t, ".tmp/benchmark-confirmation-targets.tsv", test.targets)
+			fixture.write(t, ".tmp/benchstat-confirmation.csv", test.confirmation)
+			_, log, err := fixture.run(t, samplingPrefix(fixture, "")+gate)
+			if err == nil || strings.Contains(log, "--approved-costs") {
+				t.Fatalf("invalid evidence reached the gate: err=%v log=%s", err, log)
+			}
+		})
+	}
+}
+
+func TestPerformanceArtifactRetainsTargetedConfirmationEvidence(t *testing.T) {
+	for _, step := range readQualityWorkflow(t).Jobs["performance-samples"].Steps {
+		if step.Name != "Preserve performance evidence" {
+			continue
+		}
+		if step.If != "always()" || step.With["name"] != "performance-evidence-${{ matrix.shard }}-${{ github.run_attempt }}" {
+			t.Fatal("failed and retried samples must retain attempt-specific evidence")
+		}
+		for _, path := range []string{
+			".tmp/benchmark-confirmation-targets.tsv", ".tmp/benchmark-confirmation-batch.tsv",
+			".tmp/benchmark-confirmation-expected.json", ".tmp/benchmark-expected.json", ".tmp/benchmark-batch.tsv",
+			".tmp/benchmark-*.txt", ".tmp/benchstat-*.csv",
+		} {
+			if !strings.Contains(step.With["path"], path+"\n") {
+				t.Errorf("performance artifact lost %s", path)
+			}
+		}
+		return
+	}
+	t.Fatal("missing performance evidence upload")
 }
 
 func TestPerformancePlanArtifactUsesProducingAttempt(t *testing.T) {
@@ -175,4 +329,207 @@ func TestPerformancePlanArtifactUsesProducingAttempt(t *testing.T) {
 		return
 	}
 	t.Fatal("missing benchmark plan loading")
+}
+
+func TestPerformancePreparesScratchWithinBothRevisions(t *testing.T) {
+	for _, stage := range []struct{ job, step string }{
+		{"performance-scope", "Discover and plan benchmark batches"},
+		{"performance-samples", "Compile benchmark binaries"},
+	} {
+		t.Run(stage.job, func(t *testing.T) {
+			fixture := newQualityFixture(t)
+			for _, revision := range []string{"base", "head"} {
+				fixture.write(t, ".tmp/"+revision+"/go.mod", "")
+			}
+			fixture.write(t, "bin/mkdir", "#!/bin/sh\nexec /bin/mkdir \"$@\"\n")
+			fixture.write(t, "scripts/setup-modules.sh", "#!/bin/sh\nexit 0\n")
+			fixture.write(t, ".tmp/benchmark-packages.txt", "pkg/lux/pg\n")
+			fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/lux/pg\t^BenchmarkPendingMigrationFiles$\n")
+			fixture.write(t, ".tmp/bin/benchrun", `#!/bin/sh
+set -eu
+printf '%s %s\n' "$1" "$2" >> "$QUALITY_LOG"
+if [ ! -d "$2/.tmp" ]; then
+    printf 'missing benchmark scratch: %s/.tmp\n' "$2" >&2
+    exit 1
+fi
+`)
+			script := "export GITHUB_OUTPUT=.tmp/outputs RUN_ATTEMPT=1\n" + performanceStep(t, stage.job, stage.step)
+			output, log, err := fixture.run(t, script)
+			if err != nil {
+				t.Fatalf("benchmark setup failed: %v\n%s", err, output)
+			}
+			for _, revision := range []string{"base", "head"} {
+				if !strings.Contains(log, "compile .tmp/"+revision+"\n") {
+					t.Errorf("revision %s did not reach compilation:\n%s", revision, log)
+				}
+			}
+		})
+	}
+}
+
+// The workflow must compare the exact tree being tested to its actual main parent.
+func TestPerformanceResolvesSyntheticMergeBaseline(t *testing.T) {
+	script := performanceStep(t, "performance-scope", "Resolve benchmark revisions")
+	fixture := performanceGitFixture(t)
+	for _, test := range []struct {
+		name, checkout, eventBase, eventHead, tested string
+		valid                                        bool
+	}{
+		{"stale-event-base", "merge", "event_base", "pr_head", "merge", true},
+		{"current-event-base", "merge", "actual_base", "pr_head", "merge", true},
+		{"unrelated-event-base", "merge", "pr_head", "pr_head", "merge", false},
+		{"wrong-pr-head", "merge", "event_base", "actual_base", "merge", false},
+		{"wrong-tested-sha", "merge", "event_base", "pr_head", "actual_base", false},
+		{"nonmerge-checkout", "actual_base", "event_base", "pr_head", "actual_base", false},
+		{"octopus-checkout", "octopus", "event_base", "pr_head", "octopus", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prefix := performanceReadGitGraph + fmt.Sprintf(
+				"git update-ref --no-deref HEAD \"$%s\"\nexport EVENT_BASE_SHA=\"$%s\" EVENT_HEAD_SHA=\"$%s\" TESTED_SHA=\"$%s\"\n",
+				test.checkout, test.eventBase, test.eventHead, test.tested,
+			)
+			suffix := ""
+			if test.valid {
+				suffix = "\ngrep -Fxq \"base_sha=$actual_base\" \"$GITHUB_OUTPUT\"\n" +
+					"grep -Fxq \"tested_sha=$merge\" \"$GITHUB_OUTPUT\"\n" +
+					"cmp \"$GITHUB_OUTPUT\" .tmp/benchmark-revisions.txt\n"
+			}
+			output, _, err := fixture.run(t, prefix+script+suffix)
+			if (err == nil) != test.valid {
+				t.Fatalf("valid=%v err=%v\n%s", test.valid, err, output)
+			}
+			if !test.valid {
+				if got := readQualityFile(t, filepath.Join(string(fixture), "github-output")); got != "" {
+					t.Fatalf("published revisions after rejecting checkout: %q", got)
+				}
+			}
+		})
+	}
+}
+
+const performanceGitGraph = `set -euo pipefail
+export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid
+export GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid
+git init -q
+empty=$(git mktree </dev/null)
+event_base=$(git commit-tree "$empty" -m "event base")
+actual_base=$(git commit-tree "$empty" -p "$event_base" -m "advanced base")
+pr_head=$(git commit-tree "$empty" -p "$event_base" -m "PR head")
+extra=$(git commit-tree "$empty" -p "$event_base" -m "additional parent")
+payload=$(printf 'synthetic tree\n' | git hash-object -w --stdin)
+merged_tree=$(printf '100644 blob %s\tmerge-source.txt\n' "$payload" | git mktree)
+merge=$(git commit-tree "$merged_tree" -p "$actual_base" -p "$pr_head" -m "synthetic merge")
+octopus=$(git commit-tree "$empty" -p "$actual_base" -p "$pr_head" -p "$extra" -m "octopus merge")
+printf 'event_base=%s\nactual_base=%s\npr_head=%s\nmerge=%s\noctopus=%s\n' \
+    "$event_base" "$actual_base" "$pr_head" "$merge" "$octopus" > .git/benchmark-fixture-shas
+`
+
+const performanceReadGitGraph = `set -euo pipefail
+source .git/benchmark-fixture-shas
+export GITHUB_OUTPUT="$PWD/github-output"
+: > "$GITHUB_OUTPUT"
+`
+
+func TestPerformanceRoutesResolvedRevisions(t *testing.T) {
+	workflow := readQualityWorkflow(t)
+	scope, samples := workflow.Jobs["performance-scope"], workflow.Jobs["performance-samples"]
+	const base = "${{ needs.performance-scope.outputs.base_sha }}"
+	const tested = "${{ needs.performance-scope.outputs.tested_sha }}"
+	for _, name := range []string{"base_sha", "tested_sha"} {
+		want := "${{ steps.benchmark_revisions.outputs." + name + " }}"
+		if scope.Outputs[name] != want {
+			t.Errorf("scope output %s = %q, want %q", name, scope.Outputs[name], want)
+		}
+	}
+	for _, step := range scope.Steps {
+		switch step.Name {
+		case "Check out benchmark baseline":
+			if step.With["ref"] != "${{ steps.benchmark_revisions.outputs.base_sha }}" {
+				t.Errorf("scope baseline still uses %q", step.With["ref"])
+			}
+		case "Select affected benchmark packages":
+			if step.Env["BASE_SHA"] != "${{ steps.benchmark_revisions.outputs.base_sha }}" {
+				t.Errorf("scope diff still uses %q", step.Env["BASE_SHA"])
+			}
+		}
+	}
+	if len(samples.Steps) < 2 || samples.Steps[0].With["ref"] != tested ||
+		samples.Steps[1].With["ref"] != base || samples.Steps[1].With["path"] != ".tmp/base" {
+		t.Fatal("sampling must check out the scope job's tested merge and actual baseline")
+	}
+	for _, step := range samples.Steps {
+		switch step.Name {
+		case "Load benchmark batch":
+			if step.Env["BASE_SHA"] != base || step.Env["TESTED_SHA"] != tested {
+				t.Error("sample archive and plan must be bound to the same revisions")
+			}
+		case "Enforce performance baseline":
+			if step.Env["BASE_SHA"] != base {
+				t.Errorf("approvals still use %q", step.Env["BASE_SHA"])
+			}
+		}
+	}
+}
+
+func performanceGitFixture(t *testing.T) qualityFixture {
+	t.Helper()
+	fixture := newQualityFixture(t)
+	for _, tool := range []string{"git", "mkdir", "cat", "grep", "cmp", "cp", "tar"} {
+		path, err := exec.LookPath(tool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.write(t, "bin/"+tool, "#!/bin/sh\nexec "+shellQualityQuote(path)+" \"$@\"\n")
+	}
+	if output, _, err := fixture.run(t, performanceGitGraph); err != nil {
+		t.Fatalf("prepare fixture Git history: %v\n%s", err, output)
+	}
+	return fixture
+}
+
+func TestPerformanceSamplesRejectMismatchedRevisions(t *testing.T) {
+	script := performanceStep(t, "performance-samples", "Load benchmark batch")
+	fixture := performanceGitFixture(t)
+	prepare := performanceReadGitGraph + "git update-ref --no-deref HEAD \"$merge\"\ngit clone -q --no-checkout . .tmp/base\n"
+	if output, _, err := fixture.run(t, prepare); err != nil {
+		t.Fatalf("prepare sample checkout: %v\n%s", err, output)
+	}
+	fixture.tool(t, "gh", `set -eu
+test "$*" = "run download fixture-run --name fixture-plan --dir .tmp/plan"
+mkdir -p .tmp/plan/benchmark-plan
+printf 'base_sha=%s\ntested_sha=%s\n' "$RECEIPT_BASE" "$TESTED_SHA" > .tmp/plan/benchmark-revisions.txt
+printf 'fixture batch\n' > .tmp/plan/benchmark-plan/shard-01.tsv
+printf 'fixture expectations\n' > .tmp/plan/benchmark-plan/shard-01.json
+`, false)
+	for _, test := range []struct {
+		name, checkedBase, event, receiptBase string
+		load                                  bool
+		valid                                 bool
+	}{
+		{"stale-checkout", "event_base", "merge", "actual_base", false, false},
+		{"wrong-event-commit", "actual_base", "pr_head", "actual_base", false, false},
+		{"stale-plan", "actual_base", "merge", "event_base", true, false},
+		{"exact", "actual_base", "merge", "actual_base", true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			prefix := performanceReadGitGraph + fmt.Sprintf(
+				": > \"$QUALITY_LOG\"\ngit -C .tmp/base update-ref --no-deref HEAD \"$%s\"\n"+
+					"export RUN_ID=fixture-run PLAN_ARTIFACT=fixture-plan SHARD=01 BASE_SHA=\"$actual_base\" "+
+					"TESTED_SHA=\"$merge\" GITHUB_SHA=\"$%s\" RECEIPT_BASE=\"$%s\"\n",
+				test.checkedBase, test.event, test.receiptBase,
+			)
+			output, log, err := fixture.run(t, prefix+script)
+			if (err == nil) != test.valid || strings.Contains(log, "gh run download") != test.load {
+				t.Fatalf("valid=%v fetch=%v err=%v\n%s\n%s", test.valid, test.load, err, output, log)
+			}
+			source := filepath.Join(string(fixture), ".tmp", "head", "merge-source.txt")
+			if test.valid {
+				if got := readQualityFile(t, source); got != "synthetic tree\n" {
+					t.Fatalf("sample archive = %q, want the tested merge's source", got)
+				}
+			} else if _, err := os.Stat(source); !os.IsNotExist(err) {
+				t.Fatalf("sample extraction after rejecting revisions: %v", err)
+			}
+		})
+	}
 }

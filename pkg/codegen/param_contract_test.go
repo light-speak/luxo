@@ -338,6 +338,36 @@ func TestScopes(t *testing.T){
 `, StableIDs{})
 }
 
+func TestGeneratedDestructuredEmptyListBindings(t *testing.T) {
+	runGeneratedFixture(t, `
+fn emptyCopies(): Int {
+ val (left, right) = []
+ return left.size() + right.size()
+}
+fn emptyShadow(values: [Int]): Int {
+ var total = values.size()
+ if true {
+  val (values, copy) = []
+  total += values.size() + copy.size()
+ }
+ return total + values.size()
+}
+fn emptyDiscard(): Int {
+ val (_, values, _) = []
+ return values.size()
+}
+`, `package generated
+import "testing"
+
+func TestDestructuredEmptyListValues(t *testing.T) {
+ app:=&App{}
+ if value,err:=app.emptyCopies(t.Context());err!=nil||value!=0{t.Fatal("copies",value,err)}
+ if value,err:=app.emptyShadow(t.Context(),[]int64{1,2,3});err!=nil||value!=6{t.Fatal("shadow",value,err)}
+ if value,err:=app.emptyDiscard(t.Context());err!=nil||value!=0{t.Fatal("discard",value,err)}
+}
+`, StableIDs{})
+}
+
 func TestGeneratedLocalRuntimeNames(t *testing.T) {
 	runGeneratedFixture(t, `
 fn localNames(): Int { val ctx = 10 val err = 7 return ctx + err }
