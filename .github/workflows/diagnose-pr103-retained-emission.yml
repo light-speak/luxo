@@ -1,0 +1,54 @@
+name: Compare PR 103 retained emitter changes on native Linux
+
+on:
+  push:
+    branches: [diagnostics/pr103-retained-emission]
+    paths:
+      - .github/workflows/diagnose-pr103-retained-emission.yml
+      - .github/qualification/pr103-retained-emission.patch.b64
+      - scripts/diagnose-pr103-retained-emission.sh
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr103-retained-emission'
+    name: compare (${{ matrix.scope }})
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [intel, amd]
+    runs-on: ubuntu-latest
+    timeout-minutes: 32
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the exact comparison inputs
+        run: >-
+          git fetch --no-tags origin
+          ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+          7d73e6896b8348a97ec79f869e4a7966c7238dda
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Compare default binaries on the actual runner model
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: 1
+          MEASUREMENT_SCOPE: ${{ matrix.scope }}
+        run: bash scripts/diagnose-pr103-retained-emission.sh "$MEASUREMENT_SCOPE"
+      - name: Preserve the exact sources, gates, and raw samples
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr103-retained-emission-${{ matrix.scope }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr103-retained-emission-${{ matrix.scope }}/
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: true
