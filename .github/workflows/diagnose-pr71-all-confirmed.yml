@@ -1,0 +1,53 @@
+name: Diagnose all confirmed PR 71 performance leaves
+
+on:
+  push:
+    branches: [diagnostics/pr71-all-confirmed]
+    paths:
+      - .github/workflows/diagnose-pr71-all-confirmed.yml
+      - scripts/diagnose-pr71-all-confirmed.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnose-pr71-all-confirmed-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr71-all-confirmed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the two exact source parents
+        run: >-
+          git fetch --no-tags origin
+          ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+          ec041a07b105c9caf9e327a2cbf73de772582d00
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Compare locked fixtures on one native runner
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: 1
+        run: bash scripts/diagnose-pr71-all-confirmed.sh run
+      - name: Preserve source bindings and both complete sample groups
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: hosted-pr71-all-confirmed-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr71-all-confirmed/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove owned evidence after upload
+        if: always()
+        run: rm -rf -- .tmp/hosted-pr71-all-confirmed
