@@ -1,0 +1,43 @@
+package luvia
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"testing"
+
+	"github.com/light-speak/luxo/pkg/lux/auth"
+)
+
+func BenchmarkDiagnosticGatewayAuthHeaders(b *testing.B) {
+	cfg := testCfg()
+	token, err := auth.Sign(cfg, testClaimsJSON(`{"id":42}`))
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, sample := range []struct {
+		name   string
+		header http.Header
+		want   string
+	}{
+		{"ordinary-nonempty", http.Header{"Accept": {"application/json"}}, ""},
+		{"websocket-query", http.Header{"Connection": {"keep-alive, Upgrade"}, "Upgrade": {"websocket"}}, token},
+		{"repeated-authorization", http.Header{"Authorization": {"Bearer " + token, "Bearer invalid"}}, token},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			request := httptest.NewRequest(http.MethodGet, "/luvia?token="+url.QueryEscape(token), nil)
+			request.Header = sample.header
+			handler := AuthMiddleware(cfg, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				middlewareIdentitySink, middlewareTokenSink = Identity(r.Context()), BearerToken(r.Context())
+			}))
+			handler.ServeHTTP(nil, request)
+			if middlewareTokenSink != sample.want || (middlewareIdentitySink != nil) != (sample.want != "") {
+				b.Fatal("unexpected authorization result")
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				handler.ServeHTTP(nil, request)
+			}
+		})
+	}
+}

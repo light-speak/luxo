@@ -1,0 +1,58 @@
+name: Qualify PR 78 and PR 79 empty Header routing
+
+on:
+  push:
+    branches: [diagnostics/pr78-pr79-empty-header]
+    paths:
+      - .github/workflows/diagnose-pr78-pr79-empty-header.yml
+      - .github/qualification/pr78-pr79-empty-header.patch.b64
+      - scripts/diagnose-pr78-pr79-empty-header.*
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-pr78-pr79-empty-header
+  cancel-in-progress: false
+
+jobs:
+  qualification:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr78-pr79-empty-header'
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [pr78, pr79]
+    runs-on: ubuntu-latest
+    timeout-minutes: 28
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch exact product and diagnostic revisions
+        run: >-
+          git fetch --no-tags origin
+          ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+          397af9c8c6fc6dc807e1dbcbe2e05d8913f58944
+          e04c586e491b8b215308d10f7228636e38547f5b
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Measure both release projections and the empty Header change on the same runner
+        env:
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+        run: bash scripts/diagnose-pr78-pr79-empty-header.sh '${{ matrix.suite }}'
+      - name: Preserve native compilation, complete sample groups and separate verdicts
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: hosted-empty-header-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-empty-header-${{ matrix.suite }}/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove uploaded evidence from the runner
+        if: always()
+        run: rm -rf -- '.tmp/hosted-empty-header-${{ matrix.suite }}'
