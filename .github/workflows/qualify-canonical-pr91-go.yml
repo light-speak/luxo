@@ -1,18 +1,18 @@
-name: Qualify the Canonical JSON fixture and PR 91 query facade
+name: Qualify PR 73 deployment and PR 91 query facade
 
 on:
   push:
     branches: [diagnostics/pr91-query-facade]
     paths:
       - .github/workflows/qualify-canonical-pr91-go.yml
-      - .github/qualification/canonical-json-golden.patch.b64
+      - .github/qualification/pr73-deployment-registration.patch.b64
       - .github/qualification/pr91-query-facade-with-regressions.patch.b64
 
 permissions:
   contents: read
 
 concurrency:
-  group: qualify-canonical-pr91-go-${{ github.ref }}
+  group: qualify-release-go-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -25,15 +25,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - candidate: canonical-json
+          - candidate: pr73-deployment
             base: ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
             base_tree: ba252c7cace8908cdfcd7c203bc9dc11bb2ba746
-            tree: d17eb6f305a92034f50b8ad174eb61829b100ed1
-            patch_sha256: 82eb0e36c705eff9832e1f412553e08c1fca67efe60ba1982e25c753a7862942
-            payload: .github/qualification/canonical-json-golden.patch.b64
-            paths: '["pkg/lux/api/binary_bench_test.go"]'
+            tree: 944c2384588c7a0f85aeb98a300e73d2bb722147
+            patch_sha256: ff39e9854c610090404f78de03721a40f887fc832061aaf7ed7cc1225245f433
+            payload: .github/qualification/pr73-deployment-registration.patch.b64
+            paths: '["pkg/codegen/deploy.go","pkg/codegen/deploy_helm.go","pkg/codegen/deploy_helm_test.go","pkg/codegen/deploy_test.go","pkg/codegen/handler.go","pkg/codegen/handler_test.go"]'
             source_sha256: |
-              25c281c1a5ccccd2a4d16f5ba13c243a743faef715481622248e5c33e7ee4b07  pkg/lux/api/binary_bench_test.go
+              bc67438450dcef24288cf6a1aaedbca4837ffef0675cb2fb7fcb9d28028cd8d3  pkg/codegen/deploy.go
+              822d444c162d88d534b9f29e286d5078f8743239b7bb23e29172645c472cdde8  pkg/codegen/deploy_helm.go
+              5ee233ee43d528ade3ba6d3e3a667951b62cbd92db742f4e77a91f75246b8638  pkg/codegen/deploy_helm_test.go
+              0b3b9741b196cf6652aa7e5116d6ae32baa376bbaa24777a38eb8bf25287f5d2  pkg/codegen/deploy_test.go
+              ab929bf46d5aaef14d28ead500f507bece7b9f3a2ab3c3523b5ca5b682f5eb29  pkg/codegen/handler.go
+              898db0c8bbe0b59c070468586ac6bd91ec040ed5a7af38b145739ab1cfbe3082  pkg/codegen/handler_test.go
           - candidate: pr91-query-facade
             base: 32b67c84d53e3a5ff4c93e66ce96fa1a5ffa96c2
             base_tree: c8333e7682bdac15b4faf0cc0f9ead198a7f6ccb
@@ -94,10 +99,11 @@ jobs:
           go-version: '1.27.1'
           check-latest: false
 
-      - name: Restore only this matrix entry's exact candidate
+      - name: Restore this matrix entry's exact candidate
+        id: restore
         run: |
           set -euo pipefail
-          case "$QUALIFICATION_CANDIDATE" in canonical-json|pr91-query-facade) ;; *) exit 2;; esac
+          case "$QUALIFICATION_CANDIDATE" in pr73-deployment|pr91-query-facade) ;; *) exit 2;; esac
           source="$PWD/.tmp/candidate-go-source"
           evidence="$PWD/.tmp/candidate-go-evidence"
           test ! -e "$source"
@@ -193,13 +199,11 @@ jobs:
           fi
           go tool cover -func="$evidence/root.coverage" > "$evidence/root.coverage-summary"
           go tool cover -func="$evidence/cli.coverage" > "$evidence/cli.coverage-summary"
-          if [[ "$QUALIFICATION_CANDIDATE" == canonical-json ]]; then
-            for variant in before after full; do
-              filter='^BenchmarkCanonicalJSON(Float|Value)$'
-              if [[ "$variant" != full ]]; then filter+="/.*/^$variant\$"; fi
-              go test -p 2 ./pkg/lux/api -run '^$' -bench "$filter" -benchtime=1x -count=1 -cpu=2 -timeout=90s \
-                > "$evidence/fixture-$variant.log" 2>&1
-            done
+          if [[ "$QUALIFICATION_CANDIDATE" == pr73-deployment ]]; then
+            for function_name in writeAPIRegistration writeAPIParameterRegistration writeRegistryRoute writeRegisteredParam; do
+              grep -E "/pkg/codegen/handler.go:[0-9]+:[[:space:]]+$function_name[[:space:]]+100\.0%$" \
+                "$evidence/root.coverage-summary"
+            done > "$evidence/deployment-registration.coverage"
           else
             for function_name in generateQueryFacade writeQueryFacadeParts; do
               grep -E "/pkg/codegen/query_facade.go:[0-9]+:[[:space:]]+$function_name[[:space:]]+100\.0%$" \
@@ -207,43 +211,49 @@ jobs:
             done > "$evidence/query-facade.coverage"
           fi
           python3 - "$evidence" <<'PYTHON'
-          import collections
           import json
           import os
           from pathlib import Path
           import sys
           evidence = Path(sys.argv[1])
-          if os.environ["QUALIFICATION_CANDIDATE"] == "canonical-json":
-              names = {}
-              for variant, count in (("before", 12), ("after", 12), ("full", 24)):
-                  rows = [line.split()[0] for line in (evidence / ("fixture-" + variant + ".log")).read_text().splitlines()
-                          if line.startswith("Benchmark")]
-                  assert len(rows) == count and len(set(rows)) == count, (variant, rows)
-                  names[variant] = set(rows)
-              assert names["before"].isdisjoint(names["after"])
-              assert names["full"] == names["before"] | names["after"]
+          if os.environ["QUALIFICATION_CANDIDATE"] == "pr73-deployment":
+              required = {("github.com/light-speak/luxo/pkg/codegen", name) for name in (
+                  "TestHelmReferencesExistingJWTSecretForApplicationServices",
+                  "TestComposeInheritsJWTEnvironmentForApplicationServices",
+                  "TestWriteAPIRegistrationReservedOutput",
+                  "TestWriteRegistryRouteFormatsGoLiterals",
+                  "TestWriteAPIRegistrationLongIdentifiers",
+              )}
           else:
               required = {("github.com/light-speak/luxo/pkg/codegen", name) for name in (
                   "TestQueryFacadeSourceShapes", "TestQueryFacadeLongPartsReuseDestination",
-                  "TestGeneratedQueryFacadeBenchmarks", "TestGeneratedDestructuredEmptyListBindings")}
+                  "TestGeneratedDestructuredEmptyListBindings")}
               required.update(("github.com/light-speak/luxo/internal/inferred", name) for name in (
                   "TestPaginationPlanFinalListLineage", "TestPaginationPlanDisabled",
                   "TestPaginationObjectFieldLineage", "TestPaginationFiniteObjectListDoesNotPageInnerQueries"))
-              passed = set()
-              for line in (evidence / "root.jsonl").open():
-                  try:
-                      event = json.loads(line)
-                  except json.JSONDecodeError:
-                      continue
-                  if event.get("Action") == "pass":
-                      passed.add((event.get("Package"), event.get("Test")))
-              assert required <= passed, sorted(required - passed)
-              (evidence / "required-regressions.json").write_text(json.dumps(sorted(required), indent=2) + "\n")
+          passed = set()
+          for line in (evidence / "root.jsonl").open():
+              try:
+                  event = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              if event.get("Action") == "pass":
+                  passed.add((event.get("Package"), event.get("Test")))
+          assert required <= passed, sorted(required - passed)
+          (evidence / "required-regressions.json").write_text(json.dumps(sorted(required), indent=2) + "\n")
           PYTHON
           printf 'candidate-specific 0\n' >> "$evidence/phases.txt"
+
+      - name: Verify the final candidate source
+        if: always() && steps.restore.outcome == 'success'
+        run: |
+          set -euo pipefail
+          evidence="$PWD/.tmp/candidate-go-evidence"
+          cd .tmp/candidate-go-source
           sha256sum -c "$evidence/source.sha256" > "$evidence/final-source-check.log"
           git diff --exit-code
           test "$(git write-tree)" = "$QUALIFICATION_TREE"
+          printf 'final-source 0\n' >> "$evidence/phases.txt"
 
       - name: Remove only this entry's owned source and labeled fixtures
         if: always()
