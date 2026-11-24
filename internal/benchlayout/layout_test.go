@@ -115,3 +115,21 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		}
 	}
 }
+
+func TestCodegenLiteralProfileRequiresPackageAndExactRoot(t *testing.T) {
+	for _, tc := range []struct{ pkg, name, want string }{
+		{CodegenPackage, CodegenLiteralBenchmark, CodegenLiteralProfile},
+		{CodegenPackage, CodegenLiteralBenchmark + "/duration_plain-2", CodegenLiteralProfile},
+		{CodegenPackage, "BenchmarkGenerateNumericLiteralBindings/plain-2", DefaultProfile},
+		{CodecPackage, CodegenLiteralBenchmark, DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	profile, filter := IsolationProfile(CodegenPackage)
+	if profile != CodegenLiteralProfile || filter != "^"+CodegenLiteralBenchmark+"$" ||
+		ValidPerformanceProfile(CodecPackage, CodegenLiteralProfile) {
+		t.Fatalf("unexpected codegen isolation: %q %q", profile, filter)
+	}
+}

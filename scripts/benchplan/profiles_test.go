@@ -140,3 +140,51 @@ func TestAPIAndLuviaIsolatedInventoriesMatchOnlyRoutedRoots(t *testing.T) {
 		})
 	}
 }
+
+func TestCodegenLiteralProfileKeepsExactlyFourLeaves(t *testing.T) {
+	const pkg = "pkg/codegen"
+	const profile = "codegen-integer-literals"
+	const literals = "BenchmarkCompileDecimalIntegerLiterals"
+	const other = "BenchmarkGenerateNumericLiteralBindings"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	const ordinaryBenchmark = other + "/plain" + measurement
+	const restricted = literals + "/duration_leading_zero" + measurement +
+		literals + "/duration_plain" + measurement + literals + "/int_leading_zero" + measurement +
+		literals + "/int_plain" + measurement
+	const extra = literals + "/unverified" + measurement
+	substituted := strings.Replace(restricted, literals+"/duration_plain"+measurement, extra, 1)
+	wrongCPU := strings.ReplaceAll(restricted, "-2 1 3", "-4 1 3")
+	root := benchmarkTempDir(t)
+	ordinary, isolated := root+"/ordinary.log", root+"/isolated.log"
+	args := []string{"--verify-profile-inventory", pkg, profile, ordinary, isolated}
+	for _, tc := range []struct {
+		name, ordinary, isolated string
+		valid                    bool
+	}{
+		{"exact", restricted, restricted, true},
+		{"missing on isolated", restricted, literals + "/int_plain" + measurement, false},
+		{"extra on both", restricted + extra, restricted + extra, false},
+		{"unverified replacement on both", substituted, substituted, false},
+		{"wrong CPU suffix", wrongCPU, wrongCPU, false},
+		{"unrelated root", restricted, restricted + ordinaryBenchmark, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+ordinaryBenchmark+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			if err := run(args, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("literal inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+	primary := formatShard(benchShard{Groups: []benchGroup{{Package: pkg, Name: literals}, {Package: pkg, Name: other}}})
+	confirmation := formatConfirmationBatch([]sampleKey{{pkg, literals + "/duration_plain-2"}, {pkg, other + "/plain-2"}})
+	for _, tc := range []struct{ batch, selected, sibling string }{
+		{primary, "^(" + literals + ")$", "^(" + other + ")$"},
+		{confirmation, "^" + literals + "$/^duration_plain$", "^" + other + "$/^plain$"},
+	} {
+		if !strings.Contains(tc.batch, pkg+"\t"+profile+"\t"+tc.selected+"\n") ||
+			!strings.Contains(tc.batch, pkg+"\tdefault\t"+tc.sibling+"\n") {
+			t.Fatalf("literal profile routes the wrong benchmarks:\n%s", tc.batch)
+		}
+	}
+}
