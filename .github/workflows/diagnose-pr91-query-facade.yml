@@ -1,0 +1,45 @@
+name: Verify the query facade optimization on native Linux
+
+on:
+  push:
+    branches: [diagnostics/pr91-query-facade]
+    paths:
+      - .github/workflows/diagnose-pr91-query-facade.yml
+      - .github/qualification/pr91-query-facade.patch.b64
+      - .github/qualification/pr91-query-facade-long.go.txt
+      - scripts/diagnose-pr91-query-facade.sh
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr91-query-facade'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+      - name: Fetch exact baseline and PR head
+        run: |
+          git fetch --no-tags origin \
+            ca818da9bf89e82dc6f5bd2f539e4dfdd576a801 \
+            32b67c84d53e3a5ff4c93e66ce96fa1a5ffa96c2 \
+            61521c06948d6f4cdf04cd94abb6a19fdd2c5ac7
+      - name: Compare A/A, A/H, and A/P on the original thresholds
+        run: bash scripts/diagnose-pr91-query-facade.sh
+      - name: Preserve exact source binding, allocation and timings
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr91-query-facade-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr91-query-facade-evidence/
+          retention-days: 14
+          if-no-files-found: error
+          include-hidden-files: true

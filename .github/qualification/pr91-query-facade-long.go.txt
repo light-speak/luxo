@@ -1,0 +1,61 @@
+package codegen
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/light-speak/luxo/pkg/ast"
+)
+
+type facadeFixtureShape struct {
+	name     string
+	decimal  bool
+	writable bool
+}
+
+func (shape facadeFixtureShape) fields() []*ast.FieldDecl {
+	valueType := "Int"
+	if shape.decimal {
+		valueType = "Decimal"
+	}
+	return []*ast.FieldDecl{
+		testField("id", "Int", directive("id")),
+		{Name: "legacy"},
+		testField("value", valueType),
+	}
+}
+
+func facadeFixtureShapes() []facadeFixtureShape {
+	return []facadeFixtureShape{
+		{"R", false, false}, {"User", false, true},
+		{"Report", true, false}, {"Invoice", true, true},
+		{"A" + strings.Repeat("a", 256), false, false},
+		{"B" + strings.Repeat("b", 256), false, true},
+		{"C" + strings.Repeat("c", 319), true, false},
+		{"D" + strings.Repeat("d", 319), true, true},
+	}
+}
+
+func BenchmarkQueryFacadeLongIdentifier(b *testing.B) {
+	for _, shape := range []struct {
+		label string
+		value facadeFixtureShape
+	}{
+		{"RegularReadOnly", facadeFixtureShapes()[4]},
+		{"RegularWritable", facadeFixtureShapes()[5]},
+		{"DecimalReadOnly", facadeFixtureShapes()[6]},
+		{"DecimalWritable", facadeFixtureShapes()[7]},
+	} {
+		b.Run(shape.label, func(b *testing.B) {
+			fields := shape.value.fields()
+			b.ReportAllocs()
+			for b.Loop() {
+				var output strings.Builder
+				defaultGenerator().generateQueryFacade(&output, shape.value.name, fields, shape.value.writable)
+				if output.Len() == 0 {
+					b.Fatal("missing query facade")
+				}
+			}
+		})
+	}
+}
