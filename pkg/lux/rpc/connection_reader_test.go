@@ -32,6 +32,11 @@ func testConnectionReader(t *testing.T, router *api.Router) (*connectionReader, 
 }
 
 func TestConnectionReaderKeepsInFlightPayloadOwned(t *testing.T) {
+	synctest.Test(t, exerciseConnectionReaderKeepsInFlightPayloadOwned)
+}
+
+func exerciseConnectionReaderKeepsInFlightPayloadOwned(t *testing.T) {
+	t.Helper()
 	router := api.NewRouter()
 	if err := router.Registry.Register("echo", 1); err != nil {
 		t.Fatal(err)
@@ -59,7 +64,7 @@ func TestConnectionReaderKeepsInFlightPayloadOwned(t *testing.T) {
 		req.Buf.B = append(req.Buf.B, req.BinaryRequest()...)
 		return nil
 	})
-	_, peer := testConnectionReader(t, router)
+	reader, peer := testConnectionReader(t, router)
 	bodies := make([][]byte, 2)
 	for i := range 2 {
 		bodies[i] = encodeCallRequest(1, nil, mustEncodeParams(t, ParamField{FieldID: 1, Value: int64(i + 1)}))
@@ -74,6 +79,13 @@ func TestConnectionReaderKeepsInFlightPayloadOwned(t *testing.T) {
 	}
 	if err := WriteFrame(peer, encodeRequestEnvelope(requestKindCall, "", bodies[1])); err != nil {
 		t.Fatal(err)
+	}
+	synctest.Wait()
+	reader.mu.Lock()
+	queued := reader.queued
+	reader.mu.Unlock()
+	if !queued {
+		t.Fatal("second request was not queued while the first request owned its payload")
 	}
 	close(release)
 	for _, body := range bodies {

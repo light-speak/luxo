@@ -34,6 +34,15 @@ func run(args []string, output io.Writer) error {
 	if len(args) > 0 && args[0] == "--confirmation-plan" {
 		return writeConfirmationPlan(args)
 	}
+	if len(args) > 0 && args[0] == "--verify-equal-inventories" {
+		return verifyEqualInventories(args)
+	}
+	if len(args) > 0 && args[0] == "--verify-profile-inventory" {
+		return verifyProfileInventory(args)
+	}
+	if len(args) > 0 && args[0] == "--verify-profile-batch" {
+		return verifyProfileBatch(args)
+	}
 	if len(args) != 3 {
 		return errors.New("usage: benchplan <packages.txt> <inventory-dir> <output-dir>")
 	}
@@ -118,19 +127,13 @@ func writePlans(root string, shards []benchShard) error {
 }
 
 func formatShard(shard benchShard) string {
-	packages := make(map[string][]string)
+	batches := make(map[benchmarkProfile][]string)
 	for _, group := range shard.Groups {
-		packages[group.Package] = append(packages[group.Package], regexp.QuoteMeta(group.Name))
+		key := profileFor(group.Package, group.Name)
+		batches[key] = append(batches[key], regexp.QuoteMeta(group.Name))
 	}
-	names := make([]string, 0, len(packages))
-	for name := range packages {
-		names = append(names, name)
+	for _, names := range batches {
+		slices.Sort(names)
 	}
-	slices.Sort(names)
-	var result strings.Builder
-	for _, name := range names {
-		slices.Sort(packages[name])
-		fmt.Fprintf(&result, "%s\t^(%s)$\n", name, strings.Join(packages[name], "|"))
-	}
-	return result.String()
+	return formatBatches(batches, "^(", ")$")
 }

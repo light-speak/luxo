@@ -71,26 +71,89 @@ func TestArrayHeaderWriteCapacity(t *testing.T) {
 			return encoder.Bytes(), err
 		}},
 	}
-	const prefixLength = 2
+	reference := func(dst []byte, count int) ([]byte, error) {
+		return AppendVarint(dst, uint64(count)), nil
+	}
 	for _, writer := range writers {
 		t.Run(writer.name, func(t *testing.T) {
-			for _, count := range []int{0, 127, 128, 16383, 16384, MaxArrayElements} {
-				want := binary.AppendUvarint([]byte{0xa5, 0xa5}, uint64(count))
-				for spare := 0; spare <= len(want)-prefixLength+1; spare++ {
-					original := bytes.Repeat([]byte{0xa5}, prefixLength+spare)
-					referenceBacking := make([]byte, len(original))
-					copy(referenceBacking, original)
-					reference := AppendVarint(referenceBacking[:prefixLength], uint64(count))
+			testArrayHeaderWriteCapacity(t, writer.write, reference)
+		})
+	}
+}
 
-					got, err := writer.write(original[:prefixLength:len(original)], count)
-					if err != nil || !bytes.Equal(got, want) || cap(got) != cap(reference) ||
-						(&got[0] == &original[0]) != (&reference[0] == &referenceBacking[0]) ||
-						!bytes.Equal(original, referenceBacking) {
-						t.Fatalf("count %d, spare %d: got %x with capacity %d, want %x with capacity %d, error %v",
-							count, spare, got, cap(got), want, cap(reference), err)
-					}
+// Both writers cross the same call boundary so empty-buffer growth has the same escape context.
+func testArrayHeaderWriteCapacity(t *testing.T, write, reference func([]byte, int) ([]byte, error)) {
+	t.Helper()
+	for _, prefixLength := range []int{0, 1, 2, 7, 8, 255, 256, 1024} {
+		for _, count := range []int{0, 1, 127, 128, 129, 16383, 16384, 16385, MaxArrayElements - 1, MaxArrayElements} {
+			want := binary.AppendUvarint(bytes.Repeat([]byte{0xa5}, prefixLength), uint64(count))
+			for spare := 0; spare <= len(want)-prefixLength+1; spare++ {
+				original := bytes.Repeat([]byte{0xa5}, prefixLength+spare)
+				referenceBacking := bytes.Clone(original)
+				expected, referenceErr := reference(referenceBacking[:prefixLength:len(referenceBacking)], count)
+				got, err := write(original[:prefixLength:len(original)], count)
+				reused, referenceReused := false, false
+				if len(original) != 0 {
+					reused = &got[0] == &original[0]
+					referenceReused = &expected[0] == &referenceBacking[0]
+				}
+				if err != nil || referenceErr != nil || !bytes.Equal(got, want) || cap(got) != cap(expected) ||
+					reused != referenceReused || !bytes.Equal(original, referenceBacking) {
+					t.Fatalf("prefix %d, count %d, spare %d: got %x with capacity %d, want %x with capacity %d, error %v",
+						prefixLength, count, spare, got, cap(got), want, cap(expected), err)
 				}
 			}
+		}
+	}
+}
+
+func TestArrayHeaderRejectsEmptyDestinationsWithoutMutation(t *testing.T) {
+	for _, write := range []func([]byte, int) ([]byte, error){
+		AppendArrayHeader,
+		func(dst []byte, count int) ([]byte, error) {
+			encoder := NewEncoder(dst)
+			err := encoder.WriteArrayHeader(count)
+			return encoder.Bytes(), err
+		},
+	} {
+		for _, count := range []int{-1, -int(^uint(0)>>1) - 1, MaxArrayElements + 1, int(^uint(0) >> 1)} {
+			for _, destination := range [][]byte{nil, {}, make([]byte, 0, 4)} {
+				backing := destination[:cap(destination)]
+				for index := range backing {
+					backing[index] = 0xa5
+				}
+				before := bytes.Clone(backing)
+				got, err := write(destination, count)
+				if err != ErrInvalidArrayCount || len(got) != len(destination) || cap(got) != cap(destination) ||
+					(got == nil) != (destination == nil) || !bytes.Equal(backing, before) {
+					t.Fatal("invalid count replaced or changed an empty destination", count, got, err)
+				}
+				if cap(got) != 0 && &got[:cap(got)][0] != &backing[0] {
+					t.Fatal("invalid count replaced the original backing array", count)
+				}
+			}
+		}
+	}
+}
+
+func TestArrayHeaderPreallocatedWritesDoNotAllocate(t *testing.T) {
+	for _, count := range []int{0, 127, 128, 16383, 16384, MaxArrayElements} {
+		buffer := make([]byte, 0, 16)
+		var got []byte
+		var failure error
+		allocations := testing.AllocsPerRun(100, func() {
+			got, failure = AppendArrayHeader(buffer[:0], count)
 		})
+		if allocations != 0 || failure != nil || len(got) == 0 {
+			t.Fatal("preallocated append allocated or failed", count, allocations, failure)
+		}
+		encoder := NewEncoder(buffer[:0])
+		allocations = testing.AllocsPerRun(100, func() {
+			encoder.Reset()
+			failure = encoder.WriteArrayHeader(count)
+		})
+		if allocations != 0 || failure != nil || len(encoder.Bytes()) == 0 {
+			t.Fatal("preallocated encoder allocated or failed", count, allocations, failure)
+		}
 	}
 }

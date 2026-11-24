@@ -25,7 +25,7 @@ func TestConfirmationPlanWritesOnlyPairedLeaves(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(batch)
-	if err != nil || string(got) != "pkg/a\t^BenchmarkRead$/^a\\+b$\npkg/z\t^BenchmarkWrite$\n" {
+	if err != nil || string(got) != "pkg/a\tdefault\t^BenchmarkRead$/^a\\+b$\npkg/z\tdefault\t^BenchmarkWrite$\n" {
 		t.Fatalf("confirmation batch = %q, %v", got, err)
 	}
 	sample := filepath.Join(root, "sample.txt")
@@ -119,7 +119,7 @@ func TestConfirmationFilterRunsOnlySelectedNestedBenchmarks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, filter, _ := strings.Cut(strings.TrimSpace(string(plan)), "\t")
+	_, filter, _ := strings.Cut(strings.TrimSpace(string(plan)), "\tdefault\t")
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -188,7 +188,7 @@ func TestRunWritesReproduciblePlans(t *testing.T) {
 	}
 	for _, item := range []struct{ id, pkg string }{{"01", "a"}, {"02", "b"}} {
 		plan, err := os.ReadFile(filepath.Join(destination, "shard-"+item.id+".tsv"))
-		if err != nil || string(plan) != "pkg/"+item.pkg+"\t^(BenchmarkRead)$\n" {
+		if err != nil || string(plan) != "pkg/"+item.pkg+"\tdefault\t^(BenchmarkRead)$\n" {
 			t.Fatalf("plan=%s err=%v", plan, err)
 		}
 		samplePath := filepath.Join(root, "samples.txt")
@@ -377,4 +377,40 @@ func benchmarkTempDir(t *testing.T) string {
 		}
 	})
 	return dir
+}
+
+func TestVerifyEqualInventoriesKeepsEveryLeaf(t *testing.T) {
+	t.Parallel()
+	const original = "BenchmarkRead/int-2 1 12 ns/op 8 B/op 1 allocs/op\n" +
+		"BenchmarkRead/float-2 1 20 ns/op 8 B/op 1 allocs/op\nPASS\n"
+	tests := map[string]string{
+		"identical":      original,
+		"missing leaf":   strings.Replace(original, "BenchmarkRead/float-2 1 20 ns/op 8 B/op 1 allocs/op\n", "", 1),
+		"renamed leaf":   strings.Replace(original, "/float-2", "/ptr-2", 1),
+		"extra leaf":     "BenchmarkRead/extra-2 1 3 ns/op 0 B/op 0 allocs/op\n" + original,
+		"duplicate leaf": strings.TrimSuffix(original, "PASS\n") + original,
+		"unfinished":     strings.TrimSuffix(original, "PASS\n"),
+	}
+	for name, actual := range tests {
+		t.Run(name, func(t *testing.T) {
+			root := benchmarkTempDir(t)
+			first, second := filepath.Join(root, "normal"), filepath.Join(root, "performance")
+			writeFixture(t, first, original)
+			writeFixture(t, second, actual)
+			if err := run([]string{"--verify-equal-inventories", first, second}, io.Discard); (err == nil) != (name == "identical") {
+				t.Fatalf("unexpected inventory verdict: %v", err)
+			}
+		})
+	}
+}
+
+func TestVerifyEqualInventoriesReportsInvalidArguments(t *testing.T) {
+	t.Parallel()
+	if err := run([]string{"--verify-equal-inventories"}, io.Discard); err == nil || !strings.HasPrefix(err.Error(), "usage: ") {
+		t.Fatalf("wrong argument count returned %v", err)
+	}
+	missing := filepath.Join(benchmarkTempDir(t), "missing")
+	if err := run([]string{"--verify-equal-inventories", missing, missing}, io.Discard); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing inventory returned %v", err)
+	}
 }
