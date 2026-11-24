@@ -13,7 +13,7 @@ jobs:
   match:
     if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/native-cpu-match'
     runs-on: ubuntu-latest
-    timeout-minutes: 32
+    timeout-minutes: 60
     steps:
       - name: Identify the assigned runner before checkout
         id: cpu
@@ -60,6 +60,17 @@ jobs:
               digest=67c6414b54e7410188c0227b7266c30a16c9c0863fea7a1b8433c281feaddb25
               evidence='.tmp/native-cpu-worktree/.tmp/pr72-boxed-json-evidence-r.*/'
               ;;
+            'AMD EPYC 7763 64-CORE PROCESSOR')
+              suite=pr91-receiver-only
+              diagnostic=4afba3abe78bd692edcda4daa9dfc1034311cec7
+              tree=95bbced3a21965379d000a2903196c52622cdb40
+              base=ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+              head=679921d60ff6c03ba14c2e8ded529a1dd0dd7723
+              input=pr91-receiver-formal-01.zip
+              artifact=14908597395
+              formal_run=45368483415
+              digest=305dd9410e174043594da33e61b9a9d2fcf937b4617bd32451dee7b23e0234c1
+              ;;
             'INTEL(R) XEON(R) PLATINUM 8573C')
               suite=pr103-short-paths
               diagnostic=4afba3abe78bd692edcda4daa9dfc1034311cec7
@@ -83,11 +94,13 @@ jobs:
           } | tee -a "$receipt/selection.txt" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
+        id: checkout
         with:
           path: native-cpu-dispatch
           fetch-depth: 0
           persist-credentials: false
       - name: Fetch and verify only the selected diagnostic inputs
+        id: primary_inputs
         env:
           GH_TOKEN: ${{ github.token }}
           DIAGNOSTIC: ${{ steps.cpu.outputs.diagnostic }}
@@ -114,6 +127,11 @@ jobs:
             sampler_digest=682270521e905a123429eb78a21980e16e7636b638c695fc35669833f7c9e513
           fi
           printf '%s  %s\n' "$sampler_digest" "$root/$sampler" | sha256sum -c -
+          if [[ "$SUITE" == pr91-receiver-only ]]; then
+            driver="$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr91-receiver-only.sh"
+            printf '%s  %s\n' 395456471e46be4ae0fdb96d3884ba9552465f53789bbb7a99fe12068cfa1eec "$driver" |
+              sha256sum -c - > "$receipt/receiver-driver.txt"
+          fi
           if [[ "$SUITE" == pr72-boxed-json-header-causal ]]; then
             delta="$receipt/header-driver.patch"
             base64 -d "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr72-boxed-json-r/driver-replay.patch.b64" > "$delta"
@@ -133,11 +151,54 @@ jobs:
           gh api "repos/light-speak/luxo/actions/artifacts/$FORMAL_ARTIFACT/zip" > "$root/.tmp/$FORMAL_INPUT"
           (cd "$root/.tmp" && printf '%s  %s\n' "$FORMAL_DIGEST" "$FORMAL_INPUT" | sha256sum -c -) > "$receipt/artifact-digest-check.txt"
       - uses: actions/setup-go@v7
+        id: go
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && (steps.primary_inputs.outcome == 'success' || steps.cpu.outputs.suite == 'pr103-short-paths') }}
         with:
           go-version: '1.27.1'
           check-latest: false
           cache: false
+      - name: Verify the independent Intel GatewayIdentity inputs
+        id: gateway_inputs
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.cpu.outputs.suite == 'pr103-short-paths' }}
+        timeout-minutes: 4
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/.tmp/native-pr74-worktree"
+          diagnostic=3fa4763c7964d531abe3e55d00726a44110c4116
+          tree=793adc83b52b3b65c87c505633dd05942eb70121
+          git -C native-cpu-dispatch fetch --no-tags origin "$diagnostic"
+          git -C native-cpu-dispatch worktree add --detach "$root" "$diagnostic"
+          test "$(git -C "$root" rev-parse HEAD)" = "$diagnostic"
+          test "$(git -C "$root" rev-parse 'HEAD^{tree}')" = "$tree"
+          cd "$root"
+          driver=scripts/diagnose-pr74-gateway-identity.sh
+          sampler=scripts/diagnose-hosted-perf.sh
+          printf '%s  %s\n' 0174ecf8d668749c3cb1b435e452d5d5e2e1737b9d26c9f507c0b2feb7cf3bc0 "$driver" \
+            9e0a5f421f2e76674b819f81074a3d416a51174e0f93b858a63d20c27d64e072 "$sampler" | sha256sum -c -
+          mkdir .tmp
+          bash "$driver" --probe
+          evidence=.tmp/hosted-pr74-gateway-identity
+          grep -Fxq 'match=true' "$evidence/runner.txt"
+          gh api repos/light-speak/luxo/actions/artifacts/14928967579 > "$evidence/formal-metadata.json"
+          jq -e '.id == 14928967579 and .workflow_run.id == 45408776744 and
+            .workflow_run.head_sha == "95555312e542300f7abb51bb0310f5d535b9fe4b" and
+            .digest == "sha256:1d3e94811fea5108524cc479e4810f2b6b21b383c0d02b019a69be9b82b9b3ed" and
+            .expired == false' "$evidence/formal-metadata.json"
+          bash "$driver" --fetch
+      - name: Measure the Intel GatewayIdentity controls before the primary diagnostic
+        if: ${{ !cancelled() && steps.gateway_inputs.outcome == 'success' }}
+        timeout-minutes: 25
+        working-directory: .tmp/native-pr74-worktree
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+        run: bash scripts/diagnose-pr74-gateway-identity.sh
       - name: Run the pinned diagnostic on the same runner
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.primary_inputs.outcome == 'success' }}
+        timeout-minutes: 28
         working-directory: .tmp/native-cpu-worktree
         env:
           SUITE: ${{ steps.cpu.outputs.suite }}
@@ -149,6 +210,9 @@ jobs:
           case "$SUITE" in
             pr72-boxed-json-header-causal)
               exec bash scripts/diagnose-pr72-boxed-json/diagnose-native.sh . r .tmp/pr72-formal-shard-12.zip
+              ;;
+            pr91-receiver-only)
+              exec bash "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr91-receiver-only.sh" . run
               ;;
             pr82-lux-short-path)
               exec bash "scripts/diagnose-$SUITE.sh"
@@ -166,6 +230,17 @@ jobs:
           path: |
             .tmp/native-cpu-selection/
             ${{ steps.cpu.outputs.evidence }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve the independent Intel GatewayIdentity evidence
+        if: ${{ always() && steps.cpu.outputs.suite == 'pr103-short-paths' }}
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: native-pr74-gateway-identity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .tmp/native-cpu-selection/
+            .tmp/native-pr74-worktree/.tmp/hosted-pr74-gateway-identity/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
