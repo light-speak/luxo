@@ -1,0 +1,162 @@
+name: Smoke-test the two isolated codegen benchmark profiles
+
+on:
+  push:
+    branches: [diagnostics/pr91-receiver-profile-smoke]
+    paths: [.github/workflows/diagnose-pr91-receiver-profile-smoke.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr91-receiver-profile-smoke'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Compile and validate the seven ordinary and isolated codegen leaves
+        env:
+          GOWORK: 'off'
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          test ! -L .tmp
+          evidence="$PWD/.tmp/pr91-receiver-native-smoke"
+          mkdir "$evidence"
+          scratch=$(mktemp -d "$PWD/.tmp/pr91-receiver-smoke.XXXXXXXX")
+          trap '[[ "$scratch" == "$PWD"/.tmp/pr91-receiver-smoke.* && ! -L "$scratch" ]] && rm -rf -- "$scratch"' EXIT
+          export TMPDIR="$scratch/tmp"
+          mkdir -p "$TMPDIR" "$scratch/bin" "$scratch/trace-bin"
+          [[ "$(go version)" == 'go version go1.27.1 linux/amd64' ]]
+          [[ "$(go env GOOS GOARCH GOAMD64 CGO_ENABLED)" == $'linux\namd64\nv1\n1' ]]
+          [[ -z "$(go env GOFLAGS GOEXPERIMENT | tr -d '\n')" ]]
+          uname -a > "$evidence/host.txt"
+          lscpu >> "$evidence/host.txt"
+          go version >> "$evidence/host.txt"
+
+          base=32a10c114ac3c282b4ce46189b646d28eb767b1b
+          head=679921d60ff6c03ba14c2e8ded529a1dd0dd7723
+          tools=3d6f7a0d8e5e78866d7bb147b56b01903392b63a
+          tools_tree=323a6d928d9d2401f4660369e754f5e80b1d6951
+          git fetch --no-tags origin "$base" "$head" "$tools"
+          test "$(git rev-list --parents -n 1 "$tools")" = "$tools $base"
+          test "$(git rev-parse "$tools^{tree}")" = "$tools_tree"
+          product=$(git merge-tree --write-tree "$base" "$head")
+          combined=$(git merge-tree --write-tree "$tools" "$head")
+          test "$product" = 17a174c90224b117ce8035a0388ac251136b8b78
+          test "$combined" = bc62e45afca412d8cd83ff0ca3053f6465923130
+          git diff --exit-code "$product" "$combined" -- pkg/ cmd/ go.mod go.sum
+          git diff --exit-code "$tools" "$combined" -- scripts/benchrun scripts/benchplan internal/benchlayout
+          {
+            printf 'base=%s\nhead=%s\nproduct_tree=%s\ntools=%s\ntools_tree=%s\ncombined_tree=%s\n' \
+              "$base" "$head" "$product" "$tools" "$tools_tree" "$combined"
+            printf '%s\n' 'prior_timing_run=45420625410' 'prior_timing_artifact=14935410236' \
+              'prior_timing_sha256=0e0f6a827d4b4410f1f83e853ff10283b3a73854052c66dc3e93c2bfd2dafb2d'
+          } > "$evidence/revisions.txt"
+
+          for role in base head; do
+            revision="$base"
+            if [[ "$role" == head ]]; then revision="$combined"; fi
+            source_root="$scratch/$role"
+            mkdir -p "$source_root/.tmp"
+            git archive "$revision" | tar -xf - -C "$source_root"
+            sh "$source_root/scripts/setup-modules.sh" "$source_root"
+          done
+          (
+            cd "$scratch/head"
+            for tool in benchrun benchplan; do go build -o "$scratch/bin/$tool" "./scripts/$tool"; done
+          )
+          benchrun="$scratch/bin/benchrun"
+          benchplan="$scratch/bin/benchplan"
+          "$benchrun" performance-profile > "$evidence/compile-profile.txt"
+          "$benchrun" isolation-profile pkg/codegen > "$evidence/profiles.tsv"
+          printf 'codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\ncodegen-global-receiver\t^BenchmarkGlobalReceiverName$\n' \
+            | cmp "$evidence/profiles.tsv" -
+
+          cat > "$scratch/trace-bin/go" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          overlay=
+          for arg in "$@"; do
+            if [[ "$arg" == -overlay=* ]]; then overlay=${arg#-overlay=}; fi
+          done
+          test -f "$overlay"
+          path=$(jq -er '.Replace | to_entries[] | select(.key|endswith("/global_value_bench_test.go")) | .value' "$overlay")
+          test -f "$path"
+          cp "$path" "$PROJECTED_FIXTURE"
+          exec "$REAL_GO" "$@"
+          SCRIPT
+          chmod +x "$scratch/trace-bin/go"
+          real_go=$(command -v go)
+          fixture_sha=330fc5c6785cae1fd2e89810a1ec945e9384669a9efaa3af47cc5e3a2bf74da3
+
+          discover() {
+            local role="$1" profile="$2" filter="$3" key="$evidence/$1/$2"
+            "$benchrun" run-performance "$scratch/$role" "$scratch/bin/$role" pkg/codegen "$profile" \
+              -test.run='^$' -test.bench="$filter" -test.benchmem -test.benchtime=1x -test.count=1 -test.cpu=2 \
+              -test.timeout=90s > "$key.raw.log"
+            "$benchplan" --normalize "$key.raw.log" "$key.log"
+            awk '/^Benchmark/ { if ($2 != 1) exit 1; print $1 }' "$key.log" | sort > "$key.names"
+          }
+
+          for role in base head; do
+            dir="$evidence/$role"
+            bin="$scratch/bin/$role"
+            mkdir "$dir"
+            command=compile-performance
+            if [[ "$role" == base ]]; then command=compile-performance-baseline; fi
+            "$benchrun" "$command" "$scratch/$role" "$bin" pkg/codegen default > "$dir/default.compile.log" 2>&1
+            discover "$role" default '^BenchmarkGlobalReceiverName$|^BenchmarkCompileDecimalIntegerLiterals$'
+            GOWORK="$scratch/$role/go.work" "$benchrun" run "$scratch/$role" "$bin" pkg/codegen \
+              -test.run='^Test(ReceiverName|GeneratedUnicodeModelReceiver)$' -test.count=1 -test.v -test.timeout=180s \
+              > "$dir/receiver-correctness.log"
+            grep -q '^--- PASS: TestReceiverName ' "$dir/receiver-correctness.log"
+            grep -q '^--- PASS: TestGeneratedUnicodeModelReceiver ' "$dir/receiver-correctness.log"
+            while IFS=$'\t' read -r profile filter; do
+              if [[ "$profile" == codegen-global-receiver ]]; then
+                PROJECTED_FIXTURE="$dir/receiver-projection.go.txt" REAL_GO="$real_go" PATH="$scratch/trace-bin:$PATH" \
+                  "$benchrun" "$command" "$scratch/$role" "$bin" pkg/codegen "$profile" \
+                  > "$dir/$profile.compile.log" 2>&1
+                printf '%s  %s\n' "$fixture_sha" "$dir/receiver-projection.go.txt" | sha256sum -c - \
+                  > "$dir/receiver-projection.sha256.txt"
+              else
+                "$benchrun" "$command" "$scratch/$role" "$bin" pkg/codegen "$profile" > "$dir/$profile.compile.log" 2>&1
+              fi
+              "$benchrun" run-performance "$scratch/$role" "$bin" pkg/codegen "$profile" -test.list='.' > "$dir/$profile.roots"
+              expected_root=${filter#^}
+              test "$(cat "$dir/$profile.roots")" = "${expected_root%$}"
+              discover "$role" "$profile" .
+              "$benchplan" --verify-profile-inventory pkg/codegen "$profile" "$dir/default.log" "$dir/$profile.log"
+            done < "$evidence/profiles.tsv"
+            test "$(wc -l < "$dir/codegen-global-receiver.names")" -eq 3
+            test "$(wc -l < "$dir/codegen-integer-literals.names")" -eq 4
+            comm -12 "$dir/codegen-global-receiver.names" "$dir/codegen-integer-literals.names" > "$dir/intersection.names"
+            test ! -s "$dir/intersection.names"
+            cat "$dir/codegen-global-receiver.names" "$dir/codegen-integer-literals.names" | sort > "$dir/union.names"
+            cmp "$dir/union.names" "$dir/default.names"
+            (cd "$bin" && sha256sum ./*.test && go version -m ./*.test) > "$dir/binaries.txt"
+          done
+          cmp "$evidence/base/default.names" "$evidence/head/default.names"
+          cmp "$evidence/base/receiver-projection.go.txt" "$evidence/head/receiver-projection.go.txt"
+      - name: Preserve profile routing, correctness and native inventory evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr91-receiver-profile-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr91-receiver-native-smoke/
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: true
