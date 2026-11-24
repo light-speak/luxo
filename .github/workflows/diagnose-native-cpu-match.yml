@@ -39,14 +39,9 @@ jobs:
           evidence=
           case "${names[0]^^}" in
             'INTEL(R) XEON(R) 6975P-C')
-              suite=pr82-lux-short-path
-              diagnostic=d91a6be31ee7d3e7d9c97cf37809820b22557c00
-              tree=c810f46534ce008d10d5be963459d56a4169f115
-              head=0bcc72b6861423c53b615d3b80a5cad36688d4ff
-              input=pr82-short-path-08.zip
-              artifact=14919152905
-              formal_run=45387275899
-              digest=addc34c9a86d6f20a77b02321bfcb835b7de20ac1f9e7948d45935d6336adca3
+              suite=pr71-gateway-current-profile
+              printf 'suite=%s\n' "$suite" | tee -a "$receipt/selection.txt" >> "$GITHUB_OUTPUT"
+              exit 0
               ;;
             'AMD EPYC 9V45 96-CORE PROCESSOR')
               suite=pr71-static-jwt
@@ -83,16 +78,6 @@ jobs:
               digest=094c81b14547cfbe5aa21d6b402c4b2574925fbafb701e503d9ac09354efb993
               evidence='.tmp/native-cpu-worktree/.tmp/hosted-columnar-merge-pr71-formal/'
               ;;
-            'INTEL(R) XEON(R) PLATINUM 8573C')
-              suite=pr103-short-paths
-              diagnostic=4afba3abe78bd692edcda4daa9dfc1034311cec7
-              tree=95bbced3a21965379d000a2903196c52622cdb40
-              head=dcf2ca3eb2193f2e060051dfe4d47c5277b19f5d
-              input=pr103-short-path-formal-03.zip
-              artifact=14917795901
-              formal_run=45385956331
-              digest=26fc97aea69750a853d11f6735b683f08c1083e3113b342c5b1e11b14ad57892
-              ;;
             *)
               printf 'status=no-matching-pending-scope\n' >> "$receipt/selection.txt"
               printf 'No pending native diagnostic matches the assigned model.\n' >&2
@@ -113,6 +98,7 @@ jobs:
           persist-credentials: false
       - name: Fetch and verify only the selected diagnostic inputs
         id: primary_inputs
+        if: ${{ steps.cpu.outputs.suite != 'pr71-gateway-current-profile' }}
         env:
           GH_TOKEN: ${{ github.token }}
           DIAGNOSTIC: ${{ steps.cpu.outputs.diagnostic }}
@@ -153,11 +139,11 @@ jobs:
           if [[ "$SUITE" == pr72-boxed-json-header-causal ]]; then
             delta="$receipt/header-driver.patch"
             base64 -d "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr72-boxed-json-r/driver-replay.patch.b64" > "$delta"
-            printf '%s  %s\n' 223e75f4a14976578d743951396c52130f8235c90f63d114c4bed75af66b37b9 "$delta" |
+            printf '%s  %s\n' 42e647de1ba8d82510a7419bdac01d487ea8f9e7dbd1e52794d42be6c372f382 "$delta" |
               sha256sum -c - > "$receipt/header-driver-input.txt"
             git -C "$root" apply --check --whitespace=error-all "$delta"
             git -C "$root" apply --whitespace=error-all "$delta"
-            printf '%s  %s\n' d6d2987867fe307334aab468d3e5922e94e358ccbefef33651c500a20c051317 "$root/$sampler" |
+            printf '%s  %s\n' 86a7654778af0652957f7113dca0aeab607bb48bdff166132731a59c21f9a123 "$root/$sampler" |
               sha256sum -c - > "$receipt/header-driver-output.txt"
           fi
           mkdir -p "$root/.tmp"
@@ -183,50 +169,11 @@ jobs:
           fi
       - uses: actions/setup-go@v7
         id: go
-        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && (steps.primary_inputs.outcome == 'success' || steps.cpu.outputs.suite == 'pr103-short-paths') }}
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && (steps.primary_inputs.outcome == 'success' || steps.cpu.outputs.suite == 'pr71-gateway-current-profile' || steps.cpu.outputs.suite == 'pr72-boxed-json-header-causal') }}
         with:
           go-version: '1.27.1'
           check-latest: false
           cache: false
-      - name: Verify the independent Intel GatewayIdentity inputs
-        id: gateway_inputs
-        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.cpu.outputs.suite == 'pr103-short-paths' }}
-        timeout-minutes: 4
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          root="$GITHUB_WORKSPACE/.tmp/native-pr74-worktree"
-          diagnostic=3fa4763c7964d531abe3e55d00726a44110c4116
-          tree=793adc83b52b3b65c87c505633dd05942eb70121
-          git -C native-cpu-dispatch fetch --no-tags origin "$diagnostic"
-          git -C native-cpu-dispatch worktree add --detach "$root" "$diagnostic"
-          test "$(git -C "$root" rev-parse HEAD)" = "$diagnostic"
-          test "$(git -C "$root" rev-parse 'HEAD^{tree}')" = "$tree"
-          cd "$root"
-          driver=scripts/diagnose-pr74-gateway-identity.sh
-          sampler=scripts/diagnose-hosted-perf.sh
-          printf '%s  %s\n' 0174ecf8d668749c3cb1b435e452d5d5e2e1737b9d26c9f507c0b2feb7cf3bc0 "$driver" \
-            9e0a5f421f2e76674b819f81074a3d416a51174e0f93b858a63d20c27d64e072 "$sampler" | sha256sum -c -
-          mkdir .tmp
-          bash "$driver" --probe
-          evidence=.tmp/hosted-pr74-gateway-identity
-          grep -Fxq 'match=true' "$evidence/runner.txt"
-          gh api repos/light-speak/luxo/actions/artifacts/14928967579 > "$evidence/formal-metadata.json"
-          jq -e '.id == 14928967579 and .workflow_run.id == 45408776744 and
-            .workflow_run.head_sha == "95555312e542300f7abb51bb0310f5d535b9fe4b" and
-            .digest == "sha256:1d3e94811fea5108524cc479e4810f2b6b21b383c0d02b019a69be9b82b9b3ed" and
-            .expired == false' "$evidence/formal-metadata.json"
-          bash "$driver" --fetch
-      - name: Measure the Intel GatewayIdentity controls before the primary diagnostic
-        if: ${{ !cancelled() && steps.gateway_inputs.outcome == 'success' }}
-        timeout-minutes: 25
-        working-directory: .tmp/native-pr74-worktree
-        env:
-          GOTOOLCHAIN: local
-          GOAMD64: v1
-          CGO_ENABLED: '1'
-        run: bash scripts/diagnose-pr74-gateway-identity.sh
       - name: Run the pinned diagnostic on the same runner
         if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.primary_inputs.outcome == 'success' }}
         timeout-minutes: 28
@@ -248,14 +195,50 @@ jobs:
             pr71-columnar)
               exec bash "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr71-columnar.sh" . .tmp/pr71-columnar-formal-08.zip
               ;;
-            pr82-lux-short-path)
-              exec bash "scripts/diagnose-$SUITE.sh"
-              ;;
-            pr103-short-paths)
-              PR103_REQUIRED_SHORT_PATH_SCOPE=intel exec bash scripts/diagnose-pr103-short-paths.sh run
-              ;;
             *) exit 2 ;;
           esac
+      - name: Measure the remaining PR 71 leaf controls on the assigned runner
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && (steps.cpu.outputs.suite == 'pr71-gateway-current-profile' || steps.cpu.outputs.suite == 'pr72-boxed-json-header-causal') }}
+        timeout-minutes: 20
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUITE: ${{ steps.cpu.outputs.suite }}
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+        run: |
+          set -euo pipefail
+          dispatch="$GITHUB_WORKSPACE/native-cpu-dispatch"
+          receipt="$GITHUB_WORKSPACE/.tmp/native-cpu-selection"
+          driver="$dispatch/scripts/diagnose-pr71-secondary.sh"
+          helper="$dispatch/scripts/diagnose-pr71-secondary.py"
+          [[ "$(git -C "$dispatch" rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          printf '%s  %s\n' \
+            712d3330d3f36e26a82923f006a97527b30bed3f9796c2f7dfa651f36a0735c5 "$driver" \
+            83445334e93a9f6d37c7e97541180a001549713284bbe59a0f206c4610987074 "$helper" | sha256sum -c -
+          case "$SUITE" in
+            pr71-gateway-current-profile) scope=gateway-identity ;;
+            pr72-boxed-json-header-causal) scope=rpc-trace-local ;;
+            *) exit 2 ;;
+          esac
+          IFS=$'\t' read -r _ _ _ _ _ artifact digest _ < <(python3 "$helper" tuple "$scope")
+          [[ "$artifact" =~ ^[0-9]+$ && "$digest" =~ ^[a-f0-9]{64}$ ]]
+          git -C "$dispatch" fetch --no-tags origin \
+            1117eb9ffcc0beef977abceec656a351b0988389 4177d556d135cff1cd27e42798c0b082cf09f9b3 \
+            3baa5b629d86749c6f5dc38dd9e540e0d11c39e9 dd6405a02c653c8f2da90ff8ea81795a6781033b \
+            3a9838348d630bcd0f806fbf38c67ee3e327924b
+          gh api "repos/light-speak/luxo/actions/artifacts/$artifact" > "$receipt/pr71-$scope-metadata.json"
+          jq -e --arg id "$artifact" --arg digest "sha256:$digest" '
+            ((.id | tostring) == $id) and (.workflow_run.id == 45413131379) and
+            (.workflow_run.head_sha == "4177d556d135cff1cd27e42798c0b082cf09f9b3") and
+            (.digest == $digest) and (.expired == false)
+          ' "$receipt/pr71-$scope-metadata.json"
+          mkdir -p "$dispatch/.tmp"
+          archive=$(mktemp "$dispatch/.tmp/pr71-input.XXXXXXXX")
+          trap 'rm -f -- "$archive"' EXIT
+          gh api "repos/light-speak/luxo/actions/artifacts/$artifact/zip" > "$archive"
+          printf '%s  %s\n' "$digest" "$archive" | sha256sum -c - > "$receipt/pr71-$scope-digest-check.txt"
+          bash "$driver" "$dispatch" "$scope" "$archive"
       - name: Preserve the CPU selection and diagnostic evidence
         if: always()
         uses: actions/upload-artifact@v7.0.2
@@ -264,17 +247,7 @@ jobs:
           path: |
             .tmp/native-cpu-selection/
             ${{ steps.cpu.outputs.evidence }}
-          include-hidden-files: true
-          if-no-files-found: error
-          retention-days: 14
-      - name: Preserve the independent Intel GatewayIdentity evidence
-        if: ${{ always() && steps.cpu.outputs.suite == 'pr103-short-paths' }}
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: native-pr74-gateway-identity-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            .tmp/native-cpu-selection/
-            .tmp/native-pr74-worktree/.tmp/hosted-pr74-gateway-identity/
+            native-cpu-dispatch/.tmp/hosted-pr71-*/
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
