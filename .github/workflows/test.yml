@@ -437,6 +437,7 @@ jobs:
                   case "$profile" in
                     codec-reader) exclusive_root=BenchmarkElementPayload ;;
                     codegen-global-receiver) exclusive_root=BenchmarkGlobalReceiverName ;;
+                    luvia-gateway-identity) exclusive_root=BenchmarkGatewayIdentity ;;
                     *) exclusive_root= ;;
                   esac
                   if [[ -n "$exclusive_root" ]]; then

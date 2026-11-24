@@ -23,7 +23,8 @@ const (
 	// Discovery and sampling must consume the same benchmark compilation profile.
 	performanceProfile = "rpc-boundary-overlay-v2 " + rpcBoundarySHA +
 		"\ncodec-reader-overlay-v1\napi-non-identity-overlay-v1\nluvia-primary-trace-overlay-v1\ncodegen-integer-literals-overlay-v1" +
-		"\ncodegen-global-receiver-overlay-v1 " + codegenReceiverProjectionSHA
+		"\ncodegen-global-receiver-overlay-v1 " + codegenReceiverProjectionSHA +
+		"\nluvia-gateway-identity-overlay-v1 " + luviaGatewayIdentityProjectionSHA
 )
 
 func performanceOverlay(root, packagePath string, baseline bool) (string, func() error, error) {
