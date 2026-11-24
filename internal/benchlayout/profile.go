@@ -6,19 +6,21 @@ import (
 )
 
 const (
-	DefaultProfile           = "default"
-	CodecReaderProfile       = "codec-reader"
-	APINonIdentityProfile    = "api-non-identity"
-	LuviaPrimaryTraceProfile = "luvia-primary-trace"
-	CodegenLiteralProfile    = "codegen-integer-literals"
-	CodegenReceiverProfile   = "codegen-global-receiver"
-	CodecPackage             = "pkg/lux/codec"
-	CodecReaderBenchmark     = "BenchmarkElementPayload"
-	APIPackage               = "pkg/lux/api"
-	LuviaPackage             = "pkg/lux/luvia"
-	CodegenPackage           = "pkg/codegen"
-	CodegenLiteralBenchmark  = "BenchmarkCompileDecimalIntegerLiterals"
-	CodegenReceiverBenchmark = "BenchmarkGlobalReceiverName"
+	DefaultProfile                = "default"
+	CodecReaderProfile            = "codec-reader"
+	APINonIdentityProfile         = "api-non-identity"
+	LuviaPrimaryTraceProfile      = "luvia-primary-trace"
+	LuviaGatewayIdentityProfile   = "luvia-gateway-identity"
+	CodegenLiteralProfile         = "codegen-integer-literals"
+	CodegenReceiverProfile        = "codegen-global-receiver"
+	CodecPackage                  = "pkg/lux/codec"
+	CodecReaderBenchmark          = "BenchmarkElementPayload"
+	APIPackage                    = "pkg/lux/api"
+	LuviaPackage                  = "pkg/lux/luvia"
+	LuviaGatewayIdentityBenchmark = "BenchmarkGatewayIdentity"
+	CodegenPackage                = "pkg/codegen"
+	CodegenLiteralBenchmark       = "BenchmarkCompileDecimalIntegerLiterals"
+	CodegenReceiverBenchmark      = "BenchmarkGlobalReceiverName"
 )
 
 var apiIdentityRoots = []string{
@@ -40,6 +42,9 @@ func ProfileForBenchmark(pkg, name string) string {
 			return APINonIdentityProfile
 		}
 	case LuviaPackage:
+		if root == LuviaGatewayIdentityBenchmark {
+			return LuviaGatewayIdentityProfile
+		}
 		if slices.Contains(luviaIsolatedRoots, root) {
 			return LuviaPrimaryTraceProfile
 		}
@@ -67,7 +72,10 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 	case APIPackage:
 		return []IsolationSpec{{APINonIdentityProfile, "."}}
 	case LuviaPackage:
-		return []IsolationSpec{{LuviaPrimaryTraceProfile, "^" + strings.Join(luviaIsolatedRoots, "$|^") + "$"}}
+		return []IsolationSpec{
+			{LuviaPrimaryTraceProfile, "^" + strings.Join(luviaIsolatedRoots, "$|^") + "$"},
+			{LuviaGatewayIdentityProfile, "^" + LuviaGatewayIdentityBenchmark + "$"},
+		}
 	case CodegenPackage:
 		return []IsolationSpec{
 			{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"},

@@ -96,6 +96,10 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{APIPackage, "BenchmarkCanonicalJSONBytes", APINonIdentityProfile},
 		{LuviaPackage, "BenchmarkPrimaryKeys/row-small/keyLast=false/baseline=true-2", LuviaPrimaryTraceProfile},
 		{LuviaPackage, "BenchmarkTraceEncodingComparison", LuviaPrimaryTraceProfile},
+		{LuviaPackage, "BenchmarkGatewayIdentity", LuviaGatewayIdentityProfile},
+		{LuviaPackage, "BenchmarkGatewayIdentity/authenticated/after-2", LuviaGatewayIdentityProfile},
+		{LuviaPackage, "BenchmarkGatewayIdentitySibling", DefaultProfile},
+		{CodegenPackage, "BenchmarkGatewayIdentity", DefaultProfile},
 		{LuviaPackage, "BenchmarkStaticMetricsJSON", DefaultProfile},
 		{LuviaPackage, "BenchmarkConvenienceKeyParentValidation", DefaultProfile},
 	} {
@@ -105,7 +109,6 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 	}
 	for _, tc := range []struct{ pkg, profile, filter string }{
 		{APIPackage, APINonIdentityProfile, "."},
-		{LuviaPackage, LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"},
 		{CodecPackage, CodecReaderProfile, "."},
 		{"pkg/lux/rpc", "", ""},
 	} {
@@ -119,6 +122,12 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		if len(got) != 1 || got[0] != (IsolationSpec{tc.profile, tc.filter}) {
 			t.Fatalf("isolation of %s = %v, want %q %q", tc.pkg, got, tc.profile, tc.filter)
 		}
+	}
+	profiles := IsolationProfiles(LuviaPackage)
+	if len(profiles) != 2 || profiles[0] != (IsolationSpec{LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"}) ||
+		profiles[1] != (IsolationSpec{LuviaGatewayIdentityProfile, "^BenchmarkGatewayIdentity$"}) ||
+		ValidPerformanceProfile(CodegenPackage, LuviaGatewayIdentityProfile) {
+		t.Fatalf("unexpected Luvia isolation: %v", profiles)
 	}
 }
 
