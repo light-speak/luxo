@@ -36,7 +36,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: frozen-gate-controls-${ github.run_id }}-${ github.run_attempt }}
+          name: frozen-gate-controls-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/hosted-frozen-gate-controls/
           if-no-files-found: error
           retention-days: 14

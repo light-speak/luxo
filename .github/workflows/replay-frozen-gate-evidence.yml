@@ -1,0 +1,54 @@
+name: Replay retained frozen benchmark gate evidence
+
+on:
+  push:
+    branches: [diagnostics/replay-frozen-gate]
+    paths:
+      - .github/workflows/replay-frozen-gate-evidence.yml
+      - scripts/diagnose-frozen-gate-controls.py
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  replay:
+    if: github.repository == 'light-speak/luxo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Verify the original artifact and replay the corrected verifier
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GOTOOLCHAIN: local
+          GOWORK: 'off'
+        run: |
+          set -euo pipefail
+          work="$PWD/.tmp/replay-frozen-gate"
+          mkdir -p "$work/raw-normalized/raw" "$work/original"
+          trap 'rm -rf -- "$work"' EXIT
+          gh api repos/light-speak/luxo/actions/artifacts/14898194471/zip > "$work/evidence.zip"
+          printf '%s  %s\n' 78ae21bc96666701d0127f18a5f8b8822db84be527e2a6becb01934cc8225168 "$work/evidence.zip" | sha256sum -c -
+          unzip -q "$work/evidence.zip" -d "$work/original"
+          result="$work/original"
+          cp "$result/signed-pairs.tsv" "$work/expected-signed.tsv"
+          printf '%s  %s\n' 6cb479c7e93ec6814cc2f36bf5ebfb7b43fe686bb16d3a1121b08309261874df "$work/expected-signed.tsv" | sha256sum -c -
+          go build -o "$work/benchplan" ./scripts/benchplan
+          for raw in "$result"/raw/*.txt; do
+            "$work/benchplan" --normalize "$raw" "$work/raw-normalized/raw/${raw##*/}"
+          done
+          driver=scripts/diagnose-frozen-gate-controls.py
+          python3 "$driver" inventories "$result"
+          python3 "$driver" order "$result"
+          python3 "$driver" metrics "$result" "$work/raw-normalized"
+          cmp "$work/expected-signed.tsv" "$result/signed-pairs.tsv"
+          python3 "$driver" verdict "$result"
+          cat "$result/verdicts.tsv"

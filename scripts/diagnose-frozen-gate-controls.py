@@ -13,6 +13,7 @@ import sys
 PACKAGE = "pkg/lux/sample"
 IMPORT = "github.com/light-speak/luxo/" + PACKAGE
 PROBE = "BenchmarkProbe-2"
+BENCHSTAT_PROBE = f"{IMPORT}/{PROBE.removeprefix('Benchmark')}"
 ONE_SIDED = "BenchmarkOneSided-2"
 GROUPS = ("primary", "confirmation")
 MODES = ("native", "frozen")
@@ -254,8 +255,10 @@ def verdict(evidence):
             else {"B/op", "allocs/op"} if role == "alloc"
             else set()
         )
-        rejected = re.findall(rf"(?m)^confirmed performance regression: {PACKAGE}/{PROBE} (\S+) ", log)
-        actual = set(rejected)
+        rejected = re.findall(r"(?m)^confirmed performance regression: (\S+) (\S+) ", log)
+        require(all(name == BENCHSTAT_PROBE for name, _ in rejected),
+                f"unexpected confirmed benchmark for {comparison}: {rejected}")
+        actual = {unit for _, unit in rejected}
         require(actual >= expected and (actual == expected or role == "alloc" and actual - expected == {"sec/op"}),
                 f"unexpected confirmed metrics for {comparison}: {actual}, require {expected}")
         if expected:
