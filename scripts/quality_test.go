@@ -33,6 +33,7 @@ type qualityWorkflow struct {
 		RunsOn          string `yaml:"runs-on"`
 		ContinueOnError bool   `yaml:"continue-on-error"`
 		Env             map[string]string
+		Outputs         map[string]string
 		Permissions     map[string]string
 		Strategy        struct {
 			FailFast    *bool `yaml:"fail-fast"`
