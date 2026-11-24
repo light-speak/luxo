@@ -45,8 +45,34 @@ func confirmationCases(primary evaluation) (map[costKey]struct{}, error) {
 			return nil, fmt.Errorf("invalid confirmation target package %q or benchmark %q", key.Package, key.Benchmark)
 		}
 		cases[key] = struct{}{}
+		if context, ok := pairedFixtureContext(key, primary.Comparisons); ok {
+			cases[context] = struct{}{}
+		}
 	}
 	return cases, nil
+}
+
+func pairedFixtureContext(target costKey, comparisons map[comparisonKey]struct{}) (costKey, bool) {
+	name := target.Benchmark
+	var companion string
+	// A fixture can initialize its reference output in the earlier sibling.
+	switch {
+	case strings.HasSuffix(name, "/after-2"):
+		companion = strings.TrimSuffix(name, "/after-2") + "/before-2"
+	case strings.HasSuffix(name, "/After-2"):
+		companion = strings.TrimSuffix(name, "/After-2") + "/Before-2"
+	case target.Package == benchmarkPackagePrefix+"pkg/lux/api" &&
+		strings.HasPrefix(name, "BinaryJSONDocuments/") && strings.HasSuffix(name, "/typed-2"):
+		companion = strings.TrimSuffix(name, "/typed-2") + "/boxed-2"
+	default:
+		return costKey{}, false
+	}
+	for _, unit := range comparisonUnits {
+		if _, measured := comparisons[comparisonKey{Package: target.Package, Benchmark: companion, Unit: unit}]; !measured {
+			return costKey{}, false
+		}
+	}
+	return costKey{Package: target.Package, Benchmark: companion}, true
 }
 
 func validTargetPackage(packageName string) bool {

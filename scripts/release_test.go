@@ -107,10 +107,10 @@ func TestCoreAndSwiftCandidateBindings(t *testing.T) {
 		t.Error("CLI default must identify the current candidate, not an unrelated dev build")
 	}
 	checks := 0
-	for _, step := range readQualityWorkflow(t).Jobs["sdk-swift-conformance"].Steps {
+	for _, step := range readQualityWorkflow(t).Jobs[swiftNativeCIJob].Steps {
 		if step.Name == "Verify Swift candidate version" {
 			checks++
-			if step.Run != "cmp VERSION .tmp/luxo-swift/VERSION" || step.ContinueOnError {
+			if step.Run != "cmp VERSION .tmp/luxo-swift/VERSION" || step.If != "" || step.ContinueOnError {
 				t.Error("Swift candidate mismatch must fail conformance")
 			}
 		}
@@ -135,7 +135,7 @@ func TestKotlinBuildPluginHasExplicitBytecodeTarget(t *testing.T) {
 
 func TestSwiftCandidateCheckoutIsPinned(t *testing.T) {
 	checkouts := 0
-	for _, step := range readQualityWorkflow(t).Jobs["sdk-swift-conformance"].Steps {
+	for _, step := range readQualityWorkflow(t).Jobs[swiftNativeCIJob].Steps {
 		if step.With["repository"] != "light-speak/luxo-swift" {
 			continue
 		}
@@ -143,7 +143,7 @@ func TestSwiftCandidateCheckoutIsPinned(t *testing.T) {
 		if step.With["ref"] != "40aa5cc7948a0b74cfc59bc97dfbbc85371f4705" {
 			t.Errorf("Swift conformance must use the verified beta.1 candidate, got %q", step.With["ref"])
 		}
-		if step.With["path"] != ".tmp/luxo-swift" || step.With["persist-credentials"] != "false" || step.ContinueOnError {
+		if step.With["path"] != ".tmp/luxo-swift" || step.With["persist-credentials"] != "false" || step.If != "" || step.ContinueOnError {
 			t.Error("Swift checkout must fail closed in the isolated candidate path without persisted credentials")
 		}
 	}
@@ -154,7 +154,7 @@ func TestSwiftCandidateCheckoutIsPinned(t *testing.T) {
 
 func TestSwiftCICheckoutIsDocumented(t *testing.T) {
 	var revision string
-	for _, step := range readQualityWorkflow(t).Jobs["sdk-swift-conformance"].Steps {
+	for _, step := range readQualityWorkflow(t).Jobs[swiftNativeCIJob].Steps {
 		if step.With["repository"] == "light-speak/luxo-swift" {
 			revision = step.With["ref"]
 		}

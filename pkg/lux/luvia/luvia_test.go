@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -530,6 +531,32 @@ func TestServe_H2C(t *testing.T) {
 	// Use a random high port
 	t.Setenv("APP_PORT", "0")
 	serveWithPendingShutdown(t, gw, "test-v1")
+}
+
+func TestServeRegistersTheBoundPort(t *testing.T) {
+	studio := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer studio.Close()
+	t.Setenv("APP_PORT", "0")
+	t.Setenv("LUXO_STUDIO_URL", studio.URL)
+	t.Setenv("LUXO_API_KEY", "test-key")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
+	t.Setenv("LUXO_INSTANCE_ID", "localhost")
+	t.Setenv("LUXO_GATEWAY_ENDPOINT", "")
+	gw := New()
+	serveWithPendingShutdown(t, gw, "test-v1")
+	server, ok := gw.server.(*gatewayHTTPServer)
+	if !ok {
+		t.Fatalf("gateway started unexpected runtime %T", gw.server)
+	}
+	_, port, err := net.SplitHostPort(server.Addr)
+	if err != nil || port == "0" {
+		t.Fatalf("bound address %q: %v", server.Addr, err)
+	}
+	if gw.registrar == nil || gw.registrar.endpoint != "http://localhost:"+port {
+		t.Fatalf("Studio registration did not use bound port %s", port)
+	}
 }
 
 func TestServe_CustomShutdownTimeout(t *testing.T) {
