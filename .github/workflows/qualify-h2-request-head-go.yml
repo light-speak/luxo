@@ -1,0 +1,144 @@
+name: Qualify the staged HTTP/2 request-head parser
+
+on:
+  push:
+    branches: [diagnostics/qualify-h2-request-head-go]
+    paths:
+      - .github/workflows/qualify-h2-request-head-go.yml
+      - .github/qualification/h2-request-head.patch.b64
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/qualify-h2-request-head-go'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: luxo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d luxo_test"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=5
+
+    env:
+      DATABASE_HOST: localhost
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_PREFIX: luxo_test
+      DATABASE_SSL: disable
+      LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_AUDIT_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_TRANSACTION_RACE: '1'
+      NATS_URL: nats://127.0.0.1:4222
+      GOTOOLCHAIN: local
+      QUALIFICATION_BASE: ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+      QUALIFICATION_TREE: 74f2f384715be4780412fa34a60ca997158fe058
+      QUALIFICATION_PATCH_SHA256: bed510f4113cc1b1d500c0b2745890a18ccbe7f3ec959167c1d8f7ee18d5fc22
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+
+      - name: Restore and verify the exact staged product tree
+        run: |
+          set -euo pipefail
+          source="$PWD/.tmp/h2-request-head-go-source"
+          evidence="$PWD/.tmp/h2-request-head-go-evidence"
+          mkdir -p "$evidence"
+          patch="$evidence/candidate.patch"
+          base64 -d .github/qualification/h2-request-head.patch.b64 > "$patch"
+          printf '%s  %s\n' "$QUALIFICATION_PATCH_SHA256" "$patch" | sha256sum -c
+          test "$(git rev-parse "$QUALIFICATION_BASE^{tree}")" = ba252c7cace8908cdfcd7c203bc9dc11bb2ba746
+          git worktree add --detach "$source" "$QUALIFICATION_BASE"
+          git -C "$source" apply --index --check --whitespace=error "$patch"
+          git -C "$source" apply --index --whitespace=error "$patch"
+          git -C "$source" apply --reverse --check "$patch"
+          git -C "$source" diff --cached --check
+          test "$(git -C "$source" write-tree)" = "$QUALIFICATION_TREE"
+          git -C "$source" diff --cached --name-only > "$evidence/paths.txt"
+          printf '%s\n' pkg/lux/h2transport/request_headers.go pkg/lux/h2transport/request_headers_test.go | diff - "$evidence/paths.txt"
+          printf '%s %s %s\n' "$QUALIFICATION_BASE" "$QUALIFICATION_TREE" "$QUALIFICATION_PATCH_SHA256" > "$evidence/revision.txt"
+          go version > "$evidence/go-version.txt"
+          test "$(cat "$evidence/go-version.txt")" = 'go version go1.27.1 linux/amd64'
+          (cd "$source" && printf '%s\n' "3956c63ae1795051b6cc54c94856ec8dfb1149c270242cdb1717e7d6fffca6ca  pkg/lux/h2transport/request_headers.go" "00a36c38c5c9bb0310e8cb4f84c974e08ea1fc35afe60366312b912b5fe7a3d7  pkg/lux/h2transport/request_headers_test.go" | sha256sum -c)
+          test -z "$(gofmt -s -l "$source/pkg/lux/h2transport/request_headers.go" "$source/pkg/lux/h2transport/request_headers_test.go")"
+          sh "$source/scripts/setup-modules.sh" "$source"
+
+      - name: Start the owned JetStream fixture
+        run: |
+          set -euo pipefail
+          owner="luxo-qualify-h2-request-head-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker run --detach --name "$owner" --label "org.luxo.audit.owner=$owner" \
+            --publish 127.0.0.1:4222:4222 --publish 127.0.0.1:8222:8222 \
+            nats:2.15.3-alpine -js -m 8222
+          curl --fail --silent --show-error --retry 20 --retry-all-errors \
+            --retry-delay 1 --connect-timeout 2 --max-time 5 http://127.0.0.1:8222/healthz
+          curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8222/jsz | jq --exit-status \
+            '.disabled != true and .config.max_memory > 0 and .config.max_storage > 0'
+
+      - name: Verify root packages with coverage and the CLI race suite
+        run: |
+          set -euo pipefail
+          evidence="$PWD/.tmp/h2-request-head-go-evidence"
+          cd .tmp/h2-request-head-go-source
+          export GOWORK="$PWD/go.work"
+          root=0
+          go test -p 2 ./pkg/... -cover -coverprofile="$evidence/root.coverage" -count=1 -timeout=95m -json \
+            > "$evidence/root.jsonl" 2>&1 || root=$?
+          printf 'root %s\n' "$root" >> "$evidence/phases.txt"
+          if (( root != 0 )); then tail -n 80 "$evidence/root.jsonl"; exit "$root"; fi
+          cli=0
+          go test -p 2 -race ./cmd/luxo/... -coverprofile="$evidence/cli.coverage" -count=1 -timeout=15m -json \
+            > "$evidence/cli.jsonl" 2>&1 || cli=$?
+          printf 'cli %s\n' "$cli" >> "$evidence/phases.txt"
+          if (( cli != 0 )); then tail -n 80 "$evidence/cli.jsonl"; exit "$cli"; fi
+          go tool cover -func="$evidence/root.coverage" > "$evidence/root.coverage-summary"
+          grep -E '/pkg/lux/h2transport/request_headers.go:[0-9]+:[[:space:]]+parseRequestHead[[:space:]]+100.0%' \
+            "$evidence/root.coverage-summary"
+          go vet -p 2 ./pkg/... ./cmd/... ./cmd/luxo/... > "$evidence/vet.log" 2>&1
+          git diff --exit-code
+          test "$(git write-tree)" = "$QUALIFICATION_TREE"
+
+      - name: Remove the owned source and JetStream fixture
+        if: always()
+        run: |
+          set -euo pipefail
+          owner="luxo-qualify-h2-request-head-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ids=$(docker ps -aq --filter "label=org.luxo.audit.owner=$owner")
+          if [[ -n "$ids" ]]; then
+            while IFS= read -r id; do docker rm -fv "$id"; done <<< "$ids"
+          fi
+          test -z "$(docker ps -aq --filter "label=org.luxo.audit.owner=$owner")"
+          test -z "$(docker volume ls -q --filter "label=org.luxo.audit.owner=$owner")"
+          if [[ -d .tmp/h2-request-head-go-source ]]; then
+            git worktree remove --force .tmp/h2-request-head-go-source
+          fi
+
+      - name: Preserve exact coverage and test logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: h2-request-head-go-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/h2-request-head-go-evidence/
+          if-no-files-found: error
+          retention-days: 14
