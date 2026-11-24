@@ -13,19 +13,9 @@ permissions:
 
 jobs:
   native:
-    name: native (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
+    name: native (windows)
+    runs-on: windows-2025
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            platform: linux
-            python: python3
-          - runner: windows-2025
-            platform: windows
-            python: python
     steps:
       - uses: actions/checkout@v7
         with:
@@ -38,14 +28,14 @@ jobs:
 
       - name: Verify the pinned native Dart boundary
         env:
-          DART_NATIVE_PLATFORM: ${{ matrix.platform }}
-        run: ${{ matrix.python }} .github/qualification/dart-snapshot-native.py
+          DART_NATIVE_PLATFORM: windows
+        run: python .github/qualification/dart-snapshot-native.py
 
       - name: Preserve exact source, test events and physical coverage
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: dart-snapshot-boundary-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dart-snapshot-boundary-windows-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/dart-snapshot-native-evidence/
           include-hidden-files: true
           if-no-files-found: error

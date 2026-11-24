@@ -16,12 +16,11 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 
-DIAGNOSTIC_BASE = "307d602b6c0588d636eefb70c627cab7177784d8"
+DIAGNOSTIC_BASE = "61a708a5078694862403fc3e38d912df9d1fb17b"
 DIAGNOSTIC_REF = "refs/heads/diagnostics/dart-snapshot-native"
 DIAGNOSTIC_FILES = {
     ".github/workflows/qualify-dart-snapshot-native.yml",
     ".github/qualification/dart-snapshot-native.py",
-    ".github/qualification/dart-snapshot-product.patch.b64",
 }
 BASE = "dd6405a02c653c8f2da90ff8ea81795a6781033b"
 BASE_TREE = "5cb2421d34fc1addd094a0a68ad6671414230c13"
@@ -65,7 +64,7 @@ def verify_diagnostic_checkout(repo):
             "expected the dedicated diagnostic push")
     require(head == os.environ.get("GITHUB_SHA"), "unexpected diagnostic workflow head")
     require(git(repo, "rev-list", "--parents", "--max-count=1", "HEAD") == f"{head} {DIAGNOSTIC_BASE}",
-            "the diagnostic head must extend the pinned successful branch head")
+            "the diagnostic head must extend the pinned first attempt")
     changed = set(git(repo, "diff", "--name-only", DIAGNOSTIC_BASE, head).splitlines())
     require(changed == DIAGNOSTIC_FILES, "unexpected diagnostic publication paths")
     subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=repo, check=True)
@@ -93,25 +92,26 @@ def restore(repo, scratch):
     patch.write_bytes(base64.b64decode(b"".join(payload.read_bytes().splitlines()), validate=True))
     require(digest(patch) == PATCH_SHA, "product patch digest changed")
 
-    store = scratch / "git"
-    git(repo, "init", "--quiet", "--bare", str(store))
-    objects = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects")
-    (store / "objects/info/alternates").write_bytes((Path(objects).as_posix() + "\n").encode("utf-8"))
-    binding = ("--git-dir", str(store))
-    git(repo, *binding, "read-tree", BASE)
-    git(repo, *binding, "apply", "--cached", "--whitespace=error", str(patch))
-    actual = git(repo, *binding, "write-tree")
-    require(actual == CANDIDATE_TREE, "candidate tree changed")
-    require(git(repo, *binding, "rev-parse", f"{actual}:packages/dart") == DART_TREE, "Dart subtree changed")
-    changed = set(git(repo, *binding, "diff", "--cached", "--name-only", BASE).splitlines())
-    require(changed == PRODUCT_FILES.keys(), "unexpected product paths")
-    git(repo, *binding, "apply", "--cached", "--reverse", "--whitespace=error", str(patch))
-    require(git(repo, *binding, "write-tree") == BASE_TREE, "reverse projection failed")
-
     extras = sorted(path for path in PRODUCT_FILES if path.startswith(".github/"))
     archive_path = scratch / "source.zip"
-    git(repo, "-c", "core.autocrlf=false", "-c", "core.eol=lf", *binding,
-        "archive", "--format=zip", "-o", str(archive_path), actual, "--", "packages/dart", *extras)
+    # TemporaryDirectory removes Git's read-only loose objects on Windows.
+    with tempfile.TemporaryDirectory(prefix="git-", dir=scratch) as directory:
+        store = Path(directory)
+        git(repo, "init", "--quiet", "--bare", str(store))
+        objects = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+        (store / "objects/info/alternates").write_bytes((Path(objects).as_posix() + "\n").encode("utf-8"))
+        binding = ("--git-dir", str(store))
+        git(repo, *binding, "read-tree", BASE)
+        git(repo, *binding, "apply", "--cached", "--whitespace=error", str(patch))
+        actual = git(repo, *binding, "write-tree")
+        require(actual == CANDIDATE_TREE, "candidate tree changed")
+        require(git(repo, *binding, "rev-parse", f"{actual}:packages/dart") == DART_TREE, "Dart subtree changed")
+        changed = set(git(repo, *binding, "diff", "--cached", "--name-only", BASE).splitlines())
+        require(changed == PRODUCT_FILES.keys(), "unexpected product paths")
+        git(repo, *binding, "apply", "--cached", "--reverse", "--whitespace=error", str(patch))
+        require(git(repo, *binding, "write-tree") == BASE_TREE, "reverse projection failed")
+        git(repo, "-c", "core.autocrlf=false", "-c", "core.eol=lf", *binding,
+            "archive", "--format=zip", "-o", str(archive_path), actual, "--", "packages/dart", *extras)
     source = scratch / "src"
     extract_candidate(archive_path, source, extras)
     require(all(digest(source / path) == sha for path, sha in PRODUCT_FILES.items()), "extracted product bytes changed")
