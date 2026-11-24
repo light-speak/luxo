@@ -196,6 +196,8 @@ func cloneEventContext(source *EventContext) *EventContext {
 		remotePKModels:    cloneBoolMap(source.remotePKModels),
 		ModulePath:        source.ModulePath,
 	}
+	// The private policy catalog is immutable after BuildEventContext returns.
+	result.modelErrorPolicies = source.modelErrorPolicies
 	return result
 }
 
