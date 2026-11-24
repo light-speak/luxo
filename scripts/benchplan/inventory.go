@@ -115,7 +115,23 @@ func verifyProfileInventory(args []string) error {
 	if len(ordinary) == 0 || !maps.EqualFunc(ordinary, isolated, maps.Equal[map[string]struct{}]) {
 		return fmt.Errorf("benchmark profile %q must reproduce its exact ordinary benchmark inventory", profile)
 	}
+	if profile == benchlayout.CodegenLiteralProfile && !verifiedCodegenLiteralLeaves(isolated[benchlayout.CodegenLiteralBenchmark]) {
+		return errors.New("codegen integer literal profile requires the four verified integer and duration leaves")
+	}
 	return nil
+}
+
+func verifiedCodegenLiteralLeaves(leaves map[string]struct{}) bool {
+	cases := [...]string{"duration_leading_zero", "duration_plain", "int_leading_zero", "int_plain"}
+	if len(leaves) != len(cases) {
+		return false
+	}
+	for _, name := range cases {
+		if _, ok := leaves[benchlayout.CodegenLiteralBenchmark+"/"+name+"-2"]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func readInventoryPair(first, second string) (inventory, inventory, error) {

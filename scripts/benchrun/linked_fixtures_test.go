@@ -17,6 +17,7 @@ func TestIsolationProfileCommand(t *testing.T) {
 	for _, tc := range []struct{ pkg, want string }{
 		{"pkg/lux/api", "api-non-identity\t.\n"},
 		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n"},
+		{"pkg/codegen", "codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n"},
 		{"pkg/lux/rpc", ""},
 	} {
 		var output bytes.Buffer

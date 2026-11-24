@@ -10,10 +10,13 @@ const (
 	CodecReaderProfile       = "codec-reader"
 	APINonIdentityProfile    = "api-non-identity"
 	LuviaPrimaryTraceProfile = "luvia-primary-trace"
+	CodegenLiteralProfile    = "codegen-integer-literals"
 	CodecPackage             = "pkg/lux/codec"
 	CodecReaderBenchmark     = "BenchmarkElementPayload"
 	APIPackage               = "pkg/lux/api"
 	LuviaPackage             = "pkg/lux/luvia"
+	CodegenPackage           = "pkg/codegen"
+	CodegenLiteralBenchmark  = "BenchmarkCompileDecimalIntegerLiterals"
 )
 
 var apiIdentityRoots = []string{
@@ -38,6 +41,10 @@ func ProfileForBenchmark(pkg, name string) string {
 		if slices.Contains(luviaIsolatedRoots, root) {
 			return LuviaPrimaryTraceProfile
 		}
+	case CodegenPackage:
+		if root == CodegenLiteralBenchmark {
+			return CodegenLiteralProfile
+		}
 	}
 	return DefaultProfile
 }
@@ -51,6 +58,8 @@ func IsolationProfile(pkg string) (profile, filter string) {
 		return APINonIdentityProfile, "."
 	case LuviaPackage:
 		return LuviaPrimaryTraceProfile, "^" + strings.Join(luviaIsolatedRoots, "$|^") + "$"
+	case CodegenPackage:
+		return CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"
 	default:
 		return "", ""
 	}

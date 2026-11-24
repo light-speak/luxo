@@ -106,6 +106,8 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-api-non-identity-*", writeAPIBenchmarkOverlay)
 	case benchlayout.LuviaPrimaryTraceProfile:
 		return packageTestOverlay(root, packagePath, "bench-luvia-primary-trace-*", writeLuviaBenchmarkOverlay)
+	case benchlayout.CodegenLiteralProfile:
+		return packageTestOverlay(root, packagePath, "bench-codegen-integer-literals-*", writeCodegenLiteralOverlay)
 	default:
 		return performanceOverlay(root, packagePath, baseline)
 	}
