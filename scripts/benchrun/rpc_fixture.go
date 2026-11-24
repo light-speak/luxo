@@ -24,7 +24,9 @@ const (
 	performanceProfile = "rpc-boundary-overlay-v2 " + rpcBoundarySHA +
 		"\ncodec-reader-overlay-v1\napi-non-identity-overlay-v1\nluvia-primary-trace-overlay-v1\ncodegen-integer-literals-overlay-v1" +
 		"\ncodegen-global-receiver-overlay-v1 " + codegenReceiverProjectionSHA +
-		"\nluvia-gateway-identity-overlay-v1 " + luviaGatewayIdentityProjectionSHA
+		"\nluvia-gateway-identity-overlay-v1 " + luviaGatewayIdentityProjectionSHA +
+		"\nlux-short-path-overlay-v1 " + luxFilterFixture + "=" + luxFilterProjectionSHA +
+		" " + luxDecimalFixture + "=" + luxDecimalProjectionSHA
 )
 
 func performanceOverlay(root, packagePath string, baseline bool) (string, func() error, error) {
