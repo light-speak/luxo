@@ -1,0 +1,192 @@
+name: Qualify the staged PR 73 deployment and registration fixes
+
+on:
+  push:
+    branches: [diagnostics/qualify-pr73-deploy-go]
+    paths:
+      - .github/workflows/qualify-pr73-deploy-go.yml
+      - .github/qualification/pr73-deploy.patch.b64
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/qualify-pr73-deploy-go'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: luxo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d luxo_test"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=5
+
+    env:
+      DATABASE_HOST: localhost
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_PREFIX: luxo_test
+      DATABASE_SSL: disable
+      LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_AUDIT_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_TRANSACTION_RACE: '1'
+      NATS_URL: nats://127.0.0.1:4222
+      GOTOOLCHAIN: local
+      QUALIFICATION_BASE: ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+      QUALIFICATION_TREE: 944c2384588c7a0f85aeb98a300e73d2bb722147
+      QUALIFICATION_PATCH_SHA256: ff39e9854c610090404f78de03721a40f887fc832061aaf7ed7cc1225245f433
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+
+      - name: Restore and verify the exact staged product tree
+        run: |
+          set -euo pipefail
+          source="$PWD/.tmp/pr73-deploy-go-source"
+          evidence="$PWD/.tmp/pr73-deploy-go-evidence"
+          mkdir -p "$evidence"
+          patch="$evidence/candidate.patch"
+          base64 -d < .github/qualification/pr73-deploy.patch.b64 > "$patch"
+          printf '%s  %s\n' "$QUALIFICATION_PATCH_SHA256" "$patch" | sha256sum -c -
+          test "$(git rev-parse "$QUALIFICATION_BASE^{tree}")" = ba252c7cace8908cdfcd7c203bc9dc11bb2ba746
+          git worktree add --detach "$source" "$QUALIFICATION_BASE"
+          git -C "$source" apply --index --check --whitespace=error "$patch"
+          git -C "$source" apply --index --whitespace=error "$patch"
+          git -C "$source" apply --reverse --check "$patch"
+          git -C "$source" diff --cached --check
+          test "$(git -C "$source" write-tree)" = "$QUALIFICATION_TREE"
+          git -C "$source" diff --cached --name-only > "$evidence/paths.txt"
+          printf '%s\n' \
+            pkg/codegen/deploy.go \
+            pkg/codegen/deploy_helm.go \
+            pkg/codegen/deploy_helm_test.go \
+            pkg/codegen/deploy_test.go \
+            pkg/codegen/handler.go \
+            pkg/codegen/handler_test.go \
+            | diff - "$evidence/paths.txt"
+          printf '%s %s %s\n' "$QUALIFICATION_BASE" "$QUALIFICATION_TREE" "$QUALIFICATION_PATCH_SHA256" > "$evidence/revision.txt"
+          go version > "$evidence/go-version.txt"
+          test "$(cat "$evidence/go-version.txt")" = 'go version go1.27.1 linux/amd64'
+          cat > "$evidence/source.sha256" <<'SHA256'
+          bc67438450dcef24288cf6a1aaedbca4837ffef0675cb2fb7fcb9d28028cd8d3  pkg/codegen/deploy.go
+          822d444c162d88d534b9f29e286d5078f8743239b7bb23e29172645c472cdde8  pkg/codegen/deploy_helm.go
+          5ee233ee43d528ade3ba6d3e3a667951b62cbd92db742f4e77a91f75246b8638  pkg/codegen/deploy_helm_test.go
+          0b3b9741b196cf6652aa7e5116d6ae32baa376bbaa24777a38eb8bf25287f5d2  pkg/codegen/deploy_test.go
+          ab929bf46d5aaef14d28ead500f507bece7b9f3a2ab3c3523b5ca5b682f5eb29  pkg/codegen/handler.go
+          898db0c8bbe0b59c070468586ac6bd91ec040ed5a7af38b145739ab1cfbe3082  pkg/codegen/handler_test.go
+          SHA256
+          (cd "$source" && sha256sum -c "$evidence/source.sha256")
+          paths=()
+          while IFS= read -r path; do paths+=("$path"); done < "$evidence/paths.txt"
+          (cd "$source" && test -z "$(gofmt -s -l "${paths[@]}")")
+          sh "$source/scripts/setup-modules.sh" "$source"
+
+      - name: Start the owned JetStream fixture
+        run: |
+          set -euo pipefail
+          owner="luxo-qualify-pr73-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker run --detach --name "$owner" --label "org.luxo.audit.owner=$owner" \
+            --publish 127.0.0.1:4222:4222 --publish 127.0.0.1:8222:8222 \
+            nats:2.15.3-alpine -js -m 8222
+          curl --fail --silent --show-error --retry 20 --retry-all-errors \
+            --retry-delay 1 --connect-timeout 2 --max-time 5 http://127.0.0.1:8222/healthz
+          curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8222/jsz | jq --exit-status \
+            '.disabled != true and .config.max_memory > 0 and .config.max_storage > 0'
+
+      - name: Verify root packages with coverage and the CLI race suite
+        run: |
+          set -euo pipefail
+          evidence="$PWD/.tmp/pr73-deploy-go-evidence"
+          cd .tmp/pr73-deploy-go-source
+          export GOWORK="$PWD/go.work"
+          root=0
+          go test -p 2 ./pkg/... -cover -coverprofile="$evidence/root.coverage" -count=1 -timeout=95m -json \
+            > "$evidence/root.jsonl" 2>&1 || root=$?
+          printf 'root %s\n' "$root" >> "$evidence/phases.txt"
+          if (( root != 0 )); then tail -n 80 "$evidence/root.jsonl"; exit "$root"; fi
+          cli=0
+          go test -p 2 -race ./cmd/luxo/... -coverprofile="$evidence/cli.coverage" -count=1 -timeout=15m -json \
+            > "$evidence/cli.jsonl" 2>&1 || cli=$?
+          printf 'cli %s\n' "$cli" >> "$evidence/phases.txt"
+          if (( cli != 0 )); then tail -n 80 "$evidence/cli.jsonl"; exit "$cli"; fi
+          go tool cover -func="$evidence/root.coverage" > "$evidence/root.coverage-summary"
+          for function_name in writeAPIParameterRegistration writeRegistryRoute writeRegisteredParam; do
+            grep -E "/pkg/codegen/handler.go:[0-9]+:[[:space:]]+$function_name[[:space:]]+100\.0%$" \
+              "$evidence/root.coverage-summary"
+          done > "$evidence/registration.coverage"
+          require_passing_tests() {
+            local results="$1" package="$2" expected="$3"
+            jq -Rne --arg package "$package" --argjson expected "$expected" '
+              [inputs | fromjson? | select(.Action == "pass" and .Package == $package) | .Test] as $passed |
+              ($expected - $passed) as $missing |
+              if $missing == [] then $expected else error("missing required tests: " + ($missing | join(", "))) end
+            ' "$results"
+          }
+          require_passing_tests "$evidence/root.jsonl" 'github.com/light-speak/luxo/pkg/codegen' '[
+            "TestComposeInheritsJWTEnvironmentForApplicationServices",
+            "TestHelmReferencesExistingJWTSecretForApplicationServices",
+            "TestWriteAPIRegistrationReservedOutput",
+            "TestWriteRegistryRouteFormatsGoLiterals",
+            "TestWriteAPIRegistrationLongIdentifiers"
+          ]' > "$evidence/codegen.regressions.json"
+          require_passing_tests "$evidence/cli.jsonl" 'github.com/light-speak/luxo/cmd/luxo' '[
+            "TestDeployGeneratesProjectArtifacts",
+            "TestDeployInputErrorsPreserveProject",
+            "TestDeployEmptyModulesDoNotWriteFiles"
+          ]' > "$evidence/cli.regressions.json"
+          go vet -p 2 ./pkg/... ./cmd/... ./cmd/luxo/... > "$evidence/vet.log" 2>&1
+          printf 'vet 0\n' >> "$evidence/phases.txt"
+          mkdir -p "$PWD/.tmp/qualification-bin"
+          export GOBIN="$PWD/.tmp/qualification-bin"
+          export PATH="$GOBIN:$PATH"
+          go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
+          go version -m "$GOBIN/gocyclo" > "$evidence/gocyclo-version.txt"
+          sh scripts/check-go.sh complexity pkg/ cmd/ scripts/ internal/ > "$evidence/complexity.log" 2>&1
+          printf 'complexity 0\n' >> "$evidence/phases.txt"
+          sha256sum -c "$evidence/source.sha256"
+          git diff --exit-code
+          test "$(git write-tree)" = "$QUALIFICATION_TREE"
+
+      - name: Remove the owned source and JetStream fixture
+        if: always()
+        run: |
+          set -euo pipefail
+          owner="luxo-qualify-pr73-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ids=$(docker ps -aq --filter "label=org.luxo.audit.owner=$owner")
+          if [[ -n "$ids" ]]; then
+            while IFS= read -r id; do docker rm -fv "$id"; done <<< "$ids"
+          fi
+          test -z "$(docker ps -aq --filter "label=org.luxo.audit.owner=$owner")"
+          test -z "$(docker volume ls -q --filter "label=org.luxo.audit.owner=$owner")"
+          if [[ -d .tmp/pr73-deploy-go-source ]]; then
+            git worktree remove --force .tmp/pr73-deploy-go-source
+          fi
+
+      - name: Preserve exact coverage and test logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr73-deploy-go-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr73-deploy-go-evidence/
+          if-no-files-found: error
+          retention-days: 14
