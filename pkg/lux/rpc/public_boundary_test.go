@@ -1,3 +1,8 @@
+// luxo:benchmark-isolated-correctness
+//
+// Ordinary Go test runs include this fixture. The performance compiler checks
+// that it only declares correctness fixtures before isolating its linkage.
+
 package rpc
 
 import (
