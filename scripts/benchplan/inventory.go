@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/light-speak/luxo/internal/benchlayout"
 )
 
 type inventory map[string]map[string]struct{}
@@ -83,22 +85,52 @@ func verifyEqualInventories(args []string) error {
 	if len(args) != 3 {
 		return errors.New("usage: benchplan --verify-equal-inventories <ordinary.log> <performance.log>")
 	}
-	var inventories [2]inventory
-	for i, path := range args[1:] {
-		file, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		inventories[i], err = readInventory(file)
-		_ = file.Close()
-		if err != nil {
-			return fmt.Errorf("%s: %w", path, err)
-		}
+	ordinary, performance, err := readInventoryPair(args[1], args[2])
+	if err != nil {
+		return err
 	}
-	if !maps.EqualFunc(inventories[0], inventories[1], maps.Equal[map[string]struct{}]) {
+	if !maps.EqualFunc(ordinary, performance, maps.Equal[map[string]struct{}]) {
 		return errors.New("performance compilation changed the benchmark inventory")
 	}
 	return nil
+}
+
+func verifyProfileInventory(args []string) error {
+	if len(args) != 5 {
+		return errors.New("usage: benchplan --verify-profile-inventory <package> <profile> <ordinary.log> <isolated.log>")
+	}
+	pkg, profile := args[1], args[2]
+	if profile == benchlayout.DefaultProfile || !benchlayout.ValidPerformanceProfile(pkg, profile) {
+		return fmt.Errorf("unknown isolated benchmark profile %q for %s", profile, pkg)
+	}
+	ordinary, isolated, err := readInventoryPair(args[3], args[4])
+	if err != nil {
+		return err
+	}
+	for root := range ordinary {
+		if benchlayout.ProfileForBenchmark(pkg, root) != profile {
+			delete(ordinary, root)
+		}
+	}
+	if len(ordinary) == 0 || !maps.EqualFunc(ordinary, isolated, maps.Equal[map[string]struct{}]) {
+		return fmt.Errorf("benchmark profile %q must reproduce its exact ordinary benchmark inventory", profile)
+	}
+	return nil
+}
+
+func readInventoryPair(first, second string) (inventory, inventory, error) {
+	var inventories [2]inventory
+	for i, path := range []string{first, second} {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		inventories[i], err = readInventory(file)
+		if err := errors.Join(err, file.Close()); err != nil {
+			return nil, nil, fmt.Errorf("%s: %w", path, err)
+		}
+	}
+	return inventories[0], inventories[1], nil
 }
 
 func addMeasurement(result inventory, fields []string) error {
