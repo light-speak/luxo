@@ -1,0 +1,55 @@
+name: Compare PR 82 strict filter and decimal benchmark linkage
+
+on:
+  push:
+    branches: [diagnostics/pr82-lux-short-path]
+    paths:
+      - .github/workflows/diagnose-pr82-lux-short-path.yml
+      - scripts/diagnose-pr82-lux-short-path.sh
+      - scripts/diagnose-pr82-lux-evidence.py
+      - scripts/diagnose-pr82-lux-overlay/main.go
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  sample:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr82-lux-short-path'
+    runs-on: ubuntu-latest
+    timeout-minutes: 32
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Fetch exact inputs from the formal comparison
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin 925f30ee1dcd45882b29130b8ed02836ed88317e 0bcc72b6861423c53b615d3b80a5cad36688d4ff
+          mkdir -p .tmp
+          gh api repos/light-speak/luxo/actions/artifacts/14919831290/zip > .tmp/pr82-short-path-04.zip
+          gh api repos/light-speak/luxo/actions/artifacts/14919152905/zip > .tmp/pr82-short-path-08.zip
+      - name: Compare the matching CPU scope with the default linker
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: 1
+        run: |
+          git diff --exit-code 72f1abb2e57947f056c00ea60514aff7e92828ce -- scripts/diagnose-hosted-perf.sh
+          bash scripts/diagnose-pr82-lux-short-path.sh
+      - name: Preserve selected scope and samples
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr82-lux-short-path-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr82-lux-short-path/
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: true
