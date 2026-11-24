@@ -22,7 +22,8 @@ const (
 	rpcBoundarySHA    = "99658ed681f4110df0db3fc688931fa61cd656f3c62477c04a1ffd4bb567ca8e"
 	// Discovery and sampling must consume the same benchmark compilation profile.
 	performanceProfile = "rpc-boundary-overlay-v2 " + rpcBoundarySHA +
-		"\ncodec-reader-overlay-v1\napi-non-identity-overlay-v1\nluvia-primary-trace-overlay-v1\ncodegen-integer-literals-overlay-v1"
+		"\ncodec-reader-overlay-v1\napi-non-identity-overlay-v1\nluvia-primary-trace-overlay-v1\ncodegen-integer-literals-overlay-v1" +
+		"\ncodegen-global-receiver-overlay-v1 " + codegenReceiverProjectionSHA
 )
 
 func performanceOverlay(root, packagePath string, baseline bool) (string, func() error, error) {

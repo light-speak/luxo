@@ -109,27 +109,39 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{CodecPackage, CodecReaderProfile, "."},
 		{"pkg/lux/rpc", "", ""},
 	} {
-		p, f := IsolationProfile(tc.pkg)
-		if p != tc.profile || f != tc.filter {
-			t.Fatalf("isolation of %s = %q %q, want %q %q", tc.pkg, p, f, tc.profile, tc.filter)
+		got := IsolationProfiles(tc.pkg)
+		if tc.profile == "" {
+			if len(got) != 0 {
+				t.Fatalf("unexpected isolation for %s: %v", tc.pkg, got)
+			}
+			continue
+		}
+		if len(got) != 1 || got[0] != (IsolationSpec{tc.profile, tc.filter}) {
+			t.Fatalf("isolation of %s = %v, want %q %q", tc.pkg, got, tc.profile, tc.filter)
 		}
 	}
 }
 
-func TestCodegenLiteralProfileRequiresPackageAndExactRoot(t *testing.T) {
+func TestCodegenProfilesRequirePackageAndExactRoots(t *testing.T) {
 	for _, tc := range []struct{ pkg, name, want string }{
 		{CodegenPackage, CodegenLiteralBenchmark, CodegenLiteralProfile},
 		{CodegenPackage, CodegenLiteralBenchmark + "/duration_plain-2", CodegenLiteralProfile},
+		{CodegenPackage, CodegenReceiverBenchmark, CodegenReceiverProfile},
+		{CodegenPackage, CodegenReceiverBenchmark + "/用户-2", CodegenReceiverProfile},
+		{CodegenPackage, CodegenReceiverBenchmark + "Sibling-2", DefaultProfile},
 		{CodegenPackage, "BenchmarkGenerateNumericLiteralBindings/plain-2", DefaultProfile},
 		{CodecPackage, CodegenLiteralBenchmark, DefaultProfile},
+		{CodecPackage, CodegenReceiverBenchmark, DefaultProfile},
 	} {
 		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
 			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
 		}
 	}
-	profile, filter := IsolationProfile(CodegenPackage)
-	if profile != CodegenLiteralProfile || filter != "^"+CodegenLiteralBenchmark+"$" ||
-		ValidPerformanceProfile(CodecPackage, CodegenLiteralProfile) {
-		t.Fatalf("unexpected codegen isolation: %q %q", profile, filter)
+	profiles := IsolationProfiles(CodegenPackage)
+	if len(profiles) != 2 || profiles[0] != (IsolationSpec{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"}) ||
+		profiles[1] != (IsolationSpec{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"}) ||
+		ValidPerformanceProfile(CodecPackage, CodegenLiteralProfile) ||
+		ValidPerformanceProfile(CodecPackage, CodegenReceiverProfile) {
+		t.Fatalf("unexpected codegen isolation: %v", profiles)
 	}
 }

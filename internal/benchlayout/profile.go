@@ -11,12 +11,14 @@ const (
 	APINonIdentityProfile    = "api-non-identity"
 	LuviaPrimaryTraceProfile = "luvia-primary-trace"
 	CodegenLiteralProfile    = "codegen-integer-literals"
+	CodegenReceiverProfile   = "codegen-global-receiver"
 	CodecPackage             = "pkg/lux/codec"
 	CodecReaderBenchmark     = "BenchmarkElementPayload"
 	APIPackage               = "pkg/lux/api"
 	LuviaPackage             = "pkg/lux/luvia"
 	CodegenPackage           = "pkg/codegen"
 	CodegenLiteralBenchmark  = "BenchmarkCompileDecimalIntegerLiterals"
+	CodegenReceiverBenchmark = "BenchmarkGlobalReceiverName"
 )
 
 var apiIdentityRoots = []string{
@@ -42,30 +44,45 @@ func ProfileForBenchmark(pkg, name string) string {
 			return LuviaPrimaryTraceProfile
 		}
 	case CodegenPackage:
-		if root == CodegenLiteralBenchmark {
+		switch root {
+		case CodegenLiteralBenchmark:
 			return CodegenLiteralProfile
+		case CodegenReceiverBenchmark:
+			return CodegenReceiverProfile
 		}
 	}
 	return DefaultProfile
 }
 
-// IsolationProfile gives discovery the profile and exact root filter for a package.
-func IsolationProfile(pkg string) (profile, filter string) {
+// IsolationSpec pairs a benchmark compilation profile with its discovery filter.
+type IsolationSpec struct {
+	Name, Filter string
+}
+
+// IsolationProfiles gives discovery the isolated binaries for a package.
+func IsolationProfiles(pkg string) []IsolationSpec {
 	switch pkg {
 	case CodecPackage:
-		return CodecReaderProfile, "."
+		return []IsolationSpec{{CodecReaderProfile, "."}}
 	case APIPackage:
-		return APINonIdentityProfile, "."
+		return []IsolationSpec{{APINonIdentityProfile, "."}}
 	case LuviaPackage:
-		return LuviaPrimaryTraceProfile, "^" + strings.Join(luviaIsolatedRoots, "$|^") + "$"
+		return []IsolationSpec{{LuviaPrimaryTraceProfile, "^" + strings.Join(luviaIsolatedRoots, "$|^") + "$"}}
 	case CodegenPackage:
-		return CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"
+		return []IsolationSpec{
+			{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"},
+			{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"},
+		}
 	default:
-		return "", ""
+		return nil
 	}
 }
 
 func ValidPerformanceProfile(pkg, profile string) bool {
-	isolation, _ := IsolationProfile(pkg)
-	return profile == DefaultProfile || (isolation != "" && profile == isolation)
+	if profile == DefaultProfile {
+		return true
+	}
+	return slices.ContainsFunc(IsolationProfiles(pkg), func(spec IsolationSpec) bool {
+		return spec.Name == profile
+	})
 }

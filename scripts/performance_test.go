@@ -419,6 +419,55 @@ fi
 	}
 }
 
+func TestPerformanceDiscoversBothCodegenProfiles(t *testing.T) {
+	script := performanceStep(t, "performance-scope", "Discover and plan benchmark batches")
+	for _, broken := range []bool{false, true} {
+		fixture := newQualityFixture(t)
+		fixture.write(t, "bin/mkdir", "#!/bin/sh\nexec /bin/mkdir \"$@\"\n")
+		fixture.write(t, "bin/cat", "#!/bin/sh\nexec /bin/cat \"$@\"\n")
+		fixture.write(t, ".tmp/benchmark-packages.txt", "pkg/codegen\n")
+		row := "codegen-global-receiver\\t^BenchmarkGlobalReceiverName$\\n"
+		if broken {
+			row = "codegen-global-receiver\\n"
+		}
+		fixture.write(t, ".tmp/bin/benchrun", `#!/bin/sh
+set -eu
+printf 'benchrun %s\n' "$*" >> "$QUALITY_LOG"
+case "$1" in
+  isolation-profile) printf 'codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n`+row+`' ;;
+  run-performance)
+    case "$*" in
+      *"-test.list="*) printf 'BenchmarkGlobalReceiverName\n' ;;
+    esac
+    ;;
+esac
+`)
+		output, log, err := fixture.run(t, "export GITHUB_OUTPUT=.tmp/outputs RUN_ATTEMPT=1\n"+script)
+		if broken {
+			if err == nil || strings.Contains(log, " pkg/codegen codegen-global-receiver\n") {
+				t.Fatalf("malformed discovery row reached receiver validation: %v\n%s\n%s", err, output, log)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("two-profile discovery failed: %v\n%s\n%s", err, output, log)
+		}
+		for revision, command := range map[string]string{"base": "compile-performance-baseline", "head": "compile-performance"} {
+			for _, profile := range []string{"codegen-integer-literals", "codegen-global-receiver"} {
+				commandLine := "benchrun " + command + " .tmp/" + revision + " .tmp/bin/" + revision + " pkg/codegen " + profile + "\n"
+				if strings.Count(log, commandLine) != 1 {
+					t.Fatalf("missing independent %s discovery:\n%s", profile, log)
+				}
+			}
+		}
+		for _, profile := range []string{"codegen-integer-literals", "codegen-global-receiver"} {
+			if strings.Count(log, "--verify-profile-inventory pkg/codegen "+profile+" ") != 2 {
+				t.Fatalf("missing inventory validation for %s:\n%s", profile, log)
+			}
+		}
+	}
+}
+
 func checkPerformanceCompileRejectsProfile(t *testing.T, fixture qualityFixture, script string) {
 	t.Helper()
 	const profile = ".tmp/plan/benchmark-compile-profile.txt"

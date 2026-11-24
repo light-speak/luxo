@@ -17,7 +17,8 @@ func TestIsolationProfileCommand(t *testing.T) {
 	for _, tc := range []struct{ pkg, want string }{
 		{"pkg/lux/api", "api-non-identity\t.\n"},
 		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n"},
-		{"pkg/codegen", "codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n"},
+		{"pkg/codegen", "codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n" +
+			"codegen-global-receiver\t^BenchmarkGlobalReceiverName$\n"},
 		{"pkg/lux/rpc", ""},
 	} {
 		var output bytes.Buffer
@@ -25,7 +26,14 @@ func TestIsolationProfileCommand(t *testing.T) {
 			t.Fatalf("discovery profile for %s = %q, %v", tc.pkg, &output, err)
 		}
 	}
+	if err := run([]string{"isolation-profile", benchlayout.CodegenPackage}, nil, closedIsolationWriter{}, io.Discard); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("isolation output failure = %v", err)
+	}
 }
+
+type closedIsolationWriter struct{}
+
+func (closedIsolationWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
 
 func TestAPIAndLuviaOverlaysPreserveFixtureBoundaries(t *testing.T) {
 	root, err := filepath.Abs("../..")

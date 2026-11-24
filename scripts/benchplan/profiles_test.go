@@ -188,3 +188,57 @@ func TestCodegenLiteralProfileKeepsExactlyFourLeaves(t *testing.T) {
 		}
 	}
 }
+
+func TestCodegenReceiverInventoryAndIndependentRouting(t *testing.T) {
+	const pkg = "pkg/codegen"
+	const profile = "codegen-global-receiver"
+	const receiver = "BenchmarkGlobalReceiverName"
+	const literal = "BenchmarkCompileDecimalIntegerLiterals"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	const selected = receiver + "/User" + measurement + receiver + "/_Record" + measurement + receiver + "/用户" + measurement
+	const literalMeasurement = literal + "/int_plain" + measurement
+	const extra = receiver + "/Other" + measurement
+	root := benchmarkTempDir(t)
+	ordinary, isolated := root+"/ordinary.log", root+"/isolated.log"
+	for _, tc := range []struct {
+		name, ordinary, isolated string
+		valid                    bool
+	}{
+		{"exact", selected, selected, true},
+		{"missing unicode", selected, strings.ReplaceAll(selected, receiver+"/用户"+measurement, ""), false},
+		{"same wrong name", strings.ReplaceAll(selected, "用户", "Other"), strings.ReplaceAll(selected, "用户", "Other"), false},
+		{"same extra leaf", selected + extra, selected + extra, false},
+		{"literal in isolation", selected, selected + literalMeasurement, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+literalMeasurement+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			if err := run([]string{"--verify-profile-inventory", pkg, profile, ordinary, isolated}, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("receiver inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+	primary := formatShard(benchShard{Groups: []benchGroup{{Package: pkg, Name: receiver}, {Package: pkg, Name: literal}}})
+	confirmation := formatConfirmationBatch([]sampleKey{{pkg, receiver + "/用户-2"}, {pkg, literal + "/int_plain-2"}})
+	for _, tc := range []struct{ batch, a, b string }{
+		{primary, "^(" + receiver + ")$", "^(" + literal + ")$"},
+		{confirmation, "^" + receiver + "$/^用户$", "^" + literal + "$/^int_plain$"},
+	} {
+		if !strings.Contains(tc.batch, pkg+"\t"+profile+"\t"+tc.a+"\n") ||
+			!strings.Contains(tc.batch, pkg+"\tcodegen-integer-literals\t"+tc.b+"\n") {
+			t.Fatalf("codegen profiles must go to separate binaries:\n%s", tc.batch)
+		}
+	}
+	expected, batch := root+"/expected.json", root+"/batch.tsv"
+	const items = `[{"Package":"pkg/codegen","Name":"BenchmarkGlobalReceiverName/用户-2"},{"Package":"pkg/codegen","Name":"BenchmarkCompileDecimalIntegerLiterals/int_plain-2"}]`
+	writeFixture(t, expected, `{"Base":`+items+`,"Head":`+items+"}")
+	writeFixture(t, batch, confirmation)
+	args := []string{"--verify-profile-batch", "confirmation", expected, batch}
+	if err := run(args, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, batch, strings.NewReplacer(profile, "codegen-integer-literals", "codegen-integer-literals", profile).Replace(confirmation))
+	if err := run(args, io.Discard); err == nil {
+		t.Fatal("accepted swapped codegen profiles")
+	}
+}

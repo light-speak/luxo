@@ -428,15 +428,25 @@ jobs:
               fi
               specification=$(.tmp/bin/benchrun isolation-profile "$package")
               if [[ -n "$specification" ]]; then
-                IFS=$'\t' read -r profile filter <<< "$specification"
-                .tmp/bin/benchrun "$compile" ".tmp/${revision}" ".tmp/bin/${revision}" "$package" "$profile"
-                if [[ "$profile" == codec-reader ]]; then
-                  .tmp/bin/benchrun run-performance ".tmp/${revision}" ".tmp/bin/${revision}" "$package" "$profile" \
-                    -test.list='.*' > "$stem.$profile.roots"
-                  test "$(cat "$stem.$profile.roots")" = BenchmarkElementPayload
-                fi
-                record_inventory "$revision" ".tmp/bin/${revision}" "$package" "$stem.$profile" "$profile" "$filter"
-                GOWORK=off go run ./scripts/benchplan --verify-profile-inventory "$package" "$profile" "$stem.log" "$stem.$profile.log"
+                while IFS=$'\t' read -r profile filter extra; do
+                  if [[ -z "$profile" || -z "$filter" || -n "$extra" ]]; then
+                    printf 'Invalid benchmark isolation row for %s\n' "$package" >&2
+                    exit 1
+                  fi
+                  .tmp/bin/benchrun "$compile" ".tmp/${revision}" ".tmp/bin/${revision}" "${package}" "$profile"
+                  case "$profile" in
+                    codec-reader) exclusive_root=BenchmarkElementPayload ;;
+                    codegen-global-receiver) exclusive_root=BenchmarkGlobalReceiverName ;;
+                    *) exclusive_root= ;;
+                  esac
+                  if [[ -n "$exclusive_root" ]]; then
+                    .tmp/bin/benchrun run-performance ".tmp/${revision}" ".tmp/bin/${revision}" "$package" "$profile" \
+                      -test.list='.*' > "$stem.$profile.roots"
+                    test "$(cat "$stem.$profile.roots")" = "$exclusive_root"
+                  fi
+                  record_inventory "$revision" ".tmp/bin/${revision}" "$package" "$stem.$profile" "$profile" "$filter"
+                  GOWORK=off go run ./scripts/benchplan --verify-profile-inventory "$package" "$profile" "$stem.log" "$stem.$profile.log"
+                done <<< "$specification"
               fi
             done
           done < .tmp/benchmark-packages.txt

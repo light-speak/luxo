@@ -31,12 +31,7 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 		return err
 	}
 	if len(args) == 2 && args[0] == "isolation-profile" {
-		profile, filter := benchlayout.IsolationProfile(args[1])
-		if profile == "" {
-			return nil
-		}
-		_, err := fmt.Fprintf(output, "%s\t%s\n", profile, filter)
-		return err
+		return writeIsolationProfiles(output, args[1])
 	}
 	if len(args) < 4 || (args[0] != "compile" && args[0] != "compile-performance" && args[0] != "compile-performance-baseline" && args[0] != "run" && args[0] != "run-performance") {
 		return errors.New("usage: benchrun canonical | performance-profile | isolation-profile package | {compile|compile-performance|compile-performance-baseline|run|run-performance} revision binary-directory logical-package [profile] [test flags]")
@@ -82,6 +77,15 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 	return nil
 }
 
+func writeIsolationProfiles(output io.Writer, pkg string) error {
+	for _, spec := range benchlayout.IsolationProfiles(pkg) {
+		if _, err := fmt.Fprintf(output, "%s\t%s\n", spec.Name, spec.Filter); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func performanceArguments(command, pkg string, args []string) (string, []string, error) {
 	if command == "run" || command == "compile" {
 		return benchlayout.DefaultProfile, args, nil
@@ -108,6 +112,8 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-luvia-primary-trace-*", writeLuviaBenchmarkOverlay)
 	case benchlayout.CodegenLiteralProfile:
 		return packageTestOverlay(root, packagePath, "bench-codegen-integer-literals-*", writeCodegenLiteralOverlay)
+	case benchlayout.CodegenReceiverProfile:
+		return packageTestOverlay(root, packagePath, "bench-codegen-global-receiver-*", writeCodegenReceiverOverlay)
 	default:
 		return performanceOverlay(root, packagePath, baseline)
 	}
