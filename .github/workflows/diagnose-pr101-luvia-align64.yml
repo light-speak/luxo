@@ -1,0 +1,49 @@
+name: Compare PR 101 Luvia function alignment on one native runner
+
+on:
+  push:
+    branches: [diagnostics/pr101-luvia-align64]
+    paths:
+      - .github/workflows/diagnose-pr101-luvia-align64.yml
+      - scripts/diagnose-pr101-luvia-align64.sh
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    if: github.repository == 'light-speak/luxo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the exact source and diagnostic revisions
+        run: >-
+          git fetch --no-tags origin
+          ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+          8f6633bfc9f325c857e1217112a5e2039e2d85de
+          61521c06948d6f4cdf04cd94abb6a19fdd2c5ac7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Compare default and 64-byte function alignment
+        env:
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+        run: bash scripts/diagnose-pr101-luvia-align64.sh
+      - name: Preserve complete timing groups, binary hashes and assembly
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: hosted-pr101-luvia-align64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr101-luvia-align64/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove uploaded evidence
+        if: always()
+        run: rm -rf -- .tmp/hosted-pr101-luvia-align64
