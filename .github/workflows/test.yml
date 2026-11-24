@@ -404,16 +404,28 @@ jobs:
           set -euo pipefail
           mkdir -p .tmp/base/.tmp .tmp/head/.tmp
           mkdir -p .tmp/bin .tmp/test-tmp .tmp/benchmark-inventory/base .tmp/benchmark-inventory/head
+          .tmp/bin/benchrun performance-profile > .tmp/benchmark-compile-profile.txt
+          record_inventory() {
+            local revision="$1" binaries="$2" package="$3" stem="$4"
+            .tmp/bin/benchrun run ".tmp/${revision}" "$binaries" "$package" \
+              -test.run='^$' -test.bench=. -test.benchmem -test.benchtime=1x \
+              -test.count=1 -test.cpu=2 -test.timeout=180s > "$stem.raw.log"
+            GOWORK=off go run ./scripts/benchplan --normalize "$stem.raw.log" "$stem.log"
+          }
           while IFS= read -r package; do
             for revision in base head; do
-              .tmp/bin/benchrun compile ".tmp/${revision}" ".tmp/bin/${revision}" "${package}"
-              .tmp/bin/benchrun run ".tmp/${revision}" ".tmp/bin/${revision}" "${package}" \
-                -test.run='^$' -test.bench=. -test.benchmem -test.benchtime=1x \
-                -test.count=1 -test.cpu=2 -test.timeout=180s \
-                > ".tmp/benchmark-inventory/${revision}/${package//\//-}.raw.log"
-              GOWORK=off go run ./scripts/benchplan --normalize \
-                ".tmp/benchmark-inventory/${revision}/${package//\//-}.raw.log" \
-                ".tmp/benchmark-inventory/${revision}/${package//\//-}.log"
+              stem=".tmp/benchmark-inventory/${revision}/${package//\//-}"
+              compile=compile-performance
+              if [[ "$revision" == base ]]; then
+                compile=compile-performance-baseline
+              fi
+              .tmp/bin/benchrun "$compile" ".tmp/${revision}" ".tmp/bin/${revision}" "${package}"
+              record_inventory "$revision" ".tmp/bin/${revision}" "$package" "$stem"
+              if [[ "$package" == pkg/lux/rpc ]]; then
+                .tmp/bin/benchrun compile ".tmp/${revision}" ".tmp/bin/ordinary-${revision}" "${package}"
+                record_inventory "$revision" ".tmp/bin/ordinary-${revision}" "$package" "$stem.ordinary"
+                GOWORK=off go run ./scripts/benchplan --verify-equal-inventories "$stem.ordinary.log" "$stem.log"
+              fi
             done
           done < .tmp/benchmark-packages.txt
           matrix=$(GOWORK=off go run ./scripts/benchplan .tmp/benchmark-packages.txt .tmp/benchmark-inventory .tmp/benchmark-plan)
@@ -433,6 +445,7 @@ jobs:
             .tmp/*benchmark-packages.txt
             .tmp/changed-files.txt
             .tmp/benchmark-revisions.txt
+            .tmp/benchmark-compile-profile.txt
 
   performance-samples:
     needs: performance-scope
@@ -501,9 +514,11 @@ jobs:
           sh scripts/setup-modules.sh .tmp/base
           sh scripts/setup-modules.sh .tmp/head
           GOWORK=off go build -o .tmp/bin/benchrun ./scripts/benchrun
+          .tmp/bin/benchrun performance-profile > .tmp/benchmark-compile-profile.txt
+          cmp .tmp/benchmark-compile-profile.txt .tmp/plan/benchmark-compile-profile.txt
           while IFS=$'\t' read -r package filter; do
-            .tmp/bin/benchrun compile .tmp/base .tmp/bin/base "${package}"
-            .tmp/bin/benchrun compile .tmp/head .tmp/bin/head "${package}"
+            .tmp/bin/benchrun compile-performance-baseline .tmp/base .tmp/bin/base "${package}"
+            .tmp/bin/benchrun compile-performance .tmp/head .tmp/bin/head "${package}"
           done < .tmp/benchmark-batch.tsv
 
       - name: Run adaptive interleaved benchmark samples

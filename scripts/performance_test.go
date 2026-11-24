@@ -331,6 +331,34 @@ func TestPerformancePlanArtifactUsesProducingAttempt(t *testing.T) {
 	t.Fatal("missing benchmark plan loading")
 }
 
+func TestPerformanceBindsRPCCompileProfileAndCompleteInventory(t *testing.T) {
+	discover := performanceStep(t, "performance-scope", "Discover and plan benchmark batches")
+	compile := performanceStep(t, "performance-samples", "Compile benchmark binaries")
+	for _, evidence := range []struct{ script, required string }{
+		{discover, "compile=compile-performance-baseline"},
+		{discover, "compile=compile-performance"},
+		{discover, "benchrun performance-profile > .tmp/benchmark-compile-profile.txt"},
+		{discover, "--verify-equal-inventories"},
+		{discover, `benchrun compile ".tmp/${revision}" ".tmp/bin/ordinary-${revision}" "${package}"`},
+		{compile, "benchrun compile-performance-baseline .tmp/base"},
+		{compile, "benchrun compile-performance .tmp/head"},
+		{compile, "cmp .tmp/benchmark-compile-profile.txt .tmp/plan/benchmark-compile-profile.txt"},
+	} {
+		if !strings.Contains(evidence.script, evidence.required) {
+			t.Errorf("performance pipeline lost %q", evidence.required)
+		}
+	}
+	for _, step := range readQualityWorkflow(t).Jobs["performance-scope"].Steps {
+		if step.Name == "Preserve benchmark plan and discovery evidence" {
+			if !strings.Contains(step.With["path"], ".tmp/benchmark-compile-profile.txt") {
+				t.Fatal("producing attempt lost its compile profile")
+			}
+			return
+		}
+	}
+	t.Fatal("missing plan evidence")
+}
+
 func TestPerformancePreparesScratchWithinBothRevisions(t *testing.T) {
 	for _, stage := range []struct{ job, step string }{
 		{"performance-scope", "Discover and plan benchmark batches"},
@@ -342,11 +370,17 @@ func TestPerformancePreparesScratchWithinBothRevisions(t *testing.T) {
 				fixture.write(t, ".tmp/"+revision+"/go.mod", "")
 			}
 			fixture.write(t, "bin/mkdir", "#!/bin/sh\nexec /bin/mkdir \"$@\"\n")
+			fixture.write(t, "bin/cmp", "#!/bin/sh\nexec /usr/bin/cmp \"$@\"\n")
+			fixture.write(t, ".tmp/plan/benchmark-compile-profile.txt", "profile-v1\n")
 			fixture.write(t, "scripts/setup-modules.sh", "#!/bin/sh\nexit 0\n")
 			fixture.write(t, ".tmp/benchmark-packages.txt", "pkg/lux/pg\n")
 			fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/lux/pg\t^BenchmarkPendingMigrationFiles$\n")
 			fixture.write(t, ".tmp/bin/benchrun", `#!/bin/sh
 set -eu
+if [ "$1" = performance-profile ]; then
+    printf 'profile-v1\n'
+    exit
+fi
 printf '%s %s\n' "$1" "$2" >> "$QUALITY_LOG"
 if [ ! -d "$2/.tmp" ]; then
     printf 'missing benchmark scratch: %s/.tmp\n' "$2" >&2
@@ -358,12 +392,32 @@ fi
 			if err != nil {
 				t.Fatalf("benchmark setup failed: %v\n%s", err, output)
 			}
-			for _, revision := range []string{"base", "head"} {
-				if !strings.Contains(log, "compile .tmp/"+revision+"\n") {
+			for revision, action := range map[string]string{"base": "compile-performance-baseline", "head": "compile-performance"} {
+				if !strings.Contains(log, action+" .tmp/"+revision+"\n") {
 					t.Errorf("revision %s did not reach compilation:\n%s", revision, log)
 				}
 			}
+			if stage.job == "performance-samples" {
+				checkPerformanceCompileRejectsProfile(t, fixture, script)
+			}
 		})
+	}
+}
+
+func checkPerformanceCompileRejectsProfile(t *testing.T, fixture qualityFixture, script string) {
+	t.Helper()
+	const profile = ".tmp/plan/benchmark-compile-profile.txt"
+	fixture.write(t, profile, "different-profile\n")
+	for _, test := range []string{"stale", "missing"} {
+		if test == "missing" {
+			if err := os.Remove(filepath.Join(string(fixture), profile)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		output, log, err := fixture.run(t, ": > \"$QUALITY_LOG\"\n"+script)
+		if err == nil || strings.Contains(log, "compile-performance") || strings.Contains(log, "compile .tmp/") {
+			t.Fatalf("%s profile reached benchmark compilation: err=%v log=%q\n%s", test, err, log, output)
+		}
 	}
 }
 

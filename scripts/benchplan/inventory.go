@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"go/token"
 	"io"
+	"maps"
 	"math"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -75,6 +77,28 @@ func readInventory(input io.Reader) (inventory, error) {
 		return nil, errors.New("inventory requires successful benchmark measurements and PASS")
 	}
 	return result, nil
+}
+
+func verifyEqualInventories(args []string) error {
+	if len(args) != 3 {
+		return errors.New("usage: benchplan --verify-equal-inventories <ordinary.log> <performance.log>")
+	}
+	var inventories [2]inventory
+	for i, path := range args[1:] {
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		inventories[i], err = readInventory(file)
+		_ = file.Close()
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+	}
+	if !maps.EqualFunc(inventories[0], inventories[1], maps.Equal[map[string]struct{}]) {
+		return errors.New("performance compilation changed the benchmark inventory")
+	}
+	return nil
 }
 
 func addMeasurement(result inventory, fields []string) error {

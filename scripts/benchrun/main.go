@@ -26,8 +26,12 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 	if len(args) == 1 && args[0] == "canonical" {
 		return canonical(input, output)
 	}
-	if len(args) < 4 || (args[0] != "compile" && args[0] != "run") {
-		return errors.New("usage: benchrun canonical | {compile|run} revision binary-directory logical-package [test flags]")
+	if len(args) == 1 && args[0] == "performance-profile" {
+		_, err := fmt.Fprintln(output, performanceProfile)
+		return err
+	}
+	if len(args) < 4 || (args[0] != "compile" && args[0] != "compile-performance" && args[0] != "compile-performance-baseline" && args[0] != "run") {
+		return errors.New("usage: benchrun canonical | performance-profile | {compile|compile-performance|compile-performance-baseline|run} revision binary-directory logical-package [test flags]")
 	}
 	root, err := filepath.Abs(args[1])
 	if err != nil {
@@ -46,21 +50,39 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 	}
 	for _, path := range packages {
 		binary := filepath.Join(bin, strings.ReplaceAll(path, "/", "-")+".test")
-		var cmd *exec.Cmd
-		if args[0] == "compile" {
-			cmd = exec.Command("go", "test", "-trimpath", "-c", "./"+path, "-o", binary)
-			cmd.Dir = root
-			cmd.Env = append(os.Environ(), "GOWORK="+filepath.Join(root, "go.work"))
-		} else {
-			cmd = exec.Command(binary, args[4:]...)
-			cmd.Dir = filepath.Join(root, path)
+		if args[0] != "run" {
+			if err := compileBenchmarks(root, binary, path, args[0], output, errorOutput); err != nil {
+				return fmt.Errorf("%s %s: %w", args[0], path, err)
+			}
+			continue
 		}
+		cmd := exec.Command(binary, args[4:]...)
+		cmd.Dir = filepath.Join(root, path)
 		cmd.Stdout, cmd.Stderr = output, errorOutput
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("%s %s: %w", args[0], path, err)
 		}
 	}
 	return nil
+}
+
+func compileBenchmarks(root, binary, packagePath, command string, output, errorOutput io.Writer) (err error) {
+	args := []string{"test", "-trimpath", "-c"}
+	if command != "compile" {
+		overlay, cleanup, err := performanceOverlay(root, packagePath, command == "compile-performance-baseline")
+		if err != nil {
+			return err
+		}
+		defer func() { err = errors.Join(err, cleanup()) }()
+		if overlay != "" {
+			args = append(args, "-overlay="+overlay)
+		}
+	}
+	cmd := exec.Command("go", append(args, "./"+packagePath, "-o", binary)...)
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "GOWORK="+filepath.Join(root, "go.work"))
+	cmd.Stdout, cmd.Stderr = output, errorOutput
+	return cmd.Run()
 }
 
 func canonical(input io.Reader, output io.Writer) error {
