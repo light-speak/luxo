@@ -97,6 +97,7 @@ set -eu
 test "$1" = run-performance
 benchmark_bin=$3
 benchmark_package=$4
+test "$2" = "$GITHUB_WORKSPACE/.tmp/${benchmark_bin##*/}"
 test "$5" = default
 shift 5
 case "$benchmark_package" in
@@ -168,6 +169,10 @@ case "$1 $2 $3" in
   "run ./scripts/benchgate .tmp/benchstat-control.csv")
     test -s "$3"
     test "${FAIL_STAGE:-}" != control
+    ;;
+  "run ./scripts/benchgate .tmp/benchstat-control-reversed.csv")
+    test -s "$3"
+    test "${FAIL_STAGE:-}" != control-reversed
     ;;
   *) exit 42 ;;
 esac
@@ -569,7 +574,7 @@ func TestPerformanceResolvesQualificationBaseline(t *testing.T) {
 
 func TestPerformanceQualificationChecksSameBinaryControl(t *testing.T) {
 	script := performanceStep(t, "performance-samples", "Run adaptive interleaved benchmark samples")
-	for _, failure := range []string{"", "control"} {
+	for _, failure := range []string{"control-reversed", "", "control"} {
 		fixture := samplingFixture(t, true)
 		output, log, err := fixture.run(t, samplingPrefix(fixture, failure)+"export PERFORMANCE_MODE=qualification\n"+script)
 		if (err != nil) != (failure != "") {
@@ -578,6 +583,12 @@ func TestPerformanceQualificationChecksSameBinaryControl(t *testing.T) {
 		if strings.Count(log, "base -test.run=^$ -test.bench=^BenchmarkB$") != 30 ||
 			strings.Count(log, "head -test.run=^$ -test.bench=^BenchmarkB$") != 10 {
 			t.Fatalf("qualification must compare the baseline with itself using 10 pairs\n%s", log)
+		}
+		if !strings.Contains(log, "base=.tmp/benchmark-control-base.txt head=.tmp/benchmark-control-head.txt") ||
+			!strings.Contains(log, "base=.tmp/benchmark-control-head.txt head=.tmp/benchmark-control-base.txt") ||
+			!strings.Contains(log, "./scripts/benchgate .tmp/benchstat-control.csv") ||
+			!strings.Contains(log, "./scripts/benchgate .tmp/benchstat-control-reversed.csv") {
+			t.Fatalf("qualification must score both directions of the same measurements\n%s", log)
 		}
 	}
 }

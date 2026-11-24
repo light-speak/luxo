@@ -730,7 +730,14 @@ jobs:
               run_group control .tmp/benchmark-confirmation-batch.tsv
               GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-confirmation-expected.json .tmp/benchmark-control-base.txt .tmp/benchmark-control-head.txt
               .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-control-base.txt head=.tmp/benchmark-control-head.txt > .tmp/benchstat-control.csv 2> .tmp/benchstat-control-warnings.txt
-              if ! GOWORK=off go run ./scripts/benchgate .tmp/benchstat-control.csv | tee .tmp/benchmark-control-gate.txt; then
+              .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-control-head.txt head=.tmp/benchmark-control-base.txt > .tmp/benchstat-control-reversed.csv 2> .tmp/benchstat-control-reversed-warnings.txt
+              control_failed=false
+              for direction in control control-reversed; do
+                if ! GOWORK=off go run ./scripts/benchgate ".tmp/benchstat-${direction}.csv" | tee ".tmp/benchmark-${direction}-gate.txt"; then
+                  control_failed=true
+                fi
+              done
+              if [[ "$control_failed" == true ]]; then
                 echo "::error::Same-binary control failed. Qualification evidence is unstable."
                 exit 1
               fi
