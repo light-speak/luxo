@@ -21,7 +21,14 @@ base=ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
 head=ec041a07b105c9caf9e327a2cbf73de772582d00
 product=b0b7d9b7c51aa67f14bf8545f05e2339ae26f187
 mode="${1:---plan-only}"
-[[ $# -le 1 && ( "$mode" == run || "$mode" == --plan-only ) ]]
+scope="${2:-all-confirmed}"
+[[ $# -le 2 && ( "$mode" == run || "$mode" == --plan-only ) ]] || exit 2
+case "$scope" in
+  all-confirmed) target_cpu= ;;
+  epyc-7763) target_cpu='AMD EPYC 7763 64-Core Processor' ;;
+  epyc-9v74) target_cpu='AMD EPYC 9V74 80-Core Processor' ;;
+  *) printf 'Unknown replay scope: %s\n' "$scope" >&2; exit 2 ;;
+esac
 mkdir -p "$repo/.tmp"
 test ! -L "$repo/.tmp"
 scratch=$(mktemp -d "$repo/.tmp/pr71-all-confirmed.XXXXXXXX")
@@ -44,7 +51,7 @@ mkdir "$evidence"
 test "$(git -C "$repo" merge-tree --write-tree "$base" "$head")" = "$product"
 printf 'base=%s\nhead=%s\nproduct_tree=%s\nofficial_tested_merge=%s\n' \
   "$base" "$head" "$product" 12fc97a91421082200f0fbbf9c9914fb1a68ca8d > "$evidence/revisions.txt"
-python3 - "$evidence" <<'PYTHON'
+python3 - "$evidence" "$scope" "$target_cpu" <<'PYTHON'
 import json
 from pathlib import Path
 import re
@@ -186,10 +193,21 @@ rows = [
     "role": "direct-duration-control"
   }
 ]
-out = Path(sys.argv[1])
-assert len(rows) == 27
-assert sum(row["role"] == "official-confirmed" for row in rows) == 19
-assert len({(row["package"], row["name"]) for row in rows}) == 27
+out, scope, target_cpu = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+gateway_before = "BenchmarkGatewayIdentity/anonymous/before"
+gateway_after = "BenchmarkGatewayIdentity/anonymous/after"
+if scope == "epyc-7763":
+    other_models = {"BenchmarkStaticJWT/Identity/After", gateway_before}
+    rows = [row for row in rows if
+            (row["role"] == "official-confirmed" and row["name"] not in other_models)
+            or row["name"] == "BenchmarkStaticJWT/Sign/After"
+            or row["role"] == "direct-duration-control"]
+elif scope == "epyc-9v74":
+    rows = [row for row in rows if row["name"] in (gateway_before, gateway_after)]
+expected_count, official_count = {"all-confirmed": (27, 19), "epyc-7763": (22, 17), "epyc-9v74": (2, 1)}[scope]
+assert len(rows) == expected_count
+assert sum(row["role"] == "official-confirmed" for row in rows) == official_count
+assert len({(row["package"], row["name"]) for row in rows}) == expected_count
 packages = sorted({row["package"] for row in rows})
 cases, expected = [], []
 for index, package in enumerate(packages, 1):
@@ -201,10 +219,14 @@ for index, package in enumerate(packages, 1):
 (out / "packages.txt").write_text("\n".join(packages) + "\n")
 (out / "expected.json").write_text(json.dumps({"Base": expected, "Head": expected}, indent=2) + "\n")
 (out / "scope.json").write_text(json.dumps(rows, indent=2) + "\n")
+(out / "plan.txt").write_text(
+    f"scope={scope}\ntarget_cpu={target_cpu or 'any'}\n"
+    f"groups=primary,confirmation samples_per_group=10 comparisons=aa,ab "
+    f"expected_leaves={expected_count} official_confirmed={official_count}\n"
+)
 PYTHON
 if [[ "$mode" == --plan-only ]]; then
-  cat "$evidence/revisions.txt" "$evidence/cases.tsv"
-  printf 'groups=primary,confirmation samples_per_group=10 comparisons=aa,ab expected_leaves=27 official_confirmed=19\n'
+  cat "$evidence/revisions.txt" "$evidence/cases.tsv" "$evidence/plan.txt"
   exit 0
 fi
 export TMPDIR="$scratch/tmp" GOWORK=off GOTOOLCHAIN=local
@@ -277,12 +299,12 @@ for role in base head; do
   cat "$evidence"/inventory-"$role"-*.txt > "$scratch/inventory-$role.raw.txt"
   "$scratch/bin/benchplan" --normalize "$scratch/inventory-$role.raw.txt" "$evidence/inventory-$role.txt"
 done
-python3 - "$evidence" <<'PYTHON'
+python3 - "$evidence" "$scope" "$target_cpu" <<'PYTHON'
 import collections
 import json
 from pathlib import Path
 import sys
-out = Path(sys.argv[1])
+out, scope, target_cpu = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 expected = json.loads((out / "expected.json").read_text())
 cpus = {}
 for role, key in (("base", "Base"), ("head", "Head")):
@@ -303,20 +325,34 @@ for role, key in (("base", "Base"), ("head", "Head")):
     assert len(observed_cpus) == 1 and next(iter(observed_cpus))
     cpus[role] = observed_cpus
 assert cpus["base"] == cpus["head"], cpus
+actual = next(iter(cpus["base"]))
+host = {line.split(":", 1)[1].strip()
+        for line in (out / "environment.txt").read_text().splitlines()
+        if line.startswith("Model name:")}
+assert host == {actual}, (host, actual)
+(out / "runner-cpu.json").write_text(json.dumps({
+    "scope": scope,
+    "expected": target_cpu or None,
+    "observed": actual,
+    "matchesRequestedModel": not target_cpu or actual == target_cpu,
+}, indent=2) + "\n")
 PYTHON
 # These extra head-native benchmarks are observations, not paired historical evidence.
-"$scratch/bin/benchrun" compile "$scratch/source/head" "$scratch/bin/head-native" pkg/lux/auth \
-  > "$evidence/auth-head-native.compile.log" 2>&1
-"$scratch/bin/benchrun" run "$scratch/source/head" "$scratch/bin/head-native" pkg/lux/auth \
-  -test.run='^$' -test.bench='^BenchmarkJWTDurationConfig$/^(1e-1\*10s|0x1p-1\*24h)$' \
-  -test.benchmem -test.benchtime=1x -test.count=1 -test.cpu=2 -test.timeout=90s > "$evidence/auth-head-only.txt"
-test "$(grep -c '^BenchmarkJWTDurationConfig/' "$evidence/auth-head-only.txt")" = 2
-record_binaries head-native
+if [[ "$scope" != epyc-9v74 ]]; then
+  "$scratch/bin/benchrun" compile "$scratch/source/head" "$scratch/bin/head-native" pkg/lux/auth \
+    > "$evidence/auth-head-native.compile.log" 2>&1
+  "$scratch/bin/benchrun" run "$scratch/source/head" "$scratch/bin/head-native" pkg/lux/auth \
+    -test.run='^$' -test.bench='^BenchmarkJWTDurationConfig$/^(1e-1\*10s|0x1p-1\*24h)$' \
+    -test.benchmem -test.benchtime=1x -test.count=1 -test.cpu=2 -test.timeout=90s > "$evidence/auth-head-only.txt"
+  test "$(grep -c '^BenchmarkJWTDurationConfig/' "$evidence/auth-head-only.txt")" = 2
+  record_binaries head-native
+fi
 sample_groups
 bind_pr71_sources after
 python3 - "$evidence" <<'PYTHON'
 import csv
 from collections import Counter
+import json
 from pathlib import Path
 import sys
 out = Path(sys.argv[1])
@@ -333,7 +369,8 @@ for row in rows:
     found = {line[5:].strip() for line in raw.splitlines() if line.startswith("cpu: ")}
     assert len(found) == 1 and next(iter(found))
     cpus.update(found)
-assert len(cpus) == 1, cpus
+recorded_cpu = json.loads((out / "runner-cpu.json").read_text())["observed"]
+assert cpus == {recorded_cpu}, (cpus, recorded_cpu)
 PYTHON
 status=0
 printf 'comparison\tgate_exit\n' > "$evidence/verdicts.tsv"
@@ -355,5 +392,10 @@ done
 cat "$evidence/verdicts.tsv"
 if ! grep -Fxq $'aa\t0' "$evidence/verdicts.tsv"; then
   printf '%s\n' 'Same-binary control crossed the unchanged threshold; attribution is inconclusive.'
+fi
+cat "$evidence/runner-cpu.json"
+if ! jq -e '.matchesRequestedModel' "$evidence/runner-cpu.json" >/dev/null; then
+  printf '%s\n' 'Runner model did not match the requested scope. Samples are retained as observations.'
+  if (( status == 0 )); then status=3; fi
 fi
 exit "$status"

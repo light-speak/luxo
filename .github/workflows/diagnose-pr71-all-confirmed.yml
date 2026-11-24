@@ -1,8 +1,8 @@
-name: Diagnose all confirmed PR 71 performance leaves
+name: Replay PR 71 benchmarks by AMD EPYC model
 
 on:
   push:
-    branches: [diagnostics/pr71-all-confirmed]
+    branches: [diagnostics/pr71-amd-scope]
     paths:
       - .github/workflows/diagnose-pr71-all-confirmed.yml
       - scripts/diagnose-pr71-all-confirmed.sh
@@ -16,7 +16,12 @@ concurrency:
 
 jobs:
   compare:
-    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr71-all-confirmed'
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr71-amd-scope'
+    name: Compare PR 71 on a native runner for ${{ matrix.scope }}
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [epyc-7763, epyc-9v74]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -39,12 +44,13 @@ jobs:
           GOTOOLCHAIN: local
           GOAMD64: v1
           CGO_ENABLED: 1
-        run: bash scripts/diagnose-pr71-all-confirmed.sh run
+          REPLAY_SCOPE: ${{ matrix.scope }}
+        run: bash scripts/diagnose-pr71-all-confirmed.sh run "$REPLAY_SCOPE"
       - name: Preserve source bindings and both complete sample groups
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: hosted-pr71-all-confirmed-${{ github.run_id }}-${{ github.run_attempt }}
+          name: hosted-pr71-${{ matrix.scope }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/hosted-pr71-all-confirmed/
           if-no-files-found: error
           retention-days: 14
