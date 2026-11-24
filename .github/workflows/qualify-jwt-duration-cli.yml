@@ -1,0 +1,133 @@
+name: Qualify the staged JWT duration CLI
+
+on:
+  push:
+    branches: [diagnostics/qualify-jwt-duration-cli]
+    paths:
+      - .github/workflows/qualify-jwt-duration-cli.yml
+      - .github/qualification/jwt-duration.patch.b64
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/qualify-jwt-duration-cli'
+    runs-on: ubuntu-latest
+    timeout-minutes: 42
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: luxo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d luxo_test"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=5
+
+    env:
+      DATABASE_HOST: localhost
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_PREFIX: luxo_test
+      DATABASE_SSL: disable
+      LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_AUDIT_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_TRANSACTION_RACE: '1'
+      GOTOOLCHAIN: local
+      QUALIFICATION_BASE: a75a0acce23b30e3f99d44b0c47f746901b82bb8
+      QUALIFICATION_TREE: 0c47442706e22a5c5d252cedb3db4073e95c80e3
+      QUALIFICATION_PATCH_SHA256: 99d8bde37281f7cf23263d9d481223f20167d4133682ab6ef5b134c04b07b750
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+
+      - name: Restore and verify the exact staged product tree
+        run: |
+          set -euo pipefail
+          source="$PWD/.tmp/jwt-duration-cli-source"
+          evidence="$PWD/.tmp/jwt-duration-cli-evidence"
+          mkdir -p "$evidence"
+          patch="$evidence/candidate.patch"
+          base64 -d .github/qualification/jwt-duration.patch.b64 > "$patch"
+          printf '%s  %s\n' "$QUALIFICATION_PATCH_SHA256" "$patch" | sha256sum -c
+          test "$(git rev-parse "$QUALIFICATION_BASE^{tree}")" = d119706aff9f4b3f0564f3725fa491953408a124
+          git worktree add --detach "$source" "$QUALIFICATION_BASE"
+          git -C "$source" apply --index --check --whitespace=error "$patch"
+          git -C "$source" apply --index --whitespace=error "$patch"
+          git -C "$source" apply --reverse --check "$patch"
+          git -C "$source" diff --cached --check
+          test "$(git -C "$source" write-tree)" = "$QUALIFICATION_TREE"
+          git -C "$source" diff --cached --name-only > "$evidence/paths.txt"
+          printf '%s\n' pkg/lux/auth/claims_test.go pkg/lux/auth/jwt.go pkg/lux/auth/jwt_duration_test.go pkg/lux/auth/purpose_test.go pkg/lux/auth/static_bench_test.go pkg/lux/auth/static_test.go | diff - "$evidence/paths.txt"
+          printf '%s %s %s\n' "$QUALIFICATION_BASE" "$QUALIFICATION_TREE" "$QUALIFICATION_PATCH_SHA256" > "$evidence/revision.txt"
+          go version > "$evidence/go-version.txt"
+          test "$(cat "$evidence/go-version.txt")" = 'go version go1.27.1 linux/amd64'
+          sh "$source/scripts/setup-modules.sh" "$source"
+
+      - name: Verify the CLI race suite and real PostgreSQL migration cases
+        run: |
+          set -euo pipefail
+          evidence="$PWD/.tmp/jwt-duration-cli-evidence"
+          cd .tmp/jwt-duration-cli-source
+          export GOWORK="$PWD/go.work"
+          cli=0
+          go test -p 2 -race ./cmd/luxo/... -coverprofile="$evidence/cli.coverage" -count=1 -timeout=30m -json \
+            > "$evidence/cli.jsonl" 2>&1 || cli=$?
+          printf 'cli %s\n' "$cli" > "$evidence/phases.txt"
+          if (( cli != 0 )); then tail -n 80 "$evidence/cli.jsonl"; exit "$cli"; fi
+          python3 - "$evidence/cli.jsonl" <<'PYCLI'
+          from pathlib import Path
+          import json, sys
+          required = {"TestMigrationDownInvalidCountPreservesAppliedSchema",
+                      "TestMigrationDownValidCountUsesRequestedLimit",
+                      "TestMigrationRecheckKeepsAlreadyAppliedState"}
+          passed = set()
+          package_passed = False
+          for line in Path(sys.argv[1]).read_text().splitlines():
+              if not line.startswith("{"):
+                  continue
+              event = json.loads(line)
+              if event.get("Package") == "github.com/light-speak/luxo/cmd/luxo" and event["Action"] == "pass":
+                  if "Test" in event:
+                      passed.add(event["Test"])
+                  else:
+                      package_passed = True
+          if not package_passed or not required <= passed:
+              raise SystemExit(f"missing CLI or real PostgreSQL checks: {sorted(required - passed)}")
+          print("CLI and all three real PostgreSQL checks passed")
+          PYCLI
+          go vet -p 2 ./cmd/luxo/... > "$evidence/vet.log" 2>&1
+          git diff --exit-code
+          test "$(git write-tree)" = "$QUALIFICATION_TREE"
+
+      - name: Remove the owned source checkout
+        if: always()
+        run: |
+          if [[ -d .tmp/jwt-duration-cli-source ]]; then
+            git worktree remove --force .tmp/jwt-duration-cli-source
+          fi
+
+      - name: Preserve exact coverage and test logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: jwt-duration-cli-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/jwt-duration-cli-evidence/
+          if-no-files-found: error
+          retention-days: 14
