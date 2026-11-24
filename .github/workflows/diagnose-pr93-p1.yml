@@ -1,0 +1,58 @@
+name: Verify PR 93 original timing and independent single-parameter optimization
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [diagnostics/hosted-perf-pr71-pr72]
+    paths:
+      - .github/workflows/diagnose-pr93-p1.yml
+      - scripts/diagnose-pr93-p1.sh
+      - scripts/diagnose-pr93-p1.py
+      - scripts/diagnose-pr93-p1/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-pr93-p1
+  cancel-in-progress: false
+
+jobs:
+  diagnose-pr93-p1:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [codegen, semantic]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Measure original A/H and symmetric-test production H versus H plus P1
+        timeout-minutes: 85
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+        run: bash scripts/diagnose-pr93-p1.sh '${{ matrix.suite }}'
+      - name: Preserve exact executables, source, all nine targets and independent direct-path verdict
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: hosted-pr93-p1-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr93-p1-${{ matrix.suite }}/
+          include-hidden-files: true
+          if-no-files-found: error
+          compression-level: 1
+          retention-days: 14
+      - name: Remove only owned runner evidence after upload
+        if: always()
+        run: rm -rf -- .tmp/hosted-pr93-p1-${{ matrix.suite }}
