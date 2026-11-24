@@ -1,8 +1,12 @@
-name: Qualify Dart snapshots natively
+name: Qualify Dart snapshot boundaries natively
 
 on:
   push:
     branches: [diagnostics/dart-snapshot-native]
+    paths:
+      - '.github/workflows/qualify-dart-snapshot-native.yml'
+      - '.github/qualification/dart-snapshot-native.py'
+      - '.github/qualification/dart-snapshot-product.patch.b64'
 
 permissions:
   contents: read
@@ -32,16 +36,16 @@ jobs:
         with:
           sdk: '3.13.4'
 
-      - name: Verify the pinned product on the native runner
+      - name: Verify the pinned native Dart boundary
         env:
           DART_NATIVE_PLATFORM: ${{ matrix.platform }}
         run: ${{ matrix.python }} .github/qualification/dart-snapshot-native.py
 
-      - name: Preserve revision, test events, and verdict
-        if: always()
+      - name: Preserve exact source, test events and physical coverage
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: dart-snapshot-native-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: dart-snapshot-boundary-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/dart-snapshot-native-evidence/
           include-hidden-files: true
           if-no-files-found: error
