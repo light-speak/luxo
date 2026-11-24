@@ -1,0 +1,76 @@
+name: Diagnose PR 81 unary response reuse on AMD
+
+on:
+  push:
+    branches: [diagnostics/pr81-unary-amd]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the original AMD processor
+        id: cpu
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/pr81-unary-amd-evidence
+          model=$(LC_ALL=C lscpu | awk -F: '$1 == "Model name" {sub(/^[[:space:]]+/, "", $2); sub(/[[:space:]]+$/, "", $2); print $2}')
+          match=false
+          if [[ "$(uname -sm)" == 'Linux x86_64' && "$model" == 'AMD EPYC 9V74 80-Core Processor' ]]; then
+            match=true
+          fi
+          printf 'model=%s\nmatch=%s\n' "$model" "$match" | tee .tmp/pr81-unary-amd-evidence/routing.txt
+          printf 'match=%s\n' "$match" >> "$GITHUB_OUTPUT"
+          if [[ "$match" == false ]]; then
+            echo '::notice::This job did not receive the AMD 9V74 processor. No performance verdict.'
+          fi
+
+      - uses: actions/setup-go@v7
+        if: steps.cpu.outputs.match == 'true'
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Compare the pinned LRPC implementations
+        if: steps.cpu.outputs.match == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          receipt=.tmp/pr81-unary-amd-evidence
+          input=$(mktemp -d "$GITHUB_WORKSPACE/.tmp/pr81-input.XXXXXXXX")
+          trap 'rm -rf -- "$input"' EXIT
+          artifact=14931523390
+          resource="repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact"
+          gh api "$resource" > "$receipt/formal-artifact.json"
+          jq -e --argjson id "$artifact" '
+            .id == $id and .name == "performance-evidence-05-1" and (.expired | not)
+            and .digest == "sha256:27da0dfaea6eb5addef98a0198d93d420908345c8d322a3f0ef89a5a3818267d"
+            and .workflow_run.id == 45414110028
+            and .workflow_run.head_sha == "12e7743153a02a5c1cfc997e84ff5b6993a267bd"
+          ' "$receipt/formal-artifact.json" > /dev/null
+          gh api "$resource/zip" > "$input/formal.zip"
+          bash scripts/diagnose-pr81-unary-amd/diagnose-native.sh "$input/formal.zip"
+
+      - name: Preserve processor, source, and sample receipts
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: pr81-unary-amd-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr81-unary-amd-evidence/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Report a processor mismatch after preserving the routing receipt
+        if: ${{ always() && steps.cpu.outputs.match == 'false' }}
+        run: exit 3
