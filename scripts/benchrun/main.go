@@ -69,9 +69,9 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 func compileBenchmarks(root, binary, packagePath, command string, output, errorOutput io.Writer) (err error) {
 	args := []string{"test", "-trimpath", "-c"}
 	if command != "compile" {
-		overlay, cleanup, err := performanceOverlay(root, packagePath, command == "compile-performance-baseline")
-		if err != nil {
-			return err
+		overlay, cleanup, overlayErr := performanceOverlay(root, packagePath, command == "compile-performance-baseline")
+		if overlayErr != nil {
+			return overlayErr
 		}
 		defer func() { err = errors.Join(err, cleanup()) }()
 		if overlay != "" {
