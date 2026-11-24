@@ -1,0 +1,302 @@
+name: Qualify the Canonical JSON fixture and PR 91 query facade
+
+on:
+  push:
+    branches: [diagnostics/pr91-query-facade]
+    paths:
+      - .github/workflows/qualify-canonical-pr91-go.yml
+      - .github/qualification/canonical-json-golden.patch.b64
+      - .github/qualification/pr91-query-facade-with-regressions.patch.b64
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualify-canonical-pr91-go-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr91-query-facade'
+    name: Full Go qualification (${{ matrix.candidate }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - candidate: canonical-json
+            base: ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+            base_tree: ba252c7cace8908cdfcd7c203bc9dc11bb2ba746
+            tree: d17eb6f305a92034f50b8ad174eb61829b100ed1
+            patch_sha256: 82eb0e36c705eff9832e1f412553e08c1fca67efe60ba1982e25c753a7862942
+            payload: .github/qualification/canonical-json-golden.patch.b64
+            paths: '["pkg/lux/api/binary_bench_test.go"]'
+            source_sha256: |
+              25c281c1a5ccccd2a4d16f5ba13c243a743faef715481622248e5c33e7ee4b07  pkg/lux/api/binary_bench_test.go
+          - candidate: pr91-query-facade
+            base: 32b67c84d53e3a5ff4c93e66ce96fa1a5ffa96c2
+            base_tree: c8333e7682bdac15b4faf0cc0f9ead198a7f6ccb
+            tree: d42af1b5eaf3f1867c90c7f0ef6c3596ff744be5
+            patch_sha256: b13cc3527047c1bf4bf51b733854cb10bc3ba92e38f3ae52a6a32e2ed8eff176
+            payload: .github/qualification/pr91-query-facade-with-regressions.patch.b64
+            paths: '["pkg/codegen/query_facade.go","pkg/codegen/query_facade_test.go"]'
+            source_sha256: |
+              37134008d5b4bd57e3f1c967af5dade9115e696216006bbe9378f2f91ef41548  pkg/codegen/query_facade.go
+              0385297d9cbded185b14757f0571166c2e7c24a820dba4c5ca0ca88b7c997a19  pkg/codegen/query_facade_test.go
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: luxo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d luxo_test"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=5
+
+    env:
+      DATABASE_HOST: localhost
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_PREFIX: luxo_test
+      DATABASE_SSL: disable
+      LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_AUDIT_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_TRANSACTION_RACE: '1'
+      TESTCONTAINERS_SESSION_ID: luxo-qualify-${{ matrix.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}
+      TESTCONTAINERS_RYUK_DISABLED: 'true'
+      NATS_URL: nats://127.0.0.1:4222
+      GOTOOLCHAIN: local
+      QUALIFICATION_CANDIDATE: ${{ matrix.candidate }}
+      QUALIFICATION_BASE: ${{ matrix.base }}
+      QUALIFICATION_BASE_TREE: ${{ matrix.base_tree }}
+      QUALIFICATION_TREE: ${{ matrix.tree }}
+      QUALIFICATION_PATCH_SHA256: ${{ matrix.patch_sha256 }}
+      QUALIFICATION_PAYLOAD: ${{ matrix.payload }}
+      QUALIFICATION_PATHS: ${{ matrix.paths }}
+      QUALIFICATION_SOURCE_SHA256: ${{ matrix.source_sha256 }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+
+      - name: Restore only this matrix entry's exact candidate
+        run: |
+          set -euo pipefail
+          case "$QUALIFICATION_CANDIDATE" in canonical-json|pr91-query-facade) ;; *) exit 2;; esac
+          source="$PWD/.tmp/candidate-go-source"
+          evidence="$PWD/.tmp/candidate-go-evidence"
+          test ! -e "$source"
+          mkdir -p "$evidence"
+          patch="$evidence/candidate.patch"
+          base64 -d < "$QUALIFICATION_PAYLOAD" > "$patch"
+          printf '%s  %s\n' "$QUALIFICATION_PATCH_SHA256" "$patch" | sha256sum -c -
+          git fetch --no-tags origin "$QUALIFICATION_BASE"
+          test "$(git rev-parse "$QUALIFICATION_BASE^{tree}")" = "$QUALIFICATION_BASE_TREE"
+          git worktree add --detach "$source" "$QUALIFICATION_BASE"
+          printf '%s\n' "$source" > "$evidence/owned-worktree.txt"
+          git -C "$source" apply --index --check --whitespace=error "$patch"
+          git -C "$source" apply --index --whitespace=error "$patch"
+          git -C "$source" apply --reverse --check "$patch"
+          git -C "$source" diff --cached --check
+          test "$(git -C "$source" write-tree)" = "$QUALIFICATION_TREE"
+          git -C "$source" diff --cached --name-only > "$evidence/paths.txt"
+          python3 - "$evidence/paths.txt" <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          expected = json.loads(os.environ["QUALIFICATION_PATHS"])
+          assert Path(sys.argv[1]).read_text().splitlines() == expected
+          PYTHON
+          printf '%s\n' "$QUALIFICATION_SOURCE_SHA256" > "$evidence/source.sha256"
+          (cd "$source" && sha256sum -c "$evidence/source.sha256")
+          printf 'candidate=%s\nbase=%s\nbase_tree=%s\ntree=%s\npatch_sha256=%s\nworkflow_commit=%s\n' \
+            "$QUALIFICATION_CANDIDATE" "$QUALIFICATION_BASE" "$QUALIFICATION_BASE_TREE" \
+            "$QUALIFICATION_TREE" "$QUALIFICATION_PATCH_SHA256" "$GITHUB_SHA" > "$evidence/revision.txt"
+          go version > "$evidence/go-version.txt"
+          test "$(cat "$evidence/go-version.txt")" = 'go version go1.27.1 linux/amd64'
+          go env -json GOOS GOARCH GOAMD64 CGO_ENABLED GOEXPERIMENT GOFLAGS GOWORK GOVERSION > "$evidence/go-env.json"
+          uname -a > "$evidence/host.txt"
+          lscpu >> "$evidence/host.txt"
+          paths=()
+          while IFS= read -r path; do paths+=("$path"); done < "$evidence/paths.txt"
+          (cd "$source" && test -z "$(gofmt -s -l "${paths[@]}")")
+          sh "$source/scripts/setup-modules.sh" "$source"
+          cp "$source/go.work" "$evidence/go.work.txt"
+
+      - name: Start and identify the owned JetStream fixture
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          evidence="$PWD/.tmp/candidate-go-evidence"
+          owner="$TESTCONTAINERS_SESSION_ID"
+          printf '%s\n' "$owner" > "$evidence/owner.txt"
+          docker run --detach --name "$owner" --label "org.luxo.audit.owner=$owner" \
+            --publish 127.0.0.1:4222:4222 --publish 127.0.0.1:8222:8222 \
+            nats:2.15.3-alpine -js -m 8222 > "$evidence/nats-container.txt"
+          curl --fail --silent --show-error --retry 20 --retry-all-errors \
+            --retry-delay 1 --connect-timeout 2 --max-time 5 http://127.0.0.1:8222/healthz > "$evidence/nats-health.json"
+          curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8222/jsz | jq --exit-status \
+            '.disabled != true and .config.max_memory > 0 and .config.max_storage > 0' > "$evidence/nats-jetstream.json"
+          docker inspect "$owner" "$POSTGRES_CONTAINER_ID" > "$evidence/service-containers.json"
+          docker image inspect nats:2.15.3-alpine postgres:17-alpine > "$evidence/service-images.json"
+
+      - name: Verify all root packages, internal regressions, CLI race and static checks
+        run: |
+          set -euo pipefail
+          evidence="$PWD/.tmp/candidate-go-evidence"
+          cd .tmp/candidate-go-source
+          export GOWORK="$PWD/go.work"
+          root=0
+          go test -p 2 ./pkg/... ./internal/... -cover -coverprofile="$evidence/root.coverage" -count=1 -timeout=95m -json \
+            > "$evidence/root.jsonl" 2>&1 || root=$?
+          printf 'root %s\n' "$root" >> "$evidence/phases.txt"
+          cli=0
+          go test -p 2 -race ./cmd/luxo/... -coverprofile="$evidence/cli.coverage" -count=1 -timeout=15m -json \
+            > "$evidence/cli.jsonl" 2>&1 || cli=$?
+          printf 'cli %s\n' "$cli" >> "$evidence/phases.txt"
+          vet=0
+          go vet -p 2 ./pkg/... ./internal/... ./cmd/... ./cmd/luxo/... ./pkg/lux/pg/... ./pkg/lux/nats/... \
+            ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/... > "$evidence/vet.log" 2>&1 || vet=$?
+          printf 'vet %s\n' "$vet" >> "$evidence/phases.txt"
+          mkdir -p "$PWD/.tmp/qualification-bin"
+          export GOBIN="$PWD/.tmp/qualification-bin"
+          export PATH="$GOBIN:$PATH"
+          go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
+          go version -m "$GOBIN/gocyclo" > "$evidence/gocyclo-version.txt"
+          complexity=0
+          sh scripts/check-go.sh complexity pkg/ cmd/ scripts/ internal/ > "$evidence/complexity.log" 2>&1 || complexity=$?
+          printf 'complexity %s\n' "$complexity" >> "$evidence/phases.txt"
+          if (( root != 0 || cli != 0 || vet != 0 || complexity != 0 )); then
+            tail -n 80 "$evidence/root.jsonl"
+            tail -n 80 "$evidence/cli.jsonl"
+            tail -n 80 "$evidence/vet.log"
+            tail -n 80 "$evidence/complexity.log"
+            exit 1
+          fi
+          go tool cover -func="$evidence/root.coverage" > "$evidence/root.coverage-summary"
+          go tool cover -func="$evidence/cli.coverage" > "$evidence/cli.coverage-summary"
+          if [[ "$QUALIFICATION_CANDIDATE" == canonical-json ]]; then
+            for variant in before after full; do
+              filter='^BenchmarkCanonicalJSON(Float|Value)$'
+              if [[ "$variant" != full ]]; then filter+="/.*/^$variant\$"; fi
+              go test -p 2 ./pkg/lux/api -run '^$' -bench "$filter" -benchtime=1x -count=1 -cpu=2 -timeout=90s \
+                > "$evidence/fixture-$variant.log" 2>&1
+            done
+          else
+            for function_name in generateQueryFacade writeQueryFacadeParts; do
+              grep -E "/pkg/codegen/query_facade.go:[0-9]+:[[:space:]]+$function_name[[:space:]]+100\.0%$" \
+                "$evidence/root.coverage-summary"
+            done > "$evidence/query-facade.coverage"
+          fi
+          python3 - "$evidence" <<'PYTHON'
+          import collections
+          import json
+          import os
+          from pathlib import Path
+          import sys
+          evidence = Path(sys.argv[1])
+          if os.environ["QUALIFICATION_CANDIDATE"] == "canonical-json":
+              names = {}
+              for variant, count in (("before", 12), ("after", 12), ("full", 24)):
+                  rows = [line.split()[0] for line in (evidence / ("fixture-" + variant + ".log")).read_text().splitlines()
+                          if line.startswith("Benchmark")]
+                  assert len(rows) == count and len(set(rows)) == count, (variant, rows)
+                  names[variant] = set(rows)
+              assert names["before"].isdisjoint(names["after"])
+              assert names["full"] == names["before"] | names["after"]
+          else:
+              required = {("github.com/light-speak/luxo/pkg/codegen", name) for name in (
+                  "TestQueryFacadeSourceShapes", "TestQueryFacadeLongPartsReuseDestination",
+                  "TestGeneratedQueryFacadeBenchmarks", "TestGeneratedDestructuredEmptyListBindings")}
+              required.update(("github.com/light-speak/luxo/internal/inferred", name) for name in (
+                  "TestPaginationPlanFinalListLineage", "TestPaginationPlanDisabled",
+                  "TestPaginationObjectFieldLineage", "TestPaginationFiniteObjectListDoesNotPageInnerQueries"))
+              passed = set()
+              for line in (evidence / "root.jsonl").open():
+                  try:
+                      event = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  if event.get("Action") == "pass":
+                      passed.add((event.get("Package"), event.get("Test")))
+              assert required <= passed, sorted(required - passed)
+              (evidence / "required-regressions.json").write_text(json.dumps(sorted(required), indent=2) + "\n")
+          PYTHON
+          printf 'candidate-specific 0\n' >> "$evidence/phases.txt"
+          sha256sum -c "$evidence/source.sha256" > "$evidence/final-source-check.log"
+          git diff --exit-code
+          test "$(git write-tree)" = "$QUALIFICATION_TREE"
+
+      - name: Remove only this entry's owned source and labeled fixtures
+        if: always()
+        run: |
+          set -u
+          owner="$TESTCONTAINERS_SESSION_ID"
+          evidence="$PWD/.tmp/candidate-go-evidence"
+          mkdir -p "$evidence"
+          status=0
+          : > "$evidence/owned-after-cleanup.txt"
+          for filter in "org.luxo.audit.owner=$owner" "org.testcontainers.sessionId=$owner"; do
+            for kind in container volume network; do
+              if [[ "$kind" == container ]]; then
+                listing=(docker ps -aq --filter "label=$filter")
+                removal=(docker rm -fv)
+              else
+                listing=(docker "$kind" ls -q --filter "label=$filter")
+                removal=(docker "$kind" rm)
+              fi
+              ids=$("${listing[@]}") || status=1
+              while IFS= read -r id; do
+                [[ -n "$id" ]] || continue
+                "${removal[@]}" "$id" >> "$evidence/cleanup.log" 2>&1 || status=1
+              done <<< "$ids"
+              ids=$("${listing[@]}") || status=1
+              if [[ -n "$ids" ]]; then
+                printf '%s %s\n' "$kind" "$ids" >> "$evidence/owned-after-cleanup.txt"
+                status=1
+              fi
+            done
+          done
+          if [[ -f "$evidence/owned-worktree.txt" ]]; then
+            expected="$PWD/.tmp/candidate-go-source"
+            test "$(cat "$evidence/owned-worktree.txt")" = "$expected" || status=1
+            if [[ -d "$expected" ]]; then git worktree remove --force "$expected" || status=1; fi
+          fi
+          printf '%s\n' "$status" > "$evidence/cleanup.exit"
+          exit "$status"
+
+      - name: Preserve candidate-specific immutable evidence
+        id: evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: go-qualification-${{ matrix.candidate }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/candidate-go-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record the uploaded artifact identity
+        if: always() && steps.evidence.outcome == 'success'
+        env:
+          ARTIFACT_ID: ${{ steps.evidence.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.evidence.outputs.artifact-digest }}
+        run: |
+          printf 'candidate=%s artifact_id=%s sha256=%s\n' "$QUALIFICATION_CANDIDATE" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
