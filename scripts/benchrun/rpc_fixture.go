@@ -55,16 +55,20 @@ func performanceOverlayWithPathResolver(root, packagePath string, baseline bool,
 	if err != nil {
 		return "", nil, err
 	}
-	if err := validateRPCFixture(path, data, baseline); err != nil {
+	historicalDigest := ""
+	if baseline {
+		historicalDigest = rpcBoundarySHA
+	}
+	if err := validateRPCFixture(path, data, historicalDigest); err != nil {
 		return "", nil, fmt.Errorf("reviewed RPC correctness fixture %s: %w", path, err)
 	}
 	return writePerformanceOverlay(filepath.Join(physicalRoot, ".tmp"), path)
 }
 
-func validateRPCFixture(path string, data []byte, baseline bool) error {
+func validateRPCFixture(path string, data []byte, historicalDigest string) error {
 	line, _, _ := bytes.Cut(data, []byte("\n"))
 	if string(bytes.TrimSuffix(line, []byte("\r"))) != rpcBoundaryMarker {
-		if baseline && fmt.Sprintf("%x", sha256.Sum256(data)) == rpcBoundarySHA {
+		if historicalDigest != "" && fmt.Sprintf("%x", sha256.Sum256(data)) == historicalDigest {
 			return nil
 		}
 		return errors.New("missing marker or unrecognized historical baseline")

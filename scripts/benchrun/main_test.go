@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -296,6 +297,21 @@ const isolatedRPCFixture = "// luxo:benchmark-isolated-correctness\n\npackage rp
 	"func TestInternalDispatchCannotBeForgedAcrossPublicTransports(t *testing.T) {}\n" +
 	"func TestSchemaFreeRouterStreamBoundary(t *testing.T) {}\n"
 
+func TestHistoricalRPCFixtureRequiresTheRegisteredDigest(t *testing.T) {
+	source := []byte(strings.TrimPrefix(isolatedRPCFixture, rpcBoundaryMarker+"\n\n"))
+	digest := fmt.Sprintf("%x", sha256.Sum256(source))
+
+	if err := validateRPCFixture(rpcBoundaryPath, source, digest); err != nil {
+		t.Fatalf("historical fixture with the registered digest: %v", err)
+	}
+	if err := validateRPCFixture(rpcBoundaryPath, source, ""); err == nil {
+		t.Fatal("current compilation accepted a fixture without the marker")
+	}
+	if err := validateRPCFixture(rpcBoundaryPath, append(source, '\n'), digest); err == nil {
+		t.Fatal("historical compilation accepted a fixture with a different digest")
+	}
+}
+
 func TestModernRPCFixturePreservesBenchmarkBoundary(t *testing.T) {
 	const source = isolatedRPCFixture
 	for _, tc := range []struct {
@@ -324,7 +340,7 @@ func TestModernRPCFixturePreservesBenchmarkBoundary(t *testing.T) {
 		{"malformed", source + "\nfunc helper(\n", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := validateRPCFixture(rpcBoundaryPath, []byte(tc.source), false); (err == nil) != tc.accept {
+			if err := validateRPCFixture(rpcBoundaryPath, []byte(tc.source), ""); (err == nil) != tc.accept {
 				t.Fatalf("accepted=%v want %v: %v", err == nil, tc.accept, err)
 			}
 		})
