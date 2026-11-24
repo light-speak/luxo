@@ -6,6 +6,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/light-speak/luxo/internal/builtin"
@@ -1690,6 +1691,10 @@ func (g *GeneratorContext) writeAPIRegistration(b *strings.Builder, name string,
 	g.writeAPIParameterRegistration(b, name, g.requestParams[name], firstBoolSet(enumSets))
 }
 
+// Reserve enough space in the stack buffer for the fixed syntax and the field ID.
+// Longer identifiers keep fmt's pooled formatting buffer.
+const registryIdentifierStackLimit = 40
+
 func (g *GeneratorContext) writeAPIParameterRegistration(b *strings.Builder, name string, declarations []*ast.ParamDecl, enums map[string]bool) {
 	params := g.apiParamIDs(name)
 	if len(params) == 0 {
@@ -1699,7 +1704,11 @@ func (g *GeneratorContext) writeAPIParameterRegistration(b *strings.Builder, nam
 		declaration *ast.ParamDecl
 		id          int
 	}
-	registered := make([]registeredParam, 0, len(params))
+	var workspace [8]registeredParam
+	registered := workspace[:0]
+	if len(params) > len(workspace) {
+		registered = make([]registeredParam, 0, len(params))
+	}
 	for _, param := range declarations {
 		if id := params[param.Name]; id > 0 {
 			registered = append(registered, registeredParam{declaration: param, id: id})
@@ -1709,7 +1718,15 @@ func (g *GeneratorContext) writeAPIParameterRegistration(b *strings.Builder, nam
 		return
 	}
 	slices.SortFunc(registered, func(a, b registeredParam) int { return cmp.Compare(a.id, b.id) })
-	fmt.Fprintf(b, "\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{\n", name)
+	const opening, closing = "\tif err := router.Registry.RegisterParams(", ", []api.ParamMeta{\n"
+	if len(name) > registryIdentifierStackLimit {
+		fmt.Fprintf(b, opening+"%q"+closing, name)
+	} else {
+		var scratch [128]byte
+		prefix := append(scratch[:0], opening...)
+		prefix = strconv.AppendQuote(prefix, name)
+		b.Write(append(prefix, closing...))
+	}
 	for _, param := range registered {
 		g.writeRegisteredParam(b, param.declaration, param.id, enums)
 	}
@@ -1717,7 +1734,17 @@ func (g *GeneratorContext) writeAPIParameterRegistration(b *strings.Builder, nam
 }
 
 func writeRegistryRoute(b *strings.Builder, name string, id int) {
-	fmt.Fprintf(b, "\tif err := router.Registry.Register(%q, %d); err != nil { return err }\n", name, id)
+	const opening, closing = "\tif err := router.Registry.Register(", "); err != nil { return err }\n"
+	if len(name) > registryIdentifierStackLimit {
+		fmt.Fprintf(b, opening+"%q, %d"+closing, name, id)
+		return
+	}
+	var scratch [128]byte
+	line := append(scratch[:0], opening...)
+	line = strconv.AppendQuote(line, name)
+	line = append(line, ", "...)
+	line = strconv.AppendInt(line, int64(id), 10)
+	b.Write(append(line, closing...))
 }
 
 func (g *GeneratorContext) writeRegisteredParam(b *strings.Builder, param *ast.ParamDecl, id int, enums map[string]bool) {
@@ -1725,11 +1752,26 @@ func (g *GeneratorContext) writeRegisteredParam(b *strings.Builder, param *ast.P
 	if g.sealedDeclaration(param.Type.Name) != nil {
 		wireType, typeName = "Sealed", param.Type.Name
 	}
-	fmt.Fprintf(b, "\t\t{Name: %q, Type: %q", param.Name, wireType)
-	if typeName != "" {
-		fmt.Fprintf(b, ", TypeName: %q", typeName)
+	const nameField, typeField, typeNameField, idField = "\t\t{Name: ", ", Type: ", ", TypeName: ", ", FieldID: "
+	if len(param.Name)+len(wireType)+len(typeName) > registryIdentifierStackLimit {
+		fmt.Fprintf(b, nameField+"%q"+typeField+"%q", param.Name, wireType)
+		if typeName != "" {
+			fmt.Fprintf(b, typeNameField+"%q", typeName)
+		}
+		fmt.Fprintf(b, idField+"%d", id)
+	} else {
+		var scratch [128]byte
+		line := append(scratch[:0], nameField...)
+		line = strconv.AppendQuote(line, param.Name)
+		line = append(line, typeField...)
+		line = strconv.AppendQuote(line, wireType)
+		if typeName != "" {
+			line = append(line, typeNameField...)
+			line = strconv.AppendQuote(line, typeName)
+		}
+		line = append(line, idField...)
+		b.Write(strconv.AppendInt(line, int64(id), 10))
 	}
-	fmt.Fprintf(b, ", FieldID: %d", id)
 	if param.Type.IsList {
 		b.WriteString(", IsList: true")
 	}
