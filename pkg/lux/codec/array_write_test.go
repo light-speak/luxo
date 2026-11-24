@@ -2,6 +2,7 @@ package codec
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"testing"
 	"time"
@@ -33,15 +34,20 @@ func TestArrayWritersRejectOversizedCountBeforeWriting(t *testing.T) {
 
 func TestArrayHeaderWriteBounds(t *testing.T) {
 	for _, count := range []int{-1, -int(^uint(0)>>1) - 1, MaxArrayElements + 1, int(^uint(0) >> 1)} {
-		prefix := []byte{42}
+		backing := [3]byte{42, 0xa5, 0x5a}
+		original := backing
+		prefix := backing[:1]
 		actual, err := AppendArrayHeader(prefix, count)
-		if !errors.Is(err, ErrInvalidArrayCount) || !bytes.Equal(actual, prefix) {
+		if err != ErrInvalidArrayCount || len(actual) != len(prefix) || cap(actual) != cap(prefix) ||
+			&actual[0] != &prefix[0] || backing != original {
 			t.Fatal("invalid header changed output", count, actual, err)
 		}
-		var encoder Encoder
-		encoder.WriteBool(true)
-		if err := encoder.WriteArrayHeader(count); !errors.Is(err, ErrInvalidArrayCount) || !bytes.Equal(encoder.Bytes(), []byte{1}) {
-			t.Fatal("invalid encoder header changed output", count, err)
+		encoder := NewEncoder(prefix)
+		err = encoder.WriteArrayHeader(count)
+		actual = encoder.Bytes()
+		if err != ErrInvalidArrayCount || len(actual) != len(prefix) || cap(actual) != cap(prefix) ||
+			&actual[0] != &prefix[0] || backing != original {
+			t.Fatal("invalid encoder header changed output", count, actual, err)
 		}
 	}
 	for _, count := range []int{0, 1, 127, 128, MaxArrayElements} {
@@ -50,5 +56,41 @@ func TestArrayHeaderWriteBounds(t *testing.T) {
 		if err != nil || got != count || consumed != len(actual) {
 			t.Fatal("valid count changed", count, got, err)
 		}
+	}
+}
+
+func TestArrayHeaderWriteCapacity(t *testing.T) {
+	writers := []struct {
+		name  string
+		write func([]byte, int) ([]byte, error)
+	}{
+		{"append", AppendArrayHeader},
+		{"encoder", func(dst []byte, count int) ([]byte, error) {
+			encoder := NewEncoder(dst)
+			err := encoder.WriteArrayHeader(count)
+			return encoder.Bytes(), err
+		}},
+	}
+	const prefixLength = 2
+	for _, writer := range writers {
+		t.Run(writer.name, func(t *testing.T) {
+			for _, count := range []int{0, 127, 128, 16383, 16384, MaxArrayElements} {
+				want := binary.AppendUvarint([]byte{0xa5, 0xa5}, uint64(count))
+				for spare := 0; spare <= len(want)-prefixLength+1; spare++ {
+					original := bytes.Repeat([]byte{0xa5}, prefixLength+spare)
+					referenceBacking := make([]byte, len(original))
+					copy(referenceBacking, original)
+					reference := AppendVarint(referenceBacking[:prefixLength], uint64(count))
+
+					got, err := writer.write(original[:prefixLength:len(original)], count)
+					if err != nil || !bytes.Equal(got, want) || cap(got) != cap(reference) ||
+						(&got[0] == &original[0]) != (&reference[0] == &referenceBacking[0]) ||
+						!bytes.Equal(original, referenceBacking) {
+						t.Fatalf("count %d, spare %d: got %x with capacity %d, want %x with capacity %d, error %v",
+							count, spare, got, cap(got), want, cap(reference), err)
+					}
+				}
+			}
+		})
 	}
 }

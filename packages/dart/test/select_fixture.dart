@@ -78,23 +78,25 @@ class SelectFixture implements Resolver {
         .createTemp('dart-select-build-');
     try {
       for (final entry in sources.entries) {
-        final file = File('${root.path}/${entry.key}');
+        final file = File.fromUri(_fixtureUri(root, entry.key));
         await file.parent.create(recursive: true);
         await file.writeAsString(entry.value);
       }
       await _writePackageConfig(root);
       await prepare?.call(root);
       final assets = <String, String>{};
-      await for (final file in Directory(
-        '${root.path}/lib',
-      ).list(recursive: true)) {
+      final rootPath = root.uri.path;
+      final lib = root.uri.resolve('lib');
+      await for (final file in Directory.fromUri(lib).list(recursive: true)) {
         if (file is File && file.path.endsWith('.dart')) {
-          assets[file.path.substring(root.path.length + 1)] = await file
-              .readAsString();
+          final relative = Uri.decodeComponent(
+            file.uri.path.substring(rootPath.length),
+          );
+          assets[relative] = await file.readAsString();
         }
       }
       final collection = AnalysisContextCollection(
-        includedPaths: ['${root.path}/lib'],
+        includedPaths: [lib.toFilePath()],
       );
       return SelectFixture._(root, assets, collection);
     } catch (_) {
@@ -125,7 +127,7 @@ class SelectFixture implements Resolver {
   }
 
   Future<ResolvedUnitResult> unit(String path) async {
-    final absolute = '${root.path}/$path';
+    final absolute = _fixtureUri(root, path).toFilePath();
     final session = collection.contextFor(absolute).currentSession;
     final result = await session.getResolvedUnit(absolute);
     expect(result, isA<ResolvedUnitResult>());
@@ -145,7 +147,7 @@ class SelectFixture implements Resolver {
     AssetId id, {
     bool allowSyntaxErrors = false,
   }) async {
-    final path = '${root.path}/${id.path}';
+    final path = _fixtureUri(root, id.path).toFilePath();
     final session = collection.contextFor(path).currentSession;
     final result = await session.getResolvedLibrary(path);
     expect(result, isA<ResolvedLibraryResult>());
@@ -201,6 +203,9 @@ class SelectFixture implements Resolver {
     'Unexpected resolver call: ${invocation.memberName}',
   );
 }
+
+Uri _fixtureUri(Directory root, String path) =>
+    root.uri.resolveUri(Uri(path: path));
 
 Future<void> generateSelectionClient(
   Directory root, {

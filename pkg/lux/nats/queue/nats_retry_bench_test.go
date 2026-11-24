@@ -94,7 +94,7 @@ func (*benchmarkAcklessMessage) Nak() error                       { return nil }
 func (*benchmarkAcklessMessage) NakWithDelay(time.Duration) error { return nil }
 
 func BenchmarkNATSRepeatedClose(b *testing.B) {
-	q := &NATSQueue{}
+	q := &NATSQueue{js: &mockJSClient{}}
 	if err := q.Close(); err != nil {
 		b.Fatal(err)
 	}

@@ -127,12 +127,11 @@ func (g *Gateway) serve(version string, quit <-chan os.Signal) (serveResult erro
 	}
 	addr := ":" + port
 
-	// Start metrics collection + gateway registration if Studio is configured
+	// Install metrics before the server can receive requests.
 	g.metrics = NewMetricsCollector()
 	if g.metrics != nil {
 		g.Router.SetMetricsCollector(g.metrics)
 	}
-	g.registrar = newGatewayRegistrarWithDependencyStats(port, version, g.dependencyStats)
 	defer g.closeIntegrations()
 
 	certFile := envOr("APP_TLS_CERT", "")
@@ -142,6 +141,9 @@ func (g *Gateway) serve(version string, quit <-chan os.Signal) (serveResult erro
 	if err != nil {
 		return err
 	}
+	// Report the TCP listener's port, including when the OS chose it.
+	addr = server.Addr[strings.LastIndexByte(server.Addr, ':'):]
+	g.registrar = newGatewayRegistrarWithDependencyStats(addr[1:], version, g.dependencyStats)
 	if certFile != "" && keyFile != "" {
 		fmt.Printf("  Listening on https://localhost%s (HTTP/2 + TLS)\n\n", addr)
 	} else {

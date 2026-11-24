@@ -289,8 +289,12 @@ func ReadBool(buf []byte, off int) (bool, int) {
 // ErrInvalidArrayCount rejects counts outside the common array wire domain.
 var ErrInvalidArrayCount = errors.New("codec: array count must be between 0 and 1000000")
 
+func validArrayCount(count int) bool {
+	return uint(count) <= MaxArrayElements
+}
+
 func validateArrayCount(count int) error {
-	if uint(count) > MaxArrayElements {
+	if !validArrayCount(count) {
 		return ErrInvalidArrayCount
 	}
 	return nil
@@ -298,8 +302,8 @@ func validateArrayCount(count int) error {
 
 // AppendArrayHeader validates before changing the destination.
 func AppendArrayHeader(dst []byte, count int) ([]byte, error) {
-	if err := validateArrayCount(count); err != nil {
-		return dst, err
+	if !validArrayCount(count) {
+		return dst, ErrInvalidArrayCount
 	}
 	return AppendVarint(dst, uint64(count)), nil
 }

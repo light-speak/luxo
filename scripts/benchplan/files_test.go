@@ -7,10 +7,151 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestConfirmationPlanWritesOnlyPairedLeaves(t *testing.T) {
+	root := benchmarkTempDir(t)
+	expected := filepath.Join(root, "primary.json")
+	writeFixture(t, expected, `{"Base":[{"Package":"pkg/a","Name":"BenchmarkRead/a+b-2"},{"Package":"pkg/a","Name":"BenchmarkRead/skipped-2"},{"Package":"pkg/z","Name":"BenchmarkWrite-2"}],"Head":[{"Package":"pkg/a","Name":"BenchmarkRead/a+b-2"},{"Package":"pkg/a","Name":"BenchmarkRead/skipped-2"},{"Package":"pkg/z","Name":"BenchmarkWrite-2"}]}`)
+	targets := filepath.Join(root, "targets.tsv")
+	writeFixture(t, targets, "pkg/z\tBenchmarkWrite-2\npkg/a\tBenchmarkRead/a+b-2\n")
+	batch := filepath.Join(root, "batch.tsv")
+	confirmation := filepath.Join(root, "confirmation.json")
+	if err := run([]string{"--confirmation-plan", expected, targets, batch, confirmation}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(batch)
+	if err != nil || string(got) != "pkg/a\t^BenchmarkRead$/^a\\+b$\npkg/z\t^BenchmarkWrite$\n" {
+		t.Fatalf("confirmation batch = %q, %v", got, err)
+	}
+	sample := filepath.Join(root, "sample.txt")
+	complete := "pkg: github.com/light-speak/luxo/pkg/a\n" +
+		strings.Repeat("BenchmarkRead/a+b-2 1 12 ns/op 0 B/op 0 allocs/op\n", 10) + "PASS\n" +
+		"pkg: github.com/light-speak/luxo/pkg/z\n" +
+		strings.Repeat("BenchmarkWrite-2 1 12 ns/op 0 B/op 0 allocs/op\n", 10) + "PASS\n"
+	verify := []string{"--verify", confirmation, sample, sample}
+	writeFixture(t, sample, complete)
+	if err := run(verify, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{
+		strings.Replace(complete, "BenchmarkWrite-2 1 12 ns/op 0 B/op 0 allocs/op\n", "", 1),
+		strings.Replace(complete, "PASS", "BenchmarkRead/skipped-2 1 12 ns/op 0 B/op 0 allocs/op\nPASS", 1),
+	} {
+		writeFixture(t, sample, bad)
+		if err := run(verify, io.Discard); err == nil {
+			t.Fatal("accepted incorrect confirmation evidence")
+		}
+	}
+}
+
+func TestConfirmationPlanRejectsUnpairedOrMalformedTargets(t *testing.T) {
+	root := benchmarkTempDir(t)
+	expected := filepath.Join(root, "primary.json")
+	writeFixture(t, expected, `{"Base":[{"Package":"pkg/a","Name":"BenchmarkRead/common-2"}],"Head":[{"Package":"pkg/a","Name":"BenchmarkRead/common-2"},{"Package":"pkg/a","Name":"BenchmarkRead/new-2"}]}`)
+	targets := filepath.Join(root, "targets.tsv")
+	batch := filepath.Join(root, "batch.tsv")
+	confirmation := filepath.Join(root, "confirmation.json")
+	for _, contents := range []string{
+		"", "pkg/a\tBenchmarkRead/new-2\n", "pkg/z\tBenchmarkRead/common-2\n",
+		"pkg/a\tBenchmarkRead/common-2\npkg/a\tBenchmarkRead/common-2\n", "pkg/a BenchmarkRead/common-2\n",
+		"../a\tBenchmarkRead/common-2\n", "pkg/a\tBenchmarkRead/common-4\n", "pkg/a\tBenchmarkRead/with space-2\n",
+	} {
+		writeFixture(t, targets, contents)
+		args := []string{"--confirmation-plan", expected, targets, batch, confirmation}
+		if err := run(args, io.Discard); err == nil {
+			t.Errorf("accepted invalid targets %q", contents)
+		}
+	}
+}
+
+func TestConfirmationPlanReportsFileAndInventoryFailures(t *testing.T) {
+	root := benchmarkTempDir(t)
+	expected := filepath.Join(root, "primary.json")
+	targets := filepath.Join(root, "targets.tsv")
+	writeFixture(t, targets, "pkg/a\tBenchmarkRead-2\n")
+	const onePair = `{"Base":[{"Package":"pkg/a","Name":"BenchmarkRead-2"}],"Head":[{"Package":"pkg/a","Name":"BenchmarkRead-2"}]}`
+	writeFixture(t, expected, onePair)
+	batch := filepath.Join(root, "batch.tsv")
+	confirmation := filepath.Join(root, "confirmation.json")
+	for _, args := range [][]string{
+		{"--confirmation-plan"},
+		{"--confirmation-plan", filepath.Join(root, "missing"), targets, batch, confirmation},
+		{"--confirmation-plan", expected, filepath.Join(root, "missing"), batch, confirmation},
+		{"--confirmation-plan", expected, targets, root, confirmation},
+		{"--confirmation-plan", expected, targets, batch, root},
+	} {
+		if err := run(args, io.Discard); err == nil {
+			t.Errorf("accepted invalid options %v", args)
+		}
+	}
+	duplicate := strings.Replace(onePair, `"Base":[{`, `"Base":[{"Package":"pkg/a","Name":"BenchmarkRead-2"},{`, 1)
+	writeFixture(t, expected, duplicate)
+	if err := run([]string{"--confirmation-plan", expected, targets, batch, confirmation}, io.Discard); err == nil {
+		t.Fatal("accepted duplicate primary inventory")
+	}
+}
+
+func TestConfirmationFilterRunsOnlySelectedNestedBenchmarks(t *testing.T) {
+	root := benchmarkTempDir(t)
+	keys := []sampleKey{
+		{Package: "pkg/a", Name: "BenchmarkConfirmationFixture/nested/literal[+]-2"},
+		{Package: "pkg/a", Name: "BenchmarkConfirmationFixture/nested/unselected-2"},
+		{Package: "pkg/a", Name: "BenchmarkConfirmationFixture/top-2"},
+	}
+	expected := filepath.Join(root, "primary.json")
+	data, err := json.Marshal(expectedSamples{Base: keys, Head: keys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, expected, string(data))
+	targets := filepath.Join(root, "targets.tsv")
+	writeFixture(t, targets, "pkg/a\t"+keys[0].Name+"\npkg/a\t"+keys[2].Name+"\n")
+	batch := filepath.Join(root, "batch.tsv")
+	if err := run([]string{"--confirmation-plan", expected, targets, batch, filepath.Join(root, "confirmation.json")}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := os.ReadFile(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, filter, _ := strings.Cut(strings.TrimSpace(string(plan)), "\t")
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), self, "-test.run=^$", "-test.bench="+filter,
+		"-test.benchtime=1x", "-test.cpu=2", "-test.benchmem")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run nested benchmarks: %v\n%s", err, out)
+	}
+	have, err := readInventory(bytes.NewReader(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, key := range keys {
+		if _, present := have["BenchmarkConfirmationFixture"][key.Name]; present != (i != 1) {
+			t.Fatalf("wrong benchmark selection for %s\n%s", key.Name, out)
+		}
+	}
+}
+
+func BenchmarkConfirmationFixture(b *testing.B) {
+	measure := func(b *testing.B) {
+		for b.Loop() {
+		}
+	}
+	b.Run("nested", func(b *testing.B) {
+		b.Run("literal[+]", measure)
+		b.Run("unselected", measure)
+	})
+	b.Run("top", measure)
+}
 
 func writeFixture(t *testing.T, path, data string) {
 	t.Helper()

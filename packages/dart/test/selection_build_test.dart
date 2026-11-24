@@ -1,12 +1,26 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:luxo_client/src/builder/artifact_publish.dart';
 import 'package:luxo_client/src/builder/selection_build.dart';
 import 'package:test/test.dart';
 
 import 'select_fixture.dart';
 
 const _minimal = {'lib/main.dart': 'void main() {}', 'asset.txt': 'original'};
+
+class _SourceDirectoryWithTrailingSeparator implements Directory {
+  final Directory source;
+
+  _SourceDirectoryWithTrailingSeparator(this.source);
+
+  @override
+  Future<String> resolveSymbolicLinks() async =>
+      '${await source.resolveSymbolicLinks()}${Platform.pathSeparator}';
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
+}
 
 void main() {
   test('generated aggregate sources retain fields over real HTTP', () async {
@@ -351,8 +365,8 @@ Future<void> main() async {
         );
         expect(await Directory('${outside.path}/new').exists(), isFalse);
         final destination = await build.prepareOutput('.tmp/output/app');
-        expect(await destination.exists(), isFalse);
-        expect(await destination.parent.exists(), isTrue);
+        expect(await destination.destination.exists(), isFalse);
+        expect(await destination.destination.parent.exists(), isTrue);
         expect(
           await File('${fixture.root.path}/asset.txt').readAsString(),
           'original',
@@ -364,6 +378,131 @@ Future<void> main() async {
       }
     },
   );
+  test('build ownership accepts a trailing directory separator', () async {
+    const asset = 'lib/路径 with space.dart';
+    const contents = 'void extra() {}';
+    final fixture = await SelectFixture.create({..._minimal, asset: contents});
+    addTearDown(fixture.close);
+    expect((await fixture.unit(asset)).content, contents);
+    expect(fixture.sources[asset], contents);
+    final source = _SourceDirectoryWithTrailingSeparator(fixture.root);
+    final build = await SelectionBuild.prepare(source);
+    addTearDown(build.close);
+    final destination = await build.prepareOutput('build/release');
+    expect(
+      destination.destination.uri,
+      fixture.root.uri.resolve('build/release'),
+    );
+    await build.close();
+    expect(await build.directory.exists(), isFalse);
+    expect(await fixture.root.exists(), isTrue);
+  });
+  test(
+    'release publication preserves an output created after validation',
+    () async {
+      final fixture = await SelectFixture.create(_minimal);
+      SelectionBuild? build;
+      try {
+        build = await SelectionBuild.prepare(fixture.root);
+        final artifact = File('${build.directory.path}/staged');
+        await artifact.writeAsString('compiled executable');
+        final destination = await build.prepareOutput('.tmp/release/应用');
+        await destination.destination.writeAsString('another build');
+
+        expect(
+          () => publishBuildArtifact(artifact, destination),
+          throwsStateError,
+        );
+        expect(await destination.destination.readAsString(), 'another build');
+        expect(await artifact.readAsString(), 'compiled executable');
+
+        final unused = await build.prepareOutput('.tmp/release/另一个应用');
+        publishBuildArtifact(artifact, unused);
+        await build.close();
+        build = null;
+        expect(await unused.destination.readAsString(), 'compiled executable');
+      } finally {
+        await build?.close();
+        await fixture.close();
+      }
+    },
+  );
+  test(
+    'build publication accepts an ordinary in-project temporary alias',
+    () async {
+      final fixture = await SelectFixture.create(_minimal);
+      addTearDown(fixture.close);
+      final release = Directory('${fixture.root.path}/.tmp/normal-release');
+      await release.create(recursive: true);
+      await Link('${fixture.root.path}/.tmp/release-alias')
+          .create(release.path);
+      final build = await SelectionBuild.prepare(fixture.root);
+      addTearDown(build.close);
+      final output = await build.prepareOutput('.tmp/release-alias/nested/app');
+      final artifact = File('${build.directory.path}/compiled');
+      await artifact.writeAsString('normal build');
+      publishBuildArtifact(artifact, output);
+      await build.close();
+      expect(
+        await File('${release.path}/nested/app').readAsString(),
+        'normal build',
+      );
+      expect(await build.directory.exists(), isFalse);
+      expect(await fixture.root.exists(), isTrue);
+    },
+  );
+
+  test('build close releases an unconsumed prepared output', () async {
+    final fixture = await SelectFixture.create(_minimal);
+    addTearDown(fixture.close);
+    final build = await SelectionBuild.prepare(fixture.root);
+    addTearDown(build.close);
+    final outputs = [
+      await build.prepareOutput('.tmp/release/unconsumed'),
+      await build.prepareOutput('root-app'),
+    ];
+    await build.close();
+    for (final output in outputs) {
+      expect(
+        () =>
+            publishBuildArtifact(File('${fixture.root.path}/missing'), output),
+        throwsStateError,
+      );
+      expect(await output.destination.exists(), isFalse);
+    }
+    await build.close();
+  });
+
+  test('closing build rejects an in-flight output preparation', () async {
+    final fixture = await SelectFixture.create(_minimal);
+    addTearDown(fixture.close);
+    final build = await SelectionBuild.prepare(fixture.root);
+    addTearDown(build.close);
+    final preparing = build.prepareOutput('.tmp/release/inflight');
+    final rejected = expectLater(preparing, throwsStateError);
+    await build.close();
+    await rejected;
+  });
+
+  test('release publication reports a missing artifact error', () async {
+    final fixture = await SelectFixture.create(_minimal);
+    addTearDown(fixture.close);
+    final artifact = File('${fixture.root.path}/missing-executable');
+    final destination = await PreparedOutput.prepare(fixture.root, 'release');
+    addTearDown(destination.close);
+
+    expect(
+      () => publishBuildArtifact(artifact, destination),
+      throwsA(
+        isA<FileSystemException>().having(
+          (error) => error.osError?.errorCode,
+          'OS error code',
+          2,
+        ),
+      ),
+    );
+    expect(await destination.destination.exists(), isFalse);
+  });
   test('source links and path traversal are rejected without touching outside files', () async {
     final fixture = await SelectFixture.create(_minimal);
     try {
@@ -537,12 +676,60 @@ Future<void> main() async {
     },
   );
   test(
+    'release compilation failure publishes no artifact and cleans the snapshot',
+    () async {
+      final fixture = await SelectFixture.create({
+        'lib/main.dart': 'int readValue() => 1;',
+      });
+      try {
+        final result = await Process.run(Platform.resolvedExecutable, [
+          File('bin/build.dart').absolute.path,
+          '--project',
+          fixture.root.path,
+          '--entry',
+          'lib/main.dart',
+          '--compile',
+          'exe',
+          '--output',
+          '.tmp/release/failed',
+        ]);
+        expect(
+          result.exitCode,
+          isNot(0),
+          reason: '${result.stdout}\n${result.stderr}',
+        );
+        expect(
+          '${result.stdout}\n${result.stderr}',
+          contains("No 'main' method found."),
+        );
+        expect(
+          await File('${fixture.root.path}/.tmp/release/failed').exists(),
+          isFalse,
+        );
+        final entries = await Directory('${fixture.root.path}/.tmp')
+            .list()
+            .toList();
+        expect(
+          entries.where((entry) => entry.path.contains('luxo-selection-')),
+          isEmpty,
+        );
+      } finally {
+        await fixture.close();
+      }
+    },
+    timeout: const Timeout(Duration(seconds: 65)),
+  );
+
+  test(
     'AOT artifact retains call-site selections after snapshot cleanup',
     () async {
       final source = await File('test/fixtures/select_consumer.dart.txt')
           .readAsString();
       final fixture = await _generatedFixture(source);
       try {
+        final output = Platform.isWindows
+            ? '.tmp/release/verify.exe'
+            : '.tmp/release/verify';
         final compiled = await Process.run(Platform.resolvedExecutable, [
           File('bin/build.dart').absolute.path,
           '--project',
@@ -552,14 +739,14 @@ Future<void> main() async {
           '--compile',
           'exe',
           '--output',
-          '.tmp/release/verify',
+          output,
         ]);
         expect(
           compiled.exitCode,
           0,
           reason: '${compiled.stdout}\n${compiled.stderr}',
         );
-        final artifact = File('${fixture.root.path}/.tmp/release/verify');
+        final artifact = File.fromUri(fixture.root.uri.resolve(output));
         expect(await artifact.exists(), isTrue);
         final release = await Process.run(artifact.path, []);
         expect(

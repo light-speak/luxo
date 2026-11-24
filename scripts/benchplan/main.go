@@ -31,6 +31,9 @@ func run(args []string, output io.Writer) error {
 	if len(args) > 0 && args[0] == "--verify" {
 		return verifyFiles(args)
 	}
+	if len(args) > 0 && args[0] == "--confirmation-plan" {
+		return writeConfirmationPlan(args)
+	}
 	if len(args) != 3 {
 		return errors.New("usage: benchplan <packages.txt> <inventory-dir> <output-dir>")
 	}
