@@ -5,6 +5,7 @@ package env
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -80,12 +81,12 @@ func parseLine(line string) (string, string, error) {
 	// Split on first '='
 	idx := strings.IndexByte(line, '=')
 	if idx < 0 {
-		return "", "", fmt.Errorf("missing '=' in %q", line)
+		return "", "", errors.New("missing '='")
 	}
 
 	key := strings.TrimSpace(line[:idx])
 	if key == "" {
-		return "", "", fmt.Errorf("empty key in %q", line)
+		return "", "", errors.New("empty key")
 	}
 
 	value := strings.TrimSpace(line[idx+1:])

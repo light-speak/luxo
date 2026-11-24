@@ -475,6 +475,32 @@ func TestExtractBearerTokenShort(t *testing.T) {
 	}
 }
 
+func TestExtractBearerTokenHeaderValues(t *testing.T) {
+	for _, sample := range []struct {
+		name   string
+		header http.Header
+		want   string
+	}{
+		{name: "nil map"},
+		{name: "absent key", header: http.Header{}},
+		{name: "nil slice", header: http.Header{"Authorization": nil}},
+		{name: "empty slice", header: http.Header{"Authorization": {}}},
+		{name: "direct noncanonical key", header: http.Header{"authorization": {"Bearer ignored"}}},
+		{name: "empty first value", header: http.Header{"Authorization": {"", "Bearer ignored"}}},
+		{name: "other scheme first", header: http.Header{"Authorization": {"Basic example", "Bearer ignored"}}},
+		{name: "empty bearer first", header: http.Header{"Authorization": {"Bearer ", "Bearer ignored"}}},
+		{name: "first bearer wins", header: http.Header{"Authorization": {"bEaReR original", "Bearer ignored"}}, want: "original"},
+		{name: "canonical key wins", header: http.Header{"authorization": {"Bearer ignored"}, "Authorization": {"Bearer original"}}, want: "original"},
+		{name: "suffix is unchanged", header: http.Header{"Authorization": {"Bearer  original "}}, want: " original "},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			if got := extractBearerToken(&http.Request{Header: sample.header}); got != sample.want {
+				t.Errorf("extractBearerToken = %q, want %q", got, sample.want)
+			}
+		})
+	}
+}
+
 func TestClaimsAccessors(t *testing.T) {
 	c := testIdentity(t, `{"id":42,"role":"admin","active":true,"balance":99.5,"count":7}`)
 

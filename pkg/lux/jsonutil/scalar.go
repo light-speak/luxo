@@ -55,28 +55,11 @@ func ParseInt64(raw []byte) (int64, error) {
 		raw = bytes.Trim(raw, " \t\r\n")
 	}
 	digits := raw
-	negative := len(digits) > 0 && digits[0] == '-'
-	if negative {
+	if len(digits) > 0 && digits[0] == '-' {
 		digits = digits[1:]
 	}
 	if len(digits) == 0 || digits[0] < '0' || digits[0] > '9' || (digits[0] == '0' && len(digits) != 1) {
 		return 0, errExpectedInteger
-	}
-	// Eighteen decimal digits fit in int64. Preserve strconv's syntax and
-	// range errors for malformed tokens and boundary-sized values.
-	if len(digits) <= 18 {
-		var value int64
-		for _, unit := range digits {
-			digit := unit - '0'
-			if digit > 9 {
-				return strconv.ParseInt(string(raw), 10, 64)
-			}
-			value = value*10 + int64(digit)
-		}
-		if negative {
-			value = -value
-		}
-		return value, nil
 	}
 	return strconv.ParseInt(string(raw), 10, 64)
 }

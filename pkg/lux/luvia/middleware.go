@@ -69,7 +69,12 @@ func AuthMiddleware(cfg *auth.Config, next http.Handler) http.Handler {
 
 // extractBearerToken extracts the JWT from "Authorization: Bearer <token>".
 func extractBearerToken(r *http.Request) string {
-	h := r.Header.Get("Authorization")
+	// Authorization is already canonical. Keep Header.Get's first-value rule.
+	values := r.Header["Authorization"]
+	if len(values) == 0 {
+		return ""
+	}
+	h := values[0]
 	if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
 		return h[7:]
 	}
