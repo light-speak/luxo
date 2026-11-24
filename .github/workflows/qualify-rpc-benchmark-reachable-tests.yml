@@ -6,6 +6,7 @@ on:
     paths:
       - .github/workflows/qualify-rpc-benchmark-reachable-tests.yml
       - .github/qualification/rpc-benchmark-reachable-tests.patch.b64
+      - .github/qualification/rpc-benchmark-post-lstat.patch.b64
 
 permissions:
   contents: read
@@ -25,10 +26,11 @@ jobs:
       RPC_TEST_QUALIFIED_PATCH_SHA256: 34d7f8c66c41e6388225c166dba1c75df02ab26197a382b5ab183d31e58eb1a6
       RPC_TEST_AUGMENTED_TREE: debf975d828439adf2bc78315443c2dfcdd1606e
       RPC_TEST_AUGMENTED_PATCH_SHA256: 4a149ce5d9c9cf53b7a13b6bb14883d67f73afc503f3742b059c2b1911850426
+      RPC_TEST_FINAL_TREE: 69633233dc688906916718773880e776741cb3fd
+      RPC_TEST_RESOLVER_PATCH_SHA256: 828a4688ef1f8f66266903ca19906b1b1a4cf5bae90a2afc0f0837d7e8bc0150
       RPC_TEST_PATHS: |
-        scripts/benchplan/files_test.go
         scripts/benchrun/main_test.go
-        scripts/benchrun/rpc_fixture_limits_test.go
+        scripts/benchrun/rpc_fixture.go
 
     steps:
       - uses: actions/checkout@v7
@@ -42,7 +44,7 @@ jobs:
           check-latest: false
           cache: false
 
-      - name: Restore the qualified tree and exact regression tests
+      - name: Restore the qualified tree and the exact resolver change
         id: restore
         run: |
           set -euo pipefail
@@ -58,10 +60,11 @@ jobs:
           fi
           base64 -d < .github/qualification/rpc-benchmark-marker.patch.b64 > "$evidence/qualified.patch"
           base64 -d < .github/qualification/rpc-benchmark-reachable-tests.patch.b64 > "$evidence/augmented.patch"
+          base64 -d < .github/qualification/rpc-benchmark-post-lstat.patch.b64 > "$evidence/resolver.patch"
           (
             cd "$evidence"
-            printf '%s  qualified.patch\n%s  augmented.patch\n' \
-              "$RPC_TEST_QUALIFIED_PATCH_SHA256" "$RPC_TEST_AUGMENTED_PATCH_SHA256" | sha256sum -c -
+            printf '%s  qualified.patch\n%s  augmented.patch\n%s  resolver.patch\n' \
+              "$RPC_TEST_QUALIFIED_PATCH_SHA256" "$RPC_TEST_AUGMENTED_PATCH_SHA256" "$RPC_TEST_RESOLVER_PATCH_SHA256" | sha256sum -c -
           ) > "$evidence/patch-check.log"
           git worktree add --detach "$source" "$RPC_TEST_BASE"
           (
@@ -73,24 +76,29 @@ jobs:
             git apply --index --whitespace=error "$evidence/augmented.patch"
             git apply --index --reverse --check "$evidence/augmented.patch"
             test "$(git write-tree)" = "$RPC_TEST_AUGMENTED_TREE"
+            git apply --index --check --whitespace=error "$evidence/resolver.patch"
+            git apply --index --whitespace=error "$evidence/resolver.patch"
+            git apply --index --reverse --check "$evidence/resolver.patch"
+            test "$(git write-tree)" = "$RPC_TEST_FINAL_TREE"
             git diff --exit-code
-            git diff --check "$RPC_TEST_QUALIFIED_TREE" "$RPC_TEST_AUGMENTED_TREE"
-            git diff --name-only "$RPC_TEST_QUALIFIED_TREE" "$RPC_TEST_AUGMENTED_TREE" > "$evidence/changed-paths.txt"
+            git diff --check "$RPC_TEST_AUGMENTED_TREE" "$RPC_TEST_FINAL_TREE"
+            git diff --name-only "$RPC_TEST_AUGMENTED_TREE" "$RPC_TEST_FINAL_TREE" > "$evidence/changed-paths.txt"
             printf '%s' "$RPC_TEST_PATHS" | cmp "$evidence/changed-paths.txt" -
             for subtree in pkg internal cmd; do
               qualified=$(git rev-parse "$RPC_TEST_QUALIFIED_TREE:$subtree")
-              augmented=$(git rev-parse "$RPC_TEST_AUGMENTED_TREE:$subtree")
-              test "$qualified" = "$augmented"
-              printf '%s %s %s\n' "$subtree" "$qualified" "$augmented"
+              final=$(git rev-parse "$RPC_TEST_FINAL_TREE:$subtree")
+              test "$qualified" = "$final"
+              printf '%s %s %s\n' "$subtree" "$qualified" "$final"
             done > "$evidence/identical-subtrees.txt"
+            git diff --exit-code "$RPC_TEST_QUALIFIED_TREE" "$RPC_TEST_FINAL_TREE" -- .github/workflows/test.yml
             paths=()
             while IFS= read -r path; do paths+=("$path"); done < "$evidence/changed-paths.txt"
             sha256sum "${paths[@]}" > "$evidence/test-sources.sha256"
             gofmt -s -l "${paths[@]}" > "$evidence/gofmt.log"
             test ! -s "$evidence/gofmt.log"
           )
-          printf 'workflow=%s\nbase=%s\nqualified_tree=%s\naugmented_tree=%s\n' \
-            "$GITHUB_SHA" "$RPC_TEST_BASE" "$RPC_TEST_QUALIFIED_TREE" "$RPC_TEST_AUGMENTED_TREE" > "$evidence/revisions.txt"
+          printf 'workflow=%s\nbase=%s\nqualified_tree=%s\naugmented_tree=%s\nresolver_tree=%s\n' \
+            "$GITHUB_SHA" "$RPC_TEST_BASE" "$RPC_TEST_QUALIFIED_TREE" "$RPC_TEST_AUGMENTED_TREE" "$RPC_TEST_FINAL_TREE" > "$evidence/revisions.txt"
           sh "$source/scripts/setup-modules.sh" "$source"
 
       - name: Run Linux script race tests and the EFBIG regression
@@ -108,7 +116,7 @@ jobs:
           go test -p 2 -race ./scripts/benchrun -run '^TestWritePerformanceOverlayReportsWriteFailure$' \
             -count=1 -timeout=30s -json > "$evidence/write-failure.jsonl"
           go tool cover -func="$evidence/scripts.coverage" > "$evidence/coverage-summary.txt"
-          for fn in verifyEqualInventories compileBenchmarks writePerformanceOverlay; do
+          for fn in verifyEqualInventories compileBenchmarks writePerformanceOverlay performanceOverlay performanceOverlayWithPathResolver; do
             grep -E "[[:space:]]$fn[[:space:]]+100\\.0%$" "$evidence/coverage-summary.txt"
           done > "$evidence/required-functions.txt"
           python3 - "$evidence" <<'PY'
@@ -122,6 +130,7 @@ jobs:
           required = {
               "scripts.jsonl": [(root + "benchplan", "TestVerifyEqualInventoriesReportsInvalidArguments"),
                                 (root + "benchrun", "TestCompilePerformanceKeepsBenchmarksAndSeparatesCorrectness"),
+                                (root + "benchrun", "TestPerformanceOverlayReportsFixtureResolutionFailure"),
                                 (root + "benchrun", "TestPerformanceOverlayRejectsInvalidPaths/symlinked_ancestor"),
                                 (root + "benchrun", "TestPerformanceOverlayRejectsInvalidPaths/unreadable_fixture"),
                                 write_failure],
@@ -158,8 +167,8 @@ jobs:
           cd "$root/.tmp/rpc-reachable-tests-source"
           sha256sum -c "$evidence/test-sources.sha256" > "$evidence/final-source-check.log"
           git diff --exit-code
-          test "$(git write-tree)" = "$RPC_TEST_AUGMENTED_TREE"
-          printf '%s\n' "$RPC_TEST_AUGMENTED_TREE" > "$evidence/final-tree.txt"
+          test "$(git write-tree)" = "$RPC_TEST_FINAL_TREE"
+          printf '%s\n' "$RPC_TEST_FINAL_TREE" > "$evidence/final-tree.txt"
 
       - name: Remove the owned test worktree
         if: always()
