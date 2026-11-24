@@ -1,4 +1,4 @@
-name: Qualify Dart snapshot boundaries natively
+name: Qualify Dart snapshot boundaries on Windows
 
 on:
   push:
@@ -26,7 +26,7 @@ jobs:
         with:
           sdk: '3.13.4'
 
-      - name: Verify the pinned native Dart boundary
+      - name: Verify the native attributes and component-open boundaries
         env:
           DART_NATIVE_PLATFORM: windows
         run: python .github/qualification/dart-snapshot-native.py

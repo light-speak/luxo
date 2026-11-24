@@ -16,23 +16,25 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 
-DIAGNOSTIC_BASE = "61a708a5078694862403fc3e38d912df9d1fb17b"
+DIAGNOSTIC_BASE = "fc988f19bf59cd30ae167c9447875def58804975"
 DIAGNOSTIC_REF = "refs/heads/diagnostics/dart-snapshot-native"
 DIAGNOSTIC_FILES = {
     ".github/workflows/qualify-dart-snapshot-native.yml",
     ".github/qualification/dart-snapshot-native.py",
+    ".github/qualification/dart-snapshot-product.patch.b64",
 }
-BASE = "dd6405a02c653c8f2da90ff8ea81795a6781033b"
-BASE_TREE = "5cb2421d34fc1addd094a0a68ad6671414230c13"
-CANDIDATE_TREE = "8fc81745ae2a70d1a07ace8f36f923cb3a732293"
-DART_TREE = "222a4d8fdc8a567c2cbda2c5f422dd703ee1ce9b"
-PATCH_SHA = "7f20d348a174125033eea6170138b328ff98d2640987be64a1ef0d9f66a87d84"
+BASE = "a2c411b7b83ca233881ace0c5bf3bec0b9646e1d"
+BASE_TREE = "782d78fff9fe3346fa7d161960a12a452cf51ff0"
+CANDIDATE_TREE = "db05f952649f3a2ca52286634f12235d1bede41c"
+DART_TREE = "4aca3ca3c8e903f1079d77e800b078a61e5ed8b8"
+PATCH_SHA = "49ba840fecf59426cfe1c77671a1e21185c9cec6e2c9b9816b2f49ecc57ed434"
 DART_VERSION = "3.13.4"
+COMPONENT_OPEN_TEST = "snapshot refresh rejects a regular file in a directory component and can retry"
 VERIFIER = ".github/qualification/dart-snapshot-native.py"
 PRODUCT_FILES = {
     VERIFIER: "b894c0424964c4049366a6a3d7c3f10623082658e64a89f9e1c4346366bf8803",
-    ".github/workflows/dart-release-windows.yml": "9b4c502a8798ba5a35e8dfe82805b0dd58c5fc3fda55c9d3585c41c00e1c22fa",
-    ".github/workflows/test.yml": "7e186b43c3c1da1bcd630a89e87a14eeb2cb1186c96515d446e76776307da1a4",
+    ".github/workflows/dart-release-windows.yml": "f8ff0b50d52203610c1dc1d5d8c03f002e8da34824d14ce61169259a50dd1fb4",
+    ".github/workflows/test.yml": "077ec836bcf04f31131d2bb07811ca114e08692dfd88e491013c7b81166dbe2b",
     "packages/dart/bin/build.dart": "6459d88ca789c0839fa1250074d4527c80d577a732b8d868603a40b3437f771e",
     "packages/dart/bin/flutter.dart": "050468180d1d143d8b43a4a676c052fd02b2f8fabe10f8e5bbef393ab0360add",
     "packages/dart/lib/src/builder/artifact_publish.dart": "081b7122a34a0d29eab7391c73b050d5678c0c9c769e0ad6269ea22b5549b2fa",
@@ -41,7 +43,7 @@ PRODUCT_FILES = {
     "packages/dart/lib/src/builder/snapshot_posix.dart": "963467186dfadfb56a30376481c182ae141809322b78587de1744ee555bff5fb",
     "packages/dart/lib/src/builder/snapshot_windows.dart": "339a85a18eb62092ed4126d75aad294a4d7882f34e737914e4ca4ea5df098344",
     "packages/dart/test/select_fixture.dart": "8928cc9983c72cd48743b42fd61e1154fddc7a9b5c12524177658d0ae8b75a3f",
-    "packages/dart/test/selection_build_test.dart": "c6994dfd6857298dd9d468e72f17b3692c30df4f5c04e7ede8d2b334300e15c2",
+    "packages/dart/test/selection_build_test.dart": "4af911ea49c7a2ec44344f9decc06c72c20807039ef6747cceedeb7095986506",
 }
 
 
@@ -64,7 +66,7 @@ def verify_diagnostic_checkout(repo):
             "expected the dedicated diagnostic push")
     require(head == os.environ.get("GITHUB_SHA"), "unexpected diagnostic workflow head")
     require(git(repo, "rev-list", "--parents", "--max-count=1", "HEAD") == f"{head} {DIAGNOSTIC_BASE}",
-            "the diagnostic head must extend the pinned first attempt")
+            "the diagnostic head must extend the pinned Windows cleanup run")
     changed = set(git(repo, "diff", "--name-only", DIAGNOSTIC_BASE, head).splitlines())
     require(changed == DIAGNOSTIC_FILES, "unexpected diagnostic publication paths")
     subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=repo, check=True)
@@ -124,6 +126,43 @@ def installation(dart, package, evidence):
     shutil.copyfile(package / "pubspec.lock", evidence / "pubspec.lock")
 
 
+def component_open_route(native, coverage):
+    tracked = {
+        "selection_build.dart": (83, 85, 124),
+        "snapshot_directory.dart": (126, 193, 198),
+        "snapshot_windows.dart": (71, 78, 79, 80, 102, 103, 106),
+        "artifact_publish.dart": (558, 573, 574, 575, 577),
+    }
+    hits = {name: native["line_hits"](coverage, name, lines) for name, lines in tracked.items()}
+    for name, required in {
+        "selection_build.dart": (83, 85, 124),
+        "snapshot_directory.dart": (126, 193, 198),
+        "snapshot_windows.dart": (71, 78, 106),
+        "artifact_publish.dart": (558, 574, 577),
+    }.items():
+        require(all(hits[name][line] > 0 for line in required), f"missing Windows component route in {name}: {hits[name]}")
+    require(not (hits["snapshot_windows.dart"][102] or hits["snapshot_windows.dart"][103]),
+            "regular-file test entered the junction attributes rejection")
+    reports = list(coverage.rglob("*.vm.json"))
+    require(len(reports) == 1, "expected one isolated component-open coverage report")
+    files = json.loads(reports[0].read_text(encoding="utf-8"))["coverage"]
+    source = "package:luxo_client/src/builder/artifact_publish.dart"
+    entries = [entry for entry in files if entry["source"] == source]
+    require(len(entries) == 1, "expected one native open coverage entry")
+    branches = dict(zip(entries[0]["branchHits"][::2], entries[0]["branchHits"][1::2]))
+    require(branches.get(573, 0) > 0, "native Windows NTSTATUS rejection branch was not hit")
+    return {"lineHits": hits, "branchHits": {"artifact_publish.dart": {573: branches[573]}}}
+
+
+def verify_windows_case(source, root, evidence, native, dart, name):
+    before = set(root.glob("dart-select-build-*"))
+    evidence.mkdir()
+    done, messages, coverage = native["run_test"](source, evidence, dart, name)
+    require(set(root.glob("dart-select-build-*")) == before, f"Dart snapshot fixture leaked: {name}")
+    require(len(list(coverage.rglob("*.vm.json"))) == 1, f"expected isolated VM coverage for {name}")
+    return done, messages, coverage
+
+
 def qualify(source, root, evidence, native, expected):
     host = {"linux": "Linux", "windows": "Windows"}.get(expected)
     require(host and platform.system() == host and platform.machine().lower() in {"amd64", "x86_64"},
@@ -137,6 +176,7 @@ def qualify(source, root, evidence, native, expected):
     installation(dart, source / "packages/dart", evidence)
 
     name = native["TESTS"][host]
+    additional = {}
     if host == "Linux":
         require(native["FIXTURE_ENV"] not in os.environ, "diagnostic must own the Linux mount and teardown")
         with native["split_device_fixture"](root, True) as (fixture, mounted):
@@ -149,14 +189,28 @@ def qualify(source, root, evidence, native, expected):
         outcome = {"boundary": "different-volume", "lineHits": hits, "directoryIdentity": identity,
                    "fixtureCleanup": "unmounted-and-removed"}
     else:
-        before = set(root.glob("dart-select-build-*"))
-        done, messages, coverage = native["run_test"](source, evidence, dart, name)
-        require(set(root.glob("dart-select-build-*")) == before, "Dart snapshot fixture leaked")
+        attributes = evidence / "attributes"
+        done, messages, coverage = verify_windows_case(source, root, attributes, native, dart, name)
         outcome = native["windows_rejection"](messages, coverage)
+        require(outcome["reparseAttributesVerified"], "the Windows junction did not hit the attributes rejection")
+        component = evidence / "component-open"
+        component_done, _, component_coverage = verify_windows_case(
+            source, root, component, native, dart, COMPONENT_OPEN_TEST)
+        route = component_open_route(native, component_coverage)
+        additional["componentOpen"] = {
+            "test": COMPONENT_OPEN_TEST, "event": component_done, "boundary": "component-open",
+            "nativeErrorAssertedByPinnedTest": {
+                "type": "FileSystemException", "code": 267, "component": "assets",
+                "diagnostic": "Cannot prepare output component",
+            },
+            "bytePreservationAndNormalRetryAssertedByPinnedTest": True,
+            "fixtureCleanup": "removed",
+            **route,
+        }
 
     require(list(coverage.rglob("*.vm.json")), "Dart VM coverage reports are missing")
     require(all(digest(source / path) == sha for path, sha in PRODUCT_FILES.items()), "product source changed during the run")
-    return {"dart": version, "test": name, "event": done, "outcome": outcome}
+    return {"dart": version, "test": name, "event": done, "outcome": outcome, **additional}
 
 
 def main():
