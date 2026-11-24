@@ -406,9 +406,9 @@ jobs:
           mkdir -p .tmp/bin .tmp/test-tmp .tmp/benchmark-inventory/base .tmp/benchmark-inventory/head
           .tmp/bin/benchrun performance-profile > .tmp/benchmark-compile-profile.txt
           record_inventory() {
-            local revision="$1" binaries="$2" package="$3" stem="$4"
-            .tmp/bin/benchrun run ".tmp/${revision}" "$binaries" "$package" \
-              -test.run='^$' -test.bench=. -test.benchmem -test.benchtime=1x \
+            local revision="$1" binaries="$2" package="$3" stem="$4" profile="${5:-default}" filter="${6:-.}"
+            .tmp/bin/benchrun run-performance ".tmp/${revision}" "$binaries" "$package" "$profile" \
+              -test.run='^$' -test.bench="$filter" -test.benchmem -test.benchtime=1x \
               -test.count=1 -test.cpu=2 -test.timeout=180s > "$stem.raw.log"
             GOWORK=off go run ./scripts/benchplan --normalize "$stem.raw.log" "$stem.log"
           }
@@ -425,6 +425,18 @@ jobs:
                 .tmp/bin/benchrun compile ".tmp/${revision}" ".tmp/bin/ordinary-${revision}" "${package}"
                 record_inventory "$revision" ".tmp/bin/ordinary-${revision}" "$package" "$stem.ordinary"
                 GOWORK=off go run ./scripts/benchplan --verify-equal-inventories "$stem.ordinary.log" "$stem.log"
+              fi
+              specification=$(.tmp/bin/benchrun isolation-profile "$package")
+              if [[ -n "$specification" ]]; then
+                IFS=$'\t' read -r profile filter <<< "$specification"
+                .tmp/bin/benchrun "$compile" ".tmp/${revision}" ".tmp/bin/${revision}" "$package" "$profile"
+                if [[ "$profile" == codec-reader ]]; then
+                  .tmp/bin/benchrun run-performance ".tmp/${revision}" ".tmp/bin/${revision}" "$package" "$profile" \
+                    -test.list='.*' > "$stem.$profile.roots"
+                  test "$(cat "$stem.$profile.roots")" = BenchmarkElementPayload
+                fi
+                record_inventory "$revision" ".tmp/bin/${revision}" "$package" "$stem.$profile" "$profile" "$filter"
+                GOWORK=off go run ./scripts/benchplan --verify-profile-inventory "$package" "$profile" "$stem.log" "$stem.$profile.log"
               fi
             done
           done < .tmp/benchmark-packages.txt
@@ -516,9 +528,10 @@ jobs:
           GOWORK=off go build -o .tmp/bin/benchrun ./scripts/benchrun
           .tmp/bin/benchrun performance-profile > .tmp/benchmark-compile-profile.txt
           cmp .tmp/benchmark-compile-profile.txt .tmp/plan/benchmark-compile-profile.txt
-          while IFS=$'\t' read -r package filter; do
-            .tmp/bin/benchrun compile-performance-baseline .tmp/base .tmp/bin/base "${package}"
-            .tmp/bin/benchrun compile-performance .tmp/head .tmp/bin/head "${package}"
+          GOWORK=off go run ./scripts/benchplan --verify-profile-batch primary .tmp/benchmark-expected.json .tmp/benchmark-batch.tsv
+          while IFS=$'\t' read -r package profile filter; do
+            .tmp/bin/benchrun compile-performance-baseline .tmp/base .tmp/bin/base "${package}" "${profile}"
+            .tmp/bin/benchrun compile-performance .tmp/head .tmp/bin/head "${package}" "${profile}"
           done < .tmp/benchmark-batch.tsv
 
       - name: Run adaptive interleaved benchmark samples
@@ -531,8 +544,9 @@ jobs:
             local binary_root="$2"
             local output="$3"
             local package="$4"
-            local filter="$5"
-            .tmp/bin/benchrun run "${source_root}" "${binary_root}" "${package}" \
+            local profile="$5"
+            local filter="$6"
+            .tmp/bin/benchrun run-performance "${source_root}" "${binary_root}" "${package}" "${profile}" \
               -test.run='^$' -test.bench="${filter}" -test.benchmem \
               -test.benchtime=200ms -test.count=1 -test.cpu=2 >> "${output}"
           }
@@ -544,13 +558,13 @@ jobs:
             : > "${base_output}"
             : > "${head_output}"
             for sample in {1..10}; do
-              while IFS=$'\t' read -r package filter; do
+              while IFS=$'\t' read -r package profile filter; do
                 if (( sample % 2 == 1 )); then
-                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${filter}"
-                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${profile}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${profile}" "${filter}"
                 else
-                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${filter}"
-                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${profile}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${profile}" "${filter}"
                 fi
               done < "${batch}"
             done
@@ -567,6 +581,7 @@ jobs:
             GOWORK=off go run ./scripts/benchplan --confirmation-plan .tmp/benchmark-expected.json .tmp/benchmark-confirmation-targets.tsv .tmp/benchmark-confirmation-batch.tsv .tmp/benchmark-confirmation-expected.json
             test -s .tmp/benchmark-confirmation-batch.tsv
             test -s .tmp/benchmark-confirmation-expected.json
+            GOWORK=off go run ./scripts/benchplan --verify-profile-batch confirmation .tmp/benchmark-confirmation-expected.json .tmp/benchmark-confirmation-batch.tsv
             run_group confirmation .tmp/benchmark-confirmation-batch.tsv
             GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-confirmation-expected.json .tmp/benchmark-confirmation-base.txt .tmp/benchmark-confirmation-head.txt
             .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt

@@ -79,7 +79,7 @@ func TestPerformanceSummaryFailsClosed(t *testing.T) {
 func samplingFixture(t *testing.T, confirmation bool) qualityFixture {
 	t.Helper()
 	fixture := newQualityFixture(t)
-	fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/a\t^(BenchmarkA|BenchmarkB)$\npkg/control\t^BenchmarkC$\n")
+	fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/a\tdefault\t^(BenchmarkA|BenchmarkB)$\npkg/control\tdefault\t^BenchmarkC$\n")
 	fixture.write(t, ".tmp/benchmark-expected.json", "primary expectations\n")
 	for _, revision := range []string{"base", "head"} {
 		for _, binary := range []string{"pkg-a.test", "pkg-control.test"} {
@@ -89,10 +89,11 @@ func samplingFixture(t *testing.T, confirmation bool) qualityFixture {
 	fixture.write(t, ".tmp/bin/benchstat", "#!/bin/sh\nprintf 'benchstat %s\\n' \"$*\" >> \"$QUALITY_LOG\"\nprintf 'benchmark CSV\\n'\n")
 	fixture.write(t, ".tmp/bin/benchrun", `#!/bin/sh
 set -eu
-test "$1" = run
+test "$1" = run-performance
 benchmark_bin=$3
 benchmark_package=$4
-shift 4
+test "$5" = default
+shift 5
 case "$benchmark_package" in
   pkg/a) exec "$benchmark_bin/pkg-a.test" "$@" ;;
   pkg/control) exec "$benchmark_bin/pkg-control.test" "$@" ;;
@@ -118,6 +119,11 @@ esac
 
 const samplingTools = `set -eu
 case "$1 $2 $3" in
+  'run ./scripts/benchplan --verify-profile-batch')
+    test "$4" = confirmation
+    test "$5" = .tmp/benchmark-confirmation-expected.json
+    test "$6" = .tmp/benchmark-confirmation-batch.tsv
+    ;;
   "run ./scripts/benchplan --normalize")
     /bin/cat "$4" > "$5"
     ;;
@@ -148,7 +154,7 @@ case "$1 $2 $3" in
     test "$(/bin/cat "$5")" = "$(printf 'pkg/a\tBenchmarkB-2')"
     test "${FAIL_STAGE:-}" != plan
     if [ "${FAIL_STAGE:-}" != empty-plan ]; then
-      printf 'pkg/a\t^BenchmarkB$\n' > "$6"
+      printf 'pkg/a\tdefault\t^BenchmarkB$\n' > "$6"
     fi
     printf 'confirmation expectations\n' > "$7"
     ;;
@@ -187,7 +193,7 @@ func TestPerformanceSamplingAlternatesBothRevisions(t *testing.T) {
 				targets = "pkg/a\tBenchmarkB-2\n"
 			}
 			wantGate := "go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha expected-main " + gateArgs
-			if len(runs) != totalRuns || strings.Count(log, "./scripts/benchplan --verify") != groups || !strings.Contains(log, wantGate) {
+			if len(runs) != totalRuns || strings.Count(log, "./scripts/benchplan --verify ") != groups || !strings.Contains(log, wantGate) {
 				t.Fatalf("sampling or gate changed; got %d runs, log:\n%s", len(runs), log)
 			}
 			assertSampleOrder(t, runs[:40], "^(BenchmarkA|BenchmarkB)$", "^BenchmarkC$")
@@ -339,6 +345,12 @@ func TestPerformanceBindsRPCCompileProfileAndCompleteInventory(t *testing.T) {
 		{discover, "compile=compile-performance"},
 		{discover, "benchrun performance-profile > .tmp/benchmark-compile-profile.txt"},
 		{discover, "--verify-equal-inventories"},
+		{discover, "--verify-profile-inventory"},
+		{discover, `benchrun isolation-profile "$package"`},
+		{discover, `-test.list='.*' > "$stem.$profile.roots"`},
+		{discover, `record_inventory "$revision" ".tmp/bin/${revision}" "$package" "$stem.$profile" "$profile" "$filter"`},
+		{compile, `read -r package profile filter`},
+		{compile, `--verify-profile-batch primary .tmp/benchmark-expected.json .tmp/benchmark-batch.tsv`},
 		{discover, `benchrun compile ".tmp/${revision}" ".tmp/bin/ordinary-${revision}" "${package}"`},
 		{compile, "benchrun compile-performance-baseline .tmp/base"},
 		{compile, "benchrun compile-performance .tmp/head"},
@@ -374,11 +386,14 @@ func TestPerformancePreparesScratchWithinBothRevisions(t *testing.T) {
 			fixture.write(t, ".tmp/plan/benchmark-compile-profile.txt", "profile-v1\n")
 			fixture.write(t, "scripts/setup-modules.sh", "#!/bin/sh\nexit 0\n")
 			fixture.write(t, ".tmp/benchmark-packages.txt", "pkg/lux/pg\n")
-			fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/lux/pg\t^BenchmarkPendingMigrationFiles$\n")
+			fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/lux/pg\tdefault\t^BenchmarkPendingMigrationFiles$\n")
 			fixture.write(t, ".tmp/bin/benchrun", `#!/bin/sh
 set -eu
 if [ "$1" = performance-profile ]; then
     printf 'profile-v1\n'
+    exit
+fi
+if [ "$1" = isolation-profile ]; then
     exit
 fi
 printf '%s %s\n' "$1" "$2" >> "$QUALITY_LOG"

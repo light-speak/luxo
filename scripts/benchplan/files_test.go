@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -24,7 +25,7 @@ func TestConfirmationPlanWritesOnlyPairedLeaves(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(batch)
-	if err != nil || string(got) != "pkg/a\t^BenchmarkRead$/^a\\+b$\npkg/z\t^BenchmarkWrite$\n" {
+	if err != nil || string(got) != "pkg/a\tdefault\t^BenchmarkRead$/^a\\+b$\npkg/z\tdefault\t^BenchmarkWrite$\n" {
 		t.Fatalf("confirmation batch = %q, %v", got, err)
 	}
 	sample := filepath.Join(root, "sample.txt")
@@ -118,7 +119,7 @@ func TestConfirmationFilterRunsOnlySelectedNestedBenchmarks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, filter, _ := strings.Cut(strings.TrimSpace(string(plan)), "\t")
+	_, filter, _ := strings.Cut(strings.TrimSpace(string(plan)), "\tdefault\t")
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -187,7 +188,7 @@ func TestRunWritesReproduciblePlans(t *testing.T) {
 	}
 	for _, item := range []struct{ id, pkg string }{{"01", "a"}, {"02", "b"}} {
 		plan, err := os.ReadFile(filepath.Join(destination, "shard-"+item.id+".tsv"))
-		if err != nil || string(plan) != "pkg/"+item.pkg+"\t^(BenchmarkRead)$\n" {
+		if err != nil || string(plan) != "pkg/"+item.pkg+"\tdefault\t^(BenchmarkRead)$\n" {
 			t.Fatalf("plan=%s err=%v", plan, err)
 		}
 		samplePath := filepath.Join(root, "samples.txt")
@@ -195,6 +196,51 @@ func TestRunWritesReproduciblePlans(t *testing.T) {
 		if err := run([]string{"--verify", filepath.Join(destination, "shard-"+item.id+".json"), samplePath, samplePath}, io.Discard); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestRunScalesShardsWithSampleVolume(t *testing.T) {
+	root, packages := inventoryFixture(t)
+	writeFixture(t, packages, "pkg/a\n")
+	var samples strings.Builder
+	for group := range 24 {
+		for leaf := range 100 {
+			fmt.Fprintf(&samples, "BenchmarkGroup%d/leaf%d-2 1 12 ns/op 0 B/op 0 allocs/op\n", group, leaf)
+		}
+	}
+	samples.WriteString("PASS\n")
+	for _, revision := range []string{"base", "head"} {
+		writeFixture(t, filepath.Join(root, revision, "pkg-a.log"), samples.String())
+	}
+	var output bytes.Buffer
+	destination := filepath.Join(root, "plans")
+	if err := run([]string{packages, root, destination}, &output); err != nil {
+		t.Fatal(err)
+	}
+	var matrix struct{ Include []benchShard }
+	if err := json.Unmarshal(output.Bytes(), &matrix); err != nil {
+		t.Fatal(err)
+	}
+	if len(matrix.Include) != 10 {
+		t.Fatalf("planned %d shards for 4800 leaf measurements, want 10", len(matrix.Include))
+	}
+	total := 0
+	for _, shard := range matrix.Include {
+		out, err := os.ReadFile(filepath.Join(destination, "shard-"+shard.ID+".json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var expected expectedSamples
+		if err := json.Unmarshal(out, &expected); err != nil {
+			t.Fatal(err)
+		}
+		if len(expected.Base) == 0 || len(expected.Base) != len(expected.Head) {
+			t.Fatalf("shard %s is missing paired evidence", shard.ID)
+		}
+		total += len(expected.Base) + len(expected.Head)
+	}
+	if total != 4800 {
+		t.Fatalf("planned %d leaf measurements, want 4800", total)
 	}
 }
 

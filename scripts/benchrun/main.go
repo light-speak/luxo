@@ -30,8 +30,20 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 		_, err := fmt.Fprintln(output, performanceProfile)
 		return err
 	}
-	if len(args) < 4 || (args[0] != "compile" && args[0] != "compile-performance" && args[0] != "compile-performance-baseline" && args[0] != "run") {
-		return errors.New("usage: benchrun canonical | performance-profile | {compile|compile-performance|compile-performance-baseline|run} revision binary-directory logical-package [test flags]")
+	if len(args) == 2 && args[0] == "isolation-profile" {
+		profile, filter := benchlayout.IsolationProfile(args[1])
+		if profile == "" {
+			return nil
+		}
+		_, err := fmt.Fprintf(output, "%s\t%s\n", profile, filter)
+		return err
+	}
+	if len(args) < 4 || (args[0] != "compile" && args[0] != "compile-performance" && args[0] != "compile-performance-baseline" && args[0] != "run" && args[0] != "run-performance") {
+		return errors.New("usage: benchrun canonical | performance-profile | isolation-profile package | {compile|compile-performance|compile-performance-baseline|run|run-performance} revision binary-directory logical-package [profile] [test flags]")
+	}
+	profile, testFlags, err := performanceArguments(args[0], args[3], args[4:])
+	if err != nil {
+		return err
 	}
 	root, err := filepath.Abs(args[1])
 	if err != nil {
@@ -49,14 +61,18 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 		return err
 	}
 	for _, path := range packages {
-		binary := filepath.Join(bin, strings.ReplaceAll(path, "/", "-")+".test")
-		if args[0] != "run" {
-			if err := compileBenchmarks(root, binary, path, args[0], output, errorOutput); err != nil {
+		name := strings.ReplaceAll(path, "/", "-")
+		if profile != benchlayout.DefaultProfile {
+			name += "-" + profile
+		}
+		binary := filepath.Join(bin, name+".test")
+		if args[0] != "run" && args[0] != "run-performance" {
+			if err := compileBenchmarks(root, binary, path, args[0], profile, output, errorOutput); err != nil {
 				return fmt.Errorf("%s %s: %w", args[0], path, err)
 			}
 			continue
 		}
-		cmd := exec.Command(binary, args[4:]...)
+		cmd := exec.Command(binary, testFlags...)
 		cmd.Dir = filepath.Join(root, path)
 		cmd.Stdout, cmd.Stderr = output, errorOutput
 		if err := cmd.Run(); err != nil {
@@ -66,10 +82,39 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 	return nil
 }
 
-func compileBenchmarks(root, binary, packagePath, command string, output, errorOutput io.Writer) (err error) {
+func performanceArguments(command, pkg string, args []string) (string, []string, error) {
+	if command == "run" || command == "compile" {
+		return benchlayout.DefaultProfile, args, nil
+	}
+	if len(args) == 0 && command != "run-performance" {
+		return benchlayout.DefaultProfile, nil, nil
+	}
+	if len(args) == 0 || !benchlayout.ValidPerformanceProfile(pkg, args[0]) {
+		return "", nil, fmt.Errorf("invalid performance profile for %s: %v", pkg, args)
+	}
+	if command != "run-performance" && len(args) != 1 {
+		return "", nil, errors.New("unexpected performance compile arguments")
+	}
+	return args[0], args[1:], nil
+}
+
+func compileOverlay(root, packagePath string, baseline bool, profile string) (string, func() error, error) {
+	switch profile {
+	case benchlayout.CodecReaderProfile:
+		return codecReaderOverlay(root)
+	case benchlayout.APINonIdentityProfile:
+		return packageTestOverlay(root, packagePath, "bench-api-non-identity-*", writeAPIBenchmarkOverlay)
+	case benchlayout.LuviaPrimaryTraceProfile:
+		return packageTestOverlay(root, packagePath, "bench-luvia-primary-trace-*", writeLuviaBenchmarkOverlay)
+	default:
+		return performanceOverlay(root, packagePath, baseline)
+	}
+}
+
+func compileBenchmarks(root, binary, packagePath, command, profile string, output, errorOutput io.Writer) (err error) {
 	args := []string{"test", "-trimpath", "-c"}
 	if command != "compile" {
-		overlay, cleanup, overlayErr := performanceOverlay(root, packagePath, command == "compile-performance-baseline")
+		overlay, cleanup, overlayErr := compileOverlay(root, packagePath, command == "compile-performance-baseline", profile)
 		if overlayErr != nil {
 			return overlayErr
 		}
