@@ -4,9 +4,10 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo=$(git -C "$script_dir" rev-parse --show-toplevel)
 source "$script_dir/diagnose-hosted-perf.sh"
-suite="${1:?usage: diagnose-frozen-fixtures.sh pr71|pr72|pr72-array-header [--plan-only]}"
+suite="${1:?usage: diagnose-frozen-fixtures.sh pr71|pr72|pr72-array-header [--plan-only|--layout-only]}"
 mode="${2:-run}"
-[[ $# -le 2 && ( "$mode" == run || "$mode" == --plan-only ) ]]
+[[ $# -le 2 && ( "$mode" == run || "$mode" == --plan-only || "$mode" == --layout-only ) ]] || exit 2
+[[ "$mode" != --layout-only || "$suite" == pr72-array-header ]] || exit 2
 array_candidate=
 case "$suite" in
   pr71)
@@ -33,6 +34,7 @@ test ! -L "$repo/.tmp"
 scratch=$(mktemp -d "$repo/.tmp/frozen-test-fixtures.XXXXXXXX")
 evidence="$repo/.tmp/hosted-frozen-fixtures-$suite"
 if [[ "$mode" == --plan-only ]]; then evidence="$scratch/evidence"; fi
+if [[ "$mode" == --layout-only ]]; then evidence="$repo/.tmp/hosted-pr72-reference-layout"; fi
 cleanup_fixture_shadow() {
   local code=$?
   trap - EXIT
@@ -143,10 +145,12 @@ done
 (
   cd "$repo"
   go build -o "$scratch/bin/benchrun" ./scripts/benchrun
-  cd "$scratch/source/base"
-  for name in benchplan benchgate; do go build -o "$scratch/bin/$name" "./scripts/$name"; done
-  GOBIN="$scratch/bin" go install "golang.org/x/perf/cmd/benchstat@$benchstat_version"
-  go version -m "$scratch/bin/benchstat"
+  if [[ "$mode" != --layout-only ]]; then
+    cd "$scratch/source/base"
+    for name in benchplan benchgate; do go build -o "$scratch/bin/$name" "./scripts/$name"; done
+    GOBIN="$scratch/bin" go install "golang.org/x/perf/cmd/benchstat@$benchstat_version"
+    go version -m "$scratch/bin/benchstat"
+  fi
 ) > "$evidence/tools.log" 2>&1
 
 while IFS= read -r package; do
@@ -174,6 +178,11 @@ while IFS= read -r package; do
   fi
 done < "$evidence/packages.txt"
 for role in "${roles[@]}"; do record_binaries "$role"; done
+
+if [[ "$mode" == --layout-only ]]; then
+  python3 "$script_dir/diagnose-pr72-reference-layout.py" "$evidence" "$scratch/bin"
+  exit 0
+fi
 
 if [[ -n "$array_candidate" ]]; then
   "$scratch/bin/benchrun" compile "$scratch/source/candidate" "$scratch/bin/candidate-native" pkg/lux/codec
