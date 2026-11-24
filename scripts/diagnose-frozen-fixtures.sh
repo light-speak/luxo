@@ -4,10 +4,14 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo=$(git -C "$script_dir" rev-parse --show-toplevel)
 source "$script_dir/diagnose-hosted-perf.sh"
-suite="${1:?usage: diagnose-frozen-fixtures.sh pr71|pr72|pr72-array-header [--plan-only|--layout-only]}"
+suite="${1:?usage: diagnose-frozen-fixtures.sh pr71|pr72|pr72-array-header [--plan-only|--layout-only|--compare-alignment]}"
 mode="${2:-run}"
-[[ $# -le 2 && ( "$mode" == run || "$mode" == --plan-only || "$mode" == --layout-only ) ]] || exit 2
-[[ "$mode" != --layout-only || "$suite" == pr72-array-header ]] || exit 2
+[[ $# -le 2 ]] || exit 2
+case "$mode" in
+  run|--plan-only) ;;
+  --layout-only|--compare-alignment) [[ "$suite" == pr72-array-header ]] || exit 2;;
+  *) exit 2;;
+esac
 array_candidate=
 case "$suite" in
   pr71)
@@ -35,6 +39,7 @@ scratch=$(mktemp -d "$repo/.tmp/frozen-test-fixtures.XXXXXXXX")
 evidence="$repo/.tmp/hosted-frozen-fixtures-$suite"
 if [[ "$mode" == --plan-only ]]; then evidence="$scratch/evidence"; fi
 if [[ "$mode" == --layout-only ]]; then evidence="$repo/.tmp/hosted-pr72-reference-layout"; fi
+if [[ "$mode" == --compare-alignment ]]; then evidence="$repo/.tmp/hosted-pr72-reference-alignment"; fi
 cleanup_fixture_shadow() {
   local code=$?
   trap - EXIT
@@ -184,6 +189,60 @@ if [[ "$mode" == --layout-only ]]; then
   exit 0
 fi
 
+if [[ "$mode" == --compare-alignment ]]; then
+  python3 "$script_dir/diagnose-pr72-reference-layout.py" "$evidence" "$scratch/bin"
+  cat > "$evidence/alignment-protocol.txt" <<'PROTOCOL'
+Both configurations run two groups of ten interleaved pairs on one runner.
+The default binaries must match the prior measurement hashes.
+The compared pair retains identical fixtures, sources, build environment and
+eight leaf names across configurations. The aligned builds add only
+-ldflags=-funcalign=64. The flag changes layout across the linked executable.
+A/A and A/P are evaluated separately with the original thresholds for each
+configuration. This experiment leaves the official performance gate in place.
+PROTOCOL
+  for role in base candidate; do
+    pair="$scratch/candidate-pkg-lux-codec"
+    side=base
+    if [[ "$role" == candidate ]]; then side=head; fi
+    overlay="$pair/fixtures/pkg/lux/codec/$side.json"
+    test -f "$overlay"
+    mkdir "$scratch/bin/$role-align64"
+    (
+      cd "$scratch/source/$role"
+      export GOWORK="$PWD/go.work"
+      set -x
+      sha256sum "$overlay"
+      go test -trimpath -c "-overlay=$overlay" -ldflags=-funcalign=64 ./pkg/lux/codec \
+        -o "$scratch/bin/$role-align64/pkg-lux-codec.test"
+      sha256sum "$overlay"
+    ) > "$evidence/compile-$role-align64.log" 2>&1
+    record_binaries "$role-align64"
+    go tool nm -size "$scratch/bin/$role-align64/pkg-lux-codec.test" > "$evidence/$role-align64.nm.txt"
+  done
+  python3 - "$evidence" <<'PYTHON'
+from pathlib import Path
+import sys
+
+evidence = Path(sys.argv[1])
+suffixes = (".readColumnIntPtrBeforePayload", ".readColumnFloatPtrBeforePayload", ".benchmarkPayloadRead")
+layout = ["role\tsymbol\taddress\tsize"]
+for role in ("base", "candidate"):
+    seen = {}
+    for line in (evidence / f"{role}-align64.nm.txt").read_text().splitlines():
+        fields = line.split(maxsplit=3)
+        if len(fields) == 4 and fields[2] == "T" and fields[3].endswith(suffixes):
+            address, size, _, name = fields
+            if name in seen or int(address, 16) % 64 != 0:
+                raise SystemExit(f"{role} unexpected aligned layout for {name}: {address}")
+            seen[name] = address, size
+    for suffix in suffixes:
+        if sum(name.endswith(suffix) for name in seen) != 1:
+            raise SystemExit(f"{role} missing or ambiguous aligned symbol: {suffix}")
+    layout.extend(f"{role}\t{name}\t{address}\t{size}" for name, (address, size) in seen.items())
+(evidence / "aligned-hot-symbols.tsv").write_text("\n".join(layout) + "\n")
+PYTHON
+fi
+
 if [[ -n "$array_candidate" ]]; then
   "$scratch/bin/benchrun" compile "$scratch/source/candidate" "$scratch/bin/candidate-native" pkg/lux/codec
   "$scratch/bin/benchrun" run "$scratch/source/candidate" "$scratch/bin/candidate-native" pkg/lux/codec \
@@ -210,6 +269,8 @@ if [[ -z "$array_candidate" ]]; then
   sample_groups
 else
   comparisons+=(ap)
+  if [[ "$mode" == --compare-alignment ]]; then comparisons=(aa ap aligned-aa aligned-ap); fi
+  comparison_count="${#comparisons[@]}"
   mkdir "$evidence/raw"
   printf 'group\tpair\tcomparison\tcase\tside\trevision\tvariant\traw\n' > "$evidence/order.tsv"
   for group in primary confirmation; do
@@ -219,14 +280,17 @@ else
       printf -v sample '%02d' "$number"
       if (((number + offset) % 2 == 1)); then first=left; else first=right; fi
       while IFS=$'\t' read -r case_id package variant name filter; do
-        for index in 0 1 2; do
-          comparison="${comparisons[(index + number + offset + 10#$case_id) % 3]}"
+        for ((index=0; index<comparison_count; index++)); do
+          comparison="${comparisons[(index + number + offset + 10#$case_id) % comparison_count]}"
+          link_variant="$variant"
           case "$comparison" in
             aa) other=base;;
             ab) other=head;;
             ap) other=candidate;;
+            aligned-aa) other=base; link_variant=align64;;
+            aligned-ap) other=candidate; link_variant=align64;;
           esac
-          run_pair "$group" "$sample" "$comparison" "$other" "$first" "$case_id" "$package" "$variant" "$filter"
+          run_pair "$group" "$sample" "$comparison" "$other" "$first" "$case_id" "$package" "$link_variant" "$filter"
         done
       done < "$evidence/cases.tsv"
     done
@@ -246,8 +310,21 @@ for comparison in "${comparisons[@]}"; do
     grep -Eq '^performance gate rejected [1-9][0-9]* regression\(s\)$' "$evidence/$comparison.benchgate.log" || exit "$rc"
     # For the three-role run, the original head is the comparison control.
     # Only a failed baseline or tested candidate contributes to its verdict.
-    if [[ -z "$array_candidate" || "$comparison" != ab ]]; then status=1; fi
+    if [[ "$mode" == --compare-alignment ]]; then
+      if [[ "$comparison" == aa || "$comparison" == aligned-aa ]]; then status=1; fi
+    elif [[ -z "$array_candidate" || "$comparison" != ab ]]; then
+      status=1
+    fi
   fi
 done
 cat "$evidence/verdicts.tsv"
+if [[ "$mode" == --compare-alignment ]]; then
+  for kind in int float; do
+    leaf="github.com/light-speak/luxo/pkg/lux/codec/ElementPayload/$kind-nullable/column=true/count=128/version=0-2"
+    if ! grep -Fq "confirmed performance regression: $leaf sec/op " "$evidence/ap.benchgate.log"; then
+      printf 'Alignment comparison inconclusive: default comparison did not reproduce %s\n' "$leaf" >&2
+      status=1
+    fi
+  done
+fi
 exit "$status"
