@@ -16,7 +16,8 @@ import (
 func TestIsolationProfileCommand(t *testing.T) {
 	for _, tc := range []struct{ pkg, want string }{
 		{"pkg/lux/api", "api-non-identity\t.\n"},
-		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n"},
+		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n" +
+			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n"},
 		{"pkg/codegen", "codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n" +
 			"codegen-global-receiver\t^BenchmarkGlobalReceiverName$\n"},
 		{"pkg/lux/rpc", ""},
@@ -46,6 +47,7 @@ func TestAPIAndLuviaOverlaysPreserveFixtureBoundaries(t *testing.T) {
 	}{
 		{benchlayout.APIPackage, benchlayout.APINonIdentityProfile, verifyAPIOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaPrimaryTraceProfile, verifyLuviaOverlay},
+		{benchlayout.LuviaPackage, benchlayout.LuviaGatewayIdentityProfile, verifyLuviaGatewayIdentityOverlay},
 	} {
 		t.Run(tc.profile, func(t *testing.T) {
 			file, cleanup, err := compileOverlay(root, tc.pkg, false, tc.profile)

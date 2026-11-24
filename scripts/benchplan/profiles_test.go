@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -240,5 +241,63 @@ func TestCodegenReceiverInventoryAndIndependentRouting(t *testing.T) {
 	writeFixture(t, batch, strings.NewReplacer(profile, "codegen-integer-literals", "codegen-integer-literals", profile).Replace(confirmation))
 	if err := run(args, io.Discard); err == nil {
 		t.Fatal("accepted swapped codegen profiles")
+	}
+}
+
+func TestLuviaGatewayIdentityHasSixSeparateLeaves(t *testing.T) {
+	const pkg, profile = "pkg/lux/luvia", "luvia-gateway-identity"
+	const root, primaryKeys = "BenchmarkGatewayIdentity", "BenchmarkPrimaryKeys"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	var six strings.Builder
+	for _, kind := range []string{"anonymous", "authenticated", "typed-nil"} {
+		for _, stage := range []string{"before", "after"} {
+			six.WriteString(root + "/" + kind + "/" + stage + measurement)
+		}
+	}
+	all := six.String()
+	missing := strings.ReplaceAll(all, root+"/typed-nil/before"+measurement, "")
+	changed := strings.ReplaceAll(all, "/before-2", "/previous-2")
+	const trace = primaryKeys + "/rows" + measurement
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	for _, tc := range []struct {
+		name, ordinary, isolated string
+		valid                    bool
+	}{
+		{"exact", all, all, true},
+		{"missing in isolation", all, missing, false},
+		{"missing on both", missing, missing, false},
+		{"same renamed leaves", changed, changed, false},
+		{"primary trace included", all, all + trace, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+trace+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			if err := run([]string{"--verify-profile-inventory", pkg, profile, ordinary, isolated}, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("GatewayIdentity inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+	primary := formatShard(benchShard{Groups: []benchGroup{{Package: pkg, Name: root}, {Package: pkg, Name: primaryKeys}}})
+	if !strings.Contains(primary, pkg+"\t"+profile+"\t^("+root+")$\n") ||
+		!strings.Contains(primary, pkg+"\tluvia-primary-trace\t^("+primaryKeys+")$\n") {
+		t.Fatalf("Luvia profiles must go to separate binaries:\n%s", primary)
+	}
+	required := []sampleKey{{pkg, root + "/authenticated/before-2"}, {pkg, root + "/authenticated/after-2"}, {pkg, primaryKeys + "/rows-2"}}
+	confirmation := formatConfirmationBatch(required)
+	expected, batch := dir+"/expected.json", dir+"/batch.tsv"
+	data, err := json.Marshal(expectedSamples{Base: required, Head: required})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, expected, string(data))
+	writeFixture(t, batch, confirmation)
+	args := []string{"--verify-profile-batch", "confirmation", expected, batch}
+	if err := run(args, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, batch, strings.NewReplacer(profile, "luvia-primary-trace", "luvia-primary-trace", profile).Replace(confirmation))
+	if err := run(args, io.Discard); err == nil {
+		t.Fatal("accepted swapped Luvia profiles")
 	}
 }

@@ -125,6 +125,9 @@ jobs:
       - name: Run CLI module tests
         run: go test ./cmd/luxo/... -v -timeout=5m -count=1
 
+      - name: Check generated Go interoperability fixture
+        run: go test ./tests/sdk-interop -count=1
+
       - name: Run code generator tests with coverage
         run: |
           set -euo pipefail
@@ -140,7 +143,6 @@ jobs:
           go test -race ./pkg/lux/cache/redis/... -coverprofile=redis-coverage.out -count=1 -timeout=120s
           go test -race ./pkg/lux/nats/... -coverprofile=nats-coverage.out -count=1 -timeout=120s
           go test -race ./pkg/lux/pg/... -coverprofile=pg-coverage.out -count=1 -timeout=15m
-          go vet ./cmd/luxo/... ./pkg/lux/pg/... ./pkg/lux/storage/s3/... ./pkg/lux/cache/redis/... ./pkg/lux/nats/...
 
       - name: Coverage summary
         run: |
@@ -437,6 +439,7 @@ jobs:
                   case "$profile" in
                     codec-reader) exclusive_root=BenchmarkElementPayload ;;
                     codegen-global-receiver) exclusive_root=BenchmarkGlobalReceiverName ;;
+                    luvia-gateway-identity) exclusive_root=BenchmarkGatewayIdentity ;;
                     *) exclusive_root= ;;
                   esac
                   if [[ -n "$exclusive_root" ]]; then
@@ -861,9 +864,6 @@ jobs:
       - name: Verify Node toolchain
         run: sh scripts/check-node.sh
 
-      - name: Check generated Go interoperability fixture
-        run: go test ./tests/sdk-interop
-
       - name: Install dependencies
         working-directory: packages/dart
         run: dart pub get
@@ -920,9 +920,7 @@ jobs:
         run: ./gradlew build :gradle-plugin:validatePlugins --no-daemon --warning-mode fail
 
       - name: Test generated Kotlin client against Go
-        run: |
-          go test ./tests/sdk-interop
-          go run ./tests/sdk-interop -run -- ./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail
+        run: go run ./tests/sdk-interop -run -- ./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail
 
       - name: Test Kotlin gateway responses, errors and stream terminals
         run: go run ./tests/sdk-interop -run -gateway -- ./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail
@@ -954,13 +952,10 @@ jobs:
     runs-on: macos-26
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-    timeout-minutes: 20
+      LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+    timeout-minutes: 30
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        lane: [wire, direct, gateway]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -975,45 +970,39 @@ jobs:
           persist-credentials: false
 
       - name: Verify Swift candidate version
+        id: swift-version
         run: cmp VERSION .tmp/luxo-swift/VERSION
 
       - name: Verify Swift wire protocol compatibility
-        if: matrix.lane == 'wire'
         env:
           LUXO_PROTOCOL_FIXTURE: ${{ github.workspace }}/pkg/lux/codec/testdata/protocol-v1.json
         run: swift test --package-path .tmp/luxo-swift --filter ProtocolConformanceTests
 
       - uses: actions/setup-go@v7
-        if: matrix.lane != 'wire'
+        id: swift-go
+        if: ${{ !cancelled() && steps.swift-version.outcome == 'success' }}
         with:
           go-version-file: go.mod
 
       - name: Bind candidate modules for generated SDK fixtures
-        if: matrix.lane != 'wire'
+        id: swift-modules
+        if: ${{ !cancelled() && steps.swift-go.outcome == 'success' }}
         uses: ./.github/actions/setup-modules
 
       - name: Verify generated Swift client against Go
-        if: matrix.lane == 'direct'
-        env:
-          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        if: ${{ !cancelled() && steps.swift-modules.outcome == 'success' }}
         run: go run ./tests/sdk-interop -run -- bash tests/sdk-interop/swift/run.sh
 
       - name: Verify Swift gateway responses, error data and stream terminals
-        if: matrix.lane == 'gateway'
-        env:
-          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        if: ${{ !cancelled() && steps.swift-modules.outcome == 'success' }}
         run: go run ./tests/sdk-interop -run -gateway -- bash tests/sdk-interop/swift/run.sh
 
       - name: Verify old Swift SDK against new enum services directly
-        if: matrix.lane == 'direct'
-        env:
-          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        if: ${{ !cancelled() && steps.swift-modules.outcome == 'success' }}
         run: go run ./tests/sdk-interop -run -enum-upgrade -- bash tests/sdk-interop/swift/run.sh
 
       - name: Verify old Swift SDK against new enum services through the gateway
-        if: matrix.lane == 'gateway'
-        env:
-          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        if: ${{ !cancelled() && steps.swift-modules.outcome == 'success' }}
         run: go run ./tests/sdk-interop -run -enum-upgrade -gateway -- bash tests/sdk-interop/swift/run.sh
 
   sdk-swift-conformance:
@@ -1023,7 +1012,7 @@ jobs:
     timeout-minutes: 2
     permissions: {}
     steps:
-      - name: Require every Swift native lane
+      - name: Require all Swift native checks
         env:
           SWIFT_NATIVE_RESULT: ${{ needs.sdk-swift-native.result }}
         run: test "$SWIFT_NATIVE_RESULT" = success

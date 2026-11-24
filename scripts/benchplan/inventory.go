@@ -118,19 +118,25 @@ func verifyProfileInventory(args []string) error {
 	switch profile {
 	case benchlayout.CodegenLiteralProfile:
 		const root = benchlayout.CodegenLiteralBenchmark
-		if !verifiedCodegenLeaves(isolated[root], root, "duration_leading_zero", "duration_plain", "int_leading_zero", "int_plain") {
+		if !verifiedBenchmarkLeaves(isolated[root], root, "duration_leading_zero", "duration_plain", "int_leading_zero", "int_plain") {
 			return errors.New("codegen integer literal profile requires the four verified integer and duration leaves")
 		}
 	case benchlayout.CodegenReceiverProfile:
 		const root = benchlayout.CodegenReceiverBenchmark
-		if !verifiedCodegenLeaves(isolated[root], root, "User", "_Record", "用户") {
+		if !verifiedBenchmarkLeaves(isolated[root], root, "User", "_Record", "用户") {
 			return errors.New("codegen global receiver profile requires the three verified receiver leaves")
+		}
+	case benchlayout.LuviaGatewayIdentityProfile:
+		const root = benchlayout.LuviaGatewayIdentityBenchmark
+		if !verifiedBenchmarkLeaves(isolated[root], root, "anonymous/before", "anonymous/after", "authenticated/before",
+			"authenticated/after", "typed-nil/before", "typed-nil/after") {
+			return errors.New("Luvia gateway identity profile requires the six verified identity leaves")
 		}
 	}
 	return nil
 }
 
-func verifiedCodegenLeaves(leaves map[string]struct{}, root string, cases ...string) bool {
+func verifiedBenchmarkLeaves(leaves map[string]struct{}, root string, cases ...string) bool {
 	if len(leaves) != len(cases) {
 		return false
 	}
