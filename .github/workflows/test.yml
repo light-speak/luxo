@@ -14,6 +14,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pr-test-scope:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    outputs:
+      kind: ${{ steps.classification.outputs.kind }}
+    steps:
+      - uses: actions/checkout@v7
+        id: checkout
+        continue-on-error: true
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Classify changes from the verified merge
+        id: classification
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          TESTED_SHA: ${{ github.sha }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          kind=full
+          sha='^[0-9a-f]{40}$'
+          if [[ "$CHECKOUT_OUTCOME" == success && "$TESTED_SHA" =~ $sha &&
+                "$EVENT_BASE_SHA" =~ $sha && "$EVENT_HEAD_SHA" =~ $sha ]] &&
+             parents=$(git rev-list --parents --max-count=1 HEAD) &&
+             [[ "$parents" == "$TESTED_SHA $EVENT_BASE_SHA $EVENT_HEAD_SHA" ]] &&
+             classifier=$(git show "${EVENT_BASE_SHA}:scripts/classify-ci-scope.sh" 2>/dev/null) &&
+             result=$(git diff --raw --no-abbrev --no-renames --no-ext-diff --ignore-submodules=none -z \
+               "$EVENT_BASE_SHA" "$TESTED_SHA" -- | bash -c "$classifier") &&
+             [[ "$result" == benchmark-only ]]; then
+            kind=benchmark-only
+          fi
+          printf 'kind=%s\n' "$kind" >> "$GITHUB_OUTPUT"
+          printf 'Test scope: %s\n' "$kind"
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -125,6 +166,9 @@ jobs:
       - name: Run CLI module tests
         run: go test ./cmd/luxo/... -v -timeout=5m -count=1
 
+      - name: Check generated Go interoperability fixture
+        run: go test ./tests/sdk-interop -count=1
+
       - name: Run code generator tests with coverage
         run: |
           set -euo pipefail
@@ -140,7 +184,6 @@ jobs:
           go test -race ./pkg/lux/cache/redis/... -coverprofile=redis-coverage.out -count=1 -timeout=120s
           go test -race ./pkg/lux/nats/... -coverprofile=nats-coverage.out -count=1 -timeout=120s
           go test -race ./pkg/lux/pg/... -coverprofile=pg-coverage.out -count=1 -timeout=15m
-          go vet ./cmd/luxo/... ./pkg/lux/pg/... ./pkg/lux/storage/s3/... ./pkg/lux/cache/redis/... ./pkg/lux/nats/...
 
       - name: Coverage summary
         run: |
@@ -218,6 +261,8 @@ jobs:
         run: go build ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/... ./pkg/lux/nats/... ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/...
 
   race:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -240,6 +285,8 @@ jobs:
           go test ./pkg/codegen -count=1 -timeout=95m
 
   runtime-race:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -404,16 +451,51 @@ jobs:
           set -euo pipefail
           mkdir -p .tmp/base/.tmp .tmp/head/.tmp
           mkdir -p .tmp/bin .tmp/test-tmp .tmp/benchmark-inventory/base .tmp/benchmark-inventory/head
+          .tmp/bin/benchrun performance-profile > .tmp/benchmark-compile-profile.txt
+          record_inventory() {
+            local revision="$1" binaries="$2" package="$3" stem="$4" profile="${5:-default}" filter="${6:-.}"
+            .tmp/bin/benchrun run-performance ".tmp/${revision}" "$binaries" "$package" "$profile" \
+              -test.run='^$' -test.bench="$filter" -test.benchmem -test.benchtime=1x \
+              -test.count=1 -test.cpu=2 -test.timeout=180s > "$stem.raw.log"
+            GOWORK=off go run ./scripts/benchplan --normalize "$stem.raw.log" "$stem.log"
+          }
           while IFS= read -r package; do
             for revision in base head; do
-              .tmp/bin/benchrun compile ".tmp/${revision}" ".tmp/bin/${revision}" "${package}"
-              .tmp/bin/benchrun run ".tmp/${revision}" ".tmp/bin/${revision}" "${package}" \
-                -test.run='^$' -test.bench=. -test.benchmem -test.benchtime=1x \
-                -test.count=1 -test.cpu=2 -test.timeout=180s \
-                > ".tmp/benchmark-inventory/${revision}/${package//\//-}.raw.log"
-              GOWORK=off go run ./scripts/benchplan --normalize \
-                ".tmp/benchmark-inventory/${revision}/${package//\//-}.raw.log" \
-                ".tmp/benchmark-inventory/${revision}/${package//\//-}.log"
+              stem=".tmp/benchmark-inventory/${revision}/${package//\//-}"
+              compile=compile-performance
+              if [[ "$revision" == base ]]; then
+                compile=compile-performance-baseline
+              fi
+              .tmp/bin/benchrun "$compile" ".tmp/${revision}" ".tmp/bin/${revision}" "${package}"
+              record_inventory "$revision" ".tmp/bin/${revision}" "$package" "$stem"
+              if [[ "$package" == pkg/lux/rpc ]]; then
+                .tmp/bin/benchrun compile ".tmp/${revision}" ".tmp/bin/ordinary-${revision}" "${package}"
+                record_inventory "$revision" ".tmp/bin/ordinary-${revision}" "$package" "$stem.ordinary"
+                GOWORK=off go run ./scripts/benchplan --verify-equal-inventories "$stem.ordinary.log" "$stem.log"
+              fi
+              specification=$(.tmp/bin/benchrun isolation-profile "$package")
+              if [[ -n "$specification" ]]; then
+                while IFS=$'\t' read -r profile filter extra; do
+                  if [[ -z "$profile" || -z "$filter" || -n "$extra" ]]; then
+                    printf 'Invalid benchmark isolation row for %s\n' "$package" >&2
+                    exit 1
+                  fi
+                  .tmp/bin/benchrun "$compile" ".tmp/${revision}" ".tmp/bin/${revision}" "${package}" "$profile"
+                  case "$profile" in
+                    codec-reader) exclusive_root=BenchmarkElementPayload ;;
+                    codegen-global-receiver) exclusive_root=BenchmarkGlobalReceiverName ;;
+                    luvia-gateway-identity) exclusive_root=BenchmarkGatewayIdentity ;;
+                    *) exclusive_root= ;;
+                  esac
+                  if [[ -n "$exclusive_root" ]]; then
+                    .tmp/bin/benchrun run-performance ".tmp/${revision}" ".tmp/bin/${revision}" "$package" "$profile" \
+                      -test.list='.*' > "$stem.$profile.roots"
+                    test "$(cat "$stem.$profile.roots")" = "$exclusive_root"
+                  fi
+                  record_inventory "$revision" ".tmp/bin/${revision}" "$package" "$stem.$profile" "$profile" "$filter"
+                  GOWORK=off go run ./scripts/benchplan --verify-profile-inventory "$package" "$profile" "$stem.log" "$stem.$profile.log"
+                done <<< "$specification"
+              fi
             done
           done < .tmp/benchmark-packages.txt
           matrix=$(GOWORK=off go run ./scripts/benchplan .tmp/benchmark-packages.txt .tmp/benchmark-inventory .tmp/benchmark-plan)
@@ -433,6 +515,7 @@ jobs:
             .tmp/*benchmark-packages.txt
             .tmp/changed-files.txt
             .tmp/benchmark-revisions.txt
+            .tmp/benchmark-compile-profile.txt
 
   performance-samples:
     needs: performance-scope
@@ -477,9 +560,37 @@ jobs:
           test "$TESTED_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$TESTED_SHA"
           test "$(git -C .tmp/base rev-parse HEAD)" = "$BASE_SHA"
-          gh run download "${RUN_ID}" --name "${PLAN_ARTIFACT}" --dir .tmp/plan
+          download_stage=$(mktemp -d .tmp/benchmark-plan-download.XXXXXXXX)
+          trap 'rm -rf -- "$download_stage"' EXIT
+          for delay in 5 15 0; do
+            download_dir="$download_stage/$delay"
+            mkdir "$download_dir"
+            download_status=0
+            download_log=$(gh run download "${RUN_ID}" --name "${PLAN_ARTIFACT}" --dir "$download_dir" 2>&1) || download_status=$?
+            if [[ -n "$download_log" ]]; then
+              printf '%s\n' "$download_log" | sed -E 's@https?://[^[:space:])]+@<download URL>@g' >&2
+            fi
+            if (( download_status == 0 )); then break; fi
+            if (( delay == 0 )); then exit "$download_status"; fi
+            if [[ "$download_log" =~ (^|[[:space:]])HTTP[[:space:]]+([0-9]{3})([^[:digit:]]|$) ]]; then
+              case "${BASH_REMATCH[2]}" in
+                500|502|503|504) ;;
+                *) exit "$download_status" ;;
+              esac
+            else
+              case "$download_log" in
+                *"i/o timeout"*|*"TLS handshake timeout"*|*"connection reset by peer"*) ;;
+                *) exit "$download_status" ;;
+              esac
+            fi
+            printf 'Retrying benchmark plan download in %ss.\n' "$delay" >&2
+            sleep "$delay"
+          done
           printf 'base_sha=%s\ntested_sha=%s\n' "$BASE_SHA" "$TESTED_SHA" > .tmp/benchmark-revisions.txt
-          cmp .tmp/benchmark-revisions.txt .tmp/plan/benchmark-revisions.txt
+          cmp .tmp/benchmark-revisions.txt "$download_dir/benchmark-revisions.txt"
+          test ! -e .tmp/plan
+          test ! -L .tmp/plan
+          mv -- "$download_dir" .tmp/plan
           cp ".tmp/plan/benchmark-plan/shard-${SHARD}.tsv" .tmp/benchmark-batch.tsv
           cp ".tmp/plan/benchmark-plan/shard-${SHARD}.json" .tmp/benchmark-expected.json
           test -s .tmp/benchmark-batch.tsv
@@ -501,9 +612,12 @@ jobs:
           sh scripts/setup-modules.sh .tmp/base
           sh scripts/setup-modules.sh .tmp/head
           GOWORK=off go build -o .tmp/bin/benchrun ./scripts/benchrun
-          while IFS=$'\t' read -r package filter; do
-            .tmp/bin/benchrun compile .tmp/base .tmp/bin/base "${package}"
-            .tmp/bin/benchrun compile .tmp/head .tmp/bin/head "${package}"
+          .tmp/bin/benchrun performance-profile > .tmp/benchmark-compile-profile.txt
+          cmp .tmp/benchmark-compile-profile.txt .tmp/plan/benchmark-compile-profile.txt
+          GOWORK=off go run ./scripts/benchplan --verify-profile-batch primary .tmp/benchmark-expected.json .tmp/benchmark-batch.tsv
+          while IFS=$'\t' read -r package profile filter; do
+            .tmp/bin/benchrun compile-performance-baseline .tmp/base .tmp/bin/base "${package}" "${profile}"
+            .tmp/bin/benchrun compile-performance .tmp/head .tmp/bin/head "${package}" "${profile}"
           done < .tmp/benchmark-batch.tsv
 
       - name: Run adaptive interleaved benchmark samples
@@ -516,8 +630,9 @@ jobs:
             local binary_root="$2"
             local output="$3"
             local package="$4"
-            local filter="$5"
-            .tmp/bin/benchrun run "${source_root}" "${binary_root}" "${package}" \
+            local profile="$5"
+            local filter="$6"
+            .tmp/bin/benchrun run-performance "${source_root}" "${binary_root}" "${package}" "${profile}" \
               -test.run='^$' -test.bench="${filter}" -test.benchmem \
               -test.benchtime=200ms -test.count=1 -test.cpu=2 >> "${output}"
           }
@@ -529,13 +644,13 @@ jobs:
             : > "${base_output}"
             : > "${head_output}"
             for sample in {1..10}; do
-              while IFS=$'\t' read -r package filter; do
+              while IFS=$'\t' read -r package profile filter; do
                 if (( sample % 2 == 1 )); then
-                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${filter}"
-                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${profile}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${profile}" "${filter}"
                 else
-                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${filter}"
-                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${profile}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${profile}" "${filter}"
                 fi
               done < "${batch}"
             done
@@ -552,6 +667,7 @@ jobs:
             GOWORK=off go run ./scripts/benchplan --confirmation-plan .tmp/benchmark-expected.json .tmp/benchmark-confirmation-targets.tsv .tmp/benchmark-confirmation-batch.tsv .tmp/benchmark-confirmation-expected.json
             test -s .tmp/benchmark-confirmation-batch.tsv
             test -s .tmp/benchmark-confirmation-expected.json
+            GOWORK=off go run ./scripts/benchplan --verify-profile-batch confirmation .tmp/benchmark-confirmation-expected.json .tmp/benchmark-confirmation-batch.tsv
             run_group confirmation .tmp/benchmark-confirmation-batch.tsv
             GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-confirmation-expected.json .tmp/benchmark-confirmation-base.txt .tmp/benchmark-confirmation-head.txt
             .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt
@@ -614,6 +730,8 @@ jobs:
           fi
 
   external-go-consumer:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -641,6 +759,8 @@ jobs:
           GOWORK=off go test ./... -count=1
 
   fuzz:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -688,6 +808,8 @@ jobs:
             pkg/semantic/testdata/fuzz/
 
   sdk-ts:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -752,6 +874,8 @@ jobs:
         run: pnpm typecheck
 
   sdk-dart:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -793,9 +917,6 @@ jobs:
       - name: Verify Node toolchain
         run: sh scripts/check-node.sh
 
-      - name: Check generated Go interoperability fixture
-        run: go test ./tests/sdk-interop
-
       - name: Install dependencies
         working-directory: packages/dart
         run: dart pub get
@@ -818,6 +939,8 @@ jobs:
           test/unicode_test.dart
 
   sdk-kotlin:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -852,9 +975,7 @@ jobs:
         run: ./gradlew build :gradle-plugin:validatePlugins --no-daemon --warning-mode fail
 
       - name: Test generated Kotlin client against Go
-        run: |
-          go test ./tests/sdk-interop
-          go run ./tests/sdk-interop -run -- ./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail
+        run: go run ./tests/sdk-interop -run -- ./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail
 
       - name: Test Kotlin gateway responses, errors and stream terminals
         run: go run ./tests/sdk-interop -run -gateway -- ./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build --project-cache-dir .tmp/gradle-cache --no-daemon --warning-mode fail
@@ -883,16 +1004,15 @@ jobs:
           ../../packages/kotlin/gradlew build --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
 
   sdk-swift-native:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: macos-26
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-    timeout-minutes: 20
+      LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+    timeout-minutes: 30
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        lane: [wire, direct, gateway]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -907,55 +1027,49 @@ jobs:
           persist-credentials: false
 
       - name: Verify Swift candidate version
+        id: swift-version
         run: cmp VERSION .tmp/luxo-swift/VERSION
 
       - name: Verify Swift wire protocol compatibility
-        if: matrix.lane == 'wire'
         env:
           LUXO_PROTOCOL_FIXTURE: ${{ github.workspace }}/pkg/lux/codec/testdata/protocol-v1.json
         run: swift test --package-path .tmp/luxo-swift --filter ProtocolConformanceTests
 
       - uses: actions/setup-go@v7
-        if: matrix.lane != 'wire'
+        id: swift-go
+        if: ${{ !cancelled() && steps.swift-version.outcome == 'success' }}
         with:
           go-version-file: go.mod
 
       - name: Bind candidate modules for generated SDK fixtures
-        if: matrix.lane != 'wire'
+        id: swift-modules
+        if: ${{ !cancelled() && steps.swift-go.outcome == 'success' }}
         uses: ./.github/actions/setup-modules
 
       - name: Verify generated Swift client against Go
-        if: matrix.lane == 'direct'
-        env:
-          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        if: ${{ !cancelled() && steps.swift-modules.outcome == 'success' }}
         run: go run ./tests/sdk-interop -run -- bash tests/sdk-interop/swift/run.sh
 
       - name: Verify Swift gateway responses, error data and stream terminals
-        if: matrix.lane == 'gateway'
-        env:
-          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        if: ${{ !cancelled() && steps.swift-modules.outcome == 'success' }}
         run: go run ./tests/sdk-interop -run -gateway -- bash tests/sdk-interop/swift/run.sh
 
       - name: Verify old Swift SDK against new enum services directly
-        if: matrix.lane == 'direct'
-        env:
-          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        if: ${{ !cancelled() && steps.swift-modules.outcome == 'success' }}
         run: go run ./tests/sdk-interop -run -enum-upgrade -- bash tests/sdk-interop/swift/run.sh
 
       - name: Verify old Swift SDK against new enum services through the gateway
-        if: matrix.lane == 'gateway'
-        env:
-          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        if: ${{ !cancelled() && steps.swift-modules.outcome == 'success' }}
         run: go run ./tests/sdk-interop -run -enum-upgrade -gateway -- bash tests/sdk-interop/swift/run.sh
 
   sdk-swift-conformance:
-    needs: [sdk-swift-native]
-    if: always()
+    needs: [pr-test-scope, sdk-swift-native]
+    if: ${{ always() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions: {}
     steps:
-      - name: Require every Swift native lane
+      - name: Require all Swift native checks
         env:
           SWIFT_NATIVE_RESULT: ${{ needs.sdk-swift-native.result }}
         run: test "$SWIFT_NATIVE_RESULT" = success

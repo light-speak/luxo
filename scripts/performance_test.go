@@ -79,7 +79,7 @@ func TestPerformanceSummaryFailsClosed(t *testing.T) {
 func samplingFixture(t *testing.T, confirmation bool) qualityFixture {
 	t.Helper()
 	fixture := newQualityFixture(t)
-	fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/a\t^(BenchmarkA|BenchmarkB)$\npkg/control\t^BenchmarkC$\n")
+	fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/a\tdefault\t^(BenchmarkA|BenchmarkB)$\npkg/control\tdefault\t^BenchmarkC$\n")
 	fixture.write(t, ".tmp/benchmark-expected.json", "primary expectations\n")
 	for _, revision := range []string{"base", "head"} {
 		for _, binary := range []string{"pkg-a.test", "pkg-control.test"} {
@@ -89,10 +89,11 @@ func samplingFixture(t *testing.T, confirmation bool) qualityFixture {
 	fixture.write(t, ".tmp/bin/benchstat", "#!/bin/sh\nprintf 'benchstat %s\\n' \"$*\" >> \"$QUALITY_LOG\"\nprintf 'benchmark CSV\\n'\n")
 	fixture.write(t, ".tmp/bin/benchrun", `#!/bin/sh
 set -eu
-test "$1" = run
+test "$1" = run-performance
 benchmark_bin=$3
 benchmark_package=$4
-shift 4
+test "$5" = default
+shift 5
 case "$benchmark_package" in
   pkg/a) exec "$benchmark_bin/pkg-a.test" "$@" ;;
   pkg/control) exec "$benchmark_bin/pkg-control.test" "$@" ;;
@@ -118,6 +119,11 @@ esac
 
 const samplingTools = `set -eu
 case "$1 $2 $3" in
+  'run ./scripts/benchplan --verify-profile-batch')
+    test "$4" = confirmation
+    test "$5" = .tmp/benchmark-confirmation-expected.json
+    test "$6" = .tmp/benchmark-confirmation-batch.tsv
+    ;;
   "run ./scripts/benchplan --normalize")
     /bin/cat "$4" > "$5"
     ;;
@@ -148,7 +154,7 @@ case "$1 $2 $3" in
     test "$(/bin/cat "$5")" = "$(printf 'pkg/a\tBenchmarkB-2')"
     test "${FAIL_STAGE:-}" != plan
     if [ "${FAIL_STAGE:-}" != empty-plan ]; then
-      printf 'pkg/a\t^BenchmarkB$\n' > "$6"
+      printf 'pkg/a\tdefault\t^BenchmarkB$\n' > "$6"
     fi
     printf 'confirmation expectations\n' > "$7"
     ;;
@@ -187,7 +193,7 @@ func TestPerformanceSamplingAlternatesBothRevisions(t *testing.T) {
 				targets = "pkg/a\tBenchmarkB-2\n"
 			}
 			wantGate := "go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha expected-main " + gateArgs
-			if len(runs) != totalRuns || strings.Count(log, "./scripts/benchplan --verify") != groups || !strings.Contains(log, wantGate) {
+			if len(runs) != totalRuns || strings.Count(log, "./scripts/benchplan --verify ") != groups || !strings.Contains(log, wantGate) {
 				t.Fatalf("sampling or gate changed; got %d runs, log:\n%s", len(runs), log)
 			}
 			assertSampleOrder(t, runs[:40], "^(BenchmarkA|BenchmarkB)$", "^BenchmarkC$")
@@ -331,6 +337,40 @@ func TestPerformancePlanArtifactUsesProducingAttempt(t *testing.T) {
 	t.Fatal("missing benchmark plan loading")
 }
 
+func TestPerformanceBindsRPCCompileProfileAndCompleteInventory(t *testing.T) {
+	discover := performanceStep(t, "performance-scope", "Discover and plan benchmark batches")
+	compile := performanceStep(t, "performance-samples", "Compile benchmark binaries")
+	for _, evidence := range []struct{ script, required string }{
+		{discover, "compile=compile-performance-baseline"},
+		{discover, "compile=compile-performance"},
+		{discover, "benchrun performance-profile > .tmp/benchmark-compile-profile.txt"},
+		{discover, "--verify-equal-inventories"},
+		{discover, "--verify-profile-inventory"},
+		{discover, `benchrun isolation-profile "$package"`},
+		{discover, `-test.list='.*' > "$stem.$profile.roots"`},
+		{discover, `record_inventory "$revision" ".tmp/bin/${revision}" "$package" "$stem.$profile" "$profile" "$filter"`},
+		{compile, `read -r package profile filter`},
+		{compile, `--verify-profile-batch primary .tmp/benchmark-expected.json .tmp/benchmark-batch.tsv`},
+		{discover, `benchrun compile ".tmp/${revision}" ".tmp/bin/ordinary-${revision}" "${package}"`},
+		{compile, "benchrun compile-performance-baseline .tmp/base"},
+		{compile, "benchrun compile-performance .tmp/head"},
+		{compile, "cmp .tmp/benchmark-compile-profile.txt .tmp/plan/benchmark-compile-profile.txt"},
+	} {
+		if !strings.Contains(evidence.script, evidence.required) {
+			t.Errorf("performance pipeline lost %q", evidence.required)
+		}
+	}
+	for _, step := range readQualityWorkflow(t).Jobs["performance-scope"].Steps {
+		if step.Name == "Preserve benchmark plan and discovery evidence" {
+			if !strings.Contains(step.With["path"], ".tmp/benchmark-compile-profile.txt") {
+				t.Fatal("producing attempt lost its compile profile")
+			}
+			return
+		}
+	}
+	t.Fatal("missing plan evidence")
+}
+
 func TestPerformancePreparesScratchWithinBothRevisions(t *testing.T) {
 	for _, stage := range []struct{ job, step string }{
 		{"performance-scope", "Discover and plan benchmark batches"},
@@ -342,11 +382,20 @@ func TestPerformancePreparesScratchWithinBothRevisions(t *testing.T) {
 				fixture.write(t, ".tmp/"+revision+"/go.mod", "")
 			}
 			fixture.write(t, "bin/mkdir", "#!/bin/sh\nexec /bin/mkdir \"$@\"\n")
+			fixture.write(t, "bin/cmp", "#!/bin/sh\nexec /usr/bin/cmp \"$@\"\n")
+			fixture.write(t, ".tmp/plan/benchmark-compile-profile.txt", "profile-v1\n")
 			fixture.write(t, "scripts/setup-modules.sh", "#!/bin/sh\nexit 0\n")
 			fixture.write(t, ".tmp/benchmark-packages.txt", "pkg/lux/pg\n")
-			fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/lux/pg\t^BenchmarkPendingMigrationFiles$\n")
+			fixture.write(t, ".tmp/benchmark-batch.tsv", "pkg/lux/pg\tdefault\t^BenchmarkPendingMigrationFiles$\n")
 			fixture.write(t, ".tmp/bin/benchrun", `#!/bin/sh
 set -eu
+if [ "$1" = performance-profile ]; then
+    printf 'profile-v1\n'
+    exit
+fi
+if [ "$1" = isolation-profile ]; then
+    exit
+fi
 printf '%s %s\n' "$1" "$2" >> "$QUALITY_LOG"
 if [ ! -d "$2/.tmp" ]; then
     printf 'missing benchmark scratch: %s/.tmp\n' "$2" >&2
@@ -358,12 +407,81 @@ fi
 			if err != nil {
 				t.Fatalf("benchmark setup failed: %v\n%s", err, output)
 			}
-			for _, revision := range []string{"base", "head"} {
-				if !strings.Contains(log, "compile .tmp/"+revision+"\n") {
+			for revision, action := range map[string]string{"base": "compile-performance-baseline", "head": "compile-performance"} {
+				if !strings.Contains(log, action+" .tmp/"+revision+"\n") {
 					t.Errorf("revision %s did not reach compilation:\n%s", revision, log)
 				}
 			}
+			if stage.job == "performance-samples" {
+				checkPerformanceCompileRejectsProfile(t, fixture, script)
+			}
 		})
+	}
+}
+
+func TestPerformanceDiscoversBothCodegenProfiles(t *testing.T) {
+	script := performanceStep(t, "performance-scope", "Discover and plan benchmark batches")
+	for _, broken := range []bool{false, true} {
+		fixture := newQualityFixture(t)
+		fixture.write(t, "bin/mkdir", "#!/bin/sh\nexec /bin/mkdir \"$@\"\n")
+		fixture.write(t, "bin/cat", "#!/bin/sh\nexec /bin/cat \"$@\"\n")
+		fixture.write(t, ".tmp/benchmark-packages.txt", "pkg/codegen\n")
+		row := "codegen-global-receiver\\t^BenchmarkGlobalReceiverName$\\n"
+		if broken {
+			row = "codegen-global-receiver\\n"
+		}
+		fixture.write(t, ".tmp/bin/benchrun", `#!/bin/sh
+set -eu
+printf 'benchrun %s\n' "$*" >> "$QUALITY_LOG"
+case "$1" in
+  isolation-profile) printf 'codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n`+row+`' ;;
+  run-performance)
+    case "$*" in
+      *"-test.list="*) printf 'BenchmarkGlobalReceiverName\n' ;;
+    esac
+    ;;
+esac
+`)
+		output, log, err := fixture.run(t, "export GITHUB_OUTPUT=.tmp/outputs RUN_ATTEMPT=1\n"+script)
+		if broken {
+			if err == nil || strings.Contains(log, " pkg/codegen codegen-global-receiver\n") {
+				t.Fatalf("malformed discovery row reached receiver validation: %v\n%s\n%s", err, output, log)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("two-profile discovery failed: %v\n%s\n%s", err, output, log)
+		}
+		for revision, command := range map[string]string{"base": "compile-performance-baseline", "head": "compile-performance"} {
+			for _, profile := range []string{"codegen-integer-literals", "codegen-global-receiver"} {
+				commandLine := "benchrun " + command + " .tmp/" + revision + " .tmp/bin/" + revision + " pkg/codegen " + profile + "\n"
+				if strings.Count(log, commandLine) != 1 {
+					t.Fatalf("missing independent %s discovery:\n%s", profile, log)
+				}
+			}
+		}
+		for _, profile := range []string{"codegen-integer-literals", "codegen-global-receiver"} {
+			if strings.Count(log, "--verify-profile-inventory pkg/codegen "+profile+" ") != 2 {
+				t.Fatalf("missing inventory validation for %s:\n%s", profile, log)
+			}
+		}
+	}
+}
+
+func checkPerformanceCompileRejectsProfile(t *testing.T, fixture qualityFixture, script string) {
+	t.Helper()
+	const profile = ".tmp/plan/benchmark-compile-profile.txt"
+	fixture.write(t, profile, "different-profile\n")
+	for _, test := range []string{"stale", "missing"} {
+		if test == "missing" {
+			if err := os.Remove(filepath.Join(string(fixture), profile)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		output, log, err := fixture.run(t, ": > \"$QUALITY_LOG\"\n"+script)
+		if err == nil || strings.Contains(log, "compile-performance") || strings.Contains(log, "compile .tmp/") {
+			t.Fatalf("%s profile reached benchmark compilation: err=%v log=%q\n%s", test, err, log, output)
+		}
 	}
 }
 
@@ -474,7 +592,7 @@ func TestPerformanceRoutesResolvedRevisions(t *testing.T) {
 func performanceGitFixture(t *testing.T) qualityFixture {
 	t.Helper()
 	fixture := newQualityFixture(t)
-	for _, tool := range []string{"git", "mkdir", "cat", "grep", "cmp", "cp", "tar"} {
+	for _, tool := range []string{"git", "mkdir", "cat", "grep", "cmp", "cp", "tar", "mktemp", "mv", "rm", "sed"} {
 		path, err := exec.LookPath(tool)
 		if err != nil {
 			t.Fatal(err)
@@ -495,11 +613,13 @@ func TestPerformanceSamplesRejectMismatchedRevisions(t *testing.T) {
 		t.Fatalf("prepare sample checkout: %v\n%s", err, output)
 	}
 	fixture.tool(t, "gh", `set -eu
-test "$*" = "run download fixture-run --name fixture-plan --dir .tmp/plan"
-mkdir -p .tmp/plan/benchmark-plan
-printf 'base_sha=%s\ntested_sha=%s\n' "$RECEIPT_BASE" "$TESTED_SHA" > .tmp/plan/benchmark-revisions.txt
-printf 'fixture batch\n' > .tmp/plan/benchmark-plan/shard-01.tsv
-printf 'fixture expectations\n' > .tmp/plan/benchmark-plan/shard-01.json
+test "$#" = 7
+test "$1 $2 $3 $4 $5 $6" = "run download fixture-run --name fixture-plan --dir"
+destination=$7
+mkdir -p "$destination/benchmark-plan"
+printf 'base_sha=%s\ntested_sha=%s\n' "$RECEIPT_BASE" "$TESTED_SHA" > "$destination/benchmark-revisions.txt"
+printf 'fixture batch\n' > "$destination/benchmark-plan/shard-01.tsv"
+printf 'fixture expectations\n' > "$destination/benchmark-plan/shard-01.json"
 `, false)
 	for _, test := range []struct {
 		name, checkedBase, event, receiptBase string
@@ -531,5 +651,96 @@ printf 'fixture expectations\n' > .tmp/plan/benchmark-plan/shard-01.json
 				t.Fatalf("sample extraction after rejecting revisions: %v", err)
 			}
 		})
+	}
+}
+
+func TestPerformancePlanDownloadTransientErrors(t *testing.T) {
+	script := performanceStep(t, "performance-samples", "Load benchmark batch")
+	const egress = "error downloading benchmark-plan-1: HTTP 503: 503 Egress is over the account limit. (https://fixture.invalid/plan.zip?sig=fixture-secret)"
+	for _, sample := range []struct {
+		name, message         string
+		failures, calls, code int
+	}{
+		{"egress succeeds", egress, 1, 2, 0},
+		{"egress exhausted", egress, 4, 3, 43},
+		{"network reset", "error downloading benchmark-plan-1: read: connection reset by peer", 1, 2, 0},
+		{"missing", "error downloading benchmark-plan-1: HTTP 404: not found", 4, 1, 43},
+		{"conflict", "error downloading benchmark-plan-1: HTTP 409: i/o timeout", 4, 1, 43},
+		{"auth", "error downloading benchmark-plan-1: HTTP 401: authentication failed", 4, 1, 43},
+		{"forbidden", "error downloading benchmark-plan-1: HTTP 403: denied", 4, 1, 43},
+		{"other", "error finding any artifacts to download", 4, 1, 43},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			fixture := performanceGitFixture(t)
+			fixture.tool(t, "sleep", "", false)
+			fixture.tool(t, "gh", `set -eu
+test "$#" = 7
+test "$1 $2 $3 $4 $5 $6" = "run download fixture-run --name benchmark-plan-1 --dir"
+destination=$7
+calls=0
+if test -f gh-attempts; then IFS= read -r calls < gh-attempts; fi
+calls=$((calls + 1))
+printf '%s\n' "$calls" > gh-attempts
+mkdir -p "$destination/benchmark-plan"
+if test "$calls" -le "$FIXTURE_FAILURES"; then
+    printf 'incomplete download\n' > "$destination/partial"
+    printf '%s\n' "$FIXTURE_NETWORK_ERROR" >&2
+    exit 43
+fi
+printf 'base_sha=%s\ntested_sha=%s\n' "$BASE_SHA" "$TESTED_SHA" > "$destination/benchmark-revisions.txt"
+printf 'fixture batch\n' > "$destination/benchmark-plan/shard-02.tsv"
+printf 'fixture expectations\n' > "$destination/benchmark-plan/shard-02.json"
+`, false)
+			prepare := performanceReadGitGraph + `
+git update-ref --no-deref HEAD "$merge"
+git clone -q --no-checkout . .tmp/base
+git -C .tmp/base update-ref --no-deref HEAD "$actual_base"
+export RUN_ID=fixture-run PLAN_ARTIFACT=benchmark-plan-1 SHARD=02
+export BASE_SHA="$actual_base" TESTED_SHA="$merge" GITHUB_SHA="$merge"
+` + fmt.Sprintf("export FIXTURE_FAILURES=%d FIXTURE_NETWORK_ERROR=%s\n", sample.failures, shellQualityQuote(sample.message))
+			output, log, err := fixture.run(t, prepare+script)
+			code := 0
+			if err != nil {
+				failure, ok := err.(*exec.ExitError)
+				if !ok {
+					t.Fatal(err)
+				}
+				code = failure.ExitCode()
+			}
+			if code != sample.code || strings.Count(log, "gh run download ") != sample.calls || strings.Count(log, "sleep ") != sample.calls-1 {
+				t.Fatalf("exit=%d want=%d, downloads want=%d\n%s\n%s", code, sample.code, sample.calls, output, log)
+			}
+			if strings.Contains(output, "fixture-secret") || !strings.Contains(output, strings.Split(sample.message, " (")[0]) {
+				t.Fatalf("lost error reason or exposed download URL: %q", output)
+			}
+			assertPerformancePlanDownloadFiles(t, fixture, sample.code == 0)
+		})
+	}
+}
+
+func assertPerformancePlanDownloadFiles(t *testing.T, fixture qualityFixture, published bool) {
+	t.Helper()
+	tmp := filepath.Join(string(fixture), ".tmp")
+	if leftovers, err := filepath.Glob(filepath.Join(tmp, "benchmark-plan-download.*")); err != nil || len(leftovers) != 0 {
+		t.Fatalf("download staging left files: %v %v", leftovers, err)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "plan", "partial")); !os.IsNotExist(err) {
+		t.Fatalf("published a file from a partial download: %v", err)
+	}
+	source := filepath.Join(tmp, "head", "merge-source.txt")
+	if published {
+		if got := readQualityFile(t, source); got != "synthetic tree\n" {
+			t.Fatalf("sample archive = %q", got)
+		}
+		if got := readQualityFile(t, filepath.Join(tmp, "benchmark-expected.json")); got != "fixture expectations\n" {
+			t.Fatalf("selected plan expectation = %q", got)
+		}
+	} else {
+		if _, err := os.Stat(filepath.Join(tmp, "plan")); !os.IsNotExist(err) {
+			t.Fatalf("published a failed download: %v", err)
+		}
+		if _, err := os.Stat(source); !os.IsNotExist(err) {
+			t.Fatalf("extracted source after failed plan download: %v", err)
+		}
 	}
 }
