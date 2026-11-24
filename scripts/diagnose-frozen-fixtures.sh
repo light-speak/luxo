@@ -4,12 +4,12 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo=$(git -C "$script_dir" rev-parse --show-toplevel)
 source "$script_dir/diagnose-hosted-perf.sh"
-suite="${1:?usage: diagnose-frozen-fixtures.sh pr71|pr72|pr72-array-header [--plan-only|--layout-only|--compare-alignment]}"
+suite="${1:?usage: diagnose-frozen-fixtures.sh pr71|pr72|pr72-array-header [--plan-only|--layout-only|--compare-alignment|--compare-split|--check-split-inventory]}"
 mode="${2:-run}"
 [[ $# -le 2 ]] || exit 2
 case "$mode" in
   run|--plan-only) ;;
-  --layout-only|--compare-alignment) [[ "$suite" == pr72-array-header ]] || exit 2;;
+  --layout-only|--compare-alignment|--compare-split|--check-split-inventory) [[ "$suite" == pr72-array-header ]] || exit 2;;
   *) exit 2;;
 esac
 array_candidate=
@@ -40,6 +40,8 @@ evidence="$repo/.tmp/hosted-frozen-fixtures-$suite"
 if [[ "$mode" == --plan-only ]]; then evidence="$scratch/evidence"; fi
 if [[ "$mode" == --layout-only ]]; then evidence="$repo/.tmp/hosted-pr72-reference-layout"; fi
 if [[ "$mode" == --compare-alignment ]]; then evidence="$repo/.tmp/hosted-pr72-reference-alignment"; fi
+if [[ "$mode" == --compare-split ]]; then evidence="$repo/.tmp/hosted-pr72-reference-split"; fi
+if [[ "$mode" == --check-split-inventory ]]; then evidence="$repo/.tmp/hosted-pr72-reference-split-inventory"; fi
 cleanup_fixture_shadow() {
   local code=$?
   trap - EXIT
@@ -125,11 +127,19 @@ fi
 
 export TMPDIR="$scratch/tmp" GOWORK=off GOTOOLCHAIN=local
 mkdir -p "$TMPDIR" "$scratch/source/base" "$scratch/source/head" "$scratch/bin/base" "$scratch/bin/head" "$evidence/pairs"
-[[ "$(uname -s):$(uname -m)" == Linux:x86_64 ]]
-[[ "$(go version)" == 'go version go1.27.1 linux/amd64' ]]
-[[ "$(go env GOOS GOARCH GOAMD64 CGO_ENABLED)" == $'linux\namd64\nv1\n1' ]]
 [[ -z "$(go env GOFLAGS GOEXPERIMENT | tr -d '\n')" ]]
-collect_host > "$evidence/environment.txt"
+if [[ "$mode" == --check-split-inventory ]]; then
+  test "$(go env GOVERSION)" = go1.27.1
+  {
+    uname -s -m
+    go env -json GOVERSION GOOS GOARCH CGO_ENABLED GOAMD64 GOARM64 GOFLAGS GOEXPERIMENT
+  } > "$evidence/environment.txt"
+else
+  [[ "$(uname -s):$(uname -m)" == Linux:x86_64 ]]
+  [[ "$(go version)" == 'go version go1.27.1 linux/amd64' ]]
+  [[ "$(go env GOOS GOARCH GOAMD64 CGO_ENABLED)" == $'linux\namd64\nv1\n1' ]]
+  collect_host > "$evidence/environment.txt"
+fi
 merge=$(git -C "$repo" merge-tree --write-tree "$base" "$head")
 test "$merge" = "$product"
 git -C "$repo" archive "$base" | tar -xf - -C "$scratch/source/base"
@@ -150,7 +160,7 @@ done
 (
   cd "$repo"
   go build -o "$scratch/bin/benchrun" ./scripts/benchrun
-  if [[ "$mode" != --layout-only ]]; then
+  if [[ "$mode" != --layout-only && "$mode" != --check-split-inventory ]]; then
     cd "$scratch/source/base"
     for name in benchplan benchgate; do go build -o "$scratch/bin/$name" "./scripts/$name"; done
     GOBIN="$scratch/bin" go install "golang.org/x/perf/cmd/benchstat@$benchstat_version"
@@ -253,6 +263,75 @@ if [[ -n "$array_candidate" ]]; then
   done
 fi
 
+record_split_profile() {
+  local role="$1" variant="$2" overlay="$3" bin_path="$scratch/bin/$1"
+  if [[ "$variant" != default ]]; then bin_path+="-$variant"; fi
+  (
+    cd "$scratch/source/$role"
+    GOWORK="$PWD/go.work" go list -json "-overlay=$overlay" ./pkg/lux/codec
+  ) > "$evidence/split-files-$role-$variant.json"
+  "$scratch/bin/benchrun" run "$scratch/source/$role" "$bin_path" pkg/lux/codec \
+    -test.list '^Benchmark' > "$evidence/split-roots-$role-$variant.txt"
+}
+
+record_split_inventory() {
+  local role="$1" case_id variant filter package unused split bin_path
+  while IFS=$'\t' read -r case_id package variant unused filter; do
+    split="$(split_variant "$case_id")"
+    for variant in default "$split"; do
+      bin_path="$scratch/bin/$role"
+      if [[ "$variant" != default ]]; then bin_path+="-$variant"; fi
+      "$scratch/bin/benchrun" run "$scratch/source/$role" "$bin_path" "$package" \
+        -test.run='^$' -test.bench="$filter" -test.benchmem \
+        -test.benchtime=1x -test.count=1 -test.cpu=2 -test.timeout=90s \
+        > "$evidence/split-inventory-$role-$variant-$case_id.txt"
+    done
+  done < "$evidence/cases.tsv"
+}
+
+split_variant() {
+  case "$1" in
+    01) printf '%s\n' writer;;
+    02) printf '%s\n' reader;;
+    *) return 2;;
+  esac
+}
+
+prepare_codec_split() {
+  local role side overlay variant profile split_plan
+  for role in base candidate; do
+    side=base
+    if [[ "$role" == candidate ]]; then side=head; fi
+    overlay="$scratch/candidate-pkg-lux-codec/fixtures/pkg/lux/codec/$side.json"
+    split_plan="$scratch/split-plan-$role.tsv"
+    python3 "$script_dir/diagnose-pr72-codec-split.py" make-overlays \
+      "$scratch/source/$role" "$overlay" "$role" "$evidence" > "$split_plan"
+    record_split_profile "$role" default "$overlay"
+    while IFS=$'\t' read -r variant profile; do
+      mkdir "$scratch/bin/$role-$variant"
+      (
+        cd "$scratch/source/$role"
+        export GOWORK="$PWD/go.work"
+        set -x
+        go test -trimpath -c "-overlay=$profile" ./pkg/lux/codec \
+          -o "$scratch/bin/$role-$variant/pkg-lux-codec.test"
+      ) > "$evidence/compile-$role-$variant.log" 2>&1
+      record_binaries "$role-$variant"
+      record_split_profile "$role" "$variant" "$profile"
+    done < "$split_plan"
+    record_split_inventory "$role"
+  done
+  python3 "$script_dir/diagnose-pr72-codec-split.py" verify-inventory "$evidence"
+}
+
+if [[ "$mode" == --compare-split || "$mode" == --check-split-inventory ]]; then
+  if [[ "$mode" == --compare-split ]]; then
+    python3 "$script_dir/diagnose-pr72-reference-layout.py" "$evidence" "$scratch/bin"
+  fi
+  prepare_codec_split
+  if [[ "$mode" == --check-split-inventory ]]; then exit 0; fi
+fi
+
 # The two Planner leaves were introduced by PR 72. Preserve native head-only observations
 # separately. They have no matched historical series and are outside the paired verdict.
 if [[ "$suite" == pr72 ]]; then
@@ -270,6 +349,7 @@ if [[ -z "$array_candidate" ]]; then
 else
   comparisons+=(ap)
   if [[ "$mode" == --compare-alignment ]]; then comparisons=(aa ap aligned-aa aligned-ap); fi
+  if [[ "$mode" == --compare-split ]]; then comparisons=(aa ap split-aa split-ap); fi
   comparison_count="${#comparisons[@]}"
   mkdir "$evidence/raw"
   printf 'group\tpair\tcomparison\tcase\tside\trevision\tvariant\traw\n' > "$evidence/order.tsv"
@@ -289,6 +369,8 @@ else
             ap) other=candidate;;
             aligned-aa) other=base; link_variant=align64;;
             aligned-ap) other=candidate; link_variant=align64;;
+            split-aa) other=base; link_variant="$(split_variant "$case_id")";;
+            split-ap) other=candidate; link_variant="$(split_variant "$case_id")";;
           esac
           run_pair "$group" "$sample" "$comparison" "$other" "$first" "$case_id" "$package" "$link_variant" "$filter"
         done
@@ -297,6 +379,9 @@ else
   done
 fi
 test "$(( $(wc -l < "$evidence/order.tsv") - 1 ))" = "$(( 40 * ${#comparisons[@]} * $(wc -l < "$evidence/cases.tsv") ))"
+if [[ "$mode" == --compare-split ]]; then
+  python3 "$script_dir/diagnose-pr72-codec-split.py" verify-samples "$evidence"
+fi
 printf 'comparison\tgate_exit\n' > "$evidence/verdicts.tsv"
 status=0
 for comparison in "${comparisons[@]}"; do
@@ -312,6 +397,8 @@ for comparison in "${comparisons[@]}"; do
     # Only a failed baseline or tested candidate contributes to its verdict.
     if [[ "$mode" == --compare-alignment ]]; then
       if [[ "$comparison" == aa || "$comparison" == aligned-aa ]]; then status=1; fi
+    elif [[ "$mode" == --compare-split ]]; then
+      if [[ "$comparison" != ap ]]; then status=1; fi
     elif [[ -z "$array_candidate" || "$comparison" != ab ]]; then
       status=1
     fi
@@ -326,5 +413,18 @@ if [[ "$mode" == --compare-alignment ]]; then
       status=1
     fi
   done
+fi
+if [[ "$mode" == --compare-split ]]; then
+  for kind in int float; do
+    leaf="github.com/light-speak/luxo/pkg/lux/codec/ElementPayload/$kind-nullable/column=true/count=128/version=0-2"
+    if ! grep -Fq "confirmed performance regression: $leaf sec/op " "$evidence/ap.benchgate.log"; then
+      printf 'Fixture split comparison inconclusive: default comparison did not reproduce %s\n' "$leaf" >&2
+      status=1
+    fi
+  done
+  if [[ "$(grep -c '^confirmed performance regression: ' "$evidence/ap.benchgate.log")" != 2 ]]; then
+    printf 'Fixture split comparison inconclusive: expected only the two historical V0 timing reports\n' >&2
+    status=1
+  fi
 fi
 exit "$status"
