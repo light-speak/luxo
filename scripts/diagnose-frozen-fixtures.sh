@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo=$(git -C "$script_dir" rev-parse --show-toplevel)
 source "$script_dir/diagnose-hosted-perf.sh"
-suite="${1:?usage: diagnose-frozen-fixtures.sh pr71|pr72|pr72-array-header [--plan-only]}"
+suite="${1:?usage: diagnose-frozen-fixtures.sh pr71|pr72|pr72-array-header|pr74-current [--plan-only]}"
 mode="${2:-run}"
 [[ $# -le 2 && ( "$mode" == run || "$mode" == --plan-only ) ]]
 array_candidate=
@@ -18,6 +18,11 @@ case "$suite" in
     base=a75a0acce23b30e3f99d44b0c47f746901b82bb8
     head=5e4c9d1b3813cc95f98d4088a10c242dca47b8de
     product=4e0c5bc89439be2f1374db2f306ec261bdccc382
+    ;;
+  pr74-current)
+    base=ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+    head=f33b2f2a37044555807b53e9998f7df0c5315e20
+    product=f83536bbde073df4921b328787615901b38b0b24
     ;;
   pr72-array-header)
     base=ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
@@ -58,6 +63,17 @@ if suite == "pr71":
         ("pkg/lux/luvia", [f"GatewayIdentity/anonymous/{stage}" for stage in ("before", "after")]),
         ("pkg/lux/api", [f"NullableRootJSON/{kind}/{stage}" for kind in ("int", "zero") for stage in ("plain", "present")]),
     ]
+elif suite == "pr74-current":
+    api = ['CanonicalJSONFloat/0/after', 'CanonicalJSONFloat/128/after', 'CanonicalJSONFloat/16/after', 'RawJSONArrayPool/list128/encode', 'RawJSONArrayPool/object/encode', 'RawJSONArrayPool/precision/encode']
+    luvia = ['GatewayIdentity/anonymous/before', 'PrimaryKeys/column-small/keyLast=true/baseline=false', 'PrimaryKeys/column-small/keyLast=true/baseline=true']
+    # Each after branch compares output to the sibling produced by before.
+    api.extend(f"CanonicalJSONFloat/{count}/before" for count in (0, 16, 128))
+    # Adjacent context and the six request profiles that call the new extractor.
+    luvia.append("GatewayIdentity/anonymous/after")
+    luvia.extend(f"AuthUpgradeHeaders/{kind}/{stage}"
+                 for kind in ("anonymous-http", "bearer-http", "anonymous-get", "bearer-get", "bearer-ws", "query-ws")
+                 for stage in ("before", "current"))
+    groups = [("pkg/lux/api", api), ("pkg/lux/luvia", luvia)]
 elif suite == "pr72-array-header":
     codec = "pkg/lux/codec"
     groups = [
@@ -80,7 +96,7 @@ for index, (package, names) in enumerate(groups, 1):
     filters = ["/".join("^" + re.escape(part) + "$" for part in name.split("/")) for name in names]
     cases.append(f"{index:02d}\t{package}\tdefault\t{suite}\t" + "|".join(filters))
     expected.extend({"Package": package, "Name": name + "-2"} for name in names)
-if len(expected) != (17 if suite == "pr72" else 8):
+if len(expected) != {"pr71": 8, "pr72": 17, "pr72-array-header": 8, "pr74-current": 25}[suite]:
     raise SystemExit("unexpected benchmark inventory")
 (output / "cases.tsv").write_text("\n".join(cases) + "\n")
 (output / "expected.json").write_text(json.dumps({"Base": expected, "Head": expected}, indent=2) + "\n")
@@ -92,6 +108,12 @@ git -C "$repo" cat-file -e "$head^{commit}"
 printf 'base=%s\nhead=%s\nproduct_tree=%s\n' "$base" "$head" "$product" > "$evidence/revisions.txt"
 if [[ -n "$array_candidate" ]]; then
   printf 'restored_array_header_tree=%s\n' "$array_candidate" >> "$evidence/revisions.txt"
+fi
+if [[ "$suite" == pr74-current ]]; then
+  test "$(git -C "$repo" rev-list --parents -n 1 "$head")" = "$head 538dadd85ba2180505b4bb4a5a37ce66be9e8b10 $base"
+  test "$(git -C "$repo" rev-parse "$head^{tree}")" = "$product"
+  printf '%s\n' 'original_run=45343471370/1' 'original_receipt_sha256=05cc91346293854f73558a20ef181198e2976d4482e5d5d6ce3e1a11c885eefe' \
+    'official_targets=9' 'control_targets=16' >> "$evidence/revisions.txt"
 fi
 if [[ "$mode" == --plan-only ]]; then
   cat "$evidence/revisions.txt" "$evidence/cases.tsv"
