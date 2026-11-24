@@ -49,7 +49,7 @@ jobs:
               digest=addc34c9a86d6f20a77b02321bfcb835b7de20ac1f9e7948d45935d6336adca3
               ;;
             'AMD EPYC 9V74 80-CORE PROCESSOR')
-              suite=pr72-boxed-json
+              suite=pr72-boxed-json-header-causal
               diagnostic=480240c33e49e914aa04e96047a1ac0bcd470f06
               tree=a7e01c854083455a0d0cb79597220a08bab2c2e6
               base=4a660a0bcdee1eeb3c7a9dddcc95324d7967bec0
@@ -58,7 +58,7 @@ jobs:
               artifact=14924072511
               formal_run=45397856587
               digest=67c6414b54e7410188c0227b7266c30a16c9c0863fea7a1b8433c281feaddb25
-              evidence='.tmp/native-cpu-worktree/.tmp/pr72-boxed-json-evidence-a.*/'
+              evidence='.tmp/native-cpu-worktree/.tmp/pr72-boxed-json-evidence-r.*/'
               ;;
             'INTEL(R) XEON(R) PLATINUM 8573C')
               suite=pr103-short-paths
@@ -109,11 +109,21 @@ jobs:
           test "$(git -C "$root" rev-parse 'HEAD^{tree}')" = "$DIAGNOSTIC_TREE"
           sampler=scripts/diagnose-hosted-perf.sh
           sampler_digest=9e0a5f421f2e76674b819f81074a3d416a51174e0f93b858a63d20c27d64e072
-          if [[ "$SUITE" == pr72-boxed-json ]]; then
+          if [[ "$SUITE" == pr72-boxed-json-header-causal ]]; then
             sampler=scripts/diagnose-pr72-boxed-json/diagnose-native.sh
             sampler_digest=682270521e905a123429eb78a21980e16e7636b638c695fc35669833f7c9e513
           fi
           printf '%s  %s\n' "$sampler_digest" "$root/$sampler" | sha256sum -c -
+          if [[ "$SUITE" == pr72-boxed-json-header-causal ]]; then
+            delta="$receipt/header-driver.patch"
+            base64 -d "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr72-boxed-json-r/driver-replay.patch.b64" > "$delta"
+            printf '%s  %s\n' 223e75f4a14976578d743951396c52130f8235c90f63d114c4bed75af66b37b9 "$delta" |
+              sha256sum -c - > "$receipt/header-driver-input.txt"
+            git -C "$root" apply --check --whitespace=error-all "$delta"
+            git -C "$root" apply --whitespace=error-all "$delta"
+            printf '%s  %s\n' d6d2987867fe307334aab468d3e5922e94e358ccbefef33651c500a20c051317 "$root/$sampler" |
+              sha256sum -c - > "$receipt/header-driver-output.txt"
+          fi
           mkdir -p "$root/.tmp"
           gh api "repos/light-speak/luxo/actions/artifacts/$FORMAL_ARTIFACT" > "$receipt/artifact-metadata.json"
           jq -e --arg id "$FORMAL_ARTIFACT" --arg run "$FORMAL_RUN" --arg head "$PRODUCT_HEAD" --arg digest "sha256:$FORMAL_DIGEST" '
@@ -137,8 +147,8 @@ jobs:
         run: |
           set -euo pipefail
           case "$SUITE" in
-            pr72-boxed-json)
-              exec bash scripts/diagnose-pr72-boxed-json/diagnose-native.sh . a .tmp/pr72-formal-shard-12.zip
+            pr72-boxed-json-header-causal)
+              exec bash scripts/diagnose-pr72-boxed-json/diagnose-native.sh . r .tmp/pr72-formal-shard-12.zip
               ;;
             pr82-lux-short-path)
               exec bash "scripts/diagnose-$SUITE.sh"
