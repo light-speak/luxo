@@ -1,0 +1,54 @@
+name: Attribute the PR 72 array header baseline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [diagnostics/hosted-perf-pr71-pr72]
+    paths:
+      - .github/workflows/diagnose-pr72-header-baseline.yml
+      - scripts/diagnose-pr72-header-baseline.sh
+      - scripts/diagnose-pr72-header-baseline.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-pr72-header-baseline
+  cancel-in-progress: false
+
+jobs:
+  diagnose-pr72-header-baseline:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
+    runs-on: ubuntu-latest
+    timeout-minutes: 31
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Pair the exact PR revisions and the single test overlay
+        timeout-minutes: 28
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+        run: bash scripts/diagnose-pr72-header-baseline.sh
+      - name: Preserve samples, source binding, and verdicts
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: hosted-pr72-header-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr72-header-baseline/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove the evidence directory after upload
+        if: always()
+        run: |
+          test ! -L .tmp
+          rm -rf -- .tmp/hosted-pr72-header-baseline
