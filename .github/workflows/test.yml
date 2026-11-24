@@ -297,16 +297,48 @@ jobs:
       run: ${{ steps.benchmark_scope.outputs.run }}
       matrix: ${{ steps.benchmark_plan.outputs.matrix }}
       artifact: ${{ steps.benchmark_plan.outputs.artifact }}
+      base_sha: ${{ steps.benchmark_revisions.outputs.base_sha }}
+      tested_sha: ${{ steps.benchmark_revisions.outputs.tested_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Resolve benchmark revisions
+        id: benchmark_revisions
+        env:
+          TESTED_SHA: ${{ github.sha }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          for sha in "$TESTED_SHA" "$EVENT_HEAD_SHA" "$EVENT_BASE_SHA"; do
+            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Invalid benchmark event revision" >&2
+              exit 1
+            fi
+          done
+          parents=$(git rev-list --parents --max-count=1 HEAD)
+          read -r merge_sha base_sha pr_sha extra <<< "$parents"
+          if [[ "$merge_sha" != "$TESTED_SHA" || -z "$base_sha" || "$pr_sha" != "$EVENT_HEAD_SHA" || -n "$extra" ]]; then
+            echo "Benchmark checkout must be the event merge with the PR head as second parent" >&2
+            exit 1
+          fi
+          # The event's base can predate the main revision used to build the merge.
+          if ! git merge-base --is-ancestor "$EVENT_BASE_SHA" "$base_sha"; then
+            echo "PR event base is not an ancestor of the tested merge base" >&2
+            exit 1
+          fi
+          mkdir -p .tmp
+          printf 'base_sha=%s\ntested_sha=%s\n' "$base_sha" "$merge_sha" > .tmp/benchmark-revisions.txt
+          cat .tmp/benchmark-revisions.txt >> "$GITHUB_OUTPUT"
 
       - name: Check out benchmark baseline
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ steps.benchmark_revisions.outputs.base_sha }}
           path: .tmp/base
           persist-credentials: false
 
@@ -320,7 +352,8 @@ jobs:
       - name: Select affected benchmark packages
         id: benchmark_scope
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ steps.benchmark_revisions.outputs.base_sha }}
+          TESTED_SHA: ${{ steps.benchmark_revisions.outputs.tested_sha }}
         run: |
           set -euo pipefail
           benchmark_packages() {
@@ -330,8 +363,9 @@ jobs:
               done |
               sort -u
           }
+          test "$(git -C .tmp/base rev-parse HEAD)" = "$BASE_SHA"
           mkdir -p .tmp/head
-          git archive HEAD | tar -x -C .tmp/head
+          git archive "$TESTED_SHA" | tar -x -C .tmp/head
           sh scripts/setup-modules.sh .tmp/base
           sh scripts/setup-modules.sh .tmp/head
           mkdir -p .tmp/bin
@@ -345,7 +379,7 @@ jobs:
             benchmark_packages
           ) | .tmp/bin/benchrun canonical > .tmp/head-benchmark-packages.txt
           comm -12 .tmp/base-benchmark-packages.txt .tmp/head-benchmark-packages.txt > .tmp/common-benchmark-packages.txt
-          git -c core.quotePath=false diff --no-renames --name-only "${BASE_SHA}" HEAD > .tmp/changed-files.txt
+          git -c core.quotePath=false diff --no-renames --name-only "${BASE_SHA}" "${TESTED_SHA}" > .tmp/changed-files.txt
           GOWORK=off go run ./scripts/benchscope \
             .tmp/base \
             .tmp/head \
@@ -368,17 +402,42 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          mkdir -p .tmp/base/.tmp .tmp/head/.tmp
           mkdir -p .tmp/bin .tmp/test-tmp .tmp/benchmark-inventory/base .tmp/benchmark-inventory/head
+          .tmp/bin/benchrun performance-profile > .tmp/benchmark-compile-profile.txt
+          record_inventory() {
+            local revision="$1" binaries="$2" package="$3" stem="$4" profile="${5:-default}" filter="${6:-.}"
+            .tmp/bin/benchrun run-performance ".tmp/${revision}" "$binaries" "$package" "$profile" \
+              -test.run='^$' -test.bench="$filter" -test.benchmem -test.benchtime=1x \
+              -test.count=1 -test.cpu=2 -test.timeout=180s > "$stem.raw.log"
+            GOWORK=off go run ./scripts/benchplan --normalize "$stem.raw.log" "$stem.log"
+          }
           while IFS= read -r package; do
             for revision in base head; do
-              .tmp/bin/benchrun compile ".tmp/${revision}" ".tmp/bin/${revision}" "${package}"
-              .tmp/bin/benchrun run ".tmp/${revision}" ".tmp/bin/${revision}" "${package}" \
-                -test.run='^$' -test.bench=. -test.benchmem -test.benchtime=1x \
-                -test.count=1 -test.cpu=2 -test.timeout=180s \
-                > ".tmp/benchmark-inventory/${revision}/${package//\//-}.raw.log"
-              GOWORK=off go run ./scripts/benchplan --normalize \
-                ".tmp/benchmark-inventory/${revision}/${package//\//-}.raw.log" \
-                ".tmp/benchmark-inventory/${revision}/${package//\//-}.log"
+              stem=".tmp/benchmark-inventory/${revision}/${package//\//-}"
+              compile=compile-performance
+              if [[ "$revision" == base ]]; then
+                compile=compile-performance-baseline
+              fi
+              .tmp/bin/benchrun "$compile" ".tmp/${revision}" ".tmp/bin/${revision}" "${package}"
+              record_inventory "$revision" ".tmp/bin/${revision}" "$package" "$stem"
+              if [[ "$package" == pkg/lux/rpc ]]; then
+                .tmp/bin/benchrun compile ".tmp/${revision}" ".tmp/bin/ordinary-${revision}" "${package}"
+                record_inventory "$revision" ".tmp/bin/ordinary-${revision}" "$package" "$stem.ordinary"
+                GOWORK=off go run ./scripts/benchplan --verify-equal-inventories "$stem.ordinary.log" "$stem.log"
+              fi
+              specification=$(.tmp/bin/benchrun isolation-profile "$package")
+              if [[ -n "$specification" ]]; then
+                IFS=$'\t' read -r profile filter <<< "$specification"
+                .tmp/bin/benchrun "$compile" ".tmp/${revision}" ".tmp/bin/${revision}" "$package" "$profile"
+                if [[ "$profile" == codec-reader ]]; then
+                  .tmp/bin/benchrun run-performance ".tmp/${revision}" ".tmp/bin/${revision}" "$package" "$profile" \
+                    -test.list='.*' > "$stem.$profile.roots"
+                  test "$(cat "$stem.$profile.roots")" = BenchmarkElementPayload
+                fi
+                record_inventory "$revision" ".tmp/bin/${revision}" "$package" "$stem.$profile" "$profile" "$filter"
+                GOWORK=off go run ./scripts/benchplan --verify-profile-inventory "$package" "$profile" "$stem.log" "$stem.$profile.log"
+              fi
             done
           done < .tmp/benchmark-packages.txt
           matrix=$(GOWORK=off go run ./scripts/benchplan .tmp/benchmark-packages.txt .tmp/benchmark-inventory .tmp/benchmark-plan)
@@ -397,6 +456,8 @@ jobs:
             .tmp/benchmark-inventory/
             .tmp/*benchmark-packages.txt
             .tmp/changed-files.txt
+            .tmp/benchmark-revisions.txt
+            .tmp/benchmark-compile-profile.txt
 
   performance-samples:
     needs: performance-scope
@@ -413,12 +474,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ needs.performance-scope.outputs.tested_sha }}
           persist-credentials: false
 
       - name: Check out benchmark baseline
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ needs.performance-scope.outputs.base_sha }}
           path: .tmp/base
           persist-credentials: false
 
@@ -433,14 +495,21 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           PLAN_ARTIFACT: ${{ needs.performance-scope.outputs.artifact }}
           SHARD: ${{ matrix.shard }}
+          BASE_SHA: ${{ needs.performance-scope.outputs.base_sha }}
+          TESTED_SHA: ${{ needs.performance-scope.outputs.tested_sha }}
         run: |
           set -euo pipefail
+          test "$TESTED_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$TESTED_SHA"
+          test "$(git -C .tmp/base rev-parse HEAD)" = "$BASE_SHA"
           gh run download "${RUN_ID}" --name "${PLAN_ARTIFACT}" --dir .tmp/plan
+          printf 'base_sha=%s\ntested_sha=%s\n' "$BASE_SHA" "$TESTED_SHA" > .tmp/benchmark-revisions.txt
+          cmp .tmp/benchmark-revisions.txt .tmp/plan/benchmark-revisions.txt
           cp ".tmp/plan/benchmark-plan/shard-${SHARD}.tsv" .tmp/benchmark-batch.tsv
           cp ".tmp/plan/benchmark-plan/shard-${SHARD}.json" .tmp/benchmark-expected.json
           test -s .tmp/benchmark-batch.tsv
           mkdir -p .tmp/head
-          git archive HEAD | tar -x -C .tmp/head
+          git archive "$TESTED_SHA" | tar -x -C .tmp/head
 
       - name: Install pinned benchstat
         env:
@@ -452,13 +521,17 @@ jobs:
       - name: Compile benchmark binaries
         run: |
           set -euo pipefail
+          mkdir -p .tmp/base/.tmp .tmp/head/.tmp
           mkdir -p .tmp/bin/base .tmp/bin/head .tmp/test-tmp
           sh scripts/setup-modules.sh .tmp/base
           sh scripts/setup-modules.sh .tmp/head
           GOWORK=off go build -o .tmp/bin/benchrun ./scripts/benchrun
-          while IFS=$'\t' read -r package filter; do
-            .tmp/bin/benchrun compile .tmp/base .tmp/bin/base "${package}"
-            .tmp/bin/benchrun compile .tmp/head .tmp/bin/head "${package}"
+          .tmp/bin/benchrun performance-profile > .tmp/benchmark-compile-profile.txt
+          cmp .tmp/benchmark-compile-profile.txt .tmp/plan/benchmark-compile-profile.txt
+          GOWORK=off go run ./scripts/benchplan --verify-profile-batch primary .tmp/benchmark-expected.json .tmp/benchmark-batch.tsv
+          while IFS=$'\t' read -r package profile filter; do
+            .tmp/bin/benchrun compile-performance-baseline .tmp/base .tmp/bin/base "${package}" "${profile}"
+            .tmp/bin/benchrun compile-performance .tmp/head .tmp/bin/head "${package}" "${profile}"
           done < .tmp/benchmark-batch.tsv
 
       - name: Run adaptive interleaved benchmark samples
@@ -471,40 +544,46 @@ jobs:
             local binary_root="$2"
             local output="$3"
             local package="$4"
-            local filter="$5"
-            .tmp/bin/benchrun run "${source_root}" "${binary_root}" "${package}" \
+            local profile="$5"
+            local filter="$6"
+            .tmp/bin/benchrun run-performance "${source_root}" "${binary_root}" "${package}" "${profile}" \
               -test.run='^$' -test.bench="${filter}" -test.benchmem \
               -test.benchtime=200ms -test.count=1 -test.cpu=2 >> "${output}"
           }
           run_group() {
             local group="$1"
+            local batch="$2"
             local base_output="${GITHUB_WORKSPACE}/.tmp/benchmark-raw-${group}-base.txt"
             local head_output="${GITHUB_WORKSPACE}/.tmp/benchmark-raw-${group}-head.txt"
             : > "${base_output}"
             : > "${head_output}"
             for sample in {1..10}; do
-              while IFS=$'\t' read -r package filter; do
+              while IFS=$'\t' read -r package profile filter; do
                 if (( sample % 2 == 1 )); then
-                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${filter}"
-                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${profile}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${profile}" "${filter}"
                 else
-                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${filter}"
-                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/head" "${GITHUB_WORKSPACE}/.tmp/bin/head" "${head_output}" "${package}" "${profile}" "${filter}"
+                  run_package "${GITHUB_WORKSPACE}/.tmp/base" "${GITHUB_WORKSPACE}/.tmp/bin/base" "${base_output}" "${package}" "${profile}" "${filter}"
                 fi
-              done < "${GITHUB_WORKSPACE}/.tmp/benchmark-batch.tsv"
+              done < "${batch}"
             done
             GOWORK=off go run ./scripts/benchplan --normalize "${base_output}" ".tmp/benchmark-${group}-base.txt"
             GOWORK=off go run ./scripts/benchplan --normalize "${head_output}" ".tmp/benchmark-${group}-head.txt"
           }
-          run_group primary
+          run_group primary .tmp/benchmark-batch.tsv
           GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-expected.json .tmp/benchmark-primary-base.txt .tmp/benchmark-primary-head.txt
           .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt
           .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-primary-base.txt head=.tmp/benchmark-primary-head.txt > .tmp/benchstat-primary.csv 2> .tmp/benchstat-primary-warnings.txt
-          confirmation_required=$(GOWORK=off go run ./scripts/benchgate --requires-confirmation .tmp/benchstat-primary.csv)
-          if [[ "${confirmation_required}" == "true" ]]; then
-            echo "Primary samples found a regression candidate; running confirmation samples."
-            run_group confirmation
-            GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-expected.json .tmp/benchmark-confirmation-base.txt .tmp/benchmark-confirmation-head.txt
+          GOWORK=off go run ./scripts/benchgate --confirmation-targets .tmp/benchstat-primary.csv > .tmp/benchmark-confirmation-targets.tsv
+          if [[ -s .tmp/benchmark-confirmation-targets.tsv ]]; then
+            echo "Primary samples found regression candidates. Running targeted confirmation samples."
+            GOWORK=off go run ./scripts/benchplan --confirmation-plan .tmp/benchmark-expected.json .tmp/benchmark-confirmation-targets.tsv .tmp/benchmark-confirmation-batch.tsv .tmp/benchmark-confirmation-expected.json
+            test -s .tmp/benchmark-confirmation-batch.tsv
+            test -s .tmp/benchmark-confirmation-expected.json
+            GOWORK=off go run ./scripts/benchplan --verify-profile-batch confirmation .tmp/benchmark-confirmation-expected.json .tmp/benchmark-confirmation-batch.tsv
+            run_group confirmation .tmp/benchmark-confirmation-batch.tsv
+            GOWORK=off go run ./scripts/benchplan --verify .tmp/benchmark-confirmation-expected.json .tmp/benchmark-confirmation-base.txt .tmp/benchmark-confirmation-head.txt
             .tmp/bin/benchstat -alpha 0.01 base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt
             .tmp/bin/benchstat -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv base=.tmp/benchmark-confirmation-base.txt head=.tmp/benchmark-confirmation-head.txt > .tmp/benchstat-confirmation.csv 2> .tmp/benchstat-confirmation-warnings.txt
           else
@@ -513,12 +592,16 @@ jobs:
 
       - name: Enforce performance baseline
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ needs.performance-scope.outputs.base_sha }}
         run: |
           set -euo pipefail
-          if [[ -s .tmp/benchstat-confirmation.csv ]]; then
-            GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
+          test -s .tmp/benchstat-primary.csv
+          test -f .tmp/benchmark-confirmation-targets.tsv
+          if [[ -s .tmp/benchmark-confirmation-targets.tsv ]]; then
+            test -s .tmp/benchstat-confirmation.csv
+            GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" --targeted-confirmation .tmp/benchstat-primary.csv .tmp/benchstat-confirmation.csv
           else
+            test ! -s .tmp/benchstat-confirmation.csv
             GOWORK=off go run ./scripts/benchgate --approved-costs scripts/benchgate/approved-costs.json --base-sha "${BASE_SHA}" .tmp/benchstat-primary.csv
           fi
 
@@ -535,6 +618,9 @@ jobs:
             .tmp/benchstat-*-warnings.txt
             .tmp/benchmark-batch.tsv
             .tmp/benchmark-expected.json
+            .tmp/benchmark-confirmation-targets.tsv
+            .tmp/benchmark-confirmation-batch.tsv
+            .tmp/benchmark-confirmation-expected.json
 
   performance:
     needs: [performance-scope, performance-samples]
@@ -826,13 +912,17 @@ jobs:
           ../../packages/kotlin/gradlew build --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
           ../../packages/kotlin/gradlew build --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
 
-  sdk-swift-conformance:
+  sdk-swift-native:
     runs-on: macos-26
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     timeout-minutes: 20
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [wire, direct, gateway]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -850,30 +940,52 @@ jobs:
         run: cmp VERSION .tmp/luxo-swift/VERSION
 
       - name: Verify Swift wire protocol compatibility
+        if: matrix.lane == 'wire'
         env:
           LUXO_PROTOCOL_FIXTURE: ${{ github.workspace }}/pkg/lux/codec/testdata/protocol-v1.json
         run: swift test --package-path .tmp/luxo-swift --filter ProtocolConformanceTests
 
       - uses: actions/setup-go@v7
+        if: matrix.lane != 'wire'
         with:
           go-version-file: go.mod
 
       - name: Bind candidate modules for generated SDK fixtures
+        if: matrix.lane != 'wire'
         uses: ./.github/actions/setup-modules
 
       - name: Verify generated Swift client against Go
+        if: matrix.lane == 'direct'
         env:
           LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
         run: go run ./tests/sdk-interop -run -- bash tests/sdk-interop/swift/run.sh
 
       - name: Verify Swift gateway responses, error data and stream terminals
+        if: matrix.lane == 'gateway'
         env:
           LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
         run: go run ./tests/sdk-interop -run -gateway -- bash tests/sdk-interop/swift/run.sh
 
-      - name: Verify old Swift SDK against new enum services
+      - name: Verify old Swift SDK against new enum services directly
+        if: matrix.lane == 'direct'
         env:
           LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
-        run: |
-          go run ./tests/sdk-interop -run -enum-upgrade -- bash tests/sdk-interop/swift/run.sh
-          go run ./tests/sdk-interop -run -enum-upgrade -gateway -- bash tests/sdk-interop/swift/run.sh
+        run: go run ./tests/sdk-interop -run -enum-upgrade -- bash tests/sdk-interop/swift/run.sh
+
+      - name: Verify old Swift SDK against new enum services through the gateway
+        if: matrix.lane == 'gateway'
+        env:
+          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        run: go run ./tests/sdk-interop -run -enum-upgrade -gateway -- bash tests/sdk-interop/swift/run.sh
+
+  sdk-swift-conformance:
+    needs: [sdk-swift-native]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require every Swift native lane
+        env:
+          SWIFT_NATIVE_RESULT: ${{ needs.sdk-swift-native.result }}
+        run: test "$SWIFT_NATIVE_RESULT" = success

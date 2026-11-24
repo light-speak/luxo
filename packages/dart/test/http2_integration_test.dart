@@ -4,10 +4,12 @@ library;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
+import 'package:http2/transport.dart' as h2;
 import 'package:luxo_client/http2.dart';
 import 'package:luxo_client/src/buffered_http_response.dart';
 import 'package:luxo_client/luxo_client.dart';
@@ -18,6 +20,8 @@ void main() {
   late Directory temporary;
   late Uri endpoint;
   late Uri http1;
+  late String certificate;
+  late String testKey;
   late SecurityContext trust;
   late LuxoHttp2Client client;
   setUpAll(() async {
@@ -37,10 +41,10 @@ void main() {
     final config = jsonDecode(line) as Map<String, dynamic>;
     endpoint = Uri.parse(config['url'] as String);
     http1 = Uri.parse(config['http1'] as String);
+    certificate = config['certificate'] as String;
+    testKey = config['testKey'] as String;
     trust = SecurityContext(withTrustedRoots: false)
-      ..setTrustedCertificatesBytes(
-        utf8.encode(config['certificate'] as String),
-      );
+      ..setTrustedCertificatesBytes(utf8.encode(certificate));
   });
   tearDownAll(() async {
     await server.stdin.close();
@@ -57,6 +61,33 @@ void main() {
   );
   tearDown(() => client.close());
 
+  test(
+    'completed exchanges release requests with a live abort signal',
+    () async {
+      final config = (await Isolate.packageConfig)!.toFilePath();
+      final child = await Process.start(Platform.resolvedExecutable, [
+        '--enable-vm-service=0',
+        '--packages=$config',
+        'test/fixtures/http2_abort_lifetime.dart',
+        endpoint.toString(),
+        certificate,
+      ]);
+      final output = utf8.decoder.bind(child.stdout).join();
+      final errors = utf8.decoder.bind(child.stderr).join();
+      var reaped = false;
+      try {
+        final code = await child.exitCode.timeout(const Duration(seconds: 20));
+        reaped = true;
+        expect(code, 0, reason: '${await output}\n${await errors}');
+      } finally {
+        if (!reaped) {
+          child.kill(ProcessSignal.sigkill);
+          await child.exitCode.timeout(const Duration(seconds: 5));
+        }
+      }
+    },
+  );
+
   test('H2 hands off complete independent bodies after close', () async {
     final responses = await Future.wait([
       for (final value in [17, 23])
@@ -70,6 +101,23 @@ void main() {
     expect(identical(first.toResponse().bodyBytes, first.bodyBytes), isTrue);
     first.bodyBytes[0] = 99;
     expect(second.bodyBytes, [23]);
+  });
+
+  test('a shared abort signal cancels every attached exchange', () async {
+    final abort = Completer<void>();
+    final url = endpoint.resolve('/slow');
+    Future<void> expectAborted() => expectLater(
+      client.send(
+        http.AbortableRequest('POST', url, abortTrigger: abort.future),
+      ),
+      throwsA(isA<http.RequestAbortedException>()),
+    );
+    final first = expectAborted();
+    final second = expectAborted();
+    abort.completeError(StateError('cancellation signal failed'));
+    await Future.wait([first, second]);
+    await expectAborted();
+    expect((await client.post(endpoint, body: [17])).bodyBytes, [17]);
   });
 
   test(
@@ -93,6 +141,89 @@ void main() {
     expect(response.headers['x-final'], 'response');
     expect(response.headers['x-test-protocol'], 'HTTP/2.0');
   });
+
+  test(
+    '204 responses reject length, content and trailers on one stream',
+    () async {
+      final context = SecurityContext(withTrustedRoots: false)
+        ..useCertificateChainBytes(utf8.encode(certificate))
+        ..usePrivateKeyBytes(utf8.encode(testKey))
+        ..setAlpnProtocols(['h2'], true);
+      final listener = await SecureServerSocket.bind(
+        InternetAddress.loopbackIPv4,
+        0,
+        context,
+      );
+      final sockets = <SecureSocket>[];
+      final incoming = listener.listen((socket) {
+        sockets.add(socket);
+        h2.ServerTransportConnection.viaSocket(socket).incomingStreams.listen((
+          stream,
+        ) {
+          stream.incomingMessages.listen((message) {
+            if (message is! h2.HeadersStreamMessage) return;
+            final path = ascii.decode(
+              message.headers
+                  .firstWhere((header) => ascii.decode(header.name) == ':path')
+                  .value,
+            );
+            final headers = [h2.Header.ascii(':status', '204')];
+            switch (path) {
+              case '/length':
+                stream.sendHeaders([
+                  ...headers,
+                  h2.Header.ascii('content-length', '0'),
+                ], endStream: true);
+              case '/content':
+                stream.sendHeaders(headers);
+                stream.sendData([17], endStream: true);
+              case '/trailers':
+                stream.sendHeaders(headers);
+                stream.sendHeaders([
+                  h2.Header.ascii('x-trailer', 'unexpected'),
+                ], endStream: true);
+              case '/not-modified':
+                stream.sendHeaders([
+                  h2.Header.ascii(':status', '304'),
+                  h2.Header.ascii('content-length', '5'),
+                ], endStream: true);
+              default:
+                stream.sendHeaders(headers, endStream: true);
+            }
+          });
+        });
+      });
+      final address = Uri.parse('https://127.0.0.1:${listener.port}');
+      final checking = LuxoHttp2Client(
+        address,
+        securityContext: trust,
+        maxConcurrentRequests: 1,
+      );
+      addTearDown(() async {
+        checking.close();
+        await incoming.cancel();
+        await listener.close();
+        for (final socket in sockets) {
+          socket.destroy();
+        }
+      });
+      expect((await checking.get(address)).statusCode, 204);
+      for (final invalid in ['/length', '/content', '/trailers']) {
+        await expectLater(
+          checking.get(address.resolve(invalid)),
+          throwsA(isA<http.ClientException>()),
+        );
+        final response = await checking.get(address);
+        expect(response.statusCode, 204);
+        expect(response.bodyBytes, isEmpty);
+      }
+      final notModified = await checking.get(address.resolve('/not-modified'));
+      expect(notModified.statusCode, 304);
+      expect(notModified.headers['content-length'], '5');
+      expect(notModified.bodyBytes, isEmpty);
+      expect(sockets, hasLength(1));
+    },
+  );
 
   test('HTTP/2 selection rejects HTTP/1.1 without an implicit retry', () async {
     final countURL = endpoint.resolve('/http1-count');
