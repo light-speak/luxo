@@ -1,0 +1,58 @@
+name: Compare PR 73 deployment-only and complete codegen trees
+
+on:
+  push:
+    branches: [diagnostics/hosted-perf-pr71-pr72]
+    paths:
+      - .github/workflows/diagnose-pr73-deploy-only.yml
+      - scripts/diagnose-pr73-deploy-only.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-pr73-deploy-only
+  cancel-in-progress: false
+
+jobs:
+  compare-deploy-only:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-perf-pr71-pr72'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the three frozen source commits
+        run: >-
+          git fetch --no-tags origin
+          a75a0acce23b30e3f99d44b0c47f746901b82bb8
+          d8b686b516ed5ab89e185093ca836756901fb56c
+          9474fabe422599733143763e5749729cc0656c28
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Replay Int and State on one native runner
+        timeout-minutes: 17
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+        run: bash scripts/diagnose-pr73-deploy-only.sh
+      - name: Preserve exact sources, raw samples, layout and verdicts
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: hosted-pr73-deploy-only-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr73-deploy-only/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove the evidence directory after upload
+        if: always()
+        run: |
+          test ! -L .tmp
+          rm -rf -- .tmp/hosted-pr73-deploy-only
