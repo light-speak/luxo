@@ -512,9 +512,37 @@ jobs:
           test "$TESTED_SHA" = "$GITHUB_SHA"
           test "$(git rev-parse HEAD)" = "$TESTED_SHA"
           test "$(git -C .tmp/base rev-parse HEAD)" = "$BASE_SHA"
-          gh run download "${RUN_ID}" --name "${PLAN_ARTIFACT}" --dir .tmp/plan
+          download_stage=$(mktemp -d .tmp/benchmark-plan-download.XXXXXXXX)
+          trap 'rm -rf -- "$download_stage"' EXIT
+          for delay in 5 15 0; do
+            download_dir="$download_stage/$delay"
+            mkdir "$download_dir"
+            download_status=0
+            download_log=$(gh run download "${RUN_ID}" --name "${PLAN_ARTIFACT}" --dir "$download_dir" 2>&1) || download_status=$?
+            if [[ -n "$download_log" ]]; then
+              printf '%s\n' "$download_log" | sed -E 's@https?://[^[:space:])]+@<download URL>@g' >&2
+            fi
+            if (( download_status == 0 )); then break; fi
+            if (( delay == 0 )); then exit "$download_status"; fi
+            if [[ "$download_log" =~ (^|[[:space:]])HTTP[[:space:]]+([0-9]{3})([^[:digit:]]|$) ]]; then
+              case "${BASH_REMATCH[2]}" in
+                500|502|503|504) ;;
+                *) exit "$download_status" ;;
+              esac
+            else
+              case "$download_log" in
+                *"i/o timeout"*|*"TLS handshake timeout"*|*"connection reset by peer"*) ;;
+                *) exit "$download_status" ;;
+              esac
+            fi
+            printf 'Retrying benchmark plan download in %ss.\n' "$delay" >&2
+            sleep "$delay"
+          done
           printf 'base_sha=%s\ntested_sha=%s\n' "$BASE_SHA" "$TESTED_SHA" > .tmp/benchmark-revisions.txt
-          cmp .tmp/benchmark-revisions.txt .tmp/plan/benchmark-revisions.txt
+          cmp .tmp/benchmark-revisions.txt "$download_dir/benchmark-revisions.txt"
+          test ! -e .tmp/plan
+          test ! -L .tmp/plan
+          mv -- "$download_dir" .tmp/plan
           cp ".tmp/plan/benchmark-plan/shard-${SHARD}.tsv" .tmp/benchmark-batch.tsv
           cp ".tmp/plan/benchmark-plan/shard-${SHARD}.json" .tmp/benchmark-expected.json
           test -s .tmp/benchmark-batch.tsv
