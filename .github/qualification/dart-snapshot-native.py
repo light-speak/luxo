@@ -17,9 +17,9 @@ from urllib.parse import unquote
 DIAGNOSTIC_BASE = "03eb1dce2ed5f7b2d1796f08d934cb8860fb4f82"
 BASE = "32a10c114ac3c282b4ce46189b646d28eb767b1b"
 BASE_TREE = "3ddf747cccd83c2110b3dbeb5ce6c099c4de7c8e"
-CANDIDATE_TREE = "404c0998d4bc246f32c64eaaaf39868bf1a66c69"
+CANDIDATE_TREE = "9b8bbe722150fd0830c358900bbc383c248e70e1"
 DARWIN_TREE = "048b848d6dac5985cabe6b4efe3004aa4fa09520"
-PATCH_SHA = "50426cd30bc015a1ab96fc31600a135aaa46d08c9224df3f355b051e43449106"
+PATCH_SHA = "b6054acd6c776c9334050dcf3ffcdc0d4af1cb4635442e501c8c21d1aaaa5c56"
 DART_VERSION = "3.13.4"
 RELEASE_WORKFLOW = ".github/workflows/dart-release-windows.yml"
 DIAGNOSTIC_FILES = {
@@ -28,7 +28,7 @@ DIAGNOSTIC_FILES = {
     ".github/qualification/dart-snapshot-product.patch.b64",
 }
 PRODUCT_FILES = {
-    RELEASE_WORKFLOW: "fd61a919301c486b148fca2544427698e74bdf26917f8cb6d24291fb3556e613",
+    RELEASE_WORKFLOW: "a9f056801f074b364bc4991cd7a17e6dc34011e35c41d77a65cfcf9624d7c19f",
     "packages/dart/bin/build.dart": "6459d88ca789c0839fa1250074d4527c80d577a732b8d868603a40b3437f771e",
     "packages/dart/bin/flutter.dart": "050468180d1d143d8b43a4a676c052fd02b2f8fabe10f8e5bbef393ab0360add",
     "packages/dart/lib/src/builder/artifact_publish.dart": "081b7122a34a0d29eab7391c73b050d5678c0c9c769e0ad6269ea22b5549b2fa",
@@ -36,7 +36,7 @@ PRODUCT_FILES = {
     "packages/dart/lib/src/builder/snapshot_directory.dart": "50370422d15e1696661b0a0f69f52ae7079bf95d33c5dfbc721bc259a6a4cfda",
     "packages/dart/lib/src/builder/snapshot_posix.dart": "963467186dfadfb56a30376481c182ae141809322b78587de1744ee555bff5fb",
     "packages/dart/lib/src/builder/snapshot_windows.dart": "339a85a18eb62092ed4126d75aad294a4d7882f34e737914e4ca4ea5df098344",
-    "packages/dart/test/selection_build_test.dart": "6ea8cb5ae4b9235c0d2574b2593b3edaa8596ebbd9440dedd87b97425e46c025",
+    "packages/dart/test/selection_build_test.dart": "4ece4a28dca5382d273f55db8b4121f226e84b2c8e13aeab2a2555e71772a94e",
 }
 SUITES = [
     "test/artifact_publish_test.dart",
@@ -56,7 +56,9 @@ COMMON = {
     "prepared output accepts a root-level file and normalized relative names",
     "prepared output preserves a project selected through its directory alias",
     "prepared output keeps an existing ordinary file unchanged",
+    "snapshot refresh retires a present managed file",
     "snapshot refresh retires an already absent managed file",
+    "snapshot refresh retires a file whose staging parent is absent",
     "snapshot refresh can retry after source graph preparation fails",
     "snapshot refresh retains a zero-length asset",
     "snapshot publishes its own staged artifact",
@@ -72,6 +74,10 @@ COMMON = {
     "restart waits for transformation; other commands pass through",
     "failed refresh rejects restart without killing the session",
 }
+WINDOWS_ONLY = {
+    "snapshot refresh can retry after a read-only staged file rejects replacement",
+}
+WINDOWS = COMMON | WINDOWS_ONLY
 LINUX = COMMON | {
     "failed prepare keeps both errors when scratch cleanup is blocked",
     "shared project accepts its private build scratch directory",
@@ -79,6 +85,8 @@ LINUX = COMMON | {
     "trusted project retains a shared scratch workspace",
     "shared scratch restores retirement after an ordinary permission error",
     "failed initial move clears only its empty private staging directory",
+    "snapshot refresh retries retirement after a staging permission error",
+    "snapshot prepare retries after initial scratch creation is denied",
     "snapshot rejects a project and scratch without a trusted anchor",
     "Flutter CLI cleans its snapshot after EOF or native exit null",
     "Flutter CLI cleans its snapshot after EOF or native exit 0",
@@ -196,6 +204,18 @@ def verify_events(receipt, required, allowed_skips, exact):
     return {"passed": sorted(passed), "skipped": sorted(skipped)}
 
 
+def verify_hit_positions(tracked, metric, required):
+    verified = {}
+    for path, positions in required.items():
+        counts = tracked[path][metric]
+        verified[path] = {}
+        for line in positions:
+            require(line in counts, f"snapshot {metric} position was not reported: {path}:{line}")
+            require(counts[line] > 0, f"snapshot {metric} position was not executed: {path}:{line}")
+            verified[path][line] = counts[line]
+    return verified
+
+
 def coverage_receipt(source, raw, expected):
     reports = sorted(raw.rglob("*.vm.json"))
     require(reports, "Dart VM did not write any coverage reports")
@@ -241,25 +261,22 @@ def coverage_receipt(source, raw, expected):
     require(host["lines"]["hit"] > 0 and host["branchSourcePositions"]["hit"] > 0,
             "no executed source and branch coverage from the native snapshot implementation")
     builder = "packages/dart/lib/src/builder"
-    required_branches = {
-        f"{builder}/snapshot_directory.dart": (165, 173, 389),
-        f"{builder}/snapshot_{engine}.dart": (181,) if expected == "windows" else (336,),
-    }
-    required_hits = {}
-    for path, positions in required_branches.items():
-        hits = tracked[path]["branchHits"]
-        required_hits[path] = {}
-        for line in positions:
-            count = hits.get(line, 0)
-            require(count > 0, f"snapshot regression branch was not executed: {path}:{line}")
-            required_hits[path][line] = count
+    directory = f"{builder}/snapshot_directory.dart"
+    native = f"{builder}/snapshot_{engine}.dart"
+    if expected == "windows":
+        required_branches = {directory: (148, 157, 165, 173, 389), native: (181,)}
+        required_lines = {directory: (158,), native: (175, 198, 200)}
+    else:
+        required_branches = {directory: (157, 158, 165, 173, 389), native: (224, 336)}
+        required_lines = {native: (225, 266)}
     return {
         "scope": "Selected VM-instrumented cases. Zero positions mean no positions were "
                  "reported for that metric. CLI Dart and AOT subprocesses are verified by test events.",
         "rawReportCount": len(reports),
         "suites": SUITES,
         "productSources": observed,
-        "requiredOrdinaryBranchHits": required_hits,
+        "requiredOrdinaryBranchHits": verify_hit_positions(tracked, "branchHits", required_branches),
+        "requiredOrdinaryLineHits": verify_hit_positions(tracked, "hits", required_lines),
     }
 
 
@@ -286,10 +303,10 @@ def qualify(source, evidence, expected):
             "--branch-coverage", f"--coverage={raw_coverage}", *SUITES]
     isolated_selection = expected == "windows"
     if isolated_selection:
-        args += ["--name", "^(?:" + "|".join(sorted(COMMON)) + ")$"]
+        args += ["--name", "^(?:" + "|".join(sorted(WINDOWS)) + ")$"]
     receipt = capture(package, evidence, "tests", args, 720)
-    required = COMMON if isolated_selection else LINUX
-    skips = set() if isolated_selection else MAC_ONLY
+    required = WINDOWS if isolated_selection else LINUX
+    skips = set() if isolated_selection else MAC_ONLY | WINDOWS_ONLY
     verdict = verify_events(receipt, required, skips, isolated_selection)
     write_json(evidence / "coverage.json", coverage_receipt(source, raw_coverage, expected))
     for directory in (source / ".tmp", package / ".tmp"):
