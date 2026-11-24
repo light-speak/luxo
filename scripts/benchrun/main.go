@@ -23,6 +23,9 @@ func main() {
 }
 
 func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
+	if len(args) > 0 && args[0] == "compile-pair" {
+		return runCompilePair(args[1:], output, errorOutput)
+	}
 	if len(args) == 1 && args[0] == "canonical" {
 		return canonical(input, output)
 	}
@@ -45,12 +48,10 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 		return err
 	}
 	for _, path := range packages {
-		binary := filepath.Join(bin, strings.ReplaceAll(path, "/", "-")+".test")
+		binary := binaryPath(bin, path)
 		var cmd *exec.Cmd
 		if args[0] == "compile" {
-			cmd = exec.Command("go", "test", "-trimpath", "-c", "./"+path, "-o", binary)
-			cmd.Dir = root
-			cmd.Env = append(os.Environ(), "GOWORK="+filepath.Join(root, "go.work"))
+			cmd = compileCommand(root, path, binary, "")
 		} else {
 			cmd = exec.Command(binary, args[4:]...)
 			cmd.Dir = filepath.Join(root, path)
