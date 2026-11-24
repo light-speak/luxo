@@ -88,6 +88,10 @@ jobs:
           set -euo pipefail
           export GOWORK="$PWD/go.work" TMPDIR="$PWD/.tmp"
           evidence="$PWD/../evidence"
+          export GOBIN="$PWD/.tmp/bin"
+          export PATH="$GOBIN:$PATH"
+          go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
+          go version -m "$(command -v gocyclo)" | tee "$evidence/gocyclo-version.txt"
           sh scripts/check-go.sh format pkg/ cmd/ scripts/ internal/
           sh scripts/check-go.sh complexity pkg/ cmd/ scripts/ internal/
           go vet ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/...
