@@ -26,7 +26,9 @@ const (
 		"\ncodegen-global-receiver-overlay-v1 " + codegenReceiverProjectionSHA +
 		"\nluvia-gateway-identity-overlay-v1 " + luviaGatewayIdentityProjectionSHA +
 		"\nlux-short-path-overlay-v1 " + luxFilterFixture + "=" + luxFilterProjectionSHA +
-		" " + luxDecimalFixture + "=" + luxDecimalProjectionSHA
+		" " + luxDecimalFixture + "=" + luxDecimalProjectionSHA +
+		"\ncodegen-migration-state-overlay-v1 " + codegenMigrationStateFixture + "=" + codegenMigrationStateFixtureSHA +
+		" " + codegenReceiverFixture + "=" + codegenReceiverProjectionSHA
 )
 
 func performanceOverlay(root, packagePath string, baseline bool) (string, func() error, error) {

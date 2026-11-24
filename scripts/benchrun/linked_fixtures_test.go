@@ -19,7 +19,8 @@ func TestIsolationProfileCommand(t *testing.T) {
 		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n" +
 			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n"},
 		{"pkg/codegen", "codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n" +
-			"codegen-global-receiver\t^BenchmarkGlobalReceiverName$\n"},
+			"codegen-global-receiver\t^BenchmarkGlobalReceiverName$\n" +
+			"codegen-migration-state\t^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$\n"},
 		{"pkg/lux", "lux-short-path\t^BenchmarkStrictFilterContract$|^BenchmarkDecimalAlignment$\n"},
 		{"pkg/lux/rpc", ""},
 	} {
