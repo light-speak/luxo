@@ -1,0 +1,72 @@
+name: Recheck PR 72 boxed JSON encoding on the formal processor
+
+on:
+  push:
+    branches: [diagnostics/pr72-boxed-json-9v74]
+    paths:
+      - .github/workflows/diagnose-pr72-boxed-json.yml
+      - scripts/diagnose-pr72-boxed-json/**
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  compare:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr72-boxed-json-9v74'
+    runs-on: ubuntu-latest
+    timeout-minutes: 24
+    steps:
+      - name: Check the runner before retrieving inputs
+        run: |
+          mkdir -p .tmp/pr72-boxed-json-host
+          uname -a > .tmp/pr72-boxed-json-host/uname.txt
+          LC_ALL=C lscpu > .tmp/pr72-boxed-json-host/lscpu.txt
+          model=$(sed -n 's/^Model name:[[:space:]]*//p' .tmp/pr72-boxed-json-host/lscpu.txt)
+          if [[ "$(uname -sm)" != 'Linux x86_64' || "$model" != 'AMD EPYC 9V74 80-Core Processor' ]]; then
+            printf '%s\n' 'The runner does not match the formal AMD EPYC 9V74 scope.' >&2
+            exit 3
+          fi
+      - uses: actions/checkout@v7
+        with:
+          path: native-sources
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind the formal revisions and shard archive
+        working-directory: native-sources
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base=4a660a0bcdee1eeb3c7a9dddcc95324d7967bec0
+          head=8dcb6c8b97615f5148c43ff15e43b93320e1a342
+          receipt="$GITHUB_WORKSPACE/.tmp/pr72-boxed-json-host"
+          digest=67c6414b54e7410188c0227b7266c30a16c9c0863fea7a1b8433c281feaddb25
+          git fetch --no-tags origin "$base" "$head"
+          gh api repos/light-speak/luxo/actions/artifacts/14924072511 > "$receipt/artifact.json"
+          jq -e --arg head "$head" --arg digest "sha256:$digest" '
+            .id == 14924072511 and .workflow_run.id == 45397856587 and
+            .workflow_run.head_sha == $head and .digest == $digest and .expired == false
+          ' "$receipt/artifact.json" > /dev/null
+          mkdir -p .tmp
+          gh api repos/light-speak/luxo/actions/artifacts/14924072511/zip > .tmp/pr72-formal-shard-12.zip
+          printf '%s  %s\n' "$digest" .tmp/pr72-formal-shard-12.zip | sha256sum -c - > "$receipt/input-sha256.txt"
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Preserve the existing profiles and compare candidate A
+        working-directory: native-sources
+        run: bash scripts/diagnose-pr72-boxed-json/diagnose-native.sh . a .tmp/pr72-formal-shard-12.zip
+      - name: Preserve the runner, raw legs and gate verdicts
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr72-boxed-json-a-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .tmp/pr72-boxed-json-host/
+            native-sources/.tmp/pr72-boxed-json-evidence-a.*/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
