@@ -33,6 +33,102 @@ func TestConfirmationTargetsReportUniqueCanonicalLeaves(t *testing.T) {
 	}
 }
 
+func TestConfirmationTargetsIncludePairedFixtureContexts(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	primary := targetedPlatform +
+		targetedCSV(pkg, "BinaryJSONDocuments/128/typed-2", "+6%", "~", "~") +
+		targetedCSV(pkg, "BinaryJSONDocuments/128/boxed-2", "~", "~", "~") +
+		targetedCSV(pkg, "OtherJSONDocuments/128/typed-2", "+6%", "~", "~") +
+		targetedCSV(pkg, "OtherJSONDocuments/128/boxed-2", "~", "~", "~") +
+		targetedCSV("pkg/lux/codec", "BinaryJSONDocuments/128/typed-2", "+6%", "~", "~") +
+		targetedCSV("pkg/lux/codec", "BinaryJSONDocuments/128/boxed-2", "~", "~", "~") +
+		targetedCSV(pkg, "CanonicalJSONValue/list0/after-2", "+7.70%", "~", "~") +
+		targetedCSV(pkg, "CanonicalJSONValue/list0/before-2", "~", "~", "~") +
+		targetedCSV(pkg, "CanonicalJSONValue/stringList1/after-2", "+7.55%", "~", "~") +
+		targetedCSV(pkg, "CanonicalJSONValue/stringList1/before-2", "+5.10%", "~", "~") +
+		targetedCSV(pkg, "CanonicalJSONFloat/16/After-2", "+6%", "~", "~") +
+		targetedCSV(pkg, "CanonicalJSONFloat/16/Before-2", "~", "~", "~") +
+		targetedCSV(pkg, "CanonicalJSONFloat/1/after-2", "+6%", "~", "~") +
+		targetedCSV(pkg, "CanonicalJSONFloat/1/Before-2", "~", "~", "~") +
+		targetedCSV(pkg, "CanonicalJSONFloat/128/before-2", "~", "~", "~") +
+		targetedCSV("pkg/lux/codec", "CanonicalJSONFloat/1/before-2", "~", "~", "~") +
+		targetedCSV(pkg, "Variant/before/typed-2", "~", "~", "~") +
+		targetedCSV(pkg, "Variant/after/typed-2", "+6%", "~", "~")
+
+	var output strings.Builder
+	if err := run([]string{"--confirmation-targets", writeRunInput(t, primary)}, &output); err != nil {
+		t.Fatal(err)
+	}
+	const want = "pkg/lux/api\tBenchmarkBinaryJSONDocuments/128/boxed-2\n" +
+		"pkg/lux/api\tBenchmarkBinaryJSONDocuments/128/typed-2\n" +
+		"pkg/lux/api\tBenchmarkCanonicalJSONFloat/1/after-2\n" +
+		"pkg/lux/api\tBenchmarkCanonicalJSONFloat/16/After-2\n" +
+		"pkg/lux/api\tBenchmarkCanonicalJSONFloat/16/Before-2\n" +
+		"pkg/lux/api\tBenchmarkCanonicalJSONValue/list0/after-2\n" +
+		"pkg/lux/api\tBenchmarkCanonicalJSONValue/list0/before-2\n" +
+		"pkg/lux/api\tBenchmarkCanonicalJSONValue/stringList1/after-2\n" +
+		"pkg/lux/api\tBenchmarkCanonicalJSONValue/stringList1/before-2\n" +
+		"pkg/lux/api\tBenchmarkOtherJSONDocuments/128/typed-2\n" +
+		"pkg/lux/api\tBenchmarkVariant/after/typed-2\n" +
+		"pkg/lux/codec\tBenchmarkBinaryJSONDocuments/128/typed-2\n"
+	if got := output.String(); got != want {
+		t.Fatalf("target list = %q, want %q", got, want)
+	}
+}
+
+func TestConfirmationContextRequiresAllPrimaryMetrics(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	primary := mustEvaluate(t, targetedPlatform+
+		targetedCSV(pkg, "CanonicalJSONValue/list0/after-2", "+7.70%", "~", "~")+
+		targetedCSV(pkg, "CanonicalJSONValue/list0/before-2", "~", "~", "~")+
+		targetedCSV(pkg, "CanonicalJSONValue/stringList1/after-2", "+7.55%", "~", "~")+
+		targetedCSV(pkg, "CanonicalJSONValue/stringList1/before-2", "~", "~", "~"))
+	const prefix = "github.com/light-speak/luxo/" + pkg
+	delete(primary.Comparisons, comparisonKey{prefix, "CanonicalJSONValue/stringList1/before-2", "allocs/op"})
+	got, err := confirmationCases(primary)
+	_, complete := got[costKey{Package: prefix, Benchmark: "CanonicalJSONValue/list0/before-2"}]
+	_, incomplete := got[costKey{Package: prefix, Benchmark: "CanonicalJSONValue/stringList1/before-2"}]
+	if err != nil || !complete || incomplete || len(got) != 3 {
+		t.Fatalf("target set = %v, error = %v", got, err)
+	}
+}
+
+func TestTargetedConfirmationRequiresContextButPreservesOriginalHits(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	const before = "CanonicalJSONValue/list0/before-2"
+	const after = "CanonicalJSONValue/list0/after-2"
+	primary := writeRunInput(t, targetedPlatform+
+		targetedCSV(pkg, before, "~", "~", "~")+
+		targetedCSV(pkg, after, "+7.70%", "~", "~"))
+
+	for _, tt := range []struct {
+		name, beforeCSV, afterTime, afterBytes, wantError string
+	}{
+		{"different metric and context only", targetedCSV(pkg, before, "+6%", "~", "~"), "~", "+1%", ""},
+		{"same metric on target", targetedCSV(pkg, before, "~", "~", "~"), "+6%", "~", "performance gate rejected 1 regression(s)"},
+		{"omitted context", "", "+6%", "~", "comparison sets differ"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			confirmation := writeRunInput(t, targetedPlatform+tt.beforeCSV+
+				targetedCSV(pkg, after, tt.afterTime, tt.afterBytes, "~"))
+			var output strings.Builder
+			err := run([]string{"--targeted-confirmation", primary, confirmation}, &output)
+			if tt.wantError == "" {
+				if err != nil || strings.Contains(output.String(), "confirmed performance regression") {
+					t.Fatalf("context-only regression blocked targeted gate: %q, error = %v", output.String(), err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("targeted gate output = %q, error = %v, want %q", output.String(), err, tt.wantError)
+			}
+			if tt.afterTime == "+6%" && tt.beforeCSV != "" && !strings.Contains(output.String(), after+" sec/op") {
+				t.Fatalf("missing confirmed target in %q", output.String())
+			}
+		})
+	}
+}
+
 func TestConfirmationTargetsRejectUnusableIdentities(t *testing.T) {
 	for _, test := range []struct {
 		name string

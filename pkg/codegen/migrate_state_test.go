@@ -118,14 +118,32 @@ func TestLoadStateNotFound(t *testing.T) {
 }
 
 func TestMarshalStatePreservesEncodingAndValidation(t *testing.T) {
-	data, err := MarshalState(&SchemaState{Models: map[string]*ModelState{}})
-	if err != nil || string(data) != "{\n  \"models\": {}\n}\n" {
-		t.Fatalf("empty state encoding: %q %v", data, err)
+	removed := map[string]*ModelState{"User": {Table: "users"}}
+	delete(removed, "User")
+	for _, sample := range []struct {
+		models map[string]*ModelState
+		want   string
+	}{
+		{nil, "{\n  \"models\": null\n}\n"},
+		{map[string]*ModelState{}, "{\n  \"models\": {}\n}\n"},
+		{removed, "{\n  \"models\": {}\n}\n"},
+	} {
+		data, err := MarshalState(&SchemaState{Models: sample.models})
+		if err != nil || string(data) != sample.want {
+			t.Fatalf("empty state encoding: got %q and %v, want %q", data, err, sample.want)
+		}
 	}
-	for _, invalid := range []*SchemaState{nil, {Models: map[string]*ModelState{"User": nil}}, {Models: map[string]*ModelState{"User": {Columns: map[string]*ColumnState{"id": nil}}}}} {
-		data, err := MarshalState(invalid)
-		if err == nil || data != nil {
-			t.Fatalf("malformed state encoded: %q %v", data, err)
+	for _, sample := range []struct {
+		state *SchemaState
+		want  string
+	}{
+		{nil, "migration state must be an object"},
+		{&SchemaState{Models: map[string]*ModelState{"User": nil}}, `migration state model "User" must be an object`},
+		{&SchemaState{Models: map[string]*ModelState{"User": {Columns: map[string]*ColumnState{"id": nil}}}}, `migration state column "User"."id" must be an object`},
+	} {
+		data, err := MarshalState(sample.state)
+		if data != nil || err == nil || err.Error() != sample.want {
+			t.Fatalf("malformed state encoding: got %q and %v, want %q", data, err, sample.want)
 		}
 	}
 }

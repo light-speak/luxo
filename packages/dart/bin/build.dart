@@ -60,17 +60,21 @@ Future<int> _run(SelectionBuild build, List<String> arguments) async {
 
 Future<int> _compile(SelectionBuild build, File entry, String output) async {
   final destination = await build.prepareOutput(output);
-  final artifact = File('${build.directory.path}/.tmp/luxo-release');
-  await artifact.parent.create(recursive: true);
-  final status = await _run(build, [
-    'compile',
-    'exe',
-    entry.path,
-    '-o',
-    artifact.path,
-  ]);
-  if (status == 0) publishBuildArtifact(artifact, destination);
-  return status;
+  try {
+    final artifact = File('${build.directory.path}/.tmp/luxo-release');
+    await artifact.parent.create(recursive: true);
+    final status = await _run(build, [
+      'compile',
+      'exe',
+      entry.path,
+      '-o',
+      artifact.path,
+    ]);
+    if (status == 0) publishBuildArtifact(artifact, destination);
+    return status;
+  } finally {
+    destination.close();
+  }
 }
 
 ({
