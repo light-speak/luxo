@@ -48,6 +48,17 @@ jobs:
               formal_run=45387275899
               digest=addc34c9a86d6f20a77b02321bfcb835b7de20ac1f9e7948d45935d6336adca3
               ;;
+            'AMD EPYC 9V45 96-CORE PROCESSOR')
+              suite=pr71-static-jwt
+              diagnostic=3a9838348d630bcd0f806fbf38c67ee3e327924b
+              tree=68f0cac3a999e8762f72d8006b594975a445c57b
+              base=1117eb9ffcc0beef977abceec656a351b0988389
+              head=4177d556d135cff1cd27e42798c0b082cf09f9b3
+              input=pr71-static-jwt-formal-01.zip
+              artifact=14932692737
+              formal_run=45413131379
+              digest=789c9c7220e6a1400461f35d3bae5b1e922e94a8a8c7cd7105604948bec0f9af
+              ;;
             'AMD EPYC 9V74 80-CORE PROCESSOR')
               suite=pr72-boxed-json-header-causal
               diagnostic=480240c33e49e914aa04e96047a1ac0bcd470f06
@@ -61,15 +72,16 @@ jobs:
               evidence='.tmp/native-cpu-worktree/.tmp/pr72-boxed-json-evidence-r.*/'
               ;;
             'AMD EPYC 7763 64-CORE PROCESSOR')
-              suite=pr91-receiver-only
-              diagnostic=4afba3abe78bd692edcda4daa9dfc1034311cec7
-              tree=95bbced3a21965379d000a2903196c52622cdb40
-              base=ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
-              head=679921d60ff6c03ba14c2e8ded529a1dd0dd7723
-              input=pr91-receiver-formal-01.zip
-              artifact=14908597395
-              formal_run=45368483415
-              digest=305dd9410e174043594da33e61b9a9d2fcf937b4617bd32451dee7b23e0234c1
+              suite=pr71-columnar
+              diagnostic=8c98529d6bcc09ae80e42a7ee1023cd0568edaf1
+              tree=a2867c9ef16a916ff5912b9397be1fef5a783e37
+              base=1117eb9ffcc0beef977abceec656a351b0988389
+              head=4177d556d135cff1cd27e42798c0b082cf09f9b3
+              input=pr71-columnar-formal-08.zip
+              artifact=14931164632
+              formal_run=45413131379
+              digest=094c81b14547cfbe5aa21d6b402c4b2574925fbafb701e503d9ac09354efb993
+              evidence='.tmp/native-cpu-worktree/.tmp/hosted-columnar-merge-pr71-formal/'
               ;;
             'INTEL(R) XEON(R) PLATINUM 8573C')
               suite=pr103-short-paths
@@ -127,10 +139,16 @@ jobs:
             sampler_digest=682270521e905a123429eb78a21980e16e7636b638c695fc35669833f7c9e513
           fi
           printf '%s  %s\n' "$sampler_digest" "$root/$sampler" | sha256sum -c -
-          if [[ "$SUITE" == pr91-receiver-only ]]; then
-            driver="$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr91-receiver-only.sh"
-            printf '%s  %s\n' 395456471e46be4ae0fdb96d3884ba9552465f53789bbb7a99fe12068cfa1eec "$driver" |
-              sha256sum -c - > "$receipt/receiver-driver.txt"
+          if [[ "$SUITE" == pr71-columnar ]]; then
+            driver="$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr71-columnar.sh"
+            printf '%s  %s\n' 6b88d84f5df69e8d9ac29ac48eaf34930abbc18109fefc1e6599629cce6ae53e "$driver" |
+              sha256sum -c - > "$receipt/columnar-driver.txt"
+            tested=3baa5b629d86749c6f5dc38dd9e540e0d11c39e9
+            gh api "repos/light-speak/luxo/git/commits/$tested" > "$receipt/columnar-tested.json"
+            jq -e --arg tested "$tested" --arg base "$PRODUCT_BASE" --arg head "$PRODUCT_HEAD" '
+              .sha == $tested and .tree.sha == "175294b28abcbb21b68ba40fd6288ce63e2e1547"
+              and [.parents[].sha] == [$base, $head]
+            ' "$receipt/columnar-tested.json"
           fi
           if [[ "$SUITE" == pr72-boxed-json-header-causal ]]; then
             delta="$receipt/header-driver.patch"
@@ -150,6 +168,19 @@ jobs:
           ' "$receipt/artifact-metadata.json"
           gh api "repos/light-speak/luxo/actions/artifacts/$FORMAL_ARTIFACT/zip" > "$root/.tmp/$FORMAL_INPUT"
           (cd "$root/.tmp" && printf '%s  %s\n' "$FORMAL_DIGEST" "$FORMAL_INPUT" | sha256sum -c -) > "$receipt/artifact-digest-check.txt"
+          if [[ "$SUITE" == pr71-static-jwt ]]; then
+            driver=scripts/diagnose-pr71-static-jwt.sh
+            helper=scripts/diagnose-pr71-static-jwt.py
+            printf '%s  %s\n' \
+              2289b9051ead46a390cfdbf3d464dca6ec66f2c7df0ae2e0c5e962c8f1be8d6c "$root/$driver" \
+              56b28eb47a64344be869fa9989a09b9e6361eea57c6a5fbafddf70e099e0f656 "$root/$helper" |
+              sha256sum -c - > "$receipt/static-jwt-driver.txt"
+            git -C "$root" fetch --no-tags origin 3baa5b629d86749c6f5dc38dd9e540e0d11c39e9
+            (cd "$root" && bash "$driver" --probe)
+            evidence="$root/.tmp/hosted-pr71-static-jwt"
+            grep -Fxq 'match=true' "$evidence/runner.txt"
+            mv "$root/.tmp/$FORMAL_INPUT" "$evidence/official.zip"
+          fi
       - uses: actions/setup-go@v7
         id: go
         if: ${{ !cancelled() && steps.checkout.outcome == 'success' && (steps.primary_inputs.outcome == 'success' || steps.cpu.outputs.suite == 'pr103-short-paths') }}
@@ -208,11 +239,14 @@ jobs:
         run: |
           set -euo pipefail
           case "$SUITE" in
+            pr71-static-jwt)
+              exec bash scripts/diagnose-pr71-static-jwt.sh run
+              ;;
             pr72-boxed-json-header-causal)
               exec bash scripts/diagnose-pr72-boxed-json/diagnose-native.sh . r .tmp/pr72-formal-shard-12.zip
               ;;
-            pr91-receiver-only)
-              exec bash "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr91-receiver-only.sh" . run
+            pr71-columnar)
+              exec bash "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr71-columnar.sh" . .tmp/pr71-columnar-formal-08.zip
               ;;
             pr82-lux-short-path)
               exec bash "scripts/diagnose-$SUITE.sh"
