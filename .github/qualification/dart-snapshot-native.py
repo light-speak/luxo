@@ -112,7 +112,7 @@ def restore(repo, scratch):
     git(repo, "init", "--quiet", "--bare", str(store))
     alternates = store / "objects/info/alternates"
     objects = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects")
-    alternates.write_text(Path(objects).as_posix() + "\n", encoding="utf-8")
+    alternates.write_bytes((Path(objects).as_posix() + "\n").encode("utf-8"))
     binding = ("--git-dir", str(store))
     git(repo, *binding, "read-tree", BASE)
     git(repo, *binding, "apply", "--cached", "--whitespace=error", str(patch))
