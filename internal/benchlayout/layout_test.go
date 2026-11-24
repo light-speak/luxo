@@ -70,3 +70,66 @@ func layoutFixture(t *testing.T) string {
 	})
 	return root
 }
+
+func TestCodecReaderProfileRequiresPackageAndExactRoot(t *testing.T) {
+	for _, tc := range []struct{ pkg, name, want string }{
+		{CodecPackage, CodecReaderBenchmark, CodecReaderProfile},
+		{CodecPackage, CodecReaderBenchmark + "/x-2", CodecReaderProfile},
+		{CodecPackage, "BenchmarkMissingElementPayload", DefaultProfile},
+		{"pkg/lux/schema", CodecReaderBenchmark, DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	if ValidPerformanceProfile("pkg/lux/rpc", CodecReaderProfile) || ValidPerformanceProfile(CodecPackage, "bogus") {
+		t.Fatal("accepted a profile outside its package or registry")
+	}
+}
+
+func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
+	for _, tc := range []struct{ pkg, name, want string }{
+		{APIPackage, "BenchmarkIdentityConditionValidity/member/EnumChecked-2", DefaultProfile},
+		{APIPackage, "BenchmarkIdentityEnumArray", DefaultProfile},
+		{APIPackage, "BenchmarkIdentitySubjectVisibility", DefaultProfile},
+		{APIPackage, "BenchmarkIdentitySurface", APINonIdentityProfile},
+		{APIPackage, "BenchmarkCanonicalJSONBytes", APINonIdentityProfile},
+		{LuviaPackage, "BenchmarkPrimaryKeys/row-small/keyLast=false/baseline=true-2", LuviaPrimaryTraceProfile},
+		{LuviaPackage, "BenchmarkTraceEncodingComparison", LuviaPrimaryTraceProfile},
+		{LuviaPackage, "BenchmarkStaticMetricsJSON", DefaultProfile},
+		{LuviaPackage, "BenchmarkConvenienceKeyParentValidation", DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	for _, tc := range []struct{ pkg, profile, filter string }{
+		{APIPackage, APINonIdentityProfile, "."},
+		{LuviaPackage, LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"},
+		{CodecPackage, CodecReaderProfile, "."},
+		{"pkg/lux/rpc", "", ""},
+	} {
+		p, f := IsolationProfile(tc.pkg)
+		if p != tc.profile || f != tc.filter {
+			t.Fatalf("isolation of %s = %q %q, want %q %q", tc.pkg, p, f, tc.profile, tc.filter)
+		}
+	}
+}
+
+func TestCodegenLiteralProfileRequiresPackageAndExactRoot(t *testing.T) {
+	for _, tc := range []struct{ pkg, name, want string }{
+		{CodegenPackage, CodegenLiteralBenchmark, CodegenLiteralProfile},
+		{CodegenPackage, CodegenLiteralBenchmark + "/duration_plain-2", CodegenLiteralProfile},
+		{CodegenPackage, "BenchmarkGenerateNumericLiteralBindings/plain-2", DefaultProfile},
+		{CodecPackage, CodegenLiteralBenchmark, DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	profile, filter := IsolationProfile(CodegenPackage)
+	if profile != CodegenLiteralProfile || filter != "^"+CodegenLiteralBenchmark+"$" ||
+		ValidPerformanceProfile(CodecPackage, CodegenLiteralProfile) {
+		t.Fatalf("unexpected codegen isolation: %q %q", profile, filter)
+	}
+}

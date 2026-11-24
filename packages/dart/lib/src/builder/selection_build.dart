@@ -5,6 +5,7 @@ import 'package:analyzer/dart/analysis/analysis_context_collection.dart';
 import 'package:analyzer/dart/analysis/results.dart';
 import 'package:analyzer/diagnostic/diagnostic.dart';
 
+import 'artifact_publish.dart';
 import 'select_rewrite.dart';
 import 'selection_imports.dart';
 
@@ -14,32 +15,25 @@ class SelectionBuild {
   final Directory directory;
   final String clientPath;
   final Set<String> _outputs = {};
+  Set<PreparedOutput>? _preparedOutputs;
   bool _closed = false;
+  bool _closing = false;
   bool _refreshing = false;
 
   SelectionBuild._(this.source, this.directory, this.clientPath);
 
-  /// Reserve no file; validate the destination before invoking the release compiler.
-  Future<File> prepareOutput(String output) async {
-    if (_closed) throw StateError('Build is closed');
-    _relativePath(output);
-    final destination = File.fromUri(source.uri.resolve(output));
-    if (await FileSystemEntity.type(destination.path, followLinks: false) !=
-        FileSystemEntityType.notFound) {
-      throw StateError('Output already exists: $output');
+  /// Keep the validated output directory open until the build is finished.
+  Future<PreparedOutput> prepareOutput(String output) async {
+    if (_closed || _closing) throw StateError('Build is closed');
+    final prepared = await PreparedOutput.prepare(source, output);
+    try {
+      if (_closed || _closing) throw StateError('Build is closed');
+      (_preparedOutputs ??= {}).add(prepared);
+      return prepared;
+    } catch (_) {
+      prepared.close();
+      rethrow;
     }
-    var ancestor = destination.parent;
-    while (!await ancestor.exists()) {
-      if (ancestor.path == ancestor.parent.path)
-        throw ArgumentError('Invalid output parent');
-      ancestor = ancestor.parent;
-    }
-    final parent = Uri.directory(await ancestor.resolveSymbolicLinks());
-    if (!parent.toString().startsWith(source.uri.toString())) {
-      throw ArgumentError('Output escapes the project');
-    }
-    await destination.parent.create(recursive: true);
-    return destination;
   }
 
   static Future<SelectionBuild> prepare(
@@ -51,7 +45,7 @@ class SelectionBuild {
     if (path.endsWith(Platform.pathSeparator) && root.parent.path != path) {
       root = Directory(path.substring(0, path.length - 1));
     }
-    _relativePath(clientPath);
+    validateProjectRelativePath(clientPath);
     final temp = Directory.fromUri(root.uri.resolve('.tmp'));
     await temp.create(recursive: true);
     if (!await _resolvesToOwnPath(temp)) {
@@ -70,7 +64,7 @@ class SelectionBuild {
 
   /// Re-resolve the current source snapshot; do not reuse stale analyzer sessions.
   Future<void> refresh() async {
-    if (_closed || _refreshing)
+    if (_closed || _closing || _refreshing)
       throw StateError('Build is closed or already refreshing');
     _refreshing = true;
     try {
@@ -192,7 +186,7 @@ class SelectionBuild {
   }
 
   Future<File> _target(String relative) async {
-    _relativePath(relative);
+    validateProjectRelativePath(relative);
     final segments = Uri.parse(relative).pathSegments;
     var current = directory.uri;
     for (var i = 0; i < segments.length; i++) {
@@ -210,16 +204,55 @@ class SelectionBuild {
     return File.fromUri(current);
   }
 
+  void _closePreparedOutputs() {
+    final outputs = _preparedOutputs;
+    _preparedOutputs = null;
+    if (outputs == null) return;
+    final errors = <Object>[];
+    for (final output in outputs) {
+      try {
+        output.close();
+      } catch (error) {
+        errors.add(error);
+      }
+    }
+    if (errors.length == 1) throw errors.single;
+    if (errors.isNotEmpty)
+      throw StateError('Could not close prepared outputs: $errors');
+  }
+
   Future<void> close() async {
     if (_refreshing) throw StateError('Cannot close while preparing a build');
     if (_closed) return;
-    final expectedParent = source.uri.resolve('.tmp/');
-    if (directory.parent.uri != expectedParent ||
-        !await _resolvesToOwnPath(directory)) {
-      throw StateError('Refusing to remove an unowned build directory');
+    if (_closing) throw StateError('Build is already closing');
+    _closing = true;
+    Object? outputError;
+    StackTrace? outputStack;
+    try {
+      try {
+        _closePreparedOutputs();
+      } catch (error, stack) {
+        outputError = error;
+        outputStack = stack;
+      }
+      final expectedParent = source.uri.resolve('.tmp/');
+      if (directory.parent.uri != expectedParent ||
+          !await _resolvesToOwnPath(directory)) {
+        throw StateError('Refusing to remove an unowned build directory');
+      }
+      await directory.delete(recursive: true);
+      _closed = true;
+    } catch (error) {
+      if (outputError != null) {
+        throw StateError('Could not close build: $outputError; $error');
+      }
+      rethrow;
+    } finally {
+      _closing = false;
     }
-    await directory.delete(recursive: true);
-    _closed = true;
+    if (outputError != null) {
+      Error.throwWithStackTrace(outputError, outputStack!);
+    }
   }
 }
 
@@ -284,20 +317,6 @@ bool _sameBytes(List<int> a, List<int> b) {
     if (a[i] != b[i]) return false;
   }
   return true;
-}
-
-void _relativePath(String path) {
-  final uri = Uri.parse(path);
-  if (uri.hasScheme ||
-      uri.hasAuthority ||
-      uri.hasQuery ||
-      uri.hasFragment ||
-      path.startsWith('/') ||
-      path.contains('\\') ||
-      uri.pathSegments.any((p) => p == '..') ||
-      path.isEmpty) {
-    throw ArgumentError('Expected a project-relative path: $path');
-  }
 }
 
 extension on Uri {
