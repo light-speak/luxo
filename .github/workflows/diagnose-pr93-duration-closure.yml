@@ -1,0 +1,54 @@
+name: Compare PR 93 duration literal compiler benchmarks in isolation
+
+on:
+  push:
+    branches: [diagnostics/pr93-duration-closure]
+    paths:
+      - .github/workflows/diagnose-pr93-duration-closure.yml
+      - scripts/diagnose-pr93-duration-closure.sh
+      - scripts/diagnose-pr93-duration-evidence.py
+      - scripts/diagnose-pr93-duration-overlay/main.go
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  sample:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr93-duration-closure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 32
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Fetch the exact revisions and official shard artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin 925f30ee1dcd45882b29130b8ed02836ed88317e 40153f3e18f9f32baca9f656986a5e696f392a2f
+          mkdir -p .tmp
+          gh api repos/light-speak/luxo/actions/artifacts/14917073661/zip > .tmp/pr93-duration-official-45386469196-1.zip
+      - name: Compare ordinary and isolated benchmarks with the default linker
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: 1
+        run: |
+          git diff --exit-code 72f1abb2e57947f056c00ea60514aff7e92828ce -- scripts/diagnose-hosted-perf.sh
+          bash scripts/diagnose-pr93-duration-closure.sh
+      - name: Preserve raw samples and build bindings
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr93-duration-closure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr93-duration-closure/
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: true
