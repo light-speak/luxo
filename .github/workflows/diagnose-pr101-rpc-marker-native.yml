@@ -1,0 +1,141 @@
+name: Verify the PR 101 RPC benchmark boundary natively
+
+on:
+  push:
+    branches: [diagnostics/pr101-rpc-marker-native]
+    paths:
+      - .github/workflows/diagnose-pr101-rpc-marker-native.yml
+      - scripts/diagnose-pr101-rpc-marker.sh
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.repository == 'light-speak/luxo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 16
+    env:
+      GOTOOLCHAIN: local
+      GOENV: 'off'
+      GOAMD64: v1
+      CGO_ENABLED: '1'
+      RPC_MARKER_BASE: ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+      RPC_MARKER_BASE_TREE: ba252c7cace8908cdfcd7c203bc9dc11bb2ba746
+      RPC_MARKER_PR: 8f6633bfc9f325c857e1217112a5e2039e2d85de
+      RPC_MARKER_SAMPLER: 61521c06948d6f4cdf04cd94abb6a19fdd2c5ac7
+      RPC_MARKER_TREE: 011cb034493a360bfd6e0494faed10918f0104fd
+      RPC_MARKER_PATCH_SHA256: 34d7f8c66c41e6388225c166dba1c75df02ab26197a382b5ab183d31e58eb1a6
+      RPC_MARKER_DRIVER_SHA256: 9559af9a49d94456487ef6dc76209714906d2b59d32db710d813f551c01e2ff9
+      RPC_MARKER_SOURCE_SHA256: |
+        1c9c2ad4e43deb11332061e15b89f591425c1c74a2f8b3a809cf3938a293e42c  .github/workflows/test.yml
+        555e0a031f0f1286bca7233b6fd5c28854e5a3de3b29aad6e05e5019bbf4c578  pkg/lux/rpc/public_boundary_test.go
+        83af7ebd4b302dc8c7cd6ec306426f0ed9708e5613730848a247a4e85d21925e  scripts/benchplan/files_test.go
+        677a2bf7932f8a9b9a8d29fe7a396a2afbc345e2cb8516f5f1288ab3f0bffbdf  scripts/benchplan/inventory.go
+        3447dc98a7bf98b88f2b1aedcf85cfadfd161e6a5004549202357347afe98332  scripts/benchplan/main.go
+        43c81a8f5087ed813d2cbb0e5af3c9b475ab63d4c24afa30d5be0f49cf13e2b0  scripts/benchrun/main.go
+        fe5b4d1d5234b1d3d631e104bebbbc04dc848fee22744e6fe2c74a486bbd54cc  scripts/benchrun/main_test.go
+        a6113d06d806fb94ca5ff9af83599056ceb936ee980f4184bec08526846aec53  scripts/benchrun/rpc_fixture.go
+        b8842ad12163a701c6f955bdebd85e14e65ee7385d1abca08bfe793d1b3b36eb  scripts/performance_test.go
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+
+      - name: Fetch the immutable comparison revisions
+        run: git fetch --no-tags origin "$RPC_MARKER_BASE" "$RPC_MARKER_PR" "$RPC_MARKER_SAMPLER"
+
+      - name: Restore the exact staged RPC candidate
+        run: |
+          set -euo pipefail
+          root=$(git rev-parse --show-toplevel)
+          source="$root/.tmp/pr101-rpc-marker-native-source"
+          restore="$root/.tmp/pr101-rpc-marker-native-restore"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "$RPC_MARKER_BASE^{tree}")" = "$RPC_MARKER_BASE_TREE"
+          test ! -L "$root/.tmp"
+          test ! -e "$source" && test ! -L "$source"
+          mkdir -p "$root/.tmp"
+          mkdir "$restore"
+          printf '%s  %s\n' "$RPC_MARKER_DRIVER_SHA256" scripts/diagnose-pr101-rpc-marker.sh \
+            > "$restore/driver.sha256"
+          sha256sum -c "$restore/driver.sha256"
+          patch="$restore/candidate.patch"
+          base64 -d < .github/qualification/rpc-benchmark-marker.patch.b64 > "$patch"
+          printf '%s  %s\n' "$RPC_MARKER_PATCH_SHA256" "$patch" | sha256sum -c -
+          git worktree add --detach "$source" "$RPC_MARKER_BASE"
+          git -C "$source" apply --index --check --whitespace=error "$patch"
+          git -C "$source" apply --index --whitespace=error "$patch"
+          git -C "$source" apply --index --reverse --check "$patch"
+          git -C "$source" diff --cached --check
+          git -C "$source" diff --exit-code
+          test "$(git -C "$source" rev-parse HEAD)" = "$RPC_MARKER_BASE"
+          test "$(git -C "$source" write-tree)" = "$RPC_MARKER_TREE"
+          printf '%s' "$RPC_MARKER_SOURCE_SHA256" > "$restore/source.sha256"
+          cut -c 67- "$restore/source.sha256" > "$restore/expected-paths.txt"
+          git -C "$source" diff --cached --name-only > "$restore/paths.txt"
+          cmp "$restore/expected-paths.txt" "$restore/paths.txt"
+          (cd "$source" && sha256sum -c "$restore/source.sha256") > "$restore/source-check.log"
+          printf 'workflow=%s\nbase=%s\nbase_tree=%s\ncandidate_tree=%s\npatch_sha256=%s\n' \
+            "$GITHUB_SHA" "$RPC_MARKER_BASE" "$RPC_MARKER_BASE_TREE" "$RPC_MARKER_TREE" \
+            "$RPC_MARKER_PATCH_SHA256" > "$restore/revisions.txt"
+
+      - name: Verify native inventories, binaries and paired gate
+        run: |
+          set -euo pipefail
+          root=$(git rev-parse --show-toplevel)
+          source="$root/.tmp/pr101-rpc-marker-native-source"
+          bash "$root/scripts/diagnose-pr101-rpc-marker.sh" "$source"
+          printf 'exit=0\nowned_scratch_removed=true\n' | cmp "$root/.tmp/pr101-rpc-marker-evidence/cleanup.txt" -
+
+      - name: Remove this job's candidate worktree
+        if: always()
+        run: |
+          set -euo pipefail
+          root=$(git rev-parse --show-toplevel)
+          source="$root/.tmp/pr101-rpc-marker-native-source"
+          restore="$root/.tmp/pr101-rpc-marker-native-restore"
+          test ! -L "$root/.tmp"
+          test ! -L "$restore"
+          mkdir -p "$restore"
+          if grep -Fx "worktree $source" <<< "$(git worktree list --porcelain)" > /dev/null; then
+            git worktree remove --force "$source"
+          fi
+          test ! -e "$source" && test ! -L "$source"
+          shopt -s nullglob
+          scratch=("$root/.tmp"/pr101-rpc-marker.*)
+          test "${#scratch[@]}" -eq 0
+          printf 'owned_candidate_removed=true\nowned_driver_scratch_removed=true\n' > "$restore/cleanup.txt"
+
+      - name: Preserve native inventories, binary identity and raw gate evidence
+        id: evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: hosted-pr101-rpc-marker-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .tmp/pr101-rpc-marker-native-restore/
+            .tmp/pr101-rpc-marker-evidence/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record the uploaded evidence identity
+        if: always() && steps.evidence.outcome == 'success'
+        env:
+          ARTIFACT_ID: ${{ steps.evidence.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.evidence.outputs.artifact-digest }}
+        run: printf 'artifact_id=%s sha256=%s\n' "$ARTIFACT_ID" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the uploaded local evidence
+        if: always() && steps.evidence.outcome == 'success'
+        run: |
+          test ! -L .tmp
+          rm -rf -- .tmp/pr101-rpc-marker-native-restore .tmp/pr101-rpc-marker-evidence
