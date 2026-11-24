@@ -335,7 +335,7 @@ func TestCIIndependentModulesHaveOneVetStep(t *testing.T) {
 
 func TestSwiftCIUsesOneNativeHost(t *testing.T) {
 	job := readQualityWorkflow(t).Jobs[swiftNativeCIJob]
-	if job.If != "" || job.Needs.Kind != 0 || job.RunsOn != "macos-26" || job.TimeoutMinutes != 30 ||
+	if job.If != productCheckScope || job.Needs.Value != "pr-test-scope" || job.RunsOn != "macos-26" || job.TimeoutMinutes != 30 ||
 		job.ContinueOnError || job.Strategy.FailFast != nil || job.Strategy.MaxParallel != 0 ||
 		len(job.Strategy.Matrix.Lane) != 0 {
 		t.Fatal("Swift checks must run on one bounded macOS job and propagate failures")
@@ -381,8 +381,8 @@ func assertSwiftWireBeforeGoSetup(t *testing.T) {
 func TestSwiftCIRequiresNativeResult(t *testing.T) {
 	job := readQualityWorkflow(t).Jobs[swiftConformanceCIJob]
 	var dependencies []string
-	if err := job.Needs.Decode(&dependencies); err != nil || !slices.Equal(dependencies, []string{swiftNativeCIJob}) ||
-		job.If != "always()" || job.ContinueOnError || job.Permissions == nil || len(job.Permissions) != 0 ||
+	if err := job.Needs.Decode(&dependencies); err != nil || !slices.Equal(dependencies, []string{"pr-test-scope", swiftNativeCIJob}) ||
+		job.If != "${{ always() && "+requiresProductChecks+" }}" || job.ContinueOnError || job.Permissions == nil || len(job.Permissions) != 0 ||
 		len(job.Steps) != 1 {
 		t.Fatalf("the stable Swift check must require the native result without permissions: %v", err)
 	}
