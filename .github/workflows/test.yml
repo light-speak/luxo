@@ -14,6 +14,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pr-test-scope:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    outputs:
+      kind: ${{ steps.classification.outputs.kind }}
+    steps:
+      - uses: actions/checkout@v7
+        id: checkout
+        continue-on-error: true
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Classify changes from the verified merge
+        id: classification
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          TESTED_SHA: ${{ github.sha }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          kind=full
+          sha='^[0-9a-f]{40}$'
+          if [[ "$CHECKOUT_OUTCOME" == success && "$TESTED_SHA" =~ $sha &&
+                "$EVENT_BASE_SHA" =~ $sha && "$EVENT_HEAD_SHA" =~ $sha ]] &&
+             parents=$(git rev-list --parents --max-count=1 HEAD) &&
+             [[ "$parents" == "$TESTED_SHA $EVENT_BASE_SHA $EVENT_HEAD_SHA" ]] &&
+             classifier=$(git show "${EVENT_BASE_SHA}:scripts/classify-ci-scope.sh" 2>/dev/null) &&
+             result=$(git diff --raw --no-abbrev --no-renames --no-ext-diff --ignore-submodules=none -z \
+               "$EVENT_BASE_SHA" "$TESTED_SHA" -- | bash -c "$classifier") &&
+             [[ "$result" == benchmark-only ]]; then
+            kind=benchmark-only
+          fi
+          printf 'kind=%s\n' "$kind" >> "$GITHUB_OUTPUT"
+          printf 'Test scope: %s\n' "$kind"
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -220,6 +261,8 @@ jobs:
         run: go build ./pkg/... ./cmd/... ./cmd/luxo/... ./scripts/... ./internal/... ./pkg/lux/pg/... ./pkg/lux/nats/... ./pkg/lux/cache/redis/... ./pkg/lux/storage/s3/...
 
   race:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -242,6 +285,8 @@ jobs:
           go test ./pkg/codegen -count=1 -timeout=95m
 
   runtime-race:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -657,6 +702,8 @@ jobs:
           fi
 
   external-go-consumer:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -684,6 +731,8 @@ jobs:
           GOWORK=off go test ./... -count=1
 
   fuzz:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -731,6 +780,8 @@ jobs:
             pkg/semantic/testdata/fuzz/
 
   sdk-ts:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -795,6 +846,8 @@ jobs:
         run: pnpm typecheck
 
   sdk-dart:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -858,6 +911,8 @@ jobs:
           test/unicode_test.dart
 
   sdk-kotlin:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -921,6 +976,8 @@ jobs:
           ../../packages/kotlin/gradlew build --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
 
   sdk-swift-native:
+    needs: pr-test-scope
+    if: ${{ !cancelled() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: macos-26
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
@@ -978,8 +1035,8 @@ jobs:
         run: go run ./tests/sdk-interop -run -enum-upgrade -gateway -- bash tests/sdk-interop/swift/run.sh
 
   sdk-swift-conformance:
-    needs: [sdk-swift-native]
-    if: always()
+    needs: [pr-test-scope, sdk-swift-native]
+    if: ${{ always() && (needs.pr-test-scope.result != 'success' || needs.pr-test-scope.outputs.kind != 'benchmark-only') }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions: {}
