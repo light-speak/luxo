@@ -204,7 +204,7 @@ date -u '+sampling_start=%Y-%m-%dT%H:%M:%SZ' >> "$evidence/environment.txt"
 sample_groups
 test "$(find "$evidence/raw" -type f | wc -l)" -eq 80
 test "$(wc -l < "$evidence/order.tsv")" -eq 81
-grep -h '^cpu: ' "$evidence"/{base,head}-selected.txt "$evidence"/raw/*.txt | sort -u > "$evidence/cpu.txt"
+awk '/^cpu: / { sub(/[[:space:]]+$/, ""); print }' "$evidence"/{base,head}-selected.txt "$evidence"/raw/*.txt | sort -u > "$evidence/cpu.txt"
 test "$(wc -l < "$evidence/cpu.txt")" -eq 1
 analyze_groups
 date -u '+sampling_end=%Y-%m-%dT%H:%M:%SZ' >> "$evidence/environment.txt"
