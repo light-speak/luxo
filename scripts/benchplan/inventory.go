@@ -115,19 +115,27 @@ func verifyProfileInventory(args []string) error {
 	if len(ordinary) == 0 || !maps.EqualFunc(ordinary, isolated, maps.Equal[map[string]struct{}]) {
 		return fmt.Errorf("benchmark profile %q must reproduce its exact ordinary benchmark inventory", profile)
 	}
-	if profile == benchlayout.CodegenLiteralProfile && !verifiedCodegenLiteralLeaves(isolated[benchlayout.CodegenLiteralBenchmark]) {
-		return errors.New("codegen integer literal profile requires the four verified integer and duration leaves")
+	switch profile {
+	case benchlayout.CodegenLiteralProfile:
+		const root = benchlayout.CodegenLiteralBenchmark
+		if !verifiedCodegenLeaves(isolated[root], root, "duration_leading_zero", "duration_plain", "int_leading_zero", "int_plain") {
+			return errors.New("codegen integer literal profile requires the four verified integer and duration leaves")
+		}
+	case benchlayout.CodegenReceiverProfile:
+		const root = benchlayout.CodegenReceiverBenchmark
+		if !verifiedCodegenLeaves(isolated[root], root, "User", "_Record", "用户") {
+			return errors.New("codegen global receiver profile requires the three verified receiver leaves")
+		}
 	}
 	return nil
 }
 
-func verifiedCodegenLiteralLeaves(leaves map[string]struct{}) bool {
-	cases := [...]string{"duration_leading_zero", "duration_plain", "int_leading_zero", "int_plain"}
+func verifiedCodegenLeaves(leaves map[string]struct{}, root string, cases ...string) bool {
 	if len(leaves) != len(cases) {
 		return false
 	}
 	for _, name := range cases {
-		if _, ok := leaves[benchlayout.CodegenLiteralBenchmark+"/"+name+"-2"]; !ok {
+		if _, ok := leaves[root+"/"+name+"-2"]; !ok {
 			return false
 		}
 	}
