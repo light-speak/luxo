@@ -64,7 +64,7 @@ jobs:
               artifact=14924072511
               formal_run=45397856587
               digest=67c6414b54e7410188c0227b7266c30a16c9c0863fea7a1b8433c281feaddb25
-              evidence='.tmp/native-cpu-worktree/.tmp/pr72-boxed-json-evidence-r.*/'
+              evidence='.tmp/native-cpu-worktree/.tmp/pr72-boxed-json-evidence-c.*/'
               ;;
             'AMD EPYC 7763 64-CORE PROCESSOR')
               suite=pr71-columnar
@@ -137,13 +137,17 @@ jobs:
             ' "$receipt/columnar-tested.json"
           fi
           if [[ "$SUITE" == pr72-boxed-json-header-causal ]]; then
+            git -C "$root" fetch --no-tags origin 5d9687a90092b629bc1ce7f57f28feead51e0516
             delta="$receipt/header-driver.patch"
             base64 -d "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr72-boxed-json-r/driver-replay.patch.b64" > "$delta"
-            printf '%s  %s\n' 42e647de1ba8d82510a7419bdac01d487ea8f9e7dbd1e52794d42be6c372f382 "$delta" |
+            printf '%s  %s\n' e738e8ec99ccd4f9a878de58607c591cf345192834adfaa702d781708b1dbb26 "$delta" |
               sha256sum -c - > "$receipt/header-driver-input.txt"
-            git -C "$root" apply --check --whitespace=error-all "$delta"
-            git -C "$root" apply --whitespace=error-all "$delta"
-            printf '%s  %s\n' 86a7654778af0652957f7113dca0aeab607bb48bdff166132731a59c21f9a123 "$root/$sampler" |
+            git -C "$root" apply --check --index --whitespace=error-all "$delta"
+            git -C "$root" apply --index --whitespace=error-all "$delta"
+            test "$(git -C "$root" write-tree)" = b796cb4944707ec69ebb9739e86b69353eb742ad
+            printf '%s  %s\n' \
+              fc2ad58b3a9ca44addf3585f1d0b73c8db1745f64d77f9e675db1c5af1fad6a0 "$root/$sampler" \
+              c5dbcaf4134fcc76805f190dfeb489cc9bb5a09c4d7f24dee370db633f91e9cb "$root/scripts/diagnose-pr72-boxed-json/causal-order.py" |
               sha256sum -c - > "$receipt/header-driver-output.txt"
           fi
           mkdir -p "$root/.tmp"
@@ -169,7 +173,7 @@ jobs:
           fi
       - uses: actions/setup-go@v7
         id: go
-        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && (steps.primary_inputs.outcome == 'success' || steps.cpu.outputs.suite == 'pr71-gateway-current-profile' || steps.cpu.outputs.suite == 'pr72-boxed-json-header-causal') }}
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' && (steps.primary_inputs.outcome == 'success' || steps.cpu.outputs.suite == 'pr71-gateway-current-profile') }}
         with:
           go-version: '1.27.1'
           check-latest: false
@@ -190,7 +194,7 @@ jobs:
               exec bash scripts/diagnose-pr71-static-jwt.sh run
               ;;
             pr72-boxed-json-header-causal)
-              exec bash scripts/diagnose-pr72-boxed-json/diagnose-native.sh . r .tmp/pr72-formal-shard-12.zip
+              exec bash scripts/diagnose-pr72-boxed-json/diagnose-native.sh . c .tmp/pr72-formal-shard-12.zip
               ;;
             pr71-columnar)
               exec bash "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr71-columnar.sh" . .tmp/pr71-columnar-formal-08.zip
@@ -198,7 +202,7 @@ jobs:
             *) exit 2 ;;
           esac
       - name: Measure the remaining PR 71 leaf controls on the assigned runner
-        if: ${{ !cancelled() && steps.go.outcome == 'success' && (steps.cpu.outputs.suite == 'pr71-gateway-current-profile' || steps.cpu.outputs.suite == 'pr72-boxed-json-header-causal') }}
+        if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.cpu.outputs.suite == 'pr71-gateway-current-profile' }}
         timeout-minutes: 20
         env:
           GH_TOKEN: ${{ github.token }}
@@ -216,11 +220,8 @@ jobs:
           printf '%s  %s\n' \
             712d3330d3f36e26a82923f006a97527b30bed3f9796c2f7dfa651f36a0735c5 "$driver" \
             83445334e93a9f6d37c7e97541180a001549713284bbe59a0f206c4610987074 "$helper" | sha256sum -c -
-          case "$SUITE" in
-            pr71-gateway-current-profile) scope=gateway-identity ;;
-            pr72-boxed-json-header-causal) scope=rpc-trace-local ;;
-            *) exit 2 ;;
-          esac
+          [[ "$SUITE" == pr71-gateway-current-profile ]]
+          scope=gateway-identity
           IFS=$'\t' read -r _ _ _ _ _ artifact digest _ < <(python3 "$helper" tuple "$scope")
           [[ "$artifact" =~ ^[0-9]+$ && "$digest" =~ ^[a-f0-9]{64}$ ]]
           git -C "$dispatch" fetch --no-tags origin \
