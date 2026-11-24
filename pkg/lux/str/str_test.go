@@ -35,6 +35,24 @@ func TestToSnakeCase(t *testing.T) {
 	}
 }
 
+func TestCapitalizedASCIISnakeCaseLenMatchesRenderedName(t *testing.T) {
+	for _, name := range []string{
+		"", "a", "user", "userID", "uSR", "uSr", "uRLParser", "HTTP", "HTMLParser", "api1HTTPClient",
+		"_user_v2", strings.Repeat("a", 59) + "Ba", strings.Repeat("a", 62),
+	} {
+		length, ok := CapitalizedASCIISnakeCaseLen(name)
+		want := len(ToSnakeCase(Capitalize(name)))
+		if !ok || length != want {
+			t.Errorf("%q: got %d/%v, want %d/true", name, length, ok, want)
+		}
+	}
+	for _, name := range []string{"\x00before", "a\x00b", "éstart", "aé", "a\xff", "\xff"} {
+		if _, ok := CapitalizedASCIISnakeCaseLen(name); ok {
+			t.Errorf("%q should use the general conversion", name)
+		}
+	}
+}
+
 func TestCapitalize(t *testing.T) {
 	tests := []struct{ in, want string }{
 		{"name", "Name"},

@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"strings"
 
+	pgdialect "github.com/light-speak/luxo/pkg/lux/dialect/pg"
 	"github.com/light-speak/luxo/pkg/lux/str"
+	"github.com/light-speak/luxo/pkg/semantic"
 )
 
 // Keep scaffold and build-image requirements in sync with the core module.
@@ -44,6 +46,51 @@ func AddModule(modulePath, moduleName string) *ScaffoldResult {
 	sr.Files[fmt.Sprintf("service/%s/resolver/resolver.go", moduleName)] = generateModuleResolver(modulePath, moduleName)
 
 	return sr
+}
+
+// ValidateModuleScaffoldModelName checks the model declared by a standalone scaffold.
+func ValidateModuleScaffoldModelName(moduleName string) error {
+	// The table suffix adds one byte to the measured snake-case name.
+	if size, ascii := str.CapitalizedASCIISnakeCaseLen(moduleName); ascii && size < pgdialect.MaxIdentifierBytes {
+		var model [pgdialect.MaxIdentifierBytes - 1]byte
+		n := copy(model[:], moduleName)
+		if n != 0 && model[0] >= 'a' && model[0] <= 'z' {
+			model[0] -= 'a' - 'A'
+		}
+		name := model[:n]
+		if !semantic.IsBuiltinTypeNameBytes(name) && !scaffoldGoDeclarationName(name) && !unconditionalAppMemberName(name) {
+			return nil
+		}
+	}
+	return validateScaffoldModelName(moduleName)
+}
+
+func scaffoldGoDeclarationName[Name ~string | ~[]byte](name Name) bool {
+	switch string(name) {
+	case generatedAppTypeName, generatedAppNewName, generatedAppNewFromDBName, generatedSchemaRegisterName:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateScaffoldModelName(moduleName string) error {
+	modelName := str.Capitalize(moduleName)
+	if semantic.IsBuiltinTypeName(modelName) {
+		return fmt.Errorf("generated model name %q is a built-in type / 生成的模型名 %q 是内置类型", modelName, modelName)
+	}
+	if scaffoldGoDeclarationName(modelName) {
+		return fmt.Errorf("generated model name %q conflicts with a Go declaration / 生成的模型名 %q 与 Go 声明冲突", modelName, modelName)
+	}
+	g := defaultGenerator()
+	// The scaffold has only scalar fields, so it emits no conditional App members.
+	if g.conflictsWithAppMember(modelName, &semantic.Result{}, nil) {
+		return fmt.Errorf("generated model name %q conflicts with an App member / 生成的模型名 %q 与 App 成员冲突", modelName, modelName)
+	}
+	if err := g.sqlDialect.ValidateIdentifier(modelTableName(modelName)); err != nil {
+		return fmt.Errorf("generated model name %q has an invalid database table name / 生成的模型名 %q 对应的数据库表名无效: %w", modelName, modelName, err)
+	}
+	return nil
 }
 
 // generateGitignore produces the .gitignore file.

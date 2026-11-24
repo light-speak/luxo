@@ -2692,6 +2692,19 @@ api comments(): Comment @stream @native
 	}
 }
 
+func TestIsBuiltinTypeNameMatchesResolvedCatalog(t *testing.T) {
+	for name, builtin := range BuiltinTypes() {
+		if builtin.Name != name || !IsBuiltinTypeName(name) || !IsBuiltinTypeNameBytes([]byte(name)) {
+			t.Errorf("built-in %q resolves as %q and must be reserved", name, builtin.Name)
+		}
+	}
+	for _, name := range []string{"", "int", "Void", "User", "App", "Page<Time>"} {
+		if IsBuiltinTypeName(name) || IsBuiltinTypeNameBytes([]byte(name)) {
+			t.Errorf("non-built-in name %q is reserved", name)
+		}
+	}
+}
+
 func TestBuiltinPageType(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }

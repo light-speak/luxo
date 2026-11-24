@@ -122,46 +122,86 @@ type SealedVariantInfo struct {
 	source *ast.SealedVariant // Resolve payloads after all type names are registered.
 }
 
+const (
+	builtinIntName      = "Int"
+	builtinFloatName    = "Float"
+	builtinStringName   = "String"
+	builtinBooleanName  = "Boolean"
+	builtinDateTimeName = "DateTime"
+	builtinDurationName = "Duration"
+	builtinUUIDName     = "UUID"
+	builtinDecimalName  = "Decimal"
+	builtinBytesName    = "Bytes"
+	builtinJSONName     = "JSON"
+	builtinResultName   = "Result"
+	builtinChannelName  = "Channel"
+	builtinPageName     = "Page"
+	builtinCursorName   = "Cursor"
+	builtinIdentityName = "Identity"
+)
+
+// IsBuiltinTypeName reports whether name is reserved by the built-in type catalog.
+func IsBuiltinTypeName(name string) bool {
+	return isBuiltinTypeName(name)
+}
+
+// IsBuiltinTypeNameBytes checks the same catalog using an existing byte buffer.
+func IsBuiltinTypeNameBytes(name []byte) bool {
+	return isBuiltinTypeName(name)
+}
+
+func isBuiltinTypeName[Name ~string | ~[]byte](name Name) bool {
+	switch string(name) {
+	case builtinIntName, builtinFloatName, builtinStringName, builtinBooleanName,
+		builtinDateTimeName, builtinDurationName, builtinUUIDName, builtinDecimalName,
+		builtinBytesName, builtinJSONName, builtinResultName, builtinChannelName,
+		builtinPageName, builtinCursorName, builtinIdentityName:
+		return true
+	default:
+		return false
+	}
+}
+
 // BuiltinTypes returns the built-in primitive types with their properties.
 func BuiltinTypes() map[string]*ResolvedType {
-	intType := &ResolvedType{Kind: TypeInt, Name: "Int", Fields: map[string]*FieldInfo{}}
-	floatType := &ResolvedType{Kind: TypeFloat, Name: "Float", Fields: map[string]*FieldInfo{}}
-	boolType := &ResolvedType{Kind: TypeBool, Name: "Boolean", Fields: map[string]*FieldInfo{}}
+	intType := &ResolvedType{Kind: TypeInt, Name: builtinIntName, Fields: map[string]*FieldInfo{}}
+	floatType := &ResolvedType{Kind: TypeFloat, Name: builtinFloatName, Fields: map[string]*FieldInfo{}}
+	boolType := &ResolvedType{Kind: TypeBool, Name: builtinBooleanName, Fields: map[string]*FieldInfo{}}
 
 	stringType := newStringType(intType, floatType, boolType)
 
 	identityType := newIdentityType()
 
 	return map[string]*ResolvedType{
-		"Int":      intType,
-		"Float":    floatType,
-		"String":   stringType,
-		"Boolean":  boolType,
-		"DateTime": {Kind: TypeDateTime, Name: "DateTime", Fields: map[string]*FieldInfo{}},
-		"Duration": {Kind: TypeDuration, Name: "Duration", Fields: map[string]*FieldInfo{}},
-		"UUID":     {Kind: TypeUUID, Name: "UUID", Fields: map[string]*FieldInfo{}},
-		"Decimal":  {Kind: TypeDecimal, Name: "Decimal", Fields: map[string]*FieldInfo{}},
-		"Bytes":    {Kind: TypeBytes, Name: "Bytes", Fields: map[string]*FieldInfo{}},
-		"JSON":     {Kind: TypeJSON, Name: "JSON", Fields: map[string]*FieldInfo{}},
-		"Result":   {Kind: TypeGeneric, Name: "Result", Fields: map[string]*FieldInfo{}},
-		"Channel":  {Kind: TypeGeneric, Name: "Channel", Fields: map[string]*FieldInfo{}},
-		"Page": {Kind: TypeGeneric, Name: "Page", Fields: map[string]*FieldInfo{
+		builtinIntName:      intType,
+		builtinFloatName:    floatType,
+		builtinStringName:   stringType,
+		builtinBooleanName:  boolType,
+		builtinDateTimeName: {Kind: TypeDateTime, Name: builtinDateTimeName, Fields: map[string]*FieldInfo{}},
+		builtinDurationName: {Kind: TypeDuration, Name: builtinDurationName, Fields: map[string]*FieldInfo{}},
+		builtinUUIDName:     {Kind: TypeUUID, Name: builtinUUIDName, Fields: map[string]*FieldInfo{}},
+		builtinDecimalName:  {Kind: TypeDecimal, Name: builtinDecimalName, Fields: map[string]*FieldInfo{}},
+		builtinBytesName:    {Kind: TypeBytes, Name: builtinBytesName, Fields: map[string]*FieldInfo{}},
+		builtinJSONName:     {Kind: TypeJSON, Name: builtinJSONName, Fields: map[string]*FieldInfo{}},
+		builtinResultName:   {Kind: TypeGeneric, Name: builtinResultName, Fields: map[string]*FieldInfo{}},
+		builtinChannelName:  {Kind: TypeGeneric, Name: builtinChannelName, Fields: map[string]*FieldInfo{}},
+		builtinPageName: {Kind: TypeGeneric, Name: builtinPageName, Fields: map[string]*FieldInfo{
 			"items":    {Name: "items", Type: nil},
 			"total":    {Name: "total", Type: intType},
 			"page":     {Name: "page", Type: intType},
 			"pageSize": {Name: "pageSize", Type: intType},
 		}},
-		"Cursor": {Kind: TypeGeneric, Name: "Cursor", Fields: map[string]*FieldInfo{
+		builtinCursorName: {Kind: TypeGeneric, Name: builtinCursorName, Fields: map[string]*FieldInfo{
 			"items":      {Name: "items", Type: nil},
 			"nextCursor": {Name: "nextCursor", Type: stringType, Nullable: true},
 			"hasMore":    {Name: "hasMore", Type: boolType},
 		}},
-		"Identity": identityType,
+		builtinIdentityName: identityType,
 	}
 }
 
 func newStringType(intType, floatType, boolType *ResolvedType) *ResolvedType {
-	stringType := &ResolvedType{Kind: TypeString, Name: "String"}
+	stringType := &ResolvedType{Kind: TypeString, Name: builtinStringName}
 	// Method records belong to this compilation and remain independently mutable.
 	fields := [...]FieldInfo{
 		// properties
@@ -301,7 +341,7 @@ func (t *ResolvedType) inheritsFrom(name string) bool {
 }
 
 func newIdentityType() *ResolvedType {
-	identityType := &ResolvedType{Kind: TypeModel, Name: "Identity", Fields: map[string]*FieldInfo{
+	identityType := &ResolvedType{Kind: TypeModel, Name: builtinIdentityName, Fields: map[string]*FieldInfo{
 		"id":   {Name: "id", Type: nil},                                                                                        // Resolved from stores, otherwise defaults to Int before body analysis.
 		"load": {Name: "load", Type: nil, IsMethod: true, Doc: ".load(fields...): Identity — Lazy load user fields / 懒加载用户字段"}, // my.load(fields...) — lazy load
 		"role": {Name: "role", Type: nil},                                                                                      // role from JWT stores, type resolved at codegen
