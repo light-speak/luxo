@@ -34,18 +34,43 @@ func newRequestFramer(source io.Reader) *http2.Framer {
 
 // Framer has already checked pseudo-header ordering, duplicates and field syntax.
 func parseRequestHead(frame *http2.MetaHeadersFrame) (requestHead, error) {
-	h := requestHead{method: frame.PseudoValue("method"), authority: frame.PseudoValue("authority"), path: frame.PseudoValue("path"), contentLength: -1}
 	errMalformed := http2.StreamError{StreamID: frame.StreamID, Code: http2.ErrCodeProtocol}
-	if frame.Truncated || frame.PseudoValue("status") != "" || !httpguts.ValidHeaderFieldName(h.method) {
+	if frame.Truncated {
 		return requestHead{}, errMalformed
 	}
-	if !h.readRegular(frame.RegularFields()) || !h.validTarget(frame.PseudoValue("scheme")) {
+	h := requestHead{contentLength: -1}
+	pseudo := frame.PseudoFields()
+	var scheme, status string
+	// Keep PseudoValue's first match when parsing a synthetic frame.
+	for i := len(pseudo) - 1; i >= 0; i-- {
+		field := pseudo[i]
+		switch field.Name {
+		case ":method":
+			h.method = field.Value
+		case ":authority":
+			h.authority = field.Value
+		case ":path":
+			h.path = field.Value
+		case ":scheme":
+			scheme = field.Value
+		case ":status":
+			status = field.Value
+		}
+	}
+	if status != "" || !httpguts.ValidHeaderFieldName(h.method) {
+		return requestHead{}, errMalformed
+	}
+	var regular []hpack.HeaderField
+	if len(pseudo) < len(frame.Fields) {
+		regular = frame.Fields[len(pseudo):]
+	}
+	if !h.readRegular(regular) || !h.validTarget(scheme) {
 		return requestHead{}, errMalformed
 	}
 	if frame.StreamEnded() && h.contentLength > 0 {
 		return requestHead{}, errMalformed
 	}
-	h.fields = slices.Clone(frame.RegularFields())
+	h.fields = slices.Clone(regular)
 	return h, nil
 }
 
