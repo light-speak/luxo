@@ -297,16 +297,48 @@ jobs:
       run: ${{ steps.benchmark_scope.outputs.run }}
       matrix: ${{ steps.benchmark_plan.outputs.matrix }}
       artifact: ${{ steps.benchmark_plan.outputs.artifact }}
+      base_sha: ${{ steps.benchmark_revisions.outputs.base_sha }}
+      tested_sha: ${{ steps.benchmark_revisions.outputs.tested_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Resolve benchmark revisions
+        id: benchmark_revisions
+        env:
+          TESTED_SHA: ${{ github.sha }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          for sha in "$TESTED_SHA" "$EVENT_HEAD_SHA" "$EVENT_BASE_SHA"; do
+            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Invalid benchmark event revision" >&2
+              exit 1
+            fi
+          done
+          parents=$(git rev-list --parents --max-count=1 HEAD)
+          read -r merge_sha base_sha pr_sha extra <<< "$parents"
+          if [[ "$merge_sha" != "$TESTED_SHA" || -z "$base_sha" || "$pr_sha" != "$EVENT_HEAD_SHA" || -n "$extra" ]]; then
+            echo "Benchmark checkout must be the event merge with the PR head as second parent" >&2
+            exit 1
+          fi
+          # The event's base can predate the main revision used to build the merge.
+          if ! git merge-base --is-ancestor "$EVENT_BASE_SHA" "$base_sha"; then
+            echo "PR event base is not an ancestor of the tested merge base" >&2
+            exit 1
+          fi
+          mkdir -p .tmp
+          printf 'base_sha=%s\ntested_sha=%s\n' "$base_sha" "$merge_sha" > .tmp/benchmark-revisions.txt
+          cat .tmp/benchmark-revisions.txt >> "$GITHUB_OUTPUT"
 
       - name: Check out benchmark baseline
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ steps.benchmark_revisions.outputs.base_sha }}
           path: .tmp/base
           persist-credentials: false
 
@@ -320,7 +352,8 @@ jobs:
       - name: Select affected benchmark packages
         id: benchmark_scope
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ steps.benchmark_revisions.outputs.base_sha }}
+          TESTED_SHA: ${{ steps.benchmark_revisions.outputs.tested_sha }}
         run: |
           set -euo pipefail
           benchmark_packages() {
@@ -330,8 +363,9 @@ jobs:
               done |
               sort -u
           }
+          test "$(git -C .tmp/base rev-parse HEAD)" = "$BASE_SHA"
           mkdir -p .tmp/head
-          git archive HEAD | tar -x -C .tmp/head
+          git archive "$TESTED_SHA" | tar -x -C .tmp/head
           sh scripts/setup-modules.sh .tmp/base
           sh scripts/setup-modules.sh .tmp/head
           mkdir -p .tmp/bin
@@ -345,7 +379,7 @@ jobs:
             benchmark_packages
           ) | .tmp/bin/benchrun canonical > .tmp/head-benchmark-packages.txt
           comm -12 .tmp/base-benchmark-packages.txt .tmp/head-benchmark-packages.txt > .tmp/common-benchmark-packages.txt
-          git -c core.quotePath=false diff --no-renames --name-only "${BASE_SHA}" HEAD > .tmp/changed-files.txt
+          git -c core.quotePath=false diff --no-renames --name-only "${BASE_SHA}" "${TESTED_SHA}" > .tmp/changed-files.txt
           GOWORK=off go run ./scripts/benchscope \
             .tmp/base \
             .tmp/head \
@@ -368,6 +402,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
+          mkdir -p .tmp/base/.tmp .tmp/head/.tmp
           mkdir -p .tmp/bin .tmp/test-tmp .tmp/benchmark-inventory/base .tmp/benchmark-inventory/head
           while IFS= read -r package; do
             for revision in base head; do
@@ -397,6 +432,7 @@ jobs:
             .tmp/benchmark-inventory/
             .tmp/*benchmark-packages.txt
             .tmp/changed-files.txt
+            .tmp/benchmark-revisions.txt
 
   performance-samples:
     needs: performance-scope
@@ -413,12 +449,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ needs.performance-scope.outputs.tested_sha }}
           persist-credentials: false
 
       - name: Check out benchmark baseline
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ needs.performance-scope.outputs.base_sha }}
           path: .tmp/base
           persist-credentials: false
 
@@ -433,14 +470,21 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           PLAN_ARTIFACT: ${{ needs.performance-scope.outputs.artifact }}
           SHARD: ${{ matrix.shard }}
+          BASE_SHA: ${{ needs.performance-scope.outputs.base_sha }}
+          TESTED_SHA: ${{ needs.performance-scope.outputs.tested_sha }}
         run: |
           set -euo pipefail
+          test "$TESTED_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$TESTED_SHA"
+          test "$(git -C .tmp/base rev-parse HEAD)" = "$BASE_SHA"
           gh run download "${RUN_ID}" --name "${PLAN_ARTIFACT}" --dir .tmp/plan
+          printf 'base_sha=%s\ntested_sha=%s\n' "$BASE_SHA" "$TESTED_SHA" > .tmp/benchmark-revisions.txt
+          cmp .tmp/benchmark-revisions.txt .tmp/plan/benchmark-revisions.txt
           cp ".tmp/plan/benchmark-plan/shard-${SHARD}.tsv" .tmp/benchmark-batch.tsv
           cp ".tmp/plan/benchmark-plan/shard-${SHARD}.json" .tmp/benchmark-expected.json
           test -s .tmp/benchmark-batch.tsv
           mkdir -p .tmp/head
-          git archive HEAD | tar -x -C .tmp/head
+          git archive "$TESTED_SHA" | tar -x -C .tmp/head
 
       - name: Install pinned benchstat
         env:
@@ -452,6 +496,7 @@ jobs:
       - name: Compile benchmark binaries
         run: |
           set -euo pipefail
+          mkdir -p .tmp/base/.tmp .tmp/head/.tmp
           mkdir -p .tmp/bin/base .tmp/bin/head .tmp/test-tmp
           sh scripts/setup-modules.sh .tmp/base
           sh scripts/setup-modules.sh .tmp/head
@@ -517,7 +562,7 @@ jobs:
 
       - name: Enforce performance baseline
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ needs.performance-scope.outputs.base_sha }}
         run: |
           set -euo pipefail
           test -s .tmp/benchstat-primary.csv
@@ -837,13 +882,17 @@ jobs:
           ../../packages/kotlin/gradlew build --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
           ../../packages/kotlin/gradlew build --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
 
-  sdk-swift-conformance:
+  sdk-swift-native:
     runs-on: macos-26
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     timeout-minutes: 20
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [wire, direct, gateway]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -861,30 +910,52 @@ jobs:
         run: cmp VERSION .tmp/luxo-swift/VERSION
 
       - name: Verify Swift wire protocol compatibility
+        if: matrix.lane == 'wire'
         env:
           LUXO_PROTOCOL_FIXTURE: ${{ github.workspace }}/pkg/lux/codec/testdata/protocol-v1.json
         run: swift test --package-path .tmp/luxo-swift --filter ProtocolConformanceTests
 
       - uses: actions/setup-go@v7
+        if: matrix.lane != 'wire'
         with:
           go-version-file: go.mod
 
       - name: Bind candidate modules for generated SDK fixtures
+        if: matrix.lane != 'wire'
         uses: ./.github/actions/setup-modules
 
       - name: Verify generated Swift client against Go
+        if: matrix.lane == 'direct'
         env:
           LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
         run: go run ./tests/sdk-interop -run -- bash tests/sdk-interop/swift/run.sh
 
       - name: Verify Swift gateway responses, error data and stream terminals
+        if: matrix.lane == 'gateway'
         env:
           LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
         run: go run ./tests/sdk-interop -run -gateway -- bash tests/sdk-interop/swift/run.sh
 
-      - name: Verify old Swift SDK against new enum services
+      - name: Verify old Swift SDK against new enum services directly
+        if: matrix.lane == 'direct'
         env:
           LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
-        run: |
-          go run ./tests/sdk-interop -run -enum-upgrade -- bash tests/sdk-interop/swift/run.sh
-          go run ./tests/sdk-interop -run -enum-upgrade -gateway -- bash tests/sdk-interop/swift/run.sh
+        run: go run ./tests/sdk-interop -run -enum-upgrade -- bash tests/sdk-interop/swift/run.sh
+
+      - name: Verify old Swift SDK against new enum services through the gateway
+        if: matrix.lane == 'gateway'
+        env:
+          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        run: go run ./tests/sdk-interop -run -enum-upgrade -gateway -- bash tests/sdk-interop/swift/run.sh
+
+  sdk-swift-conformance:
+    needs: [sdk-swift-native]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require every Swift native lane
+        env:
+          SWIFT_NATIVE_RESULT: ${{ needs.sdk-swift-native.result }}
+        run: test "$SWIFT_NATIVE_RESULT" = success
