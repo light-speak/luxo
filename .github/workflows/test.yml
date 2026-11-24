@@ -882,13 +882,17 @@ jobs:
           ../../packages/kotlin/gradlew build --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
           ../../packages/kotlin/gradlew build --project-cache-dir .tmp/gradle-cache --configuration-cache --no-daemon --warning-mode fail
 
-  sdk-swift-conformance:
+  sdk-swift-native:
     runs-on: macos-26
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     timeout-minutes: 20
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [wire, direct, gateway]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -906,30 +910,52 @@ jobs:
         run: cmp VERSION .tmp/luxo-swift/VERSION
 
       - name: Verify Swift wire protocol compatibility
+        if: matrix.lane == 'wire'
         env:
           LUXO_PROTOCOL_FIXTURE: ${{ github.workspace }}/pkg/lux/codec/testdata/protocol-v1.json
         run: swift test --package-path .tmp/luxo-swift --filter ProtocolConformanceTests
 
       - uses: actions/setup-go@v7
+        if: matrix.lane != 'wire'
         with:
           go-version-file: go.mod
 
       - name: Bind candidate modules for generated SDK fixtures
+        if: matrix.lane != 'wire'
         uses: ./.github/actions/setup-modules
 
       - name: Verify generated Swift client against Go
+        if: matrix.lane == 'direct'
         env:
           LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
         run: go run ./tests/sdk-interop -run -- bash tests/sdk-interop/swift/run.sh
 
       - name: Verify Swift gateway responses, error data and stream terminals
+        if: matrix.lane == 'gateway'
         env:
           LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
         run: go run ./tests/sdk-interop -run -gateway -- bash tests/sdk-interop/swift/run.sh
 
-      - name: Verify old Swift SDK against new enum services
+      - name: Verify old Swift SDK against new enum services directly
+        if: matrix.lane == 'direct'
         env:
           LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
-        run: |
-          go run ./tests/sdk-interop -run -enum-upgrade -- bash tests/sdk-interop/swift/run.sh
-          go run ./tests/sdk-interop -run -enum-upgrade -gateway -- bash tests/sdk-interop/swift/run.sh
+        run: go run ./tests/sdk-interop -run -enum-upgrade -- bash tests/sdk-interop/swift/run.sh
+
+      - name: Verify old Swift SDK against new enum services through the gateway
+        if: matrix.lane == 'gateway'
+        env:
+          LUXO_SWIFT_PATH: ${{ github.workspace }}/.tmp/luxo-swift
+        run: go run ./tests/sdk-interop -run -enum-upgrade -gateway -- bash tests/sdk-interop/swift/run.sh
+
+  sdk-swift-conformance:
+    needs: [sdk-swift-native]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require every Swift native lane
+        env:
+          SWIFT_NATIVE_RESULT: ${{ needs.sdk-swift-native.result }}
+        run: test "$SWIFT_NATIVE_RESULT" = success

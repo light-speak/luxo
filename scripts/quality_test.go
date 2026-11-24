@@ -19,16 +19,26 @@ type qualityEntry struct {
 	name, script string
 }
 
+const (
+	swiftNativeCIJob      = "sdk-swift-native"
+	swiftConformanceCIJob = "sdk-swift-conformance"
+	swiftInteropLanes     = "matrix.lane != 'wire'"
+)
+
 type qualityWorkflow struct {
 	Jobs map[string]struct {
-		If             string
-		Needs          yaml.Node
-		TimeoutMinutes int `yaml:"timeout-minutes"`
-		Env            map[string]string
-		Outputs        map[string]string
-		Strategy       struct {
-			FailFast *bool `yaml:"fail-fast"`
-			Matrix   struct{ Dart []string }
+		If              string
+		Needs           yaml.Node
+		TimeoutMinutes  int    `yaml:"timeout-minutes"`
+		RunsOn          string `yaml:"runs-on"`
+		ContinueOnError bool   `yaml:"continue-on-error"`
+		Env             map[string]string
+		Outputs         map[string]string
+		Permissions     map[string]string
+		Strategy        struct {
+			FailFast    *bool `yaml:"fail-fast"`
+			MaxParallel int   `yaml:"max-parallel"`
+			Matrix      struct{ Dart, Lane []string }
 		}
 		Steps []struct {
 			Name, Run, Uses, If string
@@ -253,8 +263,8 @@ func qualityEntries(t *testing.T) []qualityEntry {
 func TestSDKInteropCIIncludesBothTopologies(t *testing.T) {
 	workflow := readQualityWorkflow(t)
 	for job, consumer := range map[string]string{
-		"sdk-kotlin":            "./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build",
-		"sdk-swift-conformance": "bash tests/sdk-interop/swift/run.sh",
+		"sdk-kotlin":     "./packages/kotlin/gradlew -p tests/sdk-interop/kotlin build",
+		swiftNativeCIJob: "bash tests/sdk-interop/swift/run.sh",
 	} {
 		for _, mode := range []string{"-run --", "-run -gateway --", "-run -enum-upgrade --", "-run -enum-upgrade -gateway --"} {
 			command := "go run ./tests/sdk-interop " + mode + " " + consumer
@@ -265,12 +275,75 @@ func TestSDKInteropCIIncludesBothTopologies(t *testing.T) {
 					if step.ContinueOnError {
 						t.Errorf("%s must not ignore %s failure", job, mode)
 					}
+					if job == swiftNativeCIJob {
+						lane := "direct"
+						if strings.Contains(mode, "-gateway") {
+							lane = "gateway"
+						}
+						if step.If != "matrix.lane == '"+lane+"'" || strings.TrimSpace(step.Run) != command ||
+							step.Env["LUXO_SWIFT_PATH"] != "${{ github.workspace }}/.tmp/luxo-swift" {
+							t.Errorf("Swift %s must run the original consumer once in %s against the pinned checkout", mode, lane)
+						}
+					}
 				}
 			}
 			if found != 1 {
 				t.Errorf("%s needs exactly one %s consumer step; got %d", job, mode, found)
 			}
 		}
+	}
+}
+
+func TestSwiftCIUsesThreeNativeLanes(t *testing.T) {
+	job := readQualityWorkflow(t).Jobs[swiftNativeCIJob]
+	if !slices.Equal(job.Strategy.Matrix.Lane, []string{"wire", "direct", "gateway"}) {
+		t.Fatalf("Swift CI requires wire, direct and gateway lanes, got %v", job.Strategy.Matrix.Lane)
+	}
+	if job.If != "" || job.Needs.Kind != 0 || job.RunsOn != "macos-26" || job.TimeoutMinutes != 20 ||
+		job.Strategy.FailFast == nil || *job.Strategy.FailFast || job.ContinueOnError ||
+		(job.Strategy.MaxParallel != 0 && job.Strategy.MaxParallel < len(job.Strategy.Matrix.Lane)) {
+		t.Fatal("Swift lanes must run independently on macOS and propagate failures")
+	}
+	if job.Env["DEVELOPER_DIR"] != "/Applications/Xcode_26.6.app/Contents/Developer" ||
+		len(job.Permissions) != 1 || job.Permissions["contents"] != "read" {
+		t.Fatal("Swift lanes must preserve the pinned Xcode and read-only access")
+	}
+	wire := 0
+	for _, step := range job.Steps {
+		if step.Name != "Verify Swift wire protocol compatibility" {
+			continue
+		}
+		wire++
+		if step.If != "matrix.lane == 'wire'" || step.ContinueOnError ||
+			step.Run != "swift test --package-path .tmp/luxo-swift --filter ProtocolConformanceTests" ||
+			step.Env["LUXO_PROTOCOL_FIXTURE"] != "${{ github.workspace }}/pkg/lux/codec/testdata/protocol-v1.json" {
+			t.Error("the wire lane must run the original protocol conformance check with the release corpus")
+		}
+	}
+	if wire != 1 {
+		t.Fatalf("expected one wire check, got %d", wire)
+	}
+}
+
+func TestSwiftCIRequiresAllNativeLanes(t *testing.T) {
+	job := readQualityWorkflow(t).Jobs[swiftConformanceCIJob]
+	var dependencies []string
+	if err := job.Needs.Decode(&dependencies); err != nil || !slices.Equal(dependencies, []string{swiftNativeCIJob}) ||
+		job.If != "always()" || job.ContinueOnError || job.Permissions == nil || len(job.Permissions) != 0 ||
+		len(job.Steps) != 1 {
+		t.Fatalf("the stable Swift check must aggregate all native lanes without permissions: %v", err)
+	}
+	step := job.Steps[0]
+	if step.If != "" || step.ContinueOnError || step.Env["SWIFT_NATIVE_RESULT"] != "${{ needs.sdk-swift-native.result }}" {
+		t.Fatal("the Swift aggregate must require the native job's actual result")
+	}
+	for _, result := range []string{"success", "failure", "cancelled", "skipped", ""} {
+		t.Run(result, func(t *testing.T) {
+			fixture := newQualityFixture(t)
+			if _, _, err := fixture.run(t, "export SWIFT_NATIVE_RESULT="+shellQualityQuote(result)+"\n"+step.Run); (err == nil) != (result == "success") {
+				t.Fatalf("unexpected Swift aggregate outcome for %q: %v", result, err)
+			}
+		})
 	}
 }
 
@@ -686,12 +759,15 @@ func shellQualityQuote(value string) string {
 
 func TestSDKInteropBindsCandidateModules(t *testing.T) {
 	workflow := readQualityWorkflow(t)
-	for _, job := range []string{"sdk-ts", "sdk-dart", "sdk-kotlin", "sdk-swift-conformance"} {
+	for _, job := range []string{"sdk-ts", "sdk-dart", "sdk-kotlin", swiftNativeCIJob} {
 		t.Run(job, func(t *testing.T) {
 			goSetup, bindings, firstConsumer, count := -1, -1, -1, 0
 			for index, step := range workflow.Jobs[job].Steps {
 				if strings.HasPrefix(step.Uses, "actions/setup-go@") {
 					goSetup = index
+					if job == swiftNativeCIJob && (step.If != swiftInteropLanes || step.ContinueOnError) {
+						t.Error("Swift must set up Go only in the consumer lanes and require setup success")
+					}
 				}
 				if step.Uses == "./.github/actions/setup-modules" {
 					bindings = index
@@ -699,6 +775,8 @@ func TestSDKInteropBindsCandidateModules(t *testing.T) {
 					condition := ""
 					if job == "sdk-ts" {
 						condition = "matrix.package == 'vite-plugin'"
+					} else if job == swiftNativeCIJob {
+						condition = swiftInteropLanes
 					}
 					if step.If != condition || step.ContinueOnError {
 						t.Error("module setup must match Go setup and propagate failures")
