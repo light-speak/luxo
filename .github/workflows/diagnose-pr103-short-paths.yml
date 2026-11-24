@@ -35,6 +35,7 @@ jobs:
           GOTOOLCHAIN: local
           GOAMD64: v1
           CGO_ENABLED: 1
+          PR103_REQUIRED_SHORT_PATH_SCOPE: intel
         run: bash scripts/diagnose-pr103-short-paths.sh run
       - name: Preserve source bindings and immutable raw measurements
         if: always()

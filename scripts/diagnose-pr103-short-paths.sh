@@ -51,7 +51,12 @@ printf 'base=%s\nhead=%s\ntested_merge=%s\ntested_tree=%s\noriginal_run=45385956
 
 scope=
 observed=
+required_scope="${PR103_REQUIRED_SHORT_PATH_SCOPE:-}"
 if [[ "$mode" == run ]]; then
+  case "$required_scope" in
+    ''|intel|amd) ;;
+    *) printf 'Unknown required short-path scope: %s\n' "$required_scope" >&2; exit 2;;
+  esac
   [[ "$(go version)" == 'go version go1.27.1 linux/amd64' ]]
   [[ "$(go env GOOS GOARCH GOAMD64 CGO_ENABLED)" == $'linux\namd64\nv1\n1' ]]
   collect_host > "$root/environment.txt"
@@ -61,11 +66,14 @@ if [[ "$mode" == run ]]; then
     "$intel") scope=intel;;
     'AMD EPYC 9V74 80-CORE PROCESSOR') scope=amd;;
   esac
-  jq -n --arg cpu "$observed" --arg scope "$scope" --arg intel "$intel" --arg amd "$amd" \
-    '{actualCPU:$cpu, scope:$scope, matchingFormalModel:($scope != ""), supported:[$intel,$amd]}' \
+  jq -n --arg cpu "$observed" --arg scope "$scope" --arg required "$required_scope" \
+    --arg intel "$intel" --arg amd "$amd" \
+    '{actualCPU:$cpu, scope:$scope, matchingFormalModel:($scope != ""), supported:[$intel,$amd],
+      requiredScope:(if $required == "" then null else $required end),
+      matchesRequiredScope:($scope != "" and ($required == "" or $scope == $required))}' \
     > "$root/runner-cpu.json"
   cat "$root/runner-cpu.json"
-  if [[ -z "$scope" ]]; then exit 3; fi
+  if ! jq -e .matchesRequiredScope "$root/runner-cpu.json" >/dev/null; then exit 3; fi
 fi
 
 original_objects=$(git -C "$repo" rev-parse --path-format=absolute --git-path objects)
