@@ -1,0 +1,57 @@
+name: Qualify migration publication on native runners
+
+on:
+  push:
+    branches: [diagnostics/migration-publication-opt]
+    paths:
+      - .github/workflows/diagnose-migration-publication.yml
+      - scripts/diagnose-migration-publication.py
+      - scripts/diagnose-migration-publication/product.patch.b64
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: diagnose-migration-publication-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/migration-publication-opt'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux
+            python: python3
+          - runner: windows-latest
+            platform: windows
+            python: python
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Check native publication and measure the Linux CLI transaction
+        env:
+          GOTOOLCHAIN: local
+        shell: bash
+        run: ${{ matrix.python }} scripts/diagnose-migration-publication.py ${{ matrix.platform }}
+      - name: Preserve the revision, tests, and complete native comparisons
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: migration-publication-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/migration-publication-native-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
