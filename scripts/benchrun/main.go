@@ -104,6 +104,8 @@ func performanceArguments(command, pkg string, args []string) (string, []string,
 
 func compileOverlay(root, packagePath string, baseline bool, profile string) (string, func() error, error) {
 	switch profile {
+	case benchlayout.LuxShortPathProfile:
+		return packageTestOverlay(root, packagePath, "bench-lux-short-path-*", writeLuxShortPathOverlay)
 	case benchlayout.CodecReaderProfile:
 		return codecReaderOverlay(root)
 	case benchlayout.APINonIdentityProfile:

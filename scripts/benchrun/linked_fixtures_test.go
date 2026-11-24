@@ -20,6 +20,7 @@ func TestIsolationProfileCommand(t *testing.T) {
 			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n"},
 		{"pkg/codegen", "codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n" +
 			"codegen-global-receiver\t^BenchmarkGlobalReceiverName$\n"},
+		{"pkg/lux", "lux-short-path\t^BenchmarkStrictFilterContract$|^BenchmarkDecimalAlignment$\n"},
 		{"pkg/lux/rpc", ""},
 	} {
 		var output bytes.Buffer
@@ -36,7 +37,7 @@ type closedIsolationWriter struct{}
 
 func (closedIsolationWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
 
-func TestAPIAndLuviaOverlaysPreserveFixtureBoundaries(t *testing.T) {
+func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 	root, err := filepath.Abs("../..")
 	if err != nil {
 		t.Fatal(err)
@@ -46,6 +47,7 @@ func TestAPIAndLuviaOverlaysPreserveFixtureBoundaries(t *testing.T) {
 		assert       func(*testing.T, map[string]string, string)
 	}{
 		{benchlayout.APIPackage, benchlayout.APINonIdentityProfile, verifyAPIOverlay},
+		{benchlayout.LuxPackage, benchlayout.LuxShortPathProfile, verifyLuxShortPathOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaPrimaryTraceProfile, verifyLuviaOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaGatewayIdentityProfile, verifyLuviaGatewayIdentityOverlay},
 	} {

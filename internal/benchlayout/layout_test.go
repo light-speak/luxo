@@ -154,3 +154,22 @@ func TestCodegenProfilesRequirePackageAndExactRoots(t *testing.T) {
 		t.Fatalf("unexpected codegen isolation: %v", profiles)
 	}
 }
+
+func TestLuxShortPathProfileRequiresPackageAndExactRoots(t *testing.T) {
+	for _, tc := range []struct{ pkg, name, want string }{
+		{LuxPackage, LuxStrictFilterBenchmark, LuxShortPathProfile},
+		{LuxPackage, LuxDecimalAlignmentBenchmark + "/Add/zero/after-2", LuxShortPathProfile},
+		{LuxPackage, LuxStrictFilterBenchmark + "Sibling-2", DefaultProfile},
+		{LuxPackage, "BenchmarkDecimalPrecision-2", DefaultProfile},
+		{CodecPackage, LuxDecimalAlignmentBenchmark, DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	profiles := IsolationProfiles(LuxPackage)
+	want := []IsolationSpec{{LuxShortPathProfile, "^BenchmarkStrictFilterContract$|^BenchmarkDecimalAlignment$"}}
+	if !reflect.DeepEqual(profiles, want) || ValidPerformanceProfile(CodecPackage, LuxShortPathProfile) {
+		t.Fatalf("unexpected Lux isolation: %v", profiles)
+	}
+}
