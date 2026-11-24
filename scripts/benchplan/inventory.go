@@ -116,6 +116,8 @@ func verifyProfileInventory(args []string) error {
 		return fmt.Errorf("benchmark profile %q must reproduce its exact ordinary benchmark inventory", profile)
 	}
 	switch profile {
+	case benchlayout.LuxShortPathProfile:
+		return verifyLuxShortPathInventory(isolated)
 	case benchlayout.CodegenLiteralProfile:
 		const root = benchlayout.CodegenLiteralBenchmark
 		if !verifiedBenchmarkLeaves(isolated[root], root, "duration_leading_zero", "duration_plain", "int_leading_zero", "int_plain") {
@@ -132,6 +134,23 @@ func verifyProfileInventory(args []string) error {
 			"authenticated/after", "typed-nil/before", "typed-nil/after") {
 			return errors.New("Luvia gateway identity profile requires the six verified identity leaves")
 		}
+	}
+	return nil
+}
+
+func verifyLuxShortPathInventory(isolated map[string]map[string]struct{}) error {
+	const strict = benchlayout.LuxStrictFilterBenchmark
+	const decimal = benchlayout.LuxDecimalAlignmentBenchmark
+	if !verifiedBenchmarkLeaves(isolated[strict], strict,
+		"Bool/Before", "Bool/After", "Contains/Before", "Contains/After", "Float/Before", "Float/After",
+		"Int/Before", "Int/After", "Search/Before", "Search/After", "String/Before", "String/After",
+		"String1KiB/Before", "String1KiB/After", "Time/Before", "Time/After") {
+		return errors.New("Lux short-path profile requires the 16 verified filter leaves")
+	}
+	if !verifiedBenchmarkLeaves(isolated[decimal], decimal,
+		"Add/near/before", "Add/near/after", "Add/same/before", "Add/same/after", "Add/zero/before", "Add/zero/after",
+		"Sub/near/before", "Sub/near/after", "Sub/same/before", "Sub/same/after", "Sub/zero/before", "Sub/zero/after") {
+		return errors.New("Lux short-path profile requires the 12 verified decimal alignment leaves")
 	}
 	return nil
 }

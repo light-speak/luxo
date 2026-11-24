@@ -301,3 +301,54 @@ func TestLuviaGatewayIdentityHasSixSeparateLeaves(t *testing.T) {
 		t.Fatal("accepted swapped Luvia profiles")
 	}
 }
+
+func TestLuxShortPathPreservesAllNativeLeaves(t *testing.T) {
+	const pkg, profile = "pkg/lux", "lux-short-path"
+	const strict, decimal, sibling = "BenchmarkStrictFilterContract", "BenchmarkDecimalAlignment", "BenchmarkFormatDecimal"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	var selected strings.Builder
+	for _, kind := range []string{"Bool", "Contains", "Float", "Int", "Search", "String", "String1KiB", "Time"} {
+		for _, stage := range []string{"Before", "After"} {
+			selected.WriteString(strict + "/" + kind + "/" + stage + measurement)
+		}
+	}
+	for _, op := range []string{"Add", "Sub"} {
+		for _, mode := range []string{"near", "same", "zero"} {
+			for _, stage := range []string{"before", "after"} {
+				selected.WriteString(decimal + "/" + op + "/" + mode + "/" + stage + measurement)
+			}
+		}
+	}
+	all := selected.String()
+	missingStrict := strings.ReplaceAll(all, strict+"/Time/After"+measurement, "")
+	missingDecimal := strings.ReplaceAll(all, decimal+"/Add/zero/after"+measurement, "")
+	const untouched = sibling + "/example" + measurement
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	for _, tc := range []struct {
+		name, normal, projected string
+		valid                   bool
+	}{
+		{"exact", all, all, true},
+		{"missing strict", missingStrict, missingStrict, false},
+		{"missing decimal", missingDecimal, missingDecimal, false},
+		{"sibling joined isolation", all, all + untouched, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.normal+untouched+"PASS\n")
+			writeFixture(t, isolated, tc.projected+"PASS\n")
+			if err := run([]string{"--verify-profile-inventory", pkg, profile, ordinary, isolated}, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("Lux short-path inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+	confirmation := formatConfirmationBatch([]sampleKey{{pkg, strict + "/Time/After-2"}, {pkg, decimal + "/Add/zero/after-2"}, {pkg, sibling + "/example-2"}})
+	for _, route := range []string{
+		pkg + "\t" + profile + "\t^" + strict + "$/^Time$/^After$|^" + decimal + "$/^Add$/^zero$/^after$\n",
+		pkg + "\tdefault\t^" + sibling + "$/^example$\n",
+	} {
+		if !strings.Contains(confirmation, route) {
+			t.Fatalf("Lux confirmation did not preserve route %q in:\n%s", route, confirmation)
+		}
+	}
+}

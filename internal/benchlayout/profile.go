@@ -6,6 +6,10 @@ import (
 )
 
 const (
+	LuxShortPathProfile           = "lux-short-path"
+	LuxPackage                    = "pkg/lux"
+	LuxStrictFilterBenchmark      = "BenchmarkStrictFilterContract"
+	LuxDecimalAlignmentBenchmark  = "BenchmarkDecimalAlignment"
 	DefaultProfile                = "default"
 	CodecReaderProfile            = "codec-reader"
 	APINonIdentityProfile         = "api-non-identity"
@@ -33,6 +37,10 @@ var luviaIsolatedRoots = []string{"BenchmarkPrimaryKeys", "BenchmarkTraceEncodin
 func ProfileForBenchmark(pkg, name string) string {
 	root, _, _ := strings.Cut(strings.TrimSuffix(name, "-2"), "/")
 	switch pkg {
+	case LuxPackage:
+		if root == LuxStrictFilterBenchmark || root == LuxDecimalAlignmentBenchmark {
+			return LuxShortPathProfile
+		}
 	case CodecPackage:
 		if root == CodecReaderBenchmark {
 			return CodecReaderProfile
@@ -67,6 +75,8 @@ type IsolationSpec struct {
 // IsolationProfiles gives discovery the isolated binaries for a package.
 func IsolationProfiles(pkg string) []IsolationSpec {
 	switch pkg {
+	case LuxPackage:
+		return []IsolationSpec{{LuxShortPathProfile, "^" + LuxStrictFilterBenchmark + "$|^" + LuxDecimalAlignmentBenchmark + "$"}}
 	case CodecPackage:
 		return []IsolationSpec{{CodecReaderProfile, "."}}
 	case APIPackage:
