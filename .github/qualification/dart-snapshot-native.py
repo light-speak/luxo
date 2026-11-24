@@ -11,13 +11,15 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from urllib.parse import unquote
 
 
-BASE = "03eb1dce2ed5f7b2d1796f08d934cb8860fb4f82"
-BASE_TREE = "a05f7ba50a876937b5764a0e45e78f5307a69d0d"
-CANDIDATE_TREE = "87684119c182f5295e7e998f7ae4b60b8f8d54ed"
-DARWIN_TREE = "6c6fc5e950301df427758eca62bcc7bf6fa401d4"
-PATCH_SHA = "eb5b72c871b115668ccd53931a0dbcf61d911adbf0c4bef1b5e10085919b04f8"
+DIAGNOSTIC_BASE = "03eb1dce2ed5f7b2d1796f08d934cb8860fb4f82"
+BASE = "1117eb9ffcc0beef977abceec656a351b0988389"
+BASE_TREE = "97e7de78aafc023063c8ad6e44ecfaa3dab04d35"
+CANDIDATE_TREE = "e2fb3b54b65a8d81fed952e353e7cc30e20091e4"
+DARWIN_TREE = "e2fb3b54b65a8d81fed952e353e7cc30e20091e4"
+PATCH_SHA = "ce4d9bee18e1e367d556165c9f47299a1ec59ef976a749c8014c368830d35d9e"
 DART_VERSION = "3.13.4"
 RELEASE_WORKFLOW = ".github/workflows/dart-release-windows.yml"
 DIAGNOSTIC_FILES = {
@@ -32,9 +34,9 @@ PRODUCT_FILES = {
     "packages/dart/lib/src/builder/artifact_publish.dart": "081b7122a34a0d29eab7391c73b050d5678c0c9c769e0ad6269ea22b5549b2fa",
     "packages/dart/lib/src/builder/selection_build.dart": "01f27d83af297789b41af6af955c66abba99d2f4d89792cd75f279a38b05bc6f",
     "packages/dart/lib/src/builder/snapshot_directory.dart": "50370422d15e1696661b0a0f69f52ae7079bf95d33c5dfbc721bc259a6a4cfda",
-    "packages/dart/lib/src/builder/snapshot_posix.dart": "c32e8a585d3c2ecea91cbf8ffc17dae01a3f737ace695203e7c3292619e986cf",
+    "packages/dart/lib/src/builder/snapshot_posix.dart": "963467186dfadfb56a30376481c182ae141809322b78587de1744ee555bff5fb",
     "packages/dart/lib/src/builder/snapshot_windows.dart": "339a85a18eb62092ed4126d75aad294a4d7882f34e737914e4ca4ea5df098344",
-    "packages/dart/test/selection_build_test.dart": "3c98902d8a9f10edc26be167507ed8dedf991afb5559281cb18c97035d6d431c",
+    "packages/dart/test/selection_build_test.dart": "8d24f83c82999d7adc73cfbf1e1d2dfde801e49000bcbc0d8338ea3c7f3b16fa",
 }
 SUITES = [
     "test/artifact_publish_test.dart",
@@ -42,6 +44,9 @@ SUITES = [
     "test/flutter_commands_test.dart",
 ]
 COMMON = {
+    "a missing Darwin snapshot ACL requires ENOENT",
+    "Darwin ACL policy refuses unknown tags, flag values and grants",
+    "failed prepare cleans its snapshot and can retry",
     "prepared publication preserves the missing artifact error",
     "prepared publication creates ordinary parents and keeps file bytes",
     "prepared publication preserves ordinary in-project directory aliases",
@@ -67,6 +72,7 @@ COMMON = {
     "failed refresh rejects restart without killing the session",
 }
 LINUX = COMMON | {
+    "failed prepare keeps both errors when scratch cleanup is blocked",
     "shared project accepts its private build scratch directory",
     "snapshot scratch accepts a sticky shared directory",
     "trusted project retains a shared scratch workspace",
@@ -78,6 +84,7 @@ LINUX = COMMON | {
     "Flutter CLI cleans its snapshot after EOF or native exit 7",
 }
 MAC_ONLY = {
+    "macOS snapshot creation rejects deferred ACL inheritance and can retry",
     "0700 scratch accepts read-only and inherited deny ACLs",
     "0770 scratch accepts read-only and inherited deny ACLs",
     "macOS ACL trust rejects possible mutating and inherited traversal grants",
@@ -188,6 +195,59 @@ def verify_events(receipt, required, allowed_skips, exact):
     return {"passed": sorted(passed), "skipped": sorted(skipped)}
 
 
+def coverage_receipt(source, raw, expected):
+    reports = sorted(raw.rglob("*.vm.json"))
+    require(reports, "Dart VM did not write any coverage reports")
+    tracked = {
+        path: {"hits": {}, "branchHits": {}}
+        for path in PRODUCT_FILES
+        if path.startswith(("packages/dart/lib/", "packages/dart/bin/"))
+    }
+    aliases = {}
+    for path in tracked:
+        aliases[unquote((source / path).as_uri())] = path
+        if path.startswith("packages/dart/lib/"):
+            aliases["package:luxo_client/" + path.removeprefix("packages/dart/lib/")] = path
+    if os.name == "nt":
+        aliases = {uri.lower(): path for uri, path in aliases.items()}
+
+    for report in reports:
+        data = json.loads(report.read_text(encoding="utf-8"))
+        for entry in data["coverage"]:
+            uri = unquote(entry["source"])
+            path = aliases.get(uri.lower() if os.name == "nt" else uri)
+            if path is None:
+                continue
+            for kind, positions in tracked[path].items():
+                values = entry.get(kind, [])
+                require(len(values) % 2 == 0, f"invalid {kind} pairs for {path}")
+                for line, count in zip(values[::2], values[1::2]):
+                    positions[line] = positions.get(line, 0) + count
+
+    observed = {}
+    for path, data in tracked.items():
+        require(digest(source / path) == PRODUCT_FILES[path],
+                f"coverage source changed: {path}")
+        observed[path] = {"sha256": PRODUCT_FILES[path]}
+        for kind, label in (("hits", "lines"), ("branchHits", "branchSourcePositions")):
+            positions = data[kind]
+            missed = sorted(position for position, count in positions.items() if count == 0)
+            observed[path][label] = {
+                "hit": len(positions) - len(missed), "total": len(positions), "missed": missed,
+            }
+    engine = "windows" if expected == "windows" else "posix"
+    host = observed[f"packages/dart/lib/src/builder/snapshot_{engine}.dart"]
+    require(host["lines"]["hit"] > 0 and host["branchSourcePositions"]["hit"] > 0,
+            "no executed source and branch coverage from the native snapshot implementation")
+    return {
+        "scope": "Selected VM-instrumented cases. Zero positions mean no positions were "
+                 "reported for that metric. CLI Dart and AOT subprocesses are verified by test events.",
+        "rawReportCount": len(reports),
+        "suites": SUITES,
+        "productSources": observed,
+    }
+
+
 def qualify(source, evidence, expected):
     native = {"linux": "Linux", "windows": "Windows"}[expected]
     require(platform.system() == native and platform.machine().lower() in {"amd64", "x86_64"},
@@ -206,7 +266,9 @@ def qualify(source, evidence, expected):
     shutil.copyfile(package / "pubspec.lock", evidence / "pubspec.lock")
     capture(package, evidence, "analyze", [dart, "analyze", "--fatal-infos"], 240)
 
-    args = [dart, "test", "--concurrency=1", "--reporter=json", *SUITES]
+    raw_coverage = source.parent / "vm-coverage"
+    args = [dart, "test", "--concurrency=1", "--reporter=json",
+            "--branch-coverage", f"--coverage={raw_coverage}", *SUITES]
     isolated_selection = expected == "windows"
     if isolated_selection:
         args += ["--name", "^(?:" + "|".join(sorted(COMMON)) + ")$"]
@@ -214,6 +276,7 @@ def qualify(source, evidence, expected):
     required = COMMON if isolated_selection else LINUX
     skips = set() if isolated_selection else MAC_ONLY
     verdict = verify_events(receipt, required, skips, isolated_selection)
+    write_json(evidence / "coverage.json", coverage_receipt(source, raw_coverage, expected))
     for directory in (source / ".tmp", package / ".tmp"):
         require(not directory.is_symlink() and (not directory.exists() or not any(directory.iterdir())),
                 f"fixture teardown left entries in {directory.relative_to(source)}")
@@ -238,6 +301,7 @@ def main():
             "dartTree": subtree,
             "productPatchSHA256": PATCH_SHA,
             "productFileSHA256": PRODUCT_FILES,
+            "diagnosticBase": DIAGNOSTIC_BASE,
             "diagnosticHead": git(repo, "rev-parse", "HEAD"),
             "runner": platform.platform(),
             "run": os.environ.get("GITHUB_RUN_ID"),
@@ -248,7 +312,7 @@ def main():
             return
 
         require(provenance["diagnosticHead"] == os.environ["GITHUB_SHA"], "unexpected workflow head")
-        files = set(git(repo, "diff", "--name-only", BASE, "HEAD").splitlines())
+        files = set(git(repo, "diff", "--name-only", DIAGNOSTIC_BASE, "HEAD").splitlines())
         require(files == DIAGNOSTIC_FILES, "diagnostic branch changed unrelated paths")
         evidence = owned / "dart-snapshot-native-evidence"
         evidence.mkdir()
