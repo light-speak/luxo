@@ -23,7 +23,7 @@ case "$suite" in
     base=ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
     head=5e4c9d1b3813cc95f98d4088a10c242dca47b8de
     product=a9a9137fdefffe7fecd6f6c81b6367ece9a29022
-    array_candidate=362bee3437171d57167a71863de15a10a409a203
+    array_candidate=b4539db35502ccc1662b40ec75b30a3262e79174
     ;;
   *) exit 2;;
 esac
@@ -90,8 +90,26 @@ PYTHON
 git -C "$repo" cat-file -e "$base^{commit}"
 git -C "$repo" cat-file -e "$head^{commit}"
 printf 'base=%s\nhead=%s\nproduct_tree=%s\n' "$base" "$head" "$product" > "$evidence/revisions.txt"
+prepare_array_candidate() {
+  patch="$evidence/array-header.patch"
+  base64 -d < "$repo/.github/qualification/pr72-array-header-unroll.patch.b64" > "$patch"
+  printf '%s  %s\n' '14abc7638beba745aabf000a8a3717856e7bcb31936d2e31f84341fa0306bd13' "$patch" | sha256sum -c -
+  test "$(git -C "$repo" merge-tree --write-tree "$base" "$head")" = "$product"
+  (
+    export GIT_INDEX_FILE="$scratch/array-header.index"
+    git -C "$repo" read-tree "$product"
+    git -C "$repo" apply --cached --whitespace=error --check "$patch"
+    git -C "$repo" apply --cached --whitespace=error "$patch"
+    test "$(git -C "$repo" write-tree)" = "$array_candidate"
+    git -C "$repo" apply --cached --reverse --check "$patch"
+  )
+  test "$(git -C "$repo" diff --name-only "$product" "$array_candidate")" = \
+    "$(printf '%s\n' pkg/lux/codec/array_write_test.go pkg/lux/codec/wire.go)"
+  git -C "$repo" diff --check "$product" "$array_candidate"
+  printf 'candidate_array_header_tree=%s\n' "$array_candidate" >> "$evidence/revisions.txt"
+}
 if [[ -n "$array_candidate" ]]; then
-  printf 'restored_array_header_tree=%s\n' "$array_candidate" >> "$evidence/revisions.txt"
+  prepare_array_candidate
 fi
 if [[ "$mode" == --plan-only ]]; then
   cat "$evidence/revisions.txt" "$evidence/cases.tsv"
@@ -111,19 +129,9 @@ git -C "$repo" archive "$base" | tar -xf - -C "$scratch/source/base"
 git -C "$repo" archive "$merge" | tar -xf - -C "$scratch/source/head"
 roles=(base head)
 if [[ -n "$array_candidate" ]]; then
-  array_source=pkg/lux/codec/wire.go
-  (
-    export GIT_INDEX_FILE="$scratch/array-header.index"
-    git -C "$repo" read-tree "$merge"
-    wire_blob=$(git -C "$repo" rev-parse "$base:$array_source")
-    git -C "$repo" update-index --cacheinfo "100644,$wire_blob,$array_source"
-    test "$(git -C "$repo" write-tree)" = "$array_candidate"
-  )
-  test "$(git -C "$repo" diff --name-only "$merge" "$array_candidate")" = "$array_source"
-  git -C "$repo" diff --binary "$merge" "$array_candidate" > "$evidence/array-header.patch"
-  mkdir -p "$scratch/source/restored" "$scratch/bin/restored"
-  git -C "$repo" archive "$array_candidate" | tar -xf - -C "$scratch/source/restored"
-  roles+=(restored)
+  mkdir -p "$scratch/source/candidate" "$scratch/bin/candidate"
+  git -C "$repo" archive "$array_candidate" | tar -xf - -C "$scratch/source/candidate"
+  roles+=(candidate)
 fi
 for role in "${roles[@]}"; do
   dir="$scratch/source/$role"
@@ -153,19 +161,29 @@ while IFS= read -r package; do
     for binary in "$pair/$role/"*.test; do ln -s "$binary" "$scratch/bin/$role/${binary##*/}"; done
   done
   if [[ -n "$array_candidate" ]]; then
-    restored_pair="$scratch/restored-$label"
+    candidate_pair="$scratch/candidate-$label"
     rc=0
-    "$scratch/bin/benchrun" compile-pair "$scratch/source/base" "$scratch/source/restored" "$restored_pair" "$package" \
-      > "$evidence/pairs/$label.restored.compile.log" 2>&1 || rc=$?
-    if [[ -f "$restored_pair/fixtures.json" ]]; then cp "$restored_pair/fixtures.json" "$evidence/pairs/$label.restored.json"; fi
-    if (( rc != 0 )); then cat "$evidence/pairs/$label.restored.compile.log" >&2; exit "$rc"; fi
-    for binary in "$restored_pair/head/"*.test; do
-      cmp "$restored_pair/base/${binary##*/}" "$scratch/bin/base/${binary##*/}"
-      ln -s "$binary" "$scratch/bin/restored/${binary##*/}"
+    "$scratch/bin/benchrun" compile-pair "$scratch/source/base" "$scratch/source/candidate" "$candidate_pair" "$package" \
+      > "$evidence/pairs/$label.candidate.compile.log" 2>&1 || rc=$?
+    if [[ -f "$candidate_pair/fixtures.json" ]]; then cp "$candidate_pair/fixtures.json" "$evidence/pairs/$label.candidate.json"; fi
+    if (( rc != 0 )); then cat "$evidence/pairs/$label.candidate.compile.log" >&2; exit "$rc"; fi
+    for binary in "$candidate_pair/head/"*.test; do
+      cmp "$candidate_pair/base/${binary##*/}" "$scratch/bin/base/${binary##*/}"
+      ln -s "$binary" "$scratch/bin/candidate/${binary##*/}"
     done
   fi
 done < "$evidence/packages.txt"
 for role in "${roles[@]}"; do record_binaries "$role"; done
+
+if [[ -n "$array_candidate" ]]; then
+  "$scratch/bin/benchrun" compile "$scratch/source/candidate" "$scratch/bin/candidate-native" pkg/lux/codec
+  "$scratch/bin/benchrun" run "$scratch/source/candidate" "$scratch/bin/candidate-native" pkg/lux/codec \
+    -test.run='^Test(ArrayHeaderWriteBounds|ArrayHeaderWriteCapacity)$' -test.v -test.timeout=90s \
+    > "$evidence/array-header-correctness.log"
+  for check in ArrayHeaderWriteBounds ArrayHeaderWriteCapacity; do
+    grep -q "^--- PASS: Test$check " "$evidence/array-header-correctness.log"
+  done
+fi
 
 # The two Planner leaves were introduced by PR 72. Preserve native head-only observations
 # separately. They have no matched historical series and are outside the paired verdict.
@@ -182,7 +200,7 @@ comparisons=(aa ab)
 if [[ -z "$array_candidate" ]]; then
   sample_groups
 else
-  comparisons+=(ar)
+  comparisons+=(ap)
   mkdir "$evidence/raw"
   printf 'group\tpair\tcomparison\tcase\tside\trevision\tvariant\traw\n' > "$evidence/order.tsv"
   for group in primary confirmation; do
@@ -197,7 +215,7 @@ else
           case "$comparison" in
             aa) other=base;;
             ab) other=head;;
-            ar) other=restored;;
+            ap) other=candidate;;
           esac
           run_pair "$group" "$sample" "$comparison" "$other" "$first" "$case_id" "$package" "$variant" "$filter"
         done
@@ -217,7 +235,9 @@ for comparison in "${comparisons[@]}"; do
   printf '%s\t%s\n' "$comparison" "$rc" >> "$evidence/verdicts.tsv"
   if (( rc != 0 )); then
     grep -Eq '^performance gate rejected [1-9][0-9]* regression\(s\)$' "$evidence/$comparison.benchgate.log" || exit "$rc"
-    status=1
+    # For the three-role run, the original head is the comparison control.
+    # Only a failed baseline or tested candidate contributes to its verdict.
+    if [[ -z "$array_candidate" || "$comparison" != ab ]]; then status=1; fi
   fi
 done
 cat "$evidence/verdicts.tsv"

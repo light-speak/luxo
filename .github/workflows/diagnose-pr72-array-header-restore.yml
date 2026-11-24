@@ -1,17 +1,19 @@
-name: Isolate the PR 72 array header refactor
+name: Verify the unrolled PR 72 array header on one runner
 
 on:
   push:
-    branches: [diagnostics/pr72-array-header-restore]
+    branches: [diagnostics/pr72-array-header-unroll]
     paths:
       - .github/workflows/diagnose-pr72-array-header-restore.yml
+      - scripts/diagnose-frozen-fixtures.sh
+      - .github/qualification/pr72-array-header-unroll.patch.b64
 
 permissions:
   contents: read
 
 jobs:
   compare:
-    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr72-array-header-restore'
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr72-array-header-unroll'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -29,7 +31,7 @@ jobs:
           go-version: '1.27.1'
           check-latest: false
           cache: false
-      - name: Match fixtures and compare the original and restored wire source
+      - name: Compare the current main, exact PR 72 and the candidate with matched fixtures
         env:
           GOTOOLCHAIN: local
           GOAMD64: v1
@@ -39,7 +41,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: hosted-pr72-array-header-restore-${{ github.run_id }}-${{ github.run_attempt }}
+          name: hosted-pr72-array-header-unroll-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/hosted-frozen-fixtures-pr72-array-header/
           if-no-files-found: error
           retention-days: 14
