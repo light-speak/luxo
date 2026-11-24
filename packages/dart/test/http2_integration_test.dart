@@ -4,6 +4,7 @@ library;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
@@ -18,6 +19,7 @@ void main() {
   late Directory temporary;
   late Uri endpoint;
   late Uri http1;
+  late String certificate;
   late SecurityContext trust;
   late LuxoHttp2Client client;
   setUpAll(() async {
@@ -37,10 +39,9 @@ void main() {
     final config = jsonDecode(line) as Map<String, dynamic>;
     endpoint = Uri.parse(config['url'] as String);
     http1 = Uri.parse(config['http1'] as String);
+    certificate = config['certificate'] as String;
     trust = SecurityContext(withTrustedRoots: false)
-      ..setTrustedCertificatesBytes(
-        utf8.encode(config['certificate'] as String),
-      );
+      ..setTrustedCertificatesBytes(utf8.encode(certificate));
   });
   tearDownAll(() async {
     await server.stdin.close();
@@ -57,6 +58,33 @@ void main() {
   );
   tearDown(() => client.close());
 
+  test(
+    'completed exchanges release requests with a live abort signal',
+    () async {
+      final config = (await Isolate.packageConfig)!.toFilePath();
+      final child = await Process.start(Platform.resolvedExecutable, [
+        '--enable-vm-service=0',
+        '--packages=$config',
+        'test/fixtures/http2_abort_lifetime.dart',
+        endpoint.toString(),
+        certificate,
+      ]);
+      final output = utf8.decoder.bind(child.stdout).join();
+      final errors = utf8.decoder.bind(child.stderr).join();
+      var reaped = false;
+      try {
+        final code = await child.exitCode.timeout(const Duration(seconds: 20));
+        reaped = true;
+        expect(code, 0, reason: '${await output}\n${await errors}');
+      } finally {
+        if (!reaped) {
+          child.kill(ProcessSignal.sigkill);
+          await child.exitCode.timeout(const Duration(seconds: 5));
+        }
+      }
+    },
+  );
+
   test('H2 hands off complete independent bodies after close', () async {
     final responses = await Future.wait([
       for (final value in [17, 23])
@@ -70,6 +98,23 @@ void main() {
     expect(identical(first.toResponse().bodyBytes, first.bodyBytes), isTrue);
     first.bodyBytes[0] = 99;
     expect(second.bodyBytes, [23]);
+  });
+
+  test('a shared abort signal cancels every attached exchange', () async {
+    final abort = Completer<void>();
+    final url = endpoint.resolve('/slow');
+    Future<void> expectAborted() => expectLater(
+      client.send(
+        http.AbortableRequest('POST', url, abortTrigger: abort.future),
+      ),
+      throwsA(isA<http.RequestAbortedException>()),
+    );
+    final first = expectAborted();
+    final second = expectAborted();
+    abort.completeError(StateError('cancellation signal failed'));
+    await Future.wait([first, second]);
+    await expectAborted();
+    expect((await client.post(endpoint, body: [17])).bodyBytes, [17]);
   });
 
   test(
