@@ -15,12 +15,15 @@ import (
 const (
 	luxFilterFixture  = "condition_filter_bench_test.go"
 	luxDecimalFixture = "decimal_bench_test.go"
+
+	// These are the byte-preserving projections measured by the native A/A and A/H controls.
+	luxFilterProjectionSHA  = "03d082b02bcd5afc6fac26ec6bac93e51b3eb36a05b6c79ab12dbe0752249bd6"
+	luxDecimalProjectionSHA = "b175de4cf8476cc4eeef7f115b142e542b8b82d25b79341916ae8e207ff55c6f"
 )
 
-// These are the byte-preserving test projections used for the native A/A and A/H controls.
 var luxShortPathProjections = map[string]string{
-	luxFilterFixture:  "03d082b02bcd5afc6fac26ec6bac93e51b3eb36a05b6c79ab12dbe0752249bd6",
-	luxDecimalFixture: "b175de4cf8476cc4eeef7f115b142e542b8b82d25b79341916ae8e207ff55c6f",
+	luxFilterFixture:  luxFilterProjectionSHA,
+	luxDecimalFixture: luxDecimalProjectionSHA,
 }
 
 func writeLuxShortPathOverlay(pkg, workspace string) (string, error) {

@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,18 @@ func verifyLuxShortPathOverlay(t *testing.T, replacements map[string]string, pkg
 				t.Fatalf("Lux fixture %s does not match native evidence: %v", path, err)
 			}
 		}
+	}
+}
+
+func TestLuxShortPathProfileBindsProjectionDigests(t *testing.T) {
+	var output strings.Builder
+	if err := run([]string{"performance-profile"}, nil, &output, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	want := "\nlux-short-path-overlay-v1 " + luxFilterFixture + "=" + luxShortPathProjections[luxFilterFixture] +
+		" " + luxDecimalFixture + "=" + luxShortPathProjections[luxDecimalFixture] + "\n"
+	if strings.Count(output.String(), want) != 1 {
+		t.Fatalf("profile must bind both Lux fixture projections: %q", output.String())
 	}
 }
 
