@@ -1,0 +1,90 @@
+name: Diagnose PR 74 on the matching native CPU
+
+on:
+  push:
+    branches: [diagnostics/pr74-auth-linkage]
+    paths:
+      - .github/workflows/diagnose-pr74-auth-linkage.yml
+      - scripts/diagnose-pr74-auth-linkage.py
+      - scripts/diagnose-pr74-auth-linkage.sh
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  match:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr74-auth-linkage'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Select the original hardware scope
+        id: cpu
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          mkdir -p .tmp/pr74-auth-linkage-selection
+          receipt=.tmp/pr74-auth-linkage-selection
+          uname -a > "$receipt/host.txt"
+          [[ "$(uname -sm)" == 'Linux x86_64' && "$RUNNER_OS" == Linux && "$RUNNER_ARCH" == X64 ]]
+          lscpu > "$receipt/lscpu.txt"
+          cpu=$(sed -n 's/^Model name:[[:space:]]*//p' "$receipt/lscpu.txt" | sed 's/[[:space:]]*$//')
+          case "$cpu" in
+            'AMD EPYC 9V45 96-Core Processor') scope=9v45 ;;
+            'AMD EPYC 9V74 80-Core Processor') scope=9v74 ;;
+            'INTEL(R) XEON(R) PLATINUM 8573C') scope=8573c ;;
+            *) printf 'No matching CPU for this diagnostic: %s\n' "$cpu" >&2; exit 3 ;;
+          esac
+          printf 'scope=%s\ncpu=%s\n' "$scope" "$cpu" | tee "$receipt/selection.txt" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          path: diagnostic
+          persist-credentials: false
+      - name: Fetch exact source and the selected formal shard
+        working-directory: diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCOPE: ${{ steps.cpu.outputs.scope }}
+          CPU: ${{ steps.cpu.outputs.cpu }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          IFS=$'\t' read -r cpu shard artifact digest < <(python3 scripts/diagnose-pr74-auth-linkage.py tuple "$SCOPE")
+          [[ "$cpu" == "$CPU" && "$artifact" =~ ^[0-9]+$ && "$digest" =~ ^[0-9a-f]{64}$ ]]
+          git fetch --no-tags --depth=1 origin \
+            a2c411b7b83ca233881ace0c5bf3bec0b9646e1d a1faf2f6d2aa4b733ee09959387ff433917d98b0 \
+            c50446aaf51d439a105ce674bdddd93407270a5d
+          receipt="$GITHUB_WORKSPACE/.tmp/pr74-auth-linkage-selection"
+          gh api "repos/light-speak/luxo/actions/artifacts/$artifact" > "$receipt/formal-metadata.json"
+          jq -e --arg id "$artifact" --arg digest "sha256:$digest" --arg shard "$shard" '
+            (.id | tostring) == $id and .digest == $digest and .expired == false and
+            .name == ("performance-evidence-" + $shard + "-1") and .workflow_run.id == 45466757941 and
+            .workflow_run.head_sha == "a1faf2f6d2aa4b733ee09959387ff433917d98b0"
+          ' "$receipt/formal-metadata.json"
+          mkdir -p .tmp
+          gh api "repos/light-speak/luxo/actions/artifacts/$artifact/zip" > .tmp/formal.zip
+          printf '%s  %s\n' "$digest" .tmp/formal.zip | sha256sum -c - > "$receipt/formal-digest.txt"
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Prove the API ELF and measure the matched leaves
+        working-directory: diagnostic
+        env:
+          SCOPE: ${{ steps.cpu.outputs.scope }}
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+        run: bash scripts/diagnose-pr74-auth-linkage.sh . "$SCOPE" .tmp/formal.zip
+      - name: Publish source, samples and binary evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr74-auth-linkage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .tmp/pr74-auth-linkage-selection/
+            diagnostic/.tmp/pr74-auth-linkage-evidence.*/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
