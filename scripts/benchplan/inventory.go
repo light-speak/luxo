@@ -108,14 +108,82 @@ func verifyProfileInventory(args []string) error {
 		return err
 	}
 	for root := range ordinary {
-		if benchlayout.ProfileForBenchmark(pkg, root) != profile {
+		receiverCompanion := profile == benchlayout.CodegenMigrationStateProfile && root == benchlayout.CodegenReceiverBenchmark
+		if benchlayout.ProfileForBenchmark(pkg, root) != profile && !receiverCompanion {
 			delete(ordinary, root)
 		}
 	}
 	if len(ordinary) == 0 || !maps.EqualFunc(ordinary, isolated, maps.Equal[map[string]struct{}]) {
 		return fmt.Errorf("benchmark profile %q must reproduce its exact ordinary benchmark inventory", profile)
 	}
+	switch profile {
+	case benchlayout.LuxShortPathProfile:
+		return verifyLuxShortPathInventory(isolated)
+	case benchlayout.CodegenLiteralProfile:
+		const root = benchlayout.CodegenLiteralBenchmark
+		if !verifiedBenchmarkLeaves(isolated[root], root, "duration_leading_zero", "duration_plain", "int_leading_zero", "int_plain") {
+			return errors.New("codegen integer literal profile requires the four verified integer and duration leaves")
+		}
+	case benchlayout.CodegenReceiverProfile:
+		return verifyCodegenReceiverInventory(isolated)
+	case benchlayout.CodegenMigrationStateProfile:
+		return verifyCodegenMigrationStateInventory(isolated)
+	case benchlayout.LuviaGatewayIdentityProfile:
+		const root = benchlayout.LuviaGatewayIdentityBenchmark
+		if !verifiedBenchmarkLeaves(isolated[root], root, "anonymous/before", "anonymous/after", "authenticated/before",
+			"authenticated/after", "typed-nil/before", "typed-nil/after") {
+			return errors.New("Luvia gateway identity profile requires the six verified identity leaves")
+		}
+	}
 	return nil
+}
+
+func verifyCodegenReceiverInventory(isolated inventory) error {
+	const root = benchlayout.CodegenReceiverBenchmark
+	if !verifiedBenchmarkLeaves(isolated[root], root, "User", "_Record", "用户") {
+		return errors.New("codegen global receiver profile requires the three verified receiver leaves")
+	}
+	return nil
+}
+
+func verifyCodegenMigrationStateInventory(isolated inventory) error {
+	const migration = benchlayout.CodegenMigrationStateBenchmark
+	if !verifiedBenchmarkLeaves(isolated[migration], migration,
+		"empty/validate", "empty/load/reference", "empty/load/strict", "empty/save/reference", "empty/save/strict",
+		"small/validate", "small/load/reference", "small/load/strict", "small/save/reference", "small/save/strict",
+		"large/validate", "large/load/reference", "large/load/strict", "large/save/reference", "large/save/strict") {
+		return errors.New("codegen migration state profile requires the 15 verified migration leaves")
+	}
+	return verifyCodegenReceiverInventory(isolated)
+}
+
+func verifyLuxShortPathInventory(isolated map[string]map[string]struct{}) error {
+	const strict = benchlayout.LuxStrictFilterBenchmark
+	const decimal = benchlayout.LuxDecimalAlignmentBenchmark
+	if !verifiedBenchmarkLeaves(isolated[strict], strict,
+		"Bool/Before", "Bool/After", "Contains/Before", "Contains/After", "Float/Before", "Float/After",
+		"Int/Before", "Int/After", "Search/Before", "Search/After", "String/Before", "String/After",
+		"String1KiB/Before", "String1KiB/After", "Time/Before", "Time/After") {
+		return errors.New("Lux short-path profile requires the 16 verified filter leaves")
+	}
+	if !verifiedBenchmarkLeaves(isolated[decimal], decimal,
+		"Add/near/before", "Add/near/after", "Add/same/before", "Add/same/after", "Add/zero/before", "Add/zero/after",
+		"Sub/near/before", "Sub/near/after", "Sub/same/before", "Sub/same/after", "Sub/zero/before", "Sub/zero/after") {
+		return errors.New("Lux short-path profile requires the 12 verified decimal alignment leaves")
+	}
+	return nil
+}
+
+func verifiedBenchmarkLeaves(leaves map[string]struct{}, root string, cases ...string) bool {
+	if len(leaves) != len(cases) {
+		return false
+	}
+	for _, name := range cases {
+		if _, ok := leaves[root+"/"+name+"-2"]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func readInventoryPair(first, second string) (inventory, inventory, error) {
