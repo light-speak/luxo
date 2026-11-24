@@ -1,0 +1,48 @@
+name: Isolate the PR 72 array header refactor
+
+on:
+  push:
+    branches: [diagnostics/pr72-array-header-restore]
+    paths:
+      - .github/workflows/diagnose-pr72-array-header-restore.yml
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr72-array-header-restore'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch the current main and original PR head
+        run: >-
+          git fetch --no-tags origin
+          ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+          5e4c9d1b3813cc95f98d4088a10c242dca47b8de
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Match fixtures and compare the original and restored wire source
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: 1
+        run: bash scripts/diagnose-frozen-fixtures.sh pr72-array-header
+      - name: Preserve raw samples and source bindings
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: hosted-pr72-array-header-restore-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-frozen-fixtures-pr72-array-header/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove uploaded evidence from this runner
+        if: always()
+        run: rm -rf -- .tmp/hosted-frozen-fixtures-pr72-array-header

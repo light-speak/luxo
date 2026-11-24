@@ -4,9 +4,10 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 repo=$(git -C "$script_dir" rev-parse --show-toplevel)
 source "$script_dir/diagnose-hosted-perf.sh"
-suite="${1:?usage: diagnose-frozen-fixtures.sh pr71|pr72 [--plan-only]}"
+suite="${1:?usage: diagnose-frozen-fixtures.sh pr71|pr72|pr72-array-header [--plan-only]}"
 mode="${2:-run}"
 [[ $# -le 2 && ( "$mode" == run || "$mode" == --plan-only ) ]]
+array_candidate=
 case "$suite" in
   pr71)
     base=ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
@@ -17,6 +18,12 @@ case "$suite" in
     base=a75a0acce23b30e3f99d44b0c47f746901b82bb8
     head=5e4c9d1b3813cc95f98d4088a10c242dca47b8de
     product=4e0c5bc89439be2f1374db2f306ec261bdccc382
+    ;;
+  pr72-array-header)
+    base=ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+    head=5e4c9d1b3813cc95f98d4088a10c242dca47b8de
+    product=a9a9137fdefffe7fecd6f6c81b6367ece9a29022
+    array_candidate=362bee3437171d57167a71863de15a10a409a203
     ;;
   *) exit 2;;
 esac
@@ -51,6 +58,13 @@ if suite == "pr71":
         ("pkg/lux/luvia", [f"GatewayIdentity/anonymous/{stage}" for stage in ("before", "after")]),
         ("pkg/lux/api", [f"NullableRootJSON/{kind}/{stage}" for kind in ("int", "zero") for stage in ("plain", "present")]),
     ]
+elif suite == "pr72-array-header":
+    codec = "pkg/lux/codec"
+    groups = [
+        (codec, [f"ArrayHeaderWrite/{count}" for count in (0, 128, 1000000, -1)]),
+        (codec, [f"ElementPayload/{kind}-nullable/column=true/count=128/version={version}"
+                 for kind in ("float", "int") for version in (0, 1)]),
+    ]
 else:
     codec = "pkg/lux/codec"
     groups = [
@@ -66,7 +80,7 @@ for index, (package, names) in enumerate(groups, 1):
     filters = ["/".join("^" + re.escape(part) + "$" for part in name.split("/")) for name in names]
     cases.append(f"{index:02d}\t{package}\tdefault\t{suite}\t" + "|".join(filters))
     expected.extend({"Package": package, "Name": name + "-2"} for name in names)
-if len(expected) != (8 if suite == "pr71" else 17):
+if len(expected) != (17 if suite == "pr72" else 8):
     raise SystemExit("unexpected benchmark inventory")
 (output / "cases.tsv").write_text("\n".join(cases) + "\n")
 (output / "expected.json").write_text(json.dumps({"Base": expected, "Head": expected}, indent=2) + "\n")
@@ -76,6 +90,9 @@ PYTHON
 git -C "$repo" cat-file -e "$base^{commit}"
 git -C "$repo" cat-file -e "$head^{commit}"
 printf 'base=%s\nhead=%s\nproduct_tree=%s\n' "$base" "$head" "$product" > "$evidence/revisions.txt"
+if [[ -n "$array_candidate" ]]; then
+  printf 'restored_array_header_tree=%s\n' "$array_candidate" >> "$evidence/revisions.txt"
+fi
 if [[ "$mode" == --plan-only ]]; then
   cat "$evidence/revisions.txt" "$evidence/cases.tsv"
   exit 0
@@ -92,7 +109,23 @@ merge=$(git -C "$repo" merge-tree --write-tree "$base" "$head")
 test "$merge" = "$product"
 git -C "$repo" archive "$base" | tar -xf - -C "$scratch/source/base"
 git -C "$repo" archive "$merge" | tar -xf - -C "$scratch/source/head"
-for role in base head; do
+roles=(base head)
+if [[ -n "$array_candidate" ]]; then
+  array_source=pkg/lux/codec/wire.go
+  (
+    export GIT_INDEX_FILE="$scratch/array-header.index"
+    git -C "$repo" read-tree "$merge"
+    wire_blob=$(git -C "$repo" rev-parse "$base:$array_source")
+    git -C "$repo" update-index --cacheinfo "100644,$wire_blob,$array_source"
+    test "$(git -C "$repo" write-tree)" = "$array_candidate"
+  )
+  test "$(git -C "$repo" diff --name-only "$merge" "$array_candidate")" = "$array_source"
+  git -C "$repo" diff --binary "$merge" "$array_candidate" > "$evidence/array-header.patch"
+  mkdir -p "$scratch/source/restored" "$scratch/bin/restored"
+  git -C "$repo" archive "$array_candidate" | tar -xf - -C "$scratch/source/restored"
+  roles+=(restored)
+fi
+for role in "${roles[@]}"; do
   dir="$scratch/source/$role"
   mkdir -p "$dir/.tmp"
   sh "$dir/scripts/setup-modules.sh" "$dir"
@@ -119,8 +152,20 @@ while IFS= read -r package; do
   for role in base head; do
     for binary in "$pair/$role/"*.test; do ln -s "$binary" "$scratch/bin/$role/${binary##*/}"; done
   done
+  if [[ -n "$array_candidate" ]]; then
+    restored_pair="$scratch/restored-$label"
+    rc=0
+    "$scratch/bin/benchrun" compile-pair "$scratch/source/base" "$scratch/source/restored" "$restored_pair" "$package" \
+      > "$evidence/pairs/$label.restored.compile.log" 2>&1 || rc=$?
+    if [[ -f "$restored_pair/fixtures.json" ]]; then cp "$restored_pair/fixtures.json" "$evidence/pairs/$label.restored.json"; fi
+    if (( rc != 0 )); then cat "$evidence/pairs/$label.restored.compile.log" >&2; exit "$rc"; fi
+    for binary in "$restored_pair/head/"*.test; do
+      cmp "$restored_pair/base/${binary##*/}" "$scratch/bin/base/${binary##*/}"
+      ln -s "$binary" "$scratch/bin/restored/${binary##*/}"
+    done
+  fi
 done < "$evidence/packages.txt"
-for role in base head; do record_binaries "$role"; done
+for role in "${roles[@]}"; do record_binaries "$role"; done
 
 # The two Planner leaves were introduced by PR 72. Preserve native head-only observations
 # separately. They have no matched historical series and are outside the paired verdict.
@@ -133,11 +178,37 @@ if [[ "$suite" == pr72 ]]; then
   test "$(grep -c '^BenchmarkPlanSelection/' "$evidence/planner-head-only.txt")" = 2
 fi
 
-sample_groups
-test "$(( $(wc -l < "$evidence/order.tsv") - 1 ))" = "$(( 80 * $(wc -l < "$evidence/cases.tsv") ))"
+comparisons=(aa ab)
+if [[ -z "$array_candidate" ]]; then
+  sample_groups
+else
+  comparisons+=(ar)
+  mkdir "$evidence/raw"
+  printf 'group\tpair\tcomparison\tcase\tside\trevision\tvariant\traw\n' > "$evidence/order.tsv"
+  for group in primary confirmation; do
+    offset=0
+    if [[ "$group" == confirmation ]]; then offset=1; fi
+    for number in {1..10}; do
+      printf -v sample '%02d' "$number"
+      if (((number + offset) % 2 == 1)); then first=left; else first=right; fi
+      while IFS=$'\t' read -r case_id package variant name filter; do
+        for index in 0 1 2; do
+          comparison="${comparisons[(index + number + offset + 10#$case_id) % 3]}"
+          case "$comparison" in
+            aa) other=base;;
+            ab) other=head;;
+            ar) other=restored;;
+          esac
+          run_pair "$group" "$sample" "$comparison" "$other" "$first" "$case_id" "$package" "$variant" "$filter"
+        done
+      done < "$evidence/cases.tsv"
+    done
+  done
+fi
+test "$(( $(wc -l < "$evidence/order.tsv") - 1 ))" = "$(( 40 * ${#comparisons[@]} * $(wc -l < "$evidence/cases.tsv") ))"
 printf 'comparison\tgate_exit\n' > "$evidence/verdicts.tsv"
 status=0
-for comparison in aa ab; do
+for comparison in "${comparisons[@]}"; do
   normalize_group "$comparison" primary
   normalize_group "$comparison" confirmation
   rc=0
