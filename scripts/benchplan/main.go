@@ -34,6 +34,15 @@ func run(args []string, output io.Writer) error {
 	if len(args) > 0 && args[0] == "--confirmation-plan" {
 		return writeConfirmationPlan(args)
 	}
+	if len(args) > 0 && args[0] == "--verify-frozen-inventory" {
+		return verifyFrozenInventoryFiles(args, output)
+	}
+	if len(args) > 0 && args[0] == "--native-only-plan" {
+		return writeNativeOnlyPlan(args, output)
+	}
+	if len(args) > 0 && args[0] == "--verify-native-only" {
+		return verifyNativeOnlyFiles(args)
+	}
 	if len(args) != 3 {
 		return errors.New("usage: benchplan <packages.txt> <inventory-dir> <output-dir>")
 	}

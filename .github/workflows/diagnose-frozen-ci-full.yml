@@ -1,0 +1,140 @@
+name: Replay the complete PR 101 performance scope with frozen fixtures
+
+on:
+  push:
+    branches: [diagnostics/frozen-ci-full-pilot]
+    paths:
+      - .github/workflows/diagnose-frozen-ci-full.yml
+      - scripts/benchmark-fixtures.sh
+      - scripts/run-benchmark-samples.sh
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+  PRODUCT_SHA: 8f6633bfc9f325c857e1217112a5e2039e2d85de
+  PRODUCT_TREE: 74f2f384715be4780412fa34a60ca997158fe058
+  GOWORK: 'off'
+  GOTOOLCHAIN: local
+  LC_ALL: C
+
+jobs:
+  discover:
+    if: github.repository == 'light-speak/luxo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Restore and discover the exact full PR 101 scope
+        id: plan
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BASE_SHA" "$PRODUCT_SHA"
+          test "$(git rev-parse "$PRODUCT_SHA^")" = "$BASE_SHA"
+          test "$(git merge-tree --write-tree "$BASE_SHA" "$PRODUCT_SHA")" = "$PRODUCT_TREE"
+          mkdir -p .tmp/base/.tmp .tmp/head/.tmp .tmp/bin
+          git archive "$BASE_SHA" | tar -xf - -C .tmp/base
+          git archive "$PRODUCT_TREE" | tar -xf - -C .tmp/head
+          for side in base head; do sh scripts/setup-modules.sh ".tmp/$side"; done
+          for tool in benchplan benchrun benchscope; do go build -o ".tmp/bin/$tool" "./scripts/$tool"; done
+          for side in base head; do
+            (cd ".tmp/$side" && find pkg -type f -name '*_test.go' -exec grep -l '^func Benchmark' {} + | xargs -r -n 1 dirname) |
+              .tmp/bin/benchrun canonical > ".tmp/$side-benchmark-packages.txt"
+          done
+          comm -12 .tmp/base-benchmark-packages.txt .tmp/head-benchmark-packages.txt > .tmp/common-benchmark-packages.txt
+          git -c core.quotePath=false diff --no-renames --name-only "$BASE_SHA" "$PRODUCT_TREE" > .tmp/changed-files.txt
+          .tmp/bin/benchscope .tmp/base .tmp/head .tmp/changed-files.txt .tmp/common-benchmark-packages.txt > .tmp/benchmark-packages.txt
+          printf '%s\n' pkg/lux/h2transport pkg/lux/luvia pkg/lux/rpc | diff - .tmp/benchmark-packages.txt
+          printf '%s\n' "$BASE_SHA" "$PRODUCT_SHA" "$PRODUCT_TREE" > .tmp/benchmark-revisions.txt
+          matrix=$(bash scripts/benchmark-fixtures.sh plan .tmp)
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+      - name: Preserve complete plans and four inventory roles
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: frozen-ci-full-plan-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: true
+          path: |
+            .tmp/benchmark-plan/
+            .tmp/benchmark-inventory/
+            .tmp/fixture-discovery/
+            .tmp/*benchmark-packages.txt
+            .tmp/benchmark-revisions.txt
+            .tmp/changed-files.txt
+
+  sample:
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover.outputs.matrix).include }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Load the shard and recompile its frozen fixture
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$BASE_SHA" "$PRODUCT_SHA"
+          test "$(git rev-parse "$PRODUCT_SHA^")" = "$BASE_SHA"
+          test "$(git merge-tree --write-tree "$BASE_SHA" "$PRODUCT_SHA")" = "$PRODUCT_TREE"
+          mkdir -p .tmp/base/.tmp .tmp/head/.tmp .tmp/bin .tmp/plan
+          git archive "$BASE_SHA" | tar -xf - -C .tmp/base
+          git archive "$PRODUCT_TREE" | tar -xf - -C .tmp/head
+          for side in base head; do sh scripts/setup-modules.sh ".tmp/$side"; done
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "frozen-ci-full-plan-$GITHUB_RUN_ATTEMPT" --dir .tmp/plan
+          printf '%s\n' "$BASE_SHA" "$PRODUCT_SHA" "$PRODUCT_TREE" > .tmp/benchmark-revisions.txt
+          cmp .tmp/benchmark-revisions.txt .tmp/plan/benchmark-revisions.txt
+          [[ "$SHARD" =~ ^[0-9][0-9]$ ]]
+          cp ".tmp/plan/benchmark-plan/shard-$SHARD.tsv" .tmp/benchmark-batch.tsv
+          cp ".tmp/plan/benchmark-plan/shard-$SHARD.json" .tmp/benchmark-expected.json
+          for tool in benchplan benchrun benchgate; do go build -o ".tmp/bin/$tool" "./scripts/$tool"; done
+          GOBIN="$PWD/.tmp/bin" go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
+          bash scripts/benchmark-fixtures.sh compile .tmp
+      - name: Run the original primary and targeted confirmation protocol
+        run: bash scripts/run-benchmark-samples.sh sample .tmp
+      - name: Measure registered native observations once per package
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: bash scripts/benchmark-fixtures.sh observe .tmp "$SHARD"
+      - name: Enforce the original performance thresholds
+        run: bash scripts/run-benchmark-samples.sh enforce .tmp "$BASE_SHA"
+      - name: Preserve samples and fixture bindings
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: frozen-ci-full-shard-${{ matrix.shard }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 14
+          include-hidden-files: true
+          path: |
+            .tmp/benchmark-*.txt
+            .tmp/benchmark-*.tsv
+            .tmp/benchmark-*.json
+            .tmp/benchstat-*.csv
+            .tmp/benchstat-*-warnings.txt
+            .tmp/fixture-compilation/
+            .tmp/fixture-observations/

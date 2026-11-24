@@ -63,18 +63,26 @@ func readExpectedSamples(path string) (expectedSamples, error) {
 }
 
 func verifySampleFile(path string, expected []sampleKey) error {
+	return verifySampleFileObserving(path, expected, nil)
+}
+
+func verifySampleFileObserving(path string, expected []sampleKey, observe func(string) error) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	if err := verifySamples(file, expected); err != nil {
+	if err := verifySamplesObserving(file, expected, observe); err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 	return nil
 }
 
 func verifySamples(input io.Reader, expected []sampleKey) error {
+	return verifySamplesObserving(input, expected, nil)
+}
+
+func verifySamplesObserving(input io.Reader, expected []sampleKey, observe func(string) error) error {
 	counts := make(map[sampleKey]int, len(expected))
 	for _, key := range expected {
 		if _, exists := counts[key]; exists {
@@ -82,7 +90,7 @@ func verifySamples(input io.Reader, expected []sampleKey) error {
 		}
 		counts[key] = 0
 	}
-	if err := countSamples(input, counts); err != nil {
+	if err := countSamples(input, counts, observe); err != nil {
 		return err
 	}
 	for key, count := range counts {
@@ -93,7 +101,7 @@ func verifySamples(input io.Reader, expected []sampleKey) error {
 	return nil
 }
 
-func countSamples(input io.Reader, counts map[sampleKey]int) error {
+func countSamples(input io.Reader, counts map[sampleKey]int, observe func(string) error) error {
 	scanner := bufio.NewScanner(input)
 	packagePath := ""
 	var completion benchmarkCompletion
@@ -104,6 +112,11 @@ func countSamples(input io.Reader, counts map[sampleKey]int) error {
 		}
 		if err := completion.observe(line); err != nil {
 			return err
+		}
+		if observe != nil {
+			if err := observe(line); err != nil {
+				return err
+			}
 		}
 		if strings.HasPrefix(line, "pkg: ") {
 			packagePath = strings.TrimPrefix(line, "pkg: github.com/light-speak/luxo/")

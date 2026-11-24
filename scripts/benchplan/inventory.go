@@ -47,6 +47,10 @@ func (state benchmarkCompletion) finish() error {
 }
 
 func readInventory(input io.Reader) (inventory, error) {
+	return readInventoryObserving(input, nil)
+}
+
+func readInventoryObserving(input io.Reader, observe func(string) error) (inventory, error) {
 	result := make(inventory)
 	scanner := bufio.NewScanner(input)
 	var completion benchmarkCompletion
@@ -57,6 +61,11 @@ func readInventory(input io.Reader) (inventory, error) {
 		}
 		if err := completion.observe(line); err != nil {
 			return nil, err
+		}
+		if observe != nil {
+			if err := observe(line); err != nil {
+				return nil, err
+			}
 		}
 		if !strings.HasPrefix(line, "Benchmark") {
 			continue

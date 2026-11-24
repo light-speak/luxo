@@ -20,19 +20,7 @@ func TestCanonicalAndInvalidCommand(t *testing.T) {
 }
 
 func TestCompileAndRunBothPartsOfSplit(t *testing.T) {
-	root, err := os.MkdirTemp("../../.tmp", "bench-run-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err = filepath.Abs(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := os.RemoveAll(root); err != nil {
-			t.Error(err)
-		}
-	})
+	root := benchmarkTestRoot(t)
 	files := map[string]string{
 		"go.mod":                            "module github.com/light-speak/luxo\ngo 1.27.1\n",
 		"go.work":                           "go 1.27.1\nuse (\n.\n./pkg/lux/cache/redis\n)\n",
@@ -64,4 +52,25 @@ func TestCompileAndRunBothPartsOfSplit(t *testing.T) {
 			t.Fatalf("missing %s: %s", want, out.String())
 		}
 	}
+}
+
+func benchmarkTestRoot(t *testing.T) string {
+	t.Helper()
+	base, err := filepath.Abs("../../.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp(base, "benchrun-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(root); err != nil {
+			t.Error(err)
+		}
+	})
+	return root
 }
