@@ -22,7 +22,9 @@ type qualityEntry struct {
 const (
 	swiftNativeCIJob      = "sdk-swift-native"
 	swiftConformanceCIJob = "sdk-swift-conformance"
-	swiftInteropLanes     = "matrix.lane != 'wire'"
+	swiftVersionReady     = "${{ !cancelled() && steps.swift-version.outcome == 'success' }}"
+	swiftGoReady          = "${{ !cancelled() && steps.swift-go.outcome == 'success' }}"
+	swiftModulesReady     = "${{ !cancelled() && steps.swift-modules.outcome == 'success' }}"
 )
 
 type qualityWorkflow struct {
@@ -41,10 +43,10 @@ type qualityWorkflow struct {
 			Matrix      struct{ Dart, Lane []string }
 		}
 		Steps []struct {
-			Name, Run, Uses, If string
-			WorkingDirectory    string `yaml:"working-directory"`
-			With, Env           map[string]string
-			ContinueOnError     bool `yaml:"continue-on-error"`
+			Name, Run, Uses, If, ID string
+			WorkingDirectory        string `yaml:"working-directory"`
+			With, Env               map[string]string
+			ContinueOnError         bool `yaml:"continue-on-error"`
 		}
 	}
 }
@@ -276,13 +278,9 @@ func TestSDKInteropCIIncludesBothTopologies(t *testing.T) {
 						t.Errorf("%s must not ignore %s failure", job, mode)
 					}
 					if job == swiftNativeCIJob {
-						lane := "direct"
-						if strings.Contains(mode, "-gateway") {
-							lane = "gateway"
-						}
-						if step.If != "matrix.lane == '"+lane+"'" || strings.TrimSpace(step.Run) != command ||
-							step.Env["LUXO_SWIFT_PATH"] != "${{ github.workspace }}/.tmp/luxo-swift" {
-							t.Errorf("Swift %s must run the original consumer once in %s against the pinned checkout", mode, lane)
+						if step.If != swiftModulesReady || strings.TrimSpace(step.Run) != command ||
+							step.Env["LUXO_SWIFT_PATH"] != "" {
+							t.Errorf("Swift %s must run the original consumer once after module setup", mode)
 						}
 					}
 				}
@@ -294,44 +292,99 @@ func TestSDKInteropCIIncludesBothTopologies(t *testing.T) {
 	}
 }
 
-func TestSwiftCIUsesThreeNativeLanes(t *testing.T) {
-	job := readQualityWorkflow(t).Jobs[swiftNativeCIJob]
-	if !slices.Equal(job.Strategy.Matrix.Lane, []string{"wire", "direct", "gateway"}) {
-		t.Fatalf("Swift CI requires wire, direct and gateway lanes, got %v", job.Strategy.Matrix.Lane)
-	}
-	if job.If != "" || job.Needs.Kind != 0 || job.RunsOn != "macos-26" || job.TimeoutMinutes != 20 ||
-		job.Strategy.FailFast == nil || *job.Strategy.FailFast || job.ContinueOnError ||
-		(job.Strategy.MaxParallel != 0 && job.Strategy.MaxParallel < len(job.Strategy.Matrix.Lane)) {
-		t.Fatal("Swift lanes must run independently on macOS and propagate failures")
-	}
-	if job.Env["DEVELOPER_DIR"] != "/Applications/Xcode_26.6.app/Contents/Developer" ||
-		len(job.Permissions) != 1 || job.Permissions["contents"] != "read" {
-		t.Fatal("Swift lanes must preserve the pinned Xcode and read-only access")
-	}
-	wire := 0
-	for _, step := range job.Steps {
-		if step.Name != "Verify Swift wire protocol compatibility" {
-			continue
-		}
-		wire++
-		if step.If != "matrix.lane == 'wire'" || step.ContinueOnError ||
-			step.Run != "swift test --package-path .tmp/luxo-swift --filter ProtocolConformanceTests" ||
-			step.Env["LUXO_PROTOCOL_FIXTURE"] != "${{ github.workspace }}/pkg/lux/codec/testdata/protocol-v1.json" {
-			t.Error("the wire lane must run the original protocol conformance check with the release corpus")
+func TestCIExecutesSharedInteropFixtureSuiteOnce(t *testing.T) {
+	workflow := readQualityWorkflow(t)
+	found := 0
+	for jobName, job := range workflow.Jobs {
+		for _, step := range job.Steps {
+			if !strings.Contains(step.Run, "go test ./tests/sdk-interop") {
+				continue
+			}
+			found++
+			if jobName != "test" || step.If != "" || step.ContinueOnError ||
+				step.Run != "go test ./tests/sdk-interop -count=1" {
+				t.Errorf("shared Go fixture suite must run as a required Linux check, got %s: %s", jobName, step.Run)
+			}
 		}
 	}
-	if wire != 1 {
-		t.Fatalf("expected one wire check, got %d", wire)
+	if found != 1 {
+		t.Errorf("expected one shared Go fixture suite, got %d", found)
 	}
 }
 
-func TestSwiftCIRequiresAllNativeLanes(t *testing.T) {
+func TestCIIndependentModulesHaveOneVetStep(t *testing.T) {
+	workflow := readQualityWorkflow(t)
+	var checked []string
+	for _, step := range workflow.Jobs["lint"].Steps {
+		if step.Name == "Vet" && step.If == "" && !step.ContinueOnError {
+			checked = strings.Fields(step.Run)
+		}
+	}
+	for _, module := range []string{"./cmd/luxo/...", "./pkg/lux/pg/...", "./pkg/lux/nats/...",
+		"./pkg/lux/cache/redis/...", "./pkg/lux/storage/s3/..."} {
+		if !slices.Contains(checked, module) {
+			t.Errorf("required lint vet does not include %s", module)
+		}
+	}
+	for _, step := range workflow.Jobs["test"].Steps {
+		if strings.Contains(step.Run, "go vet ") {
+			t.Errorf("test job repeats the dedicated lint vet: %s", step.Name)
+		}
+	}
+}
+
+func TestSwiftCIUsesOneNativeHost(t *testing.T) {
+	job := readQualityWorkflow(t).Jobs[swiftNativeCIJob]
+	if job.If != "" || job.Needs.Kind != 0 || job.RunsOn != "macos-26" || job.TimeoutMinutes != 30 ||
+		job.ContinueOnError || job.Strategy.FailFast != nil || job.Strategy.MaxParallel != 0 ||
+		len(job.Strategy.Matrix.Lane) != 0 {
+		t.Fatal("Swift checks must run on one bounded macOS job and propagate failures")
+	}
+	if job.Env["DEVELOPER_DIR"] != "/Applications/Xcode_26.6.app/Contents/Developer" ||
+		job.Env["LUXO_SWIFT_PATH"] != "${{ github.workspace }}/.tmp/luxo-swift" ||
+		len(job.Permissions) != 1 || job.Permissions["contents"] != "read" {
+		t.Fatal("Swift checks must use the shared pinned SDK, Xcode and read-only access")
+	}
+	assertSwiftWireBeforeGoSetup(t)
+}
+
+func assertSwiftWireBeforeGoSetup(t *testing.T) {
+	t.Helper()
+	version, wire, setup := -1, -1, -1
+	for index, step := range readQualityWorkflow(t).Jobs[swiftNativeCIJob].Steps {
+		switch step.Name {
+		case "Verify Swift candidate version":
+			version = index
+			if step.ID != "swift-version" {
+				t.Error("later steps must use the actual version check outcome")
+			}
+		case "Verify Swift wire protocol compatibility":
+			if wire >= 0 {
+				t.Fatal("duplicate Swift wire check")
+			}
+			wire = index
+			if step.If != "" || step.ContinueOnError ||
+				step.Run != "swift test --package-path .tmp/luxo-swift --filter ProtocolConformanceTests" ||
+				step.Env["LUXO_PROTOCOL_FIXTURE"] != "${{ github.workspace }}/pkg/lux/codec/testdata/protocol-v1.json" {
+				t.Error("Swift wire must run the original protocol check with the release corpus")
+			}
+		}
+		if step.ID == "swift-go" {
+			setup = index
+		}
+	}
+	if version < 0 || wire <= version || setup <= wire {
+		t.Fatalf("expected Swift version, wire, Go setup in order, got %d %d %d", version, wire, setup)
+	}
+}
+
+func TestSwiftCIRequiresNativeResult(t *testing.T) {
 	job := readQualityWorkflow(t).Jobs[swiftConformanceCIJob]
 	var dependencies []string
 	if err := job.Needs.Decode(&dependencies); err != nil || !slices.Equal(dependencies, []string{swiftNativeCIJob}) ||
 		job.If != "always()" || job.ContinueOnError || job.Permissions == nil || len(job.Permissions) != 0 ||
 		len(job.Steps) != 1 {
-		t.Fatalf("the stable Swift check must aggregate all native lanes without permissions: %v", err)
+		t.Fatalf("the stable Swift check must require the native result without permissions: %v", err)
 	}
 	step := job.Steps[0]
 	if step.If != "" || step.ContinueOnError || step.Env["SWIFT_NATIVE_RESULT"] != "${{ needs.sdk-swift-native.result }}" {
@@ -765,8 +818,8 @@ func TestSDKInteropBindsCandidateModules(t *testing.T) {
 			for index, step := range workflow.Jobs[job].Steps {
 				if strings.HasPrefix(step.Uses, "actions/setup-go@") {
 					goSetup = index
-					if job == swiftNativeCIJob && (step.If != swiftInteropLanes || step.ContinueOnError) {
-						t.Error("Swift must set up Go only in the consumer lanes and require setup success")
+					if job == swiftNativeCIJob && (step.ID != "swift-go" || step.If != swiftVersionReady || step.ContinueOnError) {
+						t.Error("Go setup needs a successful SDK version check and may run after a wire failure")
 					}
 				}
 				if step.Uses == "./.github/actions/setup-modules" {
@@ -776,14 +829,18 @@ func TestSDKInteropBindsCandidateModules(t *testing.T) {
 					if job == "sdk-ts" {
 						condition = "matrix.package == 'vite-plugin'"
 					} else if job == swiftNativeCIJob {
-						condition = swiftInteropLanes
+						condition = swiftGoReady
+						if step.ID != "swift-modules" {
+							t.Error("consumer steps must use the actual module graph setup outcome")
+						}
 					}
 					if step.If != condition || step.ContinueOnError {
 						t.Error("module setup must match Go setup and propagate failures")
 					}
 				}
 				consumer := strings.Contains(step.Run, "./tests/sdk-interop") ||
-					strings.Contains(step.Run, "pnpm test") || strings.Contains(step.Run, "./gradlew build")
+					strings.Contains(step.Run, "pnpm test") || strings.Contains(step.Run, "./gradlew build") ||
+					job == "sdk-dart" && strings.HasPrefix(step.Run, "dart test ")
 				if consumer && firstConsumer < 0 {
 					firstConsumer = index
 				}
