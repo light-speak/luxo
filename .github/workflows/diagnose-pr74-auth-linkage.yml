@@ -33,7 +33,7 @@ jobs:
             'AMD EPYC 9V45 96-Core Processor') scope=9v45 ;;
             'AMD EPYC 9V74 80-Core Processor') scope=9v74 ;;
             'INTEL(R) XEON(R) PLATINUM 8573C') scope=8573c ;;
-            *) printf 'No matching CPU for this diagnostic: %s\n' "$cpu" >&2; exit 3 ;;
+            *) scope=elf-only ;;
           esac
           printf 'scope=%s\ncpu=%s\n' "$scope" "$cpu" | tee "$receipt/selection.txt" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
@@ -49,11 +49,12 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
-          IFS=$'\t' read -r cpu shard artifact digest < <(python3 scripts/diagnose-pr74-auth-linkage.py tuple "$SCOPE")
-          [[ "$cpu" == "$CPU" && "$artifact" =~ ^[0-9]+$ && "$digest" =~ ^[0-9a-f]{64}$ ]]
           git fetch --no-tags --depth=1 origin \
             a2c411b7b83ca233881ace0c5bf3bec0b9646e1d a1faf2f6d2aa4b733ee09959387ff433917d98b0 \
             c50446aaf51d439a105ce674bdddd93407270a5d
+          [[ "$SCOPE" != elf-only ]] || exit 0
+          IFS=$'\t' read -r cpu shard artifact digest < <(python3 scripts/diagnose-pr74-auth-linkage.py tuple "$SCOPE")
+          [[ "$cpu" == "$CPU" && "$artifact" =~ ^[0-9]+$ && "$digest" =~ ^[0-9a-f]{64}$ ]]
           receipt="$GITHUB_WORKSPACE/.tmp/pr74-auth-linkage-selection"
           gh api "repos/light-speak/luxo/actions/artifacts/$artifact" > "$receipt/formal-metadata.json"
           jq -e --arg id "$artifact" --arg digest "sha256:$digest" --arg shard "$shard" '
@@ -76,7 +77,11 @@ jobs:
           GOTOOLCHAIN: local
           GOAMD64: v1
           CGO_ENABLED: '1'
-        run: bash scripts/diagnose-pr74-auth-linkage.sh . "$SCOPE" .tmp/formal.zip
+        run: |
+          set -euo pipefail
+          input=.tmp/formal.zip
+          if [[ "$SCOPE" == elf-only ]]; then input=-; fi
+          bash scripts/diagnose-pr74-auth-linkage.sh . "$SCOPE" "$input"
       - name: Publish source, samples and binary evidence
         if: always()
         uses: actions/upload-artifact@v7.0.2

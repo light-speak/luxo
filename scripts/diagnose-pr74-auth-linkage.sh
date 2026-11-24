@@ -3,14 +3,20 @@ set -euo pipefail
 export LC_ALL=C
 
 if [[ $# != 3 && ( $# != 4 || "$4" != --plan-only ) ]]; then
-  printf 'usage: %s <git-worktree> <9v45|9v74|8573c> <formal-shard.zip> [--plan-only]\n' "$0" >&2
+  printf 'usage: %s <git-worktree> <9v45|9v74|8573c> <formal-shard.zip> [--plan-only]\n       %s <git-worktree> elf-only -\n' "$0" "$0" >&2
   exit 2
 fi
 repo=$(git -C "$1" rev-parse --show-toplevel)
 scope=$2
-archive="$(cd "$(dirname "$3")" && pwd -P)/$(basename "$3")"
 helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/diagnose-pr74-auth-linkage.py"
-IFS=$'\t' read -r cpu shard artifact digest < <(python3 "$helper" tuple "$scope")
+artifact=none
+digest=none
+if [[ "$scope" == elf-only ]]; then
+  [[ $# == 3 && "$3" == - ]]
+else
+  archive="$(cd "$(dirname "$3")" && pwd -P)/$(basename "$3")"
+  IFS=$'\t' read -r cpu shard artifact digest < <(python3 "$helper" tuple "$scope")
+fi
 base=a2c411b7b83ca233881ace0c5bf3bec0b9646e1d
 head=a1faf2f6d2aa4b733ee09959387ff433917d98b0
 tested=c50446aaf51d439a105ce674bdddd93407270a5d
@@ -19,7 +25,9 @@ benchtime=200ms
 
 if [[ "${4:-}" != --plan-only ]]; then
   [[ "$(uname -sm)" == 'Linux x86_64' ]]
-  [[ "$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | sed 's/[[:space:]]*$//')" == "$cpu" ]]
+  if [[ "$scope" != elf-only ]]; then
+    [[ "$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | sed 's/[[:space:]]*$//')" == "$cpu" ]]
+  fi
   export GOWORK=off GOTOOLCHAIN=local
   [[ "$(go env GOVERSION GOHOSTOS GOHOSTARCH GOOS GOARCH GOAMD64 CGO_ENABLED)" == $'go1.27.1\nlinux\namd64\nlinux\namd64\nv1\n1' ]]
   [[ -z "$(go env GOFLAGS GOEXPERIMENT | tr -d '\n')" ]]
@@ -47,9 +55,11 @@ auth_tree=$("${graft[@]}" write-tree)
 [[ "$auth_tree" == b518d1fe4270e372f55c0c8fef16f5c012192434 ]]
 "${graft[@]}" diff --name-only "$tested" "$auth_tree" > "$evidence/auth-only-diff.txt"
 cmp "$evidence/auth-only-diff.txt" <(printf '%s\n' pkg/lux/luvia/middleware.go pkg/lux/luvia/middleware_test.go)
-printf 'base=%s\nhead=%s\ntested=%s\nhead_tree=%s\nauth_only_tree=%s\nartifact=%s\nsha256=%s\n' \
-  "$base" "$head" "$tested" "$head_tree" "$auth_tree" "$artifact" "$digest" > "$evidence/revisions.txt"
-python3 "$helper" plan "$scope" "$archive" "$evidence"
+printf 'base=%s\nhead=%s\ntested=%s\nhead_tree=%s\nauth_only_tree=%s\nscope=%s\nartifact=%s\nsha256=%s\n' \
+  "$base" "$head" "$tested" "$head_tree" "$auth_tree" "$scope" "$artifact" "$digest" > "$evidence/revisions.txt"
+if [[ "$scope" != elf-only ]]; then
+  python3 "$helper" plan "$scope" "$archive" "$evidence"
+fi
 printf '%s\n' "$evidence"
 [[ "${4:-}" != --plan-only ]] || exit 0
 
@@ -59,7 +69,7 @@ uname -a > "$evidence/host.txt"
 lscpu > "$evidence/lscpu.txt"
 go env -json GOVERSION GOHOSTOS GOHOSTARCH GOOS GOARCH GOAMD64 CGO_ENABLED GOFLAGS GOEXPERIMENT CC > "$evidence/go-env.json"
 roles=(base head)
-if [[ "$scope" != 9v74 ]]; then roles+=(auth-only); fi
+if [[ "$scope" != 9v74 && "$scope" != elf-only ]]; then roles+=(auth-only); fi
 for role in "${roles[@]}"; do
   case "$role" in base) revision=$base ;; head) revision=$tested ;; auth-only) revision=$auth_tree ;; esac
   source="$scratch/source/$role"
@@ -70,18 +80,23 @@ for role in "${roles[@]}"; do
 done
 (
   cd "$scratch/source/head"
-  for tool in benchrun benchplan benchgate; do go build -o "$scratch/bin/$tool" "./scripts/$tool"; done
-  (cd "$scratch" && go mod download -json golang.org/x/perf@v0.0.0-20260825160852-19be9d8e6c70) > "$evidence/benchstat-module.json"
-  perf_dir=$(jq -er 'select(.Sum == "h1:M+kM03JKR23KkrutTue5KEQYDSbZTZTJ4FJ1v5zYrHM=") | .Dir' "$evidence/benchstat-module.json")
-  (cd "$perf_dir" && go build -o "$scratch/bin/benchstat" ./cmd/benchstat)
-  go version -m "$scratch/bin/"{benchrun,benchplan,benchgate,benchstat}
+  go build -o "$scratch/bin/benchrun" ./scripts/benchrun
+  if [[ "$scope" != elf-only ]]; then
+    for tool in benchplan benchgate; do go build -o "$scratch/bin/$tool" "./scripts/$tool"; done
+    (cd "$scratch" && go mod download -json golang.org/x/perf@v0.0.0-20260825160852-19be9d8e6c70) > "$evidence/benchstat-module.json"
+    perf_dir=$(jq -er 'select(.Sum == "h1:M+kM03JKR23KkrutTue5KEQYDSbZTZTJ4FJ1v5zYrHM=") | .Dir' "$evidence/benchstat-module.json")
+    (cd "$perf_dir" && go build -o "$scratch/bin/benchstat" ./cmd/benchstat)
+  fi
+  go version -m "$scratch/bin/"*
 ) > "$evidence/tools.log" 2>&1
 
 runner="$scratch/bin/benchrun"
 planner="$scratch/bin/benchplan"
 gate="$scratch/bin/benchgate"
 "$runner" performance-profile > "$evidence/compile-profile.txt"
-cmp "$evidence/compile-profile.txt" "$evidence/formal-benchmark-compile-profile.txt"
+if [[ "$scope" != elf-only ]]; then
+  cmp "$evidence/compile-profile.txt" "$evidence/formal-benchmark-compile-profile.txt"
+fi
 
 compile_role() {
   local role=$1 pkg=$2 profile=$3 kind=$4 command=compile-performance mark= binary
@@ -108,6 +123,11 @@ for role in base head; do
 done
 python3 "$helper" elf "$scratch/bin/base/pkg-lux-api-api-non-identity.test" "$scratch/bin/head/pkg-lux-api-api-non-identity.test" \
   "$evidence/api-base.nm" "$evidence/api-head.nm" > "$evidence/api-elf.json"
+if [[ "$scope" == elf-only ]]; then
+  (cd "$evidence" && sha256sum -c -- ./*.sha256) > "$evidence/binary-recheck.txt"
+  printf '%s\n' 'ELF comparison completed on a native Linux amd64 runner. No timing samples were collected.'
+  exit 0
+fi
 if [[ "$scope" != 9v74 ]]; then
   for role in "${roles[@]}"; do
     compile_role "$role" pkg/lux/luvia default luvia
