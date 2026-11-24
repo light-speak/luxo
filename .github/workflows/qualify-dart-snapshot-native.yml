@@ -1,0 +1,48 @@
+name: Qualify Dart snapshots natively
+
+on:
+  push:
+    branches: [diagnostics/dart-snapshot-native]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: native (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux
+            python: python3
+          - runner: windows-2025
+            platform: windows
+            python: python
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.13.4'
+
+      - name: Verify the pinned product on the native runner
+        env:
+          DART_NATIVE_PLATFORM: ${{ matrix.platform }}
+        run: ${{ matrix.python }} .github/qualification/dart-snapshot-native.py
+
+      - name: Preserve revision, test events, and verdict
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: dart-snapshot-native-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/dart-snapshot-native-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
