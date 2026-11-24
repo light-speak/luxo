@@ -1,0 +1,147 @@
+name: Run the pending native diagnostic for the assigned CPU model
+
+on:
+  push:
+    branches: [diagnostics/native-cpu-match]
+    paths: [.github/workflows/diagnose-native-cpu-match.yml]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  match:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/native-cpu-match'
+    runs-on: ubuntu-latest
+    timeout-minutes: 32
+    steps:
+      - name: Identify the assigned runner before checkout
+        id: cpu
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          mkdir -p .tmp/native-cpu-selection
+          receipt=.tmp/native-cpu-selection
+          printf 'run=%s\nattempt=%s\nworkflow_sha=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" > "$receipt/selection.txt"
+          uname -a > "$receipt/uname.txt"
+          if [[ "$RUNNER_OS" != Linux || "$RUNNER_ARCH" != X64 || "$(uname -m)" != x86_64 ]]; then
+            printf 'status=incompatible-host\n' >> "$receipt/selection.txt"
+            exit 2
+          fi
+          lscpu > "$receipt/lscpu.txt"
+          mapfile -t names < <(sed -n 's/^Model name:[[:space:]]*//p' "$receipt/lscpu.txt")
+          if (( ${#names[@]} != 1 )) || [[ -z "${names[0]}" ]]; then
+            printf 'status=invalid-model\n' >> "$receipt/selection.txt"
+            exit 2
+          fi
+          printf 'cpu=%s\n' "${names[0]}" >> "$receipt/selection.txt"
+          case "${names[0]^^}" in
+            'INTEL(R) XEON(R) 6975P-C')
+              suite=pr82-lux-short-path
+              diagnostic=d91a6be31ee7d3e7d9c97cf37809820b22557c00
+              tree=c810f46534ce008d10d5be963459d56a4169f115
+              head=0bcc72b6861423c53b615d3b80a5cad36688d4ff
+              input=pr82-short-path-08.zip
+              artifact=14919152905
+              formal_run=45387275899
+              digest=addc34c9a86d6f20a77b02321bfcb835b7de20ac1f9e7948d45935d6336adca3
+              ;;
+            'AMD EPYC 7763 64-CORE PROCESSOR')
+              suite=pr93-duration-closure
+              diagnostic=feb1f59e5e75e42ee9d4d8a9eba08cce7aef231b
+              tree=99789fdc9f30873a8478ddab376fccb2815104ee
+              head=40153f3e18f9f32baca9f656986a5e696f392a2f
+              input=pr93-duration-official-45386469196-1.zip
+              artifact=14917073661
+              formal_run=45386469196
+              digest=e7ad88b0ebdf9baf9fe7ef49ee6645d489ab0be469e21d6b4ade4b0074d49d48
+              ;;
+            'INTEL(R) XEON(R) PLATINUM 8573C')
+              suite=pr103-short-paths
+              diagnostic=4afba3abe78bd692edcda4daa9dfc1034311cec7
+              tree=95bbced3a21965379d000a2903196c52622cdb40
+              head=dcf2ca3eb2193f2e060051dfe4d47c5277b19f5d
+              input=pr103-short-path-formal-03.zip
+              artifact=14917795901
+              formal_run=45385956331
+              digest=26fc97aea69750a853d11f6735b683f08c1083e3113b342c5b1e11b14ad57892
+              ;;
+            *)
+              printf 'status=no-matching-pending-scope\n' >> "$receipt/selection.txt"
+              printf 'No pending native diagnostic matches the assigned model.\n' >&2
+              exit 3
+              ;;
+          esac
+          {
+            printf 'suite=%s\ndiagnostic=%s\ntree=%s\nhead=%s\n' "$suite" "$diagnostic" "$tree" "$head"
+            printf 'artifact=%s\nformal_run=%s\ndigest=%s\ninput=%s\n' "$artifact" "$formal_run" "$digest" "$input"
+            printf 'evidence=.tmp/native-cpu-worktree/.tmp/hosted-%s/\n' "$suite"
+          } | tee -a "$receipt/selection.txt" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          path: native-cpu-dispatch
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch and verify only the selected diagnostic inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIAGNOSTIC: ${{ steps.cpu.outputs.diagnostic }}
+          DIAGNOSTIC_TREE: ${{ steps.cpu.outputs.tree }}
+          PRODUCT_HEAD: ${{ steps.cpu.outputs.head }}
+          FORMAL_ARTIFACT: ${{ steps.cpu.outputs.artifact }}
+          FORMAL_RUN: ${{ steps.cpu.outputs.formal_run }}
+          FORMAL_DIGEST: ${{ steps.cpu.outputs.digest }}
+          FORMAL_INPUT: ${{ steps.cpu.outputs.input }}
+        run: |
+          set -euo pipefail
+          base=925f30ee1dcd45882b29130b8ed02836ed88317e
+          root="$GITHUB_WORKSPACE/.tmp/native-cpu-worktree"
+          receipt="$GITHUB_WORKSPACE/.tmp/native-cpu-selection"
+          git -C native-cpu-dispatch fetch --no-tags origin "$DIAGNOSTIC" "$base" "$PRODUCT_HEAD"
+          git -C native-cpu-dispatch worktree add --detach "$root" "$DIAGNOSTIC"
+          test "$(git -C "$root" rev-parse HEAD)" = "$DIAGNOSTIC"
+          test "$(git -C "$root" rev-parse 'HEAD^{tree}')" = "$DIAGNOSTIC_TREE"
+          printf '%s  %s\n' 9e0a5f421f2e76674b819f81074a3d416a51174e0f93b858a63d20c27d64e072 "$root/scripts/diagnose-hosted-perf.sh" | sha256sum -c -
+          mkdir -p "$root/.tmp"
+          gh api "repos/light-speak/luxo/actions/artifacts/$FORMAL_ARTIFACT" > "$receipt/artifact-metadata.json"
+          jq -e --arg id "$FORMAL_ARTIFACT" --arg run "$FORMAL_RUN" --arg head "$PRODUCT_HEAD" --arg digest "sha256:$FORMAL_DIGEST" '
+            ((.id | tostring) == $id) and ((.workflow_run.id | tostring) == $run) and
+            (.workflow_run.head_sha == $head) and (.digest == $digest) and (.expired == false)
+          ' "$receipt/artifact-metadata.json"
+          gh api "repos/light-speak/luxo/actions/artifacts/$FORMAL_ARTIFACT/zip" > "$root/.tmp/$FORMAL_INPUT"
+          (cd "$root/.tmp" && printf '%s  %s\n' "$FORMAL_DIGEST" "$FORMAL_INPUT" | sha256sum -c -) > "$receipt/artifact-digest-check.txt"
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Run the pinned diagnostic on the same runner
+        working-directory: .tmp/native-cpu-worktree
+        env:
+          SUITE: ${{ steps.cpu.outputs.suite }}
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+        run: |
+          set -euo pipefail
+          case "$SUITE" in
+            pr82-lux-short-path|pr93-duration-closure)
+              exec bash "scripts/diagnose-$SUITE.sh"
+              ;;
+            pr103-short-paths)
+              PR103_REQUIRED_SHORT_PATH_SCOPE=intel exec bash scripts/diagnose-pr103-short-paths.sh run
+              ;;
+            *) exit 2 ;;
+          esac
+      - name: Preserve the CPU selection and diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: native-cpu-match-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .tmp/native-cpu-selection/
+            ${{ steps.cpu.outputs.evidence }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
