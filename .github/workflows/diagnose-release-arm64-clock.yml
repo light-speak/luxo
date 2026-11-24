@@ -1,0 +1,161 @@
+name: Verify the Linux ARM64 release benchmark environment
+
+on:
+  push:
+    branches: [diagnostics/release-arm64-clock]
+    paths: [.github/workflows/diagnose-release-arm64-clock.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    if: ${{ github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/release-arm64-clock' }}
+    name: Linux ARM64 clock and resource limits
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 8
+    steps:
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+
+      - name: Check native and container clocks against the release limit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/release-arm64-evidence
+          evidence="$PWD/.tmp/release-arm64-evidence"
+          scratch=$(mktemp -d "$PWD/.tmp/release-arm64-clock.XXXXXXXX")
+          image="luxo-clock-preflight:$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          container="luxo-clock-preflight-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          cleanup() {
+            local status=$?
+            trap - EXIT
+            if docker container inspect "$container" >/dev/null 2>&1; then
+              docker container rm --force "$container" || status=1
+            fi
+            if docker image inspect "$image" >/dev/null 2>&1; then
+              docker image rm "$image" || status=1
+            fi
+            if docker container inspect "$container" >/dev/null 2>&1 ||
+                docker image inspect "$image" >/dev/null 2>&1; then
+              status=1
+            fi
+            if [[ -d "$scratch" && "$scratch" == "$PWD"/.tmp/release-arm64-clock.* ]]; then
+              rm -rf -- "$scratch" || status=1
+            else
+              status=1
+            fi
+            printf 'exit=%s\n' "$status" > "$evidence/cleanup.txt"
+            exit "$status"
+          }
+          trap cleanup EXIT
+          uname -sm > "$evidence/kernel.txt"
+          test "$(cat "$evidence/kernel.txt")" = 'Linux aarch64'
+          go version > "$evidence/go-version.txt"
+          test "$(cat "$evidence/go-version.txt")" = 'go version go1.27.1 linux/arm64'
+          docker info --format '{{.Architecture}} cgroup={{.CgroupVersion}}' > "$evidence/docker.txt"
+          grep -q ' cgroup=2$' "$evidence/docker.txt"
+          cat > "$scratch/clock.go" <<'GO'
+          package main
+
+          import (
+              "encoding/json"
+              "log"
+              "os"
+              "strconv"
+              "strings"
+              "time"
+          )
+
+          func checkLimits() {
+              cpu, err := os.ReadFile("/sys/fs/cgroup/cpu.max")
+              if err != nil {
+                  log.Fatal(err)
+              }
+              fields := strings.Fields(string(cpu))
+              if len(fields) != 2 || fields[0] != fields[1] {
+                  log.Fatalf("expected one CPU, saw %q", cpu)
+              }
+              quota, err := strconv.Atoi(fields[0])
+              if err != nil || quota <= 0 {
+                  log.Fatalf("invalid CPU quota %q", cpu)
+              }
+              memory, err := os.ReadFile("/sys/fs/cgroup/memory.max")
+              if err != nil || strings.TrimSpace(string(memory)) != "268435456" {
+                  log.Fatalf("expected 256 MiB, saw %q (%v)", memory, err)
+              }
+              log.Printf("cpu.max=%s, memory.max=%s", strings.TrimSpace(string(cpu)), strings.TrimSpace(string(memory)))
+          }
+
+          func main() {
+              if os.Getenv("LUXO_EXPECT_CGROUP_LIMITS") == "1" {
+                  checkLimits()
+              }
+              output := json.NewEncoder(os.Stdout)
+              start := time.Now()
+              for index := range 97 {
+                  now := time.Now()
+                  row := struct {
+                      Sequence, RealtimeNS, ElapsedNS int64
+                  }{int64(index), now.UnixNano(), now.Sub(start).Nanoseconds()}
+                  if err := output.Encode(row); err != nil {
+                      log.Fatal(err)
+                  }
+                  if index < 96 {
+                      time.Sleep(250 * time.Millisecond)
+                  }
+              }
+          }
+          GO
+          GOWORK=off GOPROXY=off GOSUMDB=off CGO_ENABLED=0 \
+            go build -trimpath -o "$scratch/clock" "$scratch/clock.go"
+          sha256sum "$scratch/clock" > "$evidence/probe.sha256"
+          printf 'FROM scratch\nCOPY clock /clock\nENTRYPOINT ["/clock"]\n' > "$scratch/Dockerfile"
+          docker build --network=none -t "$image" "$scratch" > "$evidence/image.log"
+          "$scratch/clock" > "$evidence/host.jsonl"
+          docker run --rm --name "$container" --network none --cpus 1 --memory 256m \
+            --cap-drop ALL -e LUXO_EXPECT_CGROUP_LIMITS=1 "$image" \
+            > "$evidence/container.jsonl" 2> "$evidence/limits.txt"
+          python3 - "$evidence" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          evidence = Path(sys.argv[1])
+          summary = {}
+          for role in ("host", "container"):
+              measurements = [
+                  json.loads(line) for line in (evidence / f"{role}.jsonl").read_text().splitlines()
+              ]
+              assert [row["Sequence"] for row in measurements] == list(range(97))
+              assert all(
+                  second["ElapsedNS"] > first["ElapsedNS"]
+                  for first, second in zip(measurements, measurements[1:])
+              )
+              origin = measurements[0]["RealtimeNS"] - measurements[0]["ElapsedNS"]
+              drift = max(
+                  abs(row["RealtimeNS"] - row["ElapsedNS"] - origin) for row in measurements
+              )
+              summary[role] = {
+                  "samples": len(measurements),
+                  "durationSeconds": measurements[-1]["ElapsedNS"] / 1e9,
+                  "maxWallMonotonicDeltaNs": drift,
+                  "thresholdNs": 2_000_000,
+                  "passed": drift <= 2_000_000,
+              }
+          (evidence / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+          print(json.dumps(summary, indent=2))
+          if not all(window["passed"] for window in summary.values()):
+              raise SystemExit("The runner exceeded the 2 ms release clock limit")
+          PY
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: release-arm64-clock-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/release-arm64-evidence
+          if-no-files-found: error
+          retention-days: 7
