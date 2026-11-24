@@ -1,0 +1,46 @@
+name: Diagnose PR 71 RPC signing fixture linkage
+
+on:
+  push:
+    branches: [diagnostics/pr71-rpc-auth-link]
+    paths:
+      - .github/workflows/diagnose-pr71-rpc-auth-link.yml
+      - scripts/diagnose-pr71-rpc-auth-link.sh
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr71-rpc-auth-link'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch exact PR 71 sources
+        run: >-
+          git fetch --no-tags origin
+          ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+          ec041a07b105c9caf9e327a2cbf73de772582d00
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Compare ordinary and signing-fixture-isolated builds
+        env:
+          GOTOOLCHAIN: local
+          GOAMD64: v1
+          CGO_ENABLED: 1
+        run: bash scripts/diagnose-pr71-rpc-auth-link.sh
+      - name: Preserve full inventories and raw sample pairs
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: hosted-pr71-rpc-auth-link-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/hosted-pr71-rpc-auth-link/
+          if-no-files-found: error
+          retention-days: 14
