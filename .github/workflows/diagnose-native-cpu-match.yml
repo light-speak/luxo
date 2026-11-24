@@ -64,7 +64,7 @@ jobs:
               artifact=14924072511
               formal_run=45397856587
               digest=67c6414b54e7410188c0227b7266c30a16c9c0863fea7a1b8433c281feaddb25
-              evidence='.tmp/native-cpu-worktree/.tmp/pr72-boxed-json-evidence-p.*/'
+              evidence='.tmp/native-cpu-worktree/.tmp/pr72-boxed-json-evidence-q.*/'
               ;;
             'AMD EPYC 7763 64-CORE PROCESSOR')
               suite=pr71-columnar
@@ -161,6 +161,19 @@ jobs:
               ae494d7c3d6cd1d53eb3517b45fa3cf7d2480c5687acb821b554941e6c4b443e "$root/scripts/diagnose-pr72-boxed-json/causal-order.py" \
               522436aa467d4a88a950613e9d41df488d06e76c1c8207e9921be4ec4af53d70 "$root/scripts/diagnose-pr72-boxed-json/candidate-p.patch.b64" |
               sha256sum -c - > "$receipt/wrapper-driver-output.txt"
+            request="$receipt/request-driver.patch"
+            base64 -d "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr72-boxed-json-r/request-driver.patch.b64" > "$request"
+            printf '%s  %s\n' 113bddf7f1a84f7b2a9bc0c3fb2d54768eb13b3f11d614f471771d47c7e8644c "$request" |
+              sha256sum -c - > "$receipt/request-driver-input.txt"
+            git -C "$root" apply --check --index --whitespace=error-all "$request"
+            git -C "$root" apply --index --whitespace=error-all "$request"
+            test "$(git -C "$root" write-tree)" = 771c497c924012d4f496236e3567fae0c47cd051
+            printf '%s  %s\n' \
+              291f510d8fd40bf6de5790928295f68e5987024323f9f480acb8df2c7b1366bd "$root/$sampler" \
+              9a37bb786dfa220f34c410e96457ed817f3a3f495bcad3003d01476c63d7b29f "$root/scripts/diagnose-pr72-boxed-json/causal-order.py" \
+              8b5c296f96b8e7a29b70636689f4f8325f970c83be5a797e6f002b0f6218fc83 "$root/scripts/diagnose-pr72-boxed-json/candidate-q.patch.b64" \
+              358ddffec477a4f596661535640ffe469e1a95a4900e1e12d47fb3123bfd4cb3 "$root/scripts/diagnose-pr72-boxed-json/request-parameter-cardinality.go.txt" |
+              sha256sum -c - > "$receipt/request-driver-output.txt"
           fi
           mkdir -p "$root/.tmp"
           gh api "repos/light-speak/luxo/actions/artifacts/$FORMAL_ARTIFACT" > "$receipt/artifact-metadata.json"
@@ -170,6 +183,18 @@ jobs:
           ' "$receipt/artifact-metadata.json"
           gh api "repos/light-speak/luxo/actions/artifacts/$FORMAL_ARTIFACT/zip" > "$root/.tmp/$FORMAL_INPUT"
           (cd "$root/.tmp" && printf '%s  %s\n' "$FORMAL_DIGEST" "$FORMAL_INPUT" | sha256sum -c -) > "$receipt/artifact-digest-check.txt"
+          if [[ "$SUITE" == pr72-boxed-json-header-causal ]]; then
+            [[ "$(gh api repos/light-speak/luxo/pulls/72 --jq .head.sha)" == "$PRODUCT_HEAD" ]]
+            artifact=14924542453
+            digest=fa29cd4591b00efde40f538e6f6f0f4d09a55148304f216ea9450d4971795364
+            gh api "repos/light-speak/luxo/actions/artifacts/$artifact" > "$receipt/pr72-shard09-metadata.json"
+            jq -e --arg artifact "$artifact" --arg head "$PRODUCT_HEAD" --arg digest "sha256:$digest" '
+              (.id | tostring) == $artifact and .workflow_run.id == 45397856587 and .workflow_run.head_sha == $head and
+              .name == "performance-evidence-09-1" and .digest == $digest and .expired == false
+            ' "$receipt/pr72-shard09-metadata.json"
+            gh api "repos/light-speak/luxo/actions/artifacts/$artifact/zip" > "$root/.tmp/pr72-formal-shard-09.zip"
+            (cd "$root/.tmp" && printf '%s  %s\n' "$digest" pr72-formal-shard-09.zip | sha256sum -c -) > "$receipt/pr72-shard09-digest.txt"
+          fi
           if [[ "$SUITE" == pr71-static-jwt ]]; then
             driver=scripts/diagnose-pr71-static-jwt.sh
             helper=scripts/diagnose-pr71-static-jwt.py
@@ -192,7 +217,7 @@ jobs:
           cache: false
       - name: Run the pinned diagnostic on the same runner
         if: ${{ !cancelled() && steps.go.outcome == 'success' && steps.primary_inputs.outcome == 'success' }}
-        timeout-minutes: 28
+        timeout-minutes: ${{ steps.cpu.outputs.suite == 'pr72-boxed-json-header-causal' && 44 || 28 }}
         working-directory: .tmp/native-cpu-worktree
         env:
           SUITE: ${{ steps.cpu.outputs.suite }}
@@ -206,7 +231,7 @@ jobs:
               exec bash scripts/diagnose-pr71-static-jwt.sh run
               ;;
             pr72-boxed-json-header-causal)
-              exec bash scripts/diagnose-pr72-boxed-json/diagnose-native.sh . p .tmp/pr72-formal-shard-12.zip
+              exec bash scripts/diagnose-pr72-boxed-json/diagnose-native.sh . q .tmp/pr72-formal-shard-12.zip .tmp/pr72-formal-shard-09.zip
               ;;
             pr71-columnar)
               exec bash "$GITHUB_WORKSPACE/native-cpu-dispatch/scripts/diagnose-pr71-columnar.sh" . .tmp/pr71-columnar-formal-08.zip
