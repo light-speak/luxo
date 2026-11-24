@@ -172,7 +172,10 @@ PROTOCOL
     mkdir "$evidence/elf-$role"
     cp "$scratch/bin/$role/"*.test "$evidence/elf-$role/"
     go tool nm -size "$scratch/bin/$role/pkg-codegen.test" > "$evidence/symbols-$role.nm"
-    python3 "$evidence/diagnose-pr99-codegen.py" layout "$evidence/symbols-$role.nm" "$evidence/layout-$role.tsv"
+    # The layout helper expects addressed symbols; full ELF nm also lists undefined symbols.
+    PR73_LAYOUT_PATTERN="$pattern" awk '$4 ~ ENVIRON["PR73_LAYOUT_PATTERN"]' "$evidence/symbols-$role.nm" > "$evidence/layout-input-$role.nm"
+    test -s "$evidence/layout-input-$role.nm"
+    python3 "$evidence/diagnose-pr99-codegen.py" layout "$evidence/layout-input-$role.nm" "$evidence/layout-$role.tsv"
     go tool objdump -s "$pattern" "$scratch/bin/$role/pkg-codegen.test" > "$evidence/symbols-$role.objdump"
     test -s "$evidence/symbols-$role.objdump"
     IFS=$'\t' read -r case_id package helper name filter < "$evidence/cases.tsv"
