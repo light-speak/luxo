@@ -1,0 +1,153 @@
+name: Qualify the staged CLI add scaffold
+
+on:
+  push:
+    branches: [diagnostics/qualify-cli-add-go]
+    paths:
+      - .github/workflows/qualify-cli-add-go.yml
+      - .github/qualification/cli-add.patch.b64
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/qualify-cli-add-go'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: luxo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d luxo_test"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=5
+
+    env:
+      DATABASE_HOST: localhost
+      DATABASE_PORT: 5432
+      DATABASE_USER: postgres
+      DATABASE_PASSWORD: postgres
+      DATABASE_PREFIX: luxo_test
+      DATABASE_SSL: disable
+      LUXO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_AUDIT_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/luxo_test?sslmode=disable
+      LUXO_TRANSACTION_RACE: '1'
+      NATS_URL: nats://127.0.0.1:4222
+      GOTOOLCHAIN: local
+      QUALIFICATION_BASE: ca818da9bf89e82dc6f5bd2f539e4dfdd576a801
+      QUALIFICATION_TREE: 3a9b9a316f06b9f1cc3a3d7007bff27765998a1c
+      QUALIFICATION_PATCH_SHA256: 7189b019741deb212baa05fe0b41a2d2b372cd01d6a5491bf2d516421ba5eeb8
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+
+      - name: Restore and verify the exact staged product tree
+        run: |
+          set -euo pipefail
+          source="$PWD/.tmp/cli-add-go-source"
+          evidence="$PWD/.tmp/cli-add-go-evidence"
+          mkdir -p "$evidence"
+          patch="$evidence/candidate.patch"
+          base64 -d .github/qualification/cli-add.patch.b64 > "$patch"
+          printf '%s  %s\n' "$QUALIFICATION_PATCH_SHA256" "$patch" | sha256sum -c
+          test "$(git rev-parse "$QUALIFICATION_BASE^{tree}")" = ba252c7cace8908cdfcd7c203bc9dc11bb2ba746
+          git worktree add --detach "$source" "$QUALIFICATION_BASE"
+          git -C "$source" apply --index --check --whitespace=error "$patch"
+          git -C "$source" apply --index --whitespace=error "$patch"
+          git -C "$source" apply --reverse --check "$patch"
+          git -C "$source" diff --cached --check
+          test "$(git -C "$source" write-tree)" = "$QUALIFICATION_TREE"
+          git -C "$source" diff --cached --name-only > "$evidence/paths.txt"
+          printf '%s\n' cmd/luxo/add.go cmd/luxo/cli_test.go pkg/codegen/codegen.go pkg/codegen/identifiers.go pkg/codegen/init.go pkg/codegen/init_test.go pkg/codegen/schema_gen.go pkg/lux/dialect/pg/dialect.go pkg/lux/str/str.go pkg/lux/str/str_test.go pkg/semantic/analyzer_types_test.go pkg/semantic/types.go | diff - "$evidence/paths.txt"
+          printf '%s %s %s\n' "$QUALIFICATION_BASE" "$QUALIFICATION_TREE" "$QUALIFICATION_PATCH_SHA256" > "$evidence/revision.txt"
+          go version > "$evidence/go-version.txt"
+          test "$(cat "$evidence/go-version.txt")" = 'go version go1.27.1 linux/amd64'
+          (cd "$source" && printf '%s\n' '27b889fc36e9cbc099c43ec31d01d0add7152fbdc7f1481de769daa6a1f29d1b  cmd/luxo/add.go' 'b62403af7fce77f7055073004c9a0c59f8bd7b835de489fdffa849f448ab00be  cmd/luxo/cli_test.go' '56ded991c341731c1684f23b63a332bf9ba7501b670cdcb82c0e66b40bd38963  pkg/codegen/codegen.go' 'b49d15b16567c595bf0c2f643176f66723e71f3ca4e3728ba3402d5682ca051b  pkg/codegen/identifiers.go' 'ade3c09cde77297ca778bd3001f2542db5f0df256a82ca4a50b7e488d35cca65  pkg/codegen/init.go' '22d1ea9d03a6dd72dcc4142cb26e12683a336eeff0c01cfe361e9e2b52e19b00  pkg/codegen/init_test.go' '35c7936450a5bc4042c1f58612fc5563314fce07fa8a857084f010f52aa095f2  pkg/codegen/schema_gen.go' '1c36f9e971cfbec2cd0a131707e1f5d3ec7145845c3b25b9ab9d1937b1385fd5  pkg/lux/dialect/pg/dialect.go' 'acb22a6293349f85a5e00d8780459071bef76d6f9e8176dc1d752b82142d4a37  pkg/lux/str/str.go' '5582a4e2183ce45221a0bc883d96144bd2e350ba9eeefaff02ac641a18121eaa  pkg/lux/str/str_test.go' '59f297942d334c1d015cda60be9bc5d30bb35f671958d25eb1b2851140bb82de  pkg/semantic/analyzer_types_test.go' '55c3be3e942d9144e15ffa5e2861bb1f88f3d44bf581f21257c0b00a384787f6  pkg/semantic/types.go' | sha256sum -c -)
+          test -z "$(gofmt -s -l "$source/cmd/luxo/add.go" "$source/cmd/luxo/cli_test.go" "$source/pkg/codegen/codegen.go" "$source/pkg/codegen/identifiers.go" "$source/pkg/codegen/init.go" "$source/pkg/codegen/init_test.go" "$source/pkg/codegen/schema_gen.go" "$source/pkg/lux/dialect/pg/dialect.go" "$source/pkg/lux/str/str.go" "$source/pkg/lux/str/str_test.go" "$source/pkg/semantic/analyzer_types_test.go" "$source/pkg/semantic/types.go")"
+          sh "$source/scripts/setup-modules.sh" "$source"
+
+      - name: Start the owned JetStream fixture
+        run: |
+          set -euo pipefail
+          owner="luxo-qualify-cli-add-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker run --detach --name "$owner" --label "org.luxo.audit.owner=$owner" \
+            --publish 127.0.0.1:4222:4222 --publish 127.0.0.1:8222:8222 \
+            nats:2.15.3-alpine -js -m 8222
+          curl --fail --silent --show-error --retry 20 --retry-all-errors \
+            --retry-delay 1 --connect-timeout 2 --max-time 5 http://127.0.0.1:8222/healthz
+          curl --fail --silent --show-error --connect-timeout 2 --max-time 5 \
+            http://127.0.0.1:8222/jsz | jq --exit-status \
+            '.disabled != true and .config.max_memory > 0 and .config.max_storage > 0'
+
+      - name: Verify root packages with coverage and the CLI race suite
+        run: |
+          set -euo pipefail
+          evidence="$PWD/.tmp/cli-add-go-evidence"
+          cd .tmp/cli-add-go-source
+          export GOWORK="$PWD/go.work"
+          root=0
+          go test -p 2 ./pkg/... -cover -coverprofile="$evidence/root.coverage" -count=1 -timeout=95m -json \
+            > "$evidence/root.jsonl" 2>&1 || root=$?
+          printf 'root %s\n' "$root" >> "$evidence/phases.txt"
+          if (( root != 0 )); then tail -n 80 "$evidence/root.jsonl"; exit "$root"; fi
+          cli=0
+          go test -p 2 -race ./cmd/luxo/... -coverprofile="$evidence/cli.coverage" -count=1 -timeout=15m -json \
+            > "$evidence/cli.jsonl" 2>&1 || cli=$?
+          printf 'cli %s\n' "$cli" >> "$evidence/phases.txt"
+          if (( cli != 0 )); then tail -n 80 "$evidence/cli.jsonl"; exit "$cli"; fi
+          go tool cover -func="$evidence/root.coverage" > "$evidence/root.coverage-summary"
+          grep -E '/pkg/codegen/init.go:[0-9]+:[[:space:]]+ValidateModuleScaffoldModelName[[:space:]]+100.0%' "$evidence/root.coverage-summary"
+          grep -E '/pkg/codegen/init.go:[0-9]+:[[:space:]]+validateScaffoldModelName[[:space:]]+100.0%' "$evidence/root.coverage-summary"
+          grep -E '/pkg/codegen/init.go:[0-9]+:[[:space:]]+scaffoldGoDeclarationName[[:space:]]+100.0%' "$evidence/root.coverage-summary"
+          grep -E '/pkg/codegen/identifiers.go:[0-9]+:[[:space:]]+unconditionalAppMemberName[[:space:]]+100.0%' "$evidence/root.coverage-summary"
+          grep -E '/pkg/lux/str/str.go:[0-9]+:[[:space:]]+CapitalizedASCIISnakeCaseLen[[:space:]]+100.0%' "$evidence/root.coverage-summary"
+          grep -E '/pkg/lux/str/str.go:[0-9]+:[[:space:]]+snakeWordBoundary[[:space:]]+100.0%' "$evidence/root.coverage-summary"
+          grep -E '/pkg/lux/str/str.go:[0-9]+:[[:space:]]+ToSnakeCase[[:space:]]+100.0%' "$evidence/root.coverage-summary"
+          grep -E '/pkg/semantic/types.go:[0-9]+:[[:space:]]+IsBuiltinTypeNameBytes[[:space:]]+100.0%' "$evidence/root.coverage-summary"
+          grep -E '/pkg/semantic/types.go:[0-9]+:[[:space:]]+isBuiltinTypeName[[:space:]]+100.0%' "$evidence/root.coverage-summary"
+          go tool cover -func="$evidence/cli.coverage" > "$evidence/cli.coverage-summary"
+          grep -E '/cmd/luxo/add.go:[0-9]+:[[:space:]]+validScaffoldModuleName[[:space:]]+100.0%' "$evidence/cli.coverage-summary"
+          go vet -p 2 ./pkg/... ./cmd/... ./cmd/luxo/... > "$evidence/vet.log" 2>&1
+          git diff --exit-code
+          test "$(git write-tree)" = "$QUALIFICATION_TREE"
+
+      - name: Remove the owned source and JetStream fixture
+        if: always()
+        run: |
+          set -euo pipefail
+          owner="luxo-qualify-cli-add-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ids=$(docker ps -aq --filter "label=org.luxo.audit.owner=$owner")
+          if [[ -n "$ids" ]]; then
+            while IFS= read -r id; do docker rm -fv "$id"; done <<< "$ids"
+          fi
+          test -z "$(docker ps -aq --filter "label=org.luxo.audit.owner=$owner")"
+          test -z "$(docker volume ls -q --filter "label=org.luxo.audit.owner=$owner")"
+          if [[ -d .tmp/cli-add-go-source ]]; then
+            git worktree remove --force .tmp/cli-add-go-source
+          fi
+
+      - name: Preserve exact coverage and test logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: cli-add-go-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/cli-add-go-evidence/
+          if-no-files-found: error
+          retention-days: 14
