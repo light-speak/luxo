@@ -299,7 +299,8 @@ run_suite() {
   evidence="$results/$suite"
   sample_groups
   verify_scheduled_roles "$evidence" "$suite"
-  grep -h '^cpu: ' "$evidence"/inventory-*.txt "$evidence"/raw/*.txt | sort -u > "$evidence/cpu.txt"
+  grep -h '^cpu: ' "$evidence"/inventory-*.txt "$evidence"/raw/*.txt |
+    sed 's/[[:blank:]]*$//' | sort -u > "$evidence/cpu.txt"
   test "$(wc -l < "$evidence/cpu.txt")" -eq 1
   analyze_groups
 }
