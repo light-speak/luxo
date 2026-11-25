@@ -46,7 +46,12 @@ parse_fixture="$scripts/parse-log.go.txt"
 shard_tool="$scripts/shards.py"
 mode="${2:-route}"
 [[ "$mode" == route || "$mode" == --shards ]]
-cpu=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')
+cpu=$(lscpu | sed -n '/^Model name:/ { s/^Model name:[[:blank:]]*//; s/[[:blank:]]*$//; p; }')
+expected_cpu=${LUXO_DIAGNOSTIC_CPU:-}
+if [[ -n "$expected_cpu" && "$cpu" != "$expected_cpu" ]]; then
+    printf 'wrong-cpu: %s\n' "$cpu" >&2
+    exit 3
+fi
 tool="$scripts/evidence.py"
 hot='([.]BenchmarkLocalRouteExport|[.]localRouteSnapshot$|[.]BenchmarkDiagnosticWriteParseError|[.]ExportHandlers$|[.]writeParseError$|^runtime[.](gcWriteBarrier[0-9]*|writeBarrier)$)'
 

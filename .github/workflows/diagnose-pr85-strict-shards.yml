@@ -1,4 +1,4 @@
-name: Recheck five PR 85 benchmark shards on matched native Linux
+name: Recheck PR 85 shard 01 on AMD EPYC 7763
 
 "on":
   push:
@@ -13,20 +13,17 @@ permissions:
   contents: read
 
 jobs:
-  match:
+  native-7763:
     if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr85-strict-shards'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        slot: [1, 2]
     env:
       LC_ALL: C
       GOTOOLCHAIN: local
       GOMAXPROCS: '2'
       CGO_ENABLED: '1'
       GOAMD64: v1
+      LUXO_DIAGNOSTIC_CPU: AMD EPYC 7763 64-Core Processor
     steps:
       - name: Select the original hosted CPU model
         env:
@@ -40,13 +37,12 @@ jobs:
           cat /etc/os-release > "$evidence/os-release.txt"
           [[ "$RUNNER_KIND" == github-hosted && "$RUNNER_ARCH" == X64 && "$(uname -sm)" == 'Linux x86_64' ]]
           grep -Fx 'VERSION_ID="24.04"' "$evidence/os-release.txt"
-          cpu=$(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/lscpu.txt")
-          case "$cpu" in
-            'AMD EPYC 7763 64-Core Processor'|'AMD EPYC 9V74 80-Core Processor'|'Intel(R) Xeon(R) 6975P-C')
-              printf '%s\n' "$cpu" > "$evidence/selection.txt"
-              ;;
-            *) printf 'wrong-cpu: %s\n' "$cpu" | tee "$evidence/selection.txt"; exit 3 ;;
-          esac
+          cpu=$(sed -n '/^Model name:/ { s/^Model name:[[:blank:]]*//; s/[[:blank:]]*$//; p; }' "$evidence/lscpu.txt")
+          if [[ "$cpu" != "$LUXO_DIAGNOSTIC_CPU" ]]; then
+            printf 'wrong-cpu: %s\n' "$cpu" | tee "$evidence/selection.txt"
+            exit 3
+          fi
+          printf '%s\n' "$cpu" > "$evidence/selection.txt"
       - uses: actions/checkout@v7
         with:
           path: diagnostic
@@ -56,7 +52,7 @@ jobs:
           go-version: '1.27.1'
           check-latest: false
           cache: false
-      - name: Bind the exact source and this CPU's original artifacts
+      - name: Bind the exact source and original shard 01
         working-directory: diagnostic
         env:
           GH_TOKEN: ${{ github.token }}
@@ -68,7 +64,7 @@ jobs:
           evidence="$GITHUB_WORKSPACE/.tmp/pr85-strict-shards-evidence"
           cpu=$(cat "$evidence/selection.txt")
           python3 -B scripts/diagnose-pr85/shards.py artifacts "$cpu" > "$evidence/requested.tsv"
-          test -s "$evidence/requested.tsv"
+          test "$(wc -l < "$evidence/requested.tsv")" -eq 1
           while IFS=$'\t' read -r id size digest name; do
             gh api "repos/light-speak/luxo/actions/artifacts/$id" > "$evidence/$id.metadata.json"
             jq -e --argjson id "$id" --argjson size "$size" --arg digest "sha256:$digest" --arg name "$name" \
@@ -84,7 +80,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: pr85-strict-shards-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slot }}
+          name: pr85-shard-01-7763-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/pr85-strict-shards-evidence/
           if-no-files-found: error
           include-hidden-files: true
