@@ -1110,7 +1110,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: light-speak/luxo-swift
-          ref: 40aa5cc7948a0b74cfc59bc97dfbbc85371f4705
+          ref: 9c7286b4c0d6b371bbb95e1a9db0c70cdf6340f5
           path: .tmp/luxo-swift
           persist-credentials: false
 
