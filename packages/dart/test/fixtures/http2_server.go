@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"io"
@@ -88,6 +89,10 @@ func main() {
 		}
 		w.Header().Set("X-Test-Protocol", r.Proto)
 		w.Header().Set("X-Test-Connection", r.RemoteAddr)
+		if r.URL.Path == "/no-content" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if r.URL.Path == "/head" {
 			w.Header().Set("Content-Length", "5")
 			data = []byte("hello")
@@ -109,7 +114,14 @@ func main() {
 	}))
 	http1.StartTLS()
 	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
-	if err := json.NewEncoder(os.Stdout).Encode(map[string]string{"url": server.URL, "http1": http1.URL, "certificate": string(certificate)}); err != nil {
+	key, err := x509.MarshalPKCS8PrivateKey(server.TLS.Certificates[0].PrivateKey)
+	if err != nil {
+		server.Close()
+		http1.Close()
+		return
+	}
+	testKey := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key})
+	if err := json.NewEncoder(os.Stdout).Encode(map[string]string{"url": server.URL, "http1": http1.URL, "certificate": string(certificate), "testKey": string(testKey)}); err != nil {
 		server.Close()
 		http1.Close()
 		return

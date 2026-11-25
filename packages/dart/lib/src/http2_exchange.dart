@@ -11,24 +11,27 @@ class _H2Exchange {
   int? status;
   bool finished = false;
 
-  _H2Exchange(this.client, this.request);
+  factory _H2Exchange(LuxoHttp2Client client, http.BaseRequest request) {
+    final signal = request is http.AbortableRequest
+        ? request.abortTrigger
+        : null;
+    if (signal != null) {
+      return _H2AbortableExchange(
+        client,
+        request,
+        _H2AbortWatch.forSignal(signal),
+      );
+    }
+    return _H2Exchange._(client, request);
+  }
+
+  _H2Exchange._(this.client, this.request);
 
   void start() {
-    final req = request;
-    if (req is http.AbortableRequest && req.abortTrigger != null) {
-      unawaited(_watchAbort(req.abortTrigger!));
-    }
     unawaited(_send());
   }
 
-  Future<void> _watchAbort(Future<void> abort) async {
-    try {
-      await abort;
-    } catch (_) {
-      // An erroneous cancellation signal still terminates this request only.
-    }
-    fail(http.RequestAbortedException(request.url));
-  }
+  void _detachAbort() {}
 
   Future<void> _send() async {
     try {
@@ -93,7 +96,18 @@ class _H2Exchange {
 
   void _receive(h2.StreamMessage message) {
     if (finished) return;
+    final previousStatus = status;
     try {
+      if (previousStatus == 204) {
+        if (message is h2.HeadersStreamMessage ||
+            (message is h2.DataStreamMessage && message.bytes.isNotEmpty)) {
+          throw http.ClientException(
+            'HTTP/2 204 response must not contain content or trailers',
+            request.url,
+          );
+        }
+        return;
+      }
       if (message is h2.HeadersStreamMessage) {
         for (final header in message.headers) {
           final name = ascii.decode(header.name);
@@ -113,9 +127,16 @@ class _H2Exchange {
           }
         }
         // Informational fields do not belong to the final response.
-        if (status == null) headers.clear();
+        if (status == null) {
+          headers.clear();
+        } else if (status == 204 && headers.containsKey('content-length')) {
+          throw http.ClientException(
+            'HTTP/2 204 response must not have Content-Length',
+            request.url,
+          );
+        }
       } else if (message is h2.DataStreamMessage) {
-        if (status == null ||
+        if (previousStatus == null ||
             body.length + message.bytes.length > client.maxBodyBytes) {
           throw http.ClientException(
             'Missing status or response body exceeds limit',
@@ -141,6 +162,7 @@ class _H2Exchange {
       return;
     }
     finished = true;
+    _detachAbort();
     client._release(this);
     final bytes = body.takeBytes();
     result.complete(
@@ -148,9 +170,12 @@ class _H2Exchange {
     );
   }
 
+  void abort() => fail(http.RequestAbortedException(request.url));
+
   void fail(Object error) {
     if (finished) return;
     finished = true;
+    _detachAbort();
     stream?.terminate();
     unawaited(subscription?.cancel());
     body.clear();
@@ -160,5 +185,76 @@ class _H2Exchange {
           ? error
           : http.ClientException('$error', request.url),
     );
+  }
+}
+
+class _H2AbortableExchange extends _H2Exchange {
+  final _H2AbortWatch _watch;
+
+  _H2AbortableExchange(super.client, super.request, this._watch) : super._();
+
+  @override
+  void start() {
+    _watch.add(this);
+    if (!finished) super.start();
+  }
+
+  @override
+  void _detachAbort() => _watch.remove(this);
+}
+
+// A shared abort future can outlive many exchanges. One listener per signal
+// owns only the pending exchanges, and a single pending exchange needs no set.
+class _H2AbortWatch {
+  static final _signals = Expando<_H2AbortWatch>();
+  _H2Exchange? _first;
+  Set<_H2Exchange>? _others;
+  bool _aborted = false;
+
+  static _H2AbortWatch forSignal(Future<void> signal) {
+    final previous = _signals[signal];
+    if (previous != null) return previous;
+    final watch = _H2AbortWatch();
+    _signals[signal] = watch;
+    unawaited(watch._wait(signal));
+    return watch;
+  }
+
+  void add(_H2Exchange exchange) {
+    if (_aborted) {
+      exchange.abort();
+    } else if (_first == null) {
+      _first = exchange;
+    } else {
+      (_others ??= {}).add(exchange);
+    }
+  }
+
+  void remove(_H2Exchange exchange) {
+    if (identical(_first, exchange)) {
+      _first = null;
+    } else {
+      _others?.remove(exchange);
+      if (_others?.isEmpty ?? false) _others = null;
+    }
+  }
+
+  Future<void> _wait(Future<void> signal) async {
+    try {
+      await signal;
+    } catch (_) {
+      // A signal that completes with an error still cancels its exchanges.
+    }
+    _aborted = true;
+    final first = _first;
+    final others = _others;
+    _first = null;
+    _others = null;
+    first?.abort();
+    if (others != null) {
+      for (final exchange in others) {
+        exchange.abort();
+      }
+    }
   }
 }

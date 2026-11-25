@@ -70,7 +70,7 @@ func TestInitProjectEnvExample(t *testing.T) {
 		"DATABASE_DRIVER=pg",
 		"DATABASE_USER=postgres",
 		"DATABASE_PASSWORD=postgres",
-		"JWT_SECRET=change-me",
+		"# JWT_SECRET=",
 		"DEPLOY_MODE=embedded",
 		"LUXO_EVENT_BACKEND=none",
 		"LUXO_QUEUE_BACKEND=none",
@@ -84,6 +84,12 @@ func TestInitProjectEnvExample(t *testing.T) {
 	for _, check := range checks {
 		if !strings.Contains(src, check) {
 			t.Errorf("missing %q in .env.example:\n%s", check, src)
+		}
+	}
+	for _, line := range strings.Split(src, "\n") {
+		key, _, _ := strings.Cut(line, "=")
+		if strings.TrimSpace(key) == "JWT_SECRET" {
+			t.Error(".env.example must leave JWT_SECRET unset")
 		}
 	}
 

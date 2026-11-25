@@ -19,9 +19,9 @@ func (c *compiler) compileSealedComparison(expression *ast.BinaryExpr, left, rig
 		return "", false
 	}
 	var result string
-	if isNullLiteral(expression.Left) {
+	if isNullLiteral(expression.Left) || isNullAwait(expression.Left) {
 		result = c.compileSealedNullComparison(expression.Right, right)
-	} else if isNullLiteral(expression.Right) {
+	} else if isNullLiteral(expression.Right) || isNullAwait(expression.Right) {
 		result = c.compileSealedNullComparison(expression.Left, left)
 	} else {
 		if expression.Left.GetTypeTag() != owner.Name || expression.Right.GetTypeTag() != owner.Name || !c.generator.sealed.equality.comparable[owner.Name] {

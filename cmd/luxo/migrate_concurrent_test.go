@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -492,6 +493,31 @@ func TestMigrationRechecksStateAfterWaiting(t *testing.T) {
 			}
 			assertMigrationRecheckOutput(t, outputPath, kind == "squash-collision")
 		})
+	}
+}
+
+func TestMigrationRecheckKeepsAlreadyAppliedState(t *testing.T) {
+	writeGlobalGenerationProject(t, map[string]string{"main": "model Probe @noTime { id: Int @id }"})
+	const statePath = "migrations/.state.json"
+	const emptyState = `{"models":{}}`
+	writeCoverageFile(t, statePath, emptyState)
+	if err := runMigrateDiff(nil, []string{"first"}); err != nil {
+		t.Fatal(err)
+	}
+	appliedState, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appliedProject := addProjectSnapshot(t)
+
+	writeCoverageFile(t, statePath, emptyState)
+	if err := runMigrationAfterWaiting(t, runMigrateDiff, func() error {
+		return os.WriteFile(statePath, appliedState, 0600)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if actual := addProjectSnapshot(t); !maps.Equal(appliedProject, actual) {
+		t.Fatalf("migration recheck changed the applied project: got %v, want %v", actual, appliedProject)
 	}
 }
 

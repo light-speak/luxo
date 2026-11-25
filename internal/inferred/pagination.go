@@ -176,20 +176,50 @@ func (p *paginationAnalysis) declaration(statement *ast.ValStmt) {
 		bindings = make(map[string]pageValue)
 		p.scopes[len(p.scopes)-1] = bindings
 	}
-	if await, ok := statement.Value.(*ast.AwaitExpr); ok && len(statement.Names) != 0 {
-		index := 0
-		for _, item := range await.Body.Stmts {
-			if expression, ok := item.(*ast.ExprStmt); ok && index < len(statement.Names) {
-				value := p.expression(expression.Expr)
-				p.consume(value, expression.Expr)
-				value.bad = len(value.queries) != 0
-				bindings[statement.Names[index]] = value
-				index++
-			}
-		}
+	if len(statement.Names) == 0 {
+		bindings[statement.Name] = p.bindObject(p.expression(statement.Value), statement.Type)
 		return
 	}
-	bindings[statement.Name] = p.bindObject(p.expression(statement.Value), statement.Type)
+	if await, ok := statement.Value.(*ast.AwaitExpr); ok {
+		p.destructureAwait(bindings, statement, await)
+		return
+	}
+	p.bindScalarNames(bindings, statement, p.expression(statement.Value))
+}
+
+func (p *paginationAnalysis) bindScalarNames(bindings map[string]pageValue, statement *ast.ValStmt, value pageValue) {
+	expected := statement.Type
+	for _, name := range statement.Names {
+		if name == "_" {
+			continue
+		}
+		// Apply the initializer's declared representation once. Subsequent
+		// names copy that value's slots or share its existing reference.
+		value = p.bindObject(value, expected)
+		bindings[name] = value
+		expected = nil
+	}
+}
+
+func (p *paginationAnalysis) destructureAwait(bindings map[string]pageValue, statement *ast.ValStmt, await *ast.AwaitExpr) {
+	// Initializers must not see any of the destination bindings.
+	var inline [4]pageValue
+	values := inline[:0]
+	p.visitAwaitResults(await.Body, func(expr ast.Expr) {
+		value := p.consumeInput(expr)
+		if len(values) < len(statement.Names) {
+			values = append(values, p.awaitResult(value))
+		}
+	})
+	if len(values) == 1 {
+		p.bindScalarNames(bindings, statement, values[0])
+		return
+	}
+	for index, value := range values {
+		if name := statement.Names[index]; name != "_" {
+			bindings[name] = value
+		}
+	}
 }
 
 func (p *paginationAnalysis) assignment(statement *ast.AssignStmt) {
