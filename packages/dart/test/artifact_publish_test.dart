@@ -12,6 +12,64 @@ Future<Directory> project() async {
 }
 
 void main() {
+  test(
+    'prepared publication preserves an exact escaped destination name',
+    () async {
+      final root = await project();
+      final plain = File('${root.path}/release/应用-%😀');
+      await plain.create(recursive: true, exclusive: true);
+      await plain.writeAsString('plain');
+      final artifact = File('${root.path}/artifact-\uFEFF-%EF%BB%BF');
+      await artifact.writeAsString('published');
+      final output = await PreparedOutput.prepare(
+        root,
+        'release/%ef%bb%bf${Uri.encodeComponent('应用-%😀')}',
+      );
+      addTearDown(output.close);
+      publishBuildArtifact(artifact, output);
+      final marked = File('${root.path}/release/\uFEFF应用-%😀');
+      expect(output.destination.uri, marked.uri);
+      expect(await marked.readAsString(), 'published');
+      expect(await plain.readAsString(), 'plain');
+    },
+  );
+
+  test(
+    'prepared publication moves only the exact native artifact name',
+    () async {
+      final root = await project();
+      final plain = File('${root.path}/artifact-%中文😀');
+      final marked = File('${root.path}/\uFEFFartifact-%中文😀');
+      for (final (file, value) in [(plain, 'plain'), (marked, 'marked')]) {
+        await file.create(exclusive: true);
+        await file.writeAsString(value);
+      }
+      final output = await PreparedOutput.prepare(root, 'release/app');
+      addTearDown(output.close);
+      publishBuildArtifact(marked, output);
+      expect(await output.destination.readAsString(), 'marked');
+      expect(await plain.readAsString(), 'plain');
+      expect(await marked.exists(), isFalse);
+    },
+  );
+
+  test('prepared publication retains the exact project root', () async {
+    final parent = await project();
+    final root = await Directory('${parent.path}/\uFEFF项目-%😀').create();
+    final sibling = File('${parent.path}/项目-%😀/release/app');
+    await sibling.create(recursive: true, exclusive: true);
+    await sibling.writeAsString('sibling');
+    final artifact = File('${root.path}/artifact');
+    await artifact.writeAsString('published');
+    final output = await PreparedOutput.prepare(root, 'release/app');
+    addTearDown(output.close);
+    publishBuildArtifact(artifact, output);
+    final destination = File('${root.path}/release/app');
+    expect(output.destination.uri, destination.uri);
+    expect(await destination.readAsString(), 'published');
+    expect(await sibling.readAsString(), 'sibling');
+  });
+
   test('prepared publication preserves the missing artifact error', () async {
     final root = await project();
     final output = await PreparedOutput.prepare(root, 'release/app');
