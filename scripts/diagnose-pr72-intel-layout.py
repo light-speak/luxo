@@ -19,6 +19,8 @@ HPROD_TREE = "487639ff1696ef38fa82a2a95b3e173906c182fc"
 RUN = 45527815866
 CPU = "Intel(R) Xeon(R) 6975P-C"
 SHARDS = ("07", "11")
+LINK_FLAGS = {"A": "", "H": "", "A64": "-ldflags=-funcalign=64", "H64": "-ldflags=-funcalign=64"}
+LINK_PAIRS = (("A", "H"), ("A", "A64"), ("H", "H64"), ("A64", "H64"))
 ARTIFACTS = {
     "plan": (14984055331, 344051, "1b6f3cc479e47942e20b5f69127d611b9539c03eb3f8d37103ec9e18ac15655f"),
     "07": (14984773283, 159320, "9a992de6f881f05d72d6f43bd80baf050dcfed94ab09f040e7f7f2767906991d"),
@@ -112,41 +114,62 @@ def validate_inputs(directory):
         return scopes, plan.read("benchmark-compile-profile.txt")
 
 
-def source_receipt(repo, session):
+def source_receipt(repo, session, *, restore_tests=True):
     for sha in (BASE, HEAD):
         require(capture(["git", "rev-parse", sha+"^{tree}"], repo).decode().strip() == TREES[sha],
                 f"{sha}: exact source tree unavailable")
     changes = capture(["git", "diff", "--name-only", BASE, HEAD], repo).decode().splitlines()
     require(set(changes) == set(TESTS + PRODUCT), "non-selection files differ")
-    for role, sha in (("A", BASE), ("H", HEAD), ("Hprod", HEAD)):
+    roles = {"A": BASE, "H": HEAD}
+    if restore_tests:
+        roles["Hprod"] = HEAD
+    for role, sha in roles.items():
         original.snapshot(repo, sha, session.source(role))
     binding = {}
     for path in TESTS + PRODUCT:
         base = (session.source("A")/path).read_bytes()
         head = (session.source("H")/path).read_bytes()
-        expected = base if path in TESTS else head
-        dest = session.source("Hprod")/path
-        require(base != head and dest.read_bytes() == head, f"wrong source preimage: {path}")
-        if path in TESTS:
-            dest.write_bytes(base)
-        require(dest.read_bytes() == expected, f"wrong restored source: {path}")
-        binding[path] = {"base": digest(base), "head": digest(head), "Hprod": digest(expected)}
+        require(base != head, f"wrong source preimage: {path}")
+        binding[path] = {"base": digest(base), "head": digest(head)}
+        if restore_tests:
+            expected = base if path in TESTS else head
+            dest = session.source("Hprod")/path
+            require(dest.read_bytes() == head, f"wrong restored preimage: {path}")
+            if path in TESTS:
+                dest.write_bytes(base)
+            require(dest.read_bytes() == expected, f"wrong restored source: {path}")
+            binding[path]["Hprod"] = digest(expected)
     roots = {path: capture(["git", "rev-parse", f"{BASE}:{path}"], repo).decode().strip() for path in
              ("scripts/benchrun", "scripts/benchplan", "scripts/benchgate", "internal/benchlayout")}
     (session.evidence/"source.json").write_text(json.dumps({"base": BASE, "head": HEAD, "trees": TREES,
-                                                            "HprodProjection": HPROD_TREE, "filesSHA256": binding,
+                                                            "HprodProjection": HPROD_TREE if restore_tests else None,
+                                                            "filesSHA256": binding,
                                                             "toolsTrees": roots}, indent=2)+"\n")
 
 
 class LayoutReplay(original.Replay):
+    def source(self, role):
+        return super().source(role.removesuffix("64"))
+
     def compile(self, role, batch):
-        previous = self.built.copy()
-        super().compile(role, batch)
-        for _, package, profile in sorted(self.built - previous):
+        for package, profile, _ in original.rows(batch):
+            key = role, package, profile
+            if key in self.built:
+                continue
+            mode = "compile-performance-baseline" if role in ("A", "A64") else "compile-performance"
+            original.run([self.tools/"benchrun", mode, self.source(role), self.binaries(role), package, profile],
+                         self.scratch, output=None, extra_env={"GOFLAGS": LINK_FLAGS.get(role, "")})
             stem = package.replace("/", "-") + (f"-{profile}" if profile != "default" else "")
             binary = self.binaries(role)/(stem + ".test")
             directory = self.evidence/"ELF"/role/stem
+            original.record_binary(binary, SYMBOLS[package], directory)
             (directory/"sections.txt").write_bytes(capture(["readelf", "-W", "-S", str(binary)], directory))
+            if role in ("A64", "H64"):
+                text_symbols = [line.split() for line in (directory/"symbols.txt").read_text().splitlines()
+                                if line.split()[2] in ("t", "T")]
+                require(text_symbols and all(int(row[0], 16) % 64 == 0 for row in text_symbols),
+                        f"{role} {package}: retained functions must start on 64-byte boundaries")
+            self.built.add(key)
 
 
 def normalize_assembly(raw):
@@ -181,7 +204,7 @@ def normalize_assembly(raw):
     return result
 
 
-def record_layout(evidence):
+def record_layout(evidence, pairs):
     layouts = {}
     for directory in sorted((evidence/"ELF").glob("*/*")):
         assembly = directory/"disassembly.txt"
@@ -197,7 +220,7 @@ def record_layout(evidence):
         (directory/"normalized-disassembly.json").write_text(json.dumps(instructions, indent=2, sort_keys=True)+"\n")
         layouts[(directory.parent.name, directory.name)] = sizes, instructions
     comparisons = {}
-    for left, right in (("A", "H"), ("H", "Hprod"), ("Aplan", "Hplan")):
+    for left, right in pairs:
         for role, binary in sorted(layouts):
             if role != left or (right, binary) not in layouts:
                 continue
@@ -233,7 +256,20 @@ def compare_plan(repo, session, fixture):
     return session.compare("Aplan-Hplan", expected, batch, "Aplan", "Hplan")[0]
 
 
-def replay(repo, output, cpu):
+def compare_linker_layout(session, shard, expected, batch, verdicts):
+    session.go_command("benchplan", "--verify-profile-batch", "confirmation", expected, batch)
+    for role in LINK_FLAGS:
+        session.compile(role, batch)
+    for role in LINK_FLAGS:
+        session.control(f"{role}-AA-{shard}", expected, batch, role)
+    for left, right in LINK_PAIRS:
+        label = f"{left}-{right}-{shard}"
+        paired = session.sample(label, expected, batch, left, right, 2)
+        csvs = [session.benchstat(f"{label}-{group}", sides) for group, sides in enumerate(paired, 1)]
+        verdicts[label] = session.gate(label, csvs, original=(left, right) == ("A", "H"))[0]
+
+
+def replay(repo, output, cpu, *, link_control=False):
     require(cpu == CPU and sys.platform == "linux" and os.uname().machine == "x86_64", "incorrect Intel Linux runner")
     actual = capture(["lscpu"], repo).decode()
     require(re.findall(r"^Model name:\s*([^\n]+)$", actual, re.MULTILINE) == [CPU], "runner CPU changed")
@@ -244,13 +280,16 @@ def replay(repo, output, cpu):
     env = json.loads(capture(["go", "env", "-json", "GOVERSION", "GOOS", "GOARCH", "GOAMD64", "CGO_ENABLED"], repo))
     require(env == {"GOVERSION": "go1.27.1", "GOOS": "linux", "GOARCH": "amd64", "GOAMD64": "v1", "CGO_ENABLED": "1"},
             "incorrect Go qualification toolchain")
+    require(not capture(["go", "env", "GOFLAGS"], repo).strip(), "unexpected ambient GOFLAGS")
     (output/"go-env.json").write_text(json.dumps(env, indent=2)+"\n")
+    if link_control:
+        (output/"link-control.json").write_text(json.dumps({"flags": LINK_FLAGS, "pairs": LINK_PAIRS}, indent=2)+"\n")
     inputs = output/"origin"
     download(repo, inputs)
     scopes, profile = validate_inputs(inputs)
     with TemporaryDirectory(prefix="pr72-intel-build.", dir=output.parent) as scratch:
         session = LayoutReplay(Path(scratch), output, cpu)
-        source_receipt(repo, session)
+        source_receipt(repo, session, restore_tests=not link_control)
         session.build_tools()
         require(session.go_command("benchrun", "performance-profile").stdout == profile, "compile profile drift")
         (output/"tool-binaries.json").write_text(json.dumps(
@@ -263,14 +302,21 @@ def replay(repo, output, cpu):
                 batch = output/f"shard-{shard}.batch.tsv"
                 expected.write_bytes(scopes[shard][0])
                 batch.write_bytes(scopes[shard][1])
-                for left, right in (("A", "H"), ("H", "Hprod")):
-                    label = f"{left}-{right}-{shard}"
-                    verdicts[label] = session.compare(label, expected, batch, left, right)[0]
-            fixture = repo/"scripts/diagnose-pr72-intel-layout/plan-fixture.go.txt"
-            verdicts["Aplan-Hplan"] = compare_plan(repo, session, fixture)
+                if link_control:
+                    compare_linker_layout(session, shard, expected, batch, verdicts)
+                else:
+                    for left, right in (("A", "H"), ("H", "Hprod")):
+                        label = f"{left}-{right}-{shard}"
+                        verdicts[label] = session.compare(label, expected, batch, left, right)[0]
+            if not link_control:
+                fixture = repo/"scripts/diagnose-pr72-intel-layout/plan-fixture.go.txt"
+                verdicts["Aplan-Hplan"] = compare_plan(repo, session, fixture)
         finally:
             (output/"verdicts.json").write_text(json.dumps(verdicts, indent=2)+"\n")
-            record_layout(output)
+            record_layout(output, LINK_PAIRS if link_control else (("A", "H"), ("H", "Hprod"), ("Aplan", "Hplan")))
+    if link_control:
+        require(len(verdicts) == len(SHARDS)*len(LINK_PAIRS), "missing controlled comparison")
+        return 0
     return int(any(verdicts.values()))
 
 
@@ -280,6 +326,8 @@ if __name__ == "__main__":
         for shard, (expected, _) in scopes.items():
             print(f"shard {shard}: {len(json.loads(expected)['Base'])} original confirmation leaves")
         print(f"profile SHA-256 {digest(profile)}")
+    elif len(sys.argv) == 5 and sys.argv[1] == "--link-control":
+        sys.exit(replay(Path(sys.argv[2]).resolve(), Path(sys.argv[3]).resolve(), sys.argv[4], link_control=True))
     else:
         require(len(sys.argv) == 4, "expected repository, evidence directory and CPU")
         sys.exit(replay(Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve(), sys.argv[3]))
