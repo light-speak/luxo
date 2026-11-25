@@ -7,6 +7,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/light-speak/luxo/internal/benchlayout"
@@ -91,13 +92,17 @@ func writeLuviaBenchmarkOverlay(pkg, workspace string) (string, error) {
 	return writeTestOverlay(workspace, replacements)
 }
 
+func writeAPILocalRouteExportOverlay(pkg, workspace string) (string, error) {
+	return retainBenchmarkTestFiles(pkg, workspace, "API local route export", "local_input_bench_test.go")
+}
+
 func writeLuviaMergeDestinationOverlay(pkg, workspace string) (string, error) {
 	// The merge benchmark shares the primary-key input builder and its baseline fixture.
-	fixtures := map[string]bool{
-		"merger_bench_test.go":          true,
-		"primary_keys_bench_test.go":    true,
-		"primary_keys_baseline_test.go": true,
-	}
+	return retainBenchmarkTestFiles(pkg, workspace, "Luvia merge destination",
+		"merger_bench_test.go", "primary_keys_bench_test.go", "primary_keys_baseline_test.go")
+}
+
+func retainBenchmarkTestFiles(pkg, workspace, description string, fixtures ...string) (string, error) {
 	entries, err := os.ReadDir(pkg)
 	if err != nil {
 		return "", err
@@ -112,19 +117,19 @@ func writeLuviaMergeDestinationOverlay(pkg, workspace string) (string, error) {
 		path := filepath.Join(pkg, name)
 		data, err := readRegularTestFixture(path)
 		if err != nil {
-			return "", fmt.Errorf("Luvia merge destination fixture %s: %w", name, err)
+			return "", fmt.Errorf("%s fixture %s: %w", description, name, err)
 		}
 		if _, err := parseBenchmarkFixture(token.NewFileSet(), path, data); err != nil {
 			return "", err
 		}
-		if fixtures[name] {
+		if slices.Contains(fixtures, name) {
 			retained++
 			continue
 		}
 		replacements[path] = ""
 	}
 	if retained != len(fixtures) {
-		return "", errors.New("missing Luvia merge destination test fixture")
+		return "", fmt.Errorf("missing %s test fixture", description)
 	}
 	return writeTestOverlay(workspace, replacements)
 }

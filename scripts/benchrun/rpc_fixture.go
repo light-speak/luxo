@@ -29,7 +29,7 @@ const (
 		" " + luxDecimalFixture + "=" + luxDecimalProjectionSHA +
 		"\ncodegen-migration-state-overlay-v1 " + codegenMigrationStateFixture + "=" + codegenMigrationStateFixtureSHA +
 		" " + codegenReceiverFixture + "=" + codegenReceiverProjectionSHA +
-		"\nluvia-merge-destination-overlay-v1"
+		"\nluvia-merge-destination-overlay-v1\napi-local-route-export-overlay-v1"
 )
 
 func performanceOverlay(root, packagePath string, baseline bool) (string, func() error, error) {

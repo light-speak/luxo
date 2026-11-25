@@ -142,6 +142,41 @@ func TestAPIAndLuviaIsolatedInventoriesMatchOnlyRoutedRoots(t *testing.T) {
 	}
 }
 
+func TestAPILocalRouteExportProfileKeepsExactLeaves(t *testing.T) {
+	const root = "BenchmarkLocalRouteExport/"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	const other = "BenchmarkLocalRouteLookup/routes=1/current" + measurement
+	leaves := []string{"routes=1/previous", "routes=1/current", "routes=16/previous", "routes=16/current", "routes=128/previous", "routes=128/current"}
+	var measurements strings.Builder
+	for _, leaf := range leaves {
+		measurements.WriteString(root + leaf + measurement)
+	}
+	full := measurements.String()
+	partial := strings.Replace(full, root+leaves[5]+measurement, "", 1)
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	for _, tc := range []struct {
+		name, profile, ordinary, isolated string
+		valid                             bool
+	}{
+		{"exact new partition", "api-local-route-export", full + other, full, true},
+		{"missing leaf in both builds", "api-local-route-export", partial + other, partial, false},
+		{"generic fixture also retains the route", "api-non-identity", full + other, full + other, true},
+		{"generic fixture loses a route leaf", "api-non-identity", full + other, partial + other, false},
+		{"generic fixture loses a neighbor", "api-non-identity", full + other, full, false},
+		{"export profile contains the lookup", "api-local-route-export", full + other, full + other, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			args := []string{"--verify-profile-inventory", "pkg/lux/api", tc.profile, ordinary, isolated}
+			if err := run(args, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+}
+
 const (
 	mergeDestinationPackage = "pkg/lux/luvia"
 	mergeDestinationProfile = "luvia-merge-destination"

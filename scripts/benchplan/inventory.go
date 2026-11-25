@@ -107,6 +107,15 @@ func verifyProfileInventory(args []string) error {
 	if err != nil {
 		return err
 	}
+	if profile == benchlayout.APINonIdentityProfile {
+		// Keep the broad binary's layout and verify discovery before its export
+		// leaves are assigned exclusively to the dedicated sampling binary.
+		const route = benchlayout.APILocalRouteExportBenchmark
+		if !maps.Equal(ordinary[route], isolated[route]) {
+			return errors.New("API non-identity profile must retain the ordinary local route export inventory")
+		}
+		delete(isolated, route)
+	}
 	for root := range ordinary {
 		receiverCompanion := profile == benchlayout.CodegenMigrationStateProfile && root == benchlayout.CodegenReceiverBenchmark
 		if benchlayout.ProfileForBenchmark(pkg, root) != profile && !receiverCompanion {
@@ -128,6 +137,12 @@ func verifyProfileInventory(args []string) error {
 		return verifyCodegenReceiverInventory(isolated)
 	case benchlayout.CodegenMigrationStateProfile:
 		return verifyCodegenMigrationStateInventory(isolated)
+	case benchlayout.APILocalRouteExportProfile:
+		const root = benchlayout.APILocalRouteExportBenchmark
+		if !verifiedBenchmarkLeaves(isolated[root], root, "routes=1/previous", "routes=1/current", "routes=16/previous",
+			"routes=16/current", "routes=128/previous", "routes=128/current") {
+			return errors.New("API local route export profile requires the six verified export leaves")
+		}
 	case benchlayout.LuviaGatewayIdentityProfile:
 		const root = benchlayout.LuviaGatewayIdentityBenchmark
 		if !verifiedBenchmarkLeaves(isolated[root], root, "anonymous/before", "anonymous/after", "authenticated/before",
