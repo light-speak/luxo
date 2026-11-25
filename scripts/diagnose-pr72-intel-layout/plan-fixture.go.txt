@@ -1,0 +1,32 @@
+package luvia
+
+import (
+	"testing"
+
+	"github.com/light-speak/luxo/internal/testutil"
+	"github.com/light-speak/luxo/pkg/lux/codec"
+)
+
+func BenchmarkExactPlanSelection(b *testing.B) {
+	model := userModelWithExtend()
+	fields := testutil.Bytes(b)(codec.FieldMaskSet([]byte{3}, 10))
+	child := selectionNode(b, []byte{1})
+	selected := selectionNode(b, fields, codec.SelectionMaskChild{FieldID: 10, Mask: child})
+	for _, sample := range []struct {
+		name string
+		mask []byte
+	}{
+		{"all", nil},
+		{"nested", selected},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				plan, err := Plan(model, sample.mask, "user")
+				if err != nil || plan == nil {
+					b.Fatalf("valid plan failed: %v", err)
+				}
+			}
+		})
+	}
+}

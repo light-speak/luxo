@@ -1,0 +1,80 @@
+name: Diagnose PR 72 on Intel 6975P-C
+
+on:
+  push:
+    branches: [diagnostics/pr72-intel-layout]
+    paths:
+      - .github/workflows/diagnose-pr72-intel-layout.yml
+      - scripts/diagnose-pr72-intel-layout.py
+      - scripts/diagnose-pr72-intel-layout/plan-fixture.go.txt
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  replay:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr72-intel-layout'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Verify the assigned CPU
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          selection=.tmp/pr72-intel-selection
+          mkdir -p "$selection"
+          uname -a > "$selection/uname.txt"
+          lscpu > "$selection/lscpu.txt"
+          printf 'run=%s\nattempt=%s\ncheckout=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" > "$selection/selection.txt"
+          mapfile -t models < <(sed -n 's/^Model name:[[:space:]]*//p' "$selection/lscpu.txt")
+          test "$RUNNER_KIND" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$(uname -m)" = x86_64
+          if (( ${#models[@]} != 1 )) || [[ "${models[0]}" != 'Intel(R) Xeon(R) 6975P-C' ]]; then
+            printf 'status=no-matching-cpu\n' >> "$selection/selection.txt"
+            exit 3
+          fi
+          printf 'status=matched\n' >> "$selection/selection.txt"
+      - uses: actions/checkout@v7
+        with:
+          path: native-pr72-intel
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Replay frozen benchmark leaves
+        working-directory: native-pr72-intel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CGO_ENABLED: '1'
+          GOAMD64: v1
+          GOTOOLCHAIN: local
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/.tmp"
+          mkdir -p "$root/pr72-intel-tmp"
+          export TMPDIR="$root/pr72-intel-tmp"
+          trap 'rm -rf -- "$TMPDIR"' EXIT
+          python3 -B scripts/diagnose-pr72-intel-layout.py . "$root/pr72-intel-replay" 'Intel(R) Xeon(R) 6975P-C'
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr72-intel-layout-${{ github.run_attempt }}
+          path: |
+            .tmp/pr72-intel-selection/
+            .tmp/pr72-intel-replay/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Clean diagnostic evidence
+        if: always()
+        run: rm -rf -- .tmp/pr72-intel-selection .tmp/pr72-intel-replay .tmp/pr72-intel-tmp
