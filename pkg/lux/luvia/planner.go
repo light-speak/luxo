@@ -71,14 +71,16 @@ func Plan(model *schema.Model, mask []byte, apiModule string) (*QueryPlan, error
 	if !model.HasExtendFields() {
 		return nil, nil
 	}
+	selectedFields, _, valid := codec.SplitSelectionMask(mask)
+	if !valid {
+		return nil, codec.ErrInvalidSelectionMask
+	}
 
 	primaryKey := model.PrimaryKeyField()
 
 	var extends []ExtendStep
 	primaryMask := []byte{}
 	var primaryChildren []codec.SelectionMaskChild
-	selectedFields := codec.SelectionMaskFields(mask)
-
 	for i := range model.Fields {
 		f := &model.Fields[i]
 

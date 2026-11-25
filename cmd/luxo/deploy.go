@@ -44,6 +44,9 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 }
 
 func runDeployCompose() error {
+	if err := loadGenerationEnvironment(".env"); err != nil {
+		return err
+	}
 	schemaFiles, err := findSchemaFiles()
 	if err != nil {
 		return err
@@ -69,7 +72,10 @@ func runDeployCompose() error {
 		projectName = "luxo"
 	}
 
-	deploy := codegen.GenerateDeployFiles(result, projectName)
+	deploy, err := codegen.GenerateDeployFilesChecked(result, projectName, generationBackends())
+	if err != nil {
+		return err
+	}
 	if deploy == nil {
 		fmt.Println("No modules found / 未找到模块")
 		return nil
@@ -95,6 +101,9 @@ func runDeployCompose() error {
 }
 
 func runDeployHelm() error {
+	if err := loadGenerationEnvironment(".env"); err != nil {
+		return err
+	}
 	schemaFiles, err := findSchemaFiles()
 	if err != nil {
 		return err
@@ -120,7 +129,10 @@ func runDeployHelm() error {
 		projectName = "luxo"
 	}
 
-	helm := codegen.GenerateHelmFiles(result, projectName)
+	helm, err := codegen.GenerateHelmFilesChecked(result, projectName, generationBackends())
+	if err != nil {
+		return err
+	}
 	if helm == nil {
 		fmt.Println("No modules found / 未找到模块")
 		return nil
