@@ -95,6 +95,62 @@ fn mixedDependent(value: Int, seen: Channel<Int>): Int {
 	runGeneratedCompilation(t, generated, awaitProjectionCompositionAssertions)
 }
 
+func TestGeneratedAwaitEarlyReturnPreservesProjection(t *testing.T) {
+	const choice = `when {
+ early -> {
+  val rows = await {
+   if early { return Node.select().all() }
+   Node.select().all()
+  }
+  rows
+ }
+ else -> [Node { id: 1, name: "fallback" }]
+}`
+	for _, sample := range []struct {
+		name, body           string
+		projected, discarded int
+	}{
+		{"scalar", `val rows = await {
+ if early { return Node.select().all() }
+ Node.select().all()
+}
+return rows`, 2, 0},
+		{"tuple", `val (_, rows) = await {
+ if early { if early { return Node.select().all() } }
+ 42
+ Node.select().all()
+}
+return rows`, 2, 0},
+		{"statement", `await {
+ if early { return Node.select().all() }
+ Node.select().all()
+}
+return Node.select().all()`, 2, 1},
+		{"returned local value", "return " + choice, 2, 0},
+		{"discarded local value", "val ignored = " + choice + "\nreturn Node.select().all()", 1, 2},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			input := analyzePermissionFixture(t, `model Node @noTime { id: Int @id name: String }
+api page(early: Boolean): [Node] {
+`+sample.body+"\n}")
+			if len(input.Errors) != 0 {
+				t.Fatal(input.Errors)
+			}
+			ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Node": {"id": 1, "name": 2}}})
+			generated, err := Generate(input, "generated", GeneratorConfig{Driver: DriverPG, IDs: ids})
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := string(generated.Files["handler.gen.go"])
+			selected := strings.Count(handler, "selectNodeSQLColumns(req.Select)")
+			discarded := strings.Count(handler, "selectNodeSQLColumns([]*selection.Field{})")
+			if selected != sample.projected || discarded != sample.discarded {
+				t.Fatalf("projected queries=%d, discarded queries=%d; want %d and %d:\n%s", selected, discarded, sample.projected, sample.discarded, handler)
+			}
+		})
+	}
+}
+
 const awaitProjectionCompositionAssertions = `package generated
 import "testing"
 

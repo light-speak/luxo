@@ -149,13 +149,21 @@ api destructuredAwait(): Node? {
  val (row, _) = await { Node.select().first() 42 }
  return row
 }
+api earlyAwait(): Node? {
+ val row = await {
+  val early = Node.select().where(id: 1).first()
+  if early != null { return early }
+  Node.select().where(id: 2).first()
+ }
+ return row
+}
 api same(): Boolean { val row = Node.select().first() ?: throw error.NotFound val left = Holder.Model(value: row) val right = Holder.Model(value: row) return left == right }
 api sameLabeled(): Boolean { val row = Node.select().first() ?: throw error.NotFound val left = Holder.Labeled(value: row,label: row.name) val right = Holder.Labeled(value: row,label: row.name) return left == right }
 `, genericFunctionSelectionAssertions, StableIDs{ModelFields: map[string]map[string]int{"Node": {"id": 1, "name": 2, "secret": 3}, "Box": {"value": 1}, "Holder": {"Model": 1, "Labeled": 2}, "Holder.Model": {"value": 1}, "Holder.Labeled": {"value": 1, "label": 2}}})
 }
 
 const genericFunctionSelectionAssertions = `package generated
-import("bytes";"context";"encoding/json";"fmt";"net/http/httptest";"strings";"testing";
+import("bytes";"context";"encoding/json";"fmt";"net/http/httptest";"os";"strings";"testing";
 "github.com/light-speak/luxo/internal/testutil";"github.com/light-speak/luxo/pkg/lux";
 "github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/pg";
 "github.com/light-speak/luxo/pkg/lux/schema";"github.com/light-speak/luxo/pkg/lux/selection";
@@ -169,14 +177,17 @@ func(*genericFunctionTrace)FinishDatabaseQuery(context.Context,lux.DatabaseTrace
 func(*genericFunctionTrace)StartDatabaseAcquire(ctx context.Context,_ lux.DatabasePoolTraceMeta)context.Context{return ctx}
 func(*genericFunctionTrace)FinishDatabaseAcquire(context.Context,error){}
 func TestGenericFunctionSelectionSQL(t *testing.T){
- container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("generic_fn"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
- testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
- connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+ connection:=os.Getenv("LUXO_TEST_DATABASE_URL")
+ if connection==""{
+  container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("generic_fn"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+  testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
+  connection,err=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+ }
  db,err:=pg.NewDB(t.Context(),connection);if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
  if _,err:=pg.Exec(t.Context(),db,"CREATE TABLE nodes(id bigint PRIMARY KEY,name text NOT NULL,secret text NOT NULL); INSERT INTO nodes VALUES(1,'Ada','private')");err!=nil{t.Fatal(err)}
  router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
  if err:=RegisterHandlers(router,NewFromDB(db));err!=nil{t.Fatal(err)};if err:=router.Prepare();err!=nil{t.Fatal(err)}
- for _,sample:=range []struct{name,fields,want string}{{"direct","value{name}",` + "`" + `{"value":{"name":"Ada"}}` + "`" + `},{"nested","value{value{name}}",` + "`" + `{"value":{"value":{"name":"Ada"}}}` + "`" + `},{"extracted","name",` + "`" + `{"name":"Ada"}` + "`" + `},{"destructuredCopy","name",` + "`" + `{"name":"Ada"}` + "`" + `},{"destructuredAwait","name",` + "`" + `{"name":"Ada"}` + "`" + `}}{for _,binary:=range []bool{false,true}{
+ for _,sample:=range []struct{name,fields,want string}{{"direct","value{name}",` + "`" + `{"value":{"name":"Ada"}}` + "`" + `},{"nested","value{value{name}}",` + "`" + `{"value":{"value":{"name":"Ada"}}}` + "`" + `},{"extracted","name",` + "`" + `{"name":"Ada"}` + "`" + `},{"destructuredCopy","name",` + "`" + `{"name":"Ada"}` + "`" + `},{"destructuredAwait","name",` + "`" + `{"name":"Ada"}` + "`" + `},{"earlyAwait","name",` + "`" + `{"name":"Ada"}` + "`" + `}}{for _,binary:=range []bool{false,true}{
   t.Run(fmt.Sprintf("%s/%t",sample.name,binary),func(t *testing.T){
    declaration:=router.Schema.APIs[sample.name];model:=router.Schema.LookupModel(declaration.ReturnType)
    body,err:=json.Marshal(map[string]string{"$api":sample.name,"$select":sample.fields});if err!=nil{t.Fatal(err)}

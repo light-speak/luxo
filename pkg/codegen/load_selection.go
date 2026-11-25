@@ -288,7 +288,7 @@ func (a *loadDemandAnalysis) lookup(name string) ([]loadOrigin, bool) {
 func (a *loadDemandAnalysis) statement(statement ast.Stmt, publicReturn bool) []loadOrigin {
 	switch value := statement.(type) {
 	case *ast.ValStmt:
-		a.declaration(value)
+		return a.declaration(value, publicReturn)
 	case *ast.AssignStmt:
 		a.assignment(value)
 	case *ast.ReturnStmt:
@@ -298,6 +298,9 @@ func (a *loadDemandAnalysis) statement(statement ast.Stmt, publicReturn bool) []
 		}
 		return origins
 	case *ast.ExprStmt:
+		if await, ok := value.Expr.(*ast.AwaitExpr); ok {
+			return a.conditionalBlock(await.Body, nil, false, publicReturn)
+		}
 		// Evaluate effects and field reads; a discarded object is not a consumer
 		// of its full contents (notably for standalone null guards).
 		a.expression(value.Expr)
@@ -316,18 +319,18 @@ func (a *loadDemandAnalysis) statement(statement ast.Stmt, publicReturn bool) []
 	return nil
 }
 
-func (a *loadDemandAnalysis) declaration(declaration *ast.ValStmt) {
+func (a *loadDemandAnalysis) declaration(declaration *ast.ValStmt, publicReturn bool) []loadOrigin {
 	scope := a.scopes[len(a.scopes)-1]
 	if await, ok := declaration.Value.(*ast.AwaitExpr); ok {
-		a.bindAwaitResults(scope, declaration, await)
-		return
+		return a.bindAwaitResults(scope, declaration, await, publicReturn)
 	}
 	origins := a.expression(declaration.Value)
 	if len(declaration.Names) == 0 {
 		scope[declaration.Name] = a.bindObject(origins, declaration.Value, declaration.Type)
-		return
+		return nil
 	}
 	a.bindLoadAliases(scope, declaration.Names, origins, declaration.Value, declaration.Type)
+	return nil
 }
 
 type loadAwaitResult struct {
@@ -335,7 +338,7 @@ type loadAwaitResult struct {
 	origins    []loadOrigin
 }
 
-func (a *loadDemandAnalysis) bindAwaitResults(scope map[string][]loadOrigin, declaration *ast.ValStmt, await *ast.AwaitExpr) {
+func (a *loadDemandAnalysis) bindAwaitResults(scope map[string][]loadOrigin, declaration *ast.ValStmt, await *ast.AwaitExpr, publicReturn bool) []loadOrigin {
 	names := declaration.Names
 	if len(names) == 0 {
 		names = []string{declaration.Name}
@@ -344,6 +347,7 @@ func (a *loadDemandAnalysis) bindAwaitResults(scope map[string][]loadOrigin, dec
 	// The tasks read the surrounding scope before any result is bound.
 	var inline [2]loadAwaitResult
 	results := inline[:0]
+	var returned []loadOrigin
 	if await.Body != nil {
 		a.controlDepth++
 		parentDepth := len(a.scopes)
@@ -359,7 +363,7 @@ func (a *loadDemandAnalysis) bindAwaitResults(scope map[string][]loadOrigin, dec
 			if _, local := statement.(*ast.ValStmt); local && len(a.scopes) == parentDepth {
 				a.scopes = append(a.scopes, make(map[string][]loadOrigin))
 			}
-			a.statement(statement, false)
+			returned = append(returned, a.statement(statement, publicReturn)...)
 		}
 		a.scopes = a.scopes[:parentDepth]
 		a.controlDepth--
@@ -367,7 +371,7 @@ func (a *loadDemandAnalysis) bindAwaitResults(scope map[string][]loadOrigin, dec
 	if len(results) == 1 {
 		result := results[0]
 		a.bindLoadAliases(scope, names, result.origins, result.expression, declaration.Type)
-		return
+		return returned
 	}
 	for index, name := range names {
 		if name == "_" {
@@ -380,6 +384,7 @@ func (a *loadDemandAnalysis) bindAwaitResults(scope map[string][]loadOrigin, dec
 		}
 		scope[name] = bound
 	}
+	return returned
 }
 
 func (a *loadDemandAnalysis) assignment(value *ast.AssignStmt) {
