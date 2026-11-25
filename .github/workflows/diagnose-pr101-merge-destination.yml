@@ -1,0 +1,87 @@
+name: Recheck PR 101 MergeDestination on native Linux
+
+on:
+  push:
+    branches: [diagnostics/pr101-merge-destination]
+    paths:
+      - .github/workflows/diagnose-pr101-merge-destination.yml
+      - scripts/diagnose-pr101-merge-destination.sh
+      - scripts/diagnose-pr101-merge-destination.py
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  match:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr101-merge-destination'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2]
+    env:
+      LC_ALL: C
+      GOTOOLCHAIN: local
+      CGO_ENABLED: '1'
+      GOAMD64: v1
+    steps:
+      - name: Select the original hosted CPU model
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          evidence=.tmp/pr101-merge-destination-evidence
+          mkdir -p "$evidence"
+          uname -a > "$evidence/host.txt"
+          lscpu > "$evidence/lscpu.txt"
+          cat /etc/os-release > "$evidence/os-release.txt"
+          [[ "$RUNNER_KIND" == github-hosted && "$RUNNER_ARCH" == X64 && "$(uname -sm)" == 'Linux x86_64' ]]
+          grep -Fx 'VERSION_ID="24.04"' "$evidence/os-release.txt"
+          cpu=$(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/lscpu.txt")
+          if [[ "$cpu" != 'Intel(R) Xeon(R) 6975P-C' ]]; then
+            printf 'wrong-cpu: %s\n' "$cpu" | tee "$evidence/selection.txt"
+            exit 3
+          fi
+          printf 'matched: %s\n' "$cpu" | tee "$evidence/selection.txt"
+      - uses: actions/checkout@v7
+        with:
+          path: diagnostic
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Bind the exact source and original qualification artifact
+        working-directory: diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 origin \
+            7ba8d7fa68f0f096af907bd860f01589c3b2dbbd 91433a84653715d6d78a9d18725de918921669b8
+          evidence="$GITHUB_WORKSPACE/.tmp/pr101-merge-destination-evidence"
+          gh api repos/light-speak/luxo/actions/artifacts/15051468702 > "$evidence/original-metadata.json"
+          jq -e '.id == 15051468702 and .name == "performance-evidence-04-1" and .expired == false and
+            .digest == "sha256:fee7c3c17a7cf6df498c2e08239bc105e37717f0d23edd9f58ec70c541a0c3e1" and
+            .workflow_run.id == 45676516589 and .workflow_run.head_sha == "91433a84653715d6d78a9d18725de918921669b8"' \
+            "$evidence/original-metadata.json"
+          gh api repos/light-speak/luxo/actions/artifacts/15051468702/zip > "$evidence/original.zip"
+      - name: Compare exact default images and run independent test-set isolation
+        working-directory: diagnostic
+        run: |
+          set -euo pipefail
+          evidence="$GITHUB_WORKSPACE/.tmp/pr101-merge-destination-evidence"
+          bash scripts/diagnose-pr101-merge-destination.sh "$evidence" --also-isolate
+      - name: Preserve original provenance, raw samples and linker records
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr101-merge-destination-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slot }}
+          path: .tmp/pr101-merge-destination-evidence/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
