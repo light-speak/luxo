@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 )
 
@@ -17,8 +18,9 @@ const (
 // including subscription termination, cancellation, and failed exchanges.
 type poolConn struct {
 	net.Conn
-	pool  *Pool
-	state atomic.Uint32
+	pool      *Pool
+	state     atomic.Uint32
+	closeOnce sync.Once
 	// Only the current borrower accesses these buffers.
 	requestBuf   []byte
 	responseTail *frameInput
@@ -108,11 +110,13 @@ func partialResponseError(received int, err error) error {
 }
 
 func (c *poolConn) Close() error {
-	if c.state.Swap(connClosed) == connClosed {
-		return nil
-	}
-	err := c.Conn.Close()
-	c.pool.open.Add(-1)
-	c.pool.signal()
+	var err error
+	// A racing borrower must wait until the socket and its pool slot are both released.
+	c.closeOnce.Do(func() {
+		c.state.Store(connClosed)
+		err = c.Conn.Close()
+		c.pool.open.Add(-1)
+		c.pool.signal()
+	})
 	return err
 }

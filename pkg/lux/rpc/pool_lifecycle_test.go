@@ -96,6 +96,58 @@ func TestClientExchangeCancellationInterruptsBlockedIO(t *testing.T) {
 	}
 }
 
+func TestCanceledUnaryCallReturnsAfterReleasingPoolSlot(t *testing.T) {
+	options := PoolOptions{MaxIdle: 1, MaxOpen: 1, DialTimeout: time.Second}
+	client, err := NewNamedClientWithOptions("test", "unused", options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	closing, release := make(chan struct{}), make(chan struct{})
+	allowClose := sync.OnceFunc(func() { close(release) })
+	defer allowClose()
+	tracked := &poolLifecycleConn{Conn: conn, onClose: func() {
+		conn.Close()
+		close(closing)
+		<-release
+	}}
+	client.pool.Put(tracked)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, callErr := client.CallWithMaskContext(ctx, "", 1, nil, []byte{42})
+		done <- callErr
+	}()
+	if _, err := ReadFrame(peer, nil); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	<-closing
+	// The transport has interrupted I/O, but the underlying Close cannot finish yet.
+	select {
+	case err = <-done:
+		t.Error("canceled call returned while its connection still occupied the only pool slot")
+	case <-time.After(50 * time.Millisecond):
+		allowClose()
+		err = <-done
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Call error = %v", err)
+	}
+	if open := client.pool.open.Load(); open != 0 {
+		t.Errorf("pool has %d open connections after canceled Call returned", open)
+	}
+	if n := tracked.closes.Load(); n != 1 {
+		t.Errorf("underlying Close called %d times", n)
+	}
+}
+
 type cancelOnResponseConn struct {
 	net.Conn
 	remaining int
