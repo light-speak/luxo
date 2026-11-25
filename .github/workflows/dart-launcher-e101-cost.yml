@@ -1,0 +1,46 @@
+name: Dart launcher startup qualification
+
+on:
+  push:
+    branches: [diag/dart-launcher-e101-cost]
+    paths:
+      - '.github/workflows/dart-launcher-e101-cost.yml'
+      - '.github/diagnostics/dart-launcher-e101-cost/**'
+
+permissions:
+  contents: read
+
+jobs:
+  startup:
+    name: Dart startup / Linux x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.13.4'
+
+      - name: Verify locked launcher behavior and take paired startup samples
+        shell: bash
+        env:
+          PYTHONUTF8: '1'
+          LUXO_DART_COST_EXCLUSIVE: '1'
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/dart-launcher-cost-evidence
+          python3 -I -B .github/diagnostics/dart-launcher-e101-cost/cost.py collect \
+            --repo "$GITHUB_WORKSPACE" --scratch "$GITHUB_WORKSPACE/.tmp" --online \
+            | tee .tmp/dart-launcher-cost-evidence/startup.jsonl
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: dart-launcher-cost-linux-x64
+          path: .tmp/dart-launcher-cost-evidence/
+          if-no-files-found: error
+          retention-days: 14
