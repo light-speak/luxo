@@ -108,7 +108,8 @@ func verifyProfileInventory(args []string) error {
 		return err
 	}
 	for root := range ordinary {
-		if benchlayout.ProfileForBenchmark(pkg, root) != profile {
+		receiverCompanion := profile == benchlayout.CodegenMigrationStateProfile && root == benchlayout.CodegenReceiverBenchmark
+		if benchlayout.ProfileForBenchmark(pkg, root) != profile && !receiverCompanion {
 			delete(ordinary, root)
 		}
 	}
@@ -124,10 +125,9 @@ func verifyProfileInventory(args []string) error {
 			return errors.New("codegen integer literal profile requires the four verified integer and duration leaves")
 		}
 	case benchlayout.CodegenReceiverProfile:
-		const root = benchlayout.CodegenReceiverBenchmark
-		if !verifiedBenchmarkLeaves(isolated[root], root, "User", "_Record", "用户") {
-			return errors.New("codegen global receiver profile requires the three verified receiver leaves")
-		}
+		return verifyCodegenReceiverInventory(isolated)
+	case benchlayout.CodegenMigrationStateProfile:
+		return verifyCodegenMigrationStateInventory(isolated)
 	case benchlayout.LuviaGatewayIdentityProfile:
 		const root = benchlayout.LuviaGatewayIdentityBenchmark
 		if !verifiedBenchmarkLeaves(isolated[root], root, "anonymous/before", "anonymous/after", "authenticated/before",
@@ -136,6 +136,25 @@ func verifyProfileInventory(args []string) error {
 		}
 	}
 	return nil
+}
+
+func verifyCodegenReceiverInventory(isolated inventory) error {
+	const root = benchlayout.CodegenReceiverBenchmark
+	if !verifiedBenchmarkLeaves(isolated[root], root, "User", "_Record", "用户") {
+		return errors.New("codegen global receiver profile requires the three verified receiver leaves")
+	}
+	return nil
+}
+
+func verifyCodegenMigrationStateInventory(isolated inventory) error {
+	const migration = benchlayout.CodegenMigrationStateBenchmark
+	if !verifiedBenchmarkLeaves(isolated[migration], migration,
+		"empty/validate", "empty/load/reference", "empty/load/strict", "empty/save/reference", "empty/save/strict",
+		"small/validate", "small/load/reference", "small/load/strict", "small/save/reference", "small/save/strict",
+		"large/validate", "large/load/reference", "large/load/strict", "large/save/reference", "large/save/strict") {
+		return errors.New("codegen migration state profile requires the 15 verified migration leaves")
+	}
+	return verifyCodegenReceiverInventory(isolated)
 }
 
 func verifyLuxShortPathInventory(isolated map[string]map[string]struct{}) error {

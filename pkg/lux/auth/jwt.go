@@ -5,8 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"math"
+	"math/big"
+	"math/bits"
 	"strconv"
 	"strings"
 	"sync"
@@ -137,6 +140,11 @@ func signWithSubject(cfg *Config, data ClaimsWriter, expires time.Duration, purp
 		return "", fmt.Errorf("JWT claims writer is required")
 	}
 	now := time.Now()
+	issuedAt := now.Unix()
+	expiresAt := now.Add(expires).Unix()
+	if expires > 0 && expiresAt <= issuedAt {
+		return "", fmt.Errorf("JWT lifetime must reach a future whole-second deadline")
+	}
 	prefix := `{"token_use":"access","data":`
 	if purpose == refreshPurpose {
 		prefix = `{"token_use":"refresh","data":`
@@ -159,8 +167,8 @@ func signWithSubject(cfg *Config, data ClaimsWriter, expires time.Duration, purp
 			return "", fmt.Errorf("invalid JWT subject: %w", err)
 		}
 	}
-	envelope := strconv.AppendInt(append(payload, `,"exp":`...), now.Add(expires).Unix(), 10)
-	envelope = strconv.AppendInt(append(envelope, `,"iat":`...), now.Unix(), 10)
+	envelope := strconv.AppendInt(append(payload, `,"exp":`...), expiresAt, 10)
+	envelope = strconv.AppendInt(append(envelope, `,"iat":`...), issuedAt, 10)
 	payloadB64 := base64Encode(append(envelope, '}'))
 
 	sig := hmacSign(signedJWTHeader+"."+payloadB64, cfg.Secret)
@@ -308,23 +316,61 @@ func base64Decode(s string) ([]byte, error) {
 // Examples: "7d" → 168h, "2w" → 336h, "1d12h" → 36h, "30m" → 30m.
 func parseDuration(s string) (time.Duration, error) {
 	s = strings.TrimSuffix(s, "+")
-	unit := strings.IndexAny(s, "dw")
-	if unit >= 0 {
-		if unit == len(s)-1 {
-			if number, err := strconv.ParseFloat(s[:unit], 64); err == nil {
-				scale := 24 * time.Hour
-				if s[unit] == 'w' {
-					scale *= 7
-				}
-				return scaleDuration(number, scale, s)
-			}
+	hasMultiplier := false
+	for i := range len(s) {
+		switch s[i] {
+		case 'd', 'w':
+			return parseDayWeekDuration(s, i)
+		case '*':
+			hasMultiplier = true
 		}
-		return parseExtendedDuration(s)
 	}
-	if strings.Contains(s, "*") {
+	if hasMultiplier {
 		return parseDurationWithMultiplier(s)
 	}
 	return time.ParseDuration(s)
+}
+
+// A hexadecimal significand can contain d. Look for its exponent marker
+// before treating that byte as a unit suffix.
+func durationHexExponent(s string, prefix int) int {
+	if prefix == 0 || s[prefix-1] != '0' {
+		return prefix
+	}
+	for i := prefix + 1; i < len(s); i++ {
+		c := s[i] | 0x20
+		if c == 'p' {
+			return i
+		}
+		if c-'0' > 9 && c-'a' > 5 && c != '.' && s[i] != '_' {
+			break
+		}
+	}
+	return prefix
+}
+
+func durationExponentEnd(s string, marker int) int {
+	end := marker + 1
+	if end < len(s) && (s[end] == '+' || s[end] == '-') {
+		end++
+	}
+	for end < len(s) && (s[end]-'0' <= 9 || s[end] == '_') {
+		end++
+	}
+	return end
+}
+
+func parseDayWeekDuration(s string, unit int) (time.Duration, error) {
+	if unit == len(s)-1 {
+		scale := 24 * time.Hour
+		if s[unit] == 'w' {
+			scale *= 7
+		}
+		if duration, err := scaleDuration(s[:unit], scale, s); err != errInvalidDurationMultiplier {
+			return duration, err
+		}
+	}
+	return parseExtendedDuration(s)
 }
 
 func parseExtendedDuration(s string) (time.Duration, error) {
@@ -333,9 +379,22 @@ func parseExtendedDuration(s string) (time.Duration, error) {
 	for i := 0; i < len(s); i++ {
 		unit := s[i]
 		if unit != 'd' && unit != 'w' {
-			if (unit < '0' || unit > '9') && unit != '.' {
-				numberStart = i + 1
+			if unit-'0' <= 9 || unit == '.' {
+				continue
 			}
+			switch unit {
+			case 'x', 'X':
+				if marker := durationHexExponent(s, i); marker != i {
+					i = durationExponentEnd(s, marker) - 1
+					continue
+				}
+			case 'e', 'E':
+				if end := durationExponentEnd(s, i); i > numberStart && end > i+1 {
+					i = end - 1
+					continue
+				}
+			}
+			numberStart = i + 1
 			continue
 		}
 		// Ordinary Go duration units end in h, m, or s. Separate that
@@ -353,13 +412,18 @@ func parseExtendedDuration(s string) (time.Duration, error) {
 		}
 		start, numberStart = i+1, i+1
 	}
+	if start == 0 {
+		return parseDurationWithMultiplier(s)
+	}
 	normalized.WriteString(s[start:])
 	return parseDurationWithMultiplier(strings.TrimSuffix(normalized.String(), "+"))
 }
 
 func parseDurationWithMultiplier(s string) (time.Duration, error) {
 	var total time.Duration
-	for _, part := range strings.Split(s, "+") {
+	for remaining := s; remaining != ""; {
+		var part string
+		part, remaining = cutDurationTerm(remaining)
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
@@ -368,15 +432,14 @@ func parseDurationWithMultiplier(s string) (time.Duration, error) {
 		if idx := strings.Index(part, "*"); idx >= 0 {
 			numStr := part[:idx]
 			durStr := part[idx+1:]
-			num, err := strconv.ParseFloat(numStr, 64)
-			if err != nil {
-				return 0, fmt.Errorf("invalid duration %q", s)
-			}
 			d, err := time.ParseDuration(durStr)
 			if err != nil {
 				return 0, fmt.Errorf("invalid duration %q: %w", s, err)
 			}
-			duration, err = scaleDuration(num, d, s)
+			duration, err = scaleDuration(numStr, d, s)
+			if err == errInvalidDurationMultiplier {
+				return 0, fmt.Errorf("invalid duration %q", s)
+			}
 			if err != nil {
 				return 0, err
 			}
@@ -395,11 +458,224 @@ func parseDurationWithMultiplier(s string) (time.Duration, error) {
 	return total, nil
 }
 
-func scaleDuration(number float64, unit time.Duration, input string) (time.Duration, error) {
-	product := number * float64(unit)
-	// The positive bound is exclusive: float64(MaxInt64) rounds to 2^63.
-	if math.IsNaN(product) || math.IsInf(product, 0) || product >= 0x1p63 || product < -0x1p63 {
+func cutDurationTerm(s string) (part, rest string) {
+	separator := strings.IndexByte(s, '+')
+	if separator < 0 {
+		return s, ""
+	}
+	// Only the numeric multiplier can have an exponent sign, and a valid
+	// number has at most one. The numeric parser validates the full operand.
+	if separator > 0 {
+		marker := s[separator-1] | 0x20
+		if (marker == 'e' || marker == 'p') && separator+1 < len(s) && s[separator+1]-'0' <= 9 &&
+			strings.IndexByte(s[:separator], '*') < 0 {
+			next := strings.IndexByte(s[separator+1:], '+')
+			if next < 0 {
+				return s, ""
+			}
+			separator += next + 1
+		}
+	}
+	return s[:separator], s[separator+1:]
+}
+
+var errInvalidDurationMultiplier = errors.New("invalid duration multiplier")
+
+func scaleDuration(raw string, unit time.Duration, input string) (time.Duration, error) {
+	value, divisor, negative := decimalDurationMultiplier(raw)
+	if divisor == 0 {
+		value, divisor, negative = scientificDurationMultiplier(raw)
+	}
+	if divisor == 0 {
+		value, divisor, negative = hexDurationMultiplier(raw)
+	}
+	if divisor == 0 {
+		return scaleOtherDurationMultiplier(raw, unit, input)
+	}
+	return scaleDurationRatio(value, divisor, negative, unit, input)
+}
+
+// Up to 19 decimal digits fit in uint64 without rounding. Exponents, digit
+// separators, hex floats, and longer decimals use separate paths.
+func decimalDurationMultiplier(raw string) (value, divisor uint64, negative bool) {
+	if raw == "" {
+		return 0, 0, false
+	}
+	if raw[0] == '-' || raw[0] == '+' {
+		negative, raw = raw[0] == '-', raw[1:]
+	}
+	if len(raw) > 20 {
+		return 0, 0, false
+	}
+	divisor = 1
+	digits, fraction := 0, false
+	for i := range len(raw) {
+		digit := raw[i] - '0'
+		if raw[i] == '.' && !fraction {
+			fraction = true
+			continue
+		}
+		if digit > 9 || digits == 19 {
+			return 0, 0, false
+		}
+		value = value*10 + uint64(digit)
+		digits++
+		if fraction {
+			divisor *= 10
+		}
+	}
+	if digits == 0 {
+		return 0, 0, false
+	}
+	return value, divisor, negative
+}
+
+func scientificDurationMultiplier(raw string) (value, divisor uint64, negative bool) {
+	marker := strings.IndexAny(raw, "eE")
+	if marker < 1 {
+		return 0, 0, false
+	}
+	exp, err := strconv.Atoi(raw[marker+1:])
+	if err != nil || exp < -19 || exp > 19 {
+		return 0, 0, false
+	}
+	value, divisor, negative = decimalDurationMultiplier(raw[:marker])
+	if divisor == 0 {
+		return 0, 0, false
+	}
+	for ; exp > 0 && divisor > 1; exp-- {
+		divisor /= 10
+	}
+	for ; exp > 0; exp-- {
+		if value > math.MaxUint64/10 {
+			return 0, 0, false
+		}
+		value *= 10
+	}
+	for ; exp < 0; exp++ {
+		if divisor > math.MaxUint64/10 {
+			return 0, 0, false
+		}
+		divisor *= 10
+	}
+	return value, divisor, negative
+}
+
+func hexDurationMultiplier(raw string) (value, divisor uint64, negative bool) {
+	if raw == "" {
+		return 0, 0, false
+	}
+	if raw[0] == '+' || raw[0] == '-' {
+		negative, raw = raw[0] == '-', raw[1:]
+	}
+	if len(raw) < 4 || raw[0] != '0' || raw[1]|0x20 != 'x' {
+		return 0, 0, false
+	}
+	marker := strings.IndexAny(raw, "pP")
+	if marker < 3 {
+		return 0, 0, false
+	}
+	exp, err := strconv.Atoi(raw[marker+1:])
+	if err != nil || exp < -1024 || exp > 1024 {
+		return 0, 0, false
+	}
+	value, fraction, ok := hexDurationSignificand(raw[2:marker])
+	if !ok {
+		return 0, 0, false
+	}
+	if value == 0 {
+		return 0, 1, false
+	}
+	// Drop powers of two shared by the numerator and divisor before checking
+	// the compact range. Wider valid ratios still use the exact fallback.
+	trailing := bits.TrailingZeros64(value)
+	value >>= trailing
+	shift := exp - 4*fraction + trailing
+	if shift < -63 || shift > bits.LeadingZeros64(value) {
+		return 0, 0, false
+	}
+	if shift >= 0 {
+		return value << shift, 1, negative
+	}
+	return value, uint64(1) << -shift, negative
+}
+
+func hexDurationSignificand(raw string) (value uint64, fraction int, ok bool) {
+	digits, point := 0, false
+	for i := range len(raw) {
+		if raw[i] == '.' && !point {
+			point = true
+			continue
+		}
+		digit := raw[i] - '0'
+		if digit > 9 {
+			digit = (raw[i] | 0x20) - 'a'
+			if digit > 5 {
+				return 0, 0, false
+			}
+			digit += 10
+		}
+		if digits == 16 {
+			return 0, 0, false
+		}
+		value = value<<4 | uint64(digit)
+		digits++
+		if point {
+			fraction++
+		}
+	}
+	return value, fraction, digits != 0
+}
+
+func scaleDurationRatio(value, divisor uint64, negative bool, unit time.Duration, input string) (time.Duration, error) {
+	factor := uint64(unit)
+	if unit < 0 {
+		factor, negative = -factor, !negative
+	}
+	high, low := bits.Mul64(value, factor)
+	if high >= divisor {
 		return 0, fmt.Errorf("duration %q overflows", input)
 	}
-	return time.Duration(product), nil
+	var magnitude uint64
+	if high == 0 {
+		magnitude = low / divisor
+	} else {
+		magnitude, _ = bits.Div64(high, low, divisor)
+	}
+	if negative && magnitude <= 1<<63 {
+		return time.Duration(-magnitude), nil
+	}
+	if !negative && magnitude <= math.MaxInt64 {
+		return time.Duration(magnitude), nil
+	}
+	return 0, fmt.Errorf("duration %q overflows", input)
+}
+
+func scaleOtherDurationMultiplier(raw string, unit time.Duration, input string) (time.Duration, error) {
+	number, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, errInvalidDurationMultiplier
+	}
+	magnitude := math.Abs(number * float64(unit))
+	if math.IsNaN(magnitude) || magnitude >= 0x1p64 {
+		return 0, fmt.Errorf("duration %q overflows", input)
+	}
+	if magnitude == 0 {
+		return 0, nil
+	}
+	// Padding a decimal with trailing zeros must not enlarge its exact scale.
+	if strings.Contains(raw, ".") && !strings.ContainsAny(raw, "_eEpP") {
+		raw = strings.TrimRight(raw, "0")
+	}
+	var numberExact big.Rat
+	if _, ok := numberExact.SetString(raw); !ok {
+		return 0, fmt.Errorf("invalid duration %q", input)
+	}
+	var scaled, factor big.Int
+	scaled.Mul(numberExact.Num(), factor.SetInt64(int64(unit)))
+	scaled.Quo(&scaled, numberExact.Denom())
+	if !scaled.IsInt64() {
+		return 0, fmt.Errorf("duration %q overflows", input)
+	}
+	return time.Duration(scaled.Int64()), nil
 }

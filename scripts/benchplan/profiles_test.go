@@ -244,6 +244,54 @@ func TestCodegenReceiverInventoryAndIndependentRouting(t *testing.T) {
 	}
 }
 
+func TestCodegenMigrationStateInventoryRequiresNativeCohort(t *testing.T) {
+	const pkg, profile = "pkg/codegen", "codegen-migration-state"
+	const migration, receiver = "BenchmarkMigrationStateValidation", "BenchmarkGlobalReceiverName"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	const receiverRows = receiver + "/User" + measurement + receiver + "/_Record" + measurement + receiver + "/用户" + measurement
+	const unrelated = "BenchmarkCompileDecimalIntegerLiterals/int_plain" + measurement
+	var migrationRows strings.Builder
+	for _, size := range []string{"empty", "small", "large"} {
+		for _, op := range []string{"validate", "load/reference", "load/strict", "save/reference", "save/strict"} {
+			migrationRows.WriteString(migration + "/" + size + "/" + op + measurement)
+		}
+	}
+	cohort := migrationRows.String() + receiverRows
+	missingMigration := strings.ReplaceAll(cohort, migration+"/large/save/strict"+measurement, "")
+	missingReceiver := strings.ReplaceAll(cohort, receiver+"/用户"+measurement, "")
+	work := benchmarkTempDir(t)
+	ordinary, isolated := work+"/ordinary.log", work+"/isolated.log"
+	for _, tc := range []struct {
+		label, ordinary, isolated string
+		valid                     bool
+	}{
+		{"exact cohort", cohort, cohort, true},
+		{"migration leaf omitted", missingMigration, missingMigration, false},
+		{"receiver leaf omitted", missingReceiver, missingReceiver, false},
+		{"receiver root omitted", migrationRows.String(), migrationRows.String(), false},
+		{"unexpected isolated leaf", cohort, cohort + unrelated, false},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+unrelated+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			if err := run([]string{"--verify-profile-inventory", pkg, profile, ordinary, isolated}, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("migration inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+	primary := formatShard(benchShard{Groups: []benchGroup{{Package: pkg, Name: migration}, {Package: pkg, Name: receiver}}})
+	confirmation := formatConfirmationBatch([]sampleKey{{pkg, migration + "/small/load/strict-2"}, {pkg, receiver + "/用户-2"}})
+	for _, tc := range []struct{ batch, migrationFilter, receiverFilter string }{
+		{primary, "^(" + migration + ")$", "^(" + receiver + ")$"},
+		{confirmation, "^" + migration + "$/^small$/^load$/^strict$", "^" + receiver + "$/^用户$"},
+	} {
+		if !strings.Contains(tc.batch, pkg+"\t"+profile+"\t"+tc.migrationFilter+"\n") ||
+			!strings.Contains(tc.batch, pkg+"\tcodegen-global-receiver\t"+tc.receiverFilter+"\n") {
+			t.Fatalf("migration and receiver must use separate measured binaries:\n%s", tc.batch)
+		}
+	}
+}
+
 func TestLuviaGatewayIdentityHasSixSeparateLeaves(t *testing.T) {
 	const pkg, profile = "pkg/lux/luvia", "luvia-gateway-identity"
 	const root, primaryKeys = "BenchmarkGatewayIdentity", "BenchmarkPrimaryKeys"

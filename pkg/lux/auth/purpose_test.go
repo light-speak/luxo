@@ -7,6 +7,32 @@ import (
 	"time"
 )
 
+func TestSignRequiresFutureDeadlineForPositiveLifetime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		time.Sleep(100 * time.Millisecond)
+		cfg := testConfig()
+		cfg.Expires, cfg.RefreshExpires = 500*time.Millisecond, 500*time.Millisecond
+		for _, sign := range []func(*Config, ClaimsWriter) (string, error){Sign, SignRefresh} {
+			if token, err := sign(cfg, testClaims(42, "ADMIN")); err == nil || token != "" {
+				t.Fatal("signer returned a token whose deadline is the current second")
+			}
+		}
+
+		cfg.Expires = 950 * time.Millisecond
+		token, err := Sign(cfg, testClaims(42, "ADMIN"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Verify(cfg, token); err != nil {
+			t.Fatalf("fresh token rejected: %v", err)
+		}
+		time.Sleep(900 * time.Millisecond)
+		if _, err := Verify(cfg, token); err == nil {
+			t.Fatal("token remained valid at its signed deadline")
+		}
+	})
+}
+
 func TestTokensExpireAtExactBoundary(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ResetVerifyCache()
