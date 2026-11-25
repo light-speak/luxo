@@ -166,7 +166,7 @@ class SelectionBuild {
       final original = file.uri.resolve(package['rootUri'] as String);
       if (original == source.uri) {
         name = package['name'] as String;
-        package['rootUri'] = directory.uri.toString();
+        package['rootUri'] = nativeFileUri(directory.uri).toString();
       } else {
         package['rootUri'] = original.toString();
       }

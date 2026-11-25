@@ -121,6 +121,9 @@ void main() {
       }),
     );
     await File('${root.path}/asset.txt').writeAsString('owned root');
+    final source = File('${root.path}/lib/asset.g.dart');
+    await source.create(recursive: true);
+    await source.writeAsString("const value = 'owned package';");
     final build = await SelectionBuild.prepare(root);
     expect(build.directory.parent.uri, Directory('${root.path}/.tmp').uri);
     addTearDown(build.close);
@@ -129,6 +132,30 @@ void main() {
       'owned root',
     );
     expect(await sibling.list().toList(), isEmpty);
+
+    final snapshotName = build.directory.uri.pathSegments
+        .where((part) => part.isNotEmpty)
+        .last;
+    final lookalike = File(
+      '${sibling.path}/.tmp/$snapshotName/lib/asset.g.dart',
+    );
+    await lookalike.create(recursive: true, exclusive: true);
+    await lookalike.writeAsString("const value = 'wrong package';");
+    final probe = File('${fixture.root.path}/package_probe.dart');
+    await probe.writeAsString('''
+import 'package:marked_project/asset.g.dart';
+void main() => print(value);
+''');
+    // Keep the config file location unmarked so this exercises its root URI.
+    final packages = await File(
+      '${build.directory.path}/.dart_tool/package_config.json',
+    ).copy('${fixture.root.path}/probe-packages.json');
+    final result = await Process.run(Platform.resolvedExecutable, [
+      '--packages=${packages.path}',
+      probe.path,
+    ], workingDirectory: fixture.root.path);
+    expect(result.exitCode, 0, reason: '${result.stderr}');
+    expect((result.stdout as String).trim(), 'owned package');
     await build.close();
     expect(await build.directory.exists(), isFalse);
   });
