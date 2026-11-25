@@ -1,0 +1,131 @@
+package api
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"testing"
+)
+
+type diagnosticParseErrorCase struct {
+	name   string
+	status int
+	cause  error
+}
+
+type diagnosticParseErrorWriter struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (w *diagnosticParseErrorWriter) Header() http.Header { return w.header }
+func (w *diagnosticParseErrorWriter) WriteHeader(status int) {
+	w.status = status
+}
+func (w *diagnosticParseErrorWriter) Write(data []byte) (int, error) {
+	return w.body.Write(data)
+}
+func (w *diagnosticParseErrorWriter) reset() {
+	clear(w.header)
+	w.body.Reset()
+	w.status = 0
+}
+
+const diagnosticParseDetail = "fixture transport detail"
+
+func diagnosticParseErrorCases() []diagnosticParseErrorCase {
+	return []diagnosticParseErrorCase{
+		{"BadRequest", http.StatusBadRequest, fmt.Errorf("%s", diagnosticParseDetail)},
+		{"PayloadTooLarge", http.StatusRequestEntityTooLarge, fmt.Errorf("%s: %w", diagnosticParseDetail, errRequestBodyTooLarge)},
+		{"Unavailable", http.StatusServiceUnavailable, fmt.Errorf("%s: %w", diagnosticParseDetail, errReceiveCapacity)},
+	}
+}
+
+func diagnosticParseRouter(output io.Writer) *Router {
+	return NewRouterWithOptions(RouterOptions{
+		RequestLogging: true, RequestLogSampleEvery: 1, SynchronousRequestLogs: true, LogWriter: output,
+	})
+}
+
+func diagnosticParseResponse(tb testing.TB, sample diagnosticParseErrorCase, binary bool, body []byte) {
+	tb.Helper()
+	var code int
+	var name, message string
+	if binary {
+		result, err := DecodeBinaryError(body, 0)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		code, name, message = result.Code, result.Name, result.Message
+	} else {
+		var result struct {
+			Code    int    `json:"code"`
+			Name    string `json:"error"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			tb.Fatal(err)
+		}
+		code, name, message = result.Code, result.Name, result.Message
+	}
+	if code != sample.status || name != sample.name || message != sample.cause.Error() {
+		tb.Fatalf("unexpected parse response: %d %q %q", code, name, message)
+	}
+}
+
+func TestDiagnosticWriteParseErrorWire(t *testing.T) {
+	policy := os.Getenv("LUXO_DIAGNOSTIC_PARSE_LOG")
+	if policy != "original" && policy != "category" {
+		t.Fatal("diagnostic parse log policy was not pinned")
+	}
+	for _, binary := range []bool{false, true} {
+		mode := httpAbnormalMode(binary)
+		for _, sample := range diagnosticParseErrorCases() {
+			var logs bytes.Buffer
+			w := &diagnosticParseErrorWriter{header: make(http.Header)}
+			diagnosticParseRouter(&logs).writeParseError(w, httpAbnormalRequest(binary), binary, nil, sample.cause)
+			if w.status != sample.status {
+				t.Fatalf("status = %d, want %d", w.status, sample.status)
+			}
+			diagnosticParseResponse(t, sample, binary, w.body.Bytes())
+			expected := sample.cause.Error()
+			if policy == "category" {
+				expected = sample.name
+			}
+			if !bytes.Contains(logs.Bytes(), []byte("[parse]")) ||
+				!bytes.Contains(logs.Bytes(), []byte(mode)) ||
+				!bytes.HasSuffix(logs.Bytes(), []byte("✗ "+expected+colorReset+"\n")) {
+				t.Fatalf("unexpected %s parse log: %q", policy, logs.String())
+			}
+			t.Logf("parse-wire %s/%s %d %x", mode, sample.name, w.status, sha256.Sum256(w.body.Bytes()))
+		}
+	}
+}
+
+func BenchmarkDiagnosticWriteParseError(b *testing.B) {
+	for _, binary := range []bool{false, true} {
+		for _, sample := range diagnosticParseErrorCases() {
+			b.Run(httpAbnormalMode(binary)+"/"+sample.name, func(b *testing.B) {
+				rt := diagnosticParseRouter(io.Discard)
+				r := httpAbnormalRequest(binary)
+				w := &diagnosticParseErrorWriter{header: make(http.Header)}
+				rt.writeParseError(w, r, binary, nil, sample.cause)
+				diagnosticParseResponse(b, sample, binary, w.body.Bytes())
+				want := bytes.Clone(w.body.Bytes())
+				b.ReportAllocs()
+				for b.Loop() {
+					w.reset()
+					rt.writeParseError(w, r, binary, nil, sample.cause)
+				}
+				if w.status != sample.status || !bytes.Equal(w.body.Bytes(), want) {
+					b.Fatal("parse response changed")
+				}
+			})
+		}
+	}
+}

@@ -1,0 +1,86 @@
+name: Recheck PR 85 parse logging and route export on native Linux
+
+"on":
+  push:
+    branches: [diagnostics/pr85-local-route]
+    paths:
+      - .github/workflows/diagnose-pr85-local-route.yml
+      - scripts/diagnose-pr85/**
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  match:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr85-local-route'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2]
+    env:
+      LC_ALL: C
+      GOTOOLCHAIN: local
+      GOMAXPROCS: '2'
+      CGO_ENABLED: '1'
+      GOAMD64: v1
+    steps:
+      - name: Select the original hosted CPU model
+        id: host
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          evidence=.tmp/pr85-local-route-evidence
+          mkdir -p "$evidence"
+          uname -a > "$evidence/host.txt"
+          lscpu > "$evidence/lscpu.txt"
+          cat /etc/os-release > "$evidence/os-release.txt"
+          [[ "$RUNNER_KIND" == github-hosted && "$RUNNER_ARCH" == X64 && "$(uname -sm)" == 'Linux x86_64' ]]
+          grep -Fx 'VERSION_ID="24.04"' "$evidence/os-release.txt"
+          cpu=$(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/lscpu.txt")
+          if [[ "$cpu" != 'Intel(R) Xeon(R) 6975P-C' ]]; then
+            printf 'wrong-cpu: %s\n' "$cpu" | tee "$evidence/selection.txt"
+            exit 3
+          fi
+          printf 'matched: %s\n' "$cpu" | tee "$evidence/selection.txt"
+      - uses: actions/checkout@v7
+        with:
+          path: diagnostic
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Bind exact source and original qualification artifact
+        working-directory: diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 origin \
+            cbca8575fdd012835799a8f10a94f4c596d1e9d6 02c0e428f1e4abe27f049f2644f7b7fecd8dc90b
+          evidence="$GITHUB_WORKSPACE/.tmp/pr85-local-route-evidence"
+          gh api repos/light-speak/luxo/actions/artifacts/15063828133 > "$evidence/original-metadata.json"
+          jq -e '.id == 15063828133 and .name == "performance-evidence-08-1" and .expired == false and
+            .size_in_bytes == 121476 and
+            .digest == "sha256:6f08dc18fc15c5bc1804f240e4ea9f2cc9ad3d60ed27121a0c4c9a0f69469c80" and
+            .workflow_run.id == 45701411412 and .workflow_run.head_sha == "02c0e428f1e4abe27f049f2644f7b7fecd8dc90b"' \
+            "$evidence/original-metadata.json"
+          gh api repos/light-speak/luxo/actions/artifacts/15063828133/zip > "$evidence/original.zip"
+      - name: Recheck exact hosted profile and direct parse error work
+        working-directory: diagnostic
+        run: bash scripts/diagnose-pr85/native.sh "$GITHUB_WORKSPACE/.tmp/pr85-local-route-evidence"
+      - name: Preserve original provenance, raw samples and linker records
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr85-local-route-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slot }}
+          path: .tmp/pr85-local-route-evidence/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
