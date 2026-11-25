@@ -1,0 +1,47 @@
+name: Dart launcher native qualification
+
+on:
+  push:
+    branches: [diag/dart-launcher-e101-native]
+    paths:
+      - '.github/workflows/dart-launcher-e101-native.yml'
+      - '.github/diagnostics/dart-launcher-e101/**'
+
+permissions:
+  contents: read
+
+jobs:
+  dart-launcher:
+    name: Dart launcher / ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            dart_abi: windows_x64
+          - runner: ubuntu-24.04
+            dart_abi: linux_x64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.13.4'
+
+      - name: Verify the launcher and directory regressions
+        env:
+          EXPECTED_DART_ABI: ${{ matrix.dart_abi }}
+          PYTHONUTF8: '1'
+        run: python .github/diagnostics/dart-launcher-e101/qualify.py
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: dart-launcher-${{ matrix.runner }}
+          path: ${{ runner.temp }}/dart-launcher-evidence/
+          if-no-files-found: error
