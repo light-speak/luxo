@@ -59,6 +59,27 @@ void main() {
     }
   });
 
+  test('rejects a different host with the same HTTPS port', () async {
+    final client = LuxoHttp2Client(Uri.parse('https://localhost:1'));
+    addTearDown(client.close);
+    final abort = Completer<void>()..complete();
+    final url = Uri.parse('https://127.0.0.1:1/items');
+    await expectLater(
+      client.send(
+        http.AbortableRequest('GET', url, abortTrigger: abort.future),
+      ),
+      throwsA(
+        isA<http.ClientException>()
+            .having(
+              (error) => error.message,
+              'message',
+              'HTTP/2 client closed or origin mismatch',
+            )
+            .having((error) => error.uri, 'uri', url),
+      ),
+    );
+  });
+
   test('accepts equivalent HTTPS origins with default ports', () async {
     final client = LuxoHttp2Client(Uri.parse('https://[::1]'));
     addTearDown(client.close);
