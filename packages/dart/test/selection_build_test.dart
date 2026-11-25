@@ -23,6 +23,173 @@ class _SourceDirectoryWithTrailingSeparator implements Directory {
 }
 
 void main() {
+  test(
+    'native refresh preserves distinct source names beginning with U+FEFF',
+    () async {
+      const plain = 'assets/case.txt';
+      const prefixed = 'assets/\uFEFFcase.txt';
+      const twicePrefixed = 'assets/\uFEFF\uFEFFcase.txt';
+      const contents = {
+        plain: 'plain asset',
+        prefixed: 'prefixed asset',
+        twicePrefixed: 'twice prefixed asset',
+        'assets/%EF%BB%BFcase.txt': 'literal URI escape',
+        'assets/mid\uFEFFcase-%中文😀.txt': 'embedded U+FEFF',
+      };
+      final fixture = await SelectFixture.create(_minimal);
+      addTearDown(fixture.close);
+      await Directory('${fixture.root.path}/assets').create();
+      for (final MapEntry(:key, :value) in contents.entries) {
+        final file = File('${fixture.root.path}/$key');
+        await file.create(exclusive: true);
+        await file.writeAsString(value);
+      }
+      for (final MapEntry(:key, :value) in contents.entries) {
+        expect(await File('${fixture.root.path}/$key').readAsString(), value);
+      }
+      final build = await SelectionBuild.prepare(fixture.root);
+      addTearDown(build.close);
+      for (final MapEntry(:key, :value) in contents.entries) {
+        expect(
+          await File('${build.directory.path}/$key').readAsString(),
+          value,
+        );
+      }
+      final source = File('${fixture.root.path}/$prefixed');
+      final plainAsset = File('${build.directory.path}/$plain');
+      final prefixedAsset = File('${build.directory.path}/$prefixed');
+      final twicePrefixedAsset = File('${build.directory.path}/$twicePrefixed');
+
+      final cacheTime = DateTime.utc(2000, 1, 1);
+      await plainAsset.setLastModified(cacheTime);
+      await source.delete();
+      await build.refresh();
+      expect((await plainAsset.lastModified()).toUtc(), cacheTime);
+      expect(await prefixedAsset.exists(), isFalse);
+      expect(await plainAsset.readAsString(), 'plain asset');
+      expect(await twicePrefixedAsset.readAsString(), 'twice prefixed asset');
+
+      await source.writeAsString('replacement asset');
+      await build.refresh();
+      expect(await prefixedAsset.readAsString(), 'replacement asset');
+      expect(await plainAsset.readAsString(), 'plain asset');
+      expect(await twicePrefixedAsset.readAsString(), 'twice prefixed asset');
+      await build.close();
+      expect(await build.directory.exists(), isFalse);
+    },
+  );
+
+  test(
+    'snapshot source filter preserves escaped native name identity',
+    () async {
+      final fixture = await SelectFixture.create(_minimal);
+      addTearDown(fixture.close);
+      for (final (index, path) in ['.git', '\uFEFF.git'].indexed) {
+        final asset = File('${fixture.root.path}/$path/asset-%中文😀.txt');
+        await asset.create(recursive: true, exclusive: true);
+        await asset.writeAsString('asset-$index');
+      }
+      final build = await SelectionBuild.prepare(fixture.root);
+      addTearDown(build.close);
+      expect(await Directory('${build.directory.path}/.git').exists(), isFalse);
+      expect(
+        await File('${build.directory.path}/\uFEFF.git/asset-%中文😀.txt')
+            .readAsString(),
+        'asset-1',
+      );
+    },
+  );
+
+  test('snapshot workspace uses the exact project folder', () async {
+    final fixture = await SelectFixture.create(_minimal);
+    addTearDown(fixture.close);
+    final root = await Directory('${fixture.root.path}/\uFEFF项目-%😀').create();
+    final sibling = await Directory('${fixture.root.path}/项目-%😀').create();
+    final config = File('${root.path}/.dart_tool/package_config.json');
+    await config.create(recursive: true);
+    await config.writeAsString(
+      jsonEncode({
+        'configVersion': 2,
+        'packages': [
+          {
+            'name': 'marked_project',
+            'rootUri': root.uri.toString(),
+            'packageUri': 'lib/',
+            'languageVersion': '3.13',
+          },
+        ],
+      }),
+    );
+    await File('${root.path}/asset.txt').writeAsString('owned root');
+    final source = File('${root.path}/lib/asset.g.dart');
+    await source.create(recursive: true);
+    await source.writeAsString("const value = 'owned package';");
+    final build = await SelectionBuild.prepare(root);
+    expect(build.directory.parent.uri, Directory('${root.path}/.tmp').uri);
+    addTearDown(build.close);
+    expect(
+      await File('${build.directory.path}/asset.txt').readAsString(),
+      'owned root',
+    );
+    expect(await sibling.list().toList(), isEmpty);
+
+    final snapshotName = build.directory.uri.pathSegments
+        .where((part) => part.isNotEmpty)
+        .last;
+    final lookalike = File(
+      '${sibling.path}/.tmp/$snapshotName/lib/asset.g.dart',
+    );
+    await lookalike.create(recursive: true, exclusive: true);
+    await lookalike.writeAsString("const value = 'wrong package';");
+    final probe = File('${fixture.root.path}/package_probe.dart');
+    await probe.writeAsString('''
+import 'package:marked_project/asset.g.dart';
+void main() => print(value);
+''');
+    // Keep the config file location unmarked so this exercises its root URI.
+    final packages = await File(
+      '${build.directory.path}/.dart_tool/package_config.json',
+    ).copy('${fixture.root.path}/probe-packages.json');
+    final result = await Process.run(Platform.resolvedExecutable, [
+      '--packages=${packages.path}',
+      probe.path,
+    ], workingDirectory: fixture.root.path);
+    expect(result.exitCode, 0, reason: '${result.stderr}');
+    expect((result.stdout as String).trim(), 'owned package');
+    await build.close();
+    expect(await build.directory.exists(), isFalse);
+  });
+
+  test(
+    'snapshot refresh checks links using the exact marked asset path',
+    () async {
+      final fixture = await SelectFixture.create(_minimal);
+      addTearDown(fixture.close);
+      final build = await SelectionBuild.prepare(fixture.root);
+      addTearDown(build.close);
+      final preserved = File('${build.directory.path}/asset.txt');
+      final link = Link('${build.directory.path}/\uFEFFcache.txt');
+      await link.create(preserved.path);
+      await File('${fixture.root.path}/\uFEFFcache.txt')
+          .writeAsString('marked asset');
+      await expectLater(
+        build.refresh(),
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            contains('Build output contains a symlink'),
+          ),
+        ),
+      );
+      expect(await preserved.readAsString(), 'original');
+      await link.delete();
+      await build.refresh();
+      expect(await File(link.path).readAsString(), 'marked asset');
+    },
+    skip: Platform.isWindows,
+  );
+
   test('generated aggregate sources retain fields over real HTTP', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     final selections = <String>[];
