@@ -19,7 +19,7 @@ type moduleInfo struct {
 	emitsEvents   bool
 	hasServiceFns bool
 	hasSchema     bool // has models or APIs (generates RegisterSchema)
-	hasAPI        bool // has non-CRUD API declarations (needs RegisterHandlers wiring even without @crud)
+	hasUnaryAPIs  bool // needs RegisterHandlers wiring even without @crud
 	hasStreams    bool
 	hasCache      bool
 	nativeStreams []string
@@ -95,11 +95,14 @@ func collectModuleFileInfo(info *moduleInfo, file *ast.File, moduleName string, 
 	info.hasEvents = info.hasEvents || len(file.Events) > 0 || len(file.Listeners) > 0
 	info.emitsEvents = info.emitsEvents || fileEmitsEvents(file)
 	info.hasSchema = info.hasSchema || len(file.Models) > 0 || len(file.APIs) > 0
-	info.hasAPI = info.hasAPI || len(file.APIs) > 0
-	info.hasStreams = info.hasStreams || apisHaveDirective(file.APIs, "stream")
 	info.hasCache = info.hasCache || apisHaveDirective(file.APIs, "cache")
 	for _, api := range file.APIs {
-		if hasDirective(api.Directives, "stream") && hasDirective(api.Directives, "native") {
+		if !hasDirective(api.Directives, "stream") {
+			info.hasUnaryAPIs = true
+			continue
+		}
+		info.hasStreams = true
+		if hasDirective(api.Directives, "native") {
 			info.nativeStreams = append(info.nativeStreams, api.Name)
 		}
 	}
@@ -299,10 +302,14 @@ func writeEntryModuleImports(b *strings.Builder, modules []moduleInfo, modulePat
 
 func entryCapabilities(modules []moduleInfo) (hasEvents, hasServiceFunctions bool) {
 	for _, module := range modules {
-		hasEvents = hasEvents || module.hasEvents || module.emitsEvents || module.hasStreams
+		hasEvents = hasEvents || module.usesEventBus()
 		hasServiceFunctions = hasServiceFunctions || module.hasServiceFns
 	}
 	return hasEvents, hasServiceFunctions
+}
+
+func (module moduleInfo) usesEventBus() bool {
+	return module.hasEvents || module.emitsEvents || module.hasStreams
 }
 
 func entryNeedsRPC(modules []moduleInfo, hasServiceFunctions bool) bool {
@@ -320,7 +327,7 @@ func entryNeedsRPC(modules []moduleInfo, hasServiceFunctions bool) bool {
 func writeEmbeddedGatewayWiring(b *strings.Builder, modules []moduleInfo, hasServiceFunctions bool) {
 	for _, module := range modules {
 		fmt.Fprintf(b, "\tgw.AddModule(%q)\n", module.name)
-		if module.hasCrud || module.hasAPI {
+		if module.hasCrud || module.hasUnaryAPIs {
 			writeStartupRegistration(b, "handlers", fmt.Sprintf("%s_luxo.RegisterHandlers(gw.Router, %sApp)", module.name, module.name))
 		}
 		if module.hasStreams {
@@ -665,7 +672,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	}
 
 	// Events
-	if target.hasEvents || target.emitsEvents || target.hasStreams {
+	if target.usesEventBus() {
 		writeSelectedEventBus(&b, backends.Events)
 		if target.hasEvents || target.emitsEvents {
 			b.WriteString("\tapp.EventBus = eventBus\n")
@@ -684,8 +691,8 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 
 	// Gateway + handlers
 	// Same rationale as in the embedded entry: RegisterHandlers must follow
-	// handler.gen.go's own trigger (@crud OR non-CRUD APIs), not hasCrud alone.
-	if target.hasCrud || target.hasAPI {
+	// handler.gen.go's unary routes, including declarations without @crud.
+	if target.hasCrud || target.hasUnaryAPIs {
 		writeStartupRegistration(&b, "handlers", fmt.Sprintf("%s_luxo.RegisterHandlers(gw.Router, app)", target.name))
 	}
 	if target.hasStreams {
@@ -1014,7 +1021,7 @@ func writeSingleModuleEntryImports(b *strings.Builder, target moduleInfo, module
 		writeCacheBackendImport(b, backends.Cache)
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
-	if target.hasEvents || target.emitsEvents || target.hasStreams {
+	if target.usesEventBus() {
 		writeEventBackendImport(b, backends.Events)
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")

@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -59,6 +60,16 @@ func TestGeneratedToolchainMatchesCoreModule(t *testing.T) {
 	want := "FROM golang:" + version + "-alpine AS builder\n"
 	if !strings.Contains(string(generateDockerfile([]moduleInfo{{name: "user"}})), want) {
 		t.Fatalf("generated Dockerfile must use the core Go version %s", version)
+	}
+}
+
+func TestGenerateDockerfileStagesOptionalMigrations(t *testing.T) {
+	dockerfile := string(generateDockerfile([]moduleInfo{{name: "user"}, {name: "post"}}))
+	mkdir := strings.Index(dockerfile, "mkdir -p /app/migrations")
+	projectCopy := strings.Index(dockerfile, "COPY . .\n")
+	migrationCopy := "COPY --from=builder /app/migrations/ /app/migrations/\n"
+	if mkdir < 0 || projectCopy < mkdir || strings.Count(dockerfile, migrationCopy) != 2 {
+		t.Fatalf("builder must stage an empty migrations directory before copying project files:\n%s", dockerfile)
 	}
 }
 
@@ -201,6 +212,136 @@ func TestGenerateDeployFiles_NoEvents(t *testing.T) {
 
 	if strings.Contains(dc, "nats:") {
 		t.Error("should NOT include NATS when no events")
+	}
+}
+
+func TestGenerateDeployFilesCheckedBackends(t *testing.T) {
+	result := &semantic.Result{Files: []*ast.File{
+		{Name: "origin/watch.luxo", APIs: []*ast.ApiDecl{{Name: "watchValue", Directives: []*ast.Directive{{Name: "stream"}}}}},
+		{Name: "origin/order.luxo", Events: []*ast.EventDecl{{Name: "OrderCreated"}}},
+		{Name: "origin/read.luxo", APIs: []*ast.ApiDecl{{Name: "readValue", Directives: []*ast.Directive{{Name: "cache"}}}}},
+	}}
+	for _, sample := range []struct {
+		name             string
+		selection        EntryBackends
+		natsConsumers    []string
+		jetstream, redis bool
+	}{
+		{"memory", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}, nil, false, false},
+		{"event", EntryBackends{Events: "nats", Cache: "memory"}, []string{"watch", "order", "gateway"}, false, false},
+		{"queue", EntryBackends{Events: "memory", Queue: "nats", Cache: "memory"}, []string{"watch", "order", "read"}, true, false},
+		{"remote", EntryBackends{Events: "nats", Queue: "nats", Cache: "redis"}, []string{"watch", "order", "read", "gateway"}, true, true},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			files, err := GenerateDeployFilesChecked(result, "shop", sample.selection)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkComposeBackends(t, files.DockerCompose, sample.natsConsumers, sample.jetstream, sample.redis)
+		})
+	}
+}
+
+func checkComposeBackends(t *testing.T, manifest []byte, natsConsumers []string, jetstream, redis bool) {
+	t.Helper()
+	type service struct {
+		Environment map[string]string
+		DependsOn   map[string]struct{ Condition string } `yaml:"depends_on"`
+		Command     []string
+		Volumes     []string
+		Healthcheck struct{ Test []string }
+	}
+	var config struct {
+		Services map[string]service
+		Volumes  map[string]struct{}
+	}
+	if err := yaml.Unmarshal(manifest, &config); err != nil {
+		t.Fatal(err)
+	}
+	nats, hasNATS := config.Services["nats"]
+	redisService, hasRedis := config.Services["redis"]
+	if hasNATS != (len(natsConsumers) > 0) || hasRedis != redis {
+		t.Fatalf("infrastructure: NATS = %v, Redis = %v", hasNATS, hasRedis)
+	}
+	_, hasNATSVolume := config.Volumes["natsdata"]
+	if hasNATSVolume != jetstream || (len(nats.Volumes) > 0) != jetstream || (len(nats.Command) > 0 && nats.Command[0] == "-js") != jetstream {
+		t.Fatalf("JetStream command or storage mismatch: %+v, %v", nats, config.Volumes)
+	}
+	if hasNATS && len(nats.Healthcheck.Test) == 0 || redis && len(redisService.Healthcheck.Test) == 0 {
+		t.Fatal("infrastructure needs a health check")
+	}
+	checkComposeCacheSettings(t, config.Services["read"].Environment)
+	for _, name := range []string{"watch", "order", "read", "gateway"} {
+		service := config.Services[name]
+		checkComposeServiceConnection(t, name, "NATS_URL", "nats://nats:4222", service.Environment, service.DependsOn["nats"].Condition, slices.Contains(natsConsumers, name))
+		checkComposeServiceConnection(t, name, "REDIS_URL", "redis://redis:6379", service.Environment, service.DependsOn["redis"].Condition, redis && name == "read")
+		if name != "read" && service.Environment["LUXO_CACHE_PROJECT"] != "" {
+			t.Fatalf("service %s got cache settings", name)
+		}
+	}
+}
+
+func checkComposeServiceConnection(t *testing.T, service, key, url string, env map[string]string, condition string, required bool) {
+	t.Helper()
+	wantURL, wantCondition := "", ""
+	if required {
+		wantURL, wantCondition = url, "service_healthy"
+	}
+	if env[key] != wantURL || condition != wantCondition {
+		t.Fatalf("service %s: %s = %q, dependency = %q, want %q and %q", service, key, env[key], condition, wantURL, wantCondition)
+	}
+}
+
+func checkComposeCacheSettings(t *testing.T, env map[string]string) {
+	t.Helper()
+	for _, name := range []string{
+		"LUXO_CACHE_PROJECT", "LUXO_CACHE_ENVIRONMENT", "LUXO_CACHE_REVISION",
+		"LUXO_CACHE_ORIGIN_CONCURRENCY", "LUXO_CACHE_ORIGIN_MAX_WAITERS", "LUXO_CACHE_ORIGIN_WAIT_TIMEOUT",
+	} {
+		if env[name] != "${"+name+":?set "+name+"}" {
+			t.Fatalf("cache requires explicit %s, got %q", name, env[name])
+		}
+	}
+}
+
+func TestGenerateDeployFilesCheckedRejectsInvalidResult(t *testing.T) {
+	invalid := analyzePermissionFixture(t, "type Detail { level: Int }\nmodel Record { id: Int @id detail: Detail }")
+	for _, sample := range []struct {
+		result     *semantic.Result
+		diagnostic string
+	}{
+		{nil, "requires a semantic result"},
+		{invalid, "has no database mapping"},
+	} {
+		files, err := GenerateDeployFilesChecked(sample.result, "shop", EntryBackends{})
+		if files != nil || err == nil || !strings.Contains(err.Error(), sample.diagnostic) {
+			t.Fatalf("invalid result: generated=%v error=%v", files != nil, err)
+		}
+	}
+}
+
+func TestGenerateDeployFilesCheckedRejectsInvalidBackends(t *testing.T) {
+	result := analyzePermissionFixture(t, `
+event OrderCreated(id: Int)
+on OrderCreated @native
+`)
+	if len(result.Errors) != 0 {
+		t.Fatal(result.Errors)
+	}
+	for _, sample := range []struct {
+		name       string
+		selection  EntryBackends
+		diagnostic string
+	}{
+		{"missing events backend", EntryBackends{}, "events/streams require an explicit memory or nats build backend"},
+		{"unsupported queue backend", EntryBackends{Events: "memory", Queue: "invalid"}, `unsupported queue backend "invalid"`},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			files, err := GenerateDeployFilesChecked(result, "shop", sample.selection)
+			if files != nil || err == nil || !strings.Contains(err.Error(), sample.diagnostic) {
+				t.Fatalf("generated=%v error=%v", files != nil, err)
+			}
+		})
 	}
 }
 

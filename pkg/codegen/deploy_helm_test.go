@@ -186,6 +186,58 @@ func TestHelmGenerateFiles_Empty(t *testing.T) {
 	}
 }
 
+func TestHelmCheckedBackendSelection(t *testing.T) {
+	result := makeHelmResult("user")
+	result.Files[0].APIs = []*ast.ApiDecl{{Name: "watch", Directives: []*ast.Directive{{Name: "stream"}}}}
+	result.Files = append(result.Files, &ast.File{Name: "origin/read.luxo", APIs: []*ast.ApiDecl{{Name: "readValue", Directives: []*ast.Directive{{Name: "cache"}}}}})
+	for _, sample := range []struct {
+		selection                     EntryBackends
+		gatewayNATS, watchNATS, redis bool
+	}{
+		{EntryBackends{Events: "memory", Cache: "memory"}, false, false, false},
+		{EntryBackends{Events: "memory", Queue: "nats", Cache: "memory"}, false, true, false},
+		{EntryBackends{Events: "nats", Cache: "redis"}, true, true, true},
+	} {
+		chart, err := GenerateHelmFilesChecked(result, "audit", sample.selection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, check := range []struct {
+			file, env string
+			want      bool
+		}{
+			{"gateway", "NATS_URL", sample.gatewayNATS},
+			{"module-user", "NATS_URL", sample.watchNATS},
+			{"module-user", "LUXO_CACHE_PROJECT", false},
+			{"module-read", "REDIS_URL", sample.redis},
+			{"module-read", "LUXO_CACHE_PROJECT", true},
+		} {
+			source := chart.Files["templates/"+check.file+"-deployment.yaml"]
+			if strings.Contains(string(source), "name: "+check.env+"\n") != check.want {
+				t.Errorf("selection %+v: %s requires %s = %v", sample.selection, check.file, check.env, check.want)
+			}
+		}
+	}
+}
+
+func TestHelmCheckedRejectsInvalidInput(t *testing.T) {
+	invalid := analyzePermissionFixture(t, "type Detail { level: Int }\nmodel Record { id: Int @id detail: Detail }")
+	for _, sample := range []struct {
+		result     *semantic.Result
+		options    EntryBackends
+		diagnostic string
+	}{
+		{nil, EntryBackends{}, "requires a semantic result"},
+		{invalid, EntryBackends{}, "has no database mapping"},
+		{makeHelmResult("user"), EntryBackends{Queue: "unsupported"}, "unsupported queue backend"},
+	} {
+		chart, err := GenerateHelmFilesChecked(sample.result, "audit", sample.options)
+		if chart != nil || err == nil || !strings.Contains(err.Error(), sample.diagnostic) {
+			t.Fatalf("invalid result: generated=%v error=%v", chart != nil, err)
+		}
+	}
+}
+
 func TestHelmChartYAML(t *testing.T) {
 	result := makeHelmResult("user")
 	helm := GenerateHelmFiles(result, "myapp")
