@@ -1,0 +1,199 @@
+package luvia
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/light-speak/luxo/pkg/lux/api"
+	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/schema"
+)
+
+const auditFirstHealth = `{"status":"ok"}`
+const auditWarmJSON = `{"data":42}`
+
+type auditGatewayAddress struct {
+	port string
+	quit chan os.Signal
+	done chan error
+}
+
+// Observe the production listener address without polling or changing startup code.
+func auditGatewayListeningPorts(b *testing.B) <-chan string {
+	b.Helper()
+	read, write, err := os.Pipe()
+	if err != nil {
+		b.Fatal(err)
+	}
+	original := os.Stdout
+	os.Stdout = write
+	ports := make(chan string, 1)
+	drained := make(chan error, 1)
+	go func() {
+		const prefix = "  Listening on http://localhost:"
+		const suffix = " (HTTP/2 h2c)"
+		scanner := bufio.NewScanner(read)
+		for scanner.Scan() {
+			if addr, matched := strings.CutPrefix(scanner.Text(), prefix); matched {
+				if port, matched := strings.CutSuffix(addr, suffix); matched {
+					ports <- port
+				}
+			}
+		}
+		close(ports)
+		drained <- scanner.Err()
+	}()
+	b.Cleanup(func() {
+		os.Stdout = original
+		_ = write.Close()
+		if err := <-drained; err != nil {
+			b.Error(err)
+		}
+		_ = read.Close()
+	})
+	b.Setenv("APP_PORT", "0")
+	b.Setenv("CORS_ORIGIN", "*")
+	b.Setenv("GRACEFUL_TIMEOUT", "2s")
+	return ports
+}
+
+func auditStartGateway(b *testing.B, ports <-chan string) auditGatewayAddress {
+	b.Helper()
+	gateway := New()
+	if err := gateway.Router.Schema.RegisterAPI(&schema.API{ID: 1, Name: "auditEcho", ReturnType: "Int"}); err != nil {
+		b.Fatal(err)
+	}
+	if err := gateway.Router.Registry.RegisterSchemaAPIs(gateway.Router.Schema); err != nil {
+		b.Fatal(err)
+	}
+	gateway.Router.Handle("auditEcho", func(_ context.Context, request *api.Request) error {
+		request.Buf.B = codec.AppendSvarint(request.Buf.B, 42)
+		return nil
+	})
+	instance := auditGatewayAddress{quit: make(chan os.Signal, 1), done: make(chan error, 1)}
+	go func() { instance.done <- gateway.serve("readiness-benchmark", instance.quit) }()
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	select {
+	case port := <-ports:
+		if value, err := strconv.Atoi(port); err != nil || value <= 0 || value > 65535 {
+			auditStopGateway(b, instance)
+			b.Fatalf("invalid gateway port %q", port)
+		}
+		instance.port = "http://127.0.0.1:" + port
+	case err := <-instance.done:
+		b.Fatalf("gateway exited before listening: %v", err)
+	case <-timer.C:
+		auditStopGateway(b, instance)
+		b.Fatal("gateway did not announce listen address")
+	}
+	return instance
+}
+
+func auditStopGateway(b *testing.B, gateway auditGatewayAddress) {
+	b.Helper()
+	gateway.quit <- syscall.SIGINT
+	select {
+	case err := <-gateway.done:
+		if err != nil {
+			b.Error(err)
+		}
+	case <-time.After(4 * time.Second):
+		b.Error("gateway did not shut down")
+	}
+}
+
+func auditStockH2Client(b *testing.B) (*http.Client, *atomic.Int64) {
+	b.Helper()
+	var protocols http.Protocols
+	protocols.SetUnencryptedHTTP2(true)
+	var dials atomic.Int64
+	dialer := &net.Dialer{Timeout: time.Second}
+	transport := &http.Transport{Protocols: &protocols, DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dials.Add(1)
+		return dialer.DialContext(ctx, network, addr)
+	}}
+	b.Cleanup(transport.CloseIdleConnections)
+	return &http.Client{Transport: transport, Timeout: 2 * time.Second}, &dials
+}
+
+func auditCheckGatewayResponse(b *testing.B, client *http.Client, url, method, body, want string) {
+	b.Helper()
+	request, err := http.NewRequestWithContext(b.Context(), method, url, strings.NewReader(body))
+	if err != nil {
+		b.Fatal(err)
+	}
+	if method == http.MethodPost {
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Luxo-Mode", "json")
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		b.Fatal(err)
+	}
+	actual, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	if readErr != nil || closeErr != nil || response.StatusCode != http.StatusOK || response.Proto != "HTTP/2.0" ||
+		!bytes.Equal(actual, []byte(want)) {
+		b.Fatalf("%s returned %s %d %q, read=%v close=%v", url, response.Proto, response.StatusCode, actual, readErr, closeErr)
+	}
+}
+
+func BenchmarkAuditGatewayFirstHealth(b *testing.B) {
+	for _, engine := range []string{"standard", "luxo"} {
+		b.Run(engine, func(b *testing.B) {
+			b.Setenv("APP_HTTP_TRANSPORT", engine)
+			ports := auditGatewayListeningPorts(b)
+			client, _ := auditStockH2Client(b)
+			b.ReportAllocs()
+			for b.Loop() {
+				gateway := auditStartGateway(b, ports)
+				func() {
+					defer func() {
+						b.StopTimer()
+						client.CloseIdleConnections()
+						auditStopGateway(b, gateway)
+						b.StartTimer()
+					}()
+					auditCheckGatewayResponse(b, client, gateway.port+"/health", http.MethodGet, "", auditFirstHealth)
+				}()
+			}
+		})
+	}
+}
+
+func BenchmarkAuditGatewayWarmUnary(b *testing.B) {
+	for _, engine := range []string{"standard", "luxo"} {
+		b.Run(engine, func(b *testing.B) {
+			b.Setenv("APP_HTTP_TRANSPORT", engine)
+			ports := auditGatewayListeningPorts(b)
+			client, dials := auditStockH2Client(b)
+			gateway := auditStartGateway(b, ports)
+			defer func() {
+				client.CloseIdleConnections()
+				auditStopGateway(b, gateway)
+			}()
+			const body = `{"$api":"auditEcho"}`
+			url := gateway.port + "/luvia"
+			auditCheckGatewayResponse(b, client, url, http.MethodPost, body, auditWarmJSON)
+			b.ReportAllocs()
+			for b.Loop() {
+				auditCheckGatewayResponse(b, client, url, http.MethodPost, body, auditWarmJSON)
+			}
+			if dials.Load() != 1 {
+				b.Fatalf("warm unary used %d connections", dials.Load())
+			}
+		})
+	}
+}

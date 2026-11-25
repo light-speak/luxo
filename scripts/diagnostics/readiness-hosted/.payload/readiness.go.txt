@@ -1,0 +1,128 @@
+package luvia
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type auditProbeResponse struct {
+	header http.Header
+	code   int
+	body   [32]byte
+	size   int
+}
+
+func (w *auditProbeResponse) Header() http.Header  { return w.header }
+func (w *auditProbeResponse) WriteHeader(code int) { w.code = code }
+func (w *auditProbeResponse) Write(body []byte) (int, error) {
+	w.size = copy(w.body[:], body)
+	return w.size, nil
+}
+
+func auditCheckProbeResponse(b *testing.B, response *auditProbeResponse, failed bool) {
+	b.Helper()
+	code, body := http.StatusOK, auditFirstHealth
+	if failed {
+		code, body = http.StatusServiceUnavailable, `{"status":"unavailable"}`
+	}
+	if response.code != code || string(response.body[:response.size]) != body ||
+		response.header.Get("Cache-Control") != "no-store" || response.header.Get("Content-Type") != "application/json" {
+		b.Fatalf("/ready returned %d %q %v", response.code, response.body[:response.size], response.header)
+	}
+	response.code, response.size = 0, 0
+}
+
+func auditReadyMux(handler http.Handler) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("GET /ready", handler)
+	return mux
+}
+
+func BenchmarkAuditGatewayReadiness(b *testing.B) {
+	b.Run("zero-stateless", func(b *testing.B) {
+		mux := auditReadyMux(New().readinessHandler(b.Context()))
+		request, err := http.NewRequestWithContext(b.Context(), http.MethodGet, "http://localhost/ready", nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		response := &auditProbeResponse{header: make(http.Header)}
+		b.ReportAllocs()
+		for b.Loop() {
+			mux.ServeHTTP(response, request)
+			auditCheckProbeResponse(b, response, false)
+		}
+	})
+	for _, tc := range []struct {
+		name   string
+		checks int
+		cached bool
+		failed bool
+	}{
+		{"one-cold", 1, false, false},
+		{"one-cached", 1, true, false},
+		{"eight-cold", 8, false, false},
+		{"eight-cached", 8, true, false},
+		{"eight-cached-503", 8, true, true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			auditBenchmarkProbe(b, tc.checks, tc.cached, tc.failed)
+		})
+	}
+}
+
+func auditBenchmarkProbe(b *testing.B, count int, cached, failed bool) {
+	b.Helper()
+	var calls atomic.Int64
+	check := func(context.Context) error {
+		calls.Add(1)
+		return nil
+	}
+	probe := &gatewayReadiness{lifetime: b.Context()}
+	for range count {
+		probe.checks = append(probe.checks, check)
+	}
+	if failed {
+		probe.checks[0] = func(context.Context) error {
+			calls.Add(1)
+			return errors.New("private diagnostic")
+		}
+	}
+	mux := auditReadyMux(http.HandlerFunc(probe.serveHTTP))
+	request, err := http.NewRequestWithContext(b.Context(), http.MethodGet, "http://localhost/ready", nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	response := &auditProbeResponse{header: make(http.Header)}
+	if cached {
+		mux.ServeHTTP(response, request)
+		auditCheckProbeResponse(b, response, failed)
+		// Preserve the populated production cache past benchmark calibration.
+		probe.mu.Lock()
+		probe.expires = time.Now().Add(time.Hour)
+		probe.mu.Unlock()
+	}
+	previous := calls.Load()
+	b.ReportAllocs()
+	for b.Loop() {
+		if !cached {
+			b.StopTimer()
+			probe.mu.Lock()
+			probe.expires = time.Time{}
+			probe.mu.Unlock()
+			b.StartTimer()
+		}
+		mux.ServeHTTP(response, request)
+		auditCheckProbeResponse(b, response, failed)
+	}
+	expected := int64(count * b.N)
+	if cached {
+		expected = 0
+	}
+	if actual := calls.Load() - previous; actual != expected {
+		b.Fatalf("readiness executed %d callbacks, want %d", actual, expected)
+	}
+}
