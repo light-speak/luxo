@@ -14,10 +14,10 @@ from zipfile import ZipFile
 
 
 BASE = "e101cf7699acb358305fd373934e8813a98087bd"
-PREVIOUS_DIAGNOSTIC = "7c8b579ada1b65e7d72e2b98e3c906624fa8312a"
+PREVIOUS_DIAGNOSTIC = "579588616153c019fef1d8cdf36bcbbd5e472eb1"
 BASE_TREE = "377fdb5bbe6815a45930c53e10797f08cf07c917"
-TREE = "8226407033d261b8031c715e86f6fecc327a4db9"
-PATCH_SHA = "d952cffb1eeb642d6f5d51aa9d47a626a2aeaa927275edcae39be839047614ad"
+TREE = "b74d8937f7176b8721033762526723a5b73c6617"
+PATCH_SHA = "de351ae464bf5936b39867a9949b623c609fa970b03823bc84956fe935cae5a4"
 LOCK_SHA = "5f0a75b758b8e33d4d3352fc0416de253c55a04ebf040684601591af10de4cc7"
 PUBSPEC_SHA = "294368c6b2cc61a62c83880cdca56d1137de356ef9a7682a6396d4fcce9dc5f9"
 DART_REVISION = "b530c21f7de367b94fb04787bfed9d8e989d75e8"
@@ -79,9 +79,9 @@ def diagnostic_assets(repo, offline):
         patch, lock = (source / patch_name).read_bytes(), (source / "pubspec.lock").read_bytes()
     else:
         head = git(repo, "rev-parse", "HEAD").decode().strip()
-        parents = git(repo, "rev-parse", "HEAD^", "HEAD^^").decode().splitlines()
+        parents = git(repo, "rev-parse", "HEAD^", "HEAD~3").decode().splitlines()
         require(head == os.environ["GITHUB_SHA"] and parents == [PREVIOUS_DIAGNOSTIC, BASE],
-                "the retry must build on the first diagnostic commit and pinned base")
+                "the retry must build on the byte-stable Windows diagnostic and pinned base")
         paths = git(repo, "diff", "--no-renames", "--name-status", BASE, head, "--").decode().splitlines()
         expected = {f"A\t{WORKFLOW}"} | {f"A\t{FIXTURE}/{name}" for name in ("qualify.py", patch_name, "pubspec.lock")}
         require(set(paths) == expected, "the diagnostic branch must contain only its four new files")
