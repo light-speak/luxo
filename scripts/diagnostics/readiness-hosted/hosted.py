@@ -136,19 +136,64 @@ def install_benchstat(root, env):
     return binary, metadata
 
 
-def prime_modules(repo, root, env):
+def readiness_graph(source, tree, env):
+    workspace = env | {"GOWORK": str(source / "go.work")}
+    query = ("go", "list", "-mod=readonly", "-p=1", "-deps",
+             "-f", "{{.ImportPath}}|{{with .Module}}{{.Path}}@{{.Version}}{{end}}")
+    graph = run(*query, "-test", "./pkg/lux/luvia", cwd=source, env=workspace)
+    if tree == FINAL:
+        graph += run(*query, "./scripts/benchrun", "./scripts/benchplan", "./scripts/benchgate",
+                     cwd=source, env=workspace)
+    return sorted(set(graph.decode().splitlines()))
+
+
+def archive_graph(namespace, git, tree, source, env):
+    namespace["archive"](git, tree, source, env)
+    package = source / "pkg/lux/luvia"
+    fixtures = [("gateway.go.txt", "readiness_audit_gateway_bench_test.go")]
+    if tree != BASE_TREE:
+        fixtures.append(("readiness.go.txt", "readiness_audit_probe_bench_test.go"))
+    for name, target in fixtures:
+        destination = package / target
+        if destination.exists():
+            raise RuntimeError(f"tracked path overlaps the readiness fixture: {target}")
+        shutil.copyfile(PAYLOAD / name, destination)
+    return readiness_graph(source, tree, env)
+
+
+def prime_modules(repo, root, env, namespace, evidence):
     if run("git", "rev-parse", "--verify", BASE + "^{tree}", cwd=repo).decode().strip() != BASE_TREE:
         raise RuntimeError("unexpected historical baseline tree")
     subprocess.run(["git", "merge-base", "--is-ancestor", BASE, "HEAD"], cwd=repo, check=True)
+    offline = env | {"GOPROXY": "off", "GOSUMDB": "off"}
+    verified = {}
     with tempfile.TemporaryDirectory(dir=root, prefix="module-source-") as temporary:
-        src = Path(temporary)
-        with subprocess.Popen(["git", "archive", BASE_TREE], cwd=repo, stdout=subprocess.PIPE) as archive:
-            subprocess.run(["tar", "-xf", "-", "-C", src], stdin=archive.stdout, check=True)
-        if archive.returncode != 0:
-            raise RuntimeError("could not archive history baseline for module priming")
-        run("sh", src / "scripts/setup-modules.sh", src, cwd=src, env=env)
-        run("go", "list", "-p=1", "-deps", "-test", "./pkg/lux/luvia", "./scripts/benchrun",
-            "./scripts/benchplan", "./scripts/benchgate", cwd=src, env=env | {"GOWORK": str(src / "go.work")})
+        scratch = Path(temporary)
+        index = scratch / "index.git"
+        run("git", "init", "--bare", "--quiet", index)
+        (index / "objects/info/alternates").write_text(str(namespace["INDEX"] / "objects") + "\n")
+        git = ("git", f"--git-dir={index}")
+        for label, tree in (("base", BASE_TREE), ("prior", PRIOR), ("final", FINAL)):
+            namespace["bind_tree"](git, tree)
+            source = scratch / label
+            online_graph = archive_graph(namespace, git, tree, source, env)
+            workspace = env | {"GOWORK": str(source / "go.work")}
+            check = run("go", "mod", "verify", cwd=source, env=workspace).decode().strip()
+            if check != "all modules verified":
+                raise RuntimeError(f"module verification failed for {label}: {check}")
+
+            # Resolve again from a fresh archive so online workspace sums cannot
+            # hide inputs missing from the later offline compilation.
+            shutil.rmtree(source)
+            offline_graph = archive_graph(namespace, git, tree, source, offline)
+            if not offline_graph or offline_graph != online_graph:
+                raise RuntimeError(f"offline dependency graph differs for {label}")
+            shutil.rmtree(source)
+            package_modules = (line.partition("|")[2] for line in offline_graph)
+            external = sorted({module for module in package_modules if module and not module.endswith("@")})
+            verified[label] = {"tree": tree, "packages": len(offline_graph), "modules": external,
+                               "graphSHA256": sha("\n".join(offline_graph).encode()), "verify": check}
+            write_json(evidence / "module-graph.json", verified)
 
 
 def replay(repo, root, evidence, inputs):
@@ -182,7 +227,8 @@ def replay(repo, root, evidence, inputs):
         "base": BASE, "trees": {"base": BASE_TREE, "prior": PRIOR, "final": FINAL},
         "payload": inputs, "sourcePatches": PATCHES, "controllerSHA256": sha(Path(__file__).read_bytes()),
     })
-    prime_modules(repo, root, env)
+    namespace.update({"ARTIFACTS": root, "INDEX": git_dir, "PATCHES": PATCHES})
+    prime_modules(repo, root, env, namespace, evidence)
     benchstat, metadata = install_benchstat(root, env)
     (evidence / "benchstat-version.txt").write_text(metadata)
     original_sample = namespace["sample"]
@@ -193,7 +239,6 @@ def replay(repo, root, evidence, inputs):
         return original_sample(*args)
 
     namespace.update({
-        "ARTIFACTS": root, "INDEX": git_dir, "PATCHES": PATCHES,
         "SAMPLER": PAYLOAD / "sampler.py", "BENCHSTAT": benchstat,
         "BENCHSTAT_SHA": sha(benchstat.read_bytes()), "toolchain": toolchain, "parse": parse, "sample": sample,
         "ENV": env | {"GOPROXY": "off", "GOSUMDB": "off"},
