@@ -1,6 +1,7 @@
 """Smoke or collect paired wall/child-CPU launch samples for exact Dart trees."""
 
 import argparse
+import ctypes
 from base64 import b64decode
 from collections import defaultdict
 from statistics import median
@@ -16,15 +17,17 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 HERE = Path(__file__).resolve().parent
 BASE = "e101cf7699acb358305fd373934e8813a98087bd"
+PREVIOUS_DIAGNOSTIC = "ce653435a8f8592d663673f73cac8cd5b8dcac56"
+PRODUCT_HEAD = "7dffd0b3d937c429b7e8d10b893a6701a5f21803"
 TREES = {
     "A": "377fdb5bbe6815a45930c53e10797f08cf07c917",
-    "B": "b74d8937f7176b8721033762526723a5b73c6617",
+    "B": "789e77c7459163d137cf04c5547a8778b06cc8be",
 }
-PATCH_SHA = "de351ae464bf5936b39867a9949b623c609fa970b03823bc84956fe935cae5a4"
+PATCH_SHA = "4bc513a2daad984b8b1444b570d4a3353aa9f19edbc666510df466c10420b760"
 LOCK_SHA = "5f0a75b758b8e33d4d3352fc0416de253c55a04ebf040684601591af10de4cc7"
 PUBSPEC_SHA = "294368c6b2cc61a62c83880cdca56d1137de356ef9a7682a6396d4fcce9dc5f9"
 FILES_CHANGED = {
@@ -73,10 +76,12 @@ FILES = {
 }
 
 
+UNICODE_NO_MAIN = "no_main_中文.g.dart"
 REJECTIONS = {
     "no-main": ("lib/no_main.g.dart", {"lib/no_main.g.dart": "int selected() => 1;\n"}),
+    "unicode-no-main": (f"lib/{UNICODE_NO_MAIN}", {f"lib/{UNICODE_NO_MAIN}": "int selected() => 1;\n"}),
     "syntax-error": ("lib/syntax_error.g.dart", {
-        "lib/syntax_error.g.dart": "void main() { final int value = ; }\n",
+        "lib/syntax_error.g.dart": "void main() { final int value = ; } // 中文\n",
     }),
     "missing-import": ("lib/missing_import.g.dart", {
         "lib/missing_import.g.dart": "import 'missing.dart'; void main() {}\n",
@@ -110,8 +115,14 @@ def stage_objects(repo, work):
     assert git(repo, "rev-parse", f"{BASE}^{{tree}}").decode().strip() == TREES["A"]
     if os.environ.get("GITHUB_ACTIONS") == "true":
         assert git(repo, "rev-parse", "HEAD").decode().strip() == os.environ["GITHUB_SHA"]
-        assert git(repo, "rev-parse", "HEAD^").decode().strip() == BASE
+        parent = git(repo, "rev-parse", "HEAD^").decode().strip()
         relative = HERE.relative_to(repo)
+        if parent != BASE:
+            assert parent == PREVIOUS_DIAGNOSTIC and git(repo, "rev-parse", "HEAD^^").decode().strip() == BASE
+            delta = git(repo, "diff", "--name-status", parent, "HEAD", "--").decode().splitlines()
+            expected_update = {f"M\t{relative / name}" for name in ("cost.py", "product.patch.b64")}
+            expected_update.add("M\t.github/workflows/dart-launcher-e101-cost.yml")
+            assert set(delta) == expected_update, delta
         expected = {str(relative / name) for name in ("cost.py", "product.patch.b64", "pubspec.lock")}
         expected.add(".github/workflows/dart-launcher-e101-cost.yml")
         changed = git(repo, "diff", "--name-status", BASE, "HEAD", "--").decode().splitlines()
@@ -181,7 +192,11 @@ def prepare_sources(repo, work, sdk, env, online, verify_only):
         command = [sdk / "bin/dart", "pub", "get", "--enforce-lockfile"]
         if not (online and arm == "A"):
             command.append("--offline")
-        result = run_checked(command, package, env, timeout=300)
+        phase = f"pub-get:{arm}:{'offline' if '--offline' in command else 'locked-download'}"
+        emit({"stage": "setup", "phase": phase, "state": "started"})
+        result = run_checked(command, package, env, timeout=300, phase=phase)
+        emit({"stage": "setup", "phase": phase, "state": "exited", "exit": result.returncode,
+              "pid": result.pid, "group": result.group_check, "reaped": result.reaped})
         assert result.returncode == 0, (arm, result.stdout, result.stderr)
         assert sha(package / "pubspec.lock") == LOCK_SHA
         profiles[arm] = dependency_profile(package, Path(env["PUB_CACHE"]).resolve(strict=True))
@@ -210,7 +225,7 @@ def command(sdk, package, fixture, mode, entry, binary):
         sdk / "bin/dart",
         f"--packages={package / '.dart_tool/package_config.json'}",
         package / "bin/build.dart",
-        "--project", fixture, "--entry", entry,
+        "--project", fixture, "--entry", quote(entry, safe="/"),
     ]
     if mode == "aot":
         return launcher + ["--compile", "exe", "--output", binary.relative_to(fixture)]
@@ -224,7 +239,106 @@ def kill_group(pid):
         return
 
 
-def run_checked(args, fixture, env, timeout=60, measure=False):
+LINUX_SUBREAPER = False
+
+
+def enable_linux_subreaper():
+    global LINUX_SUBREAPER
+    libc = ctypes.CDLL(None, use_errno=True)
+    # PR_SET_CHILD_SUBREAPER / PR_GET_CHILD_SUBREAPER are stable Linux prctl operations.
+    zero = ctypes.c_ulong(0)
+    if libc.prctl(36, ctypes.c_ulong(1), zero, zero, zero):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    state = ctypes.c_int(0)
+    if libc.prctl(37, ctypes.byref(state), zero, zero, zero) or state.value != 1:
+        raise RuntimeError("Linux did not enable scoped descendant reaping")
+    LINUX_SUBREAPER = True
+
+
+def related_processes(group):
+    records = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_bytes().rsplit(b") ", 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        owner, actual_group = int(stat[1]), int(stat[2])
+        if owner == os.getpid() or actual_group == group:
+            records.append({"pid": int(entry.name), "ppid": owner, "pgrp": actual_group, "state": stat[0].decode("ascii")})
+    return records
+
+
+def reap_exited_children():
+    records = []
+    while True:
+        try:
+            child, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return records, False
+        if child == 0:
+            return records, True
+        records.append({"pid": child, "exit": os.waitstatus_to_exitcode(status)})
+
+
+def group_exists(group):
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def terminate_adopted(group):
+    deadline = time.monotonic() + 2
+    cleanup = []
+    while True:
+        kill_group(group)
+        for member in related_processes(group):
+            if member["ppid"] == os.getpid() and member["state"] not in ("Z", "X"):
+                try:
+                    os.kill(member["pid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        ended, active = reap_exited_children()
+        cleanup.extend(ended)
+        if not active and not group_exists(group):
+            return cleanup, []
+        if time.monotonic() >= deadline:
+            return cleanup, related_processes(group)
+        time.sleep(0.01)
+
+
+def finish_linux_process(process, phase):
+    ended, active = reap_exited_children()
+    if not active and not group_exists(process.pid):
+        return ended
+    remaining = related_processes(process.pid)
+    cleanup, missed = terminate_adopted(process.pid)
+    emit({"stage": "process-failure", "phase": phase, "pid": process.pid, "exit": process.returncode,
+          "hadUnfinishedChild": active, "remaining": remaining, "reapedBeforeFailure": ended,
+          "reapedDuringCleanup": cleanup, "remainingAfterCleanup": missed})
+    raise RuntimeError(f"{phase} left an unfinished child or unreaped process group")
+
+
+def finish_posix_group(group, env):
+    try:
+        if not group_exists(group):
+            return "gone"
+    except PermissionError:
+        if platform.system() != "Darwin" or env.get("LUXO_DART_MACOS_REAPED_ONLY") != "1":
+            raise
+        return "sandbox-denied; direct child reaped and stdio drained"
+    kill_group(group)
+    raise RuntimeError("launcher left a subprocess in its process group")
+
+
+def run_checked(args, fixture, env, timeout=60, measure=False, phase="command"):
+    linux = platform.system() == "Linux"
+    if linux and not LINUX_SUBREAPER:
+        raise RuntimeError("Linux requires scoped descendant reaping before launch")
     if measure:
         cpu_start, start = child_cpu(), time.perf_counter_ns()
     with subprocess.Popen(args, cwd=fixture, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -233,24 +347,24 @@ def run_checked(args, fixture, env, timeout=60, measure=False):
             out, err = process.communicate(timeout=timeout)
         except BaseException:
             kill_group(process.pid)
-            process.communicate()
+            if linux:
+                # Reap the direct Popen child before touching adopted children.
+                # A detached child holding stdout open must be stopped before draining the pipes.
+                process.wait(timeout=2)
+                ended, missed = terminate_adopted(process.pid)
+                emit({"stage": "process-interrupted", "phase": phase, "pid": process.pid,
+                      "reapedDuringCleanup": ended, "remainingAfterCleanup": missed})
+            process.communicate(timeout=2 if linux else None)
             raise
-        measured = ({"wallNs": time.perf_counter_ns() - start, "childCpuNs": child_cpu() - cpu_start}
-                    if measure else {})
-        group_check = "gone"
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            if platform.system() != "Darwin" or env.get("LUXO_DART_MACOS_REAPED_ONLY") != "1":
-                raise
-            group_check = "sandbox-denied; direct child reaped and stdio drained"
+        elapsed = time.perf_counter_ns() - start if measure else None
+        if linux:
+            reaped = finish_linux_process(process, phase)
+            group_check = "orphan-zombies-reaped" if reaped else "gone"
         else:
-            kill_group(process.pid)
-            raise RuntimeError("launcher left a subprocess in its process group")
-        return SimpleNamespace(returncode=process.returncode, stdout=out, stderr=err,
-                               pid=process.pid, measured=measured, group_check=group_check)
+            reaped, group_check = [], finish_posix_group(process.pid, env)
+        measured = {"wallNs": elapsed, "childCpuNs": child_cpu() - cpu_start} if measure else {}
+        return SimpleNamespace(returncode=process.returncode, stdout=out, stderr=err, pid=process.pid,
+                               measured=measured, group_check=group_check, reaped=reaped)
 
 
 def script_path(value):
@@ -279,27 +393,31 @@ def sample(sdk, package, fixture, env, mode, case="ordinary", measure=False):
     entry = "bin/app.dart" if case == "ordinary" else REJECTIONS[case][0]
     binary = fixture / "dist/verified.exe"
     assert not binary.exists()
-    result = run_checked(command(sdk, package, fixture, mode, entry, binary), fixture, env, measure=measure)
+    result = run_checked(command(sdk, package, fixture, mode, entry, binary), fixture, env, measure=measure,
+                         phase=f"launcher:{mode}:{case}")
     assert not list((fixture / ".tmp").glob("luxo-selection-*")), "left unmanaged selection snapshot"
     try:
         if case != "ordinary":
             record = {"exit": result.returncode, "output": result.stdout.strip(), "error": result.stderr.strip(),
-                      "artifact": binary.is_file(), "launcherPid": result.pid, "launcherGroup": result.group_check}
+                      "artifact": binary.is_file(), "launcherPid": result.pid, "launcherGroup": result.group_check,
+                      "launcherReaped": result.reaped}
             if binary.is_file():
-                output = run_checked([binary, *ARGS], fixture, env)
+                output = run_checked([binary, *ARGS], fixture, env, phase=f"executable:{mode}:{case}")
                 record.update(artifactExit=output.returncode, artifactOutput=output.stdout.strip(),
-                              executionPid=output.pid, executionGroup=output.group_check)
+                              executionPid=output.pid, executionGroup=output.group_check, executionReaped=output.reaped)
             return record
         artifact = None
-        observed = {**result.measured, "launcherPid": result.pid, "launcherGroup": result.group_check}
+        observed = {**result.measured, "launcherPid": result.pid, "launcherGroup": result.group_check,
+                    "launcherReaped": result.reaped}
         if mode == "aot":
             assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
             assert binary.is_file() and os.access(binary, os.X_OK), binary
             artifact = {"size": binary.stat().st_size}
             if not measure:
                 artifact["sha256"] = sha(binary)
-            result = run_checked([binary, *ARGS], fixture, env, measure=measure)
-            observed.update(executionPid=result.pid, executionGroup=result.group_check, aotExecution=result.measured)
+            result = run_checked([binary, *ARGS], fixture, env, measure=measure, phase=f"executable:{mode}:{case}")
+            observed.update(executionPid=result.pid, executionGroup=result.group_check,
+                            executionReaped=result.reaped, aotExecution=result.measured)
         contract = verify_application(result, fixture, binary, mode)
         return {**observed, "contract": contract, "artifact": artifact}
     finally:
@@ -308,7 +426,7 @@ def sample(sdk, package, fixture, env, mode, case="ordinary", measure=False):
 
 def smoke(sdk, arms, fixture, env, quick=False):
     cases = (("ordinary", "no-main", "marked") if quick else
-             ("ordinary", "no-main", "syntax-error", "missing-import", "marked"))
+             ("ordinary", "no-main", "unicode-no-main", "syntax-error", "missing-import", "marked"))
     for case in cases:
         project = fixture
         if case != "ordinary":
@@ -327,15 +445,25 @@ def smoke(sdk, arms, fixture, env, quick=False):
                 assert right["exit"] != 0 and not right["artifact"], right
                 assert "%EF%BB%BFchoice.g.dart" in right["error"] and not right["output"], right
             else:
-                expected_exit = 253 if mode == "jit" and case == "no-main" else 254
-                for arm, record in (("A", left), ("B", right)):
-                    assert record["exit"] == expected_exit and not record["artifact"], record
-                    diagnostics = record["output"] + record["error"]
-                    if case == "no-main" and mode == "jit" and arm == "A":
-                        assert "must have a 'main' function defined" in diagnostics, record
-                    else:
-                        assert "Error:" in diagnostics, record
+                verify_compiler_exit(case, mode, left, right)
             emit({"stage": "smoke", "mode": mode, "case": case, "A": left, "B": right})
+
+
+def verify_compiler_exit(case, mode, left, right):
+    missing_main = case in ("no-main", "unicode-no-main")
+    expected_exit = 253 if mode == "jit" and missing_main else 254
+    for arm, record in (("A", left), ("B", right)):
+        assert record["exit"] == expected_exit and not record["artifact"], record
+        diagnostics = record["output"] + record["error"]
+        if missing_main and mode == "jit" and arm == "A":
+            assert "must have a 'main' function defined" in diagnostics, record
+        else:
+            assert "Error:" in diagnostics, record
+    if case == "unicode-no-main":
+        name = quote(UNICODE_NO_MAIN, safe="")
+        assert f"{name}: Error: No 'main' method found." in right["error"], right
+    if case == "syntax-error":
+        assert "// 中文" in right["error"], right
 
 
 def collect(sdk, arms, fixture, env):
@@ -430,6 +558,8 @@ def main():
         sdk = (args.sdk if args.sdk else Path(dart).resolve().parent.parent).resolve(strict=True)
         version = verify_sdk(sdk)
         cpu = host_cpu()
+        if platform.system() == "Linux":
+            enable_linux_subreaper()
     signal.signal(signal.SIGTERM, interrupted)
     with tempfile.TemporaryDirectory(dir=scratch, prefix="dart-launch-cost-") as tmp:
         work = Path(tmp)
@@ -439,11 +569,16 @@ def main():
         env = dict(os.environ, TMPDIR=str(tools_tmp), TMP=str(tools_tmp), TEMP=str(tools_tmp),
                    PUB_CACHE=str(pub_cache.resolve()), DART_SUPPRESS_ANALYTICS="true",
                    LUXO_DART_MACOS_REAPED_ONLY="1" if args.macos_reaped_only else "0")
+        if not verify_only:
+            emit({"stage": "setup", "phase": "prepare", "state": "started", "trees": TREES,
+                  "lockSha256": LOCK_SHA, "version": version, "revision": REVISION,
+                  "productHead": PRODUCT_HEAD, "linuxSubreaper": LINUX_SUBREAPER})
         roots, dependencies = prepare_sources(repo, work, sdk, env, args.online, verify_only)
         if not verify_only:
             fixture = prepare_fixture(work / "application", FILES)
             emit({"stage": "start", "operation": args.operation, "base": BASE, "trees": TREES,
                   "patchSha256": PATCH_SHA, "lockSha256": LOCK_SHA, "revision": REVISION,
+                  "productHead": PRODUCT_HEAD,
                   "version": version, "cpu": cpu, "os": platform.platform(), "loadAverage": os.getloadavg(),
                   "runnerImage": os.environ.get("ImageOS"), "runnerImageVersion": os.environ.get("ImageVersion"),
                   "quickSmoke": args.quick, "macosReapedOnly": args.macos_reaped_only,
@@ -459,7 +594,7 @@ def main():
             assert all(sha(root / "pubspec.lock") == LOCK_SHA for root in roots.values())
     assert not work.exists(), work
     emit({"stage": "complete", "operation": args.operation, "trees": TREES, "lockSha256": LOCK_SHA,
-          "scratchRemoved": not work.exists(), "loadAverage": os.getloadavg()})
+          "productHead": PRODUCT_HEAD, "scratchRemoved": not work.exists(), "loadAverage": os.getloadavg()})
 
 
 if __name__ == "__main__":
