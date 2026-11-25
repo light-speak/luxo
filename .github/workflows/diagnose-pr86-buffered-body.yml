@@ -1,0 +1,69 @@
+name: Qualify PR 86 buffered body on native Linux
+
+"on":
+  push:
+    branches: [diagnostics/pr86-buffered-body]
+    paths:
+      - .github/workflows/diagnose-pr86-buffered-body.yml
+      - scripts/diagnose-pr86-buffered-body/**
+
+permissions:
+  contents: read
+
+jobs:
+  buffered-body:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr86-buffered-body'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      LC_ALL: C
+      GOTOOLCHAIN: local
+      GOMAXPROCS: '2'
+      CGO_ENABLED: '1'
+      GOAMD64: v1
+      DIAGNOSTIC_CPU: Intel(R) Xeon(R) 6975P-C
+    steps:
+      - name: Select the original hosted CPU model
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          evidence=.tmp/pr86-buffered-body-evidence
+          mkdir -p "$evidence"
+          uname -a > "$evidence/host.txt"
+          lscpu > "$evidence/lscpu.txt"
+          cat /etc/os-release > "$evidence/os-release.txt"
+          [[ "$RUNNER_KIND" == github-hosted && "$RUNNER_ARCH" == X64 && "$(uname -sm)" == 'Linux x86_64' ]]
+          grep -Fx 'VERSION_ID="24.04"' "$evidence/os-release.txt"
+          cpu=$(sed -n '/^Model name:/ { s/^Model name:[[:blank:]]*//; s/[[:blank:]]*$//; p; }' "$evidence/lscpu.txt")
+          if [[ "$cpu" != "$DIAGNOSTIC_CPU" ]]; then
+            printf 'wrong-cpu: %s\n' "$cpu" | tee "$evidence/selection.txt"
+            exit 3
+          fi
+          printf '%s\n' "$cpu" > "$evidence/selection.txt"
+      - uses: actions/checkout@v7
+        with:
+          path: diagnostic
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Compare ordinary read, borrow and close behavior
+        working-directory: diagnostic
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 origin \
+            feddadefe3ee05611c075cfa0319a851865584b5 5387d161dc3950af5f72e4c0369b972a65c602db
+          bash scripts/diagnose-pr86-buffered-body/native.sh "$GITHUB_WORKSPACE/.tmp/pr86-buffered-body-evidence"
+      - name: Preserve controls, raw samples and linker evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr86-buffered-body-6975p-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr86-buffered-body-evidence/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14

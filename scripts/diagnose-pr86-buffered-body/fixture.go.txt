@@ -1,0 +1,50 @@
+package api
+
+import (
+	"fmt"
+	"io"
+	"testing"
+	"unsafe"
+)
+
+func BenchmarkAuditBufferedBody(b *testing.B) {
+	for _, size := range []int{32, 4096} {
+		b.Run(fmt.Sprint("read-", size), func(b *testing.B) {
+			body := NewBufferedBody(make([]byte, size))
+			dst := make([]byte, size)
+			b.ReportAllocs()
+			for b.Loop() {
+				body.offset = 0
+				n, err := body.Read(dst)
+				if err != nil || n != size {
+					b.Fatal(n, err)
+				}
+			}
+			b.ReportMetric(float64(unsafe.Sizeof(*body)), "body-struct-B")
+		})
+	}
+	b.Run("borrow-4096", func(b *testing.B) {
+		body := NewBufferedBody(make([]byte, 4096))
+		b.ReportAllocs()
+		for b.Loop() {
+			body.offset = 0
+			data, err := body.borrow(4096)
+			if err != nil || len(data) != 4096 {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("close-read", func(b *testing.B) {
+		original := []byte{1}
+		b.ReportAllocs()
+		for b.Loop() {
+			body := NewBufferedBody(original)
+			if err := body.Close(); err != nil {
+				b.Fatal(err)
+			}
+			if n, err := body.Read(nil); n != 0 || err != io.ErrClosedPipe {
+				b.Fatal(n, err)
+			}
+		}
+	})
+}
