@@ -1,0 +1,86 @@
+name: Isolate PR 85 CanonicalJSON on EPYC 9V74
+
+"on":
+  push:
+    branches: [diagnostics/pr85-canonical-9v74]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  canonical:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr85-canonical-9v74'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2]
+    env:
+      LC_ALL: C
+      GOTOOLCHAIN: local
+      GOMAXPROCS: '2'
+      CGO_ENABLED: '1'
+      GOAMD64: v1
+      PYTHONOPTIMIZE: '0'
+    steps:
+      - name: Select the original hosted CPU model
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          evidence="$GITHUB_WORKSPACE/.tmp/pr85-canonical-evidence"
+          mkdir -p "$evidence"
+          uname -a > "$evidence/host.txt"
+          lscpu > "$evidence/lscpu.txt"
+          cat /etc/os-release > "$evidence/os-release.txt"
+          [[ "$RUNNER_KIND" == github-hosted && "$RUNNER_ARCH" == X64 && "$(uname -sm)" == 'Linux x86_64' ]]
+          grep -Fx 'VERSION_ID="24.04"' "$evidence/os-release.txt"
+          cpu=$(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/lscpu.txt")
+          if [[ "$cpu" != 'AMD EPYC 9V74 80-Core Processor' ]]; then
+            printf 'wrong-cpu: %s\n' "$cpu" | tee "$evidence/selection.txt"
+            exit 3
+          fi
+          printf '%s\n' "$cpu" > "$evidence/selection.txt"
+
+      - uses: actions/checkout@v7
+        with:
+          path: diagnostic
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+
+      - name: Bind the exact source and the original matched-host witness
+        working-directory: diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 origin \
+            cbca8575fdd012835799a8f10a94f4c596d1e9d6 02c0e428f1e4abe27f049f2644f7b7fecd8dc90b
+          evidence="$GITHUB_WORKSPACE/.tmp/pr85-canonical-evidence"
+          gh api repos/light-speak/luxo/actions/artifacts/15067222996 > "$evidence/witness.metadata.json"
+          jq -e '.id == 15067222996 and .expired == false and .size_in_bytes == 529448 and
+            .digest == "sha256:9be901054bf61386e5ee6f6f86f5119ea78f73fceb0c1111d9665093b772bca2" and
+            .workflow_run.id == 45709987115 and .workflow_run.head_sha == "02b0b6606770216e0067582992b6ea02379b6f4d"' \
+            "$evidence/witness.metadata.json"
+          gh api repos/light-speak/luxo/actions/artifacts/15067222996/zip > "$evidence/witness.zip"
+
+      - name: Compare matched linked and isolated CanonicalJSON fixtures
+        working-directory: diagnostic
+        run: bash scripts/diagnose-pr85/native.sh "$GITHUB_WORKSPACE/.tmp/pr85-canonical-evidence" --canonical
+
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: pr85-canonical-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slot }}
+          path: .tmp/pr85-canonical-evidence/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14

@@ -1,0 +1,147 @@
+package main
+
+import (
+	"fmt"
+	"go/ast"
+	"go/token"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+)
+
+const canonicalBenchFile = "binary_bench_test.go"
+const canonicalHelperFile = "request_scalar_bench_test.go"
+
+var canonicalDeclarations = []string{
+	"BenchmarkCanonicalJSONStructured",
+	"BenchmarkCanonicalJSONTyped",
+	"BenchmarkCanonicalJSONBytes",
+	"BenchmarkCanonicalJSONFloat",
+	"BenchmarkCanonicalJSONValue",
+	"BenchmarkCanonicalJSONInteger",
+	"canonicalIntegerSink",
+	"opaqueJSONBenchmarkCase",
+	"benchmarkCanonicalJSONValue",
+	"canonicalJSONBenchmarkGolden",
+	"encodeOpaqueJSONReference",
+	"beforeOpaqueJSONValue",
+	"beforeJSONInteger",
+}
+
+func main() {
+	if len(os.Args) != 3 || os.Args[1] != "diagnostic-canonical-isolate" {
+		ordinaryBenchrun()
+		return
+	}
+	if err := isolateCanonicalJSON(os.Args[2]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func isolateCanonicalJSON(pkg string) error {
+	entries, err := os.ReadDir(pkg)
+	if err != nil {
+		return err
+	}
+	kept := 0
+	removed := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		path := filepath.Join(pkg, name)
+		data, err := readRegularTestFixture(path)
+		if err != nil {
+			return err
+		}
+		positions := token.NewFileSet()
+		file, err := parseBenchmarkFixture(positions, path, data)
+		if err != nil {
+			return err
+		}
+		switch name {
+		case canonicalBenchFile, canonicalHelperFile:
+			if err := retainCanonicalDeclarations(name, data, positions.File(file.Pos()), file); err != nil {
+				return err
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				return err
+			}
+			kept++
+		default:
+			for _, decl := range file.Decls {
+				if fn, ok := decl.(*ast.FuncDecl); ok && strings.HasPrefix(fn.Name.Name, "BenchmarkCanonicalJSON") {
+					return fmt.Errorf("unexpected canonical benchmark in %s: %s", name, fn.Name.Name)
+				}
+			}
+			removed = append(removed, path)
+		}
+	}
+	if kept != 2 {
+		return fmt.Errorf("expected both canonical and shared helper fixture files in %s", pkg)
+	}
+	for _, path := range removed {
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+		fmt.Println(filepath.Base(path))
+	}
+	return nil
+}
+
+func retainCanonicalDeclarations(name string, data []byte, positions *token.File, file *ast.File) error {
+	wanted := canonicalDeclarations
+	if name == canonicalHelperFile {
+		wanted = []string{"benchmarkStringArray"}
+	}
+	found := make(map[string]bool, len(wanted))
+	for _, decl := range file.Decls {
+		if isImport(decl) {
+			if name == canonicalHelperFile {
+				for _, spec := range decl.(*ast.GenDecl).Specs {
+					literal := spec.(*ast.ImportSpec).Path.Value
+					if literal != `"strconv"` && literal != `"strings"` {
+						clearGoSpan(data[positions.Offset(spec.Pos()):positions.Offset(spec.End())])
+					}
+				}
+			}
+			continue
+		}
+		if identifier := canonicalDeclarationName(decl); slices.Contains(wanted, identifier) {
+			if found[identifier] {
+				return fmt.Errorf("duplicate canonical fixture declaration: %s", identifier)
+			}
+			found[identifier] = true
+			continue
+		}
+		clearGoSpan(data[positions.Offset(decl.Pos()):positions.Offset(decl.End())])
+	}
+	if len(found) != len(wanted) {
+		return fmt.Errorf("canonical fixture declarations changed in %s", name)
+	}
+	return nil
+}
+
+func canonicalDeclarationName(decl ast.Decl) string {
+	switch decl := decl.(type) {
+	case *ast.FuncDecl:
+		if decl.Recv == nil {
+			return decl.Name.Name
+		}
+	case *ast.GenDecl:
+		if len(decl.Specs) == 1 {
+			switch spec := decl.Specs[0].(type) {
+			case *ast.TypeSpec:
+				return spec.Name.Name
+			case *ast.ValueSpec:
+				if len(spec.Names) == 1 {
+					return spec.Names[0].Name
+				}
+			}
+		}
+	}
+	return ""
+}

@@ -44,8 +44,9 @@ pkg=pkg/lux/api
 scripts="$root/scripts/diagnose-pr85"
 parse_fixture="$scripts/parse-log.go.txt"
 shard_tool="$scripts/shards.py"
+canonical_tool="$scripts/canonical.py"
 mode="${2:-route}"
-[[ "$mode" == route || "$mode" == --shards ]]
+[[ "$mode" == route || "$mode" == --shards || "$mode" == --canonical ]]
 cpu=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')
 tool="$scripts/evidence.py"
 hot='([.]BenchmarkLocalRouteExport|[.]localRouteSnapshot$|[.]BenchmarkDiagnosticWriteParseError|[.]ExportHandlers$|[.]writeParseError$|^runtime[.](gcWriteBarrier[0-9]*|writeBarrier)$)'
@@ -62,8 +63,11 @@ if [[ "$mode" == route ]]; then
     test "$cpu" = 'Intel(R) Xeon(R) 6975P-C'
     printf '%s  %s\n' 647c12a482898f8d88427c41fcd70ec16b3934f8942552dd691b6f5ce555ea06 "$parse_fixture" | sha256sum -c -
     python3 -B "$tool" bind "$evidence/original.zip" "$evidence" > "$evidence/original-binding.json"
-else
+elif [[ "$mode" == --shards ]]; then
     python3 -B "$shard_tool" bind "$cpu" "$evidence" > "$evidence/lane.tsv"
+    IFS=$'\t' read -r pkg shard_profile shard_filter hot < "$evidence/lane.tsv"
+else
+    python3 -B "$canonical_tool" bind "$cpu" "$evidence" > "$evidence/lane.tsv"
     IFS=$'\t' read -r pkg shard_profile shard_filter hot < "$evidence/lane.tsv"
 fi
 { go env -json GOVERSION GOOS GOARCH GOAMD64 CGO_ENABLED GOFLAGS; uname -a; lscpu; } > "$evidence/environment.txt"
@@ -73,6 +77,13 @@ for arm in "$base" "$head"; do
         printf '%s %s %s\n' "$arm" "$(git rev-parse "$arm:$path")" "$path"
     done
 done > "$evidence/source-blobs.txt"
+if [[ "$mode" == --canonical ]]; then
+    for arm in "$base" "$head"; do
+        for path in pkg/lux/api/{binary,binary_bench_test,request_scalar_bench_test}.go; do
+            printf '%s %s %s\n' "$arm" "$(git rev-parse "$arm:$path")" "$path"
+        done
+    done > "$evidence/canonical-source-blobs.txt"
+fi
 
 mkdir -p .tmp
 work=$(mktemp -d "$root/.tmp/pr85-local-route-work.XXXXXXXX")
@@ -86,6 +97,10 @@ trap 'exit 143' TERM
 mkdir "$work/tools" "$work/tool-source" "$work/test-tmp"
 export TMPDIR="$work/test-tmp" GOWORK=off GOBIN="$work/tools"
 git archive "$head" go.mod go.sum internal/benchlayout scripts/{benchrun,benchplan,benchgate} | tar -xf - -C "$work/tool-source"
+if [[ "$mode" == --canonical ]]; then
+    python3 -B "$canonical_tool" attach-projector "$work/tool-source/scripts/benchrun"
+    sha256sum "$work/tool-source/scripts/benchrun/"{main.go,diagnostic_canonical.go} > "$evidence/projector.sha256"
+fi
 (
     cd "$work/tool-source"
     for name in benchrun benchplan benchgate; do go build -o "$work/tools/$name" "./scripts/$name"; done
@@ -123,7 +138,7 @@ build_arm() {
     if [[ "$profile" != default ]]; then binary="$bins/$stem-$profile.test"; fi
     mkdir -p "$source/.tmp" "$bins"
     git archive "$revision" | tar -xf - -C "$source"
-    if [[ "$variant" != shards ]]; then
+    if [[ "$variant" == linked || "$variant" == isolated || "$variant" == parse ]]; then
         git show "$revision:$pkg/local_input_bench_test.go" | cmp - "$source/$pkg/local_input_bench_test.go"
     fi
     case "$variant" in
@@ -133,6 +148,15 @@ build_arm() {
             ;;
         isolated)
             isolate_route_tests "$source/$pkg" > "$out/$arm.removed-tests.txt"
+            ;;
+        canonical-isolated)
+            find "$source/$pkg" -type f ! -name '*_test.go' -print0 | sort -z | xargs -0 sha256sum > "$out/$arm.product-before.sha256"
+            "$benchrun" diagnostic-canonical-isolate "$source/$pkg" > "$out/$arm.removed-tests.txt"
+            sha256sum -c "$out/$arm.product-before.sha256" > "$out/$arm.product-verified.txt"
+            (
+                cd "$source/$pkg"
+                sha256sum binary_bench_test.go request_scalar_bench_test.go
+            ) > "$out/$arm.projected-fixtures.sha256"
             ;;
     esac
     sh "$source/scripts/setup-modules.sh" "$source" > "$out/$arm.modules.log" 2>&1
@@ -225,6 +249,43 @@ run_variant() {
     python3 -B "$tool" compare "$variant" "$out" > "$out/linkage.json"
     measure "$variant" "$profile" "$filter" "$out"
 }
+
+run_canonical_variant() {
+    local variant=$1 profile=$2 out="$evidence/$1" arm
+    mkdir "$out"
+    cp "$evidence/shards.expected.json" "$out/expected.json"
+    build_arm "$variant" A "$base" compile-performance-baseline "$profile" "$out"
+    build_arm "$variant" B "$head" compile-performance "$profile" "$out"
+    if [[ "$variant" == canonical-isolated ]]; then
+        cmp "$out/A.removed-tests.txt" "$out/B.removed-tests.txt"
+        cmp "$out/A.projected-fixtures.sha256" "$out/B.projected-fixtures.sha256"
+    fi
+    for arm in A B; do
+        sample "$variant" "$arm" "$profile" '^BenchmarkCanonicalJSON' 1x > "$out/$arm.all-fixtures-1x.txt"
+        python3 -B "$canonical_tool" all-smoke "$cpu" "$evidence" "$out/$arm.all-fixtures-1x.txt"
+        sample "$variant" "$arm" "$profile" "$shard_filter" 1x > "$out/$arm.fixture-1x.txt"
+        python3 -B "$shard_tool" smoke "$cpu" "$evidence" "$out/$arm.fixture-1x.txt"
+    done
+    "$benchplan" --verify-equal-inventories "$out/A.all-fixtures-1x.txt" "$out/B.all-fixtures-1x.txt"
+    "$benchplan" --verify-equal-inventories "$out/A.fixture-1x.txt" "$out/B.fixture-1x.txt"
+    python3 -B "$shard_tool" linkage "$evidence" "$out" > "$out/linkage.json"
+    measure "$variant" "$profile" "$shard_filter" "$out"
+}
+
+if [[ "$mode" == --canonical ]]; then
+    linked_status=0
+    isolated_status=0
+    held_status=0
+    run_canonical_variant canonical-linked "$shard_profile"
+    evaluate "$evidence/canonical-linked" || linked_status=$?
+    run_canonical_variant canonical-isolated default
+    evaluate "$evidence/canonical-isolated" || isolated_status=$?
+    python3 -B "$canonical_tool" witness-confirmed "$evidence/canonical-linked/AB.gate.txt" || held_status=$?
+    printf 'linked_status=%s\nisolated_status=%s\nmatched_witness_status=%s\n' \
+        "$linked_status" "$isolated_status" "$held_status" > "$evidence/canonical-status.txt"
+    if [[ "$linked_status" != 1 || "$held_status" != 0 ]]; then exit 4; fi
+    exit "$isolated_status"
+fi
 
 if [[ "$mode" == --shards ]]; then
     out="$evidence/shards"
