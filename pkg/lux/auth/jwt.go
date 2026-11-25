@@ -67,6 +67,9 @@ func loadConfigFromEnv() (*Config, error) {
 	if !ok || strings.TrimSpace(secret) == "" {
 		return nil, fmt.Errorf("JWT_SECRET is not set")
 	}
+	if secret == "change-me" {
+		return nil, fmt.Errorf("JWT_SECRET uses the default scaffold placeholder, set a unique random signing key")
+	}
 
 	expires, err := jwtExpiryFromEnv("JWT_EXPIRES", 7*24*time.Hour)
 	if err != nil {
