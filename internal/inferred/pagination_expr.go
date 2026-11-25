@@ -54,7 +54,7 @@ func (p *paginationAnalysis) expressionValue(expr ast.Expr) pageValue {
 	case *ast.LambdaExpr:
 		return p.block(value.Body, nil, true, false)
 	case *ast.AwaitExpr:
-		return p.opaqueBlock(value.Body)
+		return p.opaqueAwait(value.Body)
 	case *ast.YieldExpr:
 		return p.expression(value.Value)
 	case *ast.UnaryExpr:
@@ -110,6 +110,55 @@ func (p *paginationAnalysis) opaqueBlock(body *ast.Block) pageValue {
 	result := p.block(body, nil, true, false)
 	result.bad = len(result.queries) != 0
 	return result
+}
+
+func (p *paginationAnalysis) opaqueAwait(body *ast.Block) pageValue {
+	// A single await result can precede a trailing statement.
+	if body == nil || len(body.Stmts) < 2 {
+		return p.opaqueBlock(body)
+	}
+	result := false
+	for index, stmt := range body.Stmts {
+		if expression, ok := stmt.(*ast.ExprStmt); ok && expression.Expr != nil {
+			if result || index == len(body.Stmts)-1 {
+				return p.opaqueBlock(body)
+			}
+			result = true
+		}
+	}
+	if !result {
+		return p.opaqueBlock(body)
+	}
+	var value pageValue
+	p.visitAwaitResults(body, func(expr ast.Expr) {
+		value = p.awaitResult(p.expression(expr))
+	})
+	return value
+}
+
+func (p *paginationAnalysis) visitAwaitResults(body *ast.Block, visit func(ast.Expr)) {
+	if body == nil {
+		return
+	}
+	outer := len(p.scopes)
+	defer func() { p.scopes = p.scopes[:outer] }()
+	for _, stmt := range body.Stmts {
+		expression, ok := stmt.(*ast.ExprStmt)
+		if !ok || expression.Expr == nil {
+			if len(p.scopes) == outer {
+				p.scopes = append(p.scopes, nil)
+			}
+			p.statement(stmt, false)
+			continue
+		}
+		visit(expression.Expr)
+	}
+}
+
+func (p *paginationAnalysis) awaitResult(value pageValue) pageValue {
+	value.bad = value.bad || len(value.queries) != 0
+	// Later statements can replace fields on a local value.
+	return p.bindObject(value, nil)
 }
 
 func (p *paginationAnalysis) call(call *ast.CallExpr) pageValue {

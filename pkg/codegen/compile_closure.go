@@ -266,7 +266,8 @@ func (c *compiler) finishWhenClosure(sub *compiler, expr *ast.WhenExpr, fallback
 // emitted by fallible fn/native calls used as later branch conditions.
 func (c *compiler) compileWhenConditions(expr *ast.WhenExpr, subject string) {
 	indent := c.indent
-	for _, branch := range expr.Branches {
+	branches := runtimeWhenBranches(expr)
+	for _, branch := range branches {
 		condition := c.compileBooleanValue(branch.Condition)
 		if subject != "" {
 			condition = c.compileWhenEquality(expr.Subject, branch.Condition, subject, condition)
@@ -281,7 +282,7 @@ func (c *compiler) compileWhenConditions(expr *ast.WhenExpr, subject string) {
 	if expr.Else != nil {
 		c.compileValueBranch(expr.Else)
 	}
-	for range expr.Branches {
+	for range branches {
 		c.indent = strings.TrimSuffix(c.indent, "\t")
 		c.write("}")
 	}
@@ -304,6 +305,9 @@ func whenNeedsValueEquality(expr *ast.WhenExpr) bool {
 }
 
 func (c *compiler) compileWhenEquality(subject, pattern ast.Expr, left, right string) string {
+	if isStaticWhenNullSubject(subject) {
+		return c.compileStaticNullMatch(pattern, right)
+	}
 	comparison := &ast.BinaryExpr{Left: subject, Right: pattern, Op: "=="}
 	if expression, ok := c.compileScalarComparison(comparison, left, right); ok {
 		return expression
@@ -311,11 +315,69 @@ func (c *compiler) compileWhenEquality(subject, pattern ast.Expr, left, right st
 	return left + " == " + right
 }
 
+func isStaticWhenNullSubject(expr ast.Expr) bool {
+	return isNullLiteral(expr) || isNullAwait(expr)
+}
+
+func isNullAwait(expr ast.Expr) bool {
+	await, ok := expr.(*ast.AwaitExpr)
+	return ok && await.GetTypeTag() == "null"
+}
+
+func (c *compiler) compileAwaitNullComparison(expr *ast.BinaryExpr, left, right string) (string, bool) {
+	if left != "nil" && right != "nil" || expr.Op != "==" && expr.Op != "!=" {
+		return "", false
+	}
+	var result string
+	switch {
+	case isNullAwait(expr.Left):
+		result = c.compileStaticNullMatch(expr.Right, right)
+	case isNullAwait(expr.Right):
+		result = c.compileStaticNullMatch(expr.Left, left)
+	default:
+		return "", false
+	}
+	if expr.Op == "!=" {
+		return "!(" + result + ")", true
+	}
+	return result, true
+}
+
+func (c *compiler) compileStaticNullMatch(pattern ast.Expr, value string) string {
+	nullPattern := isNullLiteral(pattern) || pattern.GetTypeTag() == "null"
+	if !nullPattern && pattern.IsNullable() {
+		return value + " == nil"
+	}
+	// A non-null pattern cannot match, but its evaluation can still fail.
+	if value != "nil" {
+		c.write("_ = %s", value)
+	}
+	if nullPattern {
+		return "true"
+	}
+	return "false"
+}
+
+// A statically null subject has no possible type match.
+func runtimeWhenBranches(expr *ast.WhenExpr) []*ast.WhenBranch {
+	if !isStaticWhenNullSubject(expr.Subject) || !hasWhenTypeBranch(expr) {
+		return expr.Branches
+	}
+	branches := make([]*ast.WhenBranch, 0, len(expr.Branches))
+	for _, branch := range expr.Branches {
+		if branch.IsType == "" {
+			branches = append(branches, branch)
+		}
+	}
+	return branches
+}
+
 func whenConditionsCall(expr *ast.WhenExpr) bool {
 	found := false
 	for _, branch := range expr.Branches {
 		ast.WalkExprs(&ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: branch.Condition}}}, func(value ast.Expr) {
-			if _, ok := value.(*ast.CallExpr); ok {
+			switch value.(type) {
+			case *ast.CallExpr, *ast.AwaitExpr:
 				found = true
 			}
 		})
@@ -341,12 +403,16 @@ func (c *compiler) compileYieldWhenBranches(expr *ast.WhenExpr, result string, e
 	indent := c.indent
 	subject := ""
 	if expr.Subject != nil {
-		value := c.compileBooleanValue(expr.Subject)
-		c.resultTmp++
-		subject = fmt.Sprintf("_yieldSubject%d", c.resultTmp)
-		c.write("%s := %s", subject, value)
+		subject = c.compileBooleanValue(expr.Subject)
+		if !isStaticWhenNullSubject(expr.Subject) {
+			c.resultTmp++
+			name := fmt.Sprintf("_yieldSubject%d", c.resultTmp)
+			c.write("%s := %s", name, subject)
+			subject = name
+		}
 	}
-	for _, branch := range expr.Branches {
+	branches := runtimeWhenBranches(expr)
+	for _, branch := range branches {
 		condition := c.compileBooleanValue(branch.Condition)
 		if subject != "" {
 			condition = c.compileWhenEquality(expr.Subject, branch.Condition, subject, condition)
@@ -361,7 +427,7 @@ func (c *compiler) compileYieldWhenBranches(expr *ast.WhenExpr, result string, e
 	if expr.Else != nil {
 		c.compileYieldBranch(expr.Else, result, expected)
 	}
-	for range expr.Branches {
+	for range branches {
 		c.indent = strings.TrimSuffix(c.indent, "\t")
 		c.write("}")
 	}

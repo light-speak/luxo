@@ -62,6 +62,56 @@ func TestPaginationPlanFinalListLineage(t *testing.T) {
 		{"query_offset", "", `val query = Node.offset(1) return query.all()`, 0, true},
 		{"transaction_result", "", `return transaction { Node.all() }`, 0, true},
 		{"await_source", "", `val (rows, other) = await { Node.all() Node.all() } return rows`, 0, true},
+		{"await_local_query_source", "", `val (_, rows) = await { val local = Node.all()
+local } return rows`, 0, true},
+		{"await_scalar_query_source", "", `val (_, rows) = await { Node.all() } return rows`, 0, true},
+		{"await_tuple_local_query_source", "", `val (_, rows) = await { val local = Node.all()
+1
+local } return rows`, 0, true},
+		{"await_value_before_trailing_declaration", "", `return await { val local = Node.all()
+local
+val marker = 1 }`, 0, true},
+		{"await_manual_before_trailing_declaration", "", `return await { val local = [Node { id: 1 }]
+local
+val marker = 1 }`, 0, false},
+		{"await_statement_without_result", "", `await { val one = 1
+val two = 2 }
+return Node.all()`, 1, false},
+		{"await_statement_with_results", "", `await { 1
+2 }
+return Node.all()`, 1, false},
+		{"await_destinations_do_not_shadow_outer_query", "", `val rows = Node.all()
+if choose { val (rows, alias) = await { 1
+rows }
+return alias }
+return [Node { id: 1 }]`, 0, true},
+		{"await_destinations_do_not_shadow_outer_manual", "", `val rows = [Node { id: 1 }]
+if choose { val (rows, alias) = await { Node.all()
+rows }
+return alias }
+return rows`, 0, false},
+		{"await_scope_does_not_leak", "", `val rows = Node.all()
+val (local, _) = await { val rows = [Node { id: 1 }]
+rows
+1 }
+return rows`, 1, false},
+		{"await_local_consumes_outer_query", "", `val rows = Node.all()
+val (_, _) = await { val count = rows.size()
+1
+2 }
+return rows`, 0, true},
+		{"await_discarded_aliases_consume_source", "", `val rows = Node.all()
+val (_, _) = await { rows }
+return rows`, 0, true},
+		{"await_unused_query_keeps_manual_result", "", `val (_, rows) = await { val ignored = Node.all()
+[Node { id: 1 }] }
+return rows`, 0, false},
+		{"await_result_snapshots_value_field", `type Box { rows: [Node] }`, `val (result, _) = await {
+val box = Box { rows: Node.all() }
+box
+box.rows = []
+1 }
+return result.rows`, 0, true},
 		{"load_list", "", `return Node.load(id: 1)`, 0, true},
 		{"opaque_helper", `fn rows(): [Node] { return Node.all() }`, `return rows()`, 0, true},
 		{"helper_argument", `fn rows(items: [Node]): [Node] { return items }`, `return rows(items: Node.all())`, 0, true},
