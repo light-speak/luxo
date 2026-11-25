@@ -57,12 +57,13 @@ func BenchmarkRPCStreamTerminalLifecycle(b *testing.B) {
 				b.ReportAllocs()
 				for b.Loop() {
 					ctx, cancel := context.WithCancel(context.Background())
-					stop := context.AfterFunc(ctx, func() { conn.Close() })
 					if checked {
-						sub := &Subscription{messages: make(chan []byte, 64), errors: make(chan error, 1), conn: conn, cancel: cancel, stop: stop}
+						sub := &Subscription{messages: make(chan []byte, 64), errors: make(chan error, 1), conn: conn, cancel: cancel}
+						sub.stop = context.AfterFunc(ctx, sub.closeConnection)
 						sub.finish(result)
 						terminalSubscriptionSink = sub
 					} else {
+						stop := context.AfterFunc(ctx, func() { conn.Close() })
 						sub := &subscriptionBeforeTerminalResult{messages: make(chan []byte, 64), errors: make(chan error, 1), conn: conn, cancel: cancel, stop: stop}
 						sub.finish(result)
 						legacySubscriptionSink = sub
