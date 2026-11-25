@@ -72,13 +72,13 @@ type Analyzer struct {
 	warnings                   []Warning
 	inLambda                   bool // Database-query restricted collection or predicate context.
 	inTransaction              bool // true when checking inside a transaction block
-	inAwait                    bool // true when checking inside an await block
+	awaitContext               awaitCheckContext
 	typePassDone               bool
 	loopDepth                  int      // Explicit loops reachable in the current execution scope.
 	callTarget                 ast.Expr // exact callee being checked, not its nested receivers
 	resultOperand              int      // positive while checking the direct operand of Result<T>?
 	expectedReturn             *ResolvedType
-	asyncResult                *ResolvedType // Read-only Void metadata, allocated once per analysis.
+	voidResult                 *ResolvedType // Read-only Void metadata, allocated once per analysis.
 	files                      []*ast.File
 	currentFile                *ast.File // file being analyzed in Pass 4
 	executionCacheDependencies map[*ast.ApiDecl][]CacheDependency

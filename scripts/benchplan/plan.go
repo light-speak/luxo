@@ -7,6 +7,14 @@ import (
 	"strings"
 )
 
+const (
+	defaultShardCount = 8
+	maxShardCount     = 256
+	// Two rounds of ten 200 ms samples for 480 leaves target 32 minutes
+	// of measurements, leaving time for compilation and calibration.
+	targetMeasurementsPerShard = 480
+)
+
 type benchGroup struct {
 	Package, Name        string
 	Base, Head           int
@@ -20,8 +28,17 @@ type benchShard struct {
 	Weight int          `json:"-"`
 }
 
+func workflowShardLimit(groups []benchGroup) int {
+	total := 0
+	for _, group := range groups {
+		total += group.Base + group.Head
+	}
+	target := (total + targetMeasurementsPerShard - 1) / targetMeasurementsPerShard
+	return min(maxShardCount, max(defaultShardCount, target))
+}
+
 func makePlan(groups []benchGroup, limit int) ([]benchShard, error) {
-	if limit < 1 || limit > 256 {
+	if limit < 1 || limit > maxShardCount {
 		return nil, errors.New("shard limit must be in 1..256")
 	}
 	groups = slices.Clone(groups)

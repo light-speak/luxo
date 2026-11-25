@@ -202,6 +202,99 @@ func TestHTTPServerProtocolDispatch(t *testing.T) {
 	}
 }
 
+func TestTLSConnectionCancellationKeepsListener(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	canceled := make(chan error, 1)
+	release := make(chan struct{})
+	defer close(release)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/hold" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		select {
+		case entered <- struct{}{}:
+		case <-release:
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			select {
+			case canceled <- r.Context().Err():
+			case <-release:
+			}
+		case <-release:
+		}
+	})
+	server, err := NewServer(handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	https := httptest.NewUnstartedServer(handler)
+	firstCancel := make(chan context.CancelFunc, 1)
+	var connections atomic.Int32
+	https.Config.ConnContext = func(ctx context.Context, _ net.Conn) context.Context {
+		if connections.Add(1) != 1 {
+			return ctx
+		}
+		ctx, cancel := context.WithCancel(ctx)
+		firstCancel <- cancel
+		return ctx
+	}
+	if err := server.ConfigureHTTPServer(https.Config); err != nil {
+		t.Fatal(err)
+	}
+	https.TLS = https.Config.TLSConfig.Clone()
+	https.StartTLS()
+	t.Cleanup(func() { _ = server.Close(); https.Close() })
+
+	newClient := func() *http.Client {
+		transport := &http2.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+		t.Cleanup(transport.CloseIdleConnections)
+		return &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	}
+	first := newClient()
+	done := make(chan error, 1)
+	go func() {
+		response, err := first.Get(https.URL + "/hold")
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("TLS HTTP/2 request did not reach the handler")
+	}
+	select {
+	case cancel := <-firstCancel:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("TLS connection cancellation hook was not called")
+	}
+	select {
+	case err := <-canceled:
+		if err != context.Canceled {
+			t.Fatalf("request context error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TLS connection context cancellation did not reach the request")
+	}
+	if err := <-done; err == nil {
+		t.Fatal("canceled connection returned a response")
+	}
+
+	next, err := newClient().Get(https.URL + "/ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Body.Close()
+	if next.ProtoMajor != 2 || next.StatusCode != http.StatusNoContent || connections.Load() < 2 {
+		t.Fatalf("new TLS connection returned %s %d, accepted %d", next.Proto, next.StatusCode, connections.Load())
+	}
+}
+
 func TestConfigureHTTPServerRejectsInvalidConfiguration(t *testing.T) {
 	s, err := NewServer(http.NotFoundHandler())
 	if err != nil {

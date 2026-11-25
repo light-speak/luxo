@@ -493,6 +493,7 @@ func TestGeneratedPaginatedLoopCount(t *testing.T) {
 type Snapshot { ids: [Int] }
 type Counter { count: Int }
 event Counted(count: Int)
+sealed PageSource { FromDatabase FromMemory }
 api plain(): [Node] @paginate { return Node.orderBy(id.asc).all() }
 api selectedPage(): [Node] @paginate { return Node.select().orderBy(id.asc).all() }
 api selectedFiltered(): [Node] @paginate { return Node.where(id > 1).select().orderBy(id.asc).all() }
@@ -508,6 +509,22 @@ api builderAlias(): [Node] @paginate { val query = Node.where(id > 1).orderBy(id
 api nestedBranch(left: Boolean): [Node] @paginate { val rows = when { left -> Node.where(id == 1).orderBy(id.asc).all() else -> Node.orderBy(id.asc).all() } return for row in rows { row } }
 api earlyBranch(left: Boolean): [Node] @paginate { if left { return Node.where(id == 1).orderBy(id.asc).all() } return Node.orderBy(id.asc).all() }
 api nullableFallback(): [Node] @paginate { val rows: [Node]? = Node.orderBy(id.asc).all() return rows ?: [Node { id: 8 }, Node { id: 9 }] }
+api nullAwaitDefault(): [Node] @paginate { val rows: [Node] = (await { null }) ?: Node.orderBy(id.asc).all() return rows }
+api nullLiteralDefault(): [Node] @paginate { val rows: [Node] = null ?: Node.orderBy(id.asc).all() return rows }
+api defaultFromBranch(database: Boolean): [Node] @paginate {
+  val queryRows = Node.orderBy(id.asc).all()
+  val rows: [Node] = null ?: (when { database -> queryRows else -> [Node { id: 8 }, Node { id: 9 }, Node { id: 10 }, Node { id: 11 }] })
+  return rows
+}
+api sealedPage(database: Boolean): [Node] @paginate {
+  val source: PageSource = when { database -> PageSource.FromDatabase() else -> PageSource.FromMemory() }
+  return when (source) { is FromDatabase -> Node.orderBy(id.asc).all() is FromMemory -> [Node { id: 8 }, Node { id: 9 }] }
+}
+api channelPage(database: Boolean): [Node] @paginate {
+  val ready: Channel<Int> = Channel(1)
+  if database { ready <- 1 }
+  return when { <-ready -> Node.orderBy(id.asc).all() else -> [Node { id: 8 }, Node { id: 9 }] }
+}
 api nullableBranch(database: Boolean): [Node] @paginate { val rows: [Node]? = when { database -> Node.orderBy(id.asc).all() else -> null } return rows ?: [Node { id: 8 }, Node { id: 9 }] }
 api assigned(): [Node] @paginate { var rows: [Node] = [] rows = Node.orderBy(id.asc).all() return rows }
 api transactionAssigned(): [Node] @paginate { var rows: [Node] = [] transaction { rows = Node.orderBy(id.asc).all() } return rows }
@@ -527,19 +544,25 @@ api builderInput(): [Node] @paginate { val rows = Node.all() val query = Node.wh
 api manualField(): [Node] @paginate { val rows = [Node { id: 8 }, Node { id: 9 }] val snapshot = Snapshot { ids: [] } snapshot.ids = rows.map { it.id } snapshot.ids.size() > 2 !: throw error.Conflict return rows }
 api independentField(): [Node] @paginate { val rows = Node.all() val snapshot = Snapshot { ids: [] } snapshot.ids = rows.map { it.id } snapshot.ids.size() != 3 !: throw error.Conflict return Node.where(id > 1).orderBy(id.asc).all() }
 api scalarField(): [Node] @paginate { val counter = Counter { count: 0 } counter.count = 1 return Node.orderBy(id.asc).all() }
-`, paginatedLoopAssertions, StableIDs{ModelFields: map[string]map[string]int{"Node": {"id": 1}, "Snapshot": {"ids": 1}, "Counter": {"count": 1}}, EventFields: map[string]map[string]int{"Counted": {"count": 1}}})
+`, paginatedLoopAssertions, StableIDs{ModelFields: map[string]map[string]int{"Node": {"id": 1}, "Snapshot": {"ids": 1}, "Counter": {"count": 1}, "PageSource": {"FromDatabase": 1, "FromMemory": 2}}, EventFields: map[string]map[string]int{"Counted": {"count": 1}}})
 }
 
 const paginatedLoopAssertions = `package generated
-import("bytes";"context";"encoding/json";"fmt";"net";"net/http/httptest";"strings";"sync";"testing";"github.com/jackc/pgx/v5";"github.com/jackc/pgx/v5/pgxpool";"github.com/light-speak/luxo/internal/testutil";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/event";"github.com/light-speak/luxo/pkg/lux/pg";"github.com/light-speak/luxo/pkg/lux/rpc";"github.com/light-speak/luxo/pkg/lux/schema";"github.com/testcontainers/testcontainers-go";"github.com/testcontainers/testcontainers-go/modules/postgres")
+import("os";"bytes";"context";"encoding/json";"fmt";"net";"net/http/httptest";"strings";"sync";"testing";"github.com/jackc/pgx/v5";"github.com/jackc/pgx/v5/pgxpool";"github.com/light-speak/luxo/internal/testutil";"github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/event";"github.com/light-speak/luxo/pkg/lux/pg";"github.com/light-speak/luxo/pkg/lux/rpc";"github.com/light-speak/luxo/pkg/lux/schema";"github.com/testcontainers/testcontainers-go";"github.com/testcontainers/testcontainers-go/modules/postgres")
 type pageSQLLog struct{mu sync.Mutex;queries []string}
 func(s *pageSQLLog)TraceQueryStart(ctx context.Context,_ *pgx.Conn,data pgx.TraceQueryStartData)context.Context{s.mu.Lock();if strings.HasPrefix(strings.ToUpper(data.SQL),"SELECT"){s.queries=append(s.queries,data.SQL)};s.mu.Unlock();return ctx}
 func(*pageSQLLog)TraceQueryEnd(context.Context,*pgx.Conn,pgx.TraceQueryEndData){}
 func(s *pageSQLLog)take()[]string{s.mu.Lock();defer s.mu.Unlock();result:=s.queries;s.queries=nil;return result}
 type pageCase struct{name string;params map[string]any;ids []int64;queries int}
-func TestPaginatedLoopCount(t *testing.T){
+func pageFixtureConnection(t *testing.T)string{
+ t.Helper()
+ if connection:=os.Getenv("LUXO_TEST_DATABASE_URL");connection!=""{return connection}
  container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies());testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
  connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+ return connection
+}
+func TestPaginatedLoopCount(t *testing.T){
+ connection:=pageFixtureConnection(t)
  cfg,err:=pgxpool.ParseConfig(connection);if err!=nil{t.Fatal(err)};log:=&pageSQLLog{};cfg.ConnConfig.Tracer=log
  pool,err:=pgxpool.NewWithConfig(t.Context(),cfg);if err!=nil{t.Fatal(err)};db:=pg.NewDBFromPool(pool);t.Cleanup(db.Close)
  if _,err:=pg.Exec(t.Context(),db,"CREATE TABLE nodes(id bigint PRIMARY KEY);INSERT INTO nodes VALUES(1),(2),(3)");err!=nil{t.Fatal(err)}
@@ -553,6 +576,10 @@ func TestPaginatedLoopCount(t *testing.T){
   {"mixed",map[string]any{"database":true},[]int64{1,2,3},2},{"mixed",map[string]any{"database":false},[]int64{8,9,10,11},0},
   {"assigned",nil,[]int64{1,2,3},2},{"transactionAssigned",nil,[]int64{1,2,3},2},{"unrelated",nil,[]int64{1,2,3},3},{"builderAlias",nil,[]int64{2,3},2},{"nestedBranch",map[string]any{"left":true},[]int64{1},2},{"nestedBranch",map[string]any{"left":false},[]int64{1,2,3},2},
   {"earlyBranch",map[string]any{"left":true},[]int64{1},2},{"earlyBranch",map[string]any{"left":false},[]int64{1,2,3},2},
+  {"nullAwaitDefault",nil,[]int64{1,2,3},2},{"nullLiteralDefault",nil,[]int64{1,2,3},2},
+  {"defaultFromBranch",map[string]any{"database":true},[]int64{1,2,3},2},{"defaultFromBranch",map[string]any{"database":false},[]int64{8,9,10,11},2},
+  {"sealedPage",map[string]any{"database":true},[]int64{1,2,3},2},{"sealedPage",map[string]any{"database":false},[]int64{8,9},0},
+  {"channelPage",map[string]any{"database":true},[]int64{1,2,3},2},{"channelPage",map[string]any{"database":false},[]int64{8,9},0},
   {"nullableFallback",nil,[]int64{1,2,3},2},{"nullableBranch",map[string]any{"database":true},[]int64{1,2,3},2},{"nullableBranch",map[string]any{"database":false},[]int64{8,9},0},
   {"manualFilter",nil,[]int64{2,3},0},{"manualSort",nil,[]int64{1,2,3},0},
   {"manualLoop",map[string]any{"ids":[]int64{}},[]int64{8,9},0},{"manualLoop",map[string]any{"ids":[]int64{4}},[]int64{4,5},0},{"manualLoop",map[string]any{"ids":[]int64{4,6}},[]int64{6,7},0},
