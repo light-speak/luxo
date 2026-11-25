@@ -63,15 +63,20 @@ func (w *controlWriter) apply(command controlCommand) error {
 	case responseCommand:
 		return w.writeResponse(command.streamID, command.response)
 	case abortStreamCommand:
-		if _, exists := w.data.queue.streams[command.streamID]; exists {
-			_ = w.data.queue.cancel(command.streamID)
-		}
-		w.lastStream = max(w.lastStream, command.streamID)
-		return w.data.framer.WriteRSTStream(command.streamID, command.code)
+		return w.abortStream(command.streamID, command.code)
 	default:
 		return http2.ConnectionError(http2.ErrCodeProtocol)
 	}
 	return nil
+}
+
+func (w *controlWriter) abortStream(id uint32, code http2.ErrCode) error {
+	q := w.data.queue
+	if index := q.streams[id]; index != 0 {
+		q.cancelKnown(index)
+	}
+	w.lastStream = max(w.lastStream, id)
+	return w.data.framer.WriteRSTStream(id, code)
 }
 
 func (w *controlWriter) returnReceiveCredit(id uint32, credit receiveCredit) error {
