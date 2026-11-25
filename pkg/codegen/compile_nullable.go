@@ -12,7 +12,7 @@ import (
 func (c *compiler) compileDefaultExpr(expr *ast.ElvisExpr) string {
 	result := &ast.TypeRef{Name: expr.GetTypeTag(), Nullable: expr.IsNullable(), IsList: expr.IsListType()}
 	if isNullLiteral(expr.Left) {
-		return c.compileMaterializedValue(expr.Right, result)
+		return c.compileDefaultFallback(expr, result)
 	}
 	thrown, throws := expr.Right.(*ast.UnaryExpr)
 	throws = throws && thrown.Op == "throw"
@@ -22,7 +22,7 @@ func (c *compiler) compileDefaultExpr(expr *ast.ElvisExpr) string {
 			c.writeConditionalThrow("true", thrown.Value)
 			return "nil"
 		}
-		return c.compileMaterializedValue(expr.Right, result)
+		return c.compileDefaultFallback(expr, result)
 	}
 	booleanGuard := throws && isBoolExpr(expr.Left)
 	if !expr.Left.IsNullable() && !booleanGuard {
@@ -43,15 +43,20 @@ func (c *compiler) compileDefaultExpr(expr *ast.ElvisExpr) string {
 		sub.write("\treturn *%s", name)
 	} else {
 		sub.indent += "\t"
-		value := sub.pageBranchValue(expr.Left, name)
+		value := sub.pageBranchValue(sub.pageResult, expr.Left, name)
 		sub.write("return %s", value)
 		sub.indent = c.indent + "\t"
 	}
 	sub.write("}")
 	right := sub.compileMaterializedValue(expr.Right, result)
-	right = sub.pageBranchValue(expr.Right, right)
+	right = sub.pageBranchValue(sub.pageResult, expr.Right, right)
 	sub.write("return %s", right)
 	return c.finishValueClosure(sub, compiledFunctionGoType(result, c.models), sub.b.String())
+}
+
+func (c *compiler) compileDefaultFallback(expr *ast.ElvisExpr, result *ast.TypeRef) string {
+	value := c.compileMaterializedValue(expr.Right, result)
+	return c.pageBranchValue(c.pageBranch(expr), expr.Right, value)
 }
 
 // A throwing fallback has no value to merge, so it needs no value closure.

@@ -741,7 +741,7 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 			c.write("return nil")
 		} else {
 			expression := c.compileAssignedValue(s.Value, c.valueResult)
-			expression = c.pageBranchValue(s.Value, expression)
+			expression = c.pageBranchValue(c.pageResult, s.Value, expression)
 			if c.valueModel {
 				expression = c.modelReference(s.Value, expression)
 			}
@@ -3370,7 +3370,6 @@ func (c *compiler) compileWhenValue(e *ast.WhenExpr) string {
 	}
 	sub := c.branchValueCompiler(e)
 	sub.indent += "\t"
-	sub.pageResult = c.pageBranch(e)
 	subject := ""
 	if e.Subject != nil {
 		subject = sub.compileBooleanValue(e.Subject)

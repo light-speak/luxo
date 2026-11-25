@@ -2,6 +2,17 @@ package semantic
 
 import "testing"
 
+func TestStaticNullWhenResolvesTypePatterns(t *testing.T) {
+	for _, subject := range []string{"null", "await { null }"} {
+		t.Run(subject, func(t *testing.T) {
+			base := "fn probe(): Int { return when (" + subject + ") { is "
+			end := " -> 1 null -> 2 else -> 3 } }"
+			expectNoErrors(t, analyze(t, "model Entry @noTime { id: Int @id }\n"+base+"Entry"+end))
+			expectError(t, analyze(t, base+"MissingEntry"+end), "MissingEntry")
+		})
+	}
+}
+
 func TestWhenRejectsIncompatibleGenericBlocks(t *testing.T) {
 	for _, branches := range []string{
 		`return when { flag -> { left } else -> { right } }`,

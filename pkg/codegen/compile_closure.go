@@ -167,6 +167,7 @@ func (c *compiler) valueCompiler() *compiler {
 // Branches share the resolved result ABI, including nullable scalar/object values.
 func (c *compiler) branchValueCompiler(expr ast.Expr) *compiler {
 	sub := c.valueCompiler()
+	sub.pageResult = c.pageBranch(expr)
 	if expr.IsNullable() {
 		sub.valueResult = &ast.TypeRef{Name: expr.GetTypeTag(), IsList: expr.IsListType(), Nullable: true}
 	} else {
