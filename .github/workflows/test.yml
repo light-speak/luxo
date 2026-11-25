@@ -543,7 +543,7 @@ jobs:
 
       - name: Preserve benchmark plan and discovery evidence
         if: always() && steps.benchmark_scope.outputs.run == 'true'
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: benchmark-plan-${{ github.run_attempt }}
           retention-days: 14
@@ -781,7 +781,7 @@ jobs:
 
       - name: Preserve performance evidence
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: performance-evidence-${{ matrix.shard }}-${{ github.run_attempt }}
           retention-days: 14
@@ -884,7 +884,7 @@ jobs:
 
       - name: Preserve fuzz diagnostics and failing inputs
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: fuzz-evidence-${{ github.run_attempt }}
           retention-days: 14
