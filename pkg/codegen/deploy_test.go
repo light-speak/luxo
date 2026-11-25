@@ -8,7 +8,33 @@ import (
 	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
+	"gopkg.in/yaml.v3"
 )
+
+func TestComposeInheritsJWTEnvironmentForApplicationServices(t *testing.T) {
+	files := GenerateDeployFiles(makeHelmResult("user", "post"), "myapp")
+	var compose struct {
+		Services map[string]struct {
+			Environment map[string]*string `yaml:"environment"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(files.DockerCompose, &compose); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"gateway", "user", "post"} {
+		for _, key := range []string{"JWT_SECRET", "JWT_EXPIRES", "JWT_REFRESH", "JWT_REFRESH_EXPIRES"} {
+			value, present := compose.Services[name].Environment[key]
+			if !present || value != nil {
+				t.Errorf("service %s must inherit %s without a default value", name, key)
+			}
+		}
+	}
+	for _, name := range []string{"postgres", "redis"} {
+		if _, present := compose.Services[name].Environment["JWT_SECRET"]; present {
+			t.Errorf("infrastructure service %s received the JWT secret", name)
+		}
+	}
+}
 
 func TestGeneratedToolchainMatchesCoreModule(t *testing.T) {
 	data, err := os.ReadFile("../../go.mod")
