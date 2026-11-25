@@ -102,6 +102,14 @@ func writeLuviaMergeDestinationOverlay(pkg, workspace string) (string, error) {
 		"merger_bench_test.go", "primary_keys_bench_test.go", "primary_keys_baseline_test.go")
 }
 
+func writeLuviaResolvedFieldsOverlay(pkg, workspace string) (string, error) {
+	// grouped_response_test.go provides the fixture used by the retained
+	// benchmark file. The remaining files keep the verified isolated link layout.
+	return retainBenchmarkTestFiles(pkg, workspace, "Luvia resolved fields",
+		"grouped_response_bench_test.go", "grouped_response_test.go",
+		"merger_bench_test.go", "primary_keys_bench_test.go", "primary_keys_baseline_test.go")
+}
+
 func retainBenchmarkTestFiles(pkg, workspace, description string, fixtures ...string) (string, error) {
 	entries, err := os.ReadDir(pkg)
 	if err != nil {

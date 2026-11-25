@@ -16,10 +16,12 @@ import (
 
 func TestIsolationProfileCommand(t *testing.T) {
 	for _, tc := range []struct{ pkg, want string }{
-		{"pkg/lux/api", "api-non-identity\t.\napi-local-route-export\t^BenchmarkLocalRouteExport$\n"},
+		{"pkg/lux/api", "api-non-identity\t.\napi-local-route-export\t^BenchmarkLocalRouteExport$\n" +
+			"api-canonical-json\t^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$\n"},
 		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n" +
 			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n" +
-			"luvia-merge-destination\t^BenchmarkMergeDestination$\n"},
+			"luvia-merge-destination\t^BenchmarkMergeDestination$\n" +
+			"luvia-resolved-fields\t^BenchmarkValidateResolvedFields$\n"},
 		{"pkg/codegen", "codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n" +
 			"codegen-global-receiver\t^BenchmarkGlobalReceiverName$\n" +
 			"codegen-migration-state\t^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$\n"},
@@ -52,11 +54,16 @@ func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 		{benchlayout.APIPackage, "api-local-route-export", func(t *testing.T, replace map[string]string, dir string) {
 			verifyOnlyListedTestFiles(t, replace, dir, "local_input_bench_test.go")
 		}},
+		{benchlayout.APIPackage, "api-canonical-json", verifyAPICanonicalJSONOverlay},
 		{benchlayout.APIPackage, benchlayout.APINonIdentityProfile, verifyAPIOverlay},
 		{benchlayout.LuxPackage, benchlayout.LuxShortPathProfile, verifyLuxShortPathOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaPrimaryTraceProfile, verifyLuviaOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaGatewayIdentityProfile, verifyLuviaGatewayIdentityOverlay},
 		{benchlayout.LuviaPackage, "luvia-merge-destination", verifyLuviaMergeDestinationOverlay},
+		{benchlayout.LuviaPackage, "luvia-resolved-fields", func(t *testing.T, replace map[string]string, dir string) {
+			verifyOnlyListedTestFiles(t, replace, dir, "grouped_response_bench_test.go", "grouped_response_test.go",
+				"merger_bench_test.go", "primary_keys_bench_test.go", "primary_keys_baseline_test.go")
+		}},
 	} {
 		t.Run(tc.profile, func(t *testing.T) {
 			file, cleanup, err := compileOverlay(root, tc.pkg, false, tc.profile)
@@ -78,6 +85,91 @@ func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 			}
 			tc.assert(t, overlay.Replace, filepath.Join(root, tc.pkg))
 		})
+	}
+}
+
+func verifyAPICanonicalJSONOverlay(t *testing.T, replace map[string]string, dir string) {
+	t.Helper()
+	for _, fixture := range []struct{ file, retained string }{
+		{"binary_bench_test.go", "func BenchmarkCanonicalJSONTyped("},
+		{"request_scalar_bench_test.go", "func benchmarkStringArray("},
+	} {
+		path := filepath.Join(dir, fixture.file)
+		original, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		projected, err := os.ReadFile(replace[path])
+		if err != nil {
+			t.Fatal(err)
+		}
+		offset := bytes.Index(original, []byte(fixture.retained))
+		if offset < 0 || bytes.Index(projected, []byte(fixture.retained)) != offset || len(projected) != len(original) {
+			t.Fatalf("canonical projection changed position in %s", fixture.file)
+		}
+	}
+	for _, name := range []string{"local_input_bench_test.go", "identity_reader_bench_test.go"} {
+		if replacement, present := replace[filepath.Join(dir, name)]; !present || replacement != "" {
+			t.Fatalf("canonical binary retained unrelated file %s", name)
+		}
+	}
+}
+
+func TestAPICanonicalJSONOverlayRejectsChangedFixtureBoundaries(t *testing.T) {
+	root := newBenchmarkRunTree(t)
+	pkg := filepath.Join(root, benchlayout.APIPackage)
+	workspace := filepath.Join(root, ".tmp")
+	if _, err := writeAPICanonicalJSONOverlay(pkg, workspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing API package error = %v", err)
+	}
+	if err := os.MkdirAll(pkg, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeAPICanonicalJSONOverlay(pkg, workspace); err == nil || !strings.Contains(err.Error(), "missing API CanonicalJSON fixture") {
+		t.Fatalf("absent CanonicalJSON fixtures returned %v", err)
+	}
+	for _, tc := range []struct{ file, source, expected string }{
+		{"unrelated_test.go", "package api\nfunc init() {}", "cannot isolate test package setup"},
+		{"unrelated_test.go", "package api\nfunc BenchmarkCanonicalJSONInteger() {}", "unexpected CanonicalJSON benchmark"},
+		{"binary_bench_test.go", "package api\nfunc BenchmarkCanonicalJSONTyped() {}", "fixture declarations changed"},
+		{"binary_bench_test.go", "package api\nfunc BenchmarkCanonicalJSONTyped() {}\nfunc BenchmarkCanonicalJSONTyped() {}", "duplicate CanonicalJSON declaration"},
+	} {
+		t.Run(tc.expected, func(t *testing.T) {
+			writeBenchmarkRunFixture(t, root, filepath.Join(benchlayout.APIPackage, tc.file), tc.source)
+			if _, err := writeAPICanonicalJSONOverlay(pkg, workspace); err == nil || !strings.Contains(err.Error(), tc.expected) {
+				t.Fatalf("fixture error = %v, want %s", err, tc.expected)
+			}
+			if err := os.Remove(filepath.Join(pkg, tc.file)); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	file := filepath.Join(pkg, "unrelated_test.go")
+	if err := os.Symlink("outside_test.go", file); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeAPICanonicalJSONOverlay(pkg, workspace); err == nil || !strings.Contains(err.Error(), "fixture must be a regular file") {
+		t.Fatalf("symlink fixture returned %v", err)
+	}
+}
+
+func TestAPICanonicalHelperProjectionKeepsTheHelperPosition(t *testing.T) {
+	root := newBenchmarkRunTree(t)
+	name := filepath.Join(benchlayout.APIPackage, "request_scalar_bench_test.go")
+	source := "package api\nimport \"bytes\"\nfunc benchmarkStringArray() {}\n"
+	writeBenchmarkRunFixture(t, root, name, source)
+	output, err := projectAPICanonicalFixture(filepath.Join(root, name), filepath.Join(root, ".tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offset := strings.Index(source, "func benchmarkStringArray")
+	if strings.Contains(string(projection), "\"bytes\"") || len(projection) != len(source) ||
+		string(projection[offset:]) != source[offset:] {
+		t.Fatalf("incorrect helper projection %q", projection)
 	}
 }
 
