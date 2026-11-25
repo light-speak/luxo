@@ -118,6 +118,8 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-codegen-integer-literals-*", writeCodegenLiteralOverlay)
 	case benchlayout.CodegenReceiverProfile:
 		return packageTestOverlay(root, packagePath, "bench-codegen-global-receiver-*", writeCodegenReceiverOverlay)
+	case benchlayout.CodegenMigrationStateProfile:
+		return packageTestOverlay(root, packagePath, "bench-codegen-migration-state-*", writeCodegenMigrationStateOverlay)
 	default:
 		return performanceOverlay(root, packagePath, baseline)
 	}

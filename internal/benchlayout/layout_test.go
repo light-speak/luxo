@@ -132,25 +132,31 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 }
 
 func TestCodegenProfilesRequirePackageAndExactRoots(t *testing.T) {
+	const migration, migrationProfile = "BenchmarkMigrationStateValidation", "codegen-migration-state"
 	for _, tc := range []struct{ pkg, name, want string }{
 		{CodegenPackage, CodegenLiteralBenchmark, CodegenLiteralProfile},
 		{CodegenPackage, CodegenLiteralBenchmark + "/duration_plain-2", CodegenLiteralProfile},
 		{CodegenPackage, CodegenReceiverBenchmark, CodegenReceiverProfile},
 		{CodegenPackage, CodegenReceiverBenchmark + "/用户-2", CodegenReceiverProfile},
 		{CodegenPackage, CodegenReceiverBenchmark + "Sibling-2", DefaultProfile},
+		{CodegenPackage, migration, migrationProfile},
+		{CodegenPackage, migration + "/empty/validate-2", migrationProfile},
+		{CodegenPackage, migration + "Sibling-2", DefaultProfile},
 		{CodegenPackage, "BenchmarkGenerateNumericLiteralBindings/plain-2", DefaultProfile},
 		{CodecPackage, CodegenLiteralBenchmark, DefaultProfile},
 		{CodecPackage, CodegenReceiverBenchmark, DefaultProfile},
+		{CodecPackage, migration, DefaultProfile},
 	} {
 		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
 			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
 		}
 	}
 	profiles := IsolationProfiles(CodegenPackage)
-	if len(profiles) != 2 || profiles[0] != (IsolationSpec{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"}) ||
+	if len(profiles) != 3 || profiles[0] != (IsolationSpec{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"}) ||
 		profiles[1] != (IsolationSpec{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"}) ||
+		profiles[2] != (IsolationSpec{migrationProfile, "^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$"}) ||
 		ValidPerformanceProfile(CodecPackage, CodegenLiteralProfile) ||
-		ValidPerformanceProfile(CodecPackage, CodegenReceiverProfile) {
+		ValidPerformanceProfile(CodecPackage, CodegenReceiverProfile) || ValidPerformanceProfile(CodecPackage, migrationProfile) {
 		t.Fatalf("unexpected codegen isolation: %v", profiles)
 	}
 }

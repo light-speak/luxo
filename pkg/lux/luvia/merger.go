@@ -387,7 +387,11 @@ func appendMergedColumnar(dst, prefix, primary []byte, extends []ExtendColumnRes
 		return append(append(dst, prefix...), primary...)
 	}
 
-	totalSize := len(prefix) + len(primary)
+	primaryEnd := len(primary)
+	if primaryEnd > 0 && primary[primaryEnd-1] == 0 {
+		primaryEnd--
+	}
+	totalSize := len(prefix) + primaryEnd + 1
 	for _, ext := range extends {
 		if len(ext.Blobs) == 0 {
 			continue
@@ -397,18 +401,10 @@ func appendMergedColumnar(dst, prefix, primary []byte, extends []ExtendColumnRes
 			totalSize += len(blob) // Each blob already contains its varint length.
 		}
 	}
-	if len(primary) == 0 || primary[len(primary)-1] != 0 {
-		totalSize++
-	}
 	result := slices.Grow(dst, totalSize)
 	result = append(result, prefix...)
-
 	// Copy primary WITHOUT end marker
-	if len(primary) > 0 && primary[len(primary)-1] == 0x00 {
-		result = append(result, primary[:len(primary)-1]...)
-	} else {
-		result = append(result, primary...)
-	}
+	result = append(result, primary[:primaryEnd]...)
 
 	// Append extend columns
 	for _, ext := range extends {
