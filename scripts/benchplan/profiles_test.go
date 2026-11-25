@@ -142,6 +142,93 @@ func TestAPIAndLuviaIsolatedInventoriesMatchOnlyRoutedRoots(t *testing.T) {
 	}
 }
 
+const (
+	mergeDestinationPackage = "pkg/lux/luvia"
+	mergeDestinationProfile = "luvia-merge-destination"
+	mergeDestinationRoot    = "BenchmarkMergeDestination"
+	mergeDestinationControl = "BenchmarkGatewayStandardStartStop"
+	mergeDestinationTarget  = "columnar=true/rows=1/direct=true"
+)
+
+func TestMergeDestinationProfileKeepsExactlySixLeaves(t *testing.T) {
+	root := benchmarkTempDir(t)
+	ordinary, isolated := root+"/ordinary.log", root+"/isolated.log"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	rows := []string{
+		"columnar=false/rows=1/direct=false",
+		"columnar=false/rows=1/direct=true",
+		"columnar=true/rows=1/direct=false",
+		mergeDestinationTarget,
+		"columnar=true/rows=128/direct=false",
+		"columnar=true/rows=128/direct=true",
+	}
+	measure := func(leaves []string) string {
+		var output strings.Builder
+		for _, leaf := range leaves {
+			output.WriteString(mergeDestinationRoot + "/" + leaf + measurement)
+		}
+		return output.String()
+	}
+	full, shortened := measure(rows), measure(rows[:5])
+	extra := measure([]string{"columnar=false/rows=128/direct=true"})
+	const control = mergeDestinationControl + measurement
+	args := []string{"--verify-profile-inventory", mergeDestinationPackage, mergeDestinationProfile, ordinary, isolated}
+	for _, tc := range []struct {
+		name, ordinary, isolated string
+		valid                    bool
+	}{
+		{"exact", full, full, true},
+		{"missing on both", shortened, shortened, false},
+		{"changed on both", shortened + extra, shortened + extra, false},
+		{"extra on both", full + extra, full + extra, false},
+		{"default benchmark leaks", full, full + control, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+control+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			if err := run(args, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+}
+
+func TestMergeDestinationPrimaryAndConfirmationStayExclusive(t *testing.T) {
+	const pkg = mergeDestinationPackage
+	const root = mergeDestinationRoot
+	const control = mergeDestinationControl
+	primary := formatShard(benchShard{Groups: []benchGroup{{Package: pkg, Name: root}, {Package: pkg, Name: control}}})
+	keys := []sampleKey{{pkg, root + "/" + mergeDestinationTarget + "-2"}, {pkg, control + "-2"}}
+	confirmation := formatConfirmationBatch(keys)
+	data, err := json.Marshal(expectedSamples{Base: keys, Head: keys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := benchmarkTempDir(t)
+	expected, batch := dir+"/expected.json", dir+"/batch.tsv"
+	writeFixture(t, expected, string(data))
+	for _, tc := range []struct{ phase, batch, selected, sibling string }{
+		{"primary", primary, "^(" + root + ")$", "^(" + control + ")$"},
+		{"confirmation", confirmation, "^" + root + "$/^columnar=true$/^rows=1$/^direct=true$", "^" + control + "$"},
+	} {
+		t.Run(tc.phase, func(t *testing.T) {
+			if !strings.Contains(tc.batch, pkg+"\t"+mergeDestinationProfile+"\t"+tc.selected+"\n") ||
+				!strings.Contains(tc.batch, pkg+"\tdefault\t"+tc.sibling+"\n") {
+				t.Fatalf("wrong profile routing:\n%s", tc.batch)
+			}
+			args := []string{"--verify-profile-batch", tc.phase, expected, batch}
+			writeFixture(t, batch, tc.batch)
+			if err := run(args, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			writeFixture(t, batch, strings.Replace(tc.batch, "\t"+mergeDestinationProfile+"\t", "\tdefault\t", 1))
+			if err := run(args, io.Discard); err == nil {
+				t.Fatal("accepted the isolated workload in the default profile")
+			}
+		})
+	}
+}
+
 func TestCodegenLiteralProfileKeepsExactlyFourLeaves(t *testing.T) {
 	const pkg = "pkg/codegen"
 	const profile = "codegen-integer-literals"

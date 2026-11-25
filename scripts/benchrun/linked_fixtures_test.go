@@ -17,7 +17,8 @@ func TestIsolationProfileCommand(t *testing.T) {
 	for _, tc := range []struct{ pkg, want string }{
 		{"pkg/lux/api", "api-non-identity\t.\n"},
 		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n" +
-			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n"},
+			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n" +
+			"luvia-merge-destination\t^BenchmarkMergeDestination$\n"},
 		{"pkg/codegen", "codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n" +
 			"codegen-global-receiver\t^BenchmarkGlobalReceiverName$\n" +
 			"codegen-migration-state\t^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$\n"},
@@ -51,6 +52,7 @@ func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 		{benchlayout.LuxPackage, benchlayout.LuxShortPathProfile, verifyLuxShortPathOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaPrimaryTraceProfile, verifyLuviaOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaGatewayIdentityProfile, verifyLuviaGatewayIdentityOverlay},
+		{benchlayout.LuviaPackage, "luvia-merge-destination", verifyLuviaMergeDestinationOverlay},
 	} {
 		t.Run(tc.profile, func(t *testing.T) {
 			file, cleanup, err := compileOverlay(root, tc.pkg, false, tc.profile)
@@ -72,6 +74,63 @@ func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 			}
 			tc.assert(t, overlay.Replace, filepath.Join(root, tc.pkg))
 		})
+	}
+}
+
+func verifyLuviaMergeDestinationOverlay(t *testing.T, replace map[string]string, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	omitted := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		replacement, present := replace[filepath.Join(dir, name)]
+		switch name {
+		case "merger_bench_test.go", "primary_keys_bench_test.go", "primary_keys_baseline_test.go":
+			if present {
+				t.Fatalf("overlay changed retained fixture %s", name)
+			}
+			continue
+		}
+		omit := strings.HasSuffix(name, "_test.go")
+		if present != omit || replacement != "" {
+			t.Fatalf("overlay entry for %s = %q, %v; omit=%v", name, replacement, present, omit)
+		}
+		if omit {
+			omitted++
+		}
+	}
+	if len(replace) != omitted {
+		t.Fatalf("overlay contains an external path: %v", replace)
+	}
+}
+
+func TestMergeDestinationOverlayRejectsMissingFixturesAndPackageSetup(t *testing.T) {
+	root := newBenchmarkRunTree(t)
+	pkg := filepath.Join(root, benchlayout.LuviaPackage)
+	workspace := filepath.Join(root, ".tmp")
+	if _, err := writeLuviaMergeDestinationOverlay(pkg, workspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing Luvia package error = %v", err)
+	}
+	writeBenchmarkRunFixture(t, root, filepath.Join(benchlayout.LuviaPackage, "merger_bench_test.go"), "package luvia")
+	if _, err := writeLuviaMergeDestinationOverlay(pkg, workspace); err == nil || !strings.Contains(err.Error(), "missing Luvia merge destination test fixture") {
+		t.Fatalf("missing required fixture error = %v", err)
+	}
+	unrelated := filepath.Join(benchlayout.LuviaPackage, "unrelated_test.go")
+	writeBenchmarkRunFixture(t, root, unrelated, "package luvia\nfunc init() {}")
+	if _, err := writeLuviaMergeDestinationOverlay(pkg, workspace); err == nil || !strings.Contains(err.Error(), "cannot isolate test package setup") {
+		t.Fatalf("removing fixture with package setup returned %v", err)
+	}
+	if err := os.Remove(filepath.Join(root, unrelated)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("merger_bench_test.go", filepath.Join(root, unrelated)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeLuviaMergeDestinationOverlay(pkg, workspace); err == nil || !strings.Contains(err.Error(), "fixture must be a regular file") {
+		t.Fatalf("removing symlink fixture returned %v", err)
 	}
 }
 

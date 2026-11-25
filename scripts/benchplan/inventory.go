@@ -134,6 +134,14 @@ func verifyProfileInventory(args []string) error {
 			"authenticated/after", "typed-nil/before", "typed-nil/after") {
 			return errors.New("Luvia gateway identity profile requires the six verified identity leaves")
 		}
+	case benchlayout.LuviaMergeDestinationProfile:
+		const root = benchlayout.LuviaMergeDestinationBenchmark
+		if !verifiedBenchmarkLeaves(isolated[root], root,
+			"columnar=false/rows=1/direct=false", "columnar=false/rows=1/direct=true",
+			"columnar=true/rows=1/direct=false", "columnar=true/rows=1/direct=true",
+			"columnar=true/rows=128/direct=false", "columnar=true/rows=128/direct=true") {
+			return errors.New("Luvia merge destination profile requires the six verified merge leaves")
+		}
 	}
 	return nil
 }
