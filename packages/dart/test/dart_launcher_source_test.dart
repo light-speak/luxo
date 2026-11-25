@@ -10,9 +10,11 @@ const _launcherTimeout = Timeout(Duration(seconds: 65));
 const _literalEntry = 'entry-%EF%BB%BF-中文.g.dart';
 const _ordinaryEntry = 'choice.g.dart';
 const _markedEntry = '\uFEFFchoice.g.dart';
+const _unicodeNoMain = 'no_main_中文.g.dart';
 const _compilerFailures = {
   'no_main.g.dart': 'int selected() => 1;',
-  'syntax_error.g.dart': 'void main() { final int value = ; }',
+  _unicodeNoMain: 'int selected() => 1;',
+  'syntax_error.g.dart': 'void main() { final int value = ; } // 中文',
   'missing_import.g.dart': "import 'missing.dart'; void main() {}",
 };
 const _entrySource = r'''
@@ -33,18 +35,35 @@ void main() {
             'lib/${source.key}': source.value,
           });
           addTearDown(fixture.close);
-          final launched = await Process.run(Platform.resolvedExecutable, [
-            File('bin/build.dart').absolute.path,
-            '--project',
-            fixture.root.path,
-            '--entry',
-            'lib/${source.key}',
-            if (aot) ...['--compile', 'exe', '--output', _output],
-          ]);
-          final exit = !aot && source.key == 'no_main.g.dart' ? 253 : 254;
+          final launched = await Process.run(
+            Platform.resolvedExecutable,
+            [
+              File('bin/build.dart').absolute.path,
+              '--project',
+              fixture.root.path,
+              '--entry',
+              'lib/${Uri.encodeComponent(source.key)}',
+              if (aot) ...['--compile', 'exe', '--output', _output],
+            ],
+            stdoutEncoding: utf8,
+            stderrEncoding: utf8,
+          );
+          final missingMain =
+              source.key == 'no_main.g.dart' || source.key == _unicodeNoMain;
+          final exit = !aot && missingMain ? 253 : 254;
           expect(launched.exitCode, exit, reason: _diagnostics(launched));
           expect(launched.stdout, isEmpty);
           expect(launched.stderr, contains('Error:'));
+          if (source.key == _unicodeNoMain) {
+            final renderedName = Uri.encodeComponent(_unicodeNoMain);
+            expect(
+              launched.stderr,
+              contains("$renderedName: Error: No 'main' method found."),
+            );
+          }
+          if (source.key == 'syntax_error.g.dart') {
+            expect(launched.stderr, contains('// 中文'));
+          }
           expect(await File('${fixture.root.path}/$_output').exists(), isFalse);
           await _expectSnapshotClean(fixture);
         },

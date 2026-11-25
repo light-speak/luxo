@@ -57,7 +57,8 @@ Future<File> compileVerifiedDartProgram(
     entry.parent,
     ProcessStartMode.normal,
     (child) async {
-      final output = child.stdout.transform(systemEncoding.decoder).join();
+      // The frontend writes UTF-8 protocol lines and diagnostics.
+      final output = child.stdout.transform(utf8.decoder).join();
       final errors = stderr.addStream(child.stderr);
       final status = await child.exitCode;
       await errors;
@@ -91,7 +92,8 @@ Never _throwCompilerExit(
   }
   // The VM reports an absent main as 253. The batch frontend reports the
   // same condition as 254, with a single primary diagnostic and its hint.
-  final entryName = entry.uri.pathSegments.last;
+  // The frontend renders this name as an escaped relative URI.
+  final entryName = entry.uri.toString().split('/').last;
   if (!aot &&
       status == 254 &&
       framed &&
