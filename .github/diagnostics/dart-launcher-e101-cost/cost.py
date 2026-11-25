@@ -21,7 +21,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 HERE = Path(__file__).resolve().parent
 BASE = "e101cf7699acb358305fd373934e8813a98087bd"
-PREVIOUS_DIAGNOSTIC = "ce653435a8f8592d663673f73cac8cd5b8dcac56"
+PREVIOUS_DIAGNOSTIC = "9867b149940595ab7b2aa48267c6908e46bb40fb"
 PRODUCT_HEAD = "7dffd0b3d937c429b7e8d10b893a6701a5f21803"
 TREES = {
     "A": "377fdb5bbe6815a45930c53e10797f08cf07c917",
@@ -115,14 +115,12 @@ def stage_objects(repo, work):
     assert git(repo, "rev-parse", f"{BASE}^{{tree}}").decode().strip() == TREES["A"]
     if os.environ.get("GITHUB_ACTIONS") == "true":
         assert git(repo, "rev-parse", "HEAD").decode().strip() == os.environ["GITHUB_SHA"]
-        parent = git(repo, "rev-parse", "HEAD^").decode().strip()
+        assert git(repo, "rev-parse", "HEAD^").decode().strip() == PREVIOUS_DIAGNOSTIC
+        assert git(repo, "rev-parse", "HEAD^^^").decode().strip() == BASE
         relative = HERE.relative_to(repo)
-        if parent != BASE:
-            assert parent == PREVIOUS_DIAGNOSTIC and git(repo, "rev-parse", "HEAD^^").decode().strip() == BASE
-            delta = git(repo, "diff", "--name-status", parent, "HEAD", "--").decode().splitlines()
-            expected_update = {f"M\t{relative / name}" for name in ("cost.py", "product.patch.b64")}
-            expected_update.add("M\t.github/workflows/dart-launcher-e101-cost.yml")
-            assert set(delta) == expected_update, delta
+        delta = git(repo, "diff", "--name-status", PREVIOUS_DIAGNOSTIC, "HEAD", "--").decode().splitlines()
+        expected_update = {f"M\t{relative / 'cost.py'}", "M\t.github/workflows/dart-launcher-e101-cost.yml"}
+        assert set(delta) == expected_update, delta
         expected = {str(relative / name) for name in ("cost.py", "product.patch.b64", "pubspec.lock")}
         expected.add(".github/workflows/dart-launcher-e101-cost.yml")
         changed = git(repo, "diff", "--name-status", BASE, "HEAD", "--").decode().splitlines()
@@ -175,9 +173,58 @@ def dependency_profile(package, cache):
     return sorted(profile), graph
 
 
+def first_difference(left, right, path):
+    if left == right:
+        return None
+    if isinstance(left, dict) and isinstance(right, dict):
+        for key in sorted(left.keys() | right.keys()):
+            field = [*path, key]
+            if key not in left or key not in right:
+                return {"path": field, "present": [key in left, key in right]}
+            difference = first_difference(left[key], right[key], field)
+            if difference is not None:
+                return difference
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        for index, (old, new) in enumerate(zip(left, right)):
+            difference = first_difference(old, new, [*path, index])
+            if difference is not None:
+                return difference
+        return {"path": path, "lengths": [len(left), len(right)]}
+    return {"path": path, "values": [left, right]}
+
+
+def compare_resolution(left_name, right_name, profiles):
+    left, right = profiles[left_name], profiles[right_name]
+    differences, digests = {}, {}
+    for index, section in enumerate(("packageConfig", "packageGraph")):
+        old, new = left[index], right[index]
+        difference = first_difference(old, new, [])
+        if difference is not None:
+            differences[section] = difference
+        digests[section] = [hashlib.sha256(json.dumps(item, sort_keys=True).encode()).hexdigest()
+                            for item in (old, new)]
+    emit({"stage": "setup", "phase": "resolution-compare", "arms": [left_name, right_name],
+          "state": "different" if differences else "equal", "differences": differences, "sha256": digests})
+    return left == right
+
+
+def locked_pub(sdk, package, env, name, *, offline):
+    command = [sdk / "bin/dart", "pub", "get", "--enforce-lockfile"]
+    if offline:
+        command.append("--offline")
+    phase = f"pub-get:{name}:{'offline' if offline else 'locked-download'}"
+    emit({"stage": "setup", "phase": phase, "state": "started"})
+    result = run_checked(command, package, env, timeout=300, phase=phase)
+    emit({"stage": "setup", "phase": phase, "state": "exited", "exit": result.returncode,
+          "pid": result.pid, "group": result.group_check, "reaped": result.reaped})
+    assert result.returncode == 0, (name, result.stdout, result.stderr)
+    assert sha(package / "pubspec.lock") == LOCK_SHA
+    return dependency_profile(package, Path(env["PUB_CACHE"]).resolve(strict=True))
+
+
 def prepare_sources(repo, work, sdk, env, online, verify_only):
     objects, lock = stage_objects(repo, work)
-    roots, stamps, profiles = {}, {}, {}
+    roots, stamps = {}, {}
     for arm, tree in TREES.items():
         scope = work / arm
         scope.mkdir()
@@ -187,23 +234,23 @@ def prepare_sources(repo, work, sdk, env, online, verify_only):
         assert sha(package / "pubspec.yaml") == PUBSPEC_SHA
         (package / "pubspec.lock").write_bytes(lock)
         roots[arm] = package
-        if verify_only:
-            continue
-        command = [sdk / "bin/dart", "pub", "get", "--enforce-lockfile"]
-        if not (online and arm == "A"):
-            command.append("--offline")
-        phase = f"pub-get:{arm}:{'offline' if '--offline' in command else 'locked-download'}"
-        emit({"stage": "setup", "phase": phase, "state": "started"})
-        result = run_checked(command, package, env, timeout=300, phase=phase)
-        emit({"stage": "setup", "phase": phase, "state": "exited", "exit": result.returncode,
-              "pid": result.pid, "group": result.group_check, "reaped": result.reaped})
-        assert result.returncode == 0, (arm, result.stdout, result.stderr)
-        assert sha(package / "pubspec.lock") == LOCK_SHA
-        profiles[arm] = dependency_profile(package, Path(env["PUB_CACHE"]).resolve(strict=True))
+    if verify_only:
+        return roots, stamps
+    profiles = {}
+    if online:
+        seed = work / "seed"
+        seed.mkdir()
+        (seed / "pubspec.yaml").write_bytes((roots["A"] / "pubspec.yaml").read_bytes())
+        (seed / "pubspec.lock").write_bytes(lock)
+        profiles["seed"] = locked_pub(sdk, seed, env, "seed", offline=False)
+    for arm, package in roots.items():
+        assert not (package / ".dart_tool").exists(), arm
+        profiles[arm] = locked_pub(sdk, package, env, arm, offline=True)
         stamps[arm] = {name: sha(package / name) for name in
                        ("pubspec.lock", ".dart_tool/package_config.json", ".dart_tool/package_graph.json")}
-    if not verify_only:
-        assert profiles["A"] == profiles["B"], "the exact locked resolution differs between arms"
+    if online:
+        compare_resolution("seed", "A", profiles)
+    assert compare_resolution("A", "B", profiles), "the exact locked resolution differs between offline arms"
     return roots, stamps
 
 
