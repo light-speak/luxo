@@ -149,8 +149,8 @@ func(backend *policyFailureCache)assertInitialFill(t *testing.T){
  t.Helper()
  backend.mu.Lock()
  defer backend.mu.Unlock()
- if backend.writes!=1||backend.setError!=nil||backend.getError!=nil{
-  t.Fatalf("Redis fixture was not healthy before fault: writes=%d get=%v set=%v",backend.writes,backend.getError,backend.setError)
+ if backend.writes!=1||backend.setError!=nil||backend.getError!=nil||backend.initialTTL!=time.Minute{
+  t.Fatalf("Redis fixture was not healthy before fault: writes=%d get=%v set=%v ttl=%v",backend.writes,backend.getError,backend.setError,backend.initialTTL)
  }
 }
 
@@ -276,7 +276,7 @@ func stallPolicyRedis(proxy *policyRedisProxy)func(){
  })}
 }
 
-func storedPolicyValue(t *testing.T,backend *policyFailureCache)[]byte{
+func storedPolicySnapshot(t *testing.T,backend *policyFailureCache)([]byte,time.Time){
  t.Helper()
  backend.mu.Lock()
  key:=t.Name()+":"+backend.initialKey
@@ -285,9 +285,10 @@ func storedPolicyValue(t *testing.T,backend *policyFailureCache)[]byte{
  defer probe.Close()
  value,err:=probe.Get(t.Context(),key).Bytes()
  if err!=nil{t.Fatalf("direct Redis read: %v",err)}
- ttl,err:=probe.PTTL(t.Context(),key).Result()
- if err!=nil||ttl<=0||ttl>time.Minute{t.Fatalf("direct Redis ttl=%v error=%v",ttl,err)}
- return value
+ // Compare Redis's stored deadline, which does not move with its wall clock.
+ expiry,err:=probe.PExpireTime(t.Context(),key).Result()
+ if err!=nil||expiry<=0{t.Fatalf("direct Redis expiry=%v error=%v",expiry,err)}
+ return value,time.UnixMilli(int64(expiry/time.Millisecond))
 }
 
 func TestGeneratedRedisReadTimeoutDoesNotMeanEntryLoss(t *testing.T){
@@ -309,7 +310,7 @@ func verifyPolicyRedisReadTimeout(t *testing.T,http2,binary bool){
  token:=policyHTTPToken(t,cfg,9007199254740993)
  callPolicyHTTP(t,endpoint,router,token,42,binary,http2)
  backend.assertInitialFill(t)
- original:=storedPolicyValue(t,backend)
+ original,originalExpiry:=storedPolicySnapshot(t,backend)
  resume:=stallPolicyRedis(proxy)
  defer resume()
  callPolicyHTTP(t,endpoint,router,token,42,binary,http2)
@@ -326,7 +327,9 @@ func verifyPolicyRedisReadTimeout(t *testing.T,http2,binary bool){
   t.Fatalf("stalled Redis was not a timed-out read/refill: %s",backend.diagnostics())
  }
  if got:=resolver.calls.Load();got!=2{t.Fatalf("timed-out cache did not execute origin once: %d",got)}
- if !bytes.Equal(storedPolicyValue(t,backend),original){t.Fatal("timed-out read/refill changed the stored entry")}
+ stored,expiry:=storedPolicySnapshot(t,backend)
+ if !bytes.Equal(stored,original){t.Fatal("timed-out read/refill changed the stored entry")}
+ if !expiry.Equal(originalExpiry){t.Fatalf("timed-out read/refill changed the stored expiry: %v to %v",originalExpiry,expiry)}
  t.Logf("entry preserved despite origin fallback: %s",backend.diagnostics())
  resume()
  callPolicyHTTP(t,endpoint,router,token,42,binary,http2)
