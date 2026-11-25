@@ -6,6 +6,7 @@ import 'package:analyzer/dart/analysis/results.dart';
 import 'package:analyzer/diagnostic/diagnostic.dart';
 
 import 'artifact_publish.dart';
+import 'native_uri.dart';
 import 'select_rewrite.dart';
 import 'selection_imports.dart';
 
@@ -46,7 +47,7 @@ class SelectionBuild {
       root = Directory(path.substring(0, path.length - 1));
     }
     validateProjectRelativePath(clientPath);
-    final temp = Directory.fromUri(root.uri.resolve('.tmp'));
+    final temp = Directory.fromUri(nativeFileUri(root.uri.resolve('.tmp')));
     await temp.create(recursive: true);
     if (!await _resolvesToOwnPath(temp)) {
       throw StateError('The build directory must not be a symlink');
@@ -187,12 +188,13 @@ class SelectionBuild {
 
   Future<File> _target(String relative) async {
     validateProjectRelativePath(relative);
-    final segments = Uri.parse(relative).pathSegments;
-    var current = directory.uri;
+    final segments = nativeFileUri(Uri.parse(relative)).pathSegments;
+    var current = nativeFileUri(directory.uri);
     for (var i = 0; i < segments.length; i++) {
-      current = current.resolveUri(
-        Uri(pathSegments: [segments[i], if (i < segments.length - 1) '']),
+      final part = Uri(
+        pathSegments: [segments[i], if (i < segments.length - 1) ''],
       );
+      current = current.resolveUri(nativeFileUri(part));
       if (await FileSystemEntity.type(
             current.toFilePath(),
             followLinks: false,
@@ -293,7 +295,9 @@ Future<List<File>> _sourceFiles(Directory root) async {
   final files = <File>[];
   Future<void> scan(Directory directory) async {
     await for (final entry in directory.list(followLinks: false)) {
-      final name = entry.uri.pathSegments.where((p) => p.isNotEmpty).last;
+      final name = nativeFileUri(entry.uri).pathSegments
+          .where((p) => p.isNotEmpty)
+          .last;
       if (_excludedDirectories.contains(name) ||
           _isFlutterGenerated(root.uri.relativize(entry.uri)))
         continue;
