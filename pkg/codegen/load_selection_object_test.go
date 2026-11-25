@@ -307,6 +307,20 @@ func TestSelectedQueryObjectSourcesStayIndependent(t *testing.T) {
 	}{
 		{"copy", `val box = Box { rows: Node.select().all() } val copy = box box.rows = Node.select().all() val names = copy.rows.map { it.name } return box.rows`, loadProjection{columns: [][]string{{"name"}}}, loadProjection{client: true}},
 		{"await_tuple", `val (left, right) = await { Node.select().all() Node.select().all() } val names = left.map { it.name } return right`, loadProjection{columns: [][]string{{"name"}}}, loadProjection{client: true}},
+		{"await_local_scope", `val rows = Node.select().all()
+val result = await {
+ val rows = Node.select().all()
+ rows
+}
+val names = rows.map { it.name }
+return result`, loadProjection{columns: [][]string{{"name"}}}, loadProjection{client: true}},
+		{"await_local_scalar_aliases", `val rows = Node.select().all()
+val (_, result) = await {
+ val rows = Node.select().all()
+ rows
+}
+val names = rows.map { it.name }
+return result`, loadProjection{columns: [][]string{{"name"}}}, loadProjection{client: true}},
 		{"await_tuple_outer_scope", `val rows = Node.select().all() if flag { val (rows, old) = await { Node.select().all() rows } return old } return rows`, loadProjection{client: true}, loadProjection{}},
 		{"reference", `val holder = Holder { id: 1, rows: Node.select().all() } val alias = holder holder.rows = Node.select().all() val names = alias.rows.map { it.name } return holder.rows`, loadProjection{}, loadProjection{client: true, columns: [][]string{{"name"}}}},
 		{"nested_shared", `val outer = Outer { box: Box { rows: Node.select().all() } } val copy = outer copy.box.rows = Node.select().all() val names = outer.box.rows.map { it.name } return copy.box.rows`, loadProjection{}, loadProjection{client: true, columns: [][]string{{"name"}}}},
@@ -329,11 +343,46 @@ func TestSelectedQueryObjectSourcesStayIndependent(t *testing.T) {
 	}
 }
 
+func TestSelectedQueryAwaitConditionalScopeKeepsEffect(t *testing.T) {
+	projections := selectedObjectProjections(t, `val result = await {
+ if flag {
+  val rows = Node.select().all()
+  val names = rows.map { it.name }
+ }
+ Node.select().all()
+}
+return result`, "[Node]")
+	if len(projections) != 2 || projections[0].client || queryColumnArguments(projections[0].columns) != `, "name"` || !projections[1].client {
+		t.Fatalf("conditional await lost its local effect or result projection: %+v", projections)
+	}
+}
+
+func TestSelectedQueryAwaitLocalConditionalAssignment(t *testing.T) {
+	projections := selectedObjectProjections(t, `val result = await {
+ var local = Node.select().all()
+ if flag {
+  local = Node.select().all()
+ }
+ local
+}
+return result`, "[Node]")
+	if len(projections) != 2 || !projections[0].client || !projections[1].client {
+		t.Fatalf("conditional local assignment lost a returned query source: %+v", projections)
+	}
+}
+
 func TestSelectedQueryEmptyAwaitBindingShadowsOuterBinding(t *testing.T) {
 	outer := []loadOrigin{{demand: &loadDemand{model: "Node"}}}
-	for _, await := range []*ast.AwaitExpr{{}, {Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{}}}}} {
+	for _, await := range []*ast.AwaitExpr{
+		{},
+		{Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{}}}},
+		{Body: &ast.Block{Stmts: []ast.Stmt{&ast.ValStmt{Name: "local", Value: &ast.Literal{}}, nil, &ast.ExprStmt{}}}},
+	} {
 		analysis := loadDemandAnalysis{scopes: []map[string][]loadOrigin{{"row": outer}, {}}}
 		analysis.statement(&ast.ValStmt{Name: "row", Value: await}, false)
+		if _, exists := analysis.lookup("local"); exists || len(analysis.scopes) != 2 || analysis.controlDepth != 0 {
+			t.Fatal("partial await body leaked its scope")
+		}
 		if origins, exists := analysis.lookup("row"); !exists || len(origins) != 0 {
 			t.Fatal("invalid await binding inherited an outer query", origins)
 		}

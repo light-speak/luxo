@@ -133,8 +133,7 @@ api manualBox(): [Node] @paginate { val box = Box { rows: [Node { id: 8, name: "
 	suffix = strings.Replace(suffix, "body,err:=api.EncodeBinaryRequest(definition.ID,mask,params,", "body,err:=api.EncodeBinaryRequest(definition.ID,mask,objectPageWireParams(t,router,sample.name,params),", 1)
 	suffix += objectPageInputAssertions
 	test := `func TestObjectSourceSQL(t *testing.T){
- container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies());testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
- connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)};cfg,err:=pgxpool.ParseConfig(connection);if err!=nil{t.Fatal(err)};log:=&pageSQLLog{};cfg.ConnConfig.Tracer=log
+ connection:=pageFixtureConnection(t);cfg,err:=pgxpool.ParseConfig(connection);if err!=nil{t.Fatal(err)};log:=&pageSQLLog{};cfg.ConnConfig.Tracer=log
  pool,err:=pgxpool.NewWithConfig(t.Context(),cfg);if err!=nil{t.Fatal(err)};db:=pg.NewDBFromPool(pool);t.Cleanup(db.Close)
  if _,err:=pg.Exec(t.Context(),db,"CREATE TABLE nodes(id bigint PRIMARY KEY,name text NOT NULL);INSERT INTO nodes VALUES(1,'one'),(2,'two'),(3,'three')");err!=nil{t.Fatal(err)}
  router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)};if err:=RegisterHandlers(router,NewFromDB(db));err!=nil{t.Fatal(err)};if err:=router.Prepare();err!=nil{t.Fatal(err)}

@@ -679,12 +679,16 @@ func (c *compiler) compileDestructuredLocal(statement *ast.ValStmt) {
 // Each binding gets its own slot. Keep the initialized owner's type and any
 // query metadata, including when the new binding shadows an existing name.
 func (c *compiler) compileLocalAlias(name, source string) {
-	c.write("%s := %s", c.bindings.name(name), c.bindings.name(source))
+	c.writeLocalAlias(name, source)
 	if value, ok := c.vars[source]; ok {
 		c.vars[name] = value
 	} else {
 		delete(c.vars, name)
 	}
+}
+
+func (c *compiler) writeLocalAlias(name, source string) {
+	c.write("%s := %s", c.bindings.name(name), c.bindings.name(source))
 	if total := c.paginationTotals[source]; total != "" {
 		c.paginationTotals[name] = total
 	} else {
@@ -771,7 +775,7 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 			c.write("return nil")
 		} else {
 			expression := c.compileAssignedValue(s.Value, c.valueResult)
-			expression = c.pageBranchValue(s.Value, expression)
+			expression = c.pageBranchValue(c.pageResult, s.Value, expression)
 			if c.valueModel {
 				expression = c.modelReference(s.Value, expression)
 			}
@@ -1068,6 +1072,10 @@ func (c *compiler) compileThrow(s *ast.ThrowStmt) {
 
 // compileExprStmt: standalone expression (including elvis guard and ? propagation)
 func (c *compiler) compileExprStmt(s *ast.ExprStmt) {
+	if await, ok := s.Expr.(*ast.AwaitExpr); ok {
+		c.compileAwaitStmt(await)
+		return
+	}
 	if c.compileForEachStatement(s.Expr) {
 		return
 	}
@@ -1373,8 +1381,7 @@ func (c *compiler) compileBlockExpr(expr ast.Expr) string {
 	case *ast.AsyncExpr:
 		return c.compileAsync(e)
 	case *ast.AwaitExpr:
-		c.compileAwaitStmt(e)
-		return ""
+		return c.compileAwaitValue(e, nil)
 	case *ast.ForStmt:
 		return c.compileForExpr(e)
 	case *ast.YieldExpr:
@@ -2250,7 +2257,7 @@ func (c *compiler) compileBinary(e *ast.BinaryExpr) string {
 	if e.Op == "&&" || e.Op == "||" {
 		return c.compileLogicalBinary(e, left)
 	}
-	if expressionMayHaveEffects(e.Right) {
+	if left != "nil" && expressionMayHaveEffects(e.Right) {
 		leftType := c.goTypeForExpr(e.Left)
 		if c.models[e.Left.GetTypeTag()] != nil && !e.Left.IsListType() {
 			leftType = "*" + e.Left.GetTypeTag()
@@ -2259,6 +2266,9 @@ func (c *compiler) compileBinary(e *ast.BinaryExpr) string {
 	}
 	left = groupBinaryOperand(e.Left, left)
 	right := groupBinaryOperand(e.Right, c.compileBooleanValue(e.Right))
+	if left == "nil" && right == "nil" && (e.Op == "==" || e.Op == "!=") {
+		return strconv.FormatBool(e.Op == "==")
+	}
 	if expression, ok := c.compileScalarComparison(e, left, right); ok {
 		return expression
 	}
@@ -2287,7 +2297,7 @@ func (c *compiler) compileScalarComparison(expr *ast.BinaryExpr, left, right str
 		return expression, true
 	}
 	if expr.Left.GetTypeTag() != expr.Right.GetTypeTag() || expr.Left.IsListType() || expr.Right.IsListType() {
-		return "", false
+		return c.compileAwaitNullComparison(expr, left, right)
 	}
 	var goType, order string
 	switch expr.Left.GetTypeTag() {
@@ -3394,25 +3404,22 @@ func (c *compiler) compileWhenValue(e *ast.WhenExpr) string {
 	}
 	sub := c.branchValueCompiler(e)
 	sub.indent += "\t"
-	sub.pageResult = c.pageBranch(e)
 	subject := ""
 	if e.Subject != nil {
 		subject = sub.compileBooleanValue(e.Subject)
 	}
-	hasIsType := false
-	for _, branch := range e.Branches {
-		hasIsType = hasIsType || branch.IsType != ""
-	}
-	if hasIsType && e.Subject != nil {
-		subject += ".(type)"
-	}
-	if !hasIsType && (whenConditionsCall(e) || whenNeedsValueEquality(e)) {
-		if e.Subject != nil {
+	hasIsType := hasWhenTypeBranch(e)
+	nullSubject := isStaticWhenNullSubject(e.Subject)
+	if nullSubject || !hasIsType && (whenConditionsCall(e) || whenNeedsValueEquality(e)) {
+		if e.Subject != nil && !nullSubject {
 			sub.write("_subject := %s", subject)
 			subject = "_subject"
 		}
 		sub.compileWhenConditions(e, subject)
 	} else {
+		if hasIsType && e.Subject != nil {
+			subject += ".(type)"
+		}
 		sub.compileWhenSwitch(e, subject)
 	}
 	return c.finishWhenClosure(sub, e, e.Else == nil)

@@ -19,15 +19,19 @@ type awaitBatchAlias struct {
 func (b *awaitBatches) add(c *compiler, declaration *ast.ValStmt) {
 	level := b.level(declaration.Value, c.vars)
 	task := c.prepareAwaitDeclaration(declaration)
-	for len(b.groups) <= level {
-		b.groups = append(b.groups, nil)
-	}
-	b.groups[level] = append(b.groups[level], task)
+	b.enqueue(level, task)
 	if len(declaration.Names) != 0 {
 		b.addAliases(c, declaration.Names, level, task)
 		return
 	}
 	b.bind(c, declaration.Name, task.varName, level, task.valueType)
+}
+
+func (b *awaitBatches) enqueue(level int, task awaitTask) {
+	for len(b.groups) <= level {
+		b.groups = append(b.groups, nil)
+	}
+	b.groups[level] = append(b.groups[level], task)
 }
 
 func (b *awaitBatches) addAliases(c *compiler, names []string, level int, task awaitTask) {

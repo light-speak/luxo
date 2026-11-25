@@ -1,11 +1,13 @@
 package lux
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/light-speak/luxo/internal/sqllex"
 	"github.com/shopspring/decimal"
 )
 
@@ -456,38 +458,93 @@ type rawCond struct {
 	args []any
 }
 
-// RawCondition creates a condition from raw SQL with args.
-// Used for complex conditions like OR groups.
+// RawCondition creates a condition from trusted SQL with bound args.
+// PostgreSQL positional parameters use standard-conforming strings. Use E
+// string literals for backslash escapes.
 func RawCondition(sql string, args ...any) Condition {
 	return &rawCond{sql: sql, args: args}
 }
 
 func (c *rawCond) ToSQL(argOffset int) (string, []any) {
-	// Rewrite $1, $2, ... to $argOffset, $argOffset+1, ...
-	// Use a builder to avoid $1 matching inside $10
-	var b strings.Builder
-	i := 0
-	for i < len(c.sql) {
-		if c.sql[i] == '$' && i+1 < len(c.sql) && c.sql[i+1] >= '1' && c.sql[i+1] <= '9' {
-			// Parse the full number after $
-			j := i + 1
-			for j < len(c.sql) && c.sql[j] >= '0' && c.sql[j] <= '9' {
-				j++
-			}
-			n := 0
-			for _, ch := range c.sql[i+1 : j] {
-				n = n*10 + int(ch-'0')
-			}
-			b.WriteByte('$')
-			var tmp [20]byte
-			b.Write(strconv.AppendInt(tmp[:0], int64(argOffset+n-1), 10))
-			i = j
-		} else {
-			b.WriteByte(c.sql[i])
-			i++
-		}
+	if (argOffset <= 1 || strings.IndexByte(c.sql, '$') < 0) && !strings.Contains(c.sql, "--") {
+		return "(" + c.sql + ")", c.args
 	}
-	return "(" + b.String() + ")", c.args
+	var b strings.Builder
+	b.Grow(len(c.sql) + 2)
+	b.WriteByte('(')
+	appendRebasedSQL(&b, c.sql, argOffset)
+	b.WriteByte(')')
+	return b.String(), c.args
+}
+
+func appendRebasedSQL(b *strings.Builder, statement string, offset int) {
+	start := 0
+	for i := 0; i < len(statement); {
+		switch statement[i] {
+		case '"':
+			i = sqllex.SkipQuoted(statement, i+1, '"', false)
+			continue
+		case '$':
+			if end, parameter := rebasedParameter(statement, i, offset); end > i {
+				b.WriteString(statement[start : i+1])
+				var digits [20]byte
+				b.Write(strconv.AppendInt(digits[:0], parameter, 10))
+				start, i = end, end
+				continue
+			}
+			fallthrough
+		case '\'':
+			if end, literal := sqllex.SkipLiteral(statement, i); literal {
+				i = end
+				continue
+			}
+		case '-', '/':
+			if end, comment := sqllex.SkipComment(statement, i); comment {
+				if statement[i] == '-' && end == len(statement) && statement[end-1] != '\n' && statement[end-1] != '\r' {
+					b.WriteString(statement[start:])
+					b.WriteByte('\n')
+					return
+				}
+				i = end
+				continue
+			}
+		default:
+			if sqllex.IsIdentifierStart(statement[i]) {
+				i++
+				for i < len(statement) && sqllex.IsIdentifierByte(statement[i]) {
+					i++
+				}
+				continue
+			}
+		}
+		i++
+	}
+	b.WriteString(statement[start:])
+}
+
+func rebasedParameter(statement string, start, offset int) (int, int64) {
+	if offset <= 1 {
+		return start, 0
+	}
+	end := start + 1
+	var parameter int64
+	for end < len(statement) {
+		char := statement[end]
+		if char < '0' || char > '9' {
+			break
+		}
+		digit := int64(char - '0')
+		if parameter > math.MaxInt64/10 || parameter == math.MaxInt64/10 && digit > math.MaxInt64%10 {
+			return start, 0
+		}
+		parameter = parameter*10 + digit
+		end++
+	}
+	shift := int64(offset - 1)
+	if parameter == 0 || parameter > math.MaxInt64-shift {
+		return start, 0
+	}
+	return end, parameter + shift
 }
 
 // SearchBuilder generates search SQL for a specific database backend.

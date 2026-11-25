@@ -346,11 +346,22 @@ func (a *loadDemandAnalysis) bindAwaitResults(scope map[string][]loadOrigin, dec
 	results := inline[:0]
 	if await.Body != nil {
 		a.controlDepth++
+		parentDepth := len(a.scopes)
 		for _, statement := range await.Body.Stmts {
-			if value, ok := statement.(*ast.ExprStmt); ok && value.Expr != nil {
-				results = append(results, loadAwaitResult{value.Expr, a.expression(value.Expr)})
+			if value, ok := statement.(*ast.ExprStmt); ok {
+				if value.Expr != nil {
+					results = append(results, loadAwaitResult{value.Expr, a.expression(value.Expr)})
+				}
+				continue
 			}
+			// Only declarations bind names in this scope. A nested block
+			// owns its bindings, and an assignment searches existing scopes.
+			if _, local := statement.(*ast.ValStmt); local && len(a.scopes) == parentDepth {
+				a.scopes = append(a.scopes, make(map[string][]loadOrigin))
+			}
+			a.statement(statement, false)
 		}
+		a.scopes = a.scopes[:parentDepth]
 		a.controlDepth--
 	}
 	if len(results) == 1 {

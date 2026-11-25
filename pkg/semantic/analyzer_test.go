@@ -590,13 +590,109 @@ api test(): User {
 func TestAwaitEmptyBody(t *testing.T) {
 	result := analyze(t, `
 api test(): Int {
-  val x = await {
+  await {}
+  await {
     val y = 1
   }
   0
 }
 `)
 	expectNoErrors(t, result)
+}
+
+func TestAwaitStatementKeepsVoidTypeLazy(t *testing.T) {
+	analyzer := newAnalyzer()
+	expression := &ast.AwaitExpr{Body: &ast.Block{}}
+	analyzer.genericExprTypes = map[ast.Expr]*ResolvedType{expression: analyzer.types["Result"]}
+	analyzer.checkStmt(&ast.ExprStmt{Expr: expression}, analyzer.scope)
+	if analyzer.voidResult != nil || analyzer.awaitContext != awaitValueContext {
+		t.Fatal("discarded await acquired result metadata or changed the caller's context")
+	}
+	if expression.GetTypeTag() != "Void" || !expression.NoAwaitResult || analyzer.genericExprTypes[expression] != nil {
+		t.Fatal("discarded await did not replace the old expression annotation")
+	}
+	result := analyzer.checkExpr(expression, analyzer.scope)
+	if result == nil || result.Kind != TypeVoid || result != analyzer.voidResult {
+		t.Fatal("a value consumer must still obtain the private Void type")
+	}
+}
+
+func TestNestedAwaitStatementDoesNotChangeAwaitContext(t *testing.T) {
+	result := analyze(t, `fn probe(): Int {
+		await { if true { await {} } }
+		await {}
+		return 1
+	}`)
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected one nested await error, got %v", result.Errors)
+	}
+	expectError(t, result, "nested await is not allowed")
+}
+
+func TestAwaitValueBindingRequiresResultShape(t *testing.T) {
+	for _, sample := range []struct {
+		name, binding, diagnostic string
+	}{
+		{"empty", "val value = await {}", "void operation cannot initialize a variable"},
+		{"declarations only", "val value: Int = await { val local = 42 }", "void operation cannot initialize a variable"},
+		{"empty discard", "val _ = await {}", "void operation cannot initialize a variable"},
+		{"single target", "val value = await { 1 2 }", "multiple await results require a destructuring declaration"},
+		{"single discard", "val _ = await { 1 2 }", "multiple await results require a destructuring declaration"},
+		{"explicit mismatch", "val value: Int = await { 1 2 }", "variable 'value' expects 'Int'"},
+		{"one-slot destructuring", "val (value) = await { 1 2 }", "destructuring count mismatch"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			result := analyze(t, "api test(): Int { "+sample.binding+" return 0 }")
+			expectError(t, result, sample.diagnostic)
+		})
+	}
+}
+
+func TestAwaitWithoutResultCannotSupplyValue(t *testing.T) {
+	for _, sample := range []struct {
+		name, source, diagnostic string
+	}{
+		{"implicit function result", `fn bad(): Int { await {} }`, "return expects 'Int', got 'Void'"},
+		{"implicit API result", `api bad(): Int { await { val local = 1 } }`, "return expects 'Int', got 'Void'"},
+		{"implicit business Void result", `type Void { id: Int } fn bad(): Void { await {} }`, "return expects 'Void', got 'Void'"},
+		{"explicit business Void result", `type Void { id: Int } fn bad(): Void { return await {} }`, "return expects 'Void', got 'Void'"},
+		{"awaited void call", `type Void { id: Int } fn bad(done: Channel<Int>): Void { await { done.close() } }`,
+			"return expects 'Void', got 'Void'"},
+		{"when branch", `type Void { id: Int }
+			fn bad(value: Void): Void { when { true -> { await {} } else -> value } }`,
+			"when branch must produce a value"},
+		{"when branch explicit result", `type Void { id: Int }
+			fn bad(value: Void): Void { when { true -> { return await {} } else -> value } }`,
+			"when branch must produce a value"},
+		{"collection lambda", `type Void { id: Int }
+			fn bad(): Int { val values = [1].map { await {} } return 0 }`,
+			"collection lambda must return a known non-null element value"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			expectError(t, analyze(t, sample.source), sample.diagnostic)
+		})
+	}
+	expectNoErrors(t, analyze(t, `type Void { id: Int }
+		fn direct(value: Void): Void { value }
+		fn keep(value: Void): Void { await {} await { value } }
+		fn move(value: Void): Void { return await { value } }
+		fn effects() { await {} await { val local = 1 } }`))
+}
+
+func TestAwaitTupleRejectsVoidResultSlots(t *testing.T) {
+	for _, names := range []string{"discarded, answer", "_, answer"} {
+		t.Run(names, func(t *testing.T) {
+			result := analyze(t, `fn probe(mark: Channel<Int>): Int {
+  val (`+names+`) = await {
+    val seed = 42
+    mark <- 1
+    seed
+  }
+  return 0
+}`)
+			expectError(t, result, "await result cannot be void")
+		})
+	}
 }
 
 func TestAwaitWithNonExprStatements(t *testing.T) {
@@ -1821,7 +1917,7 @@ func TestCheckCompositeExprAwait(t *testing.T) {
 	result := analyze(t, `
 model User { name: String }
 api test(): Int {
-  val results = await {
+  val (first, second) = await {
     User.find(id: 1)
     User.find(id: 2)
   }

@@ -202,23 +202,22 @@ func (p *paginationAnalysis) bindScalarNames(bindings map[string]pageValue, stat
 }
 
 func (p *paginationAnalysis) destructureAwait(bindings map[string]pageValue, statement *ast.ValStmt, await *ast.AwaitExpr) {
-	// Every task reads the scope before any destination names are bound.
-	var local [4]pageValue
-	values := local[:0]
-	for _, item := range await.Body.Stmts {
-		if expression, ok := item.(*ast.ExprStmt); ok && len(values) < len(statement.Names) {
-			value := p.consumeInput(expression.Expr)
-			value.bad = value.bad || len(value.queries) != 0
-			values = append(values, value)
+	// Initializers must not see any of the destination bindings.
+	var inline [4]pageValue
+	values := inline[:0]
+	p.visitAwaitResults(await.Body, func(expr ast.Expr) {
+		value := p.consumeInput(expr)
+		if len(values) < len(statement.Names) {
+			values = append(values, p.awaitResult(value))
 		}
-	}
+	})
 	if len(values) == 1 {
 		p.bindScalarNames(bindings, statement, values[0])
 		return
 	}
 	for index, value := range values {
 		if name := statement.Names[index]; name != "_" {
-			bindings[name] = p.bindObject(value, nil)
+			bindings[name] = value
 		}
 	}
 }

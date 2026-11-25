@@ -25,12 +25,15 @@ var comparisonUnits = [...]string{"sec/op", "B/op", "allocs/op"}
 type evaluation struct {
 	GOOS                  string
 	GOARCH                string
+	CPU                   string
 	TimeComparisons       int
 	AllocationComparisons int
 	Comparisons           map[comparisonKey]struct{}
 	Measurements          map[comparisonKey]measurement
 	Regressions           []regression
 	Unconfirmed           []regression
+	TimingAdvisories      []regression
+	invalidCPU            bool
 }
 
 type comparisonKey struct {
@@ -77,16 +80,16 @@ func run(args []string, output io.Writer) error {
 			return usageError()
 		}
 		if options.confirmationTargets {
-			return reportConfirmationTargets(paths[0], output)
+			return reportConfirmationTargets(paths[0], output, options.advisoryTiming)
 		}
-		return reportConfirmationRequirement(paths[0], output)
+		return reportConfirmationRequirement(paths[0], output, options.advisoryTiming)
 	}
 	if options.targetedConfirmation && len(paths) != 2 {
 		return usageError()
 	}
 	switch len(paths) {
 	case 1:
-		return evaluatePrimary(paths[0], output)
+		return evaluatePrimary(paths[0], output, options.advisoryTiming)
 	case 2:
 		return evaluateConfirmation(paths[0], paths[1], output, options)
 	default:
@@ -98,8 +101,8 @@ func usageError() error {
 	return errors.New("usage: benchgate [--requires-confirmation | --confirmation-targets | --targeted-confirmation] [--approved-costs policy.json --base-sha SHA] <primary.csv> [confirmation.csv]")
 }
 
-func reportConfirmationRequirement(path string, output io.Writer) error {
-	result, err := evaluateFile(path)
+func reportConfirmationRequirement(path string, output io.Writer, advisoryTiming bool) error {
+	result, err := evaluateFile(path, advisoryTiming)
 	if err != nil {
 		return err
 	}
@@ -107,9 +110,12 @@ func reportConfirmationRequirement(path string, output io.Writer) error {
 	return err
 }
 
-func evaluatePrimary(path string, output io.Writer) error {
-	result, err := evaluateFile(path)
+func evaluatePrimary(path string, output io.Writer, advisoryTiming bool) error {
+	result, err := evaluateFile(path, advisoryTiming)
 	if err != nil {
+		return err
+	}
+	if err := reportTimingAdvisories(output, "primary", result.TimingAdvisories); err != nil {
 		return err
 	}
 	for _, regression := range result.Regressions {
@@ -118,18 +124,25 @@ func evaluatePrimary(path string, output io.Writer) error {
 	if len(result.Regressions) > 0 {
 		return fmt.Errorf("performance gate requires confirmation for %d regression candidate(s)", len(result.Regressions))
 	}
+	if advisoryTiming {
+		_, err := fmt.Fprintf(output, "performance gate passed: %d advisory time and %d allocation comparisons; no allocation confirmation required\n", result.TimeComparisons, result.AllocationComparisons)
+		return err
+	}
 	fmt.Fprintf(output, "performance gate passed: %d time and %d allocation comparisons; primary sample group clean without confirmation\n", result.TimeComparisons, result.AllocationComparisons)
 	return nil
 }
 
 func evaluateConfirmation(primaryPath, confirmationPath string, output io.Writer, options gateOptions) error {
-	primary, err := evaluateFile(primaryPath)
+	primary, err := evaluateFile(primaryPath, options.advisoryTiming)
 	if err != nil {
 		return err
 	}
-	confirmation, err := evaluateFile(confirmationPath)
+	confirmation, err := evaluateFile(confirmationPath, options.advisoryTiming)
 	if err != nil {
 		return err
+	}
+	if options.advisoryTiming && primary.CPU != confirmation.CPU {
+		return errors.New("benchmark CPUs differ between sample groups")
 	}
 	confirm := confirmEvaluations
 	if options.targetedConfirmation {
@@ -142,6 +155,12 @@ func evaluateConfirmation(primaryPath, confirmationPath string, output io.Writer
 	if err := applyApprovedCosts(&result, primary, confirmation, options.costs, output); err != nil {
 		return err
 	}
+	if err := reportTimingAdvisories(output, "primary", primary.TimingAdvisories); err != nil {
+		return err
+	}
+	if err := reportTimingAdvisories(output, "confirmation", confirmation.TimingAdvisories); err != nil {
+		return err
+	}
 	for _, unconfirmed := range result.Unconfirmed {
 		fmt.Fprintf(output, "unconfirmed performance variation: %s\n", unconfirmed.Description)
 	}
@@ -151,6 +170,10 @@ func evaluateConfirmation(primaryPath, confirmationPath string, output io.Writer
 	if len(result.Regressions) > 0 {
 		return fmt.Errorf("performance gate rejected %d regression(s)", len(result.Regressions))
 	}
+	if options.advisoryTiming {
+		_, err := fmt.Fprintf(output, "performance gate passed: primary %d advisory time and %d allocation comparisons; confirmation %d advisory time and %d allocation comparisons\n", result.TimeComparisons, result.AllocationComparisons, confirmation.TimeComparisons, confirmation.AllocationComparisons)
+		return err
+	}
 	if options.targetedConfirmation {
 		_, err := fmt.Fprintf(output, "performance gate passed: primary %d time and %d allocation comparisons; targeted confirmation %d time and %d allocation comparisons\n", result.TimeComparisons, result.AllocationComparisons, confirmation.TimeComparisons, confirmation.AllocationComparisons)
 		return err
@@ -159,13 +182,53 @@ func evaluateConfirmation(primaryPath, confirmationPath string, output io.Writer
 	return nil
 }
 
-func evaluateFile(path string) (evaluation, error) {
+func evaluateFile(path string, advisoryTiming bool) (evaluation, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return evaluation{}, err
 	}
 	defer file.Close()
-	return evaluate(file)
+	result, err := evaluate(file)
+	if err != nil || !advisoryTiming {
+		return result, err
+	}
+	if err := result.applyAdvisoryTiming(); err != nil {
+		return evaluation{}, err
+	}
+	return result, nil
+}
+
+func (result *evaluation) applyAdvisoryTiming() error {
+	if result.platform() == "" {
+		return errors.New("benchmark platform metadata is missing")
+	}
+	if result.CPU == "" || result.invalidCPU {
+		return errors.New("missing or mixed benchmark CPU metadata")
+	}
+	for key := range result.Comparisons {
+		if key.Unit == "sec/op" && (!validTargetPackage(key.Package) || !validTargetBenchmark(key.Benchmark)) {
+			return fmt.Errorf("invalid advisory benchmark package %q or benchmark %q", key.Package, key.Benchmark)
+		}
+	}
+	required := result.Regressions[:0]
+	for _, item := range result.Regressions {
+		if item.Key.Unit == "sec/op" {
+			result.TimingAdvisories = append(result.TimingAdvisories, item)
+			continue
+		}
+		required = append(required, item)
+	}
+	result.Regressions = required
+	return nil
+}
+
+func reportTimingAdvisories(output io.Writer, group string, regressions []regression) error {
+	for _, item := range regressions {
+		if _, err := fmt.Fprintf(output, "advisory timing regression (%s): %s\n", group, item.Description); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func evaluate(input io.Reader) (evaluation, error) {
@@ -421,6 +484,15 @@ func (result evaluation) platform() string {
 func (evaluator *comparisonEvaluator) consumePlatform(row []string) (bool, error) {
 	if len(row) != 1 {
 		return false, nil
+	}
+	if value, ok := strings.CutPrefix(row[0], "cpu:"); ok {
+		cpu := strings.TrimSpace(value)
+		result := &evaluator.result
+		if cpu == "" || strings.ContainsAny(cpu, "\t\r\n") || result.CPU != "" && result.CPU != cpu {
+			result.invalidCPU = true
+		}
+		result.CPU = cpu
+		return true, nil
 	}
 	for _, field := range []struct {
 		prefix string

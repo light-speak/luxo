@@ -96,7 +96,18 @@ class _H2Exchange {
 
   void _receive(h2.StreamMessage message) {
     if (finished) return;
+    final previousStatus = status;
     try {
+      if (previousStatus == 204) {
+        if (message is h2.HeadersStreamMessage ||
+            (message is h2.DataStreamMessage && message.bytes.isNotEmpty)) {
+          throw http.ClientException(
+            'HTTP/2 204 response must not contain content or trailers',
+            request.url,
+          );
+        }
+        return;
+      }
       if (message is h2.HeadersStreamMessage) {
         for (final header in message.headers) {
           final name = ascii.decode(header.name);
@@ -116,9 +127,16 @@ class _H2Exchange {
           }
         }
         // Informational fields do not belong to the final response.
-        if (status == null) headers.clear();
+        if (status == null) {
+          headers.clear();
+        } else if (status == 204 && headers.containsKey('content-length')) {
+          throw http.ClientException(
+            'HTTP/2 204 response must not have Content-Length',
+            request.url,
+          );
+        }
       } else if (message is h2.DataStreamMessage) {
-        if (status == null ||
+        if (previousStatus == null ||
             body.length + message.bytes.length > client.maxBodyBytes) {
           throw http.ClientException(
             'Missing status or response body exceeds limit',
