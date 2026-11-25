@@ -93,6 +93,10 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{APIPackage, "BenchmarkIdentityEnumArray", DefaultProfile},
 		{APIPackage, "BenchmarkIdentitySubjectVisibility", DefaultProfile},
 		{APIPackage, "BenchmarkIdentitySurface", APINonIdentityProfile},
+		{APIPackage, "BenchmarkLocalRouteExport", "api-local-route-export"},
+		{APIPackage, "BenchmarkLocalRouteExport/routes=128/previous-2", "api-local-route-export"},
+		{APIPackage, "BenchmarkLocalRouteLookup", APINonIdentityProfile},
+		{APIPackage, "BenchmarkLocalRouteExportSibling", APINonIdentityProfile},
 		{APIPackage, "BenchmarkCanonicalJSONBytes", APINonIdentityProfile},
 		{LuviaPackage, "BenchmarkPrimaryKeys/row-small/keyLast=false/baseline=true-2", LuviaPrimaryTraceProfile},
 		{LuviaPackage, "BenchmarkTraceEncodingComparison", LuviaPrimaryTraceProfile},
@@ -113,7 +117,6 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		}
 	}
 	for _, tc := range []struct{ pkg, profile, filter string }{
-		{APIPackage, APINonIdentityProfile, "."},
 		{CodecPackage, CodecReaderProfile, "."},
 		{"pkg/lux/rpc", "", ""},
 	} {
@@ -127,6 +130,11 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		if len(got) != 1 || got[0] != (IsolationSpec{tc.profile, tc.filter}) {
 			t.Fatalf("isolation of %s = %v, want %q %q", tc.pkg, got, tc.profile, tc.filter)
 		}
+	}
+	apiProfiles := IsolationProfiles(APIPackage)
+	if len(apiProfiles) != 2 || apiProfiles[0] != (IsolationSpec{APINonIdentityProfile, "."}) ||
+		apiProfiles[1] != (IsolationSpec{"api-local-route-export", "^BenchmarkLocalRouteExport$"}) {
+		t.Fatalf("unexpected API profiles: %v", apiProfiles)
 	}
 	profiles := IsolationProfiles(LuviaPackage)
 	if len(profiles) != 3 || profiles[0] != (IsolationSpec{LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"}) ||

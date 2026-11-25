@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -15,7 +16,7 @@ import (
 
 func TestIsolationProfileCommand(t *testing.T) {
 	for _, tc := range []struct{ pkg, want string }{
-		{"pkg/lux/api", "api-non-identity\t.\n"},
+		{"pkg/lux/api", "api-non-identity\t.\napi-local-route-export\t^BenchmarkLocalRouteExport$\n"},
 		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n" +
 			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n" +
 			"luvia-merge-destination\t^BenchmarkMergeDestination$\n"},
@@ -48,6 +49,9 @@ func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 		pkg, profile string
 		assert       func(*testing.T, map[string]string, string)
 	}{
+		{benchlayout.APIPackage, "api-local-route-export", func(t *testing.T, replace map[string]string, dir string) {
+			verifyOnlyListedTestFiles(t, replace, dir, "local_input_bench_test.go")
+		}},
 		{benchlayout.APIPackage, benchlayout.APINonIdentityProfile, verifyAPIOverlay},
 		{benchlayout.LuxPackage, benchlayout.LuxShortPathProfile, verifyLuxShortPathOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaPrimaryTraceProfile, verifyLuviaOverlay},
@@ -79,6 +83,11 @@ func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 
 func verifyLuviaMergeDestinationOverlay(t *testing.T, replace map[string]string, dir string) {
 	t.Helper()
+	verifyOnlyListedTestFiles(t, replace, dir, "merger_bench_test.go", "primary_keys_bench_test.go", "primary_keys_baseline_test.go")
+}
+
+func verifyOnlyListedTestFiles(t *testing.T, replace map[string]string, dir string, fixtures ...string) {
+	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -87,8 +96,7 @@ func verifyLuviaMergeDestinationOverlay(t *testing.T, replace map[string]string,
 	for _, entry := range entries {
 		name := entry.Name()
 		replacement, present := replace[filepath.Join(dir, name)]
-		switch name {
-		case "merger_bench_test.go", "primary_keys_bench_test.go", "primary_keys_baseline_test.go":
+		if slices.Contains(fixtures, name) {
 			if present {
 				t.Fatalf("overlay changed retained fixture %s", name)
 			}

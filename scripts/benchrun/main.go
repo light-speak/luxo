@@ -110,6 +110,8 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return codecReaderOverlay(root)
 	case benchlayout.APINonIdentityProfile:
 		return packageTestOverlay(root, packagePath, "bench-api-non-identity-*", writeAPIBenchmarkOverlay)
+	case benchlayout.APILocalRouteExportProfile:
+		return packageTestOverlay(root, packagePath, "bench-api-local-route-export-*", writeAPILocalRouteExportOverlay)
 	case benchlayout.LuviaPrimaryTraceProfile:
 		return packageTestOverlay(root, packagePath, "bench-luvia-primary-trace-*", writeLuviaBenchmarkOverlay)
 	case benchlayout.LuviaGatewayIdentityProfile:

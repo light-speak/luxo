@@ -29,6 +29,9 @@ const (
 	CodegenMigrationStateProfile   = "codegen-migration-state"
 	CodegenMigrationStateBenchmark = "BenchmarkMigrationStateValidation"
 
+	APILocalRouteExportProfile   = "api-local-route-export"
+	APILocalRouteExportBenchmark = "BenchmarkLocalRouteExport"
+
 	LuviaMergeDestinationProfile   = "luvia-merge-destination"
 	LuviaMergeDestinationBenchmark = "BenchmarkMergeDestination"
 )
@@ -52,6 +55,9 @@ func ProfileForBenchmark(pkg, name string) string {
 			return CodecReaderProfile
 		}
 	case APIPackage:
+		if root == APILocalRouteExportBenchmark {
+			return APILocalRouteExportProfile
+		}
 		if !slices.Contains(apiIdentityRoots, root) {
 			return APINonIdentityProfile
 		}
@@ -91,7 +97,10 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 	case CodecPackage:
 		return []IsolationSpec{{CodecReaderProfile, "."}}
 	case APIPackage:
-		return []IsolationSpec{{APINonIdentityProfile, "."}}
+		return []IsolationSpec{
+			{APINonIdentityProfile, "."},
+			{APILocalRouteExportProfile, "^" + APILocalRouteExportBenchmark + "$"},
+		}
 	case LuviaPackage:
 		return []IsolationSpec{
 			{LuviaPrimaryTraceProfile, "^" + strings.Join(luviaIsolatedRoots, "$|^") + "$"},
