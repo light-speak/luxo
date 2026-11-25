@@ -14,6 +14,7 @@ from zipfile import ZipFile
 
 
 BASE = "e101cf7699acb358305fd373934e8813a98087bd"
+PREVIOUS_DIAGNOSTIC = "7c8b579ada1b65e7d72e2b98e3c906624fa8312a"
 BASE_TREE = "377fdb5bbe6815a45930c53e10797f08cf07c917"
 TREE = "8226407033d261b8031c715e86f6fecc327a4db9"
 PATCH_SHA = "d952cffb1eeb642d6f5d51aa9d47a626a2aeaa927275edcae39be839047614ad"
@@ -78,11 +79,12 @@ def diagnostic_assets(repo, offline):
         patch, lock = (source / patch_name).read_bytes(), (source / "pubspec.lock").read_bytes()
     else:
         head = git(repo, "rev-parse", "HEAD").decode().strip()
-        require(head == os.environ["GITHUB_SHA"] and git(repo, "rev-parse", "HEAD^").decode().strip() == BASE,
-                "the diagnostic commit must be the only commit above the pinned base")
+        parents = git(repo, "rev-parse", "HEAD^", "HEAD^^").decode().splitlines()
+        require(head == os.environ["GITHUB_SHA"] and parents == [PREVIOUS_DIAGNOSTIC, BASE],
+                "the retry must build on the first diagnostic commit and pinned base")
         paths = git(repo, "diff", "--no-renames", "--name-status", BASE, head, "--").decode().splitlines()
         expected = {f"A\t{WORKFLOW}"} | {f"A\t{FIXTURE}/{name}" for name in ("qualify.py", patch_name, "pubspec.lock")}
-        require(set(paths) == expected, "the diagnostic commit must contain only its four new files")
+        require(set(paths) == expected, "the diagnostic branch must contain only its four new files")
         patch, lock = git(repo, "show", f"{head}:{FIXTURE}/{patch_name}"), git(repo, "show", f"{head}:{FIXTURE}/pubspec.lock")
     return b64decode(b"".join(patch.split()), validate=True), lock
 
@@ -101,7 +103,9 @@ def stage(repo, scratch, patch, lock):
     changed = git(repo, "diff", "--name-only", BASE_TREE, actual, "--").decode().splitlines()
     require(set(changed) == PRODUCT_FILES, "unexpected product file in the verified patch")
     archive = scratch / "source.zip"
-    git(repo, "archive", "--format=zip", f"--output={archive}", actual, "VERSION", "packages/dart")
+    # Git can otherwise export CRLF on Windows even from the exact LF tree.
+    git(repo, "-c", "core.autocrlf=false", "-c", "core.eol=lf",
+        "archive", "--format=zip", f"--output={archive}", actual, "VERSION", "packages/dart")
     source = scratch / "source"
     with ZipFile(archive) as bundle:
         bundle.extractall(source)
