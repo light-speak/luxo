@@ -289,12 +289,8 @@ func ReadBool(buf []byte, off int) (bool, int) {
 // ErrInvalidArrayCount rejects counts outside the common array wire domain.
 var ErrInvalidArrayCount = errors.New("codec: array count must be between 0 and 1000000")
 
-func validArrayCount(count int) bool {
-	return uint(count) <= MaxArrayElements
-}
-
 func validateArrayCount(count int) error {
-	if !validArrayCount(count) {
+	if uint(count) > MaxArrayElements {
 		return ErrInvalidArrayCount
 	}
 	return nil
@@ -302,27 +298,10 @@ func validateArrayCount(count int) error {
 
 // AppendArrayHeader validates before changing the destination.
 func AppendArrayHeader(dst []byte, count int) ([]byte, error) {
-	if uint(count) < 1<<7 {
-		return append(dst, byte(count)), nil
+	if err := validateArrayCount(count); err != nil {
+		return dst, err
 	}
-	if !validArrayCount(count) {
-		return dst, ErrInvalidArrayCount
-	}
-	return appendArrayCountMulti(dst, uint(count)), nil
-}
-
-// Small unsigned counts are valid, and every valid count fits at most three varint bytes.
-const _ uint32 = MaxArrayElements - ((1 << 7) - 1)
-const _ uint32 = ((1 << 21) - 1) - MaxArrayElements
-
-func appendArrayCountMulti(dst []byte, count uint) []byte {
-	dst = append(dst, byte(count)|0x80)
-	count >>= 7
-	if count >= 1<<7 {
-		dst = append(dst, byte(count)|0x80)
-		count >>= 7
-	}
-	return append(dst, byte(count))
+	return AppendVarint(dst, uint64(count)), nil
 }
 
 // ReadArrayHeader reads a count within MaxArrayElements before narrowing to int.

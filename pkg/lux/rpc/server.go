@@ -24,8 +24,6 @@ const handlerResponsePrefix = 0x4c525043
 
 var errHandlerResponsePrefix = stderrors.New("rpc: handler overwrote the response buffer or its transport prefix")
 var errHandlerEmptyResponse = luxerrors.InternalError.WithCause(stderrors.New("rpc: handler did not write its declared response value"))
-var errBearerVerifierNotConfigured = stderrors.New("RPC bearer verification is not configured")
-var errBearerVerifierMissingContext = stderrors.New("RPC bearer verifier returned no context")
 
 // Server handles internal RPC connections using Luxo binary protocol.
 // Dispatches both public API and RPC-only handlers from a startup snapshot.
@@ -384,22 +382,21 @@ func (s *Server) requestContext(ctx context.Context, token string) (context.Cont
 	if token == "" {
 		return ctx, nil
 	}
+	if s.internalRequestContext == nil {
+		return nil, fmt.Errorf("RPC bearer verification is not configured")
+	}
 	return s.verifyRequestContext(ctx, token)
 }
 
 func (s *Server) verifyRequestContext(ctx context.Context, token string) (verified context.Context, err error) {
-	verify := s.internalRequestContext
-	if verify == nil {
-		return nil, errBearerVerifierNotConfigured
-	}
 	defer func() {
 		if recover() != nil {
 			verified, err = nil, errAuthenticationPanic
 		}
 	}()
-	verified, err = verify(ctx, token)
+	verified, err = s.internalRequestContext(ctx, token)
 	if err == nil && verified == nil {
-		return nil, errBearerVerifierMissingContext
+		return nil, fmt.Errorf("RPC bearer verifier returned no context")
 	}
 	return verified, err
 }

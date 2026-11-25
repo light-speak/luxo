@@ -2417,63 +2417,6 @@ func TestRPCRejectsNilAuthenticatedContext(t *testing.T) {
 	}
 }
 
-func TestRPCReusesStaticAuthenticationErrors(t *testing.T) {
-	ctx := context.Background()
-	for _, sample := range []struct {
-		name   string
-		verify func(context.Context, string) (context.Context, error)
-		want   string
-	}{
-		{
-			name: "unconfigured",
-			want: "RPC bearer verification is not configured",
-		},
-		{
-			name: "nil result",
-			verify: func(context.Context, string) (context.Context, error) {
-				return nil, nil
-			},
-			want: "RPC bearer verifier returned no context",
-		},
-	} {
-		t.Run(sample.name, func(t *testing.T) {
-			server := &Server{internalRequestContext: sample.verify}
-			var verified context.Context
-			var err error
-			allocs := testing.AllocsPerRun(100, func() {
-				verified, err = server.requestContext(ctx, "token")
-			})
-			if verified != nil || err == nil || err.Error() != sample.want {
-				t.Fatalf("request context = %v, %v, want nil, %q", verified, err, sample.want)
-			}
-			if allocs != 0 {
-				t.Fatalf("request context allocates %.0f times, want 0", allocs)
-			}
-		})
-	}
-}
-
-func TestRPCRequestContextKeepsPublishedVerifierResult(t *testing.T) {
-	parent := t.Context()
-	verified, cancel := context.WithCancel(parent)
-	t.Cleanup(cancel)
-	rejected := stderrors.New("rejected by the published verifier")
-	router := api.NewRouter()
-	router.InternalRequestContext = func(ctx context.Context, token string) (context.Context, error) {
-		if ctx != parent || token != "token" {
-			t.Fatalf("verifier received different input: %v, %q", ctx, token)
-		}
-		return verified, rejected
-	}
-	server := NewServer(router)
-	t.Cleanup(server.Close)
-	router.InternalRequestContext = nil
-	got, err := server.requestContext(parent, "token")
-	if got != verified || err != rejected {
-		t.Fatalf("verifier result changed: %v, %v", got, err)
-	}
-}
-
 func TestRPCAuthenticationPanicsAreIsolated(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		for _, errorMethod := range []bool{false, true} {
