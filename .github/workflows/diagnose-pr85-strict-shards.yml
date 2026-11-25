@@ -1,0 +1,91 @@
+name: Recheck five PR 85 benchmark shards on matched native Linux
+
+"on":
+  push:
+    branches: [diagnostics/pr85-strict-shards]
+    paths:
+      - .github/workflows/diagnose-pr85-strict-shards.yml
+      - scripts/diagnose-pr85/native.sh
+      - scripts/diagnose-pr85/shards.py
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  match:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr85-strict-shards'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2]
+    env:
+      LC_ALL: C
+      GOTOOLCHAIN: local
+      GOMAXPROCS: '2'
+      CGO_ENABLED: '1'
+      GOAMD64: v1
+    steps:
+      - name: Select the original hosted CPU model
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          evidence=.tmp/pr85-strict-shards-evidence
+          mkdir -p "$evidence"
+          uname -a > "$evidence/host.txt"
+          lscpu > "$evidence/lscpu.txt"
+          cat /etc/os-release > "$evidence/os-release.txt"
+          [[ "$RUNNER_KIND" == github-hosted && "$RUNNER_ARCH" == X64 && "$(uname -sm)" == 'Linux x86_64' ]]
+          grep -Fx 'VERSION_ID="24.04"' "$evidence/os-release.txt"
+          cpu=$(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/lscpu.txt")
+          case "$cpu" in
+            'AMD EPYC 7763 64-Core Processor'|'AMD EPYC 9V74 80-Core Processor'|'Intel(R) Xeon(R) 6975P-C')
+              printf '%s\n' "$cpu" > "$evidence/selection.txt"
+              ;;
+            *) printf 'wrong-cpu: %s\n' "$cpu" | tee "$evidence/selection.txt"; exit 3 ;;
+          esac
+      - uses: actions/checkout@v7
+        with:
+          path: diagnostic
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Bind the exact source and this CPU's original artifacts
+        working-directory: diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 origin \
+            cbca8575fdd012835799a8f10a94f4c596d1e9d6 02c0e428f1e4abe27f049f2644f7b7fecd8dc90b
+          evidence="$GITHUB_WORKSPACE/.tmp/pr85-strict-shards-evidence"
+          cpu=$(cat "$evidence/selection.txt")
+          python3 -B scripts/diagnose-pr85/shards.py artifacts "$cpu" > "$evidence/requested.tsv"
+          test -s "$evidence/requested.tsv"
+          while IFS=$'\t' read -r id size digest name; do
+            gh api "repos/light-speak/luxo/actions/artifacts/$id" > "$evidence/$id.metadata.json"
+            jq -e --argjson id "$id" --argjson size "$size" --arg digest "sha256:$digest" --arg name "$name" \
+              '.id == $id and .name == $name and .expired == false and .size_in_bytes == $size and .digest == $digest and
+               .workflow_run.id == 45701411412 and .workflow_run.head_sha == "02c0e428f1e4abe27f049f2644f7b7fecd8dc90b"' \
+               "$evidence/$id.metadata.json"
+            gh api "repos/light-speak/luxo/actions/artifacts/$id/zip" > "$evidence/$id.zip"
+          done < "$evidence/requested.tsv"
+      - name: Rerun the original matched profile
+        working-directory: diagnostic
+        run: bash scripts/diagnose-pr85/native.sh "$GITHUB_WORKSPACE/.tmp/pr85-strict-shards-evidence" --shards
+      - name: Preserve original provenance, raw samples and linker records
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr85-strict-shards-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slot }}
+          path: .tmp/pr85-strict-shards-evidence/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14

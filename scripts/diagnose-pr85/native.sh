@@ -30,24 +30,33 @@ head=02c0e428f1e4abe27f049f2644f7b7fecd8dc90b
 pkg=pkg/lux/api
 scripts="$root/scripts/diagnose-pr85"
 parse_fixture="$scripts/parse-log.go.txt"
+shard_tool="$scripts/shards.py"
+mode="${2:-route}"
+[[ "$mode" == route || "$mode" == --shards ]]
+cpu=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')
 tool="$scripts/evidence.py"
 hot='([.]BenchmarkLocalRouteExport|[.]localRouteSnapshot$|[.]BenchmarkDiagnosticWriteParseError|[.]ExportHandlers$|[.]writeParseError$|^runtime[.](gcWriteBarrier[0-9]*|writeBarrier)$)'
 
 test "$(go env GOVERSION GOHOSTOS GOHOSTARCH GOAMD64 CGO_ENABLED)" = $'go1.27.1\nlinux\namd64\nv1\n1'
 test "$GOMAXPROCS" = 2
 test -z "$(go env GOFLAGS GOEXPERIMENT | tr -d '\n')"
-test "$(lscpu | sed -n 's/^Model name:[[:space:]]*//p')" = 'Intel(R) Xeon(R) 6975P-C'
 test "$(git rev-parse "$base^{tree}")" = c64b011ae17958f80af20aa8b643c8b09ee1bb94
 test "$(git rev-parse "$head^{tree}")" = 6cbf740716c176e0734b8f7fca513ee4f9007e6e
 test "$(git diff --name-only "$base" "$head")" = "$(printf '%s\n' "$pkg/router.go" "$pkg/router_log_test.go")"
 git diff --exit-code "$base" "$head" -- go.mod go.sum scripts/{benchrun,benchplan,benchgate,setup-modules.sh} \
     internal/benchlayout "$pkg/local_input_bench_test.go" "$pkg/http_abnormal_test.go"
-printf '%s  %s\n' 647c12a482898f8d88427c41fcd70ec16b3934f8942552dd691b6f5ce555ea06 "$parse_fixture" | sha256sum -c -
-python3 -B "$tool" bind "$evidence/original.zip" "$evidence" > "$evidence/original-binding.json"
+if [[ "$mode" == route ]]; then
+    test "$cpu" = 'Intel(R) Xeon(R) 6975P-C'
+    printf '%s  %s\n' 647c12a482898f8d88427c41fcd70ec16b3934f8942552dd691b6f5ce555ea06 "$parse_fixture" | sha256sum -c -
+    python3 -B "$tool" bind "$evidence/original.zip" "$evidence" > "$evidence/original-binding.json"
+else
+    python3 -B "$shard_tool" bind "$cpu" "$evidence" > "$evidence/lane.tsv"
+    IFS=$'\t' read -r pkg shard_profile shard_filter hot < "$evidence/lane.tsv"
+fi
 { go env -json GOVERSION GOOS GOARCH GOAMD64 CGO_ENABLED GOFLAGS; uname -a; lscpu; } > "$evidence/environment.txt"
 git diff "$base" "$head" --stat > "$evidence/product-diff.txt"
 for arm in "$base" "$head"; do
-    for path in "$pkg/"{local_input_bench_test,http_abnormal_test,router,router_log_test}.go; do
+    for path in pkg/lux/api/{local_input_bench_test,http_abnormal_test,router,router_log_test}.go; do
         printf '%s %s %s\n' "$arm" "$(git rev-parse "$arm:$path")" "$path"
     done
 done > "$evidence/source-blobs.txt"
@@ -76,7 +85,14 @@ benchstat="$work/tools/benchstat"
 go version -m "$benchstat" > "$evidence/benchstat-version.txt"
 "$benchrun" performance-profile > "$evidence/profile.txt"
 cmp "$evidence/profile.txt" "$evidence/original-profile.txt"
-"$benchplan" --verify-profile-batch confirmation "$evidence/original-expected.json" "$evidence/original-batch.tsv"
+if [[ "$mode" == route ]]; then
+    "$benchplan" --verify-profile-batch confirmation "$evidence/original-expected.json" "$evidence/original-batch.tsv"
+else
+    for selected in "$evidence"/shard-*.batch.tsv; do
+        "$benchplan" --verify-profile-batch confirmation "${selected%.batch.tsv}.expected.json" "$selected"
+    done
+    "$benchplan" --verify-profile-batch confirmation "$evidence/shards.expected.json" "$evidence/shards.batch.tsv"
+fi
 
 isolate_route_tests() {
     local directory=$1 file
@@ -89,11 +105,14 @@ isolate_route_tests() {
 build_arm() {
     local variant=$1 arm=$2 revision=$3 compile=$4 profile=$5 out=$6
     local source="$work/$variant-source/$arm" bins="$work/$variant-bin/$arm"
-    local binary="$bins/pkg-lux-api.test"
-    if [[ "$profile" != default ]]; then binary="$bins/pkg-lux-api-$profile.test"; fi
+    local stem=${pkg//\//-} binary
+    binary="$bins/$stem.test"
+    if [[ "$profile" != default ]]; then binary="$bins/$stem-$profile.test"; fi
     mkdir -p "$source/.tmp" "$bins"
     git archive "$revision" | tar -xf - -C "$source"
-    git show "$revision:$pkg/local_input_bench_test.go" | cmp - "$source/$pkg/local_input_bench_test.go"
+    if [[ "$variant" != shards ]]; then
+        git show "$revision:$pkg/local_input_bench_test.go" | cmp - "$source/$pkg/local_input_bench_test.go"
+    fi
     case "$variant" in
         parse)
             test ! -e "$source/$pkg/diagnostic_write_parse_error_test.go"
@@ -142,7 +161,7 @@ measure() {
         for side in left right; do
             raw="$protocol.$side.raw.txt"
             test "$(grep -c '^cpu: ' "$raw")" -eq 10
-            test "$(grep -Fxc 'cpu: Intel(R) Xeon(R) 6975P-C' "$raw")" -eq 10
+            test "$(grep -Fxc "cpu: $cpu" "$raw")" -eq 10
             test "$(grep -Fxc PASS "$raw")" -eq 10
             "$benchplan" --normalize "$raw" "$protocol.$side.txt"
         done
@@ -195,6 +214,23 @@ run_variant() {
     python3 -B "$tool" compare "$variant" "$out" > "$out/linkage.json"
     measure "$variant" "$profile" "$filter" "$out"
 }
+
+if [[ "$mode" == --shards ]]; then
+    out="$evidence/shards"
+    mkdir "$out"
+    cp "$evidence/shards.expected.json" "$out/expected.json"
+    build_arm shards A "$base" compile-performance-baseline "$shard_profile" "$out"
+    build_arm shards B "$head" compile-performance "$shard_profile" "$out"
+    for arm in A B; do
+        sample shards "$arm" "$shard_profile" "$shard_filter" 1x > "$out/$arm.fixture-1x.txt"
+        python3 -B "$shard_tool" smoke "$cpu" "$evidence" "$out/$arm.fixture-1x.txt"
+    done
+    "$benchplan" --verify-equal-inventories "$out/A.fixture-1x.txt" "$out/B.fixture-1x.txt"
+    python3 -B "$shard_tool" linkage "$evidence" "$out" > "$out/linkage.json"
+    measure shards "$shard_profile" "$shard_filter" "$out"
+    evaluate "$out"
+    exit 0
+fi
 
 run_variant linked api-non-identity '^BenchmarkLocalRouteExport$/^routes=128$/^(previous|current)$'
 linked_status=0
