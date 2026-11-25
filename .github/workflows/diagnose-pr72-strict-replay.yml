@@ -1,0 +1,88 @@
+name: Replay the current PR 72 strict samples on a matching CPU
+
+on:
+  push:
+    branches: [diagnostics/native-cpu-match]
+    paths:
+      - .github/workflows/diagnose-pr72-strict-replay.yml
+      - scripts/diagnose-pr72-strict-replay.py
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  replay:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/native-cpu-match'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Identify the assigned runner
+        id: cpu
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          mkdir -p .tmp/pr72-strict-selection
+          receipt=.tmp/pr72-strict-selection
+          printf 'run=%s\nattempt=%s\nworkflow_sha=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" > "$receipt/selection.txt"
+          uname -a > "$receipt/uname.txt"
+          if [[ "$RUNNER_OS" != Linux || "$RUNNER_ARCH" != X64 || "$(uname -m)" != x86_64 ]]; then
+            printf 'status=incompatible-host\n' >> "$receipt/selection.txt"
+            exit 2
+          fi
+          lscpu > "$receipt/lscpu.txt"
+          mapfile -t names < <(sed -n 's/^Model name:[[:space:]]*//p' "$receipt/lscpu.txt")
+          if (( ${#names[@]} != 1 )) || [[ -z "${names[0]}" ]]; then
+            printf 'status=invalid-model\n' >> "$receipt/selection.txt"
+            exit 2
+          fi
+          printf 'cpu=%s\n' "${names[0]}" >> "$receipt/selection.txt"
+          case "${names[0]^^}" in
+            'INTEL(R) XEON(R) 6975P-C'|'AMD EPYC 9V74 80-CORE PROCESSOR')
+              printf 'cpu=%s\n' "${names[0]}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              printf 'status=no-matching-pending-scope\n' >> "$receipt/selection.txt"
+              exit 3
+              ;;
+          esac
+      - uses: actions/checkout@v7
+        with:
+          path: native-cpu-dispatch
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Replay frozen fixtures and preserve compiler evidence
+        working-directory: native-cpu-dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNNER_CPU: ${{ steps.cpu.outputs.cpu }}
+          CGO_ENABLED: '1'
+          GOAMD64: v1
+          GOTOOLCHAIN: local
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/.tmp"
+          mkdir -p "$root/pr72-strict-native-tmp"
+          export TMPDIR="$root/pr72-strict-native-tmp"
+          trap 'rm -rf -- "$TMPDIR"' EXIT
+          python3 scripts/diagnose-pr72-strict-replay.py . "$root/pr72-strict-replay" "$RUNNER_CPU"
+      - name: Upload replay evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr72-strict-native-replay-${{ github.run_attempt }}
+          path: |
+            .tmp/pr72-strict-selection/
+            .tmp/pr72-strict-replay/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+      - name: Clean replay evidence
+        if: always()
+        run: rm -rf -- .tmp/pr72-strict-selection .tmp/pr72-strict-replay .tmp/pr72-strict-native-tmp
