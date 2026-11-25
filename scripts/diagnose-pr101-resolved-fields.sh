@@ -12,7 +12,7 @@ package=pkg/lux/luvia
 profile=default
 filter='^BenchmarkValidateResolvedFields$/^list-small-128x16$/^per-value$'
 hot='([.]BenchmarkValidateResolvedFields|[.]validateResolvedPerValue|[.]skipModelResponsePerValue|[.]ValidateResolvedFields|[.]skipResponseField|[.]nestedResponseFields|[.]responseFieldByID|[.]NextField$)'
-fixture=(grouped_response_bench_test.go merger_bench_test.go primary_keys_bench_test.go primary_keys_baseline_test.go)
+fixture=(grouped_response_bench_test.go grouped_response_test.go merger_bench_test.go primary_keys_bench_test.go primary_keys_baseline_test.go)
 tool=scripts/diagnose-pr101-resolved-fields.py
 
 test "$(go env GOVERSION GOHOSTOS GOHOSTARCH GOAMD64 CGO_ENABLED)" = $'go1.27.1\nlinux\namd64\nv1\n1'
@@ -68,7 +68,7 @@ isolate() {
     for file in "$source/$package/"*_test.go; do
         name=${file##*/}
         case "$name" in
-            grouped_response_bench_test.go|merger_bench_test.go|primary_keys_bench_test.go|primary_keys_baseline_test.go) ;;
+            grouped_response_bench_test.go|grouped_response_test.go|merger_bench_test.go|primary_keys_bench_test.go|primary_keys_baseline_test.go) ;;
             *) rm -- "$file"; printf '%s\n' "$name" ;;
         esac
     done | LC_ALL=C sort
