@@ -1,0 +1,88 @@
+name: Recheck PR 101 resolved-field validation on native Linux
+
+on:
+  push:
+    branches: [diagnostics/pr101-resolved-fields]
+    paths:
+      - .github/workflows/diagnose-pr101-resolved-fields.yml
+      - scripts/diagnose-pr101-resolved-fields.sh
+      - scripts/diagnose-pr101-resolved-fields.py
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  match:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr101-resolved-fields'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2]
+    env:
+      LC_ALL: C
+      GOTOOLCHAIN: local
+      CGO_ENABLED: '1'
+      GOAMD64: v1
+    steps:
+      - name: Select the original hosted CPU model
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          evidence=.tmp/pr101-resolved-fields-evidence
+          mkdir -p "$evidence"
+          uname -a > "$evidence/host.txt"
+          lscpu > "$evidence/lscpu.txt"
+          cat /etc/os-release > "$evidence/os-release.txt"
+          [[ "$RUNNER_KIND" == github-hosted && "$RUNNER_ARCH" == X64 && "$(uname -sm)" == 'Linux x86_64' ]]
+          grep -Fx 'VERSION_ID="24.04"' "$evidence/os-release.txt"
+          cpu=$(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/lscpu.txt")
+          if [[ "$cpu" != 'Intel(R) Xeon(R) 6975P-C' ]]; then
+            printf 'wrong-cpu: %s\n' "$cpu" | tee "$evidence/selection.txt"
+            exit 3
+          fi
+          printf 'matched: %s\n' "$cpu" | tee "$evidence/selection.txt"
+      - uses: actions/checkout@v7
+        with:
+          path: diagnostic
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Bind the exact source and original qualification artifact
+        working-directory: diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git fetch --no-tags --depth=1 origin \
+            e101cf7699acb358305fd373934e8813a98087bd 389c14b8a01891faee926b798039d02f5404f4aa
+          evidence="$GITHUB_WORKSPACE/.tmp/pr101-resolved-fields-evidence"
+          gh api repos/light-speak/luxo/actions/artifacts/15064823720 > "$evidence/original-metadata.json"
+          jq -e '.id == 15064823720 and .name == "performance-evidence-01-1" and .expired == false and
+            .size_in_bytes == 41461 and
+            .digest == "sha256:4b7c4adad4da169d11a3f352b48880176348ec033e92cb523fcca5ca54cd7e8c" and
+            .workflow_run.id == 45705105154 and .workflow_run.head_sha == "389c14b8a01891faee926b798039d02f5404f4aa"' \
+            "$evidence/original-metadata.json"
+          gh api repos/light-speak/luxo/actions/artifacts/15064823720/zip > "$evidence/original.zip"
+      - name: Compare exact default images and run independent test-set isolation
+        working-directory: diagnostic
+        run: |
+          set -euo pipefail
+          evidence="$GITHUB_WORKSPACE/.tmp/pr101-resolved-fields-evidence"
+          bash scripts/diagnose-pr101-resolved-fields.sh "$evidence" --also-isolate
+      - name: Preserve original provenance, raw samples and linker records
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr101-resolved-fields-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slot }}
+          path: .tmp/pr101-resolved-fields-evidence/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
