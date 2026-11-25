@@ -176,11 +176,29 @@ func (p *paginationAnalysis) declaration(statement *ast.ValStmt) {
 		bindings = make(map[string]pageValue)
 		p.scopes[len(p.scopes)-1] = bindings
 	}
-	if await, ok := statement.Value.(*ast.AwaitExpr); ok && len(statement.Names) != 0 {
+	if len(statement.Names) == 0 {
+		bindings[statement.Name] = p.bindObject(p.expression(statement.Value), statement.Type)
+		return
+	}
+	if await, ok := statement.Value.(*ast.AwaitExpr); ok {
 		p.destructureAwait(bindings, statement, await)
 		return
 	}
-	bindings[statement.Name] = p.bindObject(p.expression(statement.Value), statement.Type)
+	p.bindScalarNames(bindings, statement, p.expression(statement.Value))
+}
+
+func (p *paginationAnalysis) bindScalarNames(bindings map[string]pageValue, statement *ast.ValStmt, value pageValue) {
+	expected := statement.Type
+	for _, name := range statement.Names {
+		if name == "_" {
+			continue
+		}
+		// Apply the initializer's declared representation once. Subsequent
+		// names copy that value's slots or share its existing reference.
+		value = p.bindObject(value, expected)
+		bindings[name] = value
+		expected = nil
+	}
 }
 
 func (p *paginationAnalysis) destructureAwait(bindings map[string]pageValue, statement *ast.ValStmt, await *ast.AwaitExpr) {
@@ -194,14 +212,7 @@ func (p *paginationAnalysis) destructureAwait(bindings map[string]pageValue, sta
 		}
 	})
 	if len(values) == 1 {
-		value, expected := values[0], statement.Type
-		for _, name := range statement.Names {
-			if name != "_" {
-				value = p.bindObject(value, expected)
-				bindings[name] = value
-				expected = nil
-			}
-		}
+		p.bindScalarNames(bindings, statement, values[0])
 		return
 	}
 	for index, value := range values {

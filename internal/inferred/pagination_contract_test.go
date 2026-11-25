@@ -22,6 +22,9 @@ func TestPaginationPlanFinalListLineage(t *testing.T) {
 		{"selected_ordered_query", "", `return Node.where(id > 0).select().orderBy(id.asc).all()`, 1, false},
 		{"selected_builder_alias", "", `val query = Node.select() return query.all()`, 1, false},
 		{"query_alias", "", `val rows = Node.all() val alias = rows return alias`, 1, false},
+		{"destructured_query", "", `val (_, rows) = Node.all() return rows`, 1, false},
+		{"destructured_builder", "", `val (_, query) = Node.where(id > 1) return query.all()`, 1, false},
+		{"destructured_consumed", "", `val (first, rows) = Node.all() val count = first.size() return rows`, 0, true},
 		{"builder_alias", "", `val query = Node.where(id > 1) return query.all()`, 1, false},
 		{"find", "", `return Node.findMany(id: 1)`, 1, false},
 		{"identity_loop", "", `val rows = Node.all() return for row in rows { row }`, 1, false},
@@ -62,6 +65,11 @@ func TestPaginationPlanFinalListLineage(t *testing.T) {
 		{"query_offset", "", `val query = Node.offset(1) return query.all()`, 0, true},
 		{"transaction_result", "", `return transaction { Node.all() }`, 0, true},
 		{"await_source", "", `val (rows, other) = await { Node.all() Node.all() } return rows`, 0, true},
+		{"await_later_manual_result", "", `val (_, _, _, _, rows) = await { 1
+2
+3
+4
+[Node { id: 1 }] } return rows`, 0, false},
 		{"await_local_query_source", "", `val (_, rows) = await { val local = Node.all()
 local } return rows`, 0, true},
 		{"await_scalar_query_source", "", `val (_, rows) = await { Node.all() } return rows`, 0, true},
@@ -212,6 +220,10 @@ func TestPaginationObjectFieldLineage(t *testing.T) {
 		{"field_query_assignment", "", `val box = Box { rows: [] } box.rows = Node.all() return box.rows`, 1, false},
 		{"field_manual_overwrite", "", `val box = Box { rows: Node.all() } box.rows = [] return box.rows`, 0, false},
 		{"value_alias_keeps_query", "", `val box = Box { rows: Node.all() } val alias = box box.rows = [] return alias.rows`, 1, false},
+		{"destructured_value_slots", "", `val (box, alias) = Box { rows: Node.all() } box.rows = [] return alias.rows`, 1, false},
+		{"destructured_nested_storage", "", `val (outer, alias) = Outer { box: Box { rows: Node.all() } } outer.box.rows = [] return alias.box.rows`, 0, false},
+		{"destructured_model_reference", "", `val (first, alias) = Holder { id: 1, rows: Node.all() } first.rows = [] return alias.rows`, 0, false},
+		{"await_scalar_object_source", "", `val (_, box) = await { Box { rows: Node.all() } } return box.rows`, 0, true},
 		{"value_alias_keeps_manual", "", `val box = Box { rows: [] } val alias = box box.rows = Node.all() return alias.rows`, 0, false},
 		{"nested_storage_alias", "", `val outer = Outer { box: Box { rows: Node.all() } } val alias = outer outer.box.rows = [] return alias.box.rows`, 0, false},
 		{"nested_value_copy", "", `val outer = Outer { box: Box { rows: Node.all() } } val alias = outer.box outer.box.rows = [] return alias.rows`, 1, false},

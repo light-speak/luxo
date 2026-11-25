@@ -618,15 +618,19 @@ func (c *compiler) compileVal(s *ast.ValStmt) {
 		c.compileDiscardedBindings(s)
 		return
 	}
-	if c.compileChannelValue(s) {
-		return
-	}
 	if await, ok := s.Value.(*ast.AwaitExpr); ok {
 		names := s.Names
 		if len(names) == 0 {
 			names = []string{s.Name}
 		}
 		c.compileAwaitBindings(await, names, s.Type)
+		return
+	}
+	if len(s.Names) != 0 {
+		c.compileDestructuredLocal(s)
+		return
+	}
+	if c.compileChannelValue(s) {
 		return
 	}
 	var expected *ast.TypeRef
@@ -660,6 +664,36 @@ func (c *compiler) compileVal(s *ast.ValStmt) {
 		c.vars[s.Name] = valType{name: c.api.ReturnType.Name}
 	}
 	c.propagateLocalSource(s)
+}
+
+func (c *compiler) compileDestructuredLocal(statement *ast.ValStmt) {
+	initializer := *statement
+	initializer.Name = c.discardedBindingName()
+	initializer.Names = nil
+	c.compileVal(&initializer)
+	for _, name := range statement.Names {
+		c.compileLocalAlias(name, initializer.Name)
+	}
+}
+
+// Each binding gets its own slot. Keep the initialized owner's type and any
+// query metadata, including when the new binding shadows an existing name.
+func (c *compiler) compileLocalAlias(name, source string) {
+	c.writeLocalAlias(name, source)
+	if value, ok := c.vars[source]; ok {
+		c.vars[name] = value
+	} else {
+		delete(c.vars, name)
+	}
+}
+
+func (c *compiler) writeLocalAlias(name, source string) {
+	c.write("%s := %s", c.bindings.name(name), c.bindings.name(source))
+	if total := c.paginationTotals[source]; total != "" {
+		c.paginationTotals[name] = total
+	} else {
+		delete(c.paginationTotals, name)
+	}
 }
 
 func (c *compiler) compileQueryLocal(s *ast.ValStmt, expr string) {

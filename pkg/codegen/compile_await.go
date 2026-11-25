@@ -49,7 +49,7 @@ func (c *compiler) compileAwaitBindings(expr *ast.AwaitExpr, names []string, exp
 }
 
 func (c *compiler) bindAwaitResult(name string, task awaitTask) {
-	c.write("%s := %s", c.bindings.name(name), c.bindings.name(task.varName))
+	c.writeLocalAlias(name, task.varName)
 	c.vars[name] = task.valueType
 }
 
@@ -182,6 +182,7 @@ func (c *compiler) prepareAwaitBinding(destination string, statement *ast.ValStm
 	initialType := task.goType
 	local := *statement
 	local.Name = c.discardedBindingName()
+	local.Names = nil
 	sub := c.errorCompiler()
 	sub.indent = c.indent + "\t\t"
 	sub.compileVal(&local)
