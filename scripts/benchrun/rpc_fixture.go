@@ -28,7 +28,8 @@ const (
 		"\nlux-short-path-overlay-v1 " + luxFilterFixture + "=" + luxFilterProjectionSHA +
 		" " + luxDecimalFixture + "=" + luxDecimalProjectionSHA +
 		"\ncodegen-migration-state-overlay-v1 " + codegenMigrationStateFixture + "=" + codegenMigrationStateFixtureSHA +
-		" " + codegenReceiverFixture + "=" + codegenReceiverProjectionSHA
+		" " + codegenReceiverFixture + "=" + codegenReceiverProjectionSHA +
+		"\nluvia-merge-destination-overlay-v1"
 )
 
 func performanceOverlay(root, packagePath string, baseline bool) (string, func() error, error) {

@@ -91,6 +91,44 @@ func writeLuviaBenchmarkOverlay(pkg, workspace string) (string, error) {
 	return writeTestOverlay(workspace, replacements)
 }
 
+func writeLuviaMergeDestinationOverlay(pkg, workspace string) (string, error) {
+	// The merge benchmark shares the primary-key input builder and its baseline fixture.
+	fixtures := map[string]bool{
+		"merger_bench_test.go":          true,
+		"primary_keys_bench_test.go":    true,
+		"primary_keys_baseline_test.go": true,
+	}
+	entries, err := os.ReadDir(pkg)
+	if err != nil {
+		return "", err
+	}
+	replacements := make(map[string]string)
+	retained := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		path := filepath.Join(pkg, name)
+		data, err := readRegularTestFixture(path)
+		if err != nil {
+			return "", fmt.Errorf("Luvia merge destination fixture %s: %w", name, err)
+		}
+		if _, err := parseBenchmarkFixture(token.NewFileSet(), path, data); err != nil {
+			return "", err
+		}
+		if fixtures[name] {
+			retained++
+			continue
+		}
+		replacements[path] = ""
+	}
+	if retained != len(fixtures) {
+		return "", errors.New("missing Luvia merge destination test fixture")
+	}
+	return writeTestOverlay(workspace, replacements)
+}
+
 func projectLuviaFixture(path, workspace string) (string, error) {
 	data, err := readRegularTestFixture(path)
 	if err != nil {

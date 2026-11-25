@@ -99,6 +99,11 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{LuviaPackage, "BenchmarkGatewayIdentity", LuviaGatewayIdentityProfile},
 		{LuviaPackage, "BenchmarkGatewayIdentity/authenticated/after-2", LuviaGatewayIdentityProfile},
 		{LuviaPackage, "BenchmarkGatewayIdentitySibling", DefaultProfile},
+		{LuviaPackage, "BenchmarkMergeDestination", "luvia-merge-destination"},
+		{LuviaPackage, "BenchmarkMergeDestination/columnar=true/rows=1/direct=true-2", "luvia-merge-destination"},
+		{LuviaPackage, "BenchmarkMergeDestinationSibling", DefaultProfile},
+		{LuviaPackage, "BenchmarkGatewayStandardStartStop", DefaultProfile},
+		{CodegenPackage, "BenchmarkMergeDestination", DefaultProfile},
 		{CodegenPackage, "BenchmarkGatewayIdentity", DefaultProfile},
 		{LuviaPackage, "BenchmarkStaticMetricsJSON", DefaultProfile},
 		{LuviaPackage, "BenchmarkConvenienceKeyParentValidation", DefaultProfile},
@@ -124,9 +129,11 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		}
 	}
 	profiles := IsolationProfiles(LuviaPackage)
-	if len(profiles) != 2 || profiles[0] != (IsolationSpec{LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"}) ||
+	if len(profiles) != 3 || profiles[0] != (IsolationSpec{LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"}) ||
 		profiles[1] != (IsolationSpec{LuviaGatewayIdentityProfile, "^BenchmarkGatewayIdentity$"}) ||
-		ValidPerformanceProfile(CodegenPackage, LuviaGatewayIdentityProfile) {
+		profiles[2] != (IsolationSpec{"luvia-merge-destination", "^BenchmarkMergeDestination$"}) ||
+		ValidPerformanceProfile(CodegenPackage, LuviaGatewayIdentityProfile) ||
+		ValidPerformanceProfile(CodegenPackage, "luvia-merge-destination") {
 		t.Fatalf("unexpected Luvia isolation: %v", profiles)
 	}
 }

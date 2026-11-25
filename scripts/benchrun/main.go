@@ -114,6 +114,8 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-luvia-primary-trace-*", writeLuviaBenchmarkOverlay)
 	case benchlayout.LuviaGatewayIdentityProfile:
 		return packageTestOverlay(root, packagePath, "bench-luvia-gateway-identity-*", writeLuviaGatewayIdentityOverlay)
+	case benchlayout.LuviaMergeDestinationProfile:
+		return packageTestOverlay(root, packagePath, "bench-luvia-merge-destination-*", writeLuviaMergeDestinationOverlay)
 	case benchlayout.CodegenLiteralProfile:
 		return packageTestOverlay(root, packagePath, "bench-codegen-integer-literals-*", writeCodegenLiteralOverlay)
 	case benchlayout.CodegenReceiverProfile:

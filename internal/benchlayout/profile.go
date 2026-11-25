@@ -28,6 +28,9 @@ const (
 
 	CodegenMigrationStateProfile   = "codegen-migration-state"
 	CodegenMigrationStateBenchmark = "BenchmarkMigrationStateValidation"
+
+	LuviaMergeDestinationProfile   = "luvia-merge-destination"
+	LuviaMergeDestinationBenchmark = "BenchmarkMergeDestination"
 )
 
 var apiIdentityRoots = []string{
@@ -53,8 +56,11 @@ func ProfileForBenchmark(pkg, name string) string {
 			return APINonIdentityProfile
 		}
 	case LuviaPackage:
-		if root == LuviaGatewayIdentityBenchmark {
+		switch root {
+		case LuviaGatewayIdentityBenchmark:
 			return LuviaGatewayIdentityProfile
+		case LuviaMergeDestinationBenchmark:
+			return LuviaMergeDestinationProfile
 		}
 		if slices.Contains(luviaIsolatedRoots, root) {
 			return LuviaPrimaryTraceProfile
@@ -90,6 +96,7 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 		return []IsolationSpec{
 			{LuviaPrimaryTraceProfile, "^" + strings.Join(luviaIsolatedRoots, "$|^") + "$"},
 			{LuviaGatewayIdentityProfile, "^" + LuviaGatewayIdentityBenchmark + "$"},
+			{LuviaMergeDestinationProfile, "^" + LuviaMergeDestinationBenchmark + "$"},
 		}
 	case CodegenPackage:
 		return []IsolationSpec{
