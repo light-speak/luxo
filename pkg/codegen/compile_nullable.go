@@ -12,10 +12,18 @@ import (
 func (c *compiler) compileDefaultExpr(expr *ast.ElvisExpr) string {
 	result := &ast.TypeRef{Name: expr.GetTypeTag(), Nullable: expr.IsNullable(), IsList: expr.IsListType()}
 	if isNullLiteral(expr.Left) {
-		return c.compileMaterializedValue(expr.Right, result)
+		return c.compileDefaultFallback(expr, result)
 	}
 	thrown, throws := expr.Right.(*ast.UnaryExpr)
 	throws = throws && thrown.Op == "throw"
+	if await, ok := expr.Left.(*ast.AwaitExpr); ok && await.GetTypeTag() == "null" {
+		c.compileAwaitValue(await, nil)
+		if throws {
+			c.writeConditionalThrow("true", thrown.Value)
+			return "nil"
+		}
+		return c.compileDefaultFallback(expr, result)
+	}
 	booleanGuard := throws && isBoolExpr(expr.Left)
 	if !expr.Left.IsNullable() && !booleanGuard {
 		return c.compileMaterializedValue(expr.Left, result)
@@ -35,15 +43,20 @@ func (c *compiler) compileDefaultExpr(expr *ast.ElvisExpr) string {
 		sub.write("\treturn *%s", name)
 	} else {
 		sub.indent += "\t"
-		value := sub.pageBranchValue(expr.Left, name)
+		value := sub.pageBranchValue(sub.pageResult, expr.Left, name)
 		sub.write("return %s", value)
 		sub.indent = c.indent + "\t"
 	}
 	sub.write("}")
 	right := sub.compileMaterializedValue(expr.Right, result)
-	right = sub.pageBranchValue(expr.Right, right)
+	right = sub.pageBranchValue(sub.pageResult, expr.Right, right)
 	sub.write("return %s", right)
 	return c.finishValueClosure(sub, compiledFunctionGoType(result, c.models), sub.b.String())
+}
+
+func (c *compiler) compileDefaultFallback(expr *ast.ElvisExpr, result *ast.TypeRef) string {
+	value := c.compileMaterializedValue(expr.Right, result)
+	return c.pageBranchValue(c.pageBranch(expr), expr.Right, value)
 }
 
 // A throwing fallback has no value to merge, so it needs no value closure.
@@ -97,7 +110,12 @@ func nullableNullCondition(ref *ast.TypeRef, value string) string {
 
 // Nullable roots wrap the complete value, not its fields or list elements.
 func (c *compiler) compileNullableReturn(value ast.Expr, expected *ast.TypeRef) {
-	if isNullLiteral(value) {
+	if value.GetTypeTag() == "null" || isNullLiteral(value) {
+		if !isNullLiteral(value) {
+			if expression := c.compileExpectedExpr(value, expected); expression != "nil" {
+				c.write("_ = %s", expression)
+			}
+		}
 		c.write("req.Buf.B = codec.AppendNull(req.Buf.B)")
 		c.write("return nil")
 		return
@@ -136,7 +154,7 @@ func (c *compiler) compileNullableResult(name string, value ast.Expr, expected *
 // Preserve the declared nullable representation without evaluating a value twice.
 func (c *compiler) compileAssignedValue(value ast.Expr, expected *ast.TypeRef) string {
 	expression := c.compileMaterializedValue(value, expected)
-	if expected == nil || !expected.Nullable || value.IsNullable() || isNullLiteral(value) {
+	if expected == nil || !expected.Nullable || value.IsNullable() || expression == "nil" {
 		return expression
 	}
 	if expected.IsList {

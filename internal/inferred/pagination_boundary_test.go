@@ -28,6 +28,14 @@ func TestPaginationPartialASTFailsClosed(t *testing.T) {
 	}
 }
 
+func TestPaginationDestructuringWithoutAwaitBody(t *testing.T) {
+	p := paginationAnalysis{scopes: []map[string]pageValue{{"outer": {builder: "Node"}}}}
+	p.declaration(&ast.ValStmt{Names: []string{"_", "result"}, Value: &ast.AwaitExpr{}})
+	if len(p.scopes) != 1 || len(p.scopes[0]) != 1 || p.lookup("outer").builder != "Node" {
+		t.Fatalf("partial await introduced a binding: %v", p.scopes)
+	}
+}
+
 func TestPaginationBuilderMetadataAndMutation(t *testing.T) {
 	// Prepared type metadata must not disguise a database list as a manual list.
 	root := &ast.Ident{Name: "provided", TypeTagged: ast.TypeTagged{TypeTag: "NodeQueryBuilder"}}
