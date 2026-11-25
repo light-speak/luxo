@@ -18,6 +18,19 @@ write_schedule() {
     done
 }
 
+validate_raw_output() {
+    local raw=$1 expected_cpu=$2
+    test "$(grep -c '^cpu: ' "$raw")" -eq 10 &&
+        test "$(sed -n '/^cpu: /{ s/[[:blank:]]*$//; p; }' "$raw" | grep -Fxc "cpu: $expected_cpu")" -eq 10 &&
+        test "$(grep -Fxc PASS "$raw")" -eq 10
+}
+
+if [[ "${1:-}" == --verify-raw ]]; then
+    test "$#" -eq 3
+    validate_raw_output "$2" "$3"
+    exit 0
+fi
+
 if [[ "${1:-}" == --print-schedule ]]; then
     write_schedule
     exit 0
@@ -160,9 +173,7 @@ measure() {
         protocol="$out/$group"
         for side in left right; do
             raw="$protocol.$side.raw.txt"
-            test "$(grep -c '^cpu: ' "$raw")" -eq 10
-            test "$(grep -Fxc "cpu: $cpu" "$raw")" -eq 10
-            test "$(grep -Fxc PASS "$raw")" -eq 10
+            validate_raw_output "$raw" "$cpu"
             "$benchplan" --normalize "$raw" "$protocol.$side.txt"
         done
         "$benchplan" --verify "$out/expected.json" "$protocol.left.txt" "$protocol.right.txt"

@@ -127,7 +127,9 @@ def bind(cpu, directory):
 
 def smoke(cpu, directory, path):
     lines = path.read_text().splitlines()
-    assert all(row in lines for row in ("goos: linux", "goarch: amd64", f"cpu: {cpu}", "PASS"))
+    assert all(row in lines for row in ("goos: linux", "goarch: amd64", "PASS"))
+    cpu_rows = [row.rstrip(" \t") for row in lines if row.startswith("cpu: ")]
+    assert cpu_rows == [f"cpu: {cpu}"], cpu_rows
     keys = json.loads((directory / "shards.expected.json").read_text())["Base"]
     package, = {row["Package"] for row in keys}
     assert f"pkg: github.com/light-speak/luxo/{package}" in lines
