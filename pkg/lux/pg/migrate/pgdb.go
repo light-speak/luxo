@@ -74,6 +74,7 @@ type pgRows struct {
 
 func (r *pgRows) Next() bool             { return r.rows.Next() }
 func (r *pgRows) Scan(dest ...any) error { return r.rows.Scan(dest...) }
+func (r *pgRows) Err() error             { return r.rows.Err() }
 func (r *pgRows) Close()                 { r.rows.Close() }
 
 // pgTx wraps pgx.Tx to implement Tx.

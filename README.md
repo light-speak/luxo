@@ -630,12 +630,18 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 - [x] `@hidden` excluded from default SELECT (no password in API responses)
 - [x] `@by` relation directive + auto-inference (belongsTo/hasMany/hasOne)
 - [x] Migration engine (declarative diff · rename detection · safety warnings · `--dry-run`)
-- [x] Advisory lock + checksum verification + `CREATE INDEX CONCURRENTLY` auto-split
+- [x] Advisory lock + checksum verification + standalone `CREATE INDEX CONCURRENTLY` migrations
 - [x] Auth runtime (JWT sign/verify/refresh, Luvia `AuthMiddleware`, `Identity(ctx)`)
 - [x] Standard library (str · slice · math · datetime · crypto · jsonutil · httputil · convert)
 - [x] Project scaffold (`luxo init` + `luxo add` + `luxo gen` + `luxo run`)
 - [x] Pluggable dialect interface (PostgreSQL implemented; MySQL, SQLite, and MongoDB are roadmap targets)
 - [x] `luxo deploy compose` — Dockerfile + docker-compose.yml generation
+
+In PostgreSQL migrations, run each supported statement that requires execution outside a transaction, such as `CREATE INDEX CONCURRENTLY`, in its own numbered SQL file. For example, add the column in `002_add_column.sql` and create its index in `003_create_index.sql`. Write each `UP` or `DOWN` section as either ordinary transactional SQL or one standalone statement. Luxo validates the selected sections before applying or rolling back any migration. Rollback also checks each selected file against its recorded checksum when one exists. `luxo migrate up --dry-run` reads the pending plan without creating the history table or running migration SQL.
+
+If a previously applied file has a mixed `DOWN` section, leave its recorded file intact and create new compensating migrations in dependency order. When a concurrent index build fails, PostgreSQL can leave an invalid index. Inspect and resolve that index before retrying. A concurrent `CREATE INDEX IF NOT EXISTS` only counts as successful if the index is valid and belongs to the intended table.
+
+Standalone PostgreSQL statements and migration-history changes commit separately. An error can mean the statement returned without a confirmed success, PostgreSQL returned success but the history change remained uncommitted, or the history commit could not be confirmed. Check the affected database objects and the migration history before retrying.
 
 ### Phase 3 — Multi-service + Binary ✅
 - [x] Binary protocol (varint · svarint · fixed64 · field mask · columnar encoding)
