@@ -3,6 +3,7 @@ set -euo pipefail
 export LC_ALL=C GOTOOLCHAIN=local
 base=f83f9c78f9ee03a5d73b7d0a41bae5280a250bfd
 head=bb065672f26402b8f093ad2c49e00aa50da08f4e
+diagnostic_parent=9cf385827185661b843e5d5cdcf179e998e3db66
 cpu='Intel(R) Xeon(R) 6975P-C'
 package=pkg/lux/rpc
 symbols='BenchmarkRPCNilContextGuard|beforeNilContextGuard|beforeAuthenticationRecovery|Server\)\.(requestContext|verifyRequestContext)'
@@ -20,9 +21,10 @@ test "$(sed -n 's/^actual=//p' "$evidence/runner-route.txt")" = "$cpu"
 test "$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | sed 's/[[:space:]]*$//')" = "$cpu"
 test "$(go env GOVERSION GOOS GOARCH GOAMD64 CGO_ENABLED)" = $'go1.27.1\nlinux\namd64\nv1\n1'
 test -z "$(go env GOFLAGS)"
-test "$(g "$control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $head"
-diff -u <(printf 'A\t%s\n' .github/workflows/diagnose-pr81-nil-context.yml scripts/diagnose-pr81-nil-context.sh) \
-    <(g "$control" diff --name-status "$head" HEAD)
+test "$(g "$control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $diagnostic_parent"
+test "$(g "$control" cat-file commit "$diagnostic_parent" | sed -n 's/^parent //p')" = "$head"
+diff -u <(printf 'M\t%s\n' scripts/diagnose-pr81-nil-context.sh) \
+    <(g "$control" diff --name-status "$diagnostic_parent" HEAD)
 test "$(g "$base_checkout" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$base" 0f97d642325769e2882fd0235c1575af71e3fc3c)"
 test "$(g "$head_git" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$head" 8e978e8329322d891dc1f57c03bcc956de90f6b0)"
 test "$(g "$head_git" cat-file commit "$head" | sed -n 's/^parent //p')" = \
@@ -62,7 +64,7 @@ trap 'exit 143' TERM
 input="$scratch/input"
 tools="$scratch/bin"
 head_archive="$scratch/head"
-mkdir -p "$input" "$tools"/{base,head} "$head_archive" "$scratch/tmp"
+mkdir -p "$input" "$tools"/{base,head} "$head_archive/.tmp" "$base_checkout/.tmp" "$scratch/tmp"
 export TMPDIR="$scratch/tmp" GOTMPDIR="$scratch/tmp" GOCACHE="$scratch/go-cache"
 gh api repos/light-speak/luxo/actions/runs/45811273426/attempts/1 > "$evidence/original-run.json"
 gh api repos/light-speak/luxo/actions/artifacts/15114528645 > "$evidence/original-metadata.json"
