@@ -1,0 +1,44 @@
+name: Dart release on Windows
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/dart/**'
+      - '.github/workflows/dart-release-windows.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packages/dart/**'
+      - '.github/workflows/dart-release-windows.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dart-release-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: packages/dart
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.13.4'
+
+      - name: Install dependencies
+        run: dart pub get
+
+      - name: Verify release artifact ownership and publication
+        run: >-
+          dart test --concurrency=1 --reporter expanded test/artifact_publish_test.dart test/selection_build_test.dart
+          --name '^((prepared |two prepared |closed prepared ).*|release output rejects overwrites and escapes before creating directories|build publication accepts an ordinary in-project temporary alias|build close releases an unconsumed prepared output|closing build rejects an in-flight output preparation|release compilation failure publishes no artifact and cleans the snapshot|build ownership accepts a trailing directory separator|release publication preserves an output created after validation|release publication reports a missing artifact error|AOT artifact retains call-site selections after snapshot cleanup|native refresh preserves distinct source names beginning with U\+FEFF|snapshot source filter preserves escaped native name identity|snapshot workspace uses the exact project folder)$'

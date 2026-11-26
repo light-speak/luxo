@@ -42,6 +42,70 @@ func TestDeployGeneratesProjectArtifacts(t *testing.T) {
 	}
 }
 
+func TestDeployComposeUsesGenerationBackendSelection(t *testing.T) {
+	for _, selection := range []string{"dotenv", "memory", "invalid"} {
+		t.Run(selection, func(t *testing.T) {
+			prepareDeployProject(t, "example.com/deploy-probe")
+			writeCoverageFile(t, "origin/watch.luxo", "api watchValue(): Int @stream @native\n")
+			writeCoverageFile(t, ".env", "LUXO_EVENT_BACKEND=nats\n")
+			t.Setenv("LUXO_QUEUE_BACKEND", "none")
+			t.Setenv("LUXO_CACHE_BACKEND", "none")
+			t.Setenv("LUXO_EVENT_BACKEND", selection)
+			if selection == "dotenv" {
+				if err := os.Unsetenv("LUXO_EVENT_BACKEND"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			output, err := captureCLIResponse(t, func() error { return runDeploy(nil, []string{"compose"}) })
+			if selection == "invalid" {
+				if err == nil || !strings.Contains(err.Error(), "unsupported events backend") || output != "" {
+					t.Fatalf("invalid selection: error=%v output=%q", err, output)
+				}
+				for _, file := range []string{"Dockerfile", "docker-compose.yml"} {
+					if _, err := os.Stat(file); !os.IsNotExist(err) {
+						t.Fatalf("invalid selection wrote %s: %v", file, err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile("docker-compose.yml")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if selection == "dotenv" {
+				want = 2 // The stream module and gateway both construct the event bus.
+			}
+			if got := strings.Count(string(data), "NATS_URL: nats://nats:4222"); got != want {
+				t.Fatalf("NATS consumers = %d, want %d:\n%s", got, want, data)
+			}
+		})
+	}
+}
+
+func TestDeployHelmUsesGenerationBackendSelection(t *testing.T) {
+	prepareDeployProject(t, "example.com/deploy-probe")
+	writeCoverageFile(t, "origin/watch.luxo", "api watchValue(): Int @stream @native\n")
+	writeCoverageFile(t, "origin/read.luxo", `api readValue(): Int @cache(policy: "preview") { return 1 }`)
+	writeCoverageFile(t, "luxo.cache.json", `{"version":1,"policies":{"preview":{"mode":"ttl","ttl":"1m"}}}`)
+	t.Setenv("LUXO_EVENT_BACKEND", "nats")
+	t.Setenv("LUXO_QUEUE_BACKEND", "nats")
+	t.Setenv("LUXO_CACHE_BACKEND", "redis")
+	if _, err := captureCLIResponse(t, func() error { return runDeploy(nil, []string{"helm"}) }); err != nil {
+		t.Fatal(err)
+	}
+	root := "deploy/helm/templates/"
+	assertDeployArtifactContains(t, root+"gateway-deployment.yaml", "name: NATS_URL")
+	assertDeployArtifactContains(t, root+"module-watch-deployment.yaml", "name: NATS_URL")
+	assertDeployArtifactContains(t, root+"module-user-deployment.yaml", "name: NATS_URL")
+	assertDeployArtifactContains(t, root+"module-read-deployment.yaml", "name: NATS_URL", "name: REDIS_URL",
+		"name: LUXO_CACHE_PROJECT", "name: LUXO_CACHE_ENVIRONMENT", "name: LUXO_CACHE_REVISION",
+		"name: LUXO_CACHE_ORIGIN_CONCURRENCY", "name: LUXO_CACHE_ORIGIN_MAX_WAITERS", "name: LUXO_CACHE_ORIGIN_WAIT_TIMEOUT")
+}
+
 func prepareDeployProject(t *testing.T, module string) {
 	t.Helper()
 	enterCacheGenerationScratch(t)

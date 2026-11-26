@@ -2,6 +2,7 @@ package auth
 
 import (
 	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -26,7 +27,7 @@ func legacySignReference(cfg *Config, data map[string]any) (string, error) {
 		return "", err
 	}
 	payloadB64 := base64Encode(payload)
-	sig := hmacSign(header+"."+payloadB64, cfg.Secret)
+	sig := legacyHMACSign(header+"."+payloadB64, cfg.Secret)
 	return header + "." + payloadB64 + "." + sig, nil
 }
 
@@ -35,7 +36,7 @@ func legacyVerifyReference(cfg *Config, token string) (map[string]any, error) {
 	if len(parts) != 3 {
 		return nil, fmt.Errorf("invalid token format")
 	}
-	expected := hmacSign(parts[0]+"."+parts[1], cfg.Secret)
+	expected := legacyHMACSign(parts[0]+"."+parts[1], cfg.Secret)
 	if !hmac.Equal([]byte(parts[2]), []byte(expected)) {
 		return nil, fmt.Errorf("invalid signature")
 	}
@@ -51,6 +52,12 @@ func legacyVerifyReference(cfg *Config, token string) (map[string]any, error) {
 		return nil, fmt.Errorf("token expired")
 	}
 	return claims.Data, nil
+}
+
+func legacyHMACSign(message, secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(message))
+	return base64Encode(mac.Sum(nil))
 }
 
 var staticTokenSink string
@@ -80,11 +87,17 @@ func BenchmarkStaticJWT(b *testing.B) {
 		b.Fatal(err)
 	}
 	for _, phase := range []string{"Sign", "Verify", "Identity"} {
-		for _, revision := range []string{"Before", "After"} {
-			b.Run(phase+"/"+revision, func(b *testing.B) {
-				benchmarkStaticJWTPhase(b, cfg, data, writer, token, phase, revision == "Before")
-			})
+		legacyName := "Before"
+		if phase != "Identity" {
+			// Distinguish the frozen HMAC workload from the old Before fixture.
+			legacyName = "LegacyHMAC"
 		}
+		b.Run(phase+"/"+legacyName, func(b *testing.B) {
+			benchmarkStaticJWTPhase(b, cfg, data, writer, token, phase, true)
+		})
+		b.Run(phase+"/After", func(b *testing.B) {
+			benchmarkStaticJWTPhase(b, cfg, data, writer, token, phase, false)
+		})
 	}
 }
 

@@ -127,12 +127,11 @@ func (g *Gateway) serve(version string, quit <-chan os.Signal) (serveResult erro
 	}
 	addr := ":" + port
 
-	// Start metrics collection + gateway registration if Studio is configured
+	// Install metrics before the server can receive requests.
 	g.metrics = NewMetricsCollector()
 	if g.metrics != nil {
 		g.Router.SetMetricsCollector(g.metrics)
 	}
-	g.registrar = newGatewayRegistrarWithDependencyStats(port, version, g.dependencyStats)
 	defer g.closeIntegrations()
 
 	certFile := envOr("APP_TLS_CERT", "")
@@ -142,6 +141,9 @@ func (g *Gateway) serve(version string, quit <-chan os.Signal) (serveResult erro
 	if err != nil {
 		return err
 	}
+	// Report the TCP listener's port, including when the OS chose it.
+	addr = server.Addr[strings.LastIndexByte(server.Addr, ':'):]
+	g.registrar = newGatewayRegistrarWithDependencyStats(addr[1:], version, g.dependencyStats)
 	if certFile != "" && keyFile != "" {
 		fmt.Printf("  Listening on https://localhost%s (HTTP/2 + TLS)\n\n", addr)
 	} else {
@@ -188,6 +190,10 @@ func startGatewayServerWithBodyLimits(addr string, mux http.Handler, certFile, k
 	if err != nil {
 		return nil, nil, err
 	}
+	useTLS := certFile != ""
+	if useTLS != (keyFile != "") {
+		return nil, nil, fmt.Errorf("APP_TLS_CERT and APP_TLS_KEY must be configured together")
+	}
 	h2, err := newGatewayHTTPTransport(mux, timeouts, body)
 	if err != nil {
 		return nil, nil, err
@@ -210,7 +216,7 @@ func startGatewayServerWithBodyLimits(addr string, mux http.Handler, certFile, k
 		protocols.SetUnencryptedHTTP2(true)
 		server.Protocols = protocols
 	}
-	if certFile != "" && keyFile != "" {
+	if useTLS {
 		certificate, loadErr := tls.LoadX509KeyPair(certFile, keyFile)
 		if loadErr != nil {
 			listener.Close()
@@ -219,7 +225,7 @@ func startGatewayServerWithBodyLimits(addr string, mux http.Handler, certFile, k
 		server.Handler = mux
 		server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
 	}
-	return startConfiguredGatewayServer(listener, server, h2, certFile != "" && keyFile != "")
+	return startConfiguredGatewayServer(listener, server, h2, useTLS)
 }
 
 type serverTimeouts struct {

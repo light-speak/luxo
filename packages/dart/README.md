@@ -422,8 +422,11 @@ dart run luxo_client:build --entry bin/main.dart --compile exe --output .tmp/rel
 ```
 
 The output is project-relative, must not already exist, and is published only
-after compilation succeeds. The temporary source snapshot is removed; the
-executable remains runnable and the original business source is unchanged.
+after compilation succeeds. Its parent directory is prepared before compilation
+and kept open until publication. Directory aliases are resolved during preparation;
+publication uses that prepared directory rather than resolving the alias again.
+The temporary source snapshot is removed; the executable remains runnable and
+the original business source is unchanged.
 This is Dart native AOT, not Flutter packaging or cross-compilation.
 
 Your code, for an API with an `Int` parameter named `id`:

@@ -1,6 +1,7 @@
 package h2transport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -8,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +18,144 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
+
+func TestHandlerBodylessResponsesKeepRealConnectionUsable(t *testing.T) {
+	metadata := strings.Repeat("~", 15<<10)
+	server, conn := newHandlerTestTCP(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := w.(*response); !ok {
+			t.Error("request bypassed the dedicated HTTP/2 writer")
+		}
+		switch r.URL.Path {
+		case "/head":
+			w.Header().Set("X-Response-Metadata", metadata)
+			_, _ = io.WriteString(w, "body")
+		case "/no-content":
+			w.Header().Set("Content-Length", "4")
+			w.WriteHeader(http.StatusNoContent)
+			_, _ = io.WriteString(w, "body")
+		case "/reset-content":
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusResetContent)
+			_, _ = io.WriteString(w, "body")
+		case "/not-modified":
+			w.Header().Set("ETag", `"beta"`)
+			if r.Header.Get("If-None-Match") == `"beta"` {
+				w.Header().Set("Content-Length", "24")
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			_, _ = io.WriteString(w, strings.Repeat("x", 24))
+		case "/healthy":
+			_, _ = io.WriteString(w, "healthy")
+		}
+	}))
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(conn, http2.ClientPreface); err != nil {
+		t.Fatal(err)
+	}
+	peer := http2.NewFramer(conn, conn)
+	peer.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+	if err := peer.WriteSettings(); err != nil {
+		t.Fatal(err)
+	}
+	for i, sample := range []handlerPeerExpectation{
+		{method: http.MethodHead, path: "/head", status: http.StatusOK, length: "4", metadata: metadata},
+		{method: http.MethodGet, path: "/no-content", status: http.StatusNoContent},
+		{method: http.MethodGet, path: "/not-modified", status: http.StatusNotModified, length: "24", etag: `"beta"`},
+		{method: http.MethodGet, path: "/reset-content", status: http.StatusResetContent, length: "0"},
+		{method: http.MethodGet, path: "/healthy", status: http.StatusOK, length: "7", body: "healthy"},
+	} {
+		t.Run(strings.TrimPrefix(sample.path, "/"), func(t *testing.T) {
+			assertHandlerPeerResponse(t, peer, uint32(2*i+1), sample)
+		})
+	}
+	ping := [8]byte{1}
+	if err := peer.WritePing(false, ping); err != nil {
+		t.Fatal(err)
+	}
+	frame := readHandlerPeerFrame(t, peer)
+	if reply, ok := frame.(*http2.PingFrame); !ok || !reply.IsAck() || reply.Data != ping {
+		t.Fatalf("connection did not acknowledge ping: %v", frame)
+	}
+	if server.budget.used.Load() != 0 || server.streams.used.Load() != 0 {
+		t.Fatal("live connection retained response or stream capacity", server.budget.used.Load(), server.streams.used.Load())
+	}
+}
+
+type handlerPeerExpectation struct {
+	method, path, length, etag, metadata, body string
+	status                                     int
+}
+
+func assertHandlerPeerResponse(t *testing.T, peer *http2.Framer, id uint32, sample handlerPeerExpectation) {
+	t.Helper()
+	head := readHandlerPeerHeaders(t, peer, id, sample.method, sample.path)
+	if head.PseudoValue("status") != strconv.Itoa(sample.status) || head.StreamEnded() != (sample.body == "") {
+		t.Fatalf("status=%q end-stream=%t", head.PseudoValue("status"), head.StreamEnded())
+	}
+	headers := make(http.Header)
+	for _, field := range head.RegularFields() {
+		headers.Add(field.Name, field.Value)
+	}
+	if headers.Get("Content-Length") != sample.length || headers.Get("ETag") != sample.etag || headers.Get("X-Response-Metadata") != sample.metadata {
+		t.Fatalf("Content-Length=%q ETag=%q metadata bytes=%d", headers.Get("Content-Length"), headers.Get("ETag"), len(headers.Get("X-Response-Metadata")))
+	}
+	if sample.body == "" {
+		return
+	}
+	frame := readHandlerPeerFrame(t, peer)
+	data, ok := frame.(*http2.DataFrame)
+	if !ok || data.StreamID != id || !data.StreamEnded() || string(data.Data()) != sample.body {
+		t.Fatalf("healthy GET did not finish with its body: %v", frame)
+	}
+}
+
+func readHandlerPeerHeaders(t *testing.T, peer *http2.Framer, id uint32, method, path string) *http2.MetaHeadersFrame {
+	t.Helper()
+	var block bytes.Buffer
+	encoder := hpack.NewEncoder(&block)
+	for _, field := range []hpack.HeaderField{
+		{Name: ":method", Value: method}, {Name: ":scheme", Value: "http"},
+		{Name: ":authority", Value: "example.test"}, {Name: ":path", Value: path},
+		{Name: "if-none-match", Value: `"beta"`},
+	} {
+		if err := encoder.WriteField(field); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := peer.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block.Bytes(), EndHeaders: true, EndStream: true}); err != nil {
+		t.Fatal(err)
+	}
+	frame := readHandlerPeerFrame(t, peer)
+	head, ok := frame.(*http2.MetaHeadersFrame)
+	if !ok || head.StreamID != id || head.Truncated {
+		t.Fatalf("wanted response headers for stream %d: %v", id, frame)
+	}
+	return head
+}
+
+func readHandlerPeerFrame(t *testing.T, peer *http2.Framer) http2.Frame {
+	t.Helper()
+	for {
+		frame, err := peer.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch settings := frame.(type) {
+		case *http2.SettingsFrame:
+			if !settings.IsAck() {
+				if err := peer.WriteSettingsAck(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		case *http2.WindowUpdateFrame:
+		default:
+			return frame
+		}
+	}
+}
 
 func TestWorkerGoexitReleasesResponseAndAbortsStream(t *testing.T) {
 	for _, transfer := range []bool{false, true} {
@@ -59,7 +200,7 @@ func TestHandlerGoexitKeepsPeerAndWorkersUsable(t *testing.T) {
 	entered := make(chan struct{})
 	hold, release := context.WithCancel(t.Context())
 	defer release()
-	server, peer := goexitTestPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server, peer := newHandlerTestPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/hold":
 			close(entered)
@@ -77,14 +218,14 @@ func TestHandlerGoexitKeepsPeerAndWorkersUsable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	held := make(chan error, 1)
-	go func() { held <- readHealthyGoexitPeer(ctx, peer, "/hold") }()
+	go func() { held <- readHealthyHandlerPeer(ctx, peer, "/hold") }()
 	select {
 	case <-entered:
 	case <-ctx.Done():
 		t.Fatal("unrelated stream did not start")
 	}
 	assertGoexitStreamResets(t, ctx, peer)
-	if err := readHealthyGoexitPeer(ctx, peer, "/healthy"); err != nil {
+	if err := readHealthyHandlerPeer(ctx, peer, "/healthy"); err != nil {
 		t.Fatal("Goexit exhausted workers or closed the peer", err)
 	}
 	release()
@@ -100,7 +241,52 @@ func TestHandlerGoexitKeepsPeerAndWorkersUsable(t *testing.T) {
 	}
 }
 
-func goexitTestPeer(t *testing.T, handler http.Handler) (*Server, *http2.ClientConn) {
+func TestHandlerInvalidResponseHeaderResetsOnlyItsStream(t *testing.T) {
+	server, peer := newHandlerTestPeer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/invalid" {
+			w.Header().Set("Content-Length", "1")
+		}
+		_, _ = io.WriteString(w, "healthy")
+	}))
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://example.test/invalid", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := peer.RoundTrip(request)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	var streamErr http2.StreamError
+	if !errors.As(err, &streamErr) || streamErr.Code != http2.ErrCodeInternal {
+		t.Fatalf("invalid response did not reset only its stream: %v", err)
+	}
+	if err := readHealthyHandlerPeer(ctx, peer, "/healthy"); err != nil {
+		t.Fatal("invalid response closed the connection:", err)
+	}
+	_ = peer.Close()
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if server.budget.used.Load() != 0 || server.streams.used.Load() != 0 {
+		t.Fatal("invalid response retained stream or body capacity")
+	}
+}
+
+func newHandlerTestPeer(t *testing.T, handler http.Handler) (*Server, *http2.ClientConn) {
+	t.Helper()
+	server, conn := newHandlerTestTCP(t, handler)
+	transport := &http2.Transport{}
+	peer, err := transport.NewClientConn(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	return server, peer
+}
+
+func newHandlerTestTCP(t *testing.T, handler http.Handler) (*Server, net.Conn) {
 	t.Helper()
 	server, err := NewServer(handler)
 	if err != nil {
@@ -116,14 +302,8 @@ func goexitTestPeer(t *testing.T, handler http.Handler) (*Server, *http2.ClientC
 	if err != nil {
 		t.Fatal(err)
 	}
-	transport := &http2.Transport{}
-	peer, err := transport.NewClientConn(conn)
-	if err != nil {
-		_ = conn.Close()
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = peer.Close() })
-	return server, peer
+	t.Cleanup(func() { _ = conn.Close() })
+	return server, conn
 }
 
 func assertGoexitStreamResets(t *testing.T, ctx context.Context, peer *http2.ClientConn) {
@@ -144,7 +324,7 @@ func assertGoexitStreamResets(t *testing.T, ctx context.Context, peer *http2.Cli
 	}
 }
 
-func readHealthyGoexitPeer(ctx context.Context, peer *http2.ClientConn, path string) error {
+func readHealthyHandlerPeer(ctx context.Context, peer *http2.ClientConn, path string) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://example.test"+path, nil)
 	if err != nil {
 		return err
@@ -188,6 +368,84 @@ func TestHandlerBridgeMetadataAndErrors(t *testing.T) {
 	task.cancel()
 	if _, err := c.execute(task); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
+	}
+}
+
+func TestHandlerBodylessResponsesEndWithHeaders(t *testing.T) {
+	for _, sample := range []struct {
+		name, method, declaredLength, wireLength string
+		status                                   int
+		writeErr                                 error
+	}{
+		{name: "HEAD inferred", method: http.MethodHead, status: http.StatusOK, wireLength: "4"},
+		{name: "HEAD declared", method: http.MethodHead, status: http.StatusOK, declaredLength: "24", wireLength: "24"},
+		{name: "204", method: http.MethodPost, status: http.StatusNoContent, declaredLength: "4", writeErr: http.ErrBodyNotAllowed},
+		{name: "205", method: http.MethodPost, status: http.StatusResetContent, declaredLength: "0", wireLength: "0", writeErr: http.ErrBodyNotAllowed},
+		{name: "304", method: http.MethodGet, status: http.StatusNotModified, writeErr: http.ErrBodyNotAllowed},
+		{name: "304 declared", method: http.MethodGet, status: http.StatusNotModified, declaredLength: "24", wireLength: "24", writeErr: http.ErrBodyNotAllowed},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			c, task, _ := workerFixture(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("X-Response-Metadata", "value")
+				if sample.declaredLength != "" {
+					w.Header().Set("Content-Length", sample.declaredLength)
+				}
+				w.WriteHeader(sample.status)
+				buffer := &api.ResponseBuf{B: []byte("binary")}
+				if w.(*response).TakeBinaryResponse(buffer) || string(buffer.B) != "binary" {
+					t.Error("bodyless response took ownership of the caller's buffer")
+				}
+				n, err := io.WriteString(w, "body")
+				if !errors.Is(err, sample.writeErr) || (err == nil && n != 4) || (err != nil && n != 0) {
+					t.Errorf("Write = %d, %v", n, err)
+				}
+			}))
+			task.request.head.method = sample.method
+			result, err := c.execute(task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer result.release()
+			if len(result.body) != 0 {
+				t.Errorf("captured %d bytes for a bodyless response", len(result.body))
+			}
+			assertBodylessResponseWire(t, result, sample.wireLength)
+		})
+	}
+}
+
+func assertBodylessResponseWire(t *testing.T, result *response, wantLength string) {
+	t.Helper()
+	var wire bytes.Buffer
+	q, _ := newDataQueue(1, 4096, func([]byte) {})
+	w := newControlWriter(newDataWriter(q, &wire, 4096))
+	if err := w.apply(controlCommand{kind: openStreamCommand, streamID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.writeResponse(1, result); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.data.buffer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	reader := http2.NewFramer(nil, &wire)
+	reader.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+	frame, err := reader.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, ok := frame.(*http2.MetaHeadersFrame)
+	if !ok || !head.StreamEnded() || wire.Len() != 0 || len(q.streams) != 0 {
+		t.Fatalf("bodyless response did not finish with its headers: %v wire=%d streams=%d", frame, wire.Len(), len(q.streams))
+	}
+	var length string
+	for _, field := range head.RegularFields() {
+		if field.Name == "content-length" {
+			length = field.Value
+		}
+	}
+	if length != wantLength {
+		t.Errorf("Content-Length = %q, want %q", length, wantLength)
 	}
 }
 

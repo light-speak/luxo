@@ -62,14 +62,14 @@ class LuxoHttp2Client extends http.BaseClient {
         ),
       );
     }
+    final url = request.url;
     if (_closed ||
-        request.url.userInfo.isNotEmpty ||
-        request.url.origin != endpoint.origin) {
+        url.scheme != 'https' ||
+        url.userInfo.isNotEmpty ||
+        url.host != endpoint.host ||
+        url.port != endpoint.port) {
       return Future.error(
-        http.ClientException(
-          'HTTP/2 client closed or origin mismatch',
-          request.url,
-        ),
+        http.ClientException('HTTP/2 client closed or origin mismatch', url),
       );
     }
     if (_pending.length >= maxConcurrentRequests) {

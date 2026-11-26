@@ -70,3 +70,127 @@ func layoutFixture(t *testing.T) string {
 	})
 	return root
 }
+
+func TestCodecReaderProfileRequiresPackageAndExactRoot(t *testing.T) {
+	for _, tc := range []struct{ pkg, name, want string }{
+		{CodecPackage, CodecReaderBenchmark, CodecReaderProfile},
+		{CodecPackage, CodecReaderBenchmark + "/x-2", CodecReaderProfile},
+		{CodecPackage, "BenchmarkMissingElementPayload", DefaultProfile},
+		{"pkg/lux/schema", CodecReaderBenchmark, DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	if ValidPerformanceProfile("pkg/lux/rpc", CodecReaderProfile) || ValidPerformanceProfile(CodecPackage, "bogus") {
+		t.Fatal("accepted a profile outside its package or registry")
+	}
+}
+
+func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
+	for _, tc := range []struct{ pkg, name, want string }{
+		{APIPackage, "BenchmarkIdentityConditionValidity/member/EnumChecked-2", DefaultProfile},
+		{APIPackage, "BenchmarkIdentityEnumArray", DefaultProfile},
+		{APIPackage, "BenchmarkIdentitySubjectVisibility", DefaultProfile},
+		{APIPackage, "BenchmarkIdentitySurface", APINonIdentityProfile},
+		{APIPackage, "BenchmarkLocalRouteExport", "api-local-route-export"},
+		{APIPackage, "BenchmarkLocalRouteExport/routes=128/previous-2", "api-local-route-export"},
+		{APIPackage, "BenchmarkLocalRouteLookup", APINonIdentityProfile},
+		{APIPackage, "BenchmarkLocalRouteExportSibling", APINonIdentityProfile},
+		{APIPackage, "BenchmarkCanonicalJSONBytes", APINonIdentityProfile},
+		{LuviaPackage, "BenchmarkPrimaryKeys/row-small/keyLast=false/baseline=true-2", LuviaPrimaryTraceProfile},
+		{LuviaPackage, "BenchmarkTraceEncodingComparison", LuviaPrimaryTraceProfile},
+		{LuviaPackage, "BenchmarkGatewayIdentity", LuviaGatewayIdentityProfile},
+		{LuviaPackage, "BenchmarkGatewayIdentity/authenticated/after-2", LuviaGatewayIdentityProfile},
+		{LuviaPackage, "BenchmarkGatewayIdentitySibling", DefaultProfile},
+		{LuviaPackage, "BenchmarkMergeDestination", "luvia-merge-destination"},
+		{LuviaPackage, "BenchmarkMergeDestination/columnar=true/rows=1/direct=true-2", "luvia-merge-destination"},
+		{LuviaPackage, "BenchmarkMergeDestinationSibling", DefaultProfile},
+		{LuviaPackage, "BenchmarkGatewayStandardStartStop", DefaultProfile},
+		{CodegenPackage, "BenchmarkMergeDestination", DefaultProfile},
+		{CodegenPackage, "BenchmarkGatewayIdentity", DefaultProfile},
+		{LuviaPackage, "BenchmarkStaticMetricsJSON", DefaultProfile},
+		{LuviaPackage, "BenchmarkConvenienceKeyParentValidation", DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	for _, tc := range []struct{ pkg, profile, filter string }{
+		{CodecPackage, CodecReaderProfile, "."},
+		{"pkg/lux/rpc", "", ""},
+	} {
+		got := IsolationProfiles(tc.pkg)
+		if tc.profile == "" {
+			if len(got) != 0 {
+				t.Fatalf("unexpected isolation for %s: %v", tc.pkg, got)
+			}
+			continue
+		}
+		if len(got) != 1 || got[0] != (IsolationSpec{tc.profile, tc.filter}) {
+			t.Fatalf("isolation of %s = %v, want %q %q", tc.pkg, got, tc.profile, tc.filter)
+		}
+	}
+	apiProfiles := IsolationProfiles(APIPackage)
+	if len(apiProfiles) != 2 || apiProfiles[0] != (IsolationSpec{APINonIdentityProfile, "."}) ||
+		apiProfiles[1] != (IsolationSpec{"api-local-route-export", "^BenchmarkLocalRouteExport$"}) {
+		t.Fatalf("unexpected API profiles: %v", apiProfiles)
+	}
+	profiles := IsolationProfiles(LuviaPackage)
+	if len(profiles) != 3 || profiles[0] != (IsolationSpec{LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"}) ||
+		profiles[1] != (IsolationSpec{LuviaGatewayIdentityProfile, "^BenchmarkGatewayIdentity$"}) ||
+		profiles[2] != (IsolationSpec{"luvia-merge-destination", "^BenchmarkMergeDestination$"}) ||
+		ValidPerformanceProfile(CodegenPackage, LuviaGatewayIdentityProfile) ||
+		ValidPerformanceProfile(CodegenPackage, "luvia-merge-destination") {
+		t.Fatalf("unexpected Luvia isolation: %v", profiles)
+	}
+}
+
+func TestCodegenProfilesRequirePackageAndExactRoots(t *testing.T) {
+	const migration, migrationProfile = "BenchmarkMigrationStateValidation", "codegen-migration-state"
+	for _, tc := range []struct{ pkg, name, want string }{
+		{CodegenPackage, CodegenLiteralBenchmark, CodegenLiteralProfile},
+		{CodegenPackage, CodegenLiteralBenchmark + "/duration_plain-2", CodegenLiteralProfile},
+		{CodegenPackage, CodegenReceiverBenchmark, CodegenReceiverProfile},
+		{CodegenPackage, CodegenReceiverBenchmark + "/用户-2", CodegenReceiverProfile},
+		{CodegenPackage, CodegenReceiverBenchmark + "Sibling-2", DefaultProfile},
+		{CodegenPackage, migration, migrationProfile},
+		{CodegenPackage, migration + "/empty/validate-2", migrationProfile},
+		{CodegenPackage, migration + "Sibling-2", DefaultProfile},
+		{CodegenPackage, "BenchmarkGenerateNumericLiteralBindings/plain-2", DefaultProfile},
+		{CodecPackage, CodegenLiteralBenchmark, DefaultProfile},
+		{CodecPackage, CodegenReceiverBenchmark, DefaultProfile},
+		{CodecPackage, migration, DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	profiles := IsolationProfiles(CodegenPackage)
+	if len(profiles) != 3 || profiles[0] != (IsolationSpec{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"}) ||
+		profiles[1] != (IsolationSpec{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"}) ||
+		profiles[2] != (IsolationSpec{migrationProfile, "^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$"}) ||
+		ValidPerformanceProfile(CodecPackage, CodegenLiteralProfile) ||
+		ValidPerformanceProfile(CodecPackage, CodegenReceiverProfile) || ValidPerformanceProfile(CodecPackage, migrationProfile) {
+		t.Fatalf("unexpected codegen isolation: %v", profiles)
+	}
+}
+
+func TestLuxShortPathProfileRequiresPackageAndExactRoots(t *testing.T) {
+	for _, tc := range []struct{ pkg, name, want string }{
+		{LuxPackage, LuxStrictFilterBenchmark, LuxShortPathProfile},
+		{LuxPackage, LuxDecimalAlignmentBenchmark + "/Add/zero/after-2", LuxShortPathProfile},
+		{LuxPackage, LuxStrictFilterBenchmark + "Sibling-2", DefaultProfile},
+		{LuxPackage, "BenchmarkDecimalPrecision-2", DefaultProfile},
+		{CodecPackage, LuxDecimalAlignmentBenchmark, DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	profiles := IsolationProfiles(LuxPackage)
+	want := []IsolationSpec{{LuxShortPathProfile, "^BenchmarkStrictFilterContract$|^BenchmarkDecimalAlignment$"}}
+	if !reflect.DeepEqual(profiles, want) || ValidPerformanceProfile(CodecPackage, LuxShortPathProfile) {
+		t.Fatalf("unexpected Lux isolation: %v", profiles)
+	}
+}

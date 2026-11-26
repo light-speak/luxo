@@ -6,6 +6,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/light-speak/luxo/internal/builtin"
@@ -1690,6 +1691,10 @@ func (g *GeneratorContext) writeAPIRegistration(b *strings.Builder, name string,
 	g.writeAPIParameterRegistration(b, name, g.requestParams[name], firstBoolSet(enumSets))
 }
 
+// Reserve enough space in the stack buffer for the fixed syntax and the field ID.
+// Longer identifiers keep fmt's pooled formatting buffer.
+const registryIdentifierStackLimit = 40
+
 func (g *GeneratorContext) writeAPIParameterRegistration(b *strings.Builder, name string, declarations []*ast.ParamDecl, enums map[string]bool) {
 	params := g.apiParamIDs(name)
 	if len(params) == 0 {
@@ -1699,7 +1704,11 @@ func (g *GeneratorContext) writeAPIParameterRegistration(b *strings.Builder, nam
 		declaration *ast.ParamDecl
 		id          int
 	}
-	registered := make([]registeredParam, 0, len(params))
+	var workspace [8]registeredParam
+	registered := workspace[:0]
+	if len(params) > len(workspace) {
+		registered = make([]registeredParam, 0, len(params))
+	}
 	for _, param := range declarations {
 		if id := params[param.Name]; id > 0 {
 			registered = append(registered, registeredParam{declaration: param, id: id})
@@ -1709,7 +1718,15 @@ func (g *GeneratorContext) writeAPIParameterRegistration(b *strings.Builder, nam
 		return
 	}
 	slices.SortFunc(registered, func(a, b registeredParam) int { return cmp.Compare(a.id, b.id) })
-	fmt.Fprintf(b, "\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{\n", name)
+	const opening, closing = "\tif err := router.Registry.RegisterParams(", ", []api.ParamMeta{\n"
+	if len(name) > registryIdentifierStackLimit {
+		fmt.Fprintf(b, opening+"%q"+closing, name)
+	} else {
+		var scratch [128]byte
+		prefix := append(scratch[:0], opening...)
+		prefix = strconv.AppendQuote(prefix, name)
+		b.Write(append(prefix, closing...))
+	}
 	for _, param := range registered {
 		g.writeRegisteredParam(b, param.declaration, param.id, enums)
 	}
@@ -1717,7 +1734,17 @@ func (g *GeneratorContext) writeAPIParameterRegistration(b *strings.Builder, nam
 }
 
 func writeRegistryRoute(b *strings.Builder, name string, id int) {
-	fmt.Fprintf(b, "\tif err := router.Registry.Register(%q, %d); err != nil { return err }\n", name, id)
+	const opening, closing = "\tif err := router.Registry.Register(", "); err != nil { return err }\n"
+	if len(name) > registryIdentifierStackLimit {
+		fmt.Fprintf(b, opening+"%q, %d"+closing, name, id)
+		return
+	}
+	var scratch [128]byte
+	line := append(scratch[:0], opening...)
+	line = strconv.AppendQuote(line, name)
+	line = append(line, ", "...)
+	line = strconv.AppendInt(line, int64(id), 10)
+	b.Write(append(line, closing...))
 }
 
 func (g *GeneratorContext) writeRegisteredParam(b *strings.Builder, param *ast.ParamDecl, id int, enums map[string]bool) {
@@ -1725,11 +1752,26 @@ func (g *GeneratorContext) writeRegisteredParam(b *strings.Builder, param *ast.P
 	if g.sealedDeclaration(param.Type.Name) != nil {
 		wireType, typeName = "Sealed", param.Type.Name
 	}
-	fmt.Fprintf(b, "\t\t{Name: %q, Type: %q", param.Name, wireType)
-	if typeName != "" {
-		fmt.Fprintf(b, ", TypeName: %q", typeName)
+	const nameField, typeField, typeNameField, idField = "\t\t{Name: ", ", Type: ", ", TypeName: ", ", FieldID: "
+	if len(param.Name)+len(wireType)+len(typeName) > registryIdentifierStackLimit {
+		fmt.Fprintf(b, nameField+"%q"+typeField+"%q", param.Name, wireType)
+		if typeName != "" {
+			fmt.Fprintf(b, typeNameField+"%q", typeName)
+		}
+		fmt.Fprintf(b, idField+"%d", id)
+	} else {
+		var scratch [128]byte
+		line := append(scratch[:0], nameField...)
+		line = strconv.AppendQuote(line, param.Name)
+		line = append(line, typeField...)
+		line = strconv.AppendQuote(line, wireType)
+		if typeName != "" {
+			line = append(line, typeNameField...)
+			line = strconv.AppendQuote(line, typeName)
+		}
+		line = append(line, idField...)
+		b.Write(strconv.AppendInt(line, int64(id), 10))
 	}
-	fmt.Fprintf(b, ", FieldID: %d", id)
 	if param.Type.IsList {
 		b.WriteString(", IsList: true")
 	}
@@ -2197,9 +2239,8 @@ func generateNumericValidation(b *strings.Builder, f *ast.FieldDecl, varName, in
 			minimum, minLabel, minOk := numericValidationBound(d.Args[0].Value)
 			maximum, maxLabel, maxOk := numericValidationBound(d.Args[1].Value)
 			if minOk && maxOk {
-				writeValidationCheck(b, indent, f.Name,
-					fmt.Sprintf("%s < %s || %s > %s", varName, minimum, varName, maximum),
-					"out of range ["+minLabel+", "+maxLabel+"]")
+				writeValidationCheckParts(b, indent, f.Name, "out of range ["+minLabel+", "+maxLabel+"]",
+					varName, " < ", minimum, " || ", varName, " > ", maximum)
 			}
 		}
 	}
@@ -2223,9 +2264,29 @@ func numericValidationBound(expression ast.Expr) (value, label string, ok bool) 
 }
 
 func writeValidationCheck(b *strings.Builder, indent, field, cond, errMsg string) {
-	fmt.Fprintf(b, "%sif %s {\n", indent, cond)
-	fmt.Fprintf(b, "%s\treturn errors.BadRequest.WithData(errors.ParamError{Param: %q, Error: %q})\n", indent, field, errMsg)
-	fmt.Fprintf(b, "%s}\n", indent)
+	writeValidationCheckParts(b, indent, field, errMsg, cond)
+}
+
+// Quote once and reserve the full check without joining its condition.
+func writeValidationCheckParts(b *strings.Builder, indent, field, errMsg string, conditionParts ...string) {
+	const failure = "\treturn errors.BadRequest.WithData(errors.ParamError{Param: "
+	var scratch [128]byte
+	quoted := strconv.AppendQuote(scratch[:0], field)
+	fieldEnd := len(quoted)
+	quoted = strconv.AppendQuote(quoted, errMsg)
+	size := 3*len(indent) + len("if ") + len(" {\n") + len(failure) +
+		len(", Error: ") + len("})\n") + len("}\n") + len(quoted)
+	for _, part := range conditionParts {
+		size += len(part)
+	}
+	b.Grow(size)
+	writeStringParts(b, indent, "if ")
+	writeStringParts(b, conditionParts...)
+	writeStringParts(b, " {\n", indent, failure)
+	b.Write(quoted[:fieldEnd])
+	b.WriteString(", Error: ")
+	b.Write(quoted[fieldEnd:])
+	writeStringParts(b, "})\n", indent, "}\n")
 }
 
 // scanModelsForValidation checks if any CRUD model has validation directives.

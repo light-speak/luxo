@@ -2,6 +2,7 @@
 import 'dart:io';
 import 'dart:async';
 
+import 'package:luxo_client/src/builder/artifact_publish.dart';
 import 'package:luxo_client/src/builder/selection_build.dart';
 
 Future<void> main(List<String> arguments) async {
@@ -59,23 +60,21 @@ Future<int> _run(SelectionBuild build, List<String> arguments) async {
 
 Future<int> _compile(SelectionBuild build, File entry, String output) async {
   final destination = await build.prepareOutput(output);
-  final artifact = File('${build.directory.path}/.tmp/luxo-release');
-  await artifact.parent.create(recursive: true);
-  final status = await _run(build, [
-    'compile',
-    'exe',
-    entry.path,
-    '-o',
-    artifact.path,
-  ]);
-  if (status == 0) {
-    if (await FileSystemEntity.type(destination.path, followLinks: false) !=
-        FileSystemEntityType.notFound) {
-      throw StateError('Output appeared during compilation: $output');
-    }
-    await artifact.rename(destination.path);
+  try {
+    final artifact = File('${build.directory.path}/.tmp/luxo-release');
+    await artifact.parent.create(recursive: true);
+    final status = await _run(build, [
+      'compile',
+      'exe',
+      entry.path,
+      '-o',
+      artifact.path,
+    ]);
+    if (status == 0) publishBuildArtifact(artifact, destination);
+    return status;
+  } finally {
+    destination.close();
   }
-  return status;
 }
 
 ({
