@@ -1,4 +1,4 @@
-name: Measure PostgreSQL durable migration costs
+name: Compare PostgreSQL fresh holder lock costs
 
 on:
   push:
@@ -28,7 +28,7 @@ jobs:
       - name: Fetch the exact common product source
         run: |
           set -euo pipefail
-          base=0a6b143ad667c84f0e517b9ef0a9e9d5bd6ec367
+          base=5b10a26eef09248d77520ce1f118273793f30fc5
           git fetch --depth=1 --no-tags origin "$base"
           test "$(git rev-parse FETCH_HEAD)" = "$base"
       - uses: actions/setup-go@v7
@@ -36,7 +36,7 @@ jobs:
           go-version: '1.27.1'
           check-latest: false
           cache: false
-      - name: Measure cold, warm, standalone and reconciliation boundaries
+      - name: Measure the first lock, first reuse, and DDL on one runner
         timeout-minutes: 40
         run: python3 -I -B scripts/diagnostics/pg-durable-hosted/hosted.py run
       - name: Confirm task-owned PostgreSQL resources returned to zero
@@ -46,7 +46,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: hosted-pg-durable-${{ github.run_id }}-${{ github.run_attempt }}
+          name: hosted-pg-durable-fresh-lock-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/pg-durable-hosted-evidence/
           if-no-files-found: error
           retention-days: 14

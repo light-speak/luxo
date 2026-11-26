@@ -58,8 +58,8 @@ func usedPoolPID(f fixture, db *migrate.PGDB) (int32, error) {
 
 func TestDurableFirstQuerySessions(t *testing.T) {
 	arm := os.Getenv("LUXO_DURABLE_ARM")
-	if arm != "A" && arm != "H" && arm != "P" {
-		t.Fatal("driver must select A, H or P")
+	if arm != "P" && arm != "Q" {
+		t.Fatal("driver must select P or Q")
 	}
 	for _, tc := range []struct {
 		name string
@@ -87,7 +87,7 @@ func TestDurableFirstQuerySessions(t *testing.T) {
 			names, err := runner.Up(f.ctx)
 			verifyAppliedFirstQuery(f, before, names, err)
 			got := f.activity()
-			separate := arm == "H" || arm == "P" && tc.used
+			separate := tc.used
 			expectedCount := 1
 			if separate {
 				expectedCount++
@@ -115,6 +115,7 @@ func BenchmarkDurableFirstQuery(b *testing.B) {
 	b.Run("cold-open-ping-up", func(b *testing.B) { benchmarkFreshFirstQuery(b, false) })
 	b.Run("already-used-pool-up", func(b *testing.B) { benchmarkFreshFirstQuery(b, true) })
 	b.Run("warm-read-only-holder-up", benchmarkWarmFirstQuery)
+	b.Run("used-holder-first-reuse-up", benchmarkUsedHolderFirstReuse)
 }
 
 func benchmarkFreshFirstQuery(b *testing.B, used bool) {

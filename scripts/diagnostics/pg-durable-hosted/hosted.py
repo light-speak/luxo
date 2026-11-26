@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay retained migration samples and measure only supported recovery work."""
+"""Compare a new holder’s first lock and subsequent operations with the same database protocol."""
 import argparse
 import base64
 import gzip
@@ -22,27 +22,26 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-PARENT = "608326ec5d5336fc565514165aeaae7347b8029f"
-BASE = "0a6b143ad667c84f0e517b9ef0a9e9d5bd6ec367"
-BASE_TREE = "c12a0bf33f9bd39da85ba6a199ac9d76e16fa00b"
-ARMS = {"A": BASE_TREE, "H": "fb62f62b62599a623f6b7887bf0c007a9d1aff6a", "P": "ff67b201dc39ce5d6df033283ad3a2a8bde0da9f"}
+PARENT = "89d217edc211f8c1c8bd52b77d86ea965e814e33"
+BASE = "5b10a26eef09248d77520ce1f118273793f30fc5"
+BASE_TREE = "18ec2a84fcd20299a4bb8f3759fbb58b73574176"
+ARMS = {"P": "7bc5b40d440439e2f5233d0f0f2c358056ea65f6", "Q": "8a2f2fe01062cfe550c4391ad6b9c376f8b8a008"}
 PATCHES = {
-    "H": "b61a7b2ee1b08960193ad66c47733f3eb1c7b48c38cea7b27ab1b9584b9d9db7",
-    "P": "61d5b5c63674710ed674613e457340b505507e11ba12fdd134778e11e08bc797",
+    "P": (BASE_TREE, "61d5b5c63674710ed674613e457340b505507e11ba12fdd134778e11e08bc797"),
+    "Q": (ARMS["P"], "d20fe94ccca626144f3cdb9f352b1819366fff5f1b2b7147406c2370e38a4c56"),
 }
 LEAVES = {
-    "first-query": {"cold-open-ping-up", "already-used-pool-up", "warm-read-only-holder-up"},
-    "standalone": {"ordinary/up", "ordinary/down", "ordinary/up-existing",
-                   "concurrent/up", "concurrent/down", "concurrent/up-existing-index"},
-    "recovery": {"first-journal-and-create-index", "acknowledge-committed-down",
-                 "record-applied-after-restart", "retry-after-invalid-index-repair"},
+    "first-query": {"cold-open-ping-up", "already-used-pool-up", "warm-read-only-holder-up", "used-holder-first-reuse-up"},
+    "standalone": {"ordinary/up", "ordinary/up-existing", "concurrent/up", "concurrent/down"},
 }
 METRICS = ("ns/op", "B/op", "allocs/op")
-BENCHMARKS = {"first-query": "BenchmarkDurableFirstQuery", "standalone": "BenchmarkMigrationPair",
-              "recovery": "BenchmarkDurableRecovery"}
+BENCHMARKS = {"first-query": "BenchmarkDurableFirstQuery", "standalone": "BenchmarkMigrationPair"}
 SMOKE_TESTS = {"first-query": ("TestDurableFirstQuerySessions", "TestAdvisoryPairStandaloneWriterHoldsLock"),
-               "standalone": ("TestMigrationPairEmptyPreview",), "recovery": ()}
-STANDALONE_SUFFIX = "/^(ordinary|concurrent)$/^(up|down|up-existing|up-existing-index)$"
+               "standalone": ("TestMigrationPairEmptyPreview",)}
+SELECTORS = {
+    "first-query": "^BenchmarkDurableFirstQuery$",
+    "standalone": "^BenchmarkMigrationPair$/^ordinary$/^(up|up-existing)$|^BenchmarkMigrationPair$/^concurrent$/^(up|down)$",
+}
 CPU = "Neoverse-N2"
 
 
@@ -61,7 +60,7 @@ def put(path, value):
 
 def payload():
     names = {"shared.py", "advisory_pair_test.go", "first_query_test.go", "migration_pair_test.go",
-             "durable_reset_test.go", "recovery_test.go", "arm-H.patch.gz.b64", "arm-P.patch.gz.b64"}
+             "durable_reset_test.go", "used_holder_reuse_test.go", "arm-P.patch.gz.b64", "arm-Q.patch.gz.b64"}
     entries = {}
     for line in (PAYLOAD / "inputs.sha256").read_text().splitlines():
         digest, name = line.split("  ", 1)
@@ -82,8 +81,8 @@ def trees(repo, root):
     run("git", "init", "--bare", "--quiet", str(bare))
     (bare / "objects/info/alternates").write_text(objects + "\n")
     git = ("git", f"--git-dir={bare}")
-    for arm, digest in PATCHES.items():
-        run(*git, "read-tree", BASE_TREE)
+    for arm, (preimage, digest) in PATCHES.items():
+        run(*git, "read-tree", preimage)
         encoded = (PAYLOAD / f"arm-{arm}.patch.gz.b64").read_bytes()
         patch = gzip.decompress(base64.b64decode(b"".join(encoded.split()), validate=True))
         if sha(patch) != digest:
@@ -137,18 +136,14 @@ def prepare_arm(git, root, arm, env, evidence):
         run("sh", "scripts/setup-modules.sh", str(src), cwd=src, env=env)
         workspace = env | {"GOWORK": str(src / "go.work")}
         lanes = {"first-query": "advispair", "standalone": "migratepair"}
-        if arm != "A":
-            lanes["recovery"] = "recoverypair"
         for lane, folder in lanes.items():
             target = src / "pkg/lux/pg" / folder
             target.mkdir()
             if lane == "standalone":
                 (target / "migration_pair_test.go").write_text(standalone_fixture())
-                if arm != "A":
-                    shutil.copyfile(PAYLOAD / "durable_reset_test.go", target / "durable_reset_test.go")
+                shutil.copyfile(PAYLOAD / "durable_reset_test.go", target / "durable_reset_test.go")
             else:
-                supplement = "recovery_test.go" if lane == "recovery" else "first_query_test.go"
-                for name in ("advisory_pair_test.go", supplement):
+                for name in ("advisory_pair_test.go", "first_query_test.go", "used_holder_reuse_test.go"):
                     shutil.copyfile(PAYLOAD / name, target / name)
         packages = ["./pkg/lux/pg/" + folder for folder in lanes.values()]
         graph = run("go", "list", "-mod=readonly", "-p=1", "-deps", "-test", *packages, cwd=src, env=workspace)
@@ -199,12 +194,9 @@ def admit(path):
 
 
 def sample_arguments(lane, iterations, smoke):
-    selector = f"^{BENCHMARKS[lane]}$"
-    if lane == "standalone":
-        selector += STANDALONE_SUFFIX
     tests = SMOKE_TESTS[lane] if smoke else ()
     selected = "^(" + "|".join(tests) + ")$" if tests else "^$"
-    args = [f"-test.run={selected}", f"-test.bench={selector}", "-test.cpu=1", "-test.benchmem", "-test.count=1",
+    args = [f"-test.run={selected}", f"-test.bench={SELECTORS[lane]}", "-test.cpu=1", "-test.benchmem", "-test.count=1",
             "-test.timeout=3m", f"-test.benchtime={iterations}x"]
     if tests:
         args.append("-test.v")
@@ -234,7 +226,7 @@ def sample(root, lane, name, arm, slots, slot, identities, iterations, evidence,
     binary = root / lane / identities[arm][lane]["binary"]
     arguments, tests = sample_arguments(lane, iterations, smoke)
     env = {**os.environ, "GOMAXPROCS": "1", "GOGC": "100", "GOMEMLIMIT": "off", "GODEBUG": "",
-           "TMPDIR": str(root), "LUXO_ADVISORY_MODEL": "pooled" if arm == "A" else "holder",
+           "TMPDIR": str(root), "LUXO_ADVISORY_MODEL": "holder",
            "LUXO_DURABLE_ARM": arm, "LUXO_MIGPAIR_EMPTY_HISTORY_CREATE": "no",
            "LUXO_MIGPAIR_DATABASE_URL": f"postgres://{database}:{password}@127.0.0.1:5432/{database}?sslmode=disable"}
     proc = subprocess.run([str(binary), *arguments], cwd=root, env=env, stdout=subprocess.PIPE,
@@ -248,11 +240,8 @@ def sample(root, lane, name, arm, slots, slot, identities, iterations, evidence,
 
 
 def schedule(lane):
-    if lane == "recovery":
-        comparisons, controls, control_count = ("HP",), ("HH", "PP"), 10
-    else:
-        comparisons, controls = ("AH", "HP", "AP"), ("AA", "HH", "PP")
-        control_count = 2 if lane == "first-query" else 5
+    comparisons, controls = ("PQ",), ("PP", "QQ")
+    control_count = 2 if lane == "first-query" else 5
     for group, slots in enumerate(("ab", "ba"), 1):
         for pair in range(1, 11):
             active = comparisons + (controls if pair <= control_count else ())
