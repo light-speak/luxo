@@ -44,8 +44,8 @@ func auditReadyMux(handler http.Handler) *http.ServeMux {
 
 func BenchmarkAuditGatewayReadiness(b *testing.B) {
 	b.Run("zero-stateless", func(b *testing.B) {
-		handler, stop := New().startReadiness()
-		b.Cleanup(stop)
+		handler := New().startReadiness()
+		b.Cleanup(handler.stop)
 		mux := auditReadyMux(handler)
 		request, err := http.NewRequestWithContext(b.Context(), http.MethodGet, "http://localhost/ready", nil)
 		if err != nil {
@@ -93,7 +93,7 @@ func auditBenchmarkProbe(b *testing.B, count int, cached, failed bool) {
 			return errors.New("private diagnostic")
 		}
 	}
-	mux := auditReadyMux(http.HandlerFunc(probe.serveHTTP))
+	mux := auditReadyMux(probe)
 	request, err := http.NewRequestWithContext(b.Context(), http.MethodGet, "http://localhost/ready", nil)
 	if err != nil {
 		b.Fatal(err)
