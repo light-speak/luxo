@@ -38,11 +38,14 @@ const (
 	CodegenMigrationStateProfile   = "codegen-migration-state"
 	CodegenMigrationStateBenchmark = "BenchmarkMigrationStateValidation"
 
-	APILocalRouteExportProfile    = "api-local-route-export"
-	APILocalRouteExportBenchmark  = "BenchmarkLocalRouteExport"
-	APICanonicalJSONProfile       = "api-canonical-json"
-	APIBinaryParamLookupProfile   = "api-binary-param-lookup"
-	APIBinaryParamLookupBenchmark = "BenchmarkBinaryParamLookup"
+	APILocalRouteExportProfile      = "api-local-route-export"
+	APILocalRouteExportBenchmark    = "BenchmarkLocalRouteExport"
+	APICanonicalJSONProfile         = "api-canonical-json"
+	APIBinaryParamLookupProfile     = "api-binary-param-lookup"
+	APIBinaryParamLookupBenchmark   = "BenchmarkBinaryParamLookup"
+	APIRequestLogProfile            = "api-request-log"
+	APIRequestLogBoundaryBenchmark  = "BenchmarkRequestLogBoundary"
+	APIRequestLogDeliveredBenchmark = "BenchmarkRequestLogDelivered"
 
 	LuviaMergeDestinationProfile   = "luvia-merge-destination"
 	LuviaMergeDestinationBenchmark = "BenchmarkMergeDestination"
@@ -117,6 +120,9 @@ func ProfileForBenchmark(pkg, name string) string {
 }
 
 func apiBenchmarkProfile(root string) string {
+	if root == APIRequestLogBoundaryBenchmark || root == APIRequestLogDeliveredBenchmark {
+		return APIRequestLogProfile
+	}
 	if root == APIBinaryParamLookupBenchmark {
 		return APIBinaryParamLookupProfile
 	}
@@ -156,6 +162,7 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{APILocalRouteExportProfile, "^" + APILocalRouteExportBenchmark + "$"},
 			{APICanonicalJSONProfile, "^" + apiCanonicalJSONPrefix + "(" + strings.Join(apiCanonicalJSONFamilies, "|") + ")$"},
 			{APIBinaryParamLookupProfile, "^" + APIBinaryParamLookupBenchmark + "$"},
+			{APIRequestLogProfile, "^" + APIRequestLogBoundaryBenchmark + "$|^" + APIRequestLogDeliveredBenchmark + "$"},
 		}
 	case LuviaPackage:
 		return []IsolationSpec{

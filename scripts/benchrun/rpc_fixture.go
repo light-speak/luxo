@@ -47,7 +47,8 @@ const (
 		"\nrpc-nil-context-guard-overlay-v1 " + rpcNilContextGuardFixture + "=" + rpcNilContextGuardSHA +
 		"\nluvia-auth-middleware-overlay-v1 " + luviaAuthBenchmarkFixture + "=" + luviaAuthBenchmarkSHA +
 		" " + luviaAuthHelperFixture + "=" + luviaAuthHelperSHA +
-		"\napi-binary-param-lookup-overlay-v1 " + apiBinaryParamLookupFixture
+		"\napi-binary-param-lookup-overlay-v1 " + apiBinaryParamLookupFixture +
+		"\napi-request-log-overlay-v1 " + apiRequestLogFixture + "=" + apiRequestLogProjectionSHA + " " + apiRequestLogSourceSHA
 )
 
 func writeRPCOwnedRequestOverlay(pkg, workspace string) (string, error) {
