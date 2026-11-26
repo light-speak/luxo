@@ -22,14 +22,15 @@ from urllib.parse import unquote, urlsplit
 
 HERE = Path(__file__).resolve().parent
 BASE = "77b6cdf20d424213f4c1dc90534f924ac6b176d0"
-TREES = {"A": "9014a2b7a92f5b2abbb5aca10a6a9a7d0978955f", "B": "2abec0f73246317422f44df8593da7268c2f755f"}
-PACKAGES = {"A": "bf0dcf2da32afc0fcff9fb3ee82550b5e6cf0795", "B": "1ee160489684c2f0fde51bb07f83475c261ff0dc"}
+PREVIOUS_DIAGNOSTIC = "363248532f038736753f6945d5ad6300faadcfc7"
+TREES = {"A": "9014a2b7a92f5b2abbb5aca10a6a9a7d0978955f", "B": "02ef80cad47fe91a6537b79da850bba377dffcab"}
+PACKAGES = {"A": "bf0dcf2da32afc0fcff9fb3ee82550b5e6cf0795", "B": "cec75af701a414aac5f2d911ea74a09cf5d07bb8"}
 PACKAGE = "packages/dart"
 PATHS = {"lib/src/transport.dart", "test/http_protocol_test.dart"}
-PATCH = "c2649597321cfbc5ac8162a8a4cf713668a2bc318b68dd92ffc104f01348b581"
+PATCH = "66dd189d5703dd7f6d8f5248be14c572e540abe8dfb0dcb81e9834aa1d29db02"
 PUBSPEC = "294368c6b2cc61a62c83880cdca56d1137de356ef9a7682a6396d4fcce9dc5f9"
 LOCK_SHA = "0d107eca2444e58cd48cb37abc48bf7115ed04f5101e6ba753ab13dea7e3f8bc"
-TRANSPORT = "b573122db1a31af1c16865eb3f336d443072d55cb55e49ad3a4e00fe113333ec"
+TRANSPORT = "8f5b4c0a2bdfda1a548e94503159365a577fcdc131753f468fecb168dfbe0deb"
 PREVIOUS_NORMALIZED_CONFIG = "7024bc299c7dfa13991b87ac0a8247ec428fa91d583cdb0bc6daf99ad3d49120"
 REVISION = "b530c21f7de367b94fb04787bfed9d8e989d75e8"
 BENCHSTAT = "golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70"
@@ -61,7 +62,8 @@ def git(repo, *args, index=None, data=None):
 
 def verify_checkout(repo):
     assert git(repo, "rev-parse", "HEAD").decode().strip() == os.environ["GITHUB_SHA"]
-    assert git(repo, "rev-parse", "HEAD^").decode().strip() == BASE
+    assert git(repo, "rev-parse", "HEAD^").decode().strip() == PREVIOUS_DIAGNOSTIC
+    assert git(repo, "rev-parse", "HEAD^^").decode().strip() == BASE
     paths = {str(HERE.relative_to(repo) / name) for name in (*FIXTURES, "qualify.py", "product.patch.b64")}
     paths.add(".github/workflows/dart-http-refresh-cost.yml")
     changes = git(repo, "diff", "--name-status", BASE, "HEAD").decode().splitlines()
