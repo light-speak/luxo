@@ -87,6 +87,23 @@ func TestCodecReaderProfileRequiresPackageAndExactRoot(t *testing.T) {
 	}
 }
 
+func TestRPCOwnedRequestProfileRequiresPackageAndExactRoot(t *testing.T) {
+	for _, tc := range []struct{ pkg, name, want string }{
+		{"pkg/lux/rpc", "BenchmarkLRPCOwnedRequest", "rpc-owned-request"},
+		{"pkg/lux/rpc", "BenchmarkLRPCOwnedRequest/4096/owned-2", "rpc-owned-request"},
+		{"pkg/lux/rpc", "BenchmarkLRPCOwnedRequestSibling", DefaultProfile},
+		{"pkg/lux/rpc", "BenchmarkRPC_Ping", DefaultProfile},
+		{CodecPackage, "BenchmarkLRPCOwnedRequest", DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	if ValidPerformanceProfile(CodecPackage, "rpc-owned-request") {
+		t.Fatal("accepted the RPC owned-request profile outside its package")
+	}
+}
+
 func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 	for _, tc := range []struct{ pkg, name, want string }{
 		{APIPackage, "BenchmarkIdentityConditionValidity/member/EnumChecked-2", DefaultProfile},
@@ -118,7 +135,11 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{CodegenPackage, "BenchmarkMergeDestination", DefaultProfile},
 		{CodegenPackage, "BenchmarkGatewayIdentity", DefaultProfile},
 		{LuviaPackage, "BenchmarkStaticMetricsJSON", DefaultProfile},
-		{LuviaPackage, "BenchmarkConvenienceKeyParentValidation", DefaultProfile},
+		{LuviaPackage, "BenchmarkConvenienceKeyParentValidation", "luvia-convenience-keys"},
+		{LuviaPackage, "BenchmarkConvenienceKeyParentValidation/column-small/keyLast=false/current-2", "luvia-convenience-keys"},
+		{LuviaPackage, "BenchmarkConvenienceKeyParentValidation/column-small/keyLast=true/current-2", "luvia-convenience-keys"},
+		{LuviaPackage, "BenchmarkConvenienceKeyParentValidationSibling", DefaultProfile},
+		{CodegenPackage, "BenchmarkConvenienceKeyParentValidation", DefaultProfile},
 	} {
 		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
 			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
@@ -126,7 +147,7 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 	}
 	for _, tc := range []struct{ pkg, profile, filter string }{
 		{CodecPackage, CodecReaderProfile, "."},
-		{"pkg/lux/rpc", "", ""},
+		{"pkg/lux/schema", "", ""},
 	} {
 		got := IsolationProfiles(tc.pkg)
 		if tc.profile == "" {
@@ -146,10 +167,12 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		t.Fatalf("unexpected API profiles: %v", apiProfiles)
 	}
 	profiles := IsolationProfiles(LuviaPackage)
-	if len(profiles) != 4 || profiles[0] != (IsolationSpec{LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"}) ||
+	if len(profiles) != 5 || profiles[0] != (IsolationSpec{LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"}) ||
 		profiles[1] != (IsolationSpec{LuviaGatewayIdentityProfile, "^BenchmarkGatewayIdentity$"}) ||
 		profiles[2] != (IsolationSpec{"luvia-merge-destination", "^BenchmarkMergeDestination$"}) ||
 		profiles[3] != (IsolationSpec{"luvia-resolved-fields", "^BenchmarkValidateResolvedFields$"}) ||
+		profiles[4] != (IsolationSpec{"luvia-convenience-keys", "^BenchmarkConvenienceKeyParentValidation$"}) ||
+		ValidPerformanceProfile(CodegenPackage, "luvia-convenience-keys") ||
 		ValidPerformanceProfile(CodegenPackage, "luvia-resolved-fields") ||
 		ValidPerformanceProfile(CodegenPackage, LuviaGatewayIdentityProfile) ||
 		ValidPerformanceProfile(CodegenPackage, "luvia-merge-destination") {

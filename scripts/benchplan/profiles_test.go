@@ -231,7 +231,7 @@ func TestMergeDestinationProfileKeepsExactlySixLeaves(t *testing.T) {
 		"columnar=true/rows=128/direct=false",
 		"columnar=true/rows=128/direct=true",
 	}
-	verifyLuviaProfileInventory(t, mergeDestinationProfile, mergeDestinationRoot, rows, "columnar=false/rows=128/direct=true")
+	verifyExactProfileInventory(t, mergeDestinationPackage, mergeDestinationControl, mergeDestinationProfile, mergeDestinationRoot, rows, "columnar=false/rows=128/direct=true")
 }
 
 const (
@@ -245,10 +245,58 @@ func TestResolvedFieldsProfileKeepsExactlySixLeaves(t *testing.T) {
 		"list-small-128x16/per-value", "list-small-128x16/column-check",
 		"list-wide-128x16/per-value", "list-wide-128x16/column-check",
 	}
-	verifyLuviaProfileInventory(t, resolvedFieldsProfile, resolvedFieldsRoot, rows, "object-3/column-check")
+	verifyExactProfileInventory(t, mergeDestinationPackage, mergeDestinationControl, resolvedFieldsProfile, resolvedFieldsRoot, rows, "object-3/column-check")
 }
 
-func verifyLuviaProfileInventory(t *testing.T, profile, benchmark string, rows []string, extraLeaf string) {
+const (
+	convenienceKeyProfile = "luvia-convenience-keys"
+	convenienceKeyRoot    = "BenchmarkConvenienceKeyParentValidation"
+)
+
+func TestConvenienceKeyProfileKeepsExactlyTwentyLeaves(t *testing.T) {
+	rows := []string{
+		"row-small/keyLast=false/before", "row-small/keyLast=false/current",
+		"row-small/keyLast=true/before", "row-small/keyLast=true/current",
+		"row-wide/keyLast=false/before", "row-wide/keyLast=false/current",
+		"row-wide/keyLast=true/before", "row-wide/keyLast=true/current",
+		"column-small/keyLast=false/before", "column-small/keyLast=false/current",
+		"column-small/keyLast=true/before", "column-small/keyLast=true/current",
+		"column-batch/keyLast=false/before", "column-batch/keyLast=false/current",
+		"column-batch/keyLast=true/before", "column-batch/keyLast=true/current",
+		"column-many/keyLast=false/before", "column-many/keyLast=false/current",
+		"column-many/keyLast=true/before", "column-many/keyLast=true/current",
+	}
+	verifyExactProfileInventory(t, mergeDestinationPackage, mergeDestinationControl, convenienceKeyProfile, convenienceKeyRoot, rows, "column-extra/keyLast=true/current")
+}
+
+func TestConvenienceKeyPrimaryAndConfirmationStayExclusive(t *testing.T) {
+	for _, key := range []string{"keyLast=false", "keyLast=true"} {
+		t.Run(key, func(t *testing.T) {
+			verifyExactProfileRouting(t, mergeDestinationPackage, mergeDestinationControl, convenienceKeyProfile, convenienceKeyRoot,
+				"column-small/"+key+"/current", "^column-small$/^"+key+"$/^current$")
+		})
+	}
+}
+
+const (
+	rpcOwnedProfile = "rpc-owned-request"
+	rpcOwnedRoot    = "BenchmarkLRPCOwnedRequest"
+	rpcOwnedControl = "BenchmarkRPC_Ping"
+	rpcPackage      = "pkg/lux/rpc"
+)
+
+func TestRPCOwnedRequestProfileKeepsExactlyEightLeaves(t *testing.T) {
+	rows := []string{"0/before", "0/owned", "128/before", "128/owned",
+		"4096/before", "4096/owned", "65536/before", "65536/owned"}
+	verifyExactProfileInventory(t, rpcPackage, rpcOwnedControl, rpcOwnedProfile, rpcOwnedRoot, rows, "65537/owned")
+}
+
+func TestRPCOwnedRequestPrimaryAndConfirmationStayExclusive(t *testing.T) {
+	verifyExactProfileRouting(t, rpcPackage, rpcOwnedControl, rpcOwnedProfile, rpcOwnedRoot,
+		"4096/owned", "^4096$/^owned$")
+}
+
+func verifyExactProfileInventory(t *testing.T, pkg, controlRoot, profile, benchmark string, rows []string, extraLeaf string) {
 	t.Helper()
 	root := benchmarkTempDir(t)
 	ordinary, isolated := root+"/ordinary.log", root+"/isolated.log"
@@ -262,8 +310,8 @@ func verifyLuviaProfileInventory(t *testing.T, profile, benchmark string, rows [
 	}
 	full, shortened := measure(rows), measure(rows[:len(rows)-1])
 	extra := measure([]string{extraLeaf})
-	const control = mergeDestinationControl + measurement
-	args := []string{"--verify-profile-inventory", mergeDestinationPackage, profile, ordinary, isolated}
+	control := controlRoot + measurement
+	args := []string{"--verify-profile-inventory", pkg, profile, ordinary, isolated}
 	for _, tc := range []struct {
 		name, ordinary, isolated string
 		valid                    bool
@@ -285,19 +333,17 @@ func verifyLuviaProfileInventory(t *testing.T, profile, benchmark string, rows [
 }
 
 func TestMergeDestinationPrimaryAndConfirmationStayExclusive(t *testing.T) {
-	verifyLuviaProfileRouting(t, mergeDestinationProfile, mergeDestinationRoot,
+	verifyExactProfileRouting(t, mergeDestinationPackage, mergeDestinationControl, mergeDestinationProfile, mergeDestinationRoot,
 		mergeDestinationTarget, "^columnar=true$/^rows=1$/^direct=true$")
 }
 
 func TestResolvedFieldsPrimaryAndConfirmationStayExclusive(t *testing.T) {
-	verifyLuviaProfileRouting(t, resolvedFieldsProfile, resolvedFieldsRoot,
+	verifyExactProfileRouting(t, mergeDestinationPackage, mergeDestinationControl, resolvedFieldsProfile, resolvedFieldsRoot,
 		"list-small-128x16/per-value", "^list-small-128x16$/^per-value$")
 }
 
-func verifyLuviaProfileRouting(t *testing.T, profile, root, target, targetFilter string) {
+func verifyExactProfileRouting(t *testing.T, pkg, control, profile, root, target, targetFilter string) {
 	t.Helper()
-	const pkg = mergeDestinationPackage
-	const control = mergeDestinationControl
 	primary := formatShard(benchShard{Groups: []benchGroup{{Package: pkg, Name: root}, {Package: pkg, Name: control}}})
 	keys := []sampleKey{{pkg, root + "/" + target + "-2"}, {pkg, control + "-2"}}
 	confirmation := formatConfirmationBatch(keys)
