@@ -6,6 +6,7 @@ export interface UseLuxoMutationResult<T, V> {
   data: T | null
   loading: boolean
   error: Error | null
+  postSuccessError: Error | null
   mutate: (variables: V) => Promise<T>
   reset: () => void
 }
@@ -14,6 +15,27 @@ export interface UseLuxoMutationOptions<T, V> {
   queryClient?: QueryClient
   invalidateQueries?: readonly QueryKey[] | ((data: T, variables: V) => readonly QueryKey[])
   onSuccess?: (data: T, variables: V) => void | Promise<void>
+}
+
+function normalizeMutationError(error: unknown): Error {
+  try {
+    return error instanceof Error ? error : new Error(String(error), { cause: error })
+  } catch {
+    return new Error('Unknown mutation error', { cause: error })
+  }
+}
+
+function invalidateMutationQueries<T, V>(
+  queryClient: QueryClient, options: UseLuxoMutationOptions<T, V>, result: T, variables: V,
+): void {
+  const invalidations = typeof options.invalidateQueries === 'function'
+    ? options.invalidateQueries(result, variables)
+    : options.invalidateQueries
+  if (invalidations?.length === 1) {
+    queryClient.invalidateQueries({ queryKey: invalidations[0] })
+  } else if (invalidations?.length) {
+    queryClient.invalidateQueries(invalidations.map(queryKey => ({ queryKey })))
+  }
 }
 
 /**
@@ -36,6 +58,7 @@ export function useLuxoMutation<T, V = void>(
   const [data, setData] = useState<T | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<Error | null>(null)
+  const [postSuccessError, setPostSuccessError] = useState<Error | null>(null)
   const mountedRef = useRef(true)
   const pendingRef = useRef(0)
   const generationRef = useRef(0)
@@ -55,25 +78,38 @@ export function useLuxoMutation<T, V = void>(
     if (mountedRef.current) {
       setLoading(true)
       setError(null)
+      setPostSuccessError(null)
     }
     try {
-      const result = await mutationFnRef.current(variables)
-      const currentOptions = optionsRef.current
-      if (currentOptions.onSuccess) await currentOptions.onSuccess(result, variables)
-      const invalidations = typeof currentOptions.invalidateQueries === 'function'
-        ? currentOptions.invalidateQueries(result, variables)
-        : currentOptions.invalidateQueries
-      if (invalidations?.length === 1) {
-        queryClient.invalidateQueries({ queryKey: invalidations[0] })
-      } else if (invalidations?.length) {
-        queryClient.invalidateQueries(invalidations.map(queryKey => ({ queryKey })))
+      let result: T
+      try {
+        result = await mutationFnRef.current(variables)
+      } catch (failure) {
+        const err = normalizeMutationError(failure)
+        if (mountedRef.current && generation === generationRef.current) setError(err)
+        throw err
       }
-      if (mountedRef.current && generation === generationRef.current) setData(result)
+
+      const currentOptions = optionsRef.current
+      let followupError: Error | undefined
+      try {
+        if (currentOptions.onSuccess) await currentOptions.onSuccess(result, variables)
+      } catch (failure) {
+        followupError = normalizeMutationError(failure)
+      }
+      try {
+        invalidateMutationQueries(queryClient, currentOptions, result, variables)
+      } catch (failure) {
+        const err = normalizeMutationError(failure)
+        followupError = followupError
+          ? new AggregateError([followupError, err], 'Mutation success handling failed')
+          : err
+      }
+      if (mountedRef.current && generation === generationRef.current) {
+        setData(result)
+        if (followupError) setPostSuccessError(followupError)
+      }
       return result
-    } catch (e) {
-      const err = e instanceof Error ? e : new Error(String(e))
-      if (mountedRef.current && generation === generationRef.current) setError(err)
-      throw err
     } finally {
       if (generation === generationRef.current) {
         pendingRef.current--
@@ -87,8 +123,9 @@ export function useLuxoMutation<T, V = void>(
     pendingRef.current = 0
     setData(null)
     setError(null)
+    setPostSuccessError(null)
     setLoading(false)
   }, [])
 
-  return { data, loading, error, mutate, reset }
+  return { data, loading, error, postSuccessError, mutate, reset }
 }
