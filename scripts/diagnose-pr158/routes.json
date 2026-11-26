@@ -1,0 +1,88 @@
+{
+  "baseCommit": "59a4167f129f0bff0e8425125fa02eae87fd347b",
+  "candidateCommit": "5e41250a61e7fa2615ffb78804830bbc2db67334",
+  "failureManifestSHA256": "add7df4261e332e016daae91ef1ac8cd1847484aa34b0a0f9bde3b85f82a08f0",
+  "nativeCompileProfileSHA256": "ca6d61fffd64abebbfceb442bb80e0e4247d7ddbbd51a33ee2b35fe2c0ce8126",
+  "originalRun": "45866988415",
+  "pinOnlyPatchSHA256": "2198a072d22ef9d647010d39769b30173c61433aad7411b85b4054ac0bc7f3b4",
+  "planArtifactSHA256": "0bc40a2ebe82529096ed6eb8364ba0ad7dbfd334b4a8590154cd319e76a28fe9",
+  "routes": {
+    "epyc": {
+      "cases": [
+        {
+          "artifact": "15142383329",
+          "artifactSHA256": "bc2fdefba010769b2a66328730c3bde6f87744e75c14dc888fee9b0d1ec45d2c",
+          "kind": "signed-original",
+          "name": "BenchmarkAuthUpgradeHeaders/anonymous-get/before-2",
+          "package": "pkg/lux/luvia",
+          "profile": "default"
+        },
+        {
+          "artifact": "15142383329",
+          "artifactSHA256": "bc2fdefba010769b2a66328730c3bde6f87744e75c14dc888fee9b0d1ec45d2c",
+          "kind": "signed-original",
+          "name": "BenchmarkAuthUpgradeHeaders/anonymous-get/current-2",
+          "package": "pkg/lux/luvia",
+          "profile": "default"
+        },
+        {
+          "artifact": "15141884348",
+          "artifactSHA256": "e1e4258a59dc20fa2ccfb48a3a0e008d7fdf83d175a3ef281a8d66449fc0f069",
+          "kind": "signed-original",
+          "name": "BenchmarkCollectionLengthCompiler/list-empty-method-2",
+          "package": "pkg/codegen",
+          "profile": "default"
+        },
+        {
+          "artifact": "15140638442",
+          "kind": "dependency-control",
+          "name": "BenchmarkPriorKnowledgeConnectionLifecycle-2",
+          "package": "pkg/lux/h2transport",
+          "profile": "default"
+        }
+      ],
+      "cpu": "AMD EPYC 7763 64-Core Processor"
+    },
+    "intel": {
+      "cases": [
+        {
+          "artifact": "15142632647",
+          "artifactSHA256": "a9e42ffd9fe534354d13621f647aee3dee8dd70353743ec04a34c7dae40b0da8",
+          "kind": "signed-original",
+          "name": "BenchmarkStaticValueParams/DateTimeArray/0/Binary/static-2",
+          "package": "pkg/lux/api",
+          "profile": "api-non-identity"
+        },
+        {
+          "artifact": "15142018880",
+          "artifactSHA256": "96a6475085f878a6047dfa56313f99f1a3ab072a749f93d8381ed65788ddfa3d",
+          "kind": "signed-original",
+          "name": "BenchmarkLRPCConnectionFrameReuseCandidate/0/reuse-2",
+          "package": "pkg/lux/rpc",
+          "profile": "default"
+        },
+        {
+          "artifact": "15142906609",
+          "artifactSHA256": "8fa341e9a8edf08b61ca272a8e0f49f828e652c18f25dd87edb960d9dd6cfb2d",
+          "kind": "signed-original",
+          "name": "BenchmarkDurationWriteReject/List128Last-2",
+          "package": "pkg/lux/pg",
+          "profile": "default"
+        },
+        {
+          "artifact": "15140638442",
+          "kind": "dependency-control",
+          "name": "BenchmarkPriorKnowledgeConnectionLifecycle-2",
+          "package": "pkg/lux/h2transport",
+          "profile": "default"
+        }
+      ],
+      "cpu": "Intel(R) Xeon(R) 6975P-C"
+    }
+  },
+  "trees": {
+    "A": "c96b8db43227f6ed447d10b0b32deb39284c7f28",
+    "B": "be79c5f10e0bf505016c1182b02839016eedfe16",
+    "C": "0f2d71d92a0e1fc39918369a95330cf659ec1a84"
+  }
+}

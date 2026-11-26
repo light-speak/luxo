@@ -1,0 +1,48 @@
+name: Attribute #158 timing on the original CPU families
+
+on:
+  push:
+    branches: [diagnostics/pr158-attribution]
+
+permissions:
+  contents: read
+
+jobs:
+  witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        route: [intel, epyc]
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+
+      - uses: actions/checkout@v7
+        with:
+          ref: 59a4167f129f0bff0e8425125fa02eae87fd347b
+          path: .tmp/pr158-base
+          persist-credentials: false
+
+      - name: Validate the route and reproduce the pinned samples
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+          NATIVE_ROUTE: ${{ matrix.route }}
+        run: python3 -I -B scripts/diagnose-pr158/run.py "$NATIVE_ROUTE"
+
+      - if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr158-attribution-${{ matrix.route }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr158-attribution
+          if-no-files-found: error
+          retention-days: 14
