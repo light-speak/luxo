@@ -20,12 +20,12 @@ import time
 HERE = Path(__file__).resolve().parent
 PAYLOAD_ROOT = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-PREVIOUS = "bd37e678bfe3f280d522ee146cef1b6b8dfeb8af"
+PREVIOUS = "1621ffefcd4a0a7a53a7f945a519c8794d57cf95"
 PUBLIC_SOURCE = "77b6cdf20d424213f4c1dc90534f924ac6b176d0"
 PUBLIC_TREE = "9014a2b7a92f5b2abbb5aca10a6a9a7d0978955f"
 BASE = "6c743d11add26d7d1b8e1f40b0b7bcba21e08291"
 BASE_TREE = "92887a0ef2a7f875b5024cf5ecfa099ced96e2ad"
-ORDER_TREE = "0b46b3f1017cea25f6e6573c048ab11e623be836"
+ORDER_TREE = "c5bd9b70a82f30a3754ad6140b874991f44948c9"
 CPU_MODEL = "Neoverse-N2"
 COMPRESSED = {"baseline.patch", "order.patch"}
 TRACE = {
@@ -263,18 +263,18 @@ def verify_checkout(repo):
     if capture(*source, "rev-parse", "HEAD", "HEAD^").splitlines() != [os.environ["GITHUB_SHA"], PREVIOUS]:
         raise RuntimeError("expected a direct successor of the original PostgreSQL diagnostic")
     relative = HERE.relative_to(repo)
-    paths = {relative / "hosted.py", relative / ".payload/inputs.sha256"}
-    additions = {relative / ".payload" / name for name in ("baseline.commit", "baseline.patch.gz.b64")}
-    edits = paths | {relative / ".payload" / name for name in (
-        "formal/migration_pair_test.go", "order.patch.gz.b64", "source-e101.txt",
-        "trace/migration_pair_test.go", "trace/migration_stage_trace_test.go", "trace/stage_parser.py",
+    controller = relative / "hosted.py"
+    manifest = relative / ".payload/inputs.sha256"
+    edits = {controller, manifest} | {relative / ".payload" / name for name in (
+        "formal/migration_pair_test.go", "order.patch.gz.b64", "source-e101.txt", "trace/migration_pair_test.go",
     )}
     delta = set(capture(*source, "diff", "--name-status", PREVIOUS, "HEAD", "--").splitlines())
-    if delta != {f"A\t{path}" for path in additions} | {f"M\t{path}" for path in edits}:
+    if delta != {f"M\t{path}" for path in edits}:
         raise RuntimeError("unexpected diagnostic change list")
-    unchanged = {relative / name for name in ("server.py", ".payload/formal/pair.py", ".payload/trace/pair.py")}
-    unchanged.add(Path(".github/workflows/diagnose-pg-order.yml"))
-    for path in additions | edits | unchanged:
+    tracked_payload = {relative / ".payload" / (name + ".gz.b64" if name in COMPRESSED else name)
+                       for name in PAYLOAD}
+    for path in tracked_payload | {controller, manifest, relative / "server.py",
+                                   Path(".github/workflows/diagnose-pg-order.yml")}:
         tracked = subprocess.check_output([*source, "show", f"HEAD:{path}"])
         if tracked != (repo / path).read_bytes():
             raise RuntimeError(f"uncommitted diagnostic input: {path}")

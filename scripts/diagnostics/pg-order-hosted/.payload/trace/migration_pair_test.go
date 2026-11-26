@@ -224,7 +224,7 @@ func (f historyReadFixture) verify(sample historyReadScenario, before historyRea
 	}
 }
 
-const historySessionMetadata = `SELECT selected.schema,
+const historySessionMetadata = `SELECT COALESCE(selected.schema::text, ''),
 	       pg_catalog.to_regclass(pg_catalog.quote_ident(selected.schema) || '._migrations') IS NOT NULL,
 	       pg_catalog.current_setting('standard_conforming_strings') = 'on'
 	FROM (SELECT pg_catalog.current_schema() AS schema) AS selected`
