@@ -22,7 +22,7 @@ VERIFIER = AUTH_PREFIX + "VerifyCachedWithExpiry"
 BENCHMARK = PACKAGE_PREFIX + "BenchmarkAuthMiddlewareIsolation"
 CONSTRUCTORS = {"before": PACKAGE_PREFIX + "authMiddlewareBeforeIsolation",
                 "after": PACKAGE_PREFIX + "AuthMiddleware"}
-ARM_NAMES = ("base", "head", "base64", "head64")
+ARM_NAMES = ("base", "head", "baseiso", "headiso")
 SCOPES = {
     "01": {
         "artifact": 15100912340,
@@ -325,16 +325,48 @@ def compiler_metadata(file):
     return rows
 
 
-def verify_alignment(evidence):
+BENCHMARK_FIXTURE = "middleware_bench_test.go"
+BENCHMARK_SHA = "a5a5cd5191827423e07bf382d572614207c3e7fb5b7df27452963c3136bb2d8e"
+HELPER_FIXTURE = "middleware_test.go"
+HELPER_SOURCE_SHA = "a284f6673c86a90ed916099ac82a6ffb0e9b190161c946989957839252b07034"
+HELPER_SHA = "c70f9f8da6377c484739423793d637304f974bb0e1f1ebfd10fa75eb8d6eb3f3"
+
+
+def project(source, destination):
+    package = source.resolve(strict=True) / "pkg/lux/luvia"
+    destination = destination.resolve(strict=True)
+    tests = sorted(package.glob("*_test.go"))
+    for path in tests:
+        assert path.is_file() and not path.is_symlink(), path
+    assert {BENCHMARK_FIXTURE, HELPER_FIXTURE} <= {path.name for path in tests}
+    assert sha256((package / BENCHMARK_FIXTURE).read_bytes()).hexdigest() == BENCHMARK_SHA
+    content = (package / HELPER_FIXTURE).read_bytes()
+    assert sha256(content).hexdigest() == HELPER_SOURCE_SHA
+    start = b"func testCfg()"
+    end = b"func testIdentity("
+    assert content.count(start) == 1 and content.count(end) == 1
+    first, last = content.index(start), content.index(end)
+    assert first < last
+    header = b'package luvia\n\nimport (\n\t"time"\n\n\t"github.com/light-speak/luxo/pkg/lux/auth"\n)\n\n'
+    projected = header + content[first:last]
+    assert sha256(projected).hexdigest() == HELPER_SHA
+    helper = destination / HELPER_FIXTURE
+    helper.write_bytes(projected)
+    replacements = {str(path): "" for path in tests if path.name != BENCHMARK_FIXTURE}
+    replacements[str(package / HELPER_FIXTURE)] = str(helper)
+    (destination / "overlay.json").write_text(json.dumps({"Replace": replacements}) + "\n")
+    print(json.dumps({"retained": {BENCHMARK_FIXTURE: BENCHMARK_SHA, HELPER_FIXTURE: HELPER_SHA},
+                      "helperSource": HELPER_SOURCE_SHA,
+                      "omittedTests": [Path(path).name for path, value in replacements.items() if not value]}, indent=2))
+
+
+def verify_isolation(evidence):
     def read(file):
         return json.loads(file.read_bytes())
 
-    flags = "-ldflags=-funcalign=64"
-    expected_policy = [
-        f"{arm}\tcompile-performance{'-baseline' if arm.startswith('base') else ''}\t{flags if arm.endswith('64') else ''}"
-        for arm in ARM_NAMES
-    ]
-    assert (evidence / "link-policy.tsv").read_text().splitlines() == expected_policy, "unexpected link policy"
+    expected_policy = ["base\tcompile-performance-baseline", "head\tcompile-performance",
+                       "baseiso\ttest-overlay", "headiso\ttest-overlay"]
+    assert (evidence / "build-policy.tsv").read_text().splitlines() == expected_policy, "unexpected build policy"
     reference = evidence / "default-reference"
     layout = {}
     for arm in ARM_NAMES:
@@ -356,20 +388,26 @@ def verify_alignment(evidence):
         assert symbols == read(reference / f"{arm}.symbols.json"), (arm, "stock symbol drift")
         original_build = compiler_metadata(reference / f"{arm}.build.txt")
         assert compiler_metadata(evidence / f"{arm}.build.txt") == original_build, arm
-        # Go 1.27.1 omits linker flags from BuildInfo under -trimpath.
-        assert compiler_metadata(evidence / f"{arm}64.build.txt") == original_build, arm
+        isolated_build = compiler_metadata(evidence / f"{arm}iso.build.txt")
+        original_settings = [row for row in original_build if row.startswith("\tbuild\t")]
+        isolated_settings = [row for row in isolated_build if row.startswith("\tbuild\t")]
+        assert isolated_settings == original_settings, arm
 
-        aligned, _, aligned_code = layout[arm + "64"]
-        assert current["text"]["sha256"] != aligned["text"]["sha256"], (arm, "alignment absent")
+        isolated, _, isolated_code = layout[arm + "iso"]
+        assert current["text"]["sha256"] != isolated["text"]["sha256"], (arm, "test isolation absent")
         for name, item in code.items():
-            intervention = aligned_code[name]
-            assert intervention["address"] % 64 == 0 and intervention["shape"] == item["shape"], (arm, name)
+            assert isolated_code[name]["shape"] == item["shape"], (arm, name, "hot instruction shape changed")
         report[arm] = {"exactStockELF": current["sha256"] == original["sha256"],
-                       "layout": {name: [item["address"], aligned_code[name]["address"]] for name, item in code.items()}}
-    for left, right in (("base", "head"), ("base64", "head64")):
+                       "layout": {name: [item["address"], isolated_code[name]["address"]] for name, item in code.items()}}
+    for left, right in (("base", "head"), ("baseiso", "headiso")):
         for name, item in layout[left][2].items():
             assert item["shape"] == layout[right][2][name]["shape"], (left, right, name)
-    (evidence / "alignment-verification.json").write_text(json.dumps(report, indent=2) + "\n")
+    for arm in ARM_NAMES[2:]:
+        fixture = read(evidence / f"{arm}.projection.json")
+        assert fixture["retained"] == {BENCHMARK_FIXTURE: BENCHMARK_SHA, HELPER_FIXTURE: HELPER_SHA}, arm
+        assert fixture["helperSource"] == HELPER_SOURCE_SHA and fixture["omittedTests"], arm
+    report["sameIsolatedText"] = layout["baseiso"][0]["text"] == layout["headiso"][0]["text"]
+    (evidence / "isolation-verification.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
 def confirmed_targets(text):
@@ -406,8 +444,10 @@ if __name__ == "__main__":
         print(json.dumps(symbol_fingerprints(*map(Path, args)), indent=2, sort_keys=True))
     elif action == "reference":
         read_default_reference(*map(Path, args))
-    elif action == "verify-alignment":
-        verify_alignment(Path(args[0]))
+    elif action == "verify-isolation":
+        verify_isolation(Path(args[0]))
+    elif action == "project":
+        project(*map(Path, args))
     elif action == "dispatch":
         binary, disassembly = map(Path, args)
         print(json.dumps(trace_dispatch(binary.read_bytes(), read_disassembly(disassembly)), indent=2))

@@ -4,7 +4,7 @@ export LC_ALL=C GOTOOLCHAIN=local
 
 base=36681c63627f4a3a4805bc6d19e908325614d3e9
 head=27fddbeee9a994e1ea1330df9b53b36d501c8652
-parent=5647fe4929e402aab4f2d7c9d5af353284517f88
+parent=7edd2c863f66b94607cdd1689f48be5f39d6ab32
 root=$(cd "$GITHUB_WORKSPACE" && pwd -P)
 work="$root/.tmp"
 control="$work/control"
@@ -23,7 +23,8 @@ test "$actual" = "$cpu"
 test "$(go env GOVERSION GOHOSTOS GOHOSTARCH GOOS GOARCH GOAMD64 CGO_ENABLED)" = $'go1.27.1\nlinux\namd64\nlinux\namd64\nv1\n1'
 test -z "$(go env GOFLAGS)"
 test "$(g "$control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $parent"
-diff -u <(printf 'M\t%s\n' scripts/diagnose-pr143-strict-native.py scripts/diagnose-pr143-strict-native.sh) \
+diff -u <(printf 'M\t%s\n' .github/workflows/diagnose-pr143-strict-layout.yml \
+    scripts/diagnose-pr143-strict-native.py scripts/diagnose-pr143-strict-native.sh) \
     <(g "$control" diff --name-status "$parent" HEAD)
 test "$(g "$base_checkout" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$base" d94bb8bc8d797a4cd2c0def3ff30fe59188dc772)"
 test "$(g "$head_git" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$head" 648af87da509ec22c879161c27799c857ceadbdf)"
@@ -59,7 +60,7 @@ trap 'exit 143' TERM
 input="$scratch/input"
 head_archive="$scratch/head"
 tools="$scratch/bin"
-mkdir -p "$input" "$head_archive/.tmp" "$tools"/{base,head,base64,head64} "$scratch/tmp" "$base_checkout/.tmp"
+mkdir -p "$input" "$head_archive/.tmp" "$tools"/{base,head,baseiso,headiso} "$scratch/tmp" "$base_checkout/.tmp"
 export TMPDIR="$scratch/tmp" GOTMPDIR="$scratch/tmp"
 gh api repos/light-speak/luxo/actions/runs/45783705322/attempts/1 > "$input/original-run.json"
 gh api "repos/light-speak/luxo/actions/artifacts/15101670856" > "$input/original-metadata.json"
@@ -88,22 +89,32 @@ IFS=$'\t' read -r package profile filter < "$evidence/batch.tsv"
 "$tools/benchplan" --verify-profile-batch confirmation "$evidence/expected.json" "$evidence/batch.tsv"
 source_for() {
     case "$1" in
-        base|base64) printf '%s\n' "$base_checkout" ;;
-        head|head64) printf '%s\n' "$head_archive" ;;
+        base|baseiso) printf '%s\n' "$base_checkout" ;;
+        head|headiso) printf '%s\n' "$head_archive" ;;
         *) return 2 ;;
     esac
 }
 test "$(sha256sum "$base_checkout/pkg/lux/luvia/middleware_bench_test.go" | cut -d' ' -f1)" = a5a5cd5191827423e07bf382d572614207c3e7fb5b7df27452963c3136bb2d8e
 cmp "$base_checkout/pkg/lux/luvia/middleware_bench_test.go" "$head_archive/pkg/lux/luvia/middleware_bench_test.go"
+test "$package" = pkg/lux/luvia
+test "$profile" = default
 compile_arm() {
-    local arm=$1 flags= effective command=compile-performance
+    local arm=$1 source command=compile-performance
+    source=$(source_for "$arm")
     if [[ "$arm" == base* ]]; then command=compile-performance-baseline; fi
-    if [[ "$arm" == *64 ]]; then flags=-ldflags=-funcalign=64; fi
-    effective=$(GOFLAGS="$flags" go env GOFLAGS)
-    test "$effective" = "$flags"
-    printf '%s\t%s\t%s\n' "$arm" "$command" "$effective" >> "$evidence/link-policy.tsv"
-    GOFLAGS="$flags" "$tools/benchrun" "$command" "$(source_for "$arm")" "$tools/$arm" "$package" "$profile" \
-        > "$evidence/$arm.compile.log" 2>&1
+    if [[ "$arm" == *iso ]]; then
+        mkdir "$scratch/$arm-overlay"
+        python3 -I -B "$helper" project "$source" "$scratch/$arm-overlay" > "$evidence/$arm.projection.json"
+        printf '%s\ttest-overlay\n' "$arm" >> "$evidence/build-policy.tsv"
+        (
+            cd "$source"
+            GOWORK="$source/go.work" go test -trimpath -c -overlay="$scratch/$arm-overlay/overlay.json" \
+                "./$package" -o "$tools/$arm/$binary"
+        ) > "$evidence/$arm.compile.log" 2>&1
+    else
+        printf '%s\t%s\n' "$arm" "$command" >> "$evidence/build-policy.tsv"
+        "$tools/benchrun" "$command" "$source" "$tools/$arm" "$package" "$profile" > "$evidence/$arm.compile.log" 2>&1
+    fi
 }
 binary="${package//\//-}"
 if [[ "$profile" != default ]]; then binary="$binary-$profile"; fi
@@ -121,7 +132,7 @@ record_binary() {
     python3 -I -B "$helper" symbols "$path" "$output.symbols.txt" "$output.elf.json" > "$output.symbols.json"
     python3 -I -B "$helper" dispatch "$path" "$output.objdump.txt" > "$output.dispatch.json"
 }
-for arm in base head base64 head64; do
+for arm in base head baseiso headiso; do
     compile_arm "$arm"
     record_binary "$tools/$arm/$binary" "$evidence/$arm"
     "$tools/benchrun" run-performance "$(source_for "$arm")" "$tools/$arm" "$package" "$profile" \
@@ -129,7 +140,7 @@ for arm in base head base64 head64; do
         -test.benchtime=1x -test.count=1 -test.cpu=2 > "$evidence/$arm.inventory.raw"
     python3 -I -B "$helper" inventory "$evidence/$arm.inventory.raw"
 done
-python3 -I -B "$helper" verify-alignment "$evidence"
+python3 -I -B "$helper" verify-isolation "$evidence"
 jq -s '{sameELF: (.[0].sha256 == .[1].sha256), sameTextBytes: (.[0].text.sha256 == .[1].text.sha256),
     sameTextRecord: (.[0].text == .[1].text),
     sameExecutableLoadSegments: (.[0].executableLoadSegments == .[1].executableLoadSegments)}' \
@@ -159,8 +170,8 @@ sample_pair() {
     fi
 }
 
-comparisons=(aa:base:base ab:base:head bb:head:head aa64:base64:base64 ab64:base64:head64 bb64:head64:head64
-    a-align:base:base64 b-align:head:head64)
+comparisons=(aa:base:base ab:base:head bb:head:head aaiso:baseiso:baseiso abiso:baseiso:headiso bbiso:headiso:headiso
+    a-isolate:base:baseiso b-isolate:head:headiso)
 printf 'comparison\tgroup\tpair\torder\tleft\tright\n' > "$evidence/order.tsv"
 for group in 1 2; do
     for round in {1..10}; do
@@ -196,7 +207,7 @@ gate() {
     return "$status"
 }
 unstable=0
-for side in aa bb aa64 bb64; do
+for side in aa bb aaiso bbiso; do
     for group in 1 2; do
         for direction in '' .reverse; do
             name="$side.$group$direction"
@@ -212,12 +223,12 @@ strict_compare() {
 }
 strict_status=0
 strict_compare ab || strict_status=$?
-aligned_status=0
-strict_compare ab64 || aligned_status=$?
+isolated_status=0
+strict_compare abiso || isolated_status=$?
 is_performance_rejection() {
     grep -Eq '^performance gate rejected [1-9][0-9]* regression\(s\)$' "$evidence/$1.gate.txt"
 }
-for label in a-align b-align; do
+for label in a-isolate b-isolate; do
     cross_status=0
     gate "$label-combined" "$evidence/$label.1.csv" "$evidence/$label.2.csv" || cross_status=$?
     if (( cross_status != 0 )) && ! is_performance_rejection "$label-combined"; then
@@ -225,7 +236,7 @@ for label in a-align b-align; do
         exit 4
     fi
 done
-sha256sum -c "$evidence/"{base,head,base64,head64}.sha256
+sha256sum -c "$evidence/"{base,head,baseiso,headiso}.sha256
 if (( unstable )); then printf 'unstable-control\n' > "$evidence/outcome.txt"; exit 4; fi
 if (( strict_status == 0 )); then
     printf 'default-targets-not-reproduced\n' > "$evidence/outcome.txt"
@@ -239,12 +250,12 @@ if ! python3 -I -B "$helper" confirmed-targets "$evidence/ab-combined.gate.txt";
     printf 'default-confirmed-targets-changed\n' > "$evidence/outcome.txt"
     exit "$strict_status"
 fi
-if (( aligned_status )); then
-    if is_performance_rejection ab64-combined; then
-        printf 'default-strict-failed-aligned-comparison-failed\n' > "$evidence/outcome.txt"
+if (( isolated_status )); then
+    if is_performance_rejection abiso-combined; then
+        printf 'default-strict-failed-isolated-comparison-failed\n' > "$evidence/outcome.txt"
     else
-        printf 'invalid-aligned-comparison\n' > "$evidence/outcome.txt"
+        printf 'invalid-isolated-comparison\n' > "$evidence/outcome.txt"
     fi
-    exit "$aligned_status"
+    exit "$isolated_status"
 fi
-printf 'default-strict-failed-alignment-cleared-targets\n' > "$evidence/outcome.txt"
+printf 'default-strict-failed-isolation-cleared-targets\n' > "$evidence/outcome.txt"

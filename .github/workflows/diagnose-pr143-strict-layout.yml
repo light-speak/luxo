@@ -1,4 +1,4 @@
-name: Attribute PR 143 auth middleware link layout
+name: Attribute PR 143 auth middleware test layout
 
 on:
   push:
@@ -14,7 +14,7 @@ permissions:
 jobs:
   replay:
     if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr143-strict-layout'
-    name: Auth middleware alignment (${{ matrix.slot }})
+    name: Auth middleware test isolation (${{ matrix.slot }})
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     strategy:
@@ -69,7 +69,7 @@ jobs:
           go-version: '1.27.1'
           cache: false
 
-      - name: Verify the original executable code and run four-arm auth comparisons
+      - name: Verify the original executable code and run four-arm auth isolation comparisons
         if: steps.route.outputs.match == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -79,7 +79,7 @@ jobs:
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
-          name: pr143-auth-alignment-${{ matrix.slot }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: pr143-auth-test-isolation-${{ matrix.slot }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/pr143-strict-evidence/
           include-hidden-files: true
           if-no-files-found: error
