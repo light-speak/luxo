@@ -23,13 +23,13 @@ BENCHSTAT = ROOT.parents[2] / ".tmp/pr64-perf.Y5HLWX4K/benchstat"
 BASE = "e101cf7699acb358305fd373934e8813a98087bd"
 BASE_TREE = "377fdb5bbe6815a45930c53e10797f08cf07c917"
 EQUIVALENT = "ffd90b349d9d3a116af737d0caae1d24749d24a2"
-FINAL = "442c77214d61d7ad2c39b3b7c70a111024bd6a2c"
+FINAL = "e1aa6577f84a4690b34c56f6f585ac17e271f3c1"
 BENCHSTAT_SHA = "b5004127165b217b1e9393aadf91fce40d1ae29c0b56e71bc3d897fbdfbf9697"
 PATCHES = {
     EQUIVALENT: ("readiness-7ba.Yduv1mND/combined.patch",
                  "7e00b6603dbfcbd9d2a9c7870780a088cba7aadf9af9335aadb80f73b0181757"),
     FINAL: ("readiness-e101-abnormal.5oIlePvb/on-e101-combined.patch",
-            "a9b3538f929a3ef762d2b9a9ea6103a52c40ad2c85141e768f5b2886bcf583e7"),
+            "6b697473657ac7e6836f5db17040bbf77419da071162ce91eabe595951de9d58"),
 }
 PACKAGE = "pkg/lux/luvia"
 BENCH_BINARY = "pkg-lux-luvia.test"
