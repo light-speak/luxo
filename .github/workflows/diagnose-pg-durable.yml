@@ -1,4 +1,4 @@
-name: Compare PostgreSQL migration receipt writes
+name: Compare PostgreSQL migration history and acknowledgement writes
 
 on:
   push:
@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [retry]
+        lane: [retry, lifecycle]
     env:
       LUXO_PG_DURABLE_LANE: ${{ matrix.lane }}
     steps:
@@ -58,7 +58,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: hosted-pg-durable-receipt-${{ matrix.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: hosted-pg-durable-history-${{ matrix.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/pg-durable-hosted-evidence/
           if-no-files-found: error
           retention-days: 14
