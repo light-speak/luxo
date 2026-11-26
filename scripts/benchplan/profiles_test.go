@@ -142,6 +142,78 @@ func TestAPIAndLuviaIsolatedInventoriesMatchOnlyRoutedRoots(t *testing.T) {
 	}
 }
 
+func TestAPILocalRouteExportProfileKeepsExactLeaves(t *testing.T) {
+	const root = "BenchmarkLocalRouteExport/"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	const other = "BenchmarkLocalRouteLookup/routes=1/current" + measurement
+	leaves := []string{"routes=1/previous", "routes=1/current", "routes=16/previous", "routes=16/current", "routes=128/previous", "routes=128/current"}
+	var measurements strings.Builder
+	for _, leaf := range leaves {
+		measurements.WriteString(root + leaf + measurement)
+	}
+	full := measurements.String()
+	partial := strings.Replace(full, root+leaves[5]+measurement, "", 1)
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	for _, tc := range []struct {
+		name, profile, ordinary, isolated string
+		valid                             bool
+	}{
+		{"exact new partition", "api-local-route-export", full + other, full, true},
+		{"missing leaf in both builds", "api-local-route-export", partial + other, partial, false},
+		{"generic fixture also retains the route", "api-non-identity", full + other, full + other, true},
+		{"generic fixture loses a route leaf", "api-non-identity", full + other, partial + other, false},
+		{"generic fixture loses a neighbor", "api-non-identity", full + other, full, false},
+		{"export profile contains the lookup", "api-local-route-export", full + other, full + other, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			args := []string{"--verify-profile-inventory", "pkg/lux/api", tc.profile, ordinary, isolated}
+			if err := run(args, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+}
+
+func TestAPICanonicalJSONProfileKeepsAllMeasuredLeaves(t *testing.T) {
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	const other = "BenchmarkLocalRouteLookup/routes=1/current" + measurement
+	var all strings.Builder
+	for family, leaves := range canonicalJSONCases() {
+		for _, leaf := range leaves {
+			all.WriteString("BenchmarkCanonicalJSON" + family + "/" + leaf + measurement)
+		}
+	}
+	full := all.String()
+	if strings.Count(full, measurement) != 91 {
+		t.Fatal("CanonicalJSON inventory must keep all 91 measured leaves")
+	}
+	partial := strings.Replace(full, "BenchmarkCanonicalJSONValue/object/after"+measurement, "", 1)
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	for _, tc := range []struct {
+		name, profile, ordinary, isolated string
+		valid                             bool
+	}{
+		{"dedicated keeps all leaves", "api-canonical-json", full + other, full, true},
+		{"both binaries omit a leaf", "api-canonical-json", partial + other, partial, false},
+		{"dedicated includes an unrelated leaf", "api-canonical-json", full + other, full + other, false},
+		{"broad discovery keeps all leaves", "api-non-identity", full + other, full + other, true},
+		{"broad discovery loses one leaf", "api-non-identity", full + other, partial + other, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			args := []string{"--verify-profile-inventory", "pkg/lux/api", tc.profile, ordinary, isolated}
+			if err := run(args, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+}
+
 const (
 	mergeDestinationPackage = "pkg/lux/luvia"
 	mergeDestinationProfile = "luvia-merge-destination"
@@ -151,9 +223,6 @@ const (
 )
 
 func TestMergeDestinationProfileKeepsExactlySixLeaves(t *testing.T) {
-	root := benchmarkTempDir(t)
-	ordinary, isolated := root+"/ordinary.log", root+"/isolated.log"
-	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
 	rows := []string{
 		"columnar=false/rows=1/direct=false",
 		"columnar=false/rows=1/direct=true",
@@ -162,17 +231,39 @@ func TestMergeDestinationProfileKeepsExactlySixLeaves(t *testing.T) {
 		"columnar=true/rows=128/direct=false",
 		"columnar=true/rows=128/direct=true",
 	}
+	verifyLuviaProfileInventory(t, mergeDestinationProfile, mergeDestinationRoot, rows, "columnar=false/rows=128/direct=true")
+}
+
+const (
+	resolvedFieldsProfile = "luvia-resolved-fields"
+	resolvedFieldsRoot    = "BenchmarkValidateResolvedFields"
+)
+
+func TestResolvedFieldsProfileKeepsExactlySixLeaves(t *testing.T) {
+	rows := []string{
+		"object-2/per-value", "object-2/column-check",
+		"list-small-128x16/per-value", "list-small-128x16/column-check",
+		"list-wide-128x16/per-value", "list-wide-128x16/column-check",
+	}
+	verifyLuviaProfileInventory(t, resolvedFieldsProfile, resolvedFieldsRoot, rows, "object-3/column-check")
+}
+
+func verifyLuviaProfileInventory(t *testing.T, profile, benchmark string, rows []string, extraLeaf string) {
+	t.Helper()
+	root := benchmarkTempDir(t)
+	ordinary, isolated := root+"/ordinary.log", root+"/isolated.log"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
 	measure := func(leaves []string) string {
 		var output strings.Builder
 		for _, leaf := range leaves {
-			output.WriteString(mergeDestinationRoot + "/" + leaf + measurement)
+			output.WriteString(benchmark + "/" + leaf + measurement)
 		}
 		return output.String()
 	}
-	full, shortened := measure(rows), measure(rows[:5])
-	extra := measure([]string{"columnar=false/rows=128/direct=true"})
+	full, shortened := measure(rows), measure(rows[:len(rows)-1])
+	extra := measure([]string{extraLeaf})
 	const control = mergeDestinationControl + measurement
-	args := []string{"--verify-profile-inventory", mergeDestinationPackage, mergeDestinationProfile, ordinary, isolated}
+	args := []string{"--verify-profile-inventory", mergeDestinationPackage, profile, ordinary, isolated}
 	for _, tc := range []struct {
 		name, ordinary, isolated string
 		valid                    bool
@@ -194,11 +285,21 @@ func TestMergeDestinationProfileKeepsExactlySixLeaves(t *testing.T) {
 }
 
 func TestMergeDestinationPrimaryAndConfirmationStayExclusive(t *testing.T) {
+	verifyLuviaProfileRouting(t, mergeDestinationProfile, mergeDestinationRoot,
+		mergeDestinationTarget, "^columnar=true$/^rows=1$/^direct=true$")
+}
+
+func TestResolvedFieldsPrimaryAndConfirmationStayExclusive(t *testing.T) {
+	verifyLuviaProfileRouting(t, resolvedFieldsProfile, resolvedFieldsRoot,
+		"list-small-128x16/per-value", "^list-small-128x16$/^per-value$")
+}
+
+func verifyLuviaProfileRouting(t *testing.T, profile, root, target, targetFilter string) {
+	t.Helper()
 	const pkg = mergeDestinationPackage
-	const root = mergeDestinationRoot
 	const control = mergeDestinationControl
 	primary := formatShard(benchShard{Groups: []benchGroup{{Package: pkg, Name: root}, {Package: pkg, Name: control}}})
-	keys := []sampleKey{{pkg, root + "/" + mergeDestinationTarget + "-2"}, {pkg, control + "-2"}}
+	keys := []sampleKey{{pkg, root + "/" + target + "-2"}, {pkg, control + "-2"}}
 	confirmation := formatConfirmationBatch(keys)
 	data, err := json.Marshal(expectedSamples{Base: keys, Head: keys})
 	if err != nil {
@@ -209,10 +310,10 @@ func TestMergeDestinationPrimaryAndConfirmationStayExclusive(t *testing.T) {
 	writeFixture(t, expected, string(data))
 	for _, tc := range []struct{ phase, batch, selected, sibling string }{
 		{"primary", primary, "^(" + root + ")$", "^(" + control + ")$"},
-		{"confirmation", confirmation, "^" + root + "$/^columnar=true$/^rows=1$/^direct=true$", "^" + control + "$"},
+		{"confirmation", confirmation, "^" + root + "$/" + targetFilter, "^" + control + "$"},
 	} {
 		t.Run(tc.phase, func(t *testing.T) {
-			if !strings.Contains(tc.batch, pkg+"\t"+mergeDestinationProfile+"\t"+tc.selected+"\n") ||
+			if !strings.Contains(tc.batch, pkg+"\t"+profile+"\t"+tc.selected+"\n") ||
 				!strings.Contains(tc.batch, pkg+"\tdefault\t"+tc.sibling+"\n") {
 				t.Fatalf("wrong profile routing:\n%s", tc.batch)
 			}
@@ -221,7 +322,7 @@ func TestMergeDestinationPrimaryAndConfirmationStayExclusive(t *testing.T) {
 			if err := run(args, io.Discard); err != nil {
 				t.Fatal(err)
 			}
-			writeFixture(t, batch, strings.Replace(tc.batch, "\t"+mergeDestinationProfile+"\t", "\tdefault\t", 1))
+			writeFixture(t, batch, strings.Replace(tc.batch, "\t"+profile+"\t", "\tdefault\t", 1))
 			if err := run(args, io.Discard); err == nil {
 				t.Fatal("accepted the isolated workload in the default profile")
 			}
