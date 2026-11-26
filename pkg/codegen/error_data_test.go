@@ -334,6 +334,148 @@ func TestErrorDataUnsupportedTypeRejected(t *testing.T) {
 	}
 }
 
+func TestErrorDataFieldsUseResponsePolicy(t *testing.T) {
+	file := &ast.File{
+		Types: []*ast.TypeDecl{{Name: "Details", Fields: []*ast.FieldDecl{
+			{Name: "code", Type: &ast.TypeRef{Name: "String"}},
+			{Name: "privateNote", Type: &ast.TypeRef{Name: "String", Nullable: true}, Directives: []*ast.Directive{{Name: "visible"}}},
+			{Name: "label", Type: &ast.TypeRef{Name: "String", Nullable: true}, Directives: []*ast.Directive{{Name: "mask"}}},
+			{Name: "labels", Type: &ast.TypeRef{Name: "String", IsList: true}, Directives: []*ast.Directive{{Name: "mask"}}},
+		}}},
+		Errors: []*ast.ErrorDecl{{Name: "Rejected", Fields: []*ast.ParamDecl{{Name: "details", Type: &ast.TypeRef{Name: "Details"}}}}},
+	}
+	source := string(generateErrorFile(&semantic.Result{Files: []*ast.File{file}}, "generated"))
+	for _, token := range []string{"value.Code", "str.Mask((*value.Label)", `"github.com/light-speak/luxo/pkg/lux/str"`} {
+		if !strings.Contains(source, token) {
+			t.Errorf("generated response is missing %q", token)
+		}
+	}
+	if strings.Contains(source, "value.PrivateNote") {
+		t.Error("context-free error data includes a conditionally visible field")
+	}
+	if t.Failed() {
+		return
+	}
+	var model strings.Builder
+	generateTypeStruct(&model, file.Types[0], nil)
+	runGeneratedProtocolPackage(t, source+model.String(), `package generated
+import "testing"
+
+func TestPublicErrorData(t *testing.T) {
+	label := "13812345678"
+	data := NewRejected(Details{Code: "REVIEW", Label: &label, Labels: []string{label}}).Data
+	const want = "{\"code\":\"REVIEW\",\"label\":\"138****5678\",\"labels\":[\"138****5678\"]}"
+	if got, err := data.AppendJSON(nil); string(got) != "{\"details\":"+want+"}" || err != nil {
+		t.Fatalf("structured data = %s, %v", got, err)
+	}
+	if got, ok := data.AppendText(nil, "details"); string(got) != want || !ok {
+		t.Fatalf("localized data = %s, %v", got, ok)
+	}
+	data = NewRejected(Details{Code: "REVIEW"}).Data
+	if got, err := data.AppendJSON(nil); string(got) != "{\"details\":{\"code\":\"REVIEW\",\"label\":null,\"labels\":[]}}" || err != nil {
+		t.Fatalf("absent data = %s, %v", got, err)
+	}
+}
+`)
+}
+
+func TestErrorDataProjectionPreservesOwnerPolicy(t *testing.T) {
+	const owner = `
+model ProjectedRecord @noTime {
+	key: String @id
+	title: String
+	privateLabel: String? @visible { false }
+	hiddenLabel: String @hidden
+	internalLabel: String @internal
+	ownerMask: String @mask("##********")
+	sameMask: String @mask
+	conflictMask: String @mask("###*******")
+	localMask: String
+}
+model PlainRecord @noTime { key: String @id title: String }
+model UnprojectedRecord @noTime { key: String @id title: String @mask }
+`
+	const consumer = `
+extend ProjectedRecord {
+	title: String
+	privateLabel: String?
+	hiddenLabel: String
+	internalLabel: String
+	ownerMask: String
+	sameMask: String @mask
+	conflictMask: String @mask("##********")
+	localMask: String @mask
+}
+extend PlainRecord { title: String }
+error ProjectionRejected(record: ProjectedRecord) { code: 422 message: "error.projection" }
+error PlainRejected(record: PlainRecord) { code: 422 message: "error.plain" }
+`
+	files := []*ast.File{
+		parseStreamEnumSource(t, "origin/owner/record.luxo", owner),
+		parseStreamEnumSource(t, "origin/consumer/errors.luxo", consumer),
+	}
+	analyzed := semantic.AnalyzeModules(files)
+	if len(analyzed.Errors) != 0 {
+		t.Fatal(analyzed.Errors)
+	}
+	full, err := semantic.CompilationView(analyzed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := StableIDs{ModelFields: map[string]map[string]int{
+		"ProjectedRecord": {"key": 1, "title": 2, "privateLabel": 3, "hiddenLabel": 4,
+			"internalLabel": 5, "ownerMask": 6, "sameMask": 7, "conflictMask": 8, "localMask": 9},
+		"PlainRecord": {"key": 1, "title": 2},
+	}}
+	events := BuildEventContext(full.Files, "")
+	if _, exists := events.modelErrorPolicies["UnprojectedRecord"]; exists {
+		t.Fatal("an unprojected model contributed to the owner policy catalog")
+	}
+	g := mustNewGenerator(t, GeneratorConfig{IDs: ids, Events: events})
+	selected := *full
+	selected.Files = nil
+	for _, file := range full.Files {
+		if moduleNameFromFile(file.Name) == "consumer" {
+			selected.Files = append(selected.Files, file)
+		}
+	}
+	generated, err := g.Generate(&selected, "generated", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGeneratedCompilation(t, generated, `package generated
+
+import "testing"
+
+func TestErrorResponsePolicy(t *testing.T) {
+	label := "fixture-label"
+	guarded := NewProjectionRejected(ProjectedRecord{
+		Key: "sample", Title: "sale", PrivateLabel: &label,
+		HiddenLabel: label, InternalLabel: label,
+		OwnerMask: "ALPHA12345", SameMask: "ABCDEFGHIJK",
+		ConflictMask: "ALPHA12345", LocalMask: "ABCDEFGHIJK",
+	}).Data
+	open := NewPlainRejected(PlainRecord{Key: "sample", Title: "sale"}).Data
+	const guardedObject = "{\"key\":\"sample\",\"title\":\"sale\",\"ownerMask\":\"AL********\",\"sameMask\":\"ABC****HIJK\",\"localMask\":\"ABC****HIJK\"}"
+	const openObject = "{\"key\":\"sample\",\"title\":\"sale\"}"
+	for _, item := range []struct {
+		data interface {
+			AppendJSON([]byte) ([]byte, error)
+			AppendText([]byte, string) ([]byte, bool)
+		}
+		want string
+	}{{guarded, guardedObject}, {open, openObject}} {
+		if got, err := item.data.AppendJSON(nil); err != nil || string(got) != "{\"record\":" + item.want + "}" {
+			t.Fatalf("structured data %s, %v", got, err)
+		}
+		if got, ok := item.data.AppendText(nil, "record"); !ok || string(got) != item.want {
+			t.Fatalf("localized data %s, %v", got, ok)
+		}
+	}
+}
+`)
+}
+
 func TestGeneratedErrorDataEnumBoundary(t *testing.T) {
 	status := &ast.EnumDecl{Name: "Status", Values: []string{"OPEN", "CLOSED"}}
 	details := &ast.TypeDecl{Name: "Details", Fields: []*ast.FieldDecl{
