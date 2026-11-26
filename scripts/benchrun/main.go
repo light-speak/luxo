@@ -108,6 +108,8 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-lux-short-path-*", writeLuxShortPathOverlay)
 	case benchlayout.CodecReaderProfile:
 		return codecReaderOverlay(root)
+	case benchlayout.RPCOwnedRequestProfile:
+		return packageTestOverlay(root, packagePath, "bench-rpc-owned-request-*", writeRPCOwnedRequestOverlay)
 	case benchlayout.APINonIdentityProfile:
 		return packageTestOverlay(root, packagePath, "bench-api-non-identity-*", writeAPIBenchmarkOverlay)
 	case benchlayout.APILocalRouteExportProfile:
@@ -122,6 +124,8 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-luvia-merge-destination-*", writeLuviaMergeDestinationOverlay)
 	case benchlayout.LuviaResolvedFieldsProfile:
 		return packageTestOverlay(root, packagePath, "bench-luvia-resolved-fields-*", writeLuviaResolvedFieldsOverlay)
+	case benchlayout.LuviaConvenienceKeysProfile:
+		return packageTestOverlay(root, packagePath, "bench-luvia-convenience-keys-*", writeLuviaConvenienceKeysOverlay)
 	case benchlayout.CodegenLiteralProfile:
 		return packageTestOverlay(root, packagePath, "bench-codegen-integer-literals-*", writeCodegenLiteralOverlay)
 	case benchlayout.CodegenReceiverProfile:

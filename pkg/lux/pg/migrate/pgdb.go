@@ -35,6 +35,28 @@ func (d *PGDB) Exec(ctx context.Context, sql string, args ...any) error {
 	return err
 }
 
+func (d *PGDB) execMigrationStatement(ctx context.Context, sql string) error {
+	conn, err := d.pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	if err := checkMigrationStringMode(conn.Conn()); err != nil {
+		return err
+	}
+	_, err = conn.Exec(ctx, sql)
+	return err
+}
+
+func checkMigrationStringMode(conn *pgx.Conn) error {
+	// The PostgreSQL wire protocol reports changes to this setting. A prior
+	// migration or a different pool connection can have a different mode.
+	if conn.PgConn().ParameterStatus("standard_conforming_strings") != "on" {
+		return errMigrationStringMode
+	}
+	return nil
+}
+
 func (d *PGDB) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
 	rows, err := d.pool.Query(ctx, sql, args...)
 	if err != nil {
@@ -74,6 +96,7 @@ type pgRows struct {
 
 func (r *pgRows) Next() bool             { return r.rows.Next() }
 func (r *pgRows) Scan(dest ...any) error { return r.rows.Scan(dest...) }
+func (r *pgRows) Err() error             { return r.rows.Err() }
 func (r *pgRows) Close()                 { r.rows.Close() }
 
 // pgTx wraps pgx.Tx to implement Tx.
@@ -84,6 +107,13 @@ type pgTx struct {
 func (t *pgTx) Exec(ctx context.Context, sql string, args ...any) error {
 	_, err := t.tx.Exec(ctx, sql, args...)
 	return err
+}
+
+func (t *pgTx) execMigrationStatement(ctx context.Context, sql string) error {
+	if err := checkMigrationStringMode(t.tx.Conn()); err != nil {
+		return err
+	}
+	return t.Exec(ctx, sql)
 }
 
 func (t *pgTx) Commit(ctx context.Context) error   { return t.tx.Commit(ctx) }

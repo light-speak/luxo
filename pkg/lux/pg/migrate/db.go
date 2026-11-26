@@ -34,7 +34,8 @@ type Tx interface {
 	Rollback(ctx context.Context) error
 }
 
-// Rows is an iterator over query results.
+// Rows is an iterator over query results. Drivers that can fail after Query
+// returns should expose Err() error after Next reports exhaustion.
 type Rows interface {
 	Next() bool
 	Scan(dest ...any) error

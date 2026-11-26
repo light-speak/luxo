@@ -50,7 +50,7 @@ func SkipLiteral(statement string, index int) (int, bool) {
 		escapes := hasEscapePrefix(statement, index)
 		end := SkipQuoted(statement, index+1, '\'', escapes)
 		if escapes {
-			for next := continuedString(statement, end); next != end; next = continuedString(statement, end) {
+			for next := ContinuedString(statement, end); next != end; next = ContinuedString(statement, end) {
 				end = SkipQuoted(statement, next+1, '\'', true)
 			}
 		}
@@ -84,8 +84,8 @@ func hasEscapePrefix(statement string, quoteIndex int) bool {
 		(quoteIndex == 1 || !IsIdentifierByte(statement[quoteIndex-2]))
 }
 
-// An escape string retains its escape rules in a newline-separated segment.
-func continuedString(statement string, end int) int {
+// ContinuedString finds the next quote of a newline-separated PostgreSQL string.
+func ContinuedString(statement string, end int) int {
 	newline := false
 	for index := end; index < len(statement); index++ {
 		switch statement[index] {

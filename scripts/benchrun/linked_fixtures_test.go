@@ -21,12 +21,13 @@ func TestIsolationProfileCommand(t *testing.T) {
 		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n" +
 			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n" +
 			"luvia-merge-destination\t^BenchmarkMergeDestination$\n" +
-			"luvia-resolved-fields\t^BenchmarkValidateResolvedFields$\n"},
+			"luvia-resolved-fields\t^BenchmarkValidateResolvedFields$\n" +
+			"luvia-convenience-keys\t^BenchmarkConvenienceKeyParentValidation$\n"},
 		{"pkg/codegen", "codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n" +
 			"codegen-global-receiver\t^BenchmarkGlobalReceiverName$\n" +
 			"codegen-migration-state\t^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$\n"},
 		{"pkg/lux", "lux-short-path\t^BenchmarkStrictFilterContract$|^BenchmarkDecimalAlignment$\n"},
-		{"pkg/lux/rpc", ""},
+		{"pkg/lux/rpc", "rpc-owned-request\t^BenchmarkLRPCOwnedRequest$\n"},
 	} {
 		var output bytes.Buffer
 		if err := run([]string{"isolation-profile", tc.pkg}, nil, &output, io.Discard); err != nil || output.String() != tc.want {
@@ -35,6 +36,20 @@ func TestIsolationProfileCommand(t *testing.T) {
 	}
 	if err := run([]string{"isolation-profile", benchlayout.CodegenPackage}, nil, closedIsolationWriter{}, io.Discard); !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("isolation output failure = %v", err)
+	}
+}
+
+func TestConvenienceKeyProfileRejectsMissingFixture(t *testing.T) {
+	root := newBenchmarkRunTree(t)
+	for _, fixture := range []string{"convenience_keys_bench_test.go", "primary_keys_bench_test.go"} {
+		writeBenchmarkRunFixture(t, root, filepath.Join(benchlayout.LuviaPackage, fixture), "package luvia")
+	}
+	_, _, err := compileOverlay(root, benchlayout.LuviaPackage, false, "luvia-convenience-keys")
+	if err == nil || !strings.Contains(err.Error(), "missing Luvia convenience keys test fixture") {
+		t.Fatalf("missing primary-key baseline fixture returned %v", err)
+	}
+	if !strings.Contains(performanceProfile+"\n", "\nluvia-convenience-keys-overlay-v1\n") {
+		t.Fatal("performance compile profile lacks a convenience fixture binding")
 	}
 }
 
@@ -55,11 +70,16 @@ func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 			verifyOnlyListedTestFiles(t, replace, dir, "local_input_bench_test.go")
 		}},
 		{benchlayout.APIPackage, "api-canonical-json", verifyAPICanonicalJSONOverlay},
+		{"pkg/lux/rpc", "rpc-owned-request", verifyRPCOwnedRequestOverlay},
 		{benchlayout.APIPackage, benchlayout.APINonIdentityProfile, verifyAPIOverlay},
 		{benchlayout.LuxPackage, benchlayout.LuxShortPathProfile, verifyLuxShortPathOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaPrimaryTraceProfile, verifyLuviaOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaGatewayIdentityProfile, verifyLuviaGatewayIdentityOverlay},
 		{benchlayout.LuviaPackage, "luvia-merge-destination", verifyLuviaMergeDestinationOverlay},
+		{benchlayout.LuviaPackage, "luvia-convenience-keys", func(t *testing.T, replace map[string]string, dir string) {
+			verifyOnlyListedTestFiles(t, replace, dir, "convenience_keys_bench_test.go",
+				"primary_keys_bench_test.go", "primary_keys_baseline_test.go")
+		}},
 		{benchlayout.LuviaPackage, "luvia-resolved-fields", func(t *testing.T, replace map[string]string, dir string) {
 			verifyOnlyListedTestFiles(t, replace, dir, "grouped_response_bench_test.go", "grouped_response_test.go",
 				"merger_bench_test.go", "primary_keys_bench_test.go", "primary_keys_baseline_test.go")
@@ -86,6 +106,73 @@ func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 			tc.assert(t, overlay.Replace, filepath.Join(root, tc.pkg))
 		})
 	}
+}
+
+func verifyRPCOwnedRequestOverlay(t *testing.T, replace map[string]string, dir string) {
+	t.Helper()
+	const name = "request_reuse_test.go"
+	path := filepath.Join(dir, name)
+	projected, err := os.ReadFile(replace[path])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(projected, []byte("package rpc\nimport (\"fmt\"; \"io\"; \"testing\")\nfunc BenchmarkLRPCOwnedRequest(")) ||
+		bytes.Count(projected, []byte("\nfunc ")) != 1 || !bytes.HasSuffix(projected, []byte("}\n\n")) {
+		t.Fatalf("unexpected owned-request projection %q", projected)
+	}
+	delete(replace, path)
+	verifyOnlyListedTestFiles(t, replace, dir, name)
+}
+
+func TestRPCOwnedRequestOverlayRejectsChangedFixtureBoundaries(t *testing.T) {
+	const pkg = "pkg/lux/rpc"
+	const profile = "rpc-owned-request"
+	const fixture = "request_reuse_test.go"
+	const header = "package rpc\nimport (\"fmt\"; \"io\"; \"testing\")\n"
+	const benchmark = "func BenchmarkLRPCOwnedRequest(b *testing.B) {}\n"
+	if !strings.Contains(performanceProfile+"\n", "\nrpc-owned-request-overlay-v1 request_reuse_test.go\n") {
+		t.Fatal("performance compile profile lacks the RPC owned-request fixture binding")
+	}
+
+	for _, tc := range []struct{ name, file, source, message string }{
+		{"absent", "unrelated_test.go", "package rpc", "missing RPC owned-request test fixture"},
+		{"missing declaration", fixture, header, "requires one BenchmarkLRPCOwnedRequest declaration"},
+		{"duplicate declaration", fixture, header + benchmark + benchmark, "requires one BenchmarkLRPCOwnedRequest declaration"},
+		{"renamed import", fixture, strings.Replace(header, `"fmt"`, `alias "fmt"`, 1) + benchmark, "requires the ordinary fmt import"},
+		{"different package", fixture, strings.Replace(header, "package rpc", "package rpc_test", 1) + benchmark, "requires package rpc"},
+		{"test setup", "unrelated_test.go", "package rpc\nfunc init() {}", "cannot isolate test package setup"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := newBenchmarkRunTree(t)
+			writeBenchmarkRunFixture(t, root, filepath.Join(pkg, tc.file), tc.source)
+			_, cleanup, err := compileOverlay(root, pkg, false, profile)
+			if cleanup != nil {
+				t.Cleanup(func() {
+					if err := cleanup(); err != nil {
+						t.Error(err)
+					}
+				})
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("owned-request fixture error = %v, want %s", err, tc.message)
+			}
+		})
+	}
+	root := newBenchmarkRunTree(t)
+	if _, err := writeRPCOwnedRequestOverlay(filepath.Join(root, pkg), root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing RPC directory returned %v", err)
+	}
+	path := filepath.Join(root, pkg, fixture)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("other_test.go", path); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := compileOverlay(root, pkg, true, profile); err == nil || !strings.Contains(err.Error(), "fixture must be a regular file") {
+		t.Fatalf("symlink fixture returned %v", err)
+	}
+
 }
 
 func verifyAPICanonicalJSONOverlay(t *testing.T, replace map[string]string, dir string) {

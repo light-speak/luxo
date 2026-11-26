@@ -16,6 +16,18 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
+func generateEntryFile(result *semantic.Result, modulePath string, backends EntryBackends) []byte {
+	return emitEntryFile(collectModules(result), modulePath, backends)
+}
+
+func generateModuleEntryFiles(result *semantic.Result, modulePath string, backends EntryBackends) map[string][]byte {
+	return emitModuleEntryFiles(result, collectModules(result), modulePath, backends)
+}
+
+func generateGatewayEntry(result *semantic.Result, modulePath string, backends EntryBackends) []byte {
+	return emitGatewayEntry(result, collectModules(result), modulePath, backends)
+}
+
 func TestCheckedEntriesReturnCanonicalSource(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{{Name: "origin/user.luxo", Models: []*ast.ModelDecl{{Name: "User"}}}}}
 	entries, err := GenerateModuleEntryFilesChecked(result, "example.com/app")
@@ -68,7 +80,7 @@ func TestEntryEmissionDefersFormattingToCheckedBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	emitters := map[string]bool{
-		"generateEntryFile": false, "generateSingleModuleEntry": false, "generateGatewayEntry": false,
+		"emitEntryFile": false, "generateSingleModuleEntry": false, "emitGatewayEntry": false,
 	}
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*goast.FuncDecl)

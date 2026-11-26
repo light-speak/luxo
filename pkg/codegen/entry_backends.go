@@ -70,7 +70,12 @@ func writeBackendGuard(b *strings.Builder, name, selection string) {
 	if !backendEnabled(selection) {
 		selection = "none"
 	}
-	writeStartupRegistration(b, "backend selection", fmt.Sprintf("env.CheckBackend(%q, %q)", name, selection))
+	b.WriteString("\tif err := env.CheckBackend(")
+	writeEntryQuoted(b, name)
+	b.WriteString(", ")
+	writeEntryQuoted(b, selection)
+	b.WriteByte(')')
+	writeStartupRegistrationFailure(b, "backend selection")
 }
 
 func writeSelectedEventBus(b *strings.Builder, selection string) {
