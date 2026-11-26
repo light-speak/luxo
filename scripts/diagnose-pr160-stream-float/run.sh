@@ -7,6 +7,7 @@ cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=5017b587f4cf71d30ebba8b542267aed597bb573
 head=8261decdeb6fb66f6dffa772a6889cf0a82da644
+parent=c85dafc18ed2312ad1b99c913592bd37e55d0387
 out="$repo/.tmp/pr160-stream-float"
 input="$repo/scripts/diagnose-pr160-stream-float"
 base_src="$repo/.tmp/base"
@@ -20,7 +21,14 @@ grep -Fxq 'VERSION_ID="24.04"' /etc/os-release
 test "$(getconf _NPROCESSORS_ONLN)" = 4
 test "$(cat "$out/cpu.txt")" = 'AMD EPYC 7763 64-Core Processor'
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
-test "$(git show -s --format=%P HEAD)" = "$head"
+test "$(git show -s --format=%P HEAD)" = "$parent"
+test "$(git show -s --format=%P "$parent")" = "$head"
+test "$(git rev-parse "$parent^{tree}")" = 6080a8b912a76d9a6d1ed0c81d9f7bcf5bab3972
+git diff --name-status "$parent" HEAD | diff -u - <(cat <<'PATHS'
+M	.github/workflows/diagnose-pr160-stream-float.yml
+M	scripts/diagnose-pr160-stream-float/run.sh
+PATHS
+)
 test "$(git show -s --format=%P "$head")" = "$base"
 test "$(git -C "$base_src" rev-parse HEAD)" = "$base"
 test "$(git rev-parse "$base^{tree}" "$head^{tree}")" = $'f4b13c19316c9fd4cbb0be56d9ba31eab3f98e7f\naa8223878be0583edbbb0ae534a5f122054d75e8'
@@ -122,9 +130,35 @@ for side in base head; do
     "$work/bin/benchrun" run-performance "$repo/.tmp/$side" "$work/$side" "$package" "$profile" \
         -test.run='^$' -test.bench='^BenchmarkStreamParamsLookupFloat$' -test.benchmem \
         -test.benchtime=1x -test.count=1 -test.cpu=2 > "$out/$side.inventory.raw"
-    "$work/bin/benchplan" --normalize "$out/$side.inventory.raw" "$out/$side.inventory.txt"
 done
-"$work/bin/benchplan" --verify "$input/expected.json" "$out/base.inventory.txt" "$out/head.inventory.txt"
+python3 - "$input/expected.json" "$out/base.inventory.raw" "$out/head.inventory.raw" <<'PYINVENTORY'
+from collections import Counter
+import json
+from pathlib import Path
+import sys
+
+if len(sys.argv) != 4:
+    raise SystemExit("expected one inventory for each arm")
+expected = json.loads(Path(sys.argv[1]).read_text())
+prefix = "pkg: github.com/light-speak/luxo/"
+for side, path in zip(("Base", "Head"), map(Path, sys.argv[2:])):
+    lines = path.read_text().splitlines()
+    if not lines or lines[-1] != "PASS" or any(line.startswith("FAIL") for line in lines):
+        raise SystemExit(f"{path}: benchmark smoke did not pass")
+    package = None
+    observed = Counter()
+    for line in lines:
+        if line.startswith(prefix):
+            package = line.removeprefix(prefix)
+        elif line.startswith("Benchmark"):
+            fields = line.split()
+            if len(fields) != 8 or fields[1] != "1" or fields[3::2] != ["ns/op", "B/op", "allocs/op"]:
+                raise SystemExit(f"{path}: expected one iteration with the three original metrics")
+            observed[package, fields[0]] += 1
+    wanted = Counter((item["Package"], item["Name"]) for item in expected[side])
+    if not wanted or wanted != observed:
+        raise SystemExit(f"{path}: expected each of the original leaves exactly once")
+PYINVENTORY
 if cmp -s "$work/base/pkg-lux-api-api-non-identity.test" "$work/head/pkg-lux-api-api-non-identity.test"; then
     echo 'ELF identity: byte-identical' > "$out/elf-identity.txt"
 elif cmp -s "$work/base.text" "$work/head.text"; then
