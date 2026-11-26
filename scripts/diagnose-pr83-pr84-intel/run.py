@@ -19,6 +19,7 @@ ROOT = INPUT.parents[1]
 OUT = ROOT / '.tmp/pr83-pr84-intel-evidence'
 CHECKOUTS = ROOT / '.tmp/pr83-pr84-intel-checkouts'
 REF = 'refs/heads/diagnostics/pr83-pr84-intel'
+DIAGNOSTIC_PARENT = 'e1ee754133cda6a7b36b5b4c63cc596afec8c559'
 MANIFEST_SHA = '3471b2d29d862dcce9bbdc0e27ec05440fe455c1f2b217a88e909daac1c27366'
 MANIFEST = json.loads((INPUT / 'manifest.json').read_bytes())
 PACKAGE = 'pkg/lux/api'
@@ -58,7 +59,11 @@ def save_json(path, data):
 
 
 def selector(leaves):
-    return '|'.join('/'.join('^' + re.escape(piece) + '$' for piece in name.removesuffix('-2').split('/'))
+    def anchor(piece):
+        # Match Go's regexp.QuoteMeta byte for byte in the signed benchplan TSV.
+        return '^' + re.sub(r'([\\.+*?()|\[\]{}^$])', r'\\\1', piece) + '$'
+
+    return '|'.join('/'.join(anchor(piece) for piece in name.removesuffix('-2').split('/'))
                     for name in leaves)
 
 
@@ -95,12 +100,10 @@ def runner():
          os.environ.get('GITHUB_EVENT_NAME') == 'push' and os.environ.get('GITHUB_REF') == REF,
          'expected a hosted push of the diagnostic branch')
     active = git(ROOT, 'rev-parse', 'HEAD')
-    parent = MANIFEST['revisions']['83']['base']
-    paths = ['.github/workflows/diagnose-pr83-pr84-intel.yml']
-    paths += ['scripts/diagnose-pr83-pr84-intel/' + n for n in ('go-capture.py', 'manifest.json', 'run.py')]
-    need(active == os.environ.get('GITHUB_SHA') and git(ROOT, 'show', '-s', '--format=%P', active) == parent and
-         git(ROOT, 'diff', '--name-status', parent, active).splitlines() == ['A\t' + p for p in paths],
-         'expected a single diagnostic-only commit on the pinned parent')
+    need(active == os.environ.get('GITHUB_SHA') and
+         git(ROOT, 'show', '-s', '--format=%P', active) == DIAGNOSTIC_PARENT and
+         git(ROOT, 'diff', '--name-status', DIAGNOSTIC_PARENT, active) == 'M\tscripts/diagnose-pr83-pr84-intel/run.py',
+         'expected the one-file selector correction on the published diagnostic parent')
     cpu = {line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines()
            if line.startswith('model name')}
     spec = MANIFEST['runner']
