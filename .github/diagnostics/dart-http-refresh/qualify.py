@@ -23,6 +23,7 @@ from urllib.parse import unquote, urlsplit
 HERE = Path(__file__).resolve().parent
 BASE = "77b6cdf20d424213f4c1dc90534f924ac6b176d0"
 PREVIOUS_DIAGNOSTIC = "363248532f038736753f6945d5ad6300faadcfc7"
+OPTIMIZED_DIAGNOSTIC = "b274e92be61e5c0e96ef917fb48bacfff248c5a1"
 TREES = {"A": "9014a2b7a92f5b2abbb5aca10a6a9a7d0978955f", "B": "02ef80cad47fe91a6537b79da850bba377dffcab"}
 PACKAGES = {"A": "bf0dcf2da32afc0fcff9fb3ee82550b5e6cf0795", "B": "cec75af701a414aac5f2d911ea74a09cf5d07bb8"}
 PACKAGE = "packages/dart"
@@ -62,8 +63,9 @@ def git(repo, *args, index=None, data=None):
 
 def verify_checkout(repo):
     assert git(repo, "rev-parse", "HEAD").decode().strip() == os.environ["GITHUB_SHA"]
-    assert git(repo, "rev-parse", "HEAD^").decode().strip() == PREVIOUS_DIAGNOSTIC
-    assert git(repo, "rev-parse", "HEAD^^").decode().strip() == BASE
+    assert git(repo, "rev-parse", "HEAD^").decode().strip() == OPTIMIZED_DIAGNOSTIC
+    assert git(repo, "rev-parse", "HEAD^^").decode().strip() == PREVIOUS_DIAGNOSTIC
+    assert git(repo, "rev-parse", "HEAD^^^").decode().strip() == BASE
     paths = {str(HERE.relative_to(repo) / name) for name in (*FIXTURES, "qualify.py", "product.patch.b64")}
     paths.add(".github/workflows/dart-http-refresh-cost.yml")
     changes = git(repo, "diff", "--name-status", BASE, "HEAD").decode().splitlines()

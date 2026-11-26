@@ -18,19 +18,37 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
 
+      - name: Require the original AMD processor
+        id: cpu
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence=.tmp/dart-http-refresh-evidence
+          mkdir -p "$evidence"
+          model=$(LC_ALL=C lscpu | awk -F: '$1 == "Model name" {sub(/^[[:space:]]+/, "", $2); sub(/[[:space:]]+$/, "", $2); print $2}')
+          match=false
+          if [[ "$(uname -sm)" == 'Linux x86_64' && "$model" == 'AMD EPYC 9V74 80-Core Processor' ]]; then
+            match=true
+          fi
+          printf 'model=%s\nmatch=%s\n' "$model" "$match" | tee "$evidence/routing.txt"
+          printf 'match=%s\n' "$match" >> "$GITHUB_OUTPUT"
+
       - uses: dart-lang/setup-dart@v1
+        if: steps.cpu.outputs.match == 'true'
         with:
           sdk: '3.13.4'
 
       - uses: actions/setup-go@v7
+        if: steps.cpu.outputs.match == 'true'
         with:
           go-version-file: go.mod
           cache: false
 
       - name: Bind the locked Dart arms and take paired samples
+        if: steps.cpu.outputs.match == 'true'
         env:
           PYTHONUTF8: '1'
         run: |
@@ -48,3 +66,6 @@ jobs:
           path: .tmp/dart-http-refresh-evidence/
           if-no-files-found: error
           retention-days: 14
+      - name: Report a processor mismatch after preserving the routing receipt
+        if: ${{ always() && steps.cpu.outputs.match == 'false' }}
+        run: exit 3
