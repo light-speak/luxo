@@ -20,16 +20,16 @@ import time
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 INPUTS = {
-    "gateway.go.txt", "readiness.go.txt", "native.py", "sampler.py",
+    "gateway.go.txt", "readiness.go.txt", "readiness-final.go.txt", "native.py", "sampler.py",
     "prior.patch.gz.b64", "final.patch.gz.b64",
 }
 BASE = "e101cf7699acb358305fd373934e8813a98087bd"
 BASE_TREE = "377fdb5bbe6815a45930c53e10797f08cf07c917"
 PRIOR = "ffd90b349d9d3a116af737d0caae1d24749d24a2"
-FINAL = "e1aa6577f84a4690b34c56f6f585ac17e271f3c1"
+FINAL = "bc832b5339d797ec1152fbbecc44d7c9a85ad5ec"
 PATCHES = {
     PRIOR: ("prior.patch", "7e00b6603dbfcbd9d2a9c7870780a088cba7aadf9af9335aadb80f73b0181757"),
-    FINAL: ("final.patch", "6b697473657ac7e6836f5db17040bbf77419da071162ce91eabe595951de9d58"),
+    FINAL: ("final.patch", "18fb02f3dc31c90346073fd04cf5158fed41792689e9b887ead5b62d3c243f45"),
 }
 CPU = "Neoverse-N2"
 PERF_VERSION = "v0.0.0-20260825160852-19be9d8e6c70"
@@ -152,7 +152,8 @@ def archive_graph(namespace, git, tree, source, env):
     package = source / "pkg/lux/luvia"
     fixtures = [("gateway.go.txt", "readiness_audit_gateway_bench_test.go")]
     if tree != BASE_TREE:
-        fixtures.append(("readiness.go.txt", "readiness_audit_probe_bench_test.go"))
+        arm = "head" if tree == FINAL else "base"
+        fixtures.append((namespace["probe_fixture"](arm), "readiness_audit_probe_bench_test.go"))
     for name, target in fixtures:
         destination = package / target
         if destination.exists():
@@ -199,7 +200,7 @@ def prime_modules(repo, root, env, namespace, evidence):
 def replay(repo, root, evidence, inputs):
     host = host_identity()
     write_json(evidence / "host.json", host)
-    for name in ("gateway.go.txt", "readiness.go.txt"):
+    for name in ("gateway.go.txt", "readiness.go.txt", "readiness-final.go.txt"):
         shutil.copyfile(PAYLOAD / name, root / name)
     for name, _ in PATCHES.values():
         (root / name).write_bytes(product_patch(name))

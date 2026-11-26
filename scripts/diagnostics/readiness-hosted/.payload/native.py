@@ -23,13 +23,13 @@ BENCHSTAT = ROOT.parents[2] / ".tmp/pr64-perf.Y5HLWX4K/benchstat"
 BASE = "e101cf7699acb358305fd373934e8813a98087bd"
 BASE_TREE = "377fdb5bbe6815a45930c53e10797f08cf07c917"
 EQUIVALENT = "ffd90b349d9d3a116af737d0caae1d24749d24a2"
-FINAL = "e1aa6577f84a4690b34c56f6f585ac17e271f3c1"
+FINAL = "bc832b5339d797ec1152fbbecc44d7c9a85ad5ec"
 BENCHSTAT_SHA = "b5004127165b217b1e9393aadf91fce40d1ae29c0b56e71bc3d897fbdfbf9697"
 PATCHES = {
     EQUIVALENT: ("readiness-7ba.Yduv1mND/combined.patch",
                  "7e00b6603dbfcbd9d2a9c7870780a088cba7aadf9af9335aadb80f73b0181757"),
-    FINAL: ("readiness-e101-abnormal.5oIlePvb/on-e101-combined.patch",
-            "6b697473657ac7e6836f5db17040bbf77419da071162ce91eabe595951de9d58"),
+    FINAL: ("readiness-optimized-hosted.nU4rhQsa/stateless-product-e101.patch",
+            "18fb02f3dc31c90346073fd04cf5158fed41792689e9b887ead5b62d3c243f45"),
 }
 PACKAGE = "pkg/lux/luvia"
 BENCH_BINARY = "pkg-lux-luvia.test"
@@ -132,6 +132,10 @@ def sample(stage, lane, arm, duration, env):
     return output, cpu
 
 
+def probe_fixture(arm):
+    return "readiness-final.go.txt" if arm == "head" else "readiness.go.txt"
+
+
 def build(stage, source, lane, arm, env):
     fixture_dir = source / PACKAGE
     fixture = fixture_dir / "readiness_audit_gateway_bench_test.go"
@@ -142,7 +146,7 @@ def build(stage, source, lane, arm, env):
     if lane == "probes":
         if extra.exists():
             raise RuntimeError("probe audit fixture path already exists")
-        shutil.copyfile(ROOT / "readiness.go.txt", extra)
+        shutil.copyfile(ROOT / probe_fixture(arm), extra)
     target = stage / lane / f"bin-{arm}"
     action = "compile-performance-baseline" if arm == "base" else "compile-performance"
     try:
@@ -194,7 +198,8 @@ def prepare():
         manifest = {
             "source_trees": {"base": BASE_TREE, "prior_readiness": EQUIVALENT, "final": FINAL},
             "base_commit": BASE, "host": host, "cpu": cpus.pop(), "profile": native_profile,
-            "fixtures": {name: sha(ROOT / name) for name in ("gateway.go.txt", "readiness.go.txt", "run.py")},
+            "fixtures": {name: sha(ROOT / name) for name in
+                         ("gateway.go.txt", "readiness.go.txt", "readiness-final.go.txt", "run.py")},
             "sampler": sha(SAMPLER), "prepared": {str(path.relative_to(stage)): sha(path) for path in files},
             "inventory_only": True,
         }
