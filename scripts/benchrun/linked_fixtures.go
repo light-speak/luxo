@@ -110,6 +110,12 @@ func writeLuviaResolvedFieldsOverlay(pkg, workspace string) (string, error) {
 		"merger_bench_test.go", "primary_keys_bench_test.go", "primary_keys_baseline_test.go")
 }
 
+func writeLuviaConvenienceKeysOverlay(pkg, workspace string) (string, error) {
+	// Retain the same benchmark and input helpers as the native isolation comparison.
+	return retainBenchmarkTestFiles(pkg, workspace, "Luvia convenience keys",
+		"convenience_keys_bench_test.go", "primary_keys_bench_test.go", "primary_keys_baseline_test.go")
+}
+
 func retainBenchmarkTestFiles(pkg, workspace, description string, fixtures ...string) (string, error) {
 	entries, err := os.ReadDir(pkg)
 	if err != nil {

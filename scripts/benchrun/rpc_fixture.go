@@ -12,14 +12,18 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/light-speak/luxo/internal/benchlayout"
 )
 
 const (
-	rpcBoundaryPath   = "pkg/lux/rpc/public_boundary_test.go"
-	rpcBoundaryMarker = "// luxo:benchmark-isolated-correctness"
-	rpcBoundarySHA    = "99658ed681f4110df0db3fc688931fa61cd656f3c62477c04a1ffd4bb567ca8e"
+	rpcBoundaryPath        = "pkg/lux/rpc/public_boundary_test.go"
+	rpcBoundaryMarker      = "// luxo:benchmark-isolated-correctness"
+	rpcBoundarySHA         = "99658ed681f4110df0db3fc688931fa61cd656f3c62477c04a1ffd4bb567ca8e"
+	rpcOwnedRequestFixture = "request_reuse_test.go"
 	// Discovery and sampling must consume the same benchmark compilation profile.
 	performanceProfile = "rpc-boundary-overlay-v2 " + rpcBoundarySHA +
 		"\ncodec-reader-overlay-v1\napi-non-identity-overlay-v1\nluvia-primary-trace-overlay-v1\ncodegen-integer-literals-overlay-v1" +
@@ -30,8 +34,72 @@ const (
 		"\ncodegen-migration-state-overlay-v1 " + codegenMigrationStateFixture + "=" + codegenMigrationStateFixtureSHA +
 		" " + codegenReceiverFixture + "=" + codegenReceiverProjectionSHA +
 		"\nluvia-merge-destination-overlay-v1\napi-local-route-export-overlay-v1" +
-		"\napi-canonical-json-overlay-v1\nluvia-resolved-fields-overlay-v1"
+		"\napi-canonical-json-overlay-v1\nluvia-resolved-fields-overlay-v1\nluvia-convenience-keys-overlay-v1" +
+		"\nrpc-owned-request-overlay-v1 " + rpcOwnedRequestFixture
 )
+
+func writeRPCOwnedRequestOverlay(pkg, workspace string) (string, error) {
+	entries, err := os.ReadDir(pkg)
+	if err != nil {
+		return "", err
+	}
+	replacements := make(map[string]string)
+	fixture := filepath.Join(pkg, rpcOwnedRequestFixture)
+	for _, entry := range entries {
+		if name := entry.Name(); strings.HasSuffix(name, "_test.go") {
+			path := filepath.Join(pkg, name)
+			replacement, err := projectRPCOwnedRequestFixture(path, workspace)
+			if err != nil {
+				return "", fmt.Errorf("RPC owned-request fixture %s: %w", name, err)
+			}
+			replacements[path] = replacement
+		}
+	}
+	if replacements[fixture] == "" {
+		return "", errors.New("missing RPC owned-request test fixture")
+	}
+	return writeTestOverlay(workspace, replacements)
+}
+
+func projectRPCOwnedRequestFixture(path, workspace string) (string, error) {
+	data, err := readRegularTestFixture(path)
+	if err != nil {
+		return "", err
+	}
+	positions := token.NewFileSet()
+	file, err := parseBenchmarkFixture(positions, path, data)
+	if err != nil || filepath.Base(path) != rpcOwnedRequestFixture {
+		return "", err
+	}
+	if file.Name.Name != "rpc" {
+		return "", errors.New("owned-request fixture requires package rpc")
+	}
+	for _, name := range []string{"fmt", "io", "testing"} {
+		if !slices.ContainsFunc(file.Imports, func(spec *ast.ImportSpec) bool {
+			return spec.Name == nil && spec.Path.Value == strconv.Quote(name)
+		}) {
+			return "", fmt.Errorf("owned-request fixture requires the ordinary %s import", name)
+		}
+	}
+	var benchmark ast.Decl
+	for _, declaration := range file.Decls {
+		if isFunction(declaration, benchlayout.RPCOwnedRequestBenchmark) {
+			if benchmark != nil {
+				return "", errors.New("owned-request fixture requires one BenchmarkLRPCOwnedRequest declaration")
+			}
+			benchmark = declaration
+		}
+	}
+	if benchmark == nil {
+		return "", errors.New("owned-request fixture requires one BenchmarkLRPCOwnedRequest declaration")
+	}
+	// Use the same source bytes and imports as the native isolation comparison.
+	const header = "package rpc\nimport (\"fmt\"; \"io\"; \"testing\")\n"
+	source := positions.File(benchmark.Pos())
+	projected := append([]byte(header), data[source.Offset(benchmark.Pos()):source.Offset(benchmark.End())]...)
+	output := filepath.Join(workspace, rpcOwnedRequestFixture)
+	return output, os.WriteFile(output, append(projected, '\n', '\n'), 0o600)
+}
 
 func performanceOverlay(root, packagePath string, baseline bool) (string, func() error, error) {
 	return performanceOverlayWithPathResolver(root, packagePath, baseline, filepath.EvalSymlinks)
