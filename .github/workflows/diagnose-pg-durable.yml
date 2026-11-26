@@ -1,4 +1,4 @@
-name: Compare PostgreSQL retry settings costs
+name: Compare PostgreSQL retry snapshot costs
 
 on:
   push:
@@ -51,7 +51,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: hosted-pg-durable-retry-settings-${{ github.run_id }}-${{ github.run_attempt }}
+          name: hosted-pg-durable-retry-snapshot-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/pg-durable-hosted-evidence/
           if-no-files-found: error
           retention-days: 14

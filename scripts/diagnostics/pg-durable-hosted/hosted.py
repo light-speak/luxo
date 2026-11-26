@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare retry settings on the original PostgreSQL recovery protocol."""
+"""Compare the retry snapshot on the pinned PostgreSQL recovery protocol."""
 import argparse
 import base64
 import gzip
@@ -22,7 +22,7 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-PARENT = 'fe6a15dbb3c43242cd6299eb96ec7471d21aa207'
+PARENT = '1c28a574618beb75798af447b0a8a2017290f9da'
 BASE = '15765dee6705d39de0b5a505d3039d59ebf43584'
 BASE_TREE = '75aebe5bd2fa6b45a1c614ace1a816ebc63e4c0a'
 PROJECTION = {
@@ -37,23 +37,30 @@ PROJECTION = {
     "priorNativeArtifact": 15136741248,
     "priorNativeSHA256": "d68266e78585d107a2371a52f94b5736f35ce73fbaa6ba3132a7341412f24dc8",
 }
-HISTORICAL = {"run": 45889914630, "attempt": 1, "head": PARENT, "artifact": 15150204945,
-              "artifactSHA256": "95b70ca56ac762d72454aadcc4d20c657ab6a8b940a01de32b9d6a6004585866"}
-ARMS = {'P': BASE_TREE, 'Q': '13a0159134235571a8a1a431d02d6afd362b4718',
-        'S': 'e77173b111fa67969131eb23b5eb8d7a8f148207'}
+HISTORICAL = {"run": 45895058171, "attempt": 1, "head": PARENT, "artifact": 15152714067,
+              "artifactSHA256": "5ce5f32879adb73eefeba9a859ed3d203a6c30b4d1f0a565dab2eb2a9b62807e"}
+PATCH_TREES = {
+    "Q": "13a0159134235571a8a1a431d02d6afd362b4718",
+    "S": "e77173b111fa67969131eb23b5eb8d7a8f148207",
+    "T": "87b1608db30bcd6028a07b7ecbfe1886949d8ab8",
+}
+ARMS = {"P": BASE_TREE, "S": PATCH_TREES["S"], "T": PATCH_TREES["T"]}
 PATCHES = {
-    'Q': (PROJECTION["mergeTree"], 'a2c84ab8db37a7965c63f0a87befc0c5ab3875da2fb49235cc448b8975d8dccd'),
-    'S': (ARMS['Q'], '42169934c30dd834f78222031bd50a7092bf2449615368d1fdea905cddef3ae2'),
+    "Q": (PROJECTION["mergeTree"], "a2c84ab8db37a7965c63f0a87befc0c5ab3875da2fb49235cc448b8975d8dccd"),
+    "S": (PATCH_TREES["Q"], "42169934c30dd834f78222031bd50a7092bf2449615368d1fdea905cddef3ae2"),
+    "T": (PATCH_TREES["S"], "4e5c6f5897a65b66ae85fbed7140ef57307173e6ce9f311f24c52f6b96a5dc16"),
 }
 DIAGNOSTIC_PATHS = (
     "M\t.github/workflows/diagnose-pg-durable.yml",
-    "A\tscripts/diagnostics/pg-durable-hosted/.payload/arm-S.patch.gz.b64",
+    "A\tscripts/diagnostics/pg-durable-hosted/.payload/arm-T.patch.gz.b64",
     "M\tscripts/diagnostics/pg-durable-hosted/.payload/inputs.sha256",
     "M\tscripts/diagnostics/pg-durable-hosted/hosted.py",
 )
 MODULE_PINS = ("github.com/jackc/pgx/v5 v5.10.0", "golang.org/x/net v0.58.0")
-CANDIDATE_PATHS = tuple("pkg/lux/pg/migrate/" + name for name in (
-    "migrate.go", "migration_attempt.go", "migration_execution_test.go"))
+CHANGE_PATHS = {
+    "S": ("migrate.go", "migration_attempt.go", "migration_execution_test.go"),
+    "T": ("migrate.go", "migration_attempt.go", "migration_execution.go", "migration_execution_test.go"),
+}
 RETRY_LEAF = "retry-after-invalid-index-repair"
 JOURNAL_LEAF = "first-journal-and-create-index"
 LEAVES = {"recovery": {RETRY_LEAF}}
@@ -78,7 +85,7 @@ def put(path, value):
 def payload():
     names = {"shared.py", "advisory_pair_test.go", "first_query_test.go", "migration_pair_test.go",
              "durable_reset_test.go", "used_holder_reuse_test.go", "capacity_public_test.go", "recovery_test.go",
-             "arm-Q.patch.gz.b64", "arm-R.patch.gz.b64", "arm-S.patch.gz.b64"}
+             "arm-Q.patch.gz.b64", "arm-R.patch.gz.b64", "arm-S.patch.gz.b64", "arm-T.patch.gz.b64"}
     entries = {}
     for line in (PAYLOAD / "inputs.sha256").read_text().splitlines():
         digest, name = line.split("  ", 1)
@@ -114,12 +121,13 @@ def trees(repo, root):
         if sha(patch) != digest:
             raise RuntimeError(f"{arm} patch hash changed")
         run(*git, "apply", "--cached", "--whitespace=error", "-", input=patch)
-        if run(*git, "write-tree", text=True).strip() != ARMS[arm]:
+        if run(*git, "write-tree", text=True).strip() != PATCH_TREES[arm]:
             raise RuntimeError(f"{arm} patch did not produce the expected tree")
-        if arm == "S":
-            changed = run(*git, "diff", "--name-only", preimage, ARMS[arm], text=True).splitlines()
-            if tuple(changed) != CANDIDATE_PATHS:
-                raise RuntimeError("the settings optimization changed files outside its scope")
+        if arm in CHANGE_PATHS:
+            changed = run(*git, "diff", "--name-only", preimage, PATCH_TREES[arm], text=True).splitlines()
+            expected = [f"pkg/lux/pg/migrate/{path}" for path in CHANGE_PATHS[arm]]
+            if changed != expected:
+                raise RuntimeError(f"{arm} changed files outside its bound scope")
     return git
 
 
@@ -233,7 +241,7 @@ def sample(root, lane, name, arm, slots, slot, identities, iterations, evidence,
 def schedule(lane):
     if lane not in LEAVES:
         raise RuntimeError(f"unknown recovery lane: {lane}")
-    comparisons = ("QS", "PS", "PP", "QQ", "SS")
+    comparisons = ("ST", "PT", "PP", "SS", "TT")
     for group, slots in enumerate(("ab", "ba"), 1):
         for pair in range(1, 11):
             rotate = (pair + group - 1) % len(comparisons)
@@ -333,8 +341,8 @@ def replay(repo, root, evidence, entries):
     put(evidence / "inputs.json", {"base": BASE, "baseTree": BASE_TREE, "products": ARMS,
                                   "patches": PATCHES, "payload": entries, "go": "go1.27.1 linux/arm64",
                                   "projection": PROJECTION, "historical": HISTORICAL, "modulePins": MODULE_PINS,
-                                  "candidatePaths": CANDIDATE_PATHS,
-                                  "comparisons": {"QS": "retry settings only", "PS": "remaining product costs"}})
+                                  "patchTrees": PATCH_TREES, "migrationFilesByPatch": CHANGE_PATHS,
+                                  "comparisons": {"ST": "retry snapshot only", "PT": "remaining product costs"}})
     git = trees(repo, root)
     identities = {arm: prepare_arm(git, root, arm, env, evidence) for arm in ARMS}
     shared = runpy.run_path(str(PAYLOAD / "shared.py"))
