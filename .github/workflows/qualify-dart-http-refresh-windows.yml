@@ -20,10 +20,11 @@ jobs:
         shell: bash
     env:
       CORE_BASE: c9bf5b75b8bfec4d9a65e90c135376f130fb6307
+      CONTROL_PARENT: 38c0322412f8e001abbf7d3089564a133e4fbe4e
       CORE_TREE: 23cb6e837c454388a1c36c5de4d8e7ab43c15a0e
-      PRODUCT_TREE: 56a9d668cc6ef1b4d933e928b0a6082de625430b
-      DART_TREE: d9e83c36b755f3ffbff1935ef3f3461c19a20b4f
-      PATCH_SHA256: 66dd189d5703dd7f6d8f5248be14c572e540abe8dfb0dcb81e9834aa1d29db02
+      PRODUCT_TREE: 82f4b54613e15456f07fd1a1859ebf683be9d326
+      DART_TREE: 53aafbb72447140780acc846529adfd2aaf79b0e
+      PATCH_SHA256: afdcfe28da03b3cee5a70e74690098ff906e272d4a5270da4919ef58579ce426
       LOCK_SHA256: 0d107eca2444e58cd48cb37abc48bf7115ed04f5101e6ba753ab13dea7e3f8bc
       DART_SUPPRESS_ANALYTICS: 'true'
       PYTHONUTF8: '1'
@@ -53,7 +54,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: control
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
 
       - uses: actions/checkout@v7
@@ -75,8 +76,12 @@ jobs:
           package="$PWD/product/packages/dart"
           payload=.github/diagnostics/dart-http-refresh-windows
           test "$(git -C control rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git -C control rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $CORE_BASE"
-          diff -u <(printf 'A\t%s\n' "$payload/product.patch.b64" "$payload/pubspec.lock" .github/workflows/qualify-dart-http-refresh-windows.yml) \
+          workflow=.github/workflows/qualify-dart-http-refresh-windows.yml
+          test "$(git -C control rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $CONTROL_PARENT"
+          test "$(git -C control rev-list --parents -n 1 "$CONTROL_PARENT")" = "$CONTROL_PARENT $CORE_BASE"
+          diff -u <(printf 'M\t%s\n' "$payload/product.patch.b64" "$workflow") \
+            <(git -C control diff --name-status "$CONTROL_PARENT" HEAD)
+          diff -u <(printf 'A\t%s\n' "$payload/product.patch.b64" "$payload/pubspec.lock" "$workflow") \
             <(git -C control diff --name-status "$CORE_BASE" HEAD)
           test "$(git -C product rev-parse HEAD)" = "$CORE_BASE"
           test "$(git -C product rev-parse 'HEAD^{tree}')" = "$CORE_TREE"
@@ -140,12 +145,12 @@ jobs:
           expected = "test/http_protocol_test.dart"
           assert suite == expected or suite.endswith("/" + expected), suite
           tests = [event for event in events if event["type"] == "testDone" and not event["hidden"]]
-          assert len(tests) == len({test["testID"] for test in tests}) == 61, len(tests)
+          assert len(tests) == len({test["testID"] for test in tests}) == 65, len(tests)
           assert all(test["result"] == "success" and not test["skipped"] for test in tests)
           assert all(not event["skipped"] for event in events if event["type"] == "testDone")
           completions = [event for event in events if event["type"] == "done"]
           assert len(completions) == 1 and completions[0]["success"] is True, completions
-          result = {"suite": expected, "platform": "vm", "passed": 61, "skipped": 0}
+          result = {"suite": expected, "platform": "vm", "passed": 65, "skipped": 0}
           Path(sys.argv[2]).write_text(json.dumps(result) + "\n", encoding="utf-8")
           print(json.dumps(result))
           PY
