@@ -719,3 +719,75 @@ func TestLuxShortPathPreservesAllNativeLeaves(t *testing.T) {
 		}
 	}
 }
+
+func TestAPIRequestLogProfileKeepsExactLeaves(t *testing.T) {
+	const profile = "api-request-log"
+	const pkg = "pkg/lux/api"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	const other = "BenchmarkHTTPCompletionSampling/disabled" + measurement
+	const delivered = "BenchmarkRequestLogDelivered" + measurement
+	var samples strings.Builder
+	for _, name := range []string{"disabled", "full", "synchronous", "unsampled"} {
+		samples.WriteString("BenchmarkRequestLogBoundary/" + name + measurement)
+	}
+	partial := samples.String()
+	full := partial + delivered
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	for _, tc := range []struct {
+		name, profile, ordinary, isolated string
+		valid                             bool
+	}{
+		{"complete", profile, full + other, full, true},
+		{"same missing delivered", profile, partial + other, partial, false},
+		{"same missing boundary", profile, delivered + other, delivered, false},
+		{"includes completion sampling", profile, full + other, full + other, false},
+		{"ordinary profile retains all", "api-non-identity", full + other, full + other, true},
+		{"ordinary profile loses delivered", "api-non-identity", full + other, partial + other, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			args := []string{"--verify-profile-inventory", pkg, tc.profile, ordinary, isolated}
+			if err := run(args, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+}
+
+func TestAPIRequestLogPrimaryAndConfirmationProfiles(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	const boundary = "BenchmarkRequestLogBoundary"
+	const delivered = "BenchmarkRequestLogDelivered"
+	const other = "BenchmarkHTTPCompletionSampling"
+	groups := []benchGroup{{Package: pkg, Name: boundary}, {Package: pkg, Name: delivered}, {Package: pkg, Name: other}}
+	keys := []sampleKey{{pkg, boundary + "/full-2"}, {pkg, delivered + "-2"}, {pkg, other + "/disabled-2"}}
+	body, err := json.Marshal(expectedSamples{Base: keys, Head: keys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := benchmarkTempDir(t)
+	expected, batch := dir+"/expected.json", dir+"/batch.tsv"
+	writeFixture(t, expected, string(body))
+	for _, tc := range []struct{ phase, batch string }{
+		{"primary", formatShard(benchShard{Groups: groups})},
+		{"confirmation", formatConfirmationBatch(keys)},
+	} {
+		t.Run(tc.phase, func(t *testing.T) {
+			if strings.Count(tc.batch, "\tapi-request-log\t") != 1 ||
+				!strings.Contains(tc.batch, "\tapi-non-identity\t") {
+				t.Fatalf("wrong profile routing:\n%s", tc.batch)
+			}
+			args := []string{"--verify-profile-batch", tc.phase, expected, batch}
+			writeFixture(t, batch, tc.batch)
+			if err := run(args, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			writeFixture(t, batch, strings.Replace(tc.batch, "\tapi-request-log\t", "\tapi-non-identity\t", 1))
+			if err := run(args, io.Discard); err == nil {
+				t.Fatal("accepted request-log leaves in the stock profile")
+			}
+		})
+	}
+}

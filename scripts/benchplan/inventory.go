@@ -147,6 +147,8 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 		return verifyAPICanonicalJSONInventory(isolated)
 	case benchlayout.APIBinaryParamLookupProfile:
 		return verifyAPIBinaryParamLookupInventory(isolated)
+	case benchlayout.APIRequestLogProfile:
+		return verifyAPIRequestLogInventory(isolated)
 	case benchlayout.LuviaGatewayIdentityProfile:
 		const root = benchlayout.LuviaGatewayIdentityBenchmark
 		if !verifiedBenchmarkLeaves(isolated[root], root, "anonymous/before", "anonymous/after", "authenticated/before",
@@ -222,12 +224,25 @@ func verifyAPINonIdentityCompanions(ordinary, isolated inventory) error {
 	// exclusively to their corresponding sampling binaries.
 	for root, leaves := range ordinary {
 		switch benchlayout.ProfileForBenchmark(benchlayout.APIPackage, root) {
-		case benchlayout.APILocalRouteExportProfile, benchlayout.APICanonicalJSONProfile, benchlayout.APIBinaryParamLookupProfile:
+		case benchlayout.APILocalRouteExportProfile, benchlayout.APICanonicalJSONProfile,
+			benchlayout.APIBinaryParamLookupProfile, benchlayout.APIRequestLogProfile:
 			if !maps.Equal(leaves, isolated[root]) {
 				return fmt.Errorf("API non-identity profile must retain the ordinary %s inventory", root)
 			}
 			delete(isolated, root)
 		}
+	}
+	return nil
+}
+
+func verifyAPIRequestLogInventory(isolated inventory) error {
+	const boundary = benchlayout.APIRequestLogBoundaryBenchmark
+	const delivered = benchlayout.APIRequestLogDeliveredBenchmark
+	if !verifiedBenchmarkLeaves(isolated[boundary], boundary, "disabled", "full", "synchronous", "unsampled") {
+		return errors.New("API request-log profile requires the four verified boundary leaves")
+	}
+	if _, ok := isolated[delivered][delivered+"-2"]; !ok || len(isolated[delivered]) != 1 {
+		return errors.New("API request-log profile requires the verified delivery leaf")
 	}
 	return nil
 }

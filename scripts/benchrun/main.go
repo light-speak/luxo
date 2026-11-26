@@ -122,6 +122,10 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-api-canonical-json-*", writeAPICanonicalJSONOverlay)
 	case benchlayout.APIBinaryParamLookupProfile:
 		return packageTestOverlay(root, packagePath, "bench-api-binary-param-lookup-*", writeAPIBinaryParamLookupOverlay)
+	case benchlayout.APIRequestLogProfile:
+		return packageTestOverlay(root, packagePath, "bench-api-request-log-*", func(pkg, workspace string) (string, error) {
+			return writeAPIRequestLogOverlay(pkg, workspace, apiRequestLogProjectionSHA, apiRequestLogSourceSHA)
+		})
 	case benchlayout.LuviaPrimaryTraceProfile:
 		return packageTestOverlay(root, packagePath, "bench-luvia-primary-trace-*", writeLuviaBenchmarkOverlay)
 	case benchlayout.LuviaGatewayIdentityProfile:

@@ -182,6 +182,11 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{APIPackage, "BenchmarkBinaryParamLookup/n=16/stride=65537/direct=false-2", "api-binary-param-lookup"},
 		{APIPackage, "BenchmarkBinaryParamLookupSibling", APINonIdentityProfile},
 		{RPCPackage, "BenchmarkBinaryParamLookup", DefaultProfile},
+		{APIPackage, "BenchmarkRequestLogBoundary/full-2", APIRequestLogProfile},
+		{APIPackage, "BenchmarkRequestLogDelivered-2", APIRequestLogProfile},
+		{APIPackage, "BenchmarkHTTPCompletionSampling", APINonIdentityProfile},
+		{APIPackage, "BenchmarkRequestLogDeliveredSibling", APINonIdentityProfile},
+		{RPCPackage, "BenchmarkRequestLogDelivered", DefaultProfile},
 		{LuviaPackage, "BenchmarkPrimaryKeys/row-small/keyLast=false/baseline=true-2", LuviaPrimaryTraceProfile},
 		{LuviaPackage, "BenchmarkTraceEncodingComparison", LuviaPrimaryTraceProfile},
 		{LuviaPackage, "BenchmarkGatewayIdentity", LuviaGatewayIdentityProfile},
@@ -225,10 +230,15 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		}
 	}
 	apiProfiles := IsolationProfiles(APIPackage)
-	if len(apiProfiles) != 4 || ValidPerformanceProfile(RPCPackage, "api-binary-param-lookup") || apiProfiles[0] != (IsolationSpec{APINonIdentityProfile, "."}) ||
-		apiProfiles[1] != (IsolationSpec{"api-local-route-export", "^BenchmarkLocalRouteExport$"}) ||
-		apiProfiles[2] != (IsolationSpec{"api-canonical-json", "^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$"}) ||
-		apiProfiles[3] != (IsolationSpec{"api-binary-param-lookup", "^BenchmarkBinaryParamLookup$"}) {
+	wantAPI := []IsolationSpec{
+		{APINonIdentityProfile, "."},
+		{APILocalRouteExportProfile, "^BenchmarkLocalRouteExport$"},
+		{APICanonicalJSONProfile, "^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$"},
+		{APIBinaryParamLookupProfile, "^BenchmarkBinaryParamLookup$"},
+		{APIRequestLogProfile, "^BenchmarkRequestLogBoundary$|^BenchmarkRequestLogDelivered$"},
+	}
+	if !reflect.DeepEqual(apiProfiles, wantAPI) || ValidPerformanceProfile(RPCPackage, APIBinaryParamLookupProfile) ||
+		ValidPerformanceProfile(RPCPackage, APIRequestLogProfile) {
 		t.Fatalf("unexpected API profiles: %v", apiProfiles)
 	}
 	profiles := IsolationProfiles(LuviaPackage)
