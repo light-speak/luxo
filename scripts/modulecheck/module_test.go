@@ -56,7 +56,7 @@ func consumerFixture(t *testing.T, root, module, imports string) string {
 			t.Error(err)
 		}
 	})
-	manifest := fmt.Sprintf("module example.com/consumer\n\ngo 1.27.1\nrequire github.com/light-speak/luxo v1.0.0-beta.1\nreplace github.com/light-speak/luxo => %s\n", filepath.ToSlash(root))
+	manifest := fmt.Sprintf("module example.com/consumer\n\ngo 1.27.4\nrequire github.com/light-speak/luxo v1.0.0-beta.1\nreplace github.com/light-speak/luxo => %s\n", filepath.ToSlash(root))
 	if module != "" {
 		manifest += fmt.Sprintf("require github.com/light-speak/luxo/%s v1.0.0-beta.1\nreplace github.com/light-speak/luxo/%s => %s\n", module, module, filepath.ToSlash(filepath.Join(root, module)))
 	}

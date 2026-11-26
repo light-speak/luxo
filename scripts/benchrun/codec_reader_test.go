@@ -112,8 +112,8 @@ func TestCodecReaderCompileProfileUsesGoTestRegistry(t *testing.T) {
 
 func writeReaderProfileFixture(t *testing.T, root string) {
 	t.Helper()
-	writeBenchmarkRunFixture(t, root, "go.mod", "module github.com/light-speak/luxo\ngo 1.27.1\n")
-	writeBenchmarkRunFixture(t, root, "go.work", "go 1.27.1\nuse .\n")
+	writeBenchmarkRunFixture(t, root, "go.mod", "module github.com/light-speak/luxo\ngo 1.27.4\n")
+	writeBenchmarkRunFixture(t, root, "go.work", "go 1.27.4\nuse .\n")
 	for name, data := range map[string]string{
 		"payload_bench_test.go": `package codec
 import "testing"

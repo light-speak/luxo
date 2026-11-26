@@ -111,7 +111,7 @@ func TestInitProjectGoMod(t *testing.T) {
 
 	checks := []string{
 		"module github.com/example/myapp",
-		"go 1.27.1",
+		"go 1.27.4",
 		"github.com/light-speak/luxo v1.0.0-beta.1",
 		"github.com/light-speak/luxo/pkg/lux/pg v1.0.0-beta.1",
 	}

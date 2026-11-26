@@ -1,6 +1,6 @@
 module example.com/luxo-consumer
 
-go 1.27.1
+go 1.27.4
 
 require github.com/light-speak/luxo v0.0.0
 

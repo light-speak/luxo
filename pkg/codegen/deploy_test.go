@@ -103,7 +103,7 @@ func TestGenerateDeployFiles_Basic(t *testing.T) {
 	// Dockerfile checks
 	df := string(files.Dockerfile)
 	checks := []string{
-		"FROM golang:1.27.1-alpine AS builder",
+		"FROM golang:1.27.4-alpine AS builder",
 		"FROM builder AS user",
 		"FROM builder AS post",
 		"FROM builder AS gateway",
