@@ -1,4 +1,4 @@
-name: Compare PostgreSQL fresh holder lock costs
+name: Compare PostgreSQL connection capacity and recovery
 
 on:
   push:
@@ -28,7 +28,7 @@ jobs:
       - name: Fetch the exact common product source
         run: |
           set -euo pipefail
-          base=5b10a26eef09248d77520ce1f118273793f30fc5
+          base=15765dee6705d39de0b5a505d3039d59ebf43584
           git fetch --depth=1 --no-tags origin "$base"
           test "$(git rev-parse FETCH_HEAD)" = "$base"
       - uses: actions/setup-go@v7
@@ -36,7 +36,7 @@ jobs:
           go-version: '1.27.1'
           check-latest: false
           cache: false
-      - name: Measure the first lock, first reuse, and DDL on one runner
+      - name: Measure capacity and journal recovery in independent sample batches
         timeout-minutes: 40
         run: python3 -I -B scripts/diagnostics/pg-durable-hosted/hosted.py run
       - name: Confirm task-owned PostgreSQL resources returned to zero
@@ -46,7 +46,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: hosted-pg-durable-fresh-lock-${{ github.run_id }}-${{ github.run_attempt }}
+          name: hosted-pg-durable-capacity-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/pg-durable-hosted-evidence/
           if-no-files-found: error
           retention-days: 14

@@ -22,18 +22,18 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-PARENT = "89d217edc211f8c1c8bd52b77d86ea965e814e33"
-BASE = "5b10a26eef09248d77520ce1f118273793f30fc5"
-BASE_TREE = "18ec2a84fcd20299a4bb8f3759fbb58b73574176"
-ARMS = {"P": "7bc5b40d440439e2f5233d0f0f2c358056ea65f6", "Q": "8a2f2fe01062cfe550c4391ad6b9c376f8b8a008"}
-PATCHES = {
-    "P": (BASE_TREE, "61d5b5c63674710ed674613e457340b505507e11ba12fdd134778e11e08bc797"),
-    "Q": (ARMS["P"], "d20fe94ccca626144f3cdb9f352b1819366fff5f1b2b7147406c2370e38a4c56"),
-}
+PARENT = 'af9a2e7ab9dace32a83cebf6012c391abfab6814'
+BASE = '15765dee6705d39de0b5a505d3039d59ebf43584'
+BASE_TREE = '75aebe5bd2fa6b45a1c614ace1a816ebc63e4c0a'
+ARMS = {'P': BASE_TREE, 'Q': '4f614ddcbec5f64701ad45ef57e8715189a5de8b'}
+PATCHES = {'Q': (BASE_TREE, '7cfd9d84efb6ea0abaa373358b9dddbdc21a8378817094f742109b4918eb473a')}
 LEAVES = {
     "first-query": {"cold-open-ping-up", "already-used-pool-up", "warm-read-only-holder-up", "used-holder-first-reuse-up"},
     "standalone": {"ordinary/up", "ordinary/up-existing", "concurrent/up", "concurrent/down"},
 }
+LEAVES["public"] = {'first-public-after-clean-noop', 'first-public-after-clean-write', 'warm-pool-begin-rollback', 'warm-pool-exec', 'warm-pool-query', 'warm-pool-query-row'}
+LEAVES["recovery"] = {"first-journal-and-create-index", "acknowledge-committed-down",
+                      "record-applied-after-restart", "retry-after-invalid-index-repair"}
 METRICS = ("ns/op", "B/op", "allocs/op")
 BENCHMARKS = {"first-query": "BenchmarkDurableFirstQuery", "standalone": "BenchmarkMigrationPair"}
 SMOKE_TESTS = {"first-query": ("TestDurableFirstQuerySessions", "TestAdvisoryPairStandaloneWriterHoldsLock"),
@@ -42,6 +42,12 @@ SELECTORS = {
     "first-query": "^BenchmarkDurableFirstQuery$",
     "standalone": "^BenchmarkMigrationPair$/^ordinary$/^(up|up-existing)$|^BenchmarkMigrationPair$/^concurrent$/^(up|down)$",
 }
+BENCHMARKS["public"] = "BenchmarkPGCapacityPublic"
+SMOKE_TESTS["public"] = ("TestPGCapacityPublicKeepsSpareSession",)
+SELECTORS["public"] = "^BenchmarkPGCapacityPublic$"
+BENCHMARKS["recovery"] = "BenchmarkDurableRecovery"
+SMOKE_TESTS["recovery"] = ()
+SELECTORS["recovery"] = "^BenchmarkDurableRecovery$"
 CPU = "Neoverse-N2"
 
 
@@ -60,7 +66,7 @@ def put(path, value):
 
 def payload():
     names = {"shared.py", "advisory_pair_test.go", "first_query_test.go", "migration_pair_test.go",
-             "durable_reset_test.go", "used_holder_reuse_test.go", "arm-P.patch.gz.b64", "arm-Q.patch.gz.b64"}
+             "durable_reset_test.go", "used_holder_reuse_test.go", "capacity_public_test.go", "recovery_test.go", "arm-Q.patch.gz.b64"}
     entries = {}
     for line in (PAYLOAD / "inputs.sha256").read_text().splitlines():
         digest, name = line.split("  ", 1)
@@ -135,16 +141,22 @@ def prepare_arm(git, root, arm, env, evidence):
         archive_source(git, src, ARMS[arm])
         run("sh", "scripts/setup-modules.sh", str(src), cwd=src, env=env)
         workspace = env | {"GOWORK": str(src / "go.work")}
-        lanes = {"first-query": "advispair", "standalone": "migratepair"}
+        lanes = {"first-query": "advispair", "standalone": "migratepair",
+                 "public": "capacitypair", "recovery": "recoverypair"}
         for lane, folder in lanes.items():
             target = src / "pkg/lux/pg" / folder
             target.mkdir()
             if lane == "standalone":
                 (target / "migration_pair_test.go").write_text(standalone_fixture())
                 shutil.copyfile(PAYLOAD / "durable_reset_test.go", target / "durable_reset_test.go")
+            elif lane == "recovery":
+                for name in ("advisory_pair_test.go", "recovery_test.go"):
+                    shutil.copyfile(PAYLOAD / name, target / name)
             else:
                 for name in ("advisory_pair_test.go", "first_query_test.go", "used_holder_reuse_test.go"):
                     shutil.copyfile(PAYLOAD / name, target / name)
+            if lane == "public":
+                shutil.copyfile(PAYLOAD / "capacity_public_test.go", target / "capacity_public_test.go")
         packages = ["./pkg/lux/pg/" + folder for folder in lanes.values()]
         graph = run("go", "list", "-mod=readonly", "-p=1", "-deps", "-test", *packages, cwd=src, env=workspace)
         verified = run("go", "mod", "verify", cwd=src, env=workspace, text=True).strip()
@@ -241,7 +253,7 @@ def sample(root, lane, name, arm, slots, slot, identities, iterations, evidence,
 
 def schedule(lane):
     comparisons, controls = ("PQ",), ("PP", "QQ")
-    control_count = 2 if lane == "first-query" else 5
+    control_count = {"first-query": 2, "recovery": 10}.get(lane, 5)
     for group, slots in enumerate(("ab", "ba"), 1):
         for pair in range(1, 11):
             active = comparisons + (controls if pair <= control_count else ())
@@ -323,6 +335,45 @@ def run_lane(root, evidence, helper, lane, identities, smoke):
             raise RuntimeError(f"incomplete cleanup in {lane}")
 
 
+def capacity_smoke(root, evidence, helper, identities):
+    slots, outcomes = {}, {}
+    token = secrets.token_hex(8)
+    expected = {"P": ("server-limit", "role-limit historical handshake=53300"),
+                "Q": ("available", "role-limit corrected preview/up/public/noop=ok")}
+    clean = {}
+    try:
+        for slot, arm in zip("ab", expected):
+            helper.create_slot(slot, slots, token)
+            role, password = slots[slot]
+            scope, _ = SERVER["scope"]()
+            SERVER["admin"](scope, f"ALTER ROLE {role} CONNECTION LIMIT 1;")
+            status, message = expected[arm]
+            identity = identities[arm]["public"]
+            binary = root / "public" / identity["binary"]
+            if sha(binary.read_bytes()) != identity["sha256"]:
+                raise RuntimeError("prepared capacity binary changed")
+            env = {**os.environ, "GOMAXPROCS": "1", "GOGC": "100", "GOMEMLIMIT": "off", "GODEBUG": "",
+                   "TMPDIR": str(root), "LUXO_CAPACITY_EXPECT": status,
+                   "LUXO_MIGPAIR_DATABASE_URL": f"postgres://{role}:{password}@127.0.0.1:5432/{role}?sslmode=disable"}
+            proc = subprocess.run([str(binary), "-test.run=^TestPGCapacityLimitedRole$", "-test.v",
+                                   "-test.cpu=1", "-test.count=1", "-test.timeout=3m"],
+                                  cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            raw = proc.stdout.replace(password, "[redacted]")
+            (evidence / f"capacity-{arm}.log").write_text(raw)
+            if (proc.returncode or raw.count(message) != 1 or
+                    len(re.findall(r"^--- PASS: TestPGCapacityLimitedRole ", raw, re.M)) != 1 or
+                    len(re.findall(r"^PASS$", raw, re.M)) != 1 or re.search(r"^\s*--- SKIP:", raw, re.M)):
+                raise RuntimeError(f"unexpected capped role outcome for arm {arm}")
+            outcomes[arm] = {"outcome": status, "logSHA256": sha(raw.encode())}
+    finally:
+        clean = helper.clean_slots(slots)
+        put(evidence / "capacity.json", {"outcomes": outcomes, "clean": clean})
+        if clean != {"a": "0|0", "b": "0|0"} and len(outcomes) == 2:
+            raise RuntimeError("capped role cleanup incomplete")
+        if any(result != "0|0" for result in clean.values()):
+            raise RuntimeError("partially created capped role could not be cleaned")
+
+
 def replay(repo, root, evidence, entries):
     current = run("git", "-C", str(repo), "rev-list", "--parents", "-n", "1", "HEAD", text=True).strip().split()
     if current != [os.environ["GITHUB_SHA"], PARENT]:
@@ -330,7 +381,7 @@ def replay(repo, root, evidence, entries):
     cpu = json.loads(run("lscpu", "-J"))
     put(evidence / "host-cpu.json", cpu)
     require_cpu(cpu)
-    env = {key: value for key, value in os.environ.items() if not key.startswith(("LUXO_MIGPAIR_", "LUXO_ADVISORY_", "LUXO_DURABLE_"))}
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("LUXO_MIGPAIR_", "LUXO_ADVISORY_", "LUXO_DURABLE_", "LUXO_CAPACITY_"))}
     env |= {"GOTOOLCHAIN": "local", "GOWORK": "off", "GOFLAGS": "-p=1", "GOMAXPROCS": "2", "CGO_ENABLED": "0",
             "GOENV": "off", "GOARM64": "v8.0", "GOCACHE": str(root / "cache"), "GOMODCACHE": str(root / "modules"),
             "TMPDIR": str(root), "GOTMPDIR": str(root), "GOPROXY": "https://proxy.golang.org", "GOSUMDB": "sum.golang.org"}
@@ -345,6 +396,7 @@ def replay(repo, root, evidence, entries):
     shared["admin"].__globals__["admin"] = lambda sql: SERVER["admin"](scope, sql)
     helper = SimpleNamespace(**shared)
     put(evidence / "server.json", SERVER["start_owned"]())
+    capacity_smoke(root, evidence, helper, identities)
     for phase in ("smoke", "formal"):
         failures = {}
         for lane in LEAVES:
