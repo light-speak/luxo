@@ -11,6 +11,7 @@ import { analyzeVerifiedCalls } from './analyzer'
 const repository = resolve(import.meta.dirname, '../../..')
 const temporary = join(repository, '.tmp')
 const fixtures: { directory: string; plugin: Plugin }[] = []
+const hookContext = { addWatchFile: vi.fn() }
 const schema: LuxoSchema = {
   models: { User: { name: 'User', fields: [
     { id: 1, name: 'id', type: 'Int' }, { id: 2, name: 'name', type: 'String' },
@@ -45,12 +46,12 @@ async function prepare(configured: boolean) {
   const plugin = luxo({ schema: 'schema.json', outDir: 'src/generated' })
   fixtures.push({ directory, plugin })
   ;(plugin.configResolved as (config: { root: string }) => void)({ root: directory })
-  await (plugin.buildStart as () => Promise<void>)()
+  await (plugin.buildStart as () => Promise<void>).call(hookContext)
   return { directory, plugin }
 }
 
 async function transform(plugin: Plugin, code: string, file: string) {
-  return await (plugin.transform as (code: string, file: string) => Promise<{ code: string } | null>)(code, file)
+  return await (plugin.transform as (code: string, file: string) => Promise<{ code: string } | null>).call(hookContext, code, file)
 }
 
 const source = `import { LuxoClient as SDK } from './generated/client'
