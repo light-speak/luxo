@@ -112,7 +112,7 @@ func validateAPIFixture(path string) error {
 	for _, declaration := range file.Decls {
 		fn, ok := declaration.(*ast.FuncDecl)
 		if ok && fn.Recv == nil && strings.HasPrefix(fn.Name.Name, "Benchmark") &&
-			benchlayout.ProfileForBenchmark(benchlayout.APIPackage, fn.Name.Name) != benchlayout.DefaultProfile {
+			!benchlayout.IsAPIIdentityBenchmark(fn.Name.Name) {
 			return fmt.Errorf("non-identity benchmark %s uses the ordinary identity fixture", fn.Name.Name)
 		}
 	}
@@ -151,6 +151,34 @@ func writeLuviaBenchmarkOverlay(pkg, workspace string) (string, error) {
 }
 
 const apiBinaryParamLookupFixture = "binary_param_lookup_test.go"
+
+const (
+	apiIdentityConditionFixture = "identity_reader_bench_test.go"
+	apiIdentityConditionSHA     = "20d45a1c2a71419d6c2c44e33b49e691cf15f3522f6e1041541dbce5097a3c5f"
+	apiHandlerPanicFixture      = "handler_panic_bench_test.go"
+	apiHandlerPanicSHA          = "01122e4a09e5c6d6a20018f47566fb801ad4888db504fd9d2c932be56146e302"
+	apiWSRegistrationsFixture   = "websocket_subscriptions_bench_test.go"
+	apiWSRegistrationsSHA       = "5abe6b7846bb541fa73512dd924d2eec3b4a66c1ed64f5839ee658f43492b584"
+)
+
+var apiBenchmarkFileFixtures = map[string]struct{ name, sourceSHA string }{
+	benchlayout.APIIdentityConditionProfile:      {apiIdentityConditionFixture, apiIdentityConditionSHA},
+	benchlayout.APIHandlerPanicProfile:           {apiHandlerPanicFixture, apiHandlerPanicSHA},
+	benchlayout.APIWebSocketRegistrationsProfile: {apiWSRegistrationsFixture, apiWSRegistrationsSHA},
+}
+
+func writeAPIBenchmarkFileOverlay(pkg, workspace, profile string) (string, error) {
+	fixture := apiBenchmarkFileFixtures[profile]
+	data, err := readRegularTestFixture(filepath.Join(pkg, fixture.name))
+	if err != nil {
+		return "", fmt.Errorf("%s fixture: %w", profile, err)
+	}
+	if fmt.Sprintf("%x", sha256.Sum256(data)) != fixture.sourceSHA {
+		return "", fmt.Errorf("%s fixture does not match the verified source", profile)
+	}
+	// Keep the native witness's complete benchmark file, including its companion declarations.
+	return retainBenchmarkTestFiles(pkg, workspace, profile, fixture.name)
+}
 
 func writeAPIBinaryParamLookupOverlay(pkg, workspace string) (string, error) {
 	return retainBenchmarkTestFiles(pkg, workspace, "API binary parameter lookup", apiBinaryParamLookupFixture)

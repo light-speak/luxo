@@ -21,7 +21,10 @@ func TestIsolationProfileCommand(t *testing.T) {
 		{"pkg/lux/api", "api-non-identity\t.\napi-local-route-export\t^BenchmarkLocalRouteExport$\n" +
 			"api-canonical-json\t^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$\n" +
 			"api-binary-param-lookup\t^BenchmarkBinaryParamLookup$\n" +
-			"api-request-log\t^BenchmarkRequestLogBoundary$|^BenchmarkRequestLogDelivered$\n"},
+			"api-request-log\t^BenchmarkRequestLogBoundary$|^BenchmarkRequestLogDelivered$\n" +
+			"api-identity-condition\t^BenchmarkIdentityConditionValidity$\n" +
+			"api-handler-panic\t^BenchmarkHandlerPanicFormatting$\n" +
+			"api-websocket-registrations\t^BenchmarkWSConnectionRegistrations$\n"},
 		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n" +
 			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n" +
 			"luvia-auth-middleware\t^BenchmarkAuthMiddlewareIsolation$\n" +
@@ -925,4 +928,59 @@ func TestAPIRequestLogProjection(t *testing.T) {
 			t.Fatalf("on-disk request-log projection = %q, %v", projected, err)
 		}
 	})
+}
+
+// These whole fixtures are the same link inputs on both sides of the native comparison.
+func TestAPIIntelBenchmarkOverlaysKeepOriginalFiles(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ profile, fixture, hash string }{
+		{"api-identity-condition", "identity_reader_bench_test.go", "20d45a1c2a71419d6c2c44e33b49e691cf15f3522f6e1041541dbce5097a3c5f"},
+		{"api-handler-panic", "handler_panic_bench_test.go", "01122e4a09e5c6d6a20018f47566fb801ad4888db504fd9d2c932be56146e302"},
+		{"api-websocket-registrations", "websocket_subscriptions_bench_test.go", "5abe6b7846bb541fa73512dd924d2eec3b4a66c1ed64f5839ee658f43492b584"},
+	} {
+		t.Run(tc.profile, func(t *testing.T) {
+			binding := "\n" + tc.profile + "-overlay-v1 " + tc.fixture + "=" + tc.hash + "\n"
+			if !strings.Contains(performanceProfile+"\n", binding) {
+				t.Error("performance fingerprint lacks the verified fixture binding")
+			}
+			for _, baseline := range []bool{true, false} {
+				verifyAPIWholeFixtureOverlay(t, root, tc.profile, tc.fixture, baseline)
+			}
+			missing := newBenchmarkRunTree(t)
+			writeBenchmarkRunFixture(t, missing, "pkg/lux/api/ordinary_test.go", "package api")
+			if _, cleanup, err := compileOverlay(missing, benchlayout.APIPackage, false, tc.profile); cleanup != nil || !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("expected missing retained fixture, got %v", err)
+			}
+			writeBenchmarkRunFixture(t, missing, "pkg/lux/api/"+tc.fixture, "package api\n// changed fixture\n")
+			if _, cleanup, err := compileOverlay(missing, benchlayout.APIPackage, true, tc.profile); cleanup != nil ||
+				err == nil || !strings.Contains(err.Error(), "verified source") {
+				t.Fatalf("changed fixture was not rejected: %v", err)
+			}
+		})
+	}
+}
+
+func verifyAPIWholeFixtureOverlay(t *testing.T, root, profile, fixture string, baseline bool) {
+	t.Helper()
+	path, cleanup, err := compileOverlay(root, benchlayout.APIPackage, baseline, profile)
+	if err != nil || path == "" {
+		t.Fatalf("missing retained overlay for baseline=%v: %q, %v", baseline, path, err)
+	}
+	defer func() {
+		if err := cleanup(); err != nil {
+			t.Error(err)
+		}
+	}()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var overlay struct{ Replace map[string]string }
+	if err := json.Unmarshal(data, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	verifyOnlyListedTestFiles(t, overlay.Replace, filepath.Join(root, benchlayout.APIPackage), fixture)
 }

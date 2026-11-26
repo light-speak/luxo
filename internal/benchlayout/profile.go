@@ -60,6 +60,13 @@ const (
 	APIRequestLogBoundaryBenchmark  = "BenchmarkRequestLogBoundary"
 	APIRequestLogDeliveredBenchmark = "BenchmarkRequestLogDelivered"
 
+	APIIdentityConditionProfile        = "api-identity-condition"
+	APIIdentityConditionBenchmark      = "BenchmarkIdentityConditionValidity"
+	APIHandlerPanicProfile             = "api-handler-panic"
+	APIHandlerPanicBenchmark           = "BenchmarkHandlerPanicFormatting"
+	APIWebSocketRegistrationsProfile   = "api-websocket-registrations"
+	APIWebSocketRegistrationsBenchmark = "BenchmarkWSConnectionRegistrations"
+
 	LuviaMergeDestinationProfile   = "luvia-merge-destination"
 	LuviaMergeDestinationBenchmark = "BenchmarkMergeDestination"
 
@@ -71,7 +78,12 @@ const (
 )
 
 var apiIdentityRoots = []string{
-	"BenchmarkIdentityConditionValidity", "BenchmarkIdentityEnumArray", "BenchmarkIdentitySubjectVisibility",
+	APIIdentityConditionBenchmark, "BenchmarkIdentityEnumArray", "BenchmarkIdentitySubjectVisibility",
+}
+
+// IsAPIIdentityBenchmark reports whether the broad API binary must omit the root.
+func IsAPIIdentityBenchmark(root string) bool {
+	return slices.Contains(apiIdentityRoots, root)
 }
 
 const apiCanonicalJSONPrefix = "BenchmarkCanonicalJSON"
@@ -151,6 +163,14 @@ func codegenBenchmarkProfile(root string) string {
 }
 
 func apiBenchmarkProfile(root string) string {
+	switch root {
+	case APIIdentityConditionBenchmark:
+		return APIIdentityConditionProfile
+	case APIHandlerPanicBenchmark:
+		return APIHandlerPanicProfile
+	case APIWebSocketRegistrationsBenchmark:
+		return APIWebSocketRegistrationsProfile
+	}
 	if root == APIRequestLogBoundaryBenchmark || root == APIRequestLogDeliveredBenchmark {
 		return APIRequestLogProfile
 	}
@@ -163,7 +183,7 @@ func apiBenchmarkProfile(root string) string {
 	if family, ok := strings.CutPrefix(root, apiCanonicalJSONPrefix); ok && slices.Contains(apiCanonicalJSONFamilies, family) {
 		return APICanonicalJSONProfile
 	}
-	if !slices.Contains(apiIdentityRoots, root) {
+	if !IsAPIIdentityBenchmark(root) {
 		return APINonIdentityProfile
 	}
 	return DefaultProfile
@@ -197,6 +217,9 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{APICanonicalJSONProfile, "^" + apiCanonicalJSONPrefix + "(" + strings.Join(apiCanonicalJSONFamilies, "|") + ")$"},
 			{APIBinaryParamLookupProfile, "^" + APIBinaryParamLookupBenchmark + "$"},
 			{APIRequestLogProfile, "^" + APIRequestLogBoundaryBenchmark + "$|^" + APIRequestLogDeliveredBenchmark + "$"},
+			{APIIdentityConditionProfile, "^" + APIIdentityConditionBenchmark + "$"},
+			{APIHandlerPanicProfile, "^" + APIHandlerPanicBenchmark + "$"},
+			{APIWebSocketRegistrationsProfile, "^" + APIWebSocketRegistrationsBenchmark + "$"},
 		}
 	case LuviaPackage:
 		return []IsolationSpec{

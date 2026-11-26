@@ -295,6 +295,7 @@ func TestAPIBinaryParamLookupProfileKeepsExactLeaves(t *testing.T) {
 	const root = "BenchmarkBinaryParamLookup/"
 	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
 	const other = "BenchmarkHandlerPanicFormatting/Success/After" + measurement
+	const broad = "BenchmarkHandlerResponseBuffer/Int" + measurement
 	var samples strings.Builder
 	for _, width := range []string{"n=1", "n=16"} {
 		for _, stride := range []string{"stride=1", "stride=1001", "stride=65537"} {
@@ -314,9 +315,9 @@ func TestAPIBinaryParamLookupProfileKeepsExactLeaves(t *testing.T) {
 		{"exact isolated fixture", "api-binary-param-lookup", full + other, full, true},
 		{"same missing leaf in both binaries", "api-binary-param-lookup", partial + other, partial, false},
 		{"unrelated leaf in isolated profile", "api-binary-param-lookup", full + other, full + other, false},
-		{"discovery keeps both families", "api-non-identity", full + other, full + other, true},
-		{"discovery loses lookup leaf", "api-non-identity", full + other, partial + other, false},
-		{"discovery loses handler leaf", "api-non-identity", full + other, full, false},
+		{"discovery keeps both families", "api-non-identity", full + other + broad, full + other + broad, true},
+		{"discovery loses lookup leaf", "api-non-identity", full + other + broad, partial + other + broad, false},
+		{"discovery loses handler leaf", "api-non-identity", full + other + broad, full + broad, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			writeFixture(t, ordinary, tc.ordinary+"PASS\n")
@@ -880,6 +881,80 @@ func TestAPIRequestLogPrimaryAndConfirmationProfiles(t *testing.T) {
 			writeFixture(t, batch, strings.Replace(tc.batch, "\tapi-request-log\t", "\tapi-non-identity\t", 1))
 			if err := run(args, io.Discard); err == nil {
 				t.Fatal("accepted request-log leaves in the stock profile")
+			}
+		})
+	}
+}
+
+func TestAPIIntelProfilesKeepCompleteOriginalInventories(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	const identity = "BenchmarkIdentityConditionValidity"
+	const handler = "BenchmarkHandlerPanicFormatting"
+	const websocket = "BenchmarkWSConnectionRegistrations"
+	identityLeaves := benchmarkCaseProduct([]string{"empty", "member", "missing", "wrong-kind"},
+		[]string{"EnumChecked", "EnumReference", "OwnChecked", "OwnReference", "TextChecked", "TextReference"})
+	verifyExactProfileInventory(t, pkg, "BenchmarkIdentityEnumArray", "api-identity-condition",
+		identity, identityLeaves, "member/Unverified")
+	verifyExactProfileInventory(t, pkg, "BenchmarkHandlerResponseBuffer", "api-handler-panic",
+		handler, []string{"BusinessError/Before", "BusinessError/After", "OpaquePanic/Before", "OpaquePanic/After",
+			"StringPanic/Before", "StringPanic/After", "Success/Before", "Success/After"}, "Success/Alternate")
+	verifyExactProfileInventory(t, pkg, "BenchmarkWSConnectionRegistrationCold", "api-websocket-registrations",
+		websocket, []string{"size=1/checked", "size=1/former", "size=8/checked", "size=8/former",
+			"size=64/checked", "size=64/former"}, "size=128/checked")
+}
+
+func TestAPIIntelProfilesKeepBroadInventoryAndRouteExclusively(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	const identity = "BenchmarkIdentityConditionValidity"
+	const handler = "BenchmarkHandlerPanicFormatting"
+	const websocket = "BenchmarkWSConnectionRegistrations"
+	const other = "BenchmarkWSConnectionRegistrationCold"
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	handlerRow, websocketRow := handler+"/OpaquePanic/Before"+measurement, websocket+"/size=64/checked"+measurement
+	broad := handlerRow + websocketRow + other + "/false" + measurement
+	writeFixture(t, ordinary, identity+"/member/EnumChecked"+measurement+broad+"PASS\n")
+	writeFixture(t, isolated, broad+"PASS\n")
+	args := []string{"--verify-profile-inventory", pkg, "api-non-identity", ordinary, isolated}
+	if err := run(args, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []string{handlerRow, websocketRow} {
+		writeFixture(t, isolated, strings.Replace(broad, row, "", 1)+"PASS\n")
+		if err := run(args, io.Discard); err == nil {
+			t.Fatalf("broad benchmark binary lost its verified row: %s", row)
+		}
+	}
+
+	keys := []sampleKey{{pkg, identity + "/member/EnumChecked-2"}, {pkg, handler + "/Success/Before-2"},
+		{pkg, websocket + "/size=64/checked-2"}, {pkg, other + "/false-2"}}
+	groups := []benchGroup{{Package: pkg, Name: identity}, {Package: pkg, Name: handler},
+		{Package: pkg, Name: websocket}, {Package: pkg, Name: other}}
+	body, err := json.Marshal(expectedSamples{Base: keys, Head: keys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, batch := dir+"/expected.json", dir+"/batch.tsv"
+	writeFixture(t, expected, string(body))
+	for _, tc := range []struct{ phase, batch string }{
+		{"primary", formatShard(benchShard{Groups: groups})},
+		{"confirmation", formatConfirmationBatch(keys)},
+	} {
+		t.Run(tc.phase, func(t *testing.T) {
+			for _, profile := range []string{"api-identity-condition", "api-handler-panic", "api-websocket-registrations", "api-non-identity"} {
+				if strings.Count(tc.batch, "\t"+profile+"\t") != 1 {
+					t.Fatalf("wrong routed profile %s in %s", profile, tc.batch)
+				}
+			}
+			args := []string{"--verify-profile-batch", tc.phase, expected, batch}
+			writeFixture(t, batch, tc.batch)
+			if err := run(args, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			writeFixture(t, batch, strings.Replace(tc.batch, "\tapi-handler-panic\t", "\tapi-non-identity\t", 1))
+			if err := run(args, io.Discard); err == nil {
+				t.Fatal("accepted handler panic samples from a different benchmark binary")
 			}
 		})
 	}

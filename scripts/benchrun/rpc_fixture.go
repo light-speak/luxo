@@ -41,6 +41,9 @@ const (
 		" " + codegenReceiverFixture + "=" + codegenReceiverProjectionSHA +
 		"\nluvia-merge-destination-overlay-v1\napi-local-route-export-overlay-v1" +
 		"\napi-canonical-json-overlay-v1\nluvia-resolved-fields-overlay-v1\nluvia-convenience-keys-overlay-v1" +
+		"\n" + benchlayout.APIIdentityConditionProfile + "-overlay-v1 " + apiIdentityConditionFixture + "=" + apiIdentityConditionSHA +
+		"\n" + benchlayout.APIHandlerPanicProfile + "-overlay-v1 " + apiHandlerPanicFixture + "=" + apiHandlerPanicSHA +
+		"\n" + benchlayout.APIWebSocketRegistrationsProfile + "-overlay-v1 " + apiWSRegistrationsFixture + "=" + apiWSRegistrationsSHA +
 		"\nrpc-owned-request-overlay-v1 " + rpcOwnedRequestFixture +
 		"\nrpc-deadline-classification-overlay-v1 " + rpcDeadlineBenchmarkFixture + "=" + rpcDeadlineBenchmarkSHA +
 		" " + rpcDeadlineContextFixture + "=" + rpcDeadlineContextSHA +
