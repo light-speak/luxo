@@ -3,7 +3,7 @@ set -euo pipefail
 export LC_ALL=C GOTOOLCHAIN=local
 base=f83f9c78f9ee03a5d73b7d0a41bae5280a250bfd
 head=bb065672f26402b8f093ad2c49e00aa50da08f4e
-diagnostic_parent=7665cba45e5f58bd7021d8e0399abc431f4ae901
+diagnostic_parent=34d47a77f0366562f58429e21f0298571856ca82
 cpu='Intel(R) Xeon(R) 6975P-C'
 package=pkg/lux/rpc
 symbols='BenchmarkRPCNilContextGuard|beforeNilContextGuard|beforeAuthenticationRecovery|Server\)\.(requestContext|verifyRequestContext)'
@@ -22,7 +22,7 @@ test "$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | sed 's/[[:space:]]*$//'
 test "$(go env GOVERSION GOOS GOARCH GOAMD64 CGO_ENABLED)" = $'go1.27.1\nlinux\namd64\nv1\n1'
 test -z "$(go env GOFLAGS)"
 test "$(g "$control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $diagnostic_parent"
-test "$(g "$control" cat-file commit "$diagnostic_parent" | sed -n 's/^parent //p')" = 9cf385827185661b843e5d5cdcf179e998e3db66
+test "$(g "$control" cat-file commit "$diagnostic_parent" | sed -n 's/^parent //p')" = 7665cba45e5f58bd7021d8e0399abc431f4ae901
 diff -u <(printf 'M\t%s\n' scripts/diagnose-pr81-nil-context.sh) \
     <(g "$control" diff --name-status "$diagnostic_parent" HEAD)
 test "$(g "$base_checkout" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$base" 0f97d642325769e2882fd0235c1575af71e3fc3c)"
@@ -208,7 +208,7 @@ OVERLAY
         rm -- "$scratch/$arm.nm"
         "$tools/benchrun" run-performance "$tree" "$tools/$mode/$arm" "$package" "$profile" \
             -test.run='^$' -test.bench='^BenchmarkRPCNilContextGuard$' -test.benchmem \
-            -test.benchtime=1x -test.count=1 -test.cpu=2 > "$results/$arm.family.raw"
+            -test.benchtime=1x -test.count=10 -test.cpu=2 > "$results/$arm.family.raw"
         "$tools/benchplan" --normalize "$results/$arm.family.raw" "$results/$arm.family.txt"
         test "$(sed -n 's/^cpu: //p' "$results/$arm.family.txt" | sort -u)" = "$cpu"
     done
