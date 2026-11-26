@@ -200,10 +200,15 @@ export class QueryClient {
     }
   }
 
-  invalidateQueries(filters: QueryFilters = {}): void {
-    for (const entry of this.matchingEntries(filters)) {
+  invalidateQueries(filters: QueryFilters | QueryFilters[] = {}): void {
+    const entries = Array.isArray(filters)
+      ? new Set(filters.flatMap(filter => this.matchingEntries(filter)))
+      : this.matchingEntries(filters)
+    for (const entry of entries) {
       entry.invalidated = true
+      const aborted = this.abortQuery(entry)
       this.notify(entry, { type: 'invalidated' })
+      if (aborted && !entry.controller) this.scheduleGc(entry)
     }
   }
 
@@ -270,7 +275,7 @@ export class QueryClient {
         throw error
       },
     )
-    entry.promise = promise
+    if (entry.revision === revision) entry.promise = promise
     return promise
   }
 
@@ -298,13 +303,20 @@ export class QueryClient {
   }
 
   private cancelEntry(entry: QueryEntry): void {
-    if (!entry.promise) return
-    entry.controller?.abort()
+    if (!this.abortQuery(entry)) return
+    this.notify(entry, { type: 'cancelled' })
+    if (!entry.controller) this.scheduleGc(entry)
+  }
+
+  private abortQuery(entry: QueryEntry): boolean {
+    const controller = entry.controller
+    if (!controller) return false
     entry.revision++
     entry.promise = undefined
     entry.controller = undefined
-    this.notify(entry, { type: 'cancelled' })
-    this.scheduleGc(entry)
+    // Abort listeners can synchronously start a replacement read.
+    controller.abort()
+    return true
   }
 
   private isFresh(entry: QueryEntry, staleTime: number): boolean {
@@ -341,7 +353,10 @@ export class QueryClient {
       entry.gcTimer = setTimeout(() => this.collectEntry(entry), entry.gcTime)
       return
     }
-    queueMicrotask(() => this.collectEntry(entry))
+    const revision = entry.revision
+    queueMicrotask(() => {
+      if (entry.revision === revision) this.collectEntry(entry)
+    })
   }
 
   private collectEntry(entry: QueryEntry): void {
