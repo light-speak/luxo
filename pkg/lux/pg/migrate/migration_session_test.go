@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/light-speak/luxo/pkg/lux"
 )
 
@@ -178,6 +179,20 @@ func TestIntegrationMigrationStandaloneAcquireHonorsCancellation(t *testing.T) {
 
 func setupPingLockTest(t *testing.T) (*PGDB, uint32) {
 	t.Helper()
+	ctx := t.Context()
+	db := openPingLockTest(t, ctx, nil)
+	initial := db.pool.AcquireAllIdle(ctx)
+	for _, conn := range initial {
+		defer conn.Release()
+	}
+	if len(initial) != 1 {
+		t.Fatalf("idle connections after Ping = %d, want 1", len(initial))
+	}
+	return db, initial[0].Conn().PgConn().PID()
+}
+
+func pingLockTestDSN(t *testing.T, overrides url.Values) string {
+	t.Helper()
 	ctx, admin := databaseTestAdmin(t)
 	name := "luxo_ping_lock_" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
@@ -193,20 +208,21 @@ func setupPingLockTest(t *testing.T) (*PGDB, uint32) {
 	params := dsn.Query()
 	params.Set("pool_max_conns", "1")
 	params.Set("application_name", "ping-lock-fresh")
+	for name, values := range overrides {
+		params[name] = values
+	}
 	dsn.RawQuery = params.Encode()
-	db, err := NewPGDB(ctx, dsn.String())
+	return dsn.String()
+}
+
+func openPingLockTest(t *testing.T, ctx context.Context, overrides url.Values) *PGDB {
+	t.Helper()
+	db, err := NewPGDB(ctx, pingLockTestDSN(t, overrides))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(db.Close)
-	initial := db.pool.AcquireAllIdle(ctx)
-	for _, conn := range initial {
-		defer conn.Release()
-	}
-	if len(initial) != 1 {
-		t.Fatalf("idle connections after Ping = %d, want 1", len(initial))
-	}
-	return db, initial[0].Conn().PgConn().PID()
+	return db
 }
 
 func TestIntegrationPGDBUsesPingSessionForFirstLock(t *testing.T) {
@@ -315,5 +331,152 @@ func TestIntegrationPGDBRetiresAdoptedSessionAfterWrite(t *testing.T) {
 	var pid uint32
 	if err := db.QueryRow(ctx, "SELECT pid FROM holder_pid").Scan(&pid); err != nil || pid != initialPID {
 		t.Fatalf("DDL used PID %d, want Ping PID %d: %v", pid, initialPID, err)
+	}
+}
+
+func TestIntegrationPGDBSkipsExpiredPingSession(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	lifetime := 100 * time.Millisecond
+	db := openPingLockTest(t, ctx, url.Values{"pool_max_conn_lifetime": {lifetime.String()}})
+	ping := db.pingConn.Load()
+	if ping == nil || db.pingFreshUntil.After(time.Now().Add(lifetime)) {
+		t.Fatal("Ping session freshness did not respect the pool connection lifetime")
+	}
+	timer := time.NewTimer(time.Until(db.pingFreshUntil))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if err := db.AcquireLock(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer db.ReleaseLock(ctx)
+	if db.lockConn == ping || db.pingConn.Load() != nil {
+		t.Fatal("expired Ping session was retained or used for the first lock")
+	}
+}
+
+func TestIntegrationPGDBReturnsUnrelatedIdleSession(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	db := openPingLockTest(t, ctx, url.Values{"pool_max_conns": {"2"}})
+	ping := db.pingConn.Load()
+	checkedOut, err := db.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer checkedOut.Release()
+	if checkedOut.Conn() != ping {
+		t.Fatal("fixture did not reserve the Ping session")
+	}
+	other, err := db.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherConn := other.Conn()
+	other.Release()
+	// Start the same one-second freshness window at the controlled pool snapshot.
+	db.pingFreshUntil = time.Now().Add(time.Second)
+	if err := db.AcquireLock(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer db.ReleaseLock(ctx)
+	if db.lockConn == ping || db.lockConn == otherConn {
+		t.Fatal("first lock adopted a busy or unrelated connection")
+	}
+	returned := db.pool.AcquireAllIdle(ctx)
+	for _, conn := range returned {
+		defer conn.Release()
+	}
+	if len(returned) != 1 || returned[0].Conn() != otherConn {
+		t.Fatal("unrelated connection was not returned to the query pool")
+	}
+}
+
+func TestIntegrationPGDBReleasesPoolCheckoutWhenPingFails(t *testing.T) {
+	config, err := pgxpool.ParseConfig(pingLockTestDSN(t, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	pingCtx, stopPing := context.WithCancel(ctx)
+	defer stopPing()
+	config.PrepareConn = func(context.Context, *pgx.Conn) (bool, error) {
+		stopPing()
+		return true, nil
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if conn, err := pingMigrationPool(pingCtx, pool); conn != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation after checkout: connection=%p error=%v", conn, err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("pool could not reuse its only checkout: %v", err)
+	}
+}
+
+func TestIntegrationPGDBAllowsRetryAfterFreshLockSQLFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	db := openPingLockTest(t, ctx, url.Values{"lock_timeout": {"100ms"}})
+	blocker, err := pgx.ConnectConfig(ctx, db.lockConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		if err := blocker.Close(stopCtx); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := blocker.Exec(ctx, "SELECT pg_advisory_lock($1)", pgLockID); err != nil {
+		t.Fatal(err)
+	}
+	var one int
+	if err := db.QueryRow(ctx, "SELECT 1").Scan(&one); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireLock(ctx); !migrationHasSQLState(err, "55P03") {
+		t.Fatalf("first dedicated connection did not report PostgreSQL lock timeout: %v", err)
+	}
+	if _, err := blocker.Exec(ctx, "SELECT pg_advisory_unlock($1)", pgLockID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AcquireLock(ctx); err != nil {
+		t.Fatalf("failed advisory lock left the local holder reserved: %v", err)
+	}
+	db.ReleaseLock(ctx)
+}
+
+func TestIntegrationMigrationAttemptPreservesExecutionStringModeError(t *testing.T) {
+	runner, _, _ := migrationSessionFixture(t, "off")
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	db := runner.db.(*PGDB)
+	const sql = "CREATE TABLE execution_rejected (id bigint)"
+	if err := db.execMigrationStatement(ctx, sql); err != errMigrationStringMode {
+		t.Fatalf("pooled statement string mode error = %v", err)
+	}
+	if err := db.AcquireLock(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer db.ReleaseLock(ctx)
+	holder := &pgMigrationHolder{pgMigrationQueries: pgMigrationQueries[*pgx.Conn]{conn: db.lockConn}}
+	operation := migrationOperation{db: holder}
+	attempt := &storedMigrationAttempt{MigrationAttempt: MigrationAttempt{ID: "string-mode"}}
+	if err := operation.runMigrationAttemptSQL(ctx, plannedMigration{sql: sql}, attempt); err != errMigrationStringMode {
+		t.Fatalf("holder statement was reported as unconfirmed instead of rejected: %v", err)
+	}
+	var tableExists bool
+	if err := holder.QueryRow(ctx, `SELECT pg_catalog.to_regclass('execution_rejected') IS NOT NULL`).Scan(&tableExists); err != nil || tableExists || holder.wrote {
+		t.Fatalf("rejected statement may have changed the holder: table=%t wrote=%t err=%v", tableExists, holder.wrote, err)
 	}
 }
