@@ -1,0 +1,13 @@
+product_base=f9ce659fd7f17bf57cfe0aee7de7ecb8d9b8f2e4
+base_tree=68591bb02805a9c5a95e47864c3be1abb6e256cb
+patch_parent_commit=1b6c73bd67a781beb9e8b783cc7f8f631bf1276e
+patch_parent_tree=069227acf8a9af5f1276661e70bebf9774ed3f16
+head_tree=2063c619f631f1ecd8214a08e03808ed2e84b86b
+historical_base="$product_base"
+historical_head="$patch_parent_commit"
+patch_file=entry-allocation.patch.b64
+patch_sum=50464919ff8ebef51e66f712479fd82d4c9579e039b8e952bdaabbf329efbb24
+product_paths=(pkg/codegen/entry.go pkg/codegen/entry_backends.go pkg/codegen/entry_test.go)
+reference_paths=(pkg/codegen/{app_runtime_bench_test,app_runtime_test,codegen_bench_test,compile_auth_test,codegen}.go)
+reference_paths+=(scripts/{benchgate,benchplan,benchrun} internal/benchlayout)
+symbols='(Benchmark(AppRuntimeEntry|CheckedEntryFormattingComparison)|[.](emit|generate)(EntryFile|GatewayEntry|ModuleEntryFiles|SingleModuleEntry)|[.](collectModules|validatedModules|formatGeneratedChecked|formatGeneratedWithIdentifiers|writeEntryModuleImport|writeEntryQuoted))'

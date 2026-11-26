@@ -17,13 +17,21 @@ patch_file=shutdown.patch.b64
 product_base=55f982e4237a9e196cc0cb1ef84b1f97570c0d04
 base_tree=85e9600484d2531099ef28b2e5284b3ea4aed67c
 head_tree=32ef8e8c41a5c21a22180759b5ac0d6ce6253dbd
+patch_parent_commit=
+patch_parent_tree=
 product_paths=(pkg/lux/h2transport/{limits_test,serve_conn_test,server,server_test,shutdown_test}.go)
+reference_paths=()
 symbols='\.(Benchmark(AuthMiddlewareIsolation|GatewayIdentity|MergeDestination|TraceEncodingComparison|RPCPoolCloseSafetyReverse|ShutdownNoConnections|ShutdownOneOpeningConnection|PriorKnowledgeConnectionLifecycle)|benchmark(PoolSerialAfter|MergeDestination)|extractBearerToken|appendTraceRecord|\(\*(Pool|Server)\)\.(Put|GetContext|Shutdown|beginShutdown|retireConnection))'
 case "$diagnostic" in
   pr78-shutdown) ;;
   pr83-f9)
     [[ "$lane" == 9v45 ]]
     driver="$repo/scripts/diagnose-pr83-f9"
+    source "$driver/settings.sh"
+    ;;
+  pr143-allocation)
+    [[ "$lane" == 6975 ]]
+    driver="$repo/scripts/diagnose-pr143-allocation"
     source "$driver/settings.sh"
     ;;
   *) printf 'Unknown native diagnostic: %s\n' "$diagnostic" >&2; exit 2 ;;
@@ -79,17 +87,33 @@ ea6127592cb1c6ae965007266ffead6e01eed7026e128e9346e722af64b397bb  opening.fixtur
 SHA
 ); fi
 [[ "$("${graft[@]}" rev-parse "$base^{tree}")" == "$base_tree" ]]
-"${graft[@]}" read-tree "$base"
+if [[ -n "$patch_parent_commit" ]]; then
+  [[ "$("${graft[@]}" rev-parse "$patch_parent_commit^{tree}")" == "$patch_parent_tree" ]]
+  parents=$("${graft[@]}" cat-file commit "$patch_parent_commit" | sed -n -e '/^$/q' -e 's/^parent //p')
+  [[ "$parents" == "$base" ]]
+fi
+patch_tree="${patch_parent_tree:-$base_tree}"
+"${graft[@]}" read-tree "$patch_tree"
 "${graft[@]}" apply --cached --check --whitespace=error-all "$scratch/product.patch"
 "${graft[@]}" apply --cached --whitespace=error-all "$scratch/product.patch"
 [[ "$("${graft[@]}" write-tree)" == "$head_tree" ]]
-"${graft[@]}" diff --check "$base_tree" "$head_tree"
-"${graft[@]}" diff --name-only "$base_tree" "$head_tree" > "$evidence/product-paths.txt"
+"${graft[@]}" diff --check "$patch_tree" "$head_tree"
+"${graft[@]}" diff --name-only "$patch_tree" "$head_tree" > "$evidence/product-paths.txt"
 printf '%s\n' "${product_paths[@]}" | diff -u - "$evidence/product-paths.txt"
 "${graft[@]}" apply --cached --reverse --whitespace=error-all "$scratch/product.patch"
-[[ "$("${graft[@]}" write-tree)" == "$base_tree" ]]
+[[ "$("${graft[@]}" write-tree)" == "$patch_tree" ]]
 printf 'base=%s\nbase_tree=%s\nhead_tree=%s\nhistorical_base=%s\nhistorical_head=%s\nsampler=%s\npatch_sha256=%s\n' \
   "$base" "$base_tree" "$head_tree" "$historical_base" "$historical_head" "$sampler" "$patch_sum" > "$evidence/revisions.txt"
+if [[ -n "$patch_parent_commit" ]]; then
+  printf 'patch_parent=%s\npatch_parent_tree=%s\n' "$patch_parent_commit" "$patch_tree" >> "$evidence/revisions.txt"
+  "${graft[@]}" diff --name-status "$base_tree" "$head_tree" > "$evidence/base-to-candidate.tsv"
+  for path in "${reference_paths[@]}"; do
+    expected=$("${graft[@]}" rev-parse "$base_tree:$path")
+    [[ "$("${graft[@]}" rev-parse "$patch_tree:$path")" == "$expected" ]]
+    [[ "$("${graft[@]}" rev-parse "$head_tree:$path")" == "$expected" ]]
+    printf '%s %s\n' "$expected" "$path"
+  done > "$evidence/reference-git-objects.txt"
+fi
 "${graft[@]}" ls-tree "$base_tree" -- go.mod go.sum scripts pkg/lux/{api,luvia,rpc,h2transport} > "$evidence/base-blobs.txt"
 "${graft[@]}" ls-tree "$head_tree" -- go.mod go.sum scripts pkg/lux/{api,luvia,rpc,h2transport} > "$evidence/head-blobs.txt"
 if [[ -n "$plan" ]]; then exit 0; fi
@@ -120,6 +144,9 @@ done
   GOBIN="$scratch/bin" go install "golang.org/x/perf/cmd/benchstat@$benchstat_version"
 )
 "$scratch/bin/benchrun" performance-profile > "$evidence/official-profile.txt"
+if [[ -f "$evidence/original-compile-profile.txt" ]]; then
+  cmp "$evidence/original-compile-profile.txt" "$evidence/official-profile.txt"
+fi
 go version -m "$scratch/bin/benchstat" > "$evidence/benchstat-version.txt"
 grep -Fq "$benchstat_version" "$evidence/benchstat-version.txt"
 binary_dir() {

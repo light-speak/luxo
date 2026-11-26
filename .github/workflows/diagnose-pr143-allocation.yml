@@ -1,0 +1,75 @@
+name: Recheck PR 143 entry allocation on the original Intel processor
+
+on:
+  push:
+    branches: [diagnostics/pr143-allocation]
+    paths:
+      - .github/workflows/diagnose-pr143-allocation.yml
+      - scripts/diagnose-pr143-allocation/**
+      - scripts/diagnose-pr78-shutdown/run.sh
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  native:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr143-allocation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 22
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Match the original native processor
+        id: route
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=$(python3 -B scripts/diagnose-pr143-allocation/verify.py model 6975)
+          actual=$(LC_ALL=C lscpu | awk -F: '$1 == "Model name" {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2}')
+          match=false
+          if [[ "$(uname -sm)" == 'Linux x86_64' && "$actual" == "$expected" ]]; then match=true; fi
+          mkdir -p .tmp/pr143-allocation-evidence-6975
+          printf 'actual=%s\nexpected=%s\nmatch=%s\n' "$actual" "$expected" "$match" |
+            tee .tmp/pr143-allocation-evidence-6975/routing.txt
+          printf 'match=%s\n' "$match" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Verify and replay all ten original allocation leaves
+        if: steps.route.outputs.match == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LUXO_NATIVE_DIAGNOSTIC: pr143-allocation
+        run: |
+          set -euo pipefail
+          source scripts/diagnose-pr143-allocation/settings.sh
+          git fetch --no-tags --depth=1 origin "$product_base" "$patch_parent_commit" cbf4cfb383d944ceb38f700e19cf79c4c54d3c58
+          scratch=$(mktemp -d "$PWD/.tmp/pr143-allocation-input.XXXXXXXX")
+          trap 'rm -rf -- "$scratch"' EXIT
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/45752445232/attempts/1" --jq \
+            '{id,event,run_attempt,head_sha,pull_requests:[.pull_requests[]|{number,head:.head.sha,base:.base.sha}]}' > "$scratch/run.json"
+          python3 -B scripts/diagnose-pr143-allocation/verify.py artifacts 6975 > "$scratch/refs.tsv"
+          while IFS=$'\t' read -r shard artifact digest; do
+            resource="repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact"
+            gh api "$resource" > "$scratch/$shard.json"
+            jq -e --arg sha "sha256:$digest" '.digest == $sha and (.expired | not)' "$scratch/$shard.json" > /dev/null
+            gh api "$resource/zip" > "$scratch/$shard.zip"
+          done < "$scratch/refs.tsv"
+          bash scripts/diagnose-pr78-shutdown/run.sh 6975 "$scratch"
+      - name: Preserve paired allocation and control data
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: pr143-allocation-6975-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr143-allocation-evidence-6975/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Report an unmatched runner
+        if: ${{ always() && steps.route.outputs.match == 'false' }}
+        run: exit 3
