@@ -1,0 +1,86 @@
+name: Diagnose PR 143 ordinary gateway identity component
+
+on:
+  push:
+    branches: [diagnostics/pr143-identity-ordinary]
+    paths:
+      - '.github/workflows/diagnose-pr143-ordinary.yml'
+      - 'scripts/diagnose-pr143-ordinary.*'
+      - 'scripts/diagnose-pr143-ordinary_test.py'
+
+permissions:
+  contents: read
+
+jobs:
+  ordinary:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr143-identity-ordinary'
+    name: Ordinary gateway identity (${{ matrix.slot }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2]
+    steps:
+      - name: Require the original hosted Intel 6975P-C
+        id: route
+        shell: bash
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          expected='Intel(R) Xeon(R) 6975P-C'
+          actual=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | sed 's/[[:space:]]*$//')
+          match=false
+          if [[ "$RUNNER_KIND" == github-hosted && "$(uname -sm)" == 'Linux x86_64' && "$actual" == "$expected" ]]; then match=true; fi
+          mkdir -p .tmp/pr143-ordinary-evidence
+          printf 'workflow=%s\nexpected=%s\nactual=%s\nmatch=%s\n' "$GITHUB_SHA" "$expected" "$actual" "$match" > .tmp/pr143-ordinary-evidence/runner-route.txt
+          printf 'match=%s\n' "$match" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          ref: ${{ github.sha }}
+          path: .tmp/control
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          ref: 5fc47e2a77a5a964e945dc6867ddb7061ce9e9fd
+          path: .tmp/base-git
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          ref: c884024aa15c7df09de2c42f70abd616bca8ac1c
+          path: .tmp/head-git
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Run the fixed ordinary-build identity experiment
+        if: steps.route.outputs.match == 'true'
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: bash .tmp/control/scripts/diagnose-pr143-ordinary.sh
+
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: pr143-identity-ordinary-${{ matrix.slot }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr143-ordinary-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Report a different processor after preserving the routing receipt
+        if: ${{ always() && steps.route.outputs.match == 'false' }}
+        run: exit 3
