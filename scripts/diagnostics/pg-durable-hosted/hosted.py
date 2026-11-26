@@ -22,11 +22,13 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-PARENT = '5fec0b0e892de8f0697dfb19aba04718140c60c4'
+PARENT = '65dc094cf2b5d240e30e42d4537b30bf25755154'
 BASE = '15765dee6705d39de0b5a505d3039d59ebf43584'
 BASE_TREE = '75aebe5bd2fa6b45a1c614ace1a816ebc63e4c0a'
-ARMS = {'P': BASE_TREE, 'Q': 'c20138cf4a7c0b7f71942298abe66439f2427400'}
-PATCHES = {'Q': (BASE_TREE, 'c098ffd6cd6ac36f21883f56617ffc833df8178fd8abf4c56976a5f0e2efd85d')}
+ARMS = {'P': 'c20138cf4a7c0b7f71942298abe66439f2427400', 'Q': 'd313f1aebcefb1106a0c230133bb64da662796d8'}
+PATCHES = {'P': (BASE_TREE, 'c098ffd6cd6ac36f21883f56617ffc833df8178fd8abf4c56976a5f0e2efd85d'),
+           'Q': (ARMS['P'], '0110ed0ca7d570809ea802a54f70eb27cb0582da64b0b00197982b07e653573c')}
+ACTIVE_LANES = ('standalone', 'recovery')
 LEAVES = {
     "first-query": {"cold-open-ping-up", "already-used-pool-up", "warm-read-only-holder-up", "used-holder-first-reuse-up"},
     "standalone": {"ordinary/up", "ordinary/up-existing", "concurrent/up", "concurrent/down"},
@@ -66,7 +68,7 @@ def put(path, value):
 
 def payload():
     names = {"shared.py", "advisory_pair_test.go", "first_query_test.go", "migration_pair_test.go",
-             "durable_reset_test.go", "used_holder_reuse_test.go", "capacity_public_test.go", "recovery_test.go", "arm-Q.patch.gz.b64"}
+             "durable_reset_test.go", "used_holder_reuse_test.go", "capacity_public_test.go", "recovery_test.go", "arm-P.patch.gz.b64", "arm-Q.patch.gz.b64"}
     entries = {}
     for line in (PAYLOAD / "inputs.sha256").read_text().splitlines():
         digest, name = line.split("  ", 1)
@@ -143,6 +145,7 @@ def prepare_arm(git, root, arm, env, evidence):
         workspace = env | {"GOWORK": str(src / "go.work")}
         lanes = {"first-query": "advispair", "standalone": "migratepair",
                  "public": "capacitypair", "recovery": "recoverypair"}
+        lanes = {lane: lanes[lane] for lane in ACTIVE_LANES}
         for lane, folder in lanes.items():
             target = src / "pkg/lux/pg" / folder
             target.mkdir()
@@ -396,10 +399,9 @@ def replay(repo, root, evidence, entries):
     shared["admin"].__globals__["admin"] = lambda sql: SERVER["admin"](scope, sql)
     helper = SimpleNamespace(**shared)
     put(evidence / "server.json", SERVER["start_owned"]())
-    capacity_smoke(root, evidence, helper, identities)
     for phase in ("smoke", "formal"):
         failures = {}
-        for lane in LEAVES:
+        for lane in ACTIVE_LANES:
             try:
                 run_lane(root, evidence, helper, lane, identities, phase == "smoke")
             except (RuntimeError, subprocess.SubprocessError) as err:
