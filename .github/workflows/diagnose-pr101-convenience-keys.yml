@@ -30,7 +30,7 @@ jobs:
           ALLOCATION: ${{ matrix.allocation }}
         run: |
           set -euo pipefail
-          evidence=.tmp/pr101-convenience-keys-evidence
+          evidence="$RUNNER_TEMP/pr101-convenience-keys-evidence"
           mkdir -p "$evidence"
           lscpu > "$evidence/lscpu.txt"
           printf 'allocation=%s\nimage=%s\nimage_version=%s\n' \
@@ -51,7 +51,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          evidence=.tmp/pr101-convenience-keys-evidence
+          evidence="$RUNNER_TEMP/pr101-convenience-keys-evidence"
           git fetch --no-tags --depth=1 origin f9ce659fd7f17bf57cfe0aee7de7ecb8d9b8f2e4 39d329d07d7729b4b4ddb5915e08bf9d5d07ea9d
           artifact="repos/$GITHUB_REPOSITORY/actions/artifacts/15083004141"
           gh api "$artifact" > "$evidence/original-metadata.json"
@@ -63,12 +63,12 @@ jobs:
           ' "$evidence/original-metadata.json"
           gh api "$artifact/zip" > "$evidence/original.zip"
       - name: Measure default and test-isolated layouts
-        run: bash scripts/diagnose-pr101-convenience-keys.sh .tmp/pr101-convenience-keys-evidence --also-isolate
+        run: bash scripts/diagnose-pr101-convenience-keys.sh "$RUNNER_TEMP/pr101-convenience-keys-evidence" --also-isolate
       - name: Preserve raw samples and linker receipts
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
           name: pr101-convenience-keys-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.allocation }}
-          path: .tmp/pr101-convenience-keys-evidence/
+          path: ${{ runner.temp }}/pr101-convenience-keys-evidence/
           if-no-files-found: error
           retention-days: 14
