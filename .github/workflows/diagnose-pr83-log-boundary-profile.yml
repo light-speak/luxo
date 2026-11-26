@@ -1,0 +1,91 @@
+name: Qualify the isolated PR 83 request logging profile
+
+on:
+  push:
+    branches: [diagnostics/pr83-log-boundary-profile]
+    paths:
+      - '.github/workflows/diagnose-pr83-log-boundary-profile.yml'
+      - 'scripts/diagnose-pr83-log-boundary.*'
+      - 'scripts/diagnose-pr83-log-boundary-tools.patch.gz'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  replay:
+    if: github.repository == 'light-speak/luxo'
+    name: Request logging profile (${{ matrix.slot }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        slot: [1, 2]
+    steps:
+      - name: Require the original Intel 6975P-C
+        id: route
+        shell: bash
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          expected='Intel(R) Xeon(R) 6975P-C'
+          actual=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | sed 's/[[:space:]]*$//')
+          match=false
+          if [[ "$RUNNER_KIND" == github-hosted && "$(uname -sm)" == 'Linux x86_64' && "$actual" == "$expected" ]]; then
+            match=true
+          fi
+          mkdir -p .tmp/pr83-log-profile-evidence
+          printf 'workflow=%s\nshard=07\nexpected=%s\nactual=%s\nmatch=%s\n' \
+            "$GITHUB_SHA" "$expected" "$actual" "$match" > .tmp/pr83-log-profile-evidence/runner-route.txt
+          printf 'match=%s\n' "$match" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          ref: ${{ github.sha }}
+          path: .tmp/pr83-control
+          fetch-depth: 3
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          ref: dd70430a0d3f32ba400ed25922d431d206c48ade
+          path: .tmp/pr83-base
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          ref: cb0e8dca57971c1da049fc6033e62f91e4f57cac
+          path: .tmp/pr83-head
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Verify the native witness and sample the isolated logging profile
+        if: steps.route.outputs.match == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .tmp/pr83-control/scripts/diagnose-pr83-log-boundary.sh --linked-profile
+
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: pr83-log-profile-6975-${{ matrix.slot }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr83-log-profile-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Report wrong processor without sampling
+        if: ${{ always() && steps.route.outputs.match == 'false' }}
+        run: exit 3

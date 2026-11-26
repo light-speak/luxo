@@ -146,6 +146,63 @@ def verify_stock(inputs, out):
         (out / ("stock-" + name)).write_bytes(observed)
 
 
+PROJECTED_RUN = 45831608901
+PROJECTED_SHA = "46a7dee10d32fba4347317e2824ced18ea3df915"
+PROJECTED = (
+    (15122089356, "0b8805ed226104481858bb2902011a75488c708f175e839e74588211ea2c5df6"),
+    (15120989921, "811835d63acf1e6faeb67e93b126f1d2c749a8aea38fde2704bc37b64a7e3ec5"),
+)
+PROJECTION_SHA = "ce47aebb7d132885536fe9eb2fb4a12b1f08d7b0d68ecc3b5f24b10b4dd720dc"
+PRODUCTION_SHA = "6dc7ca72cbfcf29fd5e6f30b6010b7b44bbaea9f65ecff6d96f7ba46915a1c48"
+PROJECTED_CONTROLS = {name.replace("bb.", "pp."): code for name, code in EXPECTED_CONTROLS.items()
+                      if name != "ab-combined"} | {"ap-combined": "0"}
+
+
+def check_projected_archive(archive, out):
+    assert archive.testzip() is None
+    assert archive.read("expected.json") == (out / "expected.json").read_bytes()
+    assert archive.read("rebuilt-profile.txt") == (out / "original-compile-profile.txt").read_bytes()
+    assert archive.read("original-revisions.txt").decode().splitlines() == [f"base_sha={BASE}", f"tested_sha={HEAD}"]
+    route = dict(line.split("=") for line in archive.read("runner-route.txt").decode().splitlines())
+    assert route["workflow"] == PROJECTED_SHA and route["actual"] == CPU and route["match"] == "true"
+    assert dict(line.split("\t") for line in archive.read("gates.tsv").decode().splitlines()) == PROJECTED_CONTROLS
+    assert archive.read("outcome.txt") == b"no-confirmed-regression\n"
+    receipts = archive.read("projection-compile.sha256").decode().splitlines()
+    assert [line.split()[0] for line in receipts] == [PROJECTION_SHA, PRODUCTION_SHA]
+    assert [Path(line.split()[1]).name for line in receipts] == ["request_log_async_test.go", "request_log_async.go"]
+    for arm in ("base", "projected"):
+        verify_samples(archive.read(f"{arm}.inventory.raw").decode(), 1)
+    for group in (1, 2):
+        for comparison in ("aa", "ap", "pp"):
+            for side in ("left", "right"):
+                verify_samples(archive.read(f"{comparison}.{group}.{side}.raw").decode(), 10)
+    return {
+        arm: archive.read(f"{arm}.symbols.txt").decode().splitlines()
+        for arm in ("base", "projected")
+    }
+
+
+def verify_projected(inputs, out):
+    run = json.loads((inputs / "run.json").read_text())
+    assert (run["id"], run["run_attempt"], run["head_sha"], run["event"], run["conclusion"]) == (
+        PROJECTED_RUN, 1, PROJECTED_SHA, "push", "success")
+    refs = []
+    for slot, (artifact_id, digest) in enumerate(PROJECTED, 1):
+        meta = json.loads((inputs / f"{slot}.json").read_text())
+        assert (meta["id"], meta["name"], meta["digest"]) == (
+            artifact_id, f"pr83-log-projected-6975-{slot}-{PROJECTED_RUN}-1", "sha256:" + digest)
+        assert meta["workflow_run"]["id"] == PROJECTED_RUN and meta["workflow_run"]["head_sha"] == PROJECTED_SHA
+        source = inputs / f"{slot}.zip"
+        raw = source.read_bytes()
+        assert len(raw) == meta["size_in_bytes"] and sha256(raw).hexdigest() == digest
+        with ZipFile(source) as archive:
+            refs.append(check_projected_archive(archive, out))
+    for role, other in (("base", "base"), ("projected", "profiled")):
+        assert refs[0][role] == refs[1][role], role
+        sizes = sorted(f"{line.split()[1]} {line.split()[3]}\n" for line in refs[0][role])
+        (out / f"witness-{other}.symbol-sizes.txt").write_text("".join(sizes))
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -155,6 +212,9 @@ def main():
     stock = sub.add_parser("verify-stock")
     stock.add_argument("inputs", type=Path)
     stock.add_argument("output", type=Path)
+    projected = sub.add_parser("verify-projected")
+    projected.add_argument("inputs", type=Path)
+    projected.add_argument("output", type=Path)
     samples = sub.add_parser("verify-samples")
     samples.add_argument("count", type=int, choices=(1, 10))
     samples.add_argument("file", type=Path)
@@ -163,6 +223,8 @@ def main():
         plan(args.artifact, args.metadata, args.run, args.output)
     elif args.command == "verify-stock":
         verify_stock(args.inputs, args.output)
+    elif args.command == "verify-projected":
+        verify_projected(args.inputs, args.output)
     else:
         verify_samples(args.file.read_text(), args.count)
 
