@@ -77,6 +77,8 @@ type EventContext struct {
 	// ModelFields records fields declared by each model's owning module. Extend
 	// projections reuse these fields; only absent names are federation additions.
 	ModelFields map[string]map[string]bool
+	// Only fields with an error response policy need an immutable entry.
+	modelErrorPolicies map[string]map[string]errorFieldPolicy
 	// remoteLoadCalls maps the owning module to named load patterns used by
 	// another module. The owner uses these to generate internal RPC endpoints.
 	remoteLoadCalls map[string][]loadCallInfo
@@ -137,6 +139,7 @@ func BuildEventContext(allFiles []*ast.File, modulePath string) *EventContext {
 			}
 		}
 	}
+	ctx.recordProjectedErrorPolicies(allFiles)
 	seenLoads := make(map[string]bool)
 	for _, call := range collectLoadCalls(&semantic.Result{Files: allFiles}) {
 		owner := ctx.ModelModule[call.modelName]

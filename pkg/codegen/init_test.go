@@ -10,6 +10,24 @@ import (
 	"github.com/light-speak/luxo/pkg/semantic"
 )
 
+func TestCapitalizedASCIISnakeCaseLenMatchesRenderedName(t *testing.T) {
+	for _, name := range []string{
+		"", "a", "user", "userID", "uSR", "uSr", "uRLParser", "HTTP", "HTMLParser", "api1HTTPClient",
+		"_user_v2", strings.Repeat("a", 59) + "Ba", strings.Repeat("a", 62),
+	} {
+		length, ok := capitalizedASCIISnakeCaseLen(name)
+		want := len(str.ToSnakeCase(str.Capitalize(name)))
+		if !ok || length != want {
+			t.Errorf("%q: got %d/%v, want %d/true", name, length, ok, want)
+		}
+	}
+	for _, name := range []string{"\x00before", "a\x00b", "éstart", "aé", "a\xff", "\xff"} {
+		if _, ok := capitalizedASCIISnakeCaseLen(name); ok {
+			t.Errorf("%q should use the general conversion", name)
+		}
+	}
+}
+
 func TestValidateModuleScaffoldModelNameDoesNotAllocate(t *testing.T) {
 	for _, name := range []string{
 		"user", "user_" + strings.Repeat("a", 24), strings.Repeat("a", 62),
@@ -140,7 +158,7 @@ func TestInitProjectEnvExample(t *testing.T) {
 		"DATABASE_DRIVER=pg",
 		"DATABASE_USER=postgres",
 		"DATABASE_PASSWORD=postgres",
-		"JWT_SECRET=change-me",
+		"# JWT_SECRET=",
 		"DEPLOY_MODE=embedded",
 		"LUXO_EVENT_BACKEND=none",
 		"LUXO_QUEUE_BACKEND=none",
@@ -154,6 +172,12 @@ func TestInitProjectEnvExample(t *testing.T) {
 	for _, check := range checks {
 		if !strings.Contains(src, check) {
 			t.Errorf("missing %q in .env.example:\n%s", check, src)
+		}
+	}
+	for _, line := range strings.Split(src, "\n") {
+		key, _, _ := strings.Cut(line, "=")
+		if strings.TrimSpace(key) == "JWT_SECRET" {
+			t.Error(".env.example must leave JWT_SECRET unset")
 		}
 	}
 

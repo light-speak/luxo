@@ -74,6 +74,49 @@ describe('QueryClient', () => {
     expect(userTwo).toHaveBeenCalledTimes(2)
   })
 
+  it('preserves a replacement started by an abort listener during invalidation', async () => {
+    const client = new QueryClient({ gcTime: Infinity })
+    const queryKey = ['status']
+    const oldResult = deferred<string>()
+    const newResult = deferred<string>()
+    const next = { queryKey, queryFn: vi.fn(() => newResult.promise) }
+    let replacement: Promise<string> | undefined
+    const started = client.fetchQuery({ queryKey, queryFn: ({ signal }) => {
+      signal.addEventListener('abort', () => { replacement = client.fetchQuery(next) }, { once: true })
+      client.invalidateQueries({ queryKey })
+      return oldResult.promise
+    } })
+
+    expect(client.fetchQuery(next)).toBe(replacement)
+    expect(next.queryFn).toHaveBeenCalledOnce()
+    newResult.resolve('new')
+    await expect(replacement).resolves.toBe('new')
+    oldResult.reject(new Error('late failure'))
+    await expect(started).rejects.toThrow('late failure')
+    expect(client.getQueryState(queryKey)).toMatchObject({ data: 'new', error: undefined, isInvalidated: false })
+  })
+
+  it('lets a new direct fetch outlive cleanup of an invalidated zero-cache read', async () => {
+    const client = new QueryClient()
+    const queryKey = ['tickets']
+    const oldResult = deferred<string>()
+    const newResult = deferred<string>()
+    const oldRead = client.fetchQuery({ queryKey, queryFn: () => oldResult.promise })
+    client.invalidateQueries({ queryKey })
+    const next = vi.fn(({ signal }: QueryFunctionContext) => {
+      signal.addEventListener('abort', () => newResult.reject(signal.reason), { once: true })
+      return newResult.promise
+    })
+    const newRead = client.fetchQuery({ queryKey, queryFn: next })
+    expect(next).toHaveBeenCalledOnce()
+    const checked = expect(newRead).resolves.toBe('new')
+    await Promise.resolve()
+    newResult.resolve('new')
+    oldResult.resolve('old')
+    await checked
+    await expect(oldRead).resolves.toBe('old')
+  })
+
   it('updates cached data and notifies subscribers', () => {
     const client = new QueryClient({ gcTime: Infinity })
     const listener = vi.fn()

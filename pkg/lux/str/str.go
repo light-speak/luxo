@@ -27,11 +27,11 @@ func ToSnakeCase(s string) string {
 			lower = unicode.ToLower(r)
 		}
 		if upper && i > 0 {
-			var next rune
-			if i+1 < len(runes) {
-				next = runes[i+1]
-			}
-			if snakeWordBoundary(runes[i-1], next) {
+			prev := runes[i-1]
+			// Insert _ before: lowercase→Upper, or Upper→Upper when next is lowercase (end of acronym)
+			if unicode.IsLower(prev) {
+				b.WriteByte('_')
+			} else if unicode.IsUpper(prev) && i+1 < len(runes) && unicode.IsLower(runes[i+1]) {
 				b.WriteByte('_')
 			}
 		}
@@ -42,45 +42,6 @@ func ToSnakeCase(s string) string {
 		}
 	}
 	return b.String()
-}
-
-// CapitalizedASCIISnakeCaseLen measures ToSnakeCase(Capitalize(s)) for
-// NUL-free ASCII inputs without constructing either intermediate string.
-func CapitalizedASCIISnakeCaseLen(s string) (int, bool) {
-	if s == "" {
-		return 0, true
-	}
-	first := s[0]
-	if first == 0 || first >= utf8.RuneSelf {
-		return 0, false
-	}
-	previous := rune(first)
-	if previous >= 'a' && previous <= 'z' {
-		previous -= 'a' - 'A'
-	}
-	size := len(s)
-	for i := 1; i < len(s); i++ {
-		current := rune(s[i])
-		if current == 0 || current >= utf8.RuneSelf {
-			return 0, false
-		}
-		if current >= 'A' && current <= 'Z' {
-			var next rune
-			if i+1 < len(s) {
-				next = rune(s[i+1])
-			}
-			if snakeWordBoundary(previous, next) {
-				size++
-			}
-		}
-		previous = current
-	}
-	return size, true
-}
-
-func snakeWordBoundary(previous, next rune) bool {
-	// Start a word after lowercase or at the end of an acronym.
-	return unicode.IsLower(previous) || unicode.IsUpper(previous) && unicode.IsLower(next)
 }
 
 // Capitalize returns the string with the first character uppercased.

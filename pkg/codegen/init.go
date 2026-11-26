@@ -3,6 +3,7 @@ package codegen
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	pgdialect "github.com/light-speak/luxo/pkg/lux/dialect/pg"
 	"github.com/light-speak/luxo/pkg/lux/str"
@@ -51,7 +52,7 @@ func AddModule(modulePath, moduleName string) *ScaffoldResult {
 // ValidateModuleScaffoldModelName checks the model declared by a standalone scaffold.
 func ValidateModuleScaffoldModelName(moduleName string) error {
 	// The table suffix adds one byte to the measured snake-case name.
-	if size, ascii := str.CapitalizedASCIISnakeCaseLen(moduleName); ascii && size < pgdialect.MaxIdentifierBytes {
+	if size, ascii := capitalizedASCIISnakeCaseLen(moduleName); ascii && size < pgdialect.MaxIdentifierBytes {
 		var model [pgdialect.MaxIdentifierBytes - 1]byte
 		n := copy(model[:], moduleName)
 		if n != 0 && model[0] >= 'a' && model[0] <= 'z' {
@@ -63,6 +64,40 @@ func ValidateModuleScaffoldModelName(moduleName string) error {
 		}
 	}
 	return validateScaffoldModelName(moduleName)
+}
+
+// capitalizedASCIISnakeCaseLen measures a capitalized name in snake case without allocating.
+func capitalizedASCIISnakeCaseLen(name string) (int, bool) {
+	if name == "" {
+		return 0, true
+	}
+	previous := name[0]
+	if previous == 0 || previous >= utf8.RuneSelf {
+		return 0, false
+	}
+	if previous >= 'a' && previous <= 'z' {
+		previous -= 'a' - 'A'
+	}
+	size := len(name)
+	for i := 1; i < len(name); i++ {
+		current := name[i]
+		if current == 0 || current >= utf8.RuneSelf {
+			return 0, false
+		}
+		if current >= 'A' && current <= 'Z' {
+			var next byte
+			if i+1 < len(name) {
+				next = name[i+1]
+			}
+			afterLowercase := previous >= 'a' && previous <= 'z'
+			endsAcronym := previous >= 'A' && previous <= 'Z' && next >= 'a' && next <= 'z'
+			if afterLowercase || endsAcronym {
+				size++
+			}
+		}
+		previous = current
+	}
+	return size, true
 }
 
 func scaffoldGoDeclarationName[Name ~string | ~[]byte](name Name) bool {
@@ -214,7 +249,8 @@ AUTO_MIGRATE=true                                      # apply pending migration
 # DEBUG_SQL=true                                        # print all SQL queries with timing
 
 # ---- Auth (JWT) ----
-JWT_SECRET=change-me                                   # HMAC signing key
+# Set a unique random signing key to enable JWT authentication.
+# JWT_SECRET=
 JWT_EXPIRES=7d                                         # token expiry
 JWT_REFRESH=true                                       # enable refresh tokens
 JWT_REFRESH_EXPIRES=30d                                # refresh token expiry

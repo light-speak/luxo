@@ -190,6 +190,10 @@ func startGatewayServerWithBodyLimits(addr string, mux http.Handler, certFile, k
 	if err != nil {
 		return nil, nil, err
 	}
+	useTLS := certFile != ""
+	if useTLS != (keyFile != "") {
+		return nil, nil, fmt.Errorf("APP_TLS_CERT and APP_TLS_KEY must be configured together")
+	}
 	h2, err := newGatewayHTTPTransport(mux, timeouts, body)
 	if err != nil {
 		return nil, nil, err
@@ -212,7 +216,7 @@ func startGatewayServerWithBodyLimits(addr string, mux http.Handler, certFile, k
 		protocols.SetUnencryptedHTTP2(true)
 		server.Protocols = protocols
 	}
-	if certFile != "" && keyFile != "" {
+	if useTLS {
 		certificate, loadErr := tls.LoadX509KeyPair(certFile, keyFile)
 		if loadErr != nil {
 			listener.Close()
@@ -221,7 +225,7 @@ func startGatewayServerWithBodyLimits(addr string, mux http.Handler, certFile, k
 		server.Handler = mux
 		server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
 	}
-	return startConfiguredGatewayServer(listener, server, h2, certFile != "" && keyFile != "")
+	return startConfiguredGatewayServer(listener, server, h2, useTLS)
 }
 
 type serverTimeouts struct {

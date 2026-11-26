@@ -406,6 +406,24 @@ func TestGatewayRejectsUnknownHTTPTransport(t *testing.T) {
 	}
 }
 
+func TestGatewayRejectsIncompleteTLSConfiguration(t *testing.T) {
+	for _, mode := range []string{"standard", "luxo"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("APP_HTTP_TRANSPORT", mode)
+			for _, sample := range []struct{ cert, key string }{{cert: "cert.pem"}, {key: "key.pem"}} {
+				server, done, err := startGatewayServer("127.0.0.1:0", http.NotFoundHandler(), sample.cert, sample.key)
+				if server != nil {
+					_ = server.Close()
+					<-done
+				}
+				if err == nil || !strings.Contains(err.Error(), "APP_TLS_CERT and APP_TLS_KEY") || server != nil || done != nil {
+					t.Errorf("incomplete TLS configuration started a server: cert=%q key=%q err=%v", sample.cert, sample.key, err)
+				}
+			}
+		})
+	}
+}
+
 func TestGatewayLuxoBodyLimits(t *testing.T) {
 	t.Setenv("APP_HTTP_TRANSPORT", "luxo")
 	server, done, err := startGatewayServerWithBodyLimits("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
