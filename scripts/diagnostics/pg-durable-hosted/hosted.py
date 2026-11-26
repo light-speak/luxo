@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare a new holder’s first lock and subsequent operations with the same database protocol."""
+"""Measure the one-shot migration intent on the original PostgreSQL protocol."""
 import argparse
 import base64
 import gzip
@@ -22,7 +22,7 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-PARENT = '506e4799fbcefc651ffae53ae734b466beb66a16'
+PARENT = '545261164d4a7c7819f420ffa9533400754662fb'
 BASE = '15765dee6705d39de0b5a505d3039d59ebf43584'
 BASE_TREE = '75aebe5bd2fa6b45a1c614ace1a816ebc63e4c0a'
 PROJECTION = {
@@ -37,30 +37,32 @@ PROJECTION = {
     "priorNativeArtifact": 15136741248,
     "priorNativeSHA256": "d68266e78585d107a2371a52f94b5736f35ce73fbaa6ba3132a7341412f24dc8",
 }
-ARMS = {'P': BASE_TREE, 'Q': '13a0159134235571a8a1a431d02d6afd362b4718'}
-PATCHES = {'Q': (PROJECTION["mergeTree"], 'a2c84ab8db37a7965c63f0a87befc0c5ab3875da2fb49235cc448b8975d8dccd')}
+HISTORICAL = {"run": 45879856292, "attempt": 1, "head": PARENT, "artifact": 15146123973,
+              "artifactSHA256": "49f7b4b2a0f28ea4b06d89655982f1375f4b9fbd71c19007293f50358bb8590d"}
+ARMS = {'P': BASE_TREE, 'Q': '13a0159134235571a8a1a431d02d6afd362b4718',
+        'R': '40e9e4c4aefe41bb6c9fd2d02d5d49f6c7b0909f'}
+PATCHES = {
+    'Q': (PROJECTION["mergeTree"], 'a2c84ab8db37a7965c63f0a87befc0c5ab3875da2fb49235cc448b8975d8dccd'),
+    'R': (ARMS['Q'], 'd46682d848a5640e894f55a6a9ac402f4fc5f356aadd6a0939998b07a07c9355'),
+}
+DIAGNOSTIC_PATHS = (
+    "M\t.github/workflows/diagnose-pg-durable.yml",
+    "A\tscripts/diagnostics/pg-durable-hosted/.payload/arm-R.patch.gz.b64",
+    "M\tscripts/diagnostics/pg-durable-hosted/.payload/inputs.sha256",
+    "M\tscripts/diagnostics/pg-durable-hosted/hosted.py",
+)
 MODULE_PINS = ("github.com/jackc/pgx/v5 v5.10.0", "golang.org/x/net v0.58.0")
 LEAVES = {
-    "first-query": {"cold-open-ping-up", "already-used-pool-up", "warm-read-only-holder-up", "used-holder-first-reuse-up"},
     "standalone": {"ordinary/up", "ordinary/up-existing", "concurrent/up", "concurrent/down"},
+    "recovery": {"first-journal-and-create-index", "retry-after-invalid-index-repair"},
 }
-LEAVES["public"] = {'first-public-after-clean-noop', 'first-public-after-clean-write', 'warm-pool-begin-rollback', 'warm-pool-exec', 'warm-pool-query', 'warm-pool-query-row'}
-LEAVES["recovery"] = {"first-journal-and-create-index", "acknowledge-committed-down",
-                      "record-applied-after-restart", "retry-after-invalid-index-repair"}
 METRICS = ("ns/op", "B/op", "allocs/op")
-BENCHMARKS = {"first-query": "BenchmarkDurableFirstQuery", "standalone": "BenchmarkMigrationPair"}
-SMOKE_TESTS = {"first-query": ("TestDurableFirstQuerySessions", "TestAdvisoryPairStandaloneWriterHoldsLock"),
-               "standalone": ("TestMigrationPairEmptyPreview",)}
+BENCHMARKS = {"standalone": "BenchmarkMigrationPair", "recovery": "BenchmarkDurableRecovery"}
+SMOKE_TESTS = {"standalone": ("TestMigrationPairEmptyPreview",), "recovery": ()}
 SELECTORS = {
-    "first-query": "^BenchmarkDurableFirstQuery$",
     "standalone": "^BenchmarkMigrationPair$/^ordinary$/^(up|up-existing)$|^BenchmarkMigrationPair$/^concurrent$/^(up|down)$",
+    "recovery": "^BenchmarkDurableRecovery$/^(first-journal-and-create-index|retry-after-invalid-index-repair)$",
 }
-BENCHMARKS["public"] = "BenchmarkPGCapacityPublic"
-SMOKE_TESTS["public"] = ("TestPGCapacityPublicKeepsSpareSession",)
-SELECTORS["public"] = "^BenchmarkPGCapacityPublic$"
-BENCHMARKS["recovery"] = "BenchmarkDurableRecovery"
-SMOKE_TESTS["recovery"] = ()
-SELECTORS["recovery"] = "^BenchmarkDurableRecovery$"
 CPU = "Neoverse-N2"
 
 
@@ -79,7 +81,8 @@ def put(path, value):
 
 def payload():
     names = {"shared.py", "advisory_pair_test.go", "first_query_test.go", "migration_pair_test.go",
-             "durable_reset_test.go", "used_holder_reuse_test.go", "capacity_public_test.go", "recovery_test.go", "arm-Q.patch.gz.b64"}
+             "durable_reset_test.go", "used_holder_reuse_test.go", "capacity_public_test.go", "recovery_test.go",
+             "arm-Q.patch.gz.b64", "arm-R.patch.gz.b64"}
     entries = {}
     for line in (PAYLOAD / "inputs.sha256").read_text().splitlines():
         digest, name = line.split("  ", 1)
@@ -168,22 +171,16 @@ def prepare_arm(git, root, arm, env, evidence):
                       cwd=src, env=workspace, text=True).splitlines()
         if tuple(modules) != MODULE_PINS:
             raise RuntimeError(f"unexpected effective modules for {arm}: {modules}")
-        lanes = {"first-query": "advispair", "standalone": "migratepair",
-                 "public": "capacitypair", "recovery": "recoverypair"}
+        lanes = {"standalone": "migratepair", "recovery": "recoverypair"}
         for lane, folder in lanes.items():
             target = src / "pkg/lux/pg" / folder
             target.mkdir()
             if lane == "standalone":
                 (target / "migration_pair_test.go").write_text(standalone_fixture())
                 shutil.copyfile(PAYLOAD / "durable_reset_test.go", target / "durable_reset_test.go")
-            elif lane == "recovery":
+            else:
                 for name in ("advisory_pair_test.go", "recovery_test.go"):
                     shutil.copyfile(PAYLOAD / name, target / name)
-            else:
-                for name in ("advisory_pair_test.go", "first_query_test.go", "used_holder_reuse_test.go"):
-                    shutil.copyfile(PAYLOAD / name, target / name)
-            if lane == "public":
-                shutil.copyfile(PAYLOAD / "capacity_public_test.go", target / "capacity_public_test.go")
         packages = ["./pkg/lux/pg/" + folder for folder in lanes.values()]
         graph = run("go", "list", "-mod=readonly", "-p=1", "-deps", "-test", *packages, cwd=src, env=workspace)
         verified = run("go", "mod", "verify", cwd=src, env=workspace, text=True).strip()
@@ -252,10 +249,6 @@ def sample_metrics(raw, lane, iterations, tests):
     passed = re.findall(r"^--- PASS: (Test\w+) ", raw, re.M)
     if sorted(passed) != sorted(tests) or re.search(r"^\s*--- SKIP:", raw, re.M):
         raise RuntimeError(f"incomplete {lane} smoke tests")
-    if tests and lane == "first-query":
-        cases = re.findall(r"^ +--- PASS: TestDurableFirstQuerySessions/(\S+) ", raw, re.M)
-        if sorted(cases) != ["clean-ping", "used-pool"]:
-            raise RuntimeError("missing first-query session smoke case")
     if tests and lane == "standalone" and re.findall(r"history created=(true|false)", raw) != ["false"]:
         raise RuntimeError("empty preview changed migration history")
     return {leaf: dict(zip(METRICS, values)) for leaf, _, *values in rows}
@@ -280,8 +273,8 @@ def sample(root, lane, name, arm, slots, slot, identities, iterations, evidence,
 
 
 def schedule(lane):
-    comparisons, controls = ("PQ",), ("PP", "QQ")
-    control_count = {"first-query": 2, "recovery": 10}.get(lane, 5)
+    comparisons, controls = ("QR", "PR"), ("PP", "QQ", "RR")
+    control_count = {"standalone": 5, "recovery": 10}[lane]
     for group, slots in enumerate(("ab", "ba"), 1):
         for pair in range(1, 11):
             active = comparisons + (controls if pair <= control_count else ())
@@ -363,49 +356,13 @@ def run_lane(root, evidence, helper, lane, identities, smoke):
             raise RuntimeError(f"incomplete cleanup in {lane}")
 
 
-def capacity_smoke(root, evidence, helper, identities):
-    slots, outcomes = {}, {}
-    token = secrets.token_hex(8)
-    expected = {"P": ("server-limit", "role-limit historical handshake=53300"),
-                "Q": ("available", "role-limit corrected preview/up/public/noop=ok")}
-    clean = {}
-    try:
-        for slot, arm in zip("ab", expected):
-            helper.create_slot(slot, slots, token)
-            role, password = slots[slot]
-            scope, _ = SERVER["scope"]()
-            SERVER["admin"](scope, f"ALTER ROLE {role} CONNECTION LIMIT 1;")
-            status, message = expected[arm]
-            identity = identities[arm]["public"]
-            binary = root / "public" / identity["binary"]
-            if sha(binary.read_bytes()) != identity["sha256"]:
-                raise RuntimeError("prepared capacity binary changed")
-            env = {**os.environ, "GOMAXPROCS": "1", "GOGC": "100", "GOMEMLIMIT": "off", "GODEBUG": "",
-                   "TMPDIR": str(root), "LUXO_CAPACITY_EXPECT": status,
-                   "LUXO_MIGPAIR_DATABASE_URL": f"postgres://{role}:{password}@127.0.0.1:5432/{role}?sslmode=disable"}
-            proc = subprocess.run([str(binary), "-test.run=^TestPGCapacityLimitedRole$", "-test.v",
-                                   "-test.cpu=1", "-test.count=1", "-test.timeout=3m"],
-                                  cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            raw = proc.stdout.replace(password, "[redacted]")
-            (evidence / f"capacity-{arm}.log").write_text(raw)
-            if (proc.returncode or raw.count(message) != 1 or
-                    len(re.findall(r"^--- PASS: TestPGCapacityLimitedRole ", raw, re.M)) != 1 or
-                    len(re.findall(r"^PASS$", raw, re.M)) != 1 or re.search(r"^\s*--- SKIP:", raw, re.M)):
-                raise RuntimeError(f"unexpected capped role outcome for arm {arm}")
-            outcomes[arm] = {"outcome": status, "logSHA256": sha(raw.encode())}
-    finally:
-        clean = helper.clean_slots(slots)
-        put(evidence / "capacity.json", {"outcomes": outcomes, "clean": clean})
-        if clean != {"a": "0|0", "b": "0|0"} and len(outcomes) == 2:
-            raise RuntimeError("capped role cleanup incomplete")
-        if any(result != "0|0" for result in clean.values()):
-            raise RuntimeError("partially created capped role could not be cleaned")
-
-
 def replay(repo, root, evidence, entries):
     current = run("git", "-C", str(repo), "rev-list", "--parents", "-n", "1", "HEAD", text=True).strip().split()
     if current != [os.environ["GITHUB_SHA"], PARENT]:
         raise RuntimeError("unexpected diagnostic commit or parent")
+    changed = run("git", "-C", str(repo), "diff", "--name-status", PARENT, "HEAD", text=True).splitlines()
+    if changed != list(DIAGNOSTIC_PATHS):
+        raise RuntimeError("unexpected diagnostic append scope")
     cpu = json.loads(run("lscpu", "-J"))
     put(evidence / "host-cpu.json", cpu)
     require_cpu(cpu)
@@ -417,7 +374,8 @@ def replay(repo, root, evidence, entries):
         raise RuntimeError("unexpected Go toolchain")
     put(evidence / "inputs.json", {"base": BASE, "baseTree": BASE_TREE, "products": ARMS,
                                   "patches": PATCHES, "payload": entries, "go": "go1.27.1 linux/arm64",
-                                  "projection": PROJECTION, "modulePins": MODULE_PINS})
+                                  "projection": PROJECTION, "historical": HISTORICAL, "modulePins": MODULE_PINS,
+                                  "comparisons": {"QR": "one-shot intent only", "PR": "remaining product costs"}})
     git = trees(repo, root)
     identities = {arm: prepare_arm(git, root, arm, env, evidence) for arm in ARMS}
     shared = runpy.run_path(str(PAYLOAD / "shared.py"))
@@ -425,7 +383,6 @@ def replay(repo, root, evidence, entries):
     shared["admin"].__globals__["admin"] = lambda sql: SERVER["admin"](scope, sql)
     helper = SimpleNamespace(**shared)
     put(evidence / "server.json", SERVER["start_owned"]())
-    capacity_smoke(root, evidence, helper, identities)
     for phase in ("smoke", "formal"):
         failures = {}
         for lane in LEAVES:
