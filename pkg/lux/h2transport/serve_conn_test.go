@@ -139,7 +139,7 @@ func TestServeConnLimitPreservesExistingAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { cancel(); _ = first.Close(); s.workers.Done() }()
+	defer func() { cancel(); _ = first.Close(); s.retireConnection(first) }()
 	second := &faultConn{}
 	if err := s.ServeConn(t.Context(), second); !errors.Is(err, errConnectionLimit) {
 		t.Fatal("connection limit was not enforced", err)

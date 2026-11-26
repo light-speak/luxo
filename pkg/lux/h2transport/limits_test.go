@@ -72,9 +72,12 @@ func limitedBodyClient(t *testing.T, calls *atomic.Int32) (*http.Client, string,
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ln) }()
 	t.Cleanup(func() {
-		_ = s.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := s.Shutdown(ctx); err != nil {
+			t.Error(err)
+		}
 		<-done
-		s.workers.Wait()
 		if s.budget.used.Load() != 0 || s.streams.used.Load() != 0 {
 			t.Error("server retained budget after shutdown")
 		}

@@ -21,7 +21,7 @@ type Server struct {
 	mu          sync.Mutex
 	listener    net.Listener
 	connections map[net.Conn]*serverConnection
-	workers     sync.WaitGroup
+	drained     chan struct{}
 	closed      bool
 }
 
@@ -103,10 +103,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		cancel()
 		_ = conn.Close()
-		s.mu.Lock()
-		delete(s.connections, conn)
-		s.mu.Unlock()
-		s.workers.Done()
+		s.retireConnection(conn)
 		return err
 	}
 	return s.runConnection(ctx, cancel, conn)
@@ -132,18 +129,14 @@ func (s *Server) admitConnection(parent context.Context, conn net.Conn) (context
 	}
 	ctx, cancel := context.WithCancel(parent)
 	s.connections[conn] = &serverConnection{cancel: cancel}
-	s.workers.Add(1)
 	return ctx, cancel, nil
 }
 
 func (s *Server) runConnection(ctx context.Context, cancel context.CancelFunc, conn net.Conn) error {
-	defer s.workers.Done()
 	defer func() {
 		cancel()
 		_ = conn.Close()
-		s.mu.Lock()
-		delete(s.connections, conn)
-		s.mu.Unlock()
+		s.retireConnection(conn)
 	}()
 	var tlsState *tls.ConnectionState
 	if secured, ok := conn.(*tls.Conn); ok {
@@ -176,6 +169,16 @@ func (s *Server) runConnection(ctx context.Context, cancel context.CancelFunc, c
 	return c.run()
 }
 
+func (s *Server) retireConnection(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.connections, conn)
+	if s.drained != nil && len(s.connections) == 0 {
+		close(s.drained)
+		s.drained = nil
+	}
+}
+
 func (s *Server) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -193,10 +196,37 @@ func (s *Server) Close() error {
 // Shutdown stops admission and drains accepted streams. A deadline forces
 // cancellation; application handlers must honor context cancellation to exit.
 func (s *Server) Shutdown(ctx context.Context) error {
+	done := s.beginShutdown()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		_ = s.Close()
+		return ctx.Err()
+	}
+}
+
+func (s *Server) beginShutdown() <-chan struct{} {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.drained != nil {
+		return s.drained
+	}
+	wasClosed := s.closed
 	s.closed = true
-	if s.listener != nil {
+	if !wasClosed && s.listener != nil {
 		_ = s.listener.Close()
+	}
+	if len(s.connections) == 0 {
+		return nil
+	}
+	// Connection retirement signals all callers, including after a timeout.
+	s.drained = make(chan struct{})
+	if wasClosed {
+		return s.drained
 	}
 	for conn, entry := range s.connections {
 		if entry.active == nil {
@@ -207,14 +237,5 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			_ = conn.Close()
 		}
 	}
-	s.mu.Unlock()
-	done := make(chan struct{})
-	go func() { s.workers.Wait(); close(done) }()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		_ = s.Close()
-		return ctx.Err()
-	}
+	return s.drained
 }
