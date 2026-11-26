@@ -1,0 +1,52 @@
+name: Dart snapshot native qualification
+
+on:
+  push:
+    branches: [diagnostics/dart-snapshot-5fc]
+    paths:
+      - '.github/workflows/dart-snapshot-5fc-native.yml'
+      - '.github/diagnostics/dart-snapshot-5fc/**'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/dart-snapshot-5fc'
+    name: Dart snapshot / ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            dart_abi: windows_x64
+            python: python
+          - runner: ubuntu-24.04
+            dart_abi: linux_x64
+            python: python3
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.13.4'
+
+      - name: Verify snapshot topology, release and exact launcher inputs
+        env:
+          EXPECTED_DART_ABI: ${{ matrix.dart_abi }}
+          PYTHONUTF8: '1'
+          DART_SUPPRESS_ANALYTICS: 'true'
+        run: ${{ matrix.python }} -I -B .github/diagnostics/dart-snapshot-5fc/qualify.py
+
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: dart-snapshot-5fc-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dart-snapshot-5fc-evidence/
+          if-no-files-found: error
+          retention-days: 7
