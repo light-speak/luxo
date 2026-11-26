@@ -66,6 +66,10 @@ func (a *Analyzer) resolveInheritance(file *ast.File) {
 				a.reportIdentityDataType(m.Pos)
 				continue
 			}
+			if parent.Kind == TypeSealed {
+				a.addError(m.Pos, "model '%s' cannot inherit sealed type '%s' / 模型 '%s' 不能继承密封类型 '%s'", m.Name, parentName, m.Name, parentName)
+				continue
+			}
 			typ.Parents = append(typ.Parents, parent)
 		}
 	}

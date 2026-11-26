@@ -174,6 +174,24 @@ func TestInheritanceNotFound(t *testing.T) {
 	expectError(t, result, "not found")
 }
 
+func TestModelCannotInheritSealedType(t *testing.T) {
+	result := analyze(t, `
+sealed Outcome { Ready(value: Int) Pending }
+model Base @noTime { id: Int @id label: String }
+model Record : Base, Outcome @noTime { extra: Int }
+model Descendant : Record @noTime { other: Int }
+fn compare(value: Outcome, row: Record): Boolean { return value == row }
+fn convert(row: Descendant): Outcome { return row }
+`)
+	expectError(t, result, "cannot inherit sealed type 'Outcome'")
+	expectError(t, result, "cannot compare incompatible types 'Outcome' and 'Record'")
+	expectError(t, result, "return expects 'Outcome', got 'Descendant'")
+	record := result.Types["Record"]
+	if len(record.Parents) != 1 || record.Parents[0].Name != "Base" || record.LookupField("label") == nil {
+		t.Fatalf("expected only the Base parent and its label field, got %+v", record.Parents)
+	}
+}
+
 func TestMultipleParentsInheritance(t *testing.T) {
 	result := analyze(t, `
 model Base {
