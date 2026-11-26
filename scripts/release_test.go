@@ -140,7 +140,7 @@ func TestSwiftCandidateCheckoutIsPinned(t *testing.T) {
 			continue
 		}
 		checkouts++
-		if step.With["ref"] != "9c7286b4c0d6b371bbb95e1a9db0c70cdf6340f5" {
+		if step.With["ref"] != "d6578969bcef258141c7c99cb6cface30a22a0e2" {
 			t.Errorf("Swift conformance must use the verified beta.1 candidate, got %q", step.With["ref"])
 		}
 		if step.With["path"] != ".tmp/luxo-swift" || step.With["persist-credentials"] != "false" || step.If != "" || step.ContinueOnError {
