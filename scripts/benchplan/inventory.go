@@ -145,11 +145,22 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 		}
 	case benchlayout.APICanonicalJSONProfile:
 		return verifyAPICanonicalJSONInventory(isolated)
+	case benchlayout.APIBinaryParamLookupProfile:
+		return verifyAPIBinaryParamLookupInventory(isolated)
+	case benchlayout.APIRequestLogProfile:
+		return verifyAPIRequestLogInventory(isolated)
 	case benchlayout.LuviaGatewayIdentityProfile:
 		const root = benchlayout.LuviaGatewayIdentityBenchmark
 		if !verifiedBenchmarkLeaves(isolated[root], root, "anonymous/before", "anonymous/after", "authenticated/before",
 			"authenticated/after", "typed-nil/before", "typed-nil/after") {
 			return errors.New("Luvia gateway identity profile requires the six verified identity leaves")
+		}
+	case benchlayout.LuviaAuthMiddlewareProfile:
+		const root = benchlayout.LuviaAuthMiddlewareBenchmark
+		leaves := benchmarkCaseProduct([]string{"valid", "anonymous", "invalid", "inherited-missing", "inherited-other-key"},
+			[]string{"before", "after"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("Luvia auth middleware profile requires the ten verified benchmark leaves")
 		}
 	case benchlayout.LuviaMergeDestinationProfile:
 		const root = benchlayout.LuviaMergeDestinationBenchmark
@@ -167,6 +178,15 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
 			return errors.New("RPC owned-request profile requires the eight verified benchmark leaves")
 		}
+	case benchlayout.RPCDeadlineProfile:
+		const root = benchlayout.RPCDeadlineBenchmark
+		leaves := benchmarkCaseProduct([]string{"NoDeadline", "Cancelled", "ExpiredEOF", "FutureTimeout", "ExpiredTimeout", "WrappedTimeout"},
+			[]string{"Before", "After"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("RPC deadline classification profile requires the twelve verified benchmark leaves")
+		}
+	case benchlayout.RPCNilContextGuardProfile:
+		return verifyRPCNilContextGuardInventory(isolated)
 	case benchlayout.LuviaConvenienceKeysProfile:
 		const root = benchlayout.LuviaConvenienceKeysBenchmark
 		leaves := benchmarkCaseProduct([]string{"row-small", "row-wide", "column-small", "column-batch", "column-many"},
@@ -174,6 +194,16 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
 			return errors.New("Luvia convenience keys profile requires the twenty verified benchmark leaves")
 		}
+	}
+	return nil
+}
+
+func verifyRPCNilContextGuardInventory(isolated inventory) error {
+	const root = benchlayout.RPCNilContextGuardBenchmark
+	leaves := benchmarkCaseProduct([]string{"NoToken", "Verified", "Rejected", "Unconfigured"},
+		[]string{"Before", "GuardOnly", "After"})
+	if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+		return errors.New("RPC nil-context guard profile requires the twelve verified benchmark leaves")
 	}
 	return nil
 }
@@ -194,12 +224,35 @@ func verifyAPINonIdentityCompanions(ordinary, isolated inventory) error {
 	// exclusively to their corresponding sampling binaries.
 	for root, leaves := range ordinary {
 		switch benchlayout.ProfileForBenchmark(benchlayout.APIPackage, root) {
-		case benchlayout.APILocalRouteExportProfile, benchlayout.APICanonicalJSONProfile:
+		case benchlayout.APILocalRouteExportProfile, benchlayout.APICanonicalJSONProfile,
+			benchlayout.APIBinaryParamLookupProfile, benchlayout.APIRequestLogProfile:
 			if !maps.Equal(leaves, isolated[root]) {
 				return fmt.Errorf("API non-identity profile must retain the ordinary %s inventory", root)
 			}
 			delete(isolated, root)
 		}
+	}
+	return nil
+}
+
+func verifyAPIRequestLogInventory(isolated inventory) error {
+	const boundary = benchlayout.APIRequestLogBoundaryBenchmark
+	const delivered = benchlayout.APIRequestLogDeliveredBenchmark
+	if !verifiedBenchmarkLeaves(isolated[boundary], boundary, "disabled", "full", "synchronous", "unsampled") {
+		return errors.New("API request-log profile requires the four verified boundary leaves")
+	}
+	if _, ok := isolated[delivered][delivered+"-2"]; !ok || len(isolated[delivered]) != 1 {
+		return errors.New("API request-log profile requires the verified delivery leaf")
+	}
+	return nil
+}
+
+func verifyAPIBinaryParamLookupInventory(isolated inventory) error {
+	const root = benchlayout.APIBinaryParamLookupBenchmark
+	strideAndLookup := benchmarkCaseProduct([]string{"stride=1", "stride=1001", "stride=65537"}, []string{"direct=false", "direct=true"})
+	leaves := benchmarkCaseProduct([]string{"n=1", "n=16"}, strideAndLookup)
+	if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+		return errors.New("API binary parameter lookup profile requires the twelve verified lookup leaves")
 	}
 	return nil
 }

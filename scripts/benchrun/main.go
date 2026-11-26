@@ -110,16 +110,28 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return codecReaderOverlay(root)
 	case benchlayout.RPCOwnedRequestProfile:
 		return packageTestOverlay(root, packagePath, "bench-rpc-owned-request-*", writeRPCOwnedRequestOverlay)
+	case benchlayout.RPCDeadlineProfile:
+		return packageTestOverlay(root, packagePath, "bench-rpc-deadline-*", writeRPCDeadlineOverlay)
+	case benchlayout.RPCNilContextGuardProfile:
+		return packageTestOverlay(root, packagePath, "bench-rpc-nil-context-guard-*", writeRPCNilContextGuardOverlay)
 	case benchlayout.APINonIdentityProfile:
 		return packageTestOverlay(root, packagePath, "bench-api-non-identity-*", writeAPIBenchmarkOverlay)
 	case benchlayout.APILocalRouteExportProfile:
 		return packageTestOverlay(root, packagePath, "bench-api-local-route-export-*", writeAPILocalRouteExportOverlay)
 	case benchlayout.APICanonicalJSONProfile:
 		return packageTestOverlay(root, packagePath, "bench-api-canonical-json-*", writeAPICanonicalJSONOverlay)
+	case benchlayout.APIBinaryParamLookupProfile:
+		return packageTestOverlay(root, packagePath, "bench-api-binary-param-lookup-*", writeAPIBinaryParamLookupOverlay)
+	case benchlayout.APIRequestLogProfile:
+		return packageTestOverlay(root, packagePath, "bench-api-request-log-*", func(pkg, workspace string) (string, error) {
+			return writeAPIRequestLogOverlay(pkg, workspace, apiRequestLogProjectionSHA, apiRequestLogSourceSHA)
+		})
 	case benchlayout.LuviaPrimaryTraceProfile:
 		return packageTestOverlay(root, packagePath, "bench-luvia-primary-trace-*", writeLuviaBenchmarkOverlay)
 	case benchlayout.LuviaGatewayIdentityProfile:
 		return packageTestOverlay(root, packagePath, "bench-luvia-gateway-identity-*", writeLuviaGatewayIdentityOverlay)
+	case benchlayout.LuviaAuthMiddlewareProfile:
+		return packageTestOverlay(root, packagePath, "bench-luvia-auth-middleware-*", writeLuviaAuthMiddlewareOverlay)
 	case benchlayout.LuviaMergeDestinationProfile:
 		return packageTestOverlay(root, packagePath, "bench-luvia-merge-destination-*", writeLuviaMergeDestinationOverlay)
 	case benchlayout.LuviaResolvedFieldsProfile:

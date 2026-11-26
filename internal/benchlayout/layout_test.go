@@ -104,6 +104,66 @@ func TestRPCOwnedRequestProfileRequiresPackageAndExactRoot(t *testing.T) {
 	}
 }
 
+func TestRPCDeadlineProfileRequiresPackageAndExactRoot(t *testing.T) {
+	const root = "BenchmarkRPCDeadlineClassification"
+	const profile = "rpc-deadline-classification"
+	for _, tc := range []struct{ pkg, name, want string }{
+		{RPCPackage, root, profile},
+		{RPCPackage, root + "/ExpiredEOF/After-2", profile},
+		{RPCPackage, root + "Sibling", DefaultProfile},
+		{RPCPackage, "BenchmarkRPC_Ping", DefaultProfile},
+		{RPCPackage, "BenchmarkLRPCOwnedRequest", RPCOwnedRequestProfile},
+		{LuviaPackage, root, DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	if ValidPerformanceProfile(LuviaPackage, profile) {
+		t.Fatal("accepted the RPC deadline profile outside its package")
+	}
+}
+
+func TestRPCNilContextGuardProfileRequiresPackageAndExactRoot(t *testing.T) {
+	const root = "BenchmarkRPCNilContextGuard"
+	const profile = "rpc-nil-context-guard"
+	for _, tc := range []struct{ pkg, name, want string }{
+		{RPCPackage, root, profile},
+		{RPCPackage, root + "/Rejected/After-2", profile},
+		{RPCPackage, root + "Sibling", DefaultProfile},
+		{RPCPackage, "BenchmarkRPCAuthenticationErrorRecovery/Long/After-2", DefaultProfile},
+		{RPCPackage, "BenchmarkRPCDeadlineClassification", RPCDeadlineProfile},
+		{LuviaPackage, root, DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	if ValidPerformanceProfile(LuviaPackage, profile) {
+		t.Fatal("accepted the RPC nil-context profile outside its package")
+	}
+}
+
+func TestLuviaAuthProfileRequiresPackageAndExactRoot(t *testing.T) {
+	const root = "BenchmarkAuthMiddlewareIsolation"
+	const profile = "luvia-auth-middleware"
+	for _, tc := range []struct{ pkg, name, want string }{
+		{LuviaPackage, root, profile},
+		{LuviaPackage, root + "/inherited-other-key/after-2", profile},
+		{LuviaPackage, root + "Sibling", DefaultProfile},
+		{LuviaPackage, "BenchmarkGatewayStandardStartStop", DefaultProfile},
+		{LuviaPackage, "BenchmarkGatewayIdentity", LuviaGatewayIdentityProfile},
+		{RPCPackage, root, DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	if ValidPerformanceProfile(RPCPackage, profile) {
+		t.Fatal("accepted the Luvia auth profile outside its package")
+	}
+}
+
 func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 	for _, tc := range []struct{ pkg, name, want string }{
 		{APIPackage, "BenchmarkIdentityConditionValidity/member/EnumChecked-2", DefaultProfile},
@@ -118,6 +178,15 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{APIPackage, "BenchmarkCanonicalJSONTyped/boolean/1-2", "api-canonical-json"},
 		{APIPackage, "BenchmarkCanonicalJSONValue/object/after-2", "api-canonical-json"},
 		{APIPackage, "BenchmarkCanonicalJSONSibling", APINonIdentityProfile},
+		{APIPackage, "BenchmarkBinaryParamLookup", "api-binary-param-lookup"},
+		{APIPackage, "BenchmarkBinaryParamLookup/n=16/stride=65537/direct=false-2", "api-binary-param-lookup"},
+		{APIPackage, "BenchmarkBinaryParamLookupSibling", APINonIdentityProfile},
+		{RPCPackage, "BenchmarkBinaryParamLookup", DefaultProfile},
+		{APIPackage, "BenchmarkRequestLogBoundary/full-2", APIRequestLogProfile},
+		{APIPackage, "BenchmarkRequestLogDelivered-2", APIRequestLogProfile},
+		{APIPackage, "BenchmarkHTTPCompletionSampling", APINonIdentityProfile},
+		{APIPackage, "BenchmarkRequestLogDeliveredSibling", APINonIdentityProfile},
+		{RPCPackage, "BenchmarkRequestLogDelivered", DefaultProfile},
 		{LuviaPackage, "BenchmarkPrimaryKeys/row-small/keyLast=false/baseline=true-2", LuviaPrimaryTraceProfile},
 		{LuviaPackage, "BenchmarkTraceEncodingComparison", LuviaPrimaryTraceProfile},
 		{LuviaPackage, "BenchmarkGatewayIdentity", LuviaGatewayIdentityProfile},
@@ -161,17 +230,27 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		}
 	}
 	apiProfiles := IsolationProfiles(APIPackage)
-	if len(apiProfiles) != 3 || apiProfiles[0] != (IsolationSpec{APINonIdentityProfile, "."}) ||
-		apiProfiles[1] != (IsolationSpec{"api-local-route-export", "^BenchmarkLocalRouteExport$"}) ||
-		apiProfiles[2] != (IsolationSpec{"api-canonical-json", "^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$"}) {
+	wantAPI := []IsolationSpec{
+		{APINonIdentityProfile, "."},
+		{APILocalRouteExportProfile, "^BenchmarkLocalRouteExport$"},
+		{APICanonicalJSONProfile, "^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$"},
+		{APIBinaryParamLookupProfile, "^BenchmarkBinaryParamLookup$"},
+		{APIRequestLogProfile, "^BenchmarkRequestLogBoundary$|^BenchmarkRequestLogDelivered$"},
+	}
+	if !reflect.DeepEqual(apiProfiles, wantAPI) || ValidPerformanceProfile(RPCPackage, APIBinaryParamLookupProfile) ||
+		ValidPerformanceProfile(RPCPackage, APIRequestLogProfile) {
 		t.Fatalf("unexpected API profiles: %v", apiProfiles)
 	}
 	profiles := IsolationProfiles(LuviaPackage)
-	if len(profiles) != 5 || profiles[0] != (IsolationSpec{LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"}) ||
-		profiles[1] != (IsolationSpec{LuviaGatewayIdentityProfile, "^BenchmarkGatewayIdentity$"}) ||
-		profiles[2] != (IsolationSpec{"luvia-merge-destination", "^BenchmarkMergeDestination$"}) ||
-		profiles[3] != (IsolationSpec{"luvia-resolved-fields", "^BenchmarkValidateResolvedFields$"}) ||
-		profiles[4] != (IsolationSpec{"luvia-convenience-keys", "^BenchmarkConvenienceKeyParentValidation$"}) ||
+	wantLuviaProfiles := []IsolationSpec{
+		{LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"},
+		{LuviaGatewayIdentityProfile, "^BenchmarkGatewayIdentity$"},
+		{LuviaAuthMiddlewareProfile, "^BenchmarkAuthMiddlewareIsolation$"},
+		{"luvia-merge-destination", "^BenchmarkMergeDestination$"},
+		{"luvia-resolved-fields", "^BenchmarkValidateResolvedFields$"},
+		{"luvia-convenience-keys", "^BenchmarkConvenienceKeyParentValidation$"},
+	}
+	if !reflect.DeepEqual(profiles, wantLuviaProfiles) ||
 		ValidPerformanceProfile(CodegenPackage, "luvia-convenience-keys") ||
 		ValidPerformanceProfile(CodegenPackage, "luvia-resolved-fields") ||
 		ValidPerformanceProfile(CodegenPackage, LuviaGatewayIdentityProfile) ||

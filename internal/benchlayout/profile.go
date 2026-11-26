@@ -15,16 +15,22 @@ const (
 	APINonIdentityProfile         = "api-non-identity"
 	LuviaPrimaryTraceProfile      = "luvia-primary-trace"
 	LuviaGatewayIdentityProfile   = "luvia-gateway-identity"
+	LuviaAuthMiddlewareProfile    = "luvia-auth-middleware"
 	CodegenLiteralProfile         = "codegen-integer-literals"
 	CodegenReceiverProfile        = "codegen-global-receiver"
 	CodecPackage                  = "pkg/lux/codec"
 	RPCPackage                    = "pkg/lux/rpc"
 	RPCOwnedRequestProfile        = "rpc-owned-request"
 	RPCOwnedRequestBenchmark      = "BenchmarkLRPCOwnedRequest"
+	RPCDeadlineProfile            = "rpc-deadline-classification"
+	RPCDeadlineBenchmark          = "BenchmarkRPCDeadlineClassification"
+	RPCNilContextGuardProfile     = "rpc-nil-context-guard"
+	RPCNilContextGuardBenchmark   = "BenchmarkRPCNilContextGuard"
 	CodecReaderBenchmark          = "BenchmarkElementPayload"
 	APIPackage                    = "pkg/lux/api"
 	LuviaPackage                  = "pkg/lux/luvia"
 	LuviaGatewayIdentityBenchmark = "BenchmarkGatewayIdentity"
+	LuviaAuthMiddlewareBenchmark  = "BenchmarkAuthMiddlewareIsolation"
 	CodegenPackage                = "pkg/codegen"
 	CodegenLiteralBenchmark       = "BenchmarkCompileDecimalIntegerLiterals"
 	CodegenReceiverBenchmark      = "BenchmarkGlobalReceiverName"
@@ -32,9 +38,14 @@ const (
 	CodegenMigrationStateProfile   = "codegen-migration-state"
 	CodegenMigrationStateBenchmark = "BenchmarkMigrationStateValidation"
 
-	APILocalRouteExportProfile   = "api-local-route-export"
-	APILocalRouteExportBenchmark = "BenchmarkLocalRouteExport"
-	APICanonicalJSONProfile      = "api-canonical-json"
+	APILocalRouteExportProfile      = "api-local-route-export"
+	APILocalRouteExportBenchmark    = "BenchmarkLocalRouteExport"
+	APICanonicalJSONProfile         = "api-canonical-json"
+	APIBinaryParamLookupProfile     = "api-binary-param-lookup"
+	APIBinaryParamLookupBenchmark   = "BenchmarkBinaryParamLookup"
+	APIRequestLogProfile            = "api-request-log"
+	APIRequestLogBoundaryBenchmark  = "BenchmarkRequestLogBoundary"
+	APIRequestLogDeliveredBenchmark = "BenchmarkRequestLogDelivered"
 
 	LuviaMergeDestinationProfile   = "luvia-merge-destination"
 	LuviaMergeDestinationBenchmark = "BenchmarkMergeDestination"
@@ -69,23 +80,22 @@ func ProfileForBenchmark(pkg, name string) string {
 			return CodecReaderProfile
 		}
 	case RPCPackage:
-		if root == RPCOwnedRequestBenchmark {
+		switch root {
+		case RPCOwnedRequestBenchmark:
 			return RPCOwnedRequestProfile
+		case RPCDeadlineBenchmark:
+			return RPCDeadlineProfile
+		case RPCNilContextGuardBenchmark:
+			return RPCNilContextGuardProfile
 		}
 	case APIPackage:
-		if root == APILocalRouteExportBenchmark {
-			return APILocalRouteExportProfile
-		}
-		if family, ok := strings.CutPrefix(root, apiCanonicalJSONPrefix); ok && slices.Contains(apiCanonicalJSONFamilies, family) {
-			return APICanonicalJSONProfile
-		}
-		if !slices.Contains(apiIdentityRoots, root) {
-			return APINonIdentityProfile
-		}
+		return apiBenchmarkProfile(root)
 	case LuviaPackage:
 		switch root {
 		case LuviaGatewayIdentityBenchmark:
 			return LuviaGatewayIdentityProfile
+		case LuviaAuthMiddlewareBenchmark:
+			return LuviaAuthMiddlewareProfile
 		case LuviaMergeDestinationBenchmark:
 			return LuviaMergeDestinationProfile
 		case LuviaResolvedFieldsBenchmark:
@@ -109,6 +119,25 @@ func ProfileForBenchmark(pkg, name string) string {
 	return DefaultProfile
 }
 
+func apiBenchmarkProfile(root string) string {
+	if root == APIRequestLogBoundaryBenchmark || root == APIRequestLogDeliveredBenchmark {
+		return APIRequestLogProfile
+	}
+	if root == APIBinaryParamLookupBenchmark {
+		return APIBinaryParamLookupProfile
+	}
+	if root == APILocalRouteExportBenchmark {
+		return APILocalRouteExportProfile
+	}
+	if family, ok := strings.CutPrefix(root, apiCanonicalJSONPrefix); ok && slices.Contains(apiCanonicalJSONFamilies, family) {
+		return APICanonicalJSONProfile
+	}
+	if !slices.Contains(apiIdentityRoots, root) {
+		return APINonIdentityProfile
+	}
+	return DefaultProfile
+}
+
 // IsolationSpec pairs a benchmark compilation profile with its discovery filter.
 type IsolationSpec struct {
 	Name, Filter string
@@ -122,17 +151,24 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 	case CodecPackage:
 		return []IsolationSpec{{CodecReaderProfile, "."}}
 	case RPCPackage:
-		return []IsolationSpec{{RPCOwnedRequestProfile, "^" + RPCOwnedRequestBenchmark + "$"}}
+		return []IsolationSpec{
+			{RPCOwnedRequestProfile, "^" + RPCOwnedRequestBenchmark + "$"},
+			{RPCDeadlineProfile, "^" + RPCDeadlineBenchmark + "$"},
+			{RPCNilContextGuardProfile, "^" + RPCNilContextGuardBenchmark + "$"},
+		}
 	case APIPackage:
 		return []IsolationSpec{
 			{APINonIdentityProfile, "."},
 			{APILocalRouteExportProfile, "^" + APILocalRouteExportBenchmark + "$"},
 			{APICanonicalJSONProfile, "^" + apiCanonicalJSONPrefix + "(" + strings.Join(apiCanonicalJSONFamilies, "|") + ")$"},
+			{APIBinaryParamLookupProfile, "^" + APIBinaryParamLookupBenchmark + "$"},
+			{APIRequestLogProfile, "^" + APIRequestLogBoundaryBenchmark + "$|^" + APIRequestLogDeliveredBenchmark + "$"},
 		}
 	case LuviaPackage:
 		return []IsolationSpec{
 			{LuviaPrimaryTraceProfile, "^" + strings.Join(luviaIsolatedRoots, "$|^") + "$"},
 			{LuviaGatewayIdentityProfile, "^" + LuviaGatewayIdentityBenchmark + "$"},
+			{LuviaAuthMiddlewareProfile, "^" + LuviaAuthMiddlewareBenchmark + "$"},
 			{LuviaMergeDestinationProfile, "^" + LuviaMergeDestinationBenchmark + "$"},
 			{LuviaResolvedFieldsProfile, "^" + LuviaResolvedFieldsBenchmark + "$"},
 			{LuviaConvenienceKeysProfile, "^" + LuviaConvenienceKeysBenchmark + "$"},

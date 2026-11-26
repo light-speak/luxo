@@ -214,6 +214,44 @@ func TestAPICanonicalJSONProfileKeepsAllMeasuredLeaves(t *testing.T) {
 	}
 }
 
+func TestAPIBinaryParamLookupProfileKeepsExactLeaves(t *testing.T) {
+	const root = "BenchmarkBinaryParamLookup/"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	const other = "BenchmarkHandlerPanicFormatting/Success/After" + measurement
+	var samples strings.Builder
+	for _, width := range []string{"n=1", "n=16"} {
+		for _, stride := range []string{"stride=1", "stride=1001", "stride=65537"} {
+			for _, direct := range []string{"direct=false", "direct=true"} {
+				samples.WriteString(root + width + "/" + stride + "/" + direct + measurement)
+			}
+		}
+	}
+	full := samples.String()
+	partial := strings.Replace(full, root+"n=16/stride=65537/direct=false"+measurement, "", 1)
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	for _, tc := range []struct {
+		name, profile, ordinary, isolated string
+		valid                             bool
+	}{
+		{"exact isolated fixture", "api-binary-param-lookup", full + other, full, true},
+		{"same missing leaf in both binaries", "api-binary-param-lookup", partial + other, partial, false},
+		{"unrelated leaf in isolated profile", "api-binary-param-lookup", full + other, full + other, false},
+		{"discovery keeps both families", "api-non-identity", full + other, full + other, true},
+		{"discovery loses lookup leaf", "api-non-identity", full + other, partial + other, false},
+		{"discovery loses handler leaf", "api-non-identity", full + other, full, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			args := []string{"--verify-profile-inventory", "pkg/lux/api", tc.profile, ordinary, isolated}
+			if err := run(args, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+}
+
 const (
 	mergeDestinationPackage = "pkg/lux/luvia"
 	mergeDestinationProfile = "luvia-merge-destination"
@@ -294,6 +332,53 @@ func TestRPCOwnedRequestProfileKeepsExactlyEightLeaves(t *testing.T) {
 func TestRPCOwnedRequestPrimaryAndConfirmationStayExclusive(t *testing.T) {
 	verifyExactProfileRouting(t, rpcPackage, rpcOwnedControl, rpcOwnedProfile, rpcOwnedRoot,
 		"4096/owned", "^4096$/^owned$")
+}
+
+const (
+	rpcDeadlineProfile = "rpc-deadline-classification"
+	rpcDeadlineRoot    = "BenchmarkRPCDeadlineClassification"
+)
+
+func TestRPCDeadlineProfileKeepsExactlyTwelveLeaves(t *testing.T) {
+	rows := []string{"NoDeadline/Before", "NoDeadline/After", "Cancelled/Before", "Cancelled/After",
+		"ExpiredEOF/Before", "ExpiredEOF/After", "FutureTimeout/Before", "FutureTimeout/After",
+		"ExpiredTimeout/Before", "ExpiredTimeout/After", "WrappedTimeout/Before", "WrappedTimeout/After"}
+	verifyExactProfileInventory(t, rpcPackage, rpcOwnedControl, rpcDeadlineProfile, rpcDeadlineRoot, rows, "ExpiredEOF/Alias")
+}
+
+func TestRPCDeadlinePrimaryAndConfirmationStayExclusive(t *testing.T) {
+	verifyExactProfileRouting(t, rpcPackage, rpcOwnedControl, rpcDeadlineProfile, rpcDeadlineRoot,
+		"ExpiredEOF/After", "^ExpiredEOF$/^After$")
+}
+
+func TestRPCNilContextGuardProfileKeepsExactlyTwelveLeaves(t *testing.T) {
+	rows := []string{"NoToken/Before", "NoToken/GuardOnly", "NoToken/After", "Verified/Before", "Verified/GuardOnly", "Verified/After",
+		"Rejected/Before", "Rejected/GuardOnly", "Rejected/After", "Unconfigured/Before", "Unconfigured/GuardOnly", "Unconfigured/After"}
+	verifyExactProfileInventory(t, rpcPackage, "BenchmarkRPCAuthenticationErrorRecovery", "rpc-nil-context-guard",
+		"BenchmarkRPCNilContextGuard", rows, "Rejected/Alias")
+}
+
+func TestRPCNilContextGuardPrimaryAndConfirmationStayExclusive(t *testing.T) {
+	verifyExactProfileRouting(t, rpcPackage, "BenchmarkRPCAuthenticationErrorRecovery", "rpc-nil-context-guard",
+		"BenchmarkRPCNilContextGuard", "Rejected/After", "^Rejected$/^After$")
+}
+
+const (
+	luviaAuthProfile = "luvia-auth-middleware"
+	luviaAuthRoot    = "BenchmarkAuthMiddlewareIsolation"
+)
+
+func TestLuviaAuthProfileKeepsExactlyTenLeaves(t *testing.T) {
+	rows := []string{"valid/before", "valid/after", "anonymous/before", "anonymous/after",
+		"invalid/before", "invalid/after", "inherited-missing/before", "inherited-missing/after",
+		"inherited-other-key/before", "inherited-other-key/after"}
+	verifyExactProfileInventory(t, mergeDestinationPackage, mergeDestinationControl, luviaAuthProfile, luviaAuthRoot,
+		rows, "inherited-other-key/alternate")
+}
+
+func TestLuviaAuthPrimaryAndConfirmationStayExclusive(t *testing.T) {
+	verifyExactProfileRouting(t, mergeDestinationPackage, mergeDestinationControl, luviaAuthProfile, luviaAuthRoot,
+		"inherited-other-key/after", "^inherited-other-key$/^after$")
 }
 
 func verifyExactProfileInventory(t *testing.T, pkg, controlRoot, profile, benchmark string, rows []string, extraLeaf string) {
@@ -632,5 +717,77 @@ func TestLuxShortPathPreservesAllNativeLeaves(t *testing.T) {
 		if !strings.Contains(confirmation, route) {
 			t.Fatalf("Lux confirmation did not preserve route %q in:\n%s", route, confirmation)
 		}
+	}
+}
+
+func TestAPIRequestLogProfileKeepsExactLeaves(t *testing.T) {
+	const profile = "api-request-log"
+	const pkg = "pkg/lux/api"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	const other = "BenchmarkHTTPCompletionSampling/disabled" + measurement
+	const delivered = "BenchmarkRequestLogDelivered" + measurement
+	var samples strings.Builder
+	for _, name := range []string{"disabled", "full", "synchronous", "unsampled"} {
+		samples.WriteString("BenchmarkRequestLogBoundary/" + name + measurement)
+	}
+	partial := samples.String()
+	full := partial + delivered
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	for _, tc := range []struct {
+		name, profile, ordinary, isolated string
+		valid                             bool
+	}{
+		{"complete", profile, full + other, full, true},
+		{"same missing delivered", profile, partial + other, partial, false},
+		{"same missing boundary", profile, delivered + other, delivered, false},
+		{"includes completion sampling", profile, full + other, full + other, false},
+		{"ordinary profile retains all", "api-non-identity", full + other, full + other, true},
+		{"ordinary profile loses delivered", "api-non-identity", full + other, partial + other, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFixture(t, ordinary, tc.ordinary+"PASS\n")
+			writeFixture(t, isolated, tc.isolated+"PASS\n")
+			args := []string{"--verify-profile-inventory", pkg, tc.profile, ordinary, isolated}
+			if err := run(args, io.Discard); (err == nil) != tc.valid {
+				t.Fatalf("inventory valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+}
+
+func TestAPIRequestLogPrimaryAndConfirmationProfiles(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	const boundary = "BenchmarkRequestLogBoundary"
+	const delivered = "BenchmarkRequestLogDelivered"
+	const other = "BenchmarkHTTPCompletionSampling"
+	groups := []benchGroup{{Package: pkg, Name: boundary}, {Package: pkg, Name: delivered}, {Package: pkg, Name: other}}
+	keys := []sampleKey{{pkg, boundary + "/full-2"}, {pkg, delivered + "-2"}, {pkg, other + "/disabled-2"}}
+	body, err := json.Marshal(expectedSamples{Base: keys, Head: keys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := benchmarkTempDir(t)
+	expected, batch := dir+"/expected.json", dir+"/batch.tsv"
+	writeFixture(t, expected, string(body))
+	for _, tc := range []struct{ phase, batch string }{
+		{"primary", formatShard(benchShard{Groups: groups})},
+		{"confirmation", formatConfirmationBatch(keys)},
+	} {
+		t.Run(tc.phase, func(t *testing.T) {
+			if strings.Count(tc.batch, "\tapi-request-log\t") != 1 ||
+				!strings.Contains(tc.batch, "\tapi-non-identity\t") {
+				t.Fatalf("wrong profile routing:\n%s", tc.batch)
+			}
+			args := []string{"--verify-profile-batch", tc.phase, expected, batch}
+			writeFixture(t, batch, tc.batch)
+			if err := run(args, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			writeFixture(t, batch, strings.Replace(tc.batch, "\tapi-request-log\t", "\tapi-non-identity\t", 1))
+			if err := run(args, io.Discard); err == nil {
+				t.Fatal("accepted request-log leaves in the stock profile")
+			}
+		})
 	}
 }
