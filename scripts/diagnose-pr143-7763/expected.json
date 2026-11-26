@@ -1,0 +1,38 @@
+{
+  "Base": [
+    {
+      "Package": "pkg/lux/queue",
+      "Name": "BenchmarkQueueStreamName/tasks/after-2"
+    },
+    {
+      "Package": "pkg/lux/queue",
+      "Name": "BenchmarkQueueStreamName/tasks/before-2"
+    },
+    {
+      "Package": "pkg/lux/rpc",
+      "Name": "BenchmarkLRPCPreparedFrame/0/after-2"
+    },
+    {
+      "Package": "pkg/lux/rpc",
+      "Name": "BenchmarkLRPCPreparedFrame/0/before-2"
+    }
+  ],
+  "Head": [
+    {
+      "Package": "pkg/lux/queue",
+      "Name": "BenchmarkQueueStreamName/tasks/after-2"
+    },
+    {
+      "Package": "pkg/lux/queue",
+      "Name": "BenchmarkQueueStreamName/tasks/before-2"
+    },
+    {
+      "Package": "pkg/lux/rpc",
+      "Name": "BenchmarkLRPCPreparedFrame/0/after-2"
+    },
+    {
+      "Package": "pkg/lux/rpc",
+      "Name": "BenchmarkLRPCPreparedFrame/0/before-2"
+    }
+  ]
+}

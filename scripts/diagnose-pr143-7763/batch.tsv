@@ -1,0 +1,2 @@
+pkg/lux/queue	default	^BenchmarkQueueStreamName$/^tasks$/^after$|^BenchmarkQueueStreamName$/^tasks$/^before$
+pkg/lux/rpc	default	^BenchmarkLRPCPreparedFrame$/^0$/^after$|^BenchmarkLRPCPreparedFrame$/^0$/^before$
