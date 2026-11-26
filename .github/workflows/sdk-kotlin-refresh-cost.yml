@@ -16,9 +16,33 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 55
     steps:
+      - name: Match the original measured CPU
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+          LC_ALL: C.UTF-8
+          TZ: UTC
+        run: |
+          set -euo pipefail
+          evidence="$GITHUB_WORKSPACE/.tmp/kotlin-refresh-evidence"
+          mkdir -p "$evidence"
+          test "$RUNNER_KIND" = github-hosted
+          test "$RUNNER_ARCH" = X64
+          test "$(uname -sm)" = 'Linux x86_64'
+          grep -Fx 'VERSION_ID="24.04"' /etc/os-release
+          lscpu=$(lscpu)
+          model=$(sed -n 's/^Model name:[[:space:]]*//p' <<< "$lscpu")
+          { uname -a; cat /etc/os-release; printf '%s\n' "$lscpu"; } > "$evidence/runner.txt"
+          if [[ "$model" != 'INTEL(R) XEON(R) PLATINUM 8573C' ]]; then
+            printf 'status=cpu_mismatch\n' >> "$evidence/runner.txt"
+            exit 3
+          fi
+          printf 'status=cpu_match\n' >> "$evidence/runner.txt"
+
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 3
+          ref: ${{ github.sha }}
+          path: control
+          fetch-depth: 4
           persist-credentials: false
 
       - uses: actions/setup-java@v6
@@ -31,35 +55,42 @@ jobs:
       - name: Build exact arms and measure on the same runner
         timeout-minutes: 47
         env:
-          RUNNER_KIND: ${{ runner.environment }}
           LC_ALL: C.UTF-8
           TZ: UTC
         run: |
           set -euo pipefail
-          test "$RUNNER_KIND" = github-hosted
-          test "$RUNNER_ARCH" = X64
-          test "$(uname -sm)" = 'Linux x86_64'
-          grep -Fx 'VERSION_ID="24.04"' /etc/os-release
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(git show -s --format=%P HEAD)" = 0f6bd9e4ffa650b6b6df4c6eab72b24f0f97c142
-          test "$(git rev-parse HEAD~2)" = 77b6cdf20d424213f4c1dc90534f924ac6b176d0
+          repo="$GITHUB_WORKSPACE/control"
+          parent=c41e04941b85ac4b27612524203d61bc0441fe9b
+          base=0a6b143ad667c84f0e517b9ef0a9e9d5bd6ec367
+          fixture=.github/diagnostics/sdk-kotlin-refresh
+          test "$(git -C "$repo" rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C "$repo" show -s --format=%P HEAD)" = "$parent"
+          test "$(git -C "$repo" rev-parse HEAD~3)" = 77b6cdf20d424213f4c1dc90534f924ac6b176d0
+          diff -u <(printf '%s\n' "$fixture/prepare.sh" "$fixture/transport.patch.b64" .github/workflows/sdk-kotlin-refresh-cost.yml) \
+            <(git -C "$repo" diff --name-only "$parent" HEAD)
+          git -C "$repo" fetch --no-tags --depth=1 origin "$base"
+          test "$(git -C "$repo" rev-parse FETCH_HEAD)" = "$base"
           unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS
-          export QUALIFICATION_REPO="$GITHUB_WORKSPACE"
+          export QUALIFICATION_REPO="$repo"
           evidence="$GITHUB_WORKSPACE/.tmp/kotlin-refresh-evidence"
-          mkdir -p "$evidence"
-          cp .github/diagnostics/sdk-kotlin-refresh/* "$evidence/"
+          cp "$repo/$fixture/"* "$evidence/"
           build=$(mktemp -d "$evidence/run.XXXXXXXX")
           cleanup() {
             [[ -d "$build" && ! -L "$build" && "$build" == "$evidence"/run.* ]] || return 99
+            for receipt in product-binding.txt build-metadata.txt; do
+              if [[ -f "$build/$receipt" ]]; then cp -- "$build/$receipt" "$evidence/"; fi
+            done
             rm -rf -- "$build"
           }
           trap cleanup EXIT
           trap 'exit 130' INT
           trap 'exit 143' TERM
           cpus=$(python3 -B -c 'import os; cpus = sorted(os.sched_getaffinity(0)); assert len(cpus) >= 2; print(",".join(map(str, cpus[:2])))')
-          { uname -a; cat /etc/os-release; lscpu; printf 'sample_cpuset=%s\n' "$cpus"; } > "$evidence/runner.txt"
+          {
+            printf 'sample_cpuset=%s\ndiagnostic_commit=%s\ndiagnostic_parent=%s\n' "$cpus" "$GITHUB_SHA" "$parent"
+            printf 'run_id=%s\nrun_attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          } >> "$evidence/runner.txt"
           bash "$evidence/prepare.sh" "$build"
-          cp "$build/build-metadata.txt" "$evidence/build-metadata.txt"
           taskset -c "$cpus" python3 -B "$evidence/qualify.py" smoke --build-dir "$build" --out "$evidence/smoke.json"
           taskset -c "$cpus" python3 -B "$evidence/qualify.py" measure --build-dir "$build" --out "$evidence/formal"
 
@@ -69,6 +100,7 @@ jobs:
           name: kotlin-http-refresh-linux-x64-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             .tmp/kotlin-refresh-evidence/runner.txt
+            .tmp/kotlin-refresh-evidence/product-binding.txt
             .tmp/kotlin-refresh-evidence/build-metadata.txt
             .tmp/kotlin-refresh-evidence/*.gradle.log
             .tmp/kotlin-refresh-evidence/smoke.json
