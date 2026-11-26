@@ -1,0 +1,104 @@
+{
+  "originalShards": {
+    "BenchmarkHandlerPanicFormatting/Success/After-2": "06",
+    "BenchmarkIdentityConditionValidity/empty/EnumReference-2": "06",
+    "BenchmarkIdentityConditionValidity/empty/TextChecked-2": "06",
+    "BenchmarkIdentityConditionValidity/empty/TextReference-2": "06",
+    "BenchmarkIdentityConditionValidity/member/EnumReference-2": "06",
+    "BenchmarkIdentityConditionValidity/member/TextChecked-2": "06",
+    "BenchmarkIdentityConditionValidity/member/TextReference-2": "06",
+    "BenchmarkIdentityConditionValidity/missing/EnumReference-2": "06",
+    "BenchmarkIdentityConditionValidity/missing/TextChecked-2": "06",
+    "BenchmarkIdentityConditionValidity/missing/TextReference-2": "06",
+    "BenchmarkIdentityConditionValidity/wrong-kind/EnumReference-2": "06",
+    "BenchmarkIdentityConditionValidity/wrong-kind/TextChecked-2": "06",
+    "BenchmarkIdentityConditionValidity/wrong-kind/TextReference-2": "06",
+    "BenchmarkWSConnectionRegistrations/size=64/former-2": "04"
+  },
+  "profiles": {
+    "api-non-identity": [
+      "BenchmarkHandlerPanicFormatting/Success/After-2",
+      "BenchmarkWSConnectionRegistrations/size=64/former-2"
+    ],
+    "default": [
+      "BenchmarkIdentityConditionValidity/empty/EnumReference-2",
+      "BenchmarkIdentityConditionValidity/empty/TextChecked-2",
+      "BenchmarkIdentityConditionValidity/empty/TextReference-2",
+      "BenchmarkIdentityConditionValidity/member/EnumReference-2",
+      "BenchmarkIdentityConditionValidity/member/TextChecked-2",
+      "BenchmarkIdentityConditionValidity/member/TextReference-2",
+      "BenchmarkIdentityConditionValidity/missing/EnumReference-2",
+      "BenchmarkIdentityConditionValidity/missing/TextChecked-2",
+      "BenchmarkIdentityConditionValidity/missing/TextReference-2",
+      "BenchmarkIdentityConditionValidity/wrong-kind/EnumReference-2",
+      "BenchmarkIdentityConditionValidity/wrong-kind/TextChecked-2",
+      "BenchmarkIdentityConditionValidity/wrong-kind/TextReference-2"
+    ]
+  },
+  "revisions": {
+    "83": {
+      "base": "5017b587f4cf71d30ebba8b542267aed597bb573",
+      "baseTree": "f4b13c19316c9fd4cbb0be56d9ba31eab3f98e7f",
+      "compileProfileSHA256": "2def07c8d8706eaa0de3bb81da4635c4b4264ad67fc98e2fcdf40a06a63d9e18",
+      "evidence": {
+        "04": {
+          "artifact": 15147229243,
+          "job": 140115285222,
+          "sha256": "cc5706e961ff1e72bf2cc4f04a0604fb6103237d463df102983b18641953d47d"
+        },
+        "06": {
+          "artifact": 15148746667,
+          "job": 140115285308,
+          "sha256": "38293b16ba6086f249fda9105f863e8fb5d10c83ac002bc06eb82af6c5c90840"
+        },
+        "plan": {
+          "artifact": 15146132760,
+          "sha256": "05b71d9ebb9f798a5ffe278656c920f292bb195ee465779c655d274f8523660d"
+        }
+      },
+      "head": "a6cca9106891c4207a90358642242b47590a5703",
+      "headTree": "8c1d0daea52868c5ed8e7108de4b03b7b5f61069",
+      "productPaths": [
+        "pkg/lux/api/request_log_async.go",
+        "pkg/lux/api/request_log_async_test.go"
+      ],
+      "run": 45879226514
+    },
+    "84": {
+      "base": "59a4167f129f0bff0e8425125fa02eae87fd347b",
+      "baseTree": "c96b8db43227f6ed447d10b0b32deb39284c7f28",
+      "compileProfileSHA256": "ca6d61fffd64abebbfceb442bb80e0e4247d7ddbbd51a33ee2b35fe2c0ce8126",
+      "evidence": {
+        "04": {
+          "artifact": 15143648494,
+          "job": 140081490870,
+          "sha256": "fef34795b8269535a7083aaaece1e742ef1ddd85acfffdc1897ca1d723a2501b"
+        },
+        "06": {
+          "artifact": 15142709910,
+          "job": 140081490818,
+          "sha256": "f2440618daac107b1a0631210e42b94bc21162ce0a711adc76364c8133603533"
+        },
+        "plan": {
+          "artifact": 15142216574,
+          "sha256": "71e5d7d5259b59e5716e046da8aef029a8d5b6b231e18b74ba2b5de8a53ae1b2"
+        }
+      },
+      "head": "79ad754c69deb94196d8d9dc4accefee4ebd58c2",
+      "headTree": "f7639e530bd00d0f4be4637f9b576954614c59b3",
+      "productPaths": [
+        "pkg/lux/api/trace.go",
+        "pkg/lux/api/trace_encoding_test.go"
+      ],
+      "run": 45868955532
+    }
+  },
+  "runner": {
+    "cgo": "1",
+    "cores": 4,
+    "go": "1.27.1",
+    "goamd64": "v1",
+    "model": "Intel(R) Xeon(R) 6975P-C",
+    "ubuntu": "24.04"
+  }
+}

@@ -1,0 +1,71 @@
+name: Attribute the shared PR 83 and 84 Intel performance signal
+
+on:
+  push:
+    branches: [diagnostics/pr83-pr84-intel]
+    paths:
+      - '.github/workflows/diagnose-pr83-pr84-intel.yml'
+      - 'scripts/diagnose-pr83-pr84-intel/**'
+
+permissions:
+  contents: read
+
+jobs:
+  intel:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr83-pr84-intel'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 38
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Require the original hosted processor before setup
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: python3 -I -B scripts/diagnose-pr83-pr84-intel/run.py --probe
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - uses: actions/checkout@v7
+        with:
+          ref: 5017b587f4cf71d30ebba8b542267aed597bb573
+          path: .tmp/pr83-pr84-intel-checkouts/83A
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        with:
+          ref: a6cca9106891c4207a90358642242b47590a5703
+          path: .tmp/pr83-pr84-intel-checkouts/83H
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        with:
+          ref: 59a4167f129f0bff0e8425125fa02eae87fd347b
+          path: .tmp/pr83-pr84-intel-checkouts/84A
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        with:
+          ref: 79ad754c69deb94196d8d9dc4accefee4ebd58c2
+          path: .tmp/pr83-pr84-intel-checkouts/84H
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Record exact binaries and run the interleaved control and candidate groups
+        run: python3 -I -B scripts/diagnose-pr83-pr84-intel/run.py
+
+      - if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr83-pr84-intel-attribution-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr83-pr84-intel-evidence/
+          if-no-files-found: error
+          retention-days: 14
