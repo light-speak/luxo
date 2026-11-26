@@ -15,7 +15,7 @@ jobs:
     if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/dart-snapshot-5fc'
     name: Dart snapshot / ${{ matrix.runner }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 55
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -29,14 +29,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
 
       - uses: dart-lang/setup-dart@v1
         with:
           sdk: '3.13.4'
 
-      - name: Verify snapshot topology, release and exact launcher inputs
+      - name: Verify reachable snapshot recovery boundaries
         env:
           EXPECTED_DART_ABI: ${{ matrix.dart_abi }}
           PYTHONUTF8: '1'
