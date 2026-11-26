@@ -1,0 +1,49 @@
+name: TypeScript HTTP refresh performance
+
+on:
+  push:
+    branches: [diag/sdk-ts-http-refresh-cost]
+    paths:
+      - '.github/workflows/sdk-ts-refresh-cost.yml'
+      - '.github/diagnostics/sdk-ts-refresh/**'
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: TypeScript HTTP refresh / Linux x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.9.0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26.9.0'
+          package-manager-cache: false
+
+      - name: Verify exact builds and sample on one runner
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/ts-refresh-evidence
+          python3 -I -B .github/diagnostics/sdk-ts-refresh/qualify.py collect \
+            --repo "$GITHUB_WORKSPACE" --scratch "$GITHUB_WORKSPACE/.tmp" \
+            --evidence "$GITHUB_WORKSPACE/.tmp/ts-refresh-evidence"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ts-http-refresh-linux-x64-${{ github.run_attempt }}
+          path: .tmp/ts-refresh-evidence/
+          if-no-files-found: error
+          retention-days: 14
