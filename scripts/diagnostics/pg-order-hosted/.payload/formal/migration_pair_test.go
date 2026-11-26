@@ -224,17 +224,28 @@ func (f historyReadFixture) verify(sample historyReadScenario, before historyRea
 	}
 }
 
+const historySessionMetadata = `SELECT selected.schema,
+	       pg_catalog.to_regclass(pg_catalog.quote_ident(selected.schema) || '._migrations') IS NOT NULL,
+	       pg_catalog.current_setting('standard_conforming_strings') = 'on'
+	FROM (SELECT pg_catalog.current_schema() AS schema) AS selected`
+
+func historyReadTraceSQL(sql string) string {
+	return strings.Replace(strings.TrimSpace(sql), "public._migrations", "_migrations", 1)
+}
+
 type historyReadTraceKey struct{}
 type historyReadTrace struct{ queries []string }
 
 func (tr *historyReadTrace) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
-	sql := strings.TrimSpace(data.SQL)
+	sql := historyReadTraceSQL(data.SQL)
 	var kind string
 	switch {
 	case strings.HasPrefix(sql, "CREATE TABLE IF NOT EXISTS _migrations"):
 		kind = "init"
 	case sql == "SELECT pg_catalog.to_regclass('_migrations') IS NOT NULL":
 		kind = "catalog"
+	case sql == historySessionMetadata:
+		kind = "catalog-session"
 	case strings.Contains(sql, "SELECT name, checksum FROM _migrations"):
 		kind = "checksum"
 	case strings.Contains(sql, "SELECT name, applied_at FROM _migrations"):
@@ -266,8 +277,8 @@ func (tr *historyReadTrace) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data
 
 func TestMigrationPairSQLControl(t *testing.T) {
 	arm := os.Getenv("LUXO_MIGPAIR_ARM")
-	warm := map[string]string{"A": "init,checksum,timestamp", "B": "catalog,checksum,timestamp,index-guard", "C": "checksum,timestamp,index-guard"}
-	cold := map[string]string{"A": "init,checksum,timestamp", "B": "catalog,init", "C": "checksum:42P01,catalog,init"}
+	warm := map[string]string{"A": "catalog,checksum,timestamp,index-guard", "B": "catalog-session,checksum,timestamp,index-guard"}
+	cold := map[string]string{"A": "catalog,init", "B": "catalog-session,init"}
 	if warm[arm] == "" {
 		t.Fatal("missing source arm")
 	}

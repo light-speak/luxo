@@ -45,7 +45,7 @@ var (
 )
 
 func migrationSQLStage(sql string) string {
-	sql = strings.TrimSpace(sql)
+	sql = historyReadTraceSQL(sql)
 	switch {
 	case sql == "SELECT pg_advisory_lock($1)":
 		return "lock"
@@ -55,6 +55,8 @@ func migrationSQLStage(sql string) string {
 		return "init"
 	case sql == "SELECT pg_catalog.to_regclass('_migrations') IS NOT NULL":
 		return "catalog"
+	case sql == historySessionMetadata:
+		return "catalog-session"
 	case strings.HasPrefix(sql, "SELECT name, checksum FROM _migrations"):
 		return "checksum"
 	case strings.HasPrefix(sql, "SELECT name, applied_at FROM _migrations"):

@@ -6,10 +6,10 @@ LEAVES = ("concurrent/up-existing-index", "transaction/up-missing-history")
 
 def expected_queries(arm, leaf):
     if leaf == LEAVES[0]:
-        return ({"A": "init lock checksum timestamp index",
-                 "B": "lock catalog checksum timestamp index index-guard"}[arm]
+        return ({"A": "lock catalog checksum timestamp index index-guard",
+                 "B": "lock catalog-session checksum timestamp index index-guard"}[arm]
                 + " begin history-insert commit unlock").split()
-    return ({"A": "init lock checksum timestamp", "B": "lock catalog init"}[arm]
+    return ({"A": "lock catalog init", "B": "lock catalog-session init"}[arm]
             + " begin update history-insert commit unlock").split()
 
 

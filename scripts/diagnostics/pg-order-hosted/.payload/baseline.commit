@@ -1,0 +1,8 @@
+tree 92887a0ef2a7f875b5024cf5ecfa099ced96e2ad
+parent 77b6cdf20d424213f4c1dc90534f924ac6b176d0
+author Linty <linty@staticoft.com> 1795652534 +0900
+committer Linty <linty@staticoft.com> 1795652534 +0900
+
+fix: Preserve migration order and keep dry-run read-only
+
+保留迁移执行顺序并让 dry-run 只读
