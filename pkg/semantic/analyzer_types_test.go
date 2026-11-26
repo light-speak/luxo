@@ -8,6 +8,66 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
+func TestParameterResolutionSingleFieldsKeepOwnedTypes(t *testing.T) {
+	for _, sample := range []struct {
+		name, declaration string
+		kind              TypeKind
+		nullable, list    bool
+		hasDefault        bool
+	}{
+		{"integer", "Int = 7", TypeInt, false, false, true},
+		{"nullable", "Int? = null", TypeInt, true, false, true},
+		{"list", "[Int]", TypeInt, false, true, false},
+		{"json", "JSON", TypeJSON, false, false, false},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			result := analyze(t, "sealed Payload { First(value: "+sample.declaration+") Second(value: "+sample.declaration+") }")
+			expectNoErrors(t, result)
+			variants := result.Types["Payload"].Variants
+			first, second := variants[0].Fields[0], variants[1].Fields[0]
+			for _, field := range []*FieldInfo{first, second} {
+				if field.Type.Kind != sample.kind || field.Type.Nullable != sample.nullable ||
+					field.Nullable != sample.nullable || field.Type.IsList != sample.list || field.HasDefault != sample.hasDefault {
+					t.Fatalf("single parameter lost type/default metadata: %+v / %+v", field, field.Type)
+				}
+			}
+			builtin := result.Types[first.Type.Name]
+			if first.Type == second.Type || first.Type == builtin || second.Type == builtin {
+				t.Fatal("independent parameter references reused a resolved type object")
+			}
+			first.Type.Nullable = !sample.nullable
+			if second.Type.Nullable != sample.nullable || builtin.Nullable {
+				t.Fatal("one parameter annotation changed another parameter or the builtin catalog")
+			}
+		})
+	}
+}
+
+func TestParameterResolutionArityAndDefaults(t *testing.T) {
+	for _, source := range []string{
+		`fn empty(): Int { return 42 }`,
+		`fn identity(value: Int = 7): Int { return value } api read(): Int { return identity() }`,
+		`fn combine(left: Int, right: Int): Int { return left + right }`,
+		`error Rejected(value: JSON) { code: 422 message: "error.rejected" }`,
+	} {
+		expectNoErrors(t, analyze(t, source))
+	}
+	expectError(t, analyze(t, `fn invalid(value: Int = "wrong"): Int { return value }`),
+		"default value for parameter 'value' expects 'Int', got 'String'")
+}
+
+func TestParameterResolutionDuplicateDiagnosticOrder(t *testing.T) {
+	result := analyze(t, `error Rejected(value: Int, value: JSON) { code: 422 message: "error.rejected" }`)
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Message, "duplicate parameter 'value'") {
+		t.Fatalf("two parameters lost duplicate validation: %v", result.Errors)
+	}
+	result = analyze(t, `error Rejected(value: Int = "wrong", value: JSON) { code: 422 message: "error.rejected" }`)
+	if len(result.Errors) != 2 || !strings.Contains(result.Errors[0].Message, "expects 'Int', got 'String'") ||
+		!strings.Contains(result.Errors[1].Message, "duplicate parameter 'value'") {
+		t.Fatalf("type/default and duplicate diagnostics changed order: %v", result.Errors)
+	}
+}
+
 func TestGenericExpressionMetadata(t *testing.T) {
 	analyzer := newAnalyzer()
 	expr := &ast.Ident{Name: "channel"}

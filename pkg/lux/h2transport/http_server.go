@@ -31,8 +31,13 @@ func (s *Server) ConfigureHTTPServer(server *http.Server) error {
 	config.NextProtos = []string{"h2", "http/1.1"}
 	server.TLSConfig = config
 	server.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){
-		"h2": func(_ *http.Server, conn *tls.Conn, _ http.Handler) {
-			_ = s.ServeConn(context.Background(), conn)
+		"h2": func(_ *http.Server, conn *tls.Conn, handler http.Handler) {
+			ctx := context.Background()
+			// net/http passes the listener and connection context through this handler.
+			if h, ok := handler.(interface{ BaseContext() context.Context }); ok {
+				ctx = h.BaseContext()
+			}
+			_ = s.ServeConn(ctx, conn)
 		},
 	}
 	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

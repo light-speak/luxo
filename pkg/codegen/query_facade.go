@@ -12,21 +12,54 @@ import (
 // The embedded PostgreSQL reader supplies the shared read terminals.
 // Multiline wrappers let the Go printer skip sizing each body for a single line.
 func (g *GeneratorContext) generateQueryFacade(b *strings.Builder, name string, fields []*ast.FieldDecl, writable bool, directives ...[]*ast.Directive) {
-	fmt.Fprintf(b, "type %sQuery pg.Query[%s]\n\n", name, name)
+	writeQueryFacadeParts(b, "type ", name, "Query pg.Query[", name, "]\n\n")
 	for _, method := range []struct{ name, params, args string }{
 		{"Where", "values ...lux.Condition", "values..."},
 		{"Select", "values ...string", "values..."},
 		{"OrderBy", "values ...string", "values..."},
 		{"Limit", "value int", "value"}, {"Offset", "value int", "value"},
 	} {
-		fmt.Fprintf(b, "func (q *%sQuery) %s(%s) *%sQuery {\n\t(*pg.Query[%s])(q).%s(%s)\n\treturn q\n}\n", name, method.name, method.params, name, name, method.name, method.args)
+		writeQueryFacadeParts(b,
+			"func (q *", name, "Query) ", method.name, "(", method.params, ") *", name, "Query {\n",
+			"\t(*pg.Query[", name, "])(q).", method.name, "(", method.args, ")\n\treturn q\n}\n",
+		)
 	}
 	generateDecimalQueryMethods(b, name, fields)
 	if writable {
 		for _, method := range []string{"Delete", "SoftDelete"} {
-			fmt.Fprintf(b, "func (q *%sQuery) %s(ctx context.Context) (int64,error) {\n\treturn (*pg.Query[%s])(q).%s(ctx)\n}\n", name, method, name, method)
+			writeQueryFacadeParts(b,
+				"func (q *", name, "Query) ", method, "(ctx context.Context) (int64,error) {\n",
+				"\treturn (*pg.Query[", name, "])(q).", method, "(ctx)\n}\n",
+			)
 		}
 		g.generatePreparedQueryUpdate(b, name, fields, directives...)
+	}
+}
+
+// Short declarations use stack storage and reach the destination in one write.
+func writeQueryFacadeParts(b *strings.Builder, parts ...string) {
+	var scratch [256]byte
+	declaration := scratch[:0]
+	for i, part := range parts {
+		if len(part) > len(scratch)-len(declaration) {
+			writeLongQueryFacadeParts(b, declaration, parts[i:])
+			return
+		}
+		declaration = append(declaration, part...)
+	}
+	b.Write(declaration)
+}
+
+// Reserve the full declaration in the destination before writing its parts.
+func writeLongQueryFacadeParts(b *strings.Builder, prefix []byte, parts []string) {
+	size := len(prefix)
+	for _, part := range parts {
+		size += len(part)
+	}
+	b.Grow(size)
+	b.Write(prefix)
+	for _, part := range parts {
+		b.WriteString(part)
 	}
 }
 
@@ -34,7 +67,10 @@ func generateDecimalQueryMethods(b *strings.Builder, name string, fields []*ast.
 	for _, field := range fields {
 		if field.Type != nil && field.Type.Name == "Decimal" {
 			for _, method := range []string{"SumDecimal", "AvgDecimal", "MinDecimal", "MaxDecimal"} {
-				fmt.Fprintf(b, "func (q *%sQuery) %s(ctx context.Context, column string) (decimal.Decimal,error) {\n\treturn (*pg.Query[%s])(q).%s(ctx,column)\n}\n", name, method, name, method)
+				writeQueryFacadeParts(b,
+					"func (q *", name, "Query) ", method, "(ctx context.Context, column string) (decimal.Decimal,error) {\n",
+					"\treturn (*pg.Query[", name, "])(q).", method, "(ctx,column)\n}\n",
+				)
 			}
 			return
 		}

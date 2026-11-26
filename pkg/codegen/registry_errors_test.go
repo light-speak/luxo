@@ -94,7 +94,7 @@ func TestSchemaCRUDRegistrationPropagatesConflicts(t *testing.T) {
 
 func TestEntryStopsOnRegistryFailure(t *testing.T) {
 	var b strings.Builder
-	writeEmbeddedGatewayWiring(&b, []moduleInfo{{name: "user", hasAPI: true}}, false)
+	writeEmbeddedGatewayWiring(&b, []moduleInfo{{name: "user", hasUnaryAPIs: true}}, false)
 	if !strings.Contains(b.String(), "if err := user_luxo.RegisterHandlers(gw.Router, userApp); err != nil") || !strings.Contains(b.String(), "os.Exit(1)") {
 		t.Fatalf("startup ignores registration errors:\n%s", b.String())
 	}

@@ -250,15 +250,22 @@ func blockResultExpr(body *ast.Block) ast.Expr {
 }
 
 func (a *Analyzer) resolvedExprType(expr ast.Expr) *ResolvedType {
-	if expr == nil || expr.GetTypeTag() == "" {
+	if expr == nil {
 		return nil
+	}
+	tag := expr.GetTypeTag()
+	if tag == "" {
+		return nil
+	}
+	if tag == "Void" && hasNoAwaitResult(expr) {
+		return a.voidResultType()
 	}
 	if generic := a.genericExprTypes[expr]; generic != nil {
 		return generic
 	}
-	base := a.types[expr.GetTypeTag()]
+	base := a.types[tag]
 	if base == nil {
-		base = &ResolvedType{Kind: TypeUnknown, Name: expr.GetTypeTag()}
+		base = &ResolvedType{Kind: TypeUnknown, Name: tag}
 	}
 	nullable := expr.IsNullable()
 	isList := expr.IsListType()
@@ -386,6 +393,9 @@ func isTypeAssignable(expected, actual *ResolvedType) bool {
 		return false
 	}
 	if expected.Name == actual.Name {
+		if expected.Kind != actual.Kind && (expected.Kind == TypeVoid || actual.Kind == TypeVoid) {
+			return false
+		}
 		return typeArgsAssignable(expected.TypeArgs, actual.TypeArgs)
 	}
 	return actual.inheritsFrom(expected.Name)
@@ -1965,6 +1975,9 @@ func (a *Analyzer) checkWhen(e *ast.WhenExpr, scope *Scope, required bool) *Reso
 	if e.Subject != nil {
 		subjectType = a.checkExpr(e.Subject, scope)
 	}
+	_, awaitedSubject := e.Subject.(*ast.AwaitExpr)
+	literal, literalSubject := e.Subject.(*ast.Literal)
+	staticNullSubject := isNullType(subjectType) && (awaitedSubject || literalSubject && literal.Kind == token.Null)
 	// check duplicate branches
 	seenBranches := map[string]bool{}
 	for _, b := range e.Branches {
@@ -1973,6 +1986,9 @@ func (a *Analyzer) checkWhen(e *ast.WhenExpr, scope *Scope, required bool) *Reso
 				a.addError(e.Pos, "duplicate when branch 'is %s' / 重复的 when 分支 'is %s'", b.IsType, b.IsType)
 			}
 			seenBranches[b.IsType] = true
+			if staticNullSubject {
+				a.resolveNamedType(&ast.TypeRef{Name: b.IsType}, e.Pos, 0)
+			}
 		}
 		if b.Condition != nil {
 			a.checkWhenCondition(b.Condition, subjectType, scope)

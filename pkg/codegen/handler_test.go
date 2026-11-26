@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"fmt"
 	"go/format"
 	"strings"
 	"testing"
@@ -2255,6 +2256,81 @@ func TestWriteAPIRegistration(t *testing.T) {
 	generator.writeAPIRegistration(&b, "getUser")
 	if code := b.String(); strings.Contains(code, `Name: "removed"`) {
 		t.Errorf("stale lock-file params must not be registered:\n%s", code)
+	}
+}
+
+func TestWriteAPIRegistrationReservedOutput(t *testing.T) {
+	for _, count := range []int{2, 8, 9} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			const name = "svc:lookup"
+			ids := make(map[string]int, count)
+			types := make(map[string]string, count)
+			var want strings.Builder
+			fmt.Fprintf(&want, "\tif err := router.Registry.Register(%q, 73); err != nil { return err }\n", name)
+			fmt.Fprintf(&want, "\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{\n", name)
+			for id := 1; id <= count; id++ {
+				field := fmt.Sprintf("input%d", count-id)
+				ids[field] = id
+				types[field] = "[Int]?"
+				fmt.Fprintf(&want, "\t\t{Name: %q, Type: \"Int\", FieldID: %d, IsList: true, Nullable: true},\n", field, id)
+			}
+			want.WriteString("\t}); err != nil { return err }\n")
+			generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+				APIs:      map[string]int{name: 73},
+				APIParams: map[string]map[string]int{name: ids},
+			}})
+			generator.requestParams = requestParamDeclarations(map[string]map[string]string{name: types})
+
+			var output strings.Builder
+			allocations := testing.AllocsPerRun(20, func() {
+				output.Reset()
+				output.Grow(want.Len())
+				generator.writeAPIRegistration(&output, name)
+			})
+			if output.String() != want.String() {
+				t.Fatalf("registered output changed:\n%s", output.String())
+			}
+			limit := 1.0 // The reserved output buffer.
+			if count > 8 {
+				limit++ // The larger sort workspace.
+			}
+			if allocations > limit {
+				t.Fatalf("allocations = %g, want at most %g", allocations, limit)
+			}
+		})
+	}
+}
+
+func TestWriteRegistryRouteFormatsGoLiterals(t *testing.T) {
+	name := strings.Repeat("空", 70) + "\"`\\\n"
+	var output strings.Builder
+	writeRegistryRoute(&output, name, -841)
+	want := fmt.Sprintf("\tif err := router.Registry.Register(%q, %d); err != nil { return err }\n", name, -841)
+	if output.String() != want {
+		t.Fatalf("route output differs:\n%s", output.String())
+	}
+}
+
+func TestWriteAPIRegistrationLongIdentifiers(t *testing.T) {
+	name := "service:lookup" + strings.Repeat("x", 128)
+	field := "input" + strings.Repeat("y", 128)
+	model := "Entry" + strings.Repeat("Z", 128)
+	generator := mustNewGenerator(t, GeneratorConfig{IDs: StableIDs{
+		APIs:      map[string]int{name: 273},
+		APIParams: map[string]map[string]int{name: {field: 5, "id": 1}},
+	}})
+	generator.requestParams = requestParamDeclarations(map[string]map[string]string{
+		name: {field: "[" + model + "]?", "id": "Int"},
+	})
+	var result strings.Builder
+	generator.writeAPIRegistration(&result, name)
+	want := fmt.Sprintf("\tif err := router.Registry.Register(%q, 273); err != nil { return err }\n", name) +
+		fmt.Sprintf("\tif err := router.Registry.RegisterParams(%q, []api.ParamMeta{\n", name) +
+		"\t\t{Name: \"id\", Type: \"Int\", FieldID: 1},\n" +
+		fmt.Sprintf("\t\t{Name: %q, Type: \"Model\", TypeName: %q, FieldID: 5, IsList: true, Nullable: true},\n", field, model) +
+		"\t}); err != nil { return err }\n"
+	if result.String() != want {
+		t.Fatalf("registered output changed:\n%s", result.String())
 	}
 }
 

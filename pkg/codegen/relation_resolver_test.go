@@ -1,6 +1,66 @@
 package codegen
 
-import "testing"
+import (
+	"crypto/sha256"
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/light-speak/luxo/pkg/ast"
+)
+
+// The hashes pin the unformatted resolver source, including indentation, loader
+// keys, depth checks and trace scope.
+func TestRelationResolverEmissionSource(t *testing.T) {
+	model := &ast.ModelDecl{Name: "Source"}
+	for _, sample := range []struct {
+		name                      string
+		nullable, list, recursive bool
+		computed                  bool
+		want                      string
+	}{
+		{"nullable-single", true, false, true, false, "dbf4466e921cd5220ac8049377fc33d9571b4a039312db237d4ff12a22c6265e"},
+		{"required-list", false, true, true, false, "b64c6e827c5322b45d5c64ef0c40a8ff55f70c6b43c0d28e7484bd2cf12e0902"},
+		{"leaf-list", true, true, false, false, "a772e379f445d3b1e726a254da013fbbb549ce7a8dda8f38a6fbef2865e4bccb"},
+		{"nullable-list", true, true, true, false, "f79f422dfad935c9e71f4dc4c154a2ac3d743486ea096e5c54d2c868f74a7ce4"},
+		{"computed-single", false, false, true, true, "c4cee66e2d72b125704da34a6cd1f039130f294b051370ed83dc46ee0eef0b3d"},
+		{"computed-list", true, true, true, true, "fa5dce51f7c8ecc03a67b53d46e33552ccb52b31265485690562f05de75afe18"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			relation := Relation{FieldName: "targets", TargetName: "Target", LocalKey: "groupKey", RemoteKey: "groupKey", KeyGoType: "string", FKNullable: sample.nullable, IsList: sample.list}
+			var output strings.Builder
+			generateRelationResolver(&output, model, []Relation{relation}, map[string]bool{"Target": sample.recursive}, map[string]bool{"Target": sample.computed})
+			assertRelationResolverSource(t, output.String(), sample.want)
+		})
+	}
+
+	relations := []Relation{
+		{FieldName: "targets", TargetName: "Target", LocalKey: "groupKey", RemoteKey: "groupKey", KeyGoType: "string", IsList: true},
+		{FieldName: "primary", TargetName: "Target", LocalKey: "id", RemoteKey: "id", KeyGoType: "int64", FKNullable: true},
+	}
+	for _, sample := range []struct {
+		name   string
+		values bool
+		want   string
+	}{
+		{"reference-list", false, "02117eefb5971449d099a6bcabf60d80cc78e1c5ea728f23d3a8d91a64a2f0d9"},
+		{"value-list", true, "aa08c13b1ab5b305660c7938699a72c168436f909a4238f98761216bedbb12ab"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			var output strings.Builder
+			generateListRelationResolverMode(&output, model, relations, map[string]bool{"Target": true}, sample.values, map[string]bool{"Target": true})
+			assertRelationResolverSource(t, output.String(), sample.want)
+		})
+	}
+}
+
+func assertRelationResolverSource(t *testing.T, output, want string) {
+	t.Helper()
+	got := fmt.Sprintf("%x", sha256.Sum256([]byte(output)))
+	if got != want {
+		t.Fatalf("resolver source SHA = %s, want %s:\n%s", got, want, output)
+	}
+}
 
 const nestedRelationBatchSource = `
 model Node @noTime {

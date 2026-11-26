@@ -85,12 +85,12 @@ func (c *compiler) compileLoopHeader(loop *ast.ForStmt) {
 }
 
 // Statement branches retain their enclosing Go return/error and loop scopes.
-func (c *compiler) statementCompiler() *compiler {
+func (c *compiler) statementCompiler() compiler {
 	sub := *c
 	sub.b = &strings.Builder{}
 	sub.vars = maps.Clone(c.vars)
 	sub.paginationTotals = maps.Clone(c.paginationTotals)
-	return &sub
+	return sub
 }
 
 func (c *compiler) compileWhenStatement(expr *ast.WhenExpr) {
@@ -100,10 +100,12 @@ func (c *compiler) compileWhenStatement(expr *ast.WhenExpr) {
 	subject := ""
 	if expr.Subject != nil {
 		subject = sub.compileBooleanValue(expr.Subject)
-		sub.resultTmp++
-		name := "_subject" + strconv.Itoa(sub.resultTmp)
-		sub.write("%s := %s", name, subject)
-		subject = name
+		if !isStaticWhenNullSubject(expr.Subject) {
+			sub.resultTmp++
+			name := "_subject" + strconv.Itoa(sub.resultTmp)
+			sub.write("%s := %s", name, subject)
+			subject = name
+		}
 	}
 	scope.header = sub.b.Len()
 	sub.write("switch {")
@@ -113,7 +115,7 @@ func (c *compiler) compileWhenStatement(expr *ast.WhenExpr) {
 		sub.compileSelectBody(expr)
 	} else if sub.sealedWhenOwner(expr) != nil {
 		sub.compileSealedWhenBranches(expr, subject)
-	} else if hasWhenTypeBranch(expr) {
+	} else if !isStaticWhenNullSubject(expr.Subject) && hasWhenTypeBranch(expr) {
 		sub.compileWhenSwitch(expr, subject+".(type)")
 	} else {
 		sub.compileWhenConditions(expr, subject)

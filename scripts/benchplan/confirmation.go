@@ -96,23 +96,14 @@ func validConfirmationName(name string) bool {
 }
 
 func formatConfirmationBatch(keys []sampleKey) string {
-	var batch strings.Builder
-	var current string
-	for _, key := range keys {
-		if key.Package != current {
-			if current != "" {
-				batch.WriteByte('\n')
-			}
-			batch.WriteString(key.Package)
-			batch.WriteByte('\t')
-			current = key.Package
-		} else {
-			batch.WriteByte('|')
-		}
-		writeConfirmationFilter(&batch, strings.TrimSuffix(key.Name, "-2"))
+	batches := make(map[benchmarkProfile][]string)
+	for _, leaf := range keys {
+		key := profileFor(leaf.Package, leaf.Name)
+		var filter strings.Builder
+		writeConfirmationFilter(&filter, strings.TrimSuffix(leaf.Name, "-2"))
+		batches[key] = append(batches[key], filter.String())
 	}
-	batch.WriteByte('\n')
-	return batch.String()
+	return formatBatches(batches, "", "")
 }
 
 // The Go test matcher splits at unescaped slashes and top-level alternation.

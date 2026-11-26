@@ -167,7 +167,8 @@ AUTO_MIGRATE=true                                      # apply pending migration
 # DEBUG_SQL=true                                        # print all SQL queries with timing
 
 # ---- Auth (JWT) ----
-JWT_SECRET=change-me                                   # HMAC signing key
+# Set a unique random signing key to enable JWT authentication.
+# JWT_SECRET=
 JWT_EXPIRES=7d                                         # token expiry
 JWT_REFRESH=true                                       # enable refresh tokens
 JWT_REFRESH_EXPIRES=30d                                # refresh token expiry

@@ -151,6 +151,7 @@ func (a *Analyzer) checkCallableBody(body *ast.Block, scope *Scope, expected *Re
 		expression := statement.Expr
 		if expression != nil && expected.Name != "" && len(expected.TypeArgs) == 0 &&
 			expected.Name == expression.GetTypeTag() && expected.IsList == expression.IsListType() &&
+			(expected.Name != "Void" || !hasNoAwaitResult(expression)) &&
 			(expected.Nullable || !expression.IsNullable()) {
 			return
 		}
@@ -248,13 +249,16 @@ func (a *Analyzer) checkStmt(stmt ast.Stmt, scope *Scope) {
 		}
 
 	case *ast.ExprStmt:
-		if branch, ok := s.Expr.(*ast.WhenExpr); ok {
-			a.setExprResolvedType(branch, a.checkWhen(branch, scope, false))
-		} else if guard, ok := s.Expr.(*ast.BangElvisExpr); ok {
-			a.checkBangElvisGuard(guard, scope)
-			a.setExprResolvedType(guard, &ResolvedType{Kind: TypeVoid, Name: "Void"})
-		} else if s.Expr != nil {
-			a.checkExpr(s.Expr, scope)
+		switch expression := s.Expr.(type) {
+		case *ast.WhenExpr:
+			a.setExprResolvedType(expression, a.checkWhen(expression, scope, false))
+		case *ast.BangElvisExpr:
+			a.checkBangElvisGuard(expression, scope)
+			a.setExprResolvedType(expression, &ResolvedType{Kind: TypeVoid, Name: "Void"})
+		case *ast.AwaitExpr:
+			a.checkAwaitStatement(expression, scope)
+		default:
+			a.checkExpr(expression, scope)
 		}
 	}
 }
@@ -269,6 +273,11 @@ func (a *Analyzer) checkValStmt(s *ast.ValStmt, scope *Scope) {
 	if exprType != nil && exprType.Kind == TypeVoid {
 		a.addError(s.Pos, "void operation cannot initialize a variable / 无返回值操作不能初始化变量")
 		return
+	}
+	if exprType != nil && exprType.Kind == TypeTuple {
+		if await, ok := s.Value.(*ast.AwaitExpr); ok && a.rejectAwaitTupleBinding(s, await, exprType) {
+			return
+		}
 	}
 	if s.Type != nil {
 		declaredType := a.resolveTypeRef(s.Type, s.Pos)
@@ -291,6 +300,20 @@ func (a *Analyzer) checkValStmt(s *ast.ValStmt, scope *Scope) {
 		}
 		a.defineVariable(scope, s.Name, exprType, pos, s.Mutable)
 	}
+}
+
+func (a *Analyzer) rejectAwaitTupleBinding(statement *ast.ValStmt, await *ast.AwaitExpr, result *ResolvedType) bool {
+	for _, item := range result.Tuple {
+		if isVoidResult(item) {
+			a.addError(await.Pos, "await result cannot be void / await 结果不能是无返回值操作")
+			return true
+		}
+	}
+	if len(statement.Names) == 0 && statement.Type == nil {
+		a.addError(await.Pos, "multiple await results require a destructuring declaration / 多个 await 结果需要解构声明")
+		return true
+	}
+	return false
 }
 
 // Failed declarations preserve the earlier binding; discards bind no name.
@@ -423,19 +446,37 @@ func (a *Analyzer) checkForBody(s *ast.ForStmt, scope *Scope, required bool) *Re
 	return a.inferForExprType(s.Body)
 }
 
+type awaitCheckContext uint8
+
+const (
+	awaitValueContext awaitCheckContext = iota
+	awaitStatementContext
+	awaitBodyContext
+)
+
+func (a *Analyzer) checkAwaitStatement(e *ast.AwaitExpr, scope *Scope) {
+	previous := a.awaitContext
+	if previous == awaitValueContext {
+		a.awaitContext = awaitStatementContext
+	}
+	a.checkExpr(e, scope)
+	a.awaitContext = previous
+}
+
 // checkAwaitExpr collects the type of each expression statement in the await
 // block and returns a tuple type so that destructuring can assign each variable
 // its own type: val (user, posts) = await { getUser(id); getPosts(uid) }
 func (a *Analyzer) checkAwaitExpr(e *ast.AwaitExpr, scope *Scope) *ResolvedType {
-	if a.inAwait {
+	e.NoAwaitResult = false
+	previous := a.awaitContext
+	if previous == awaitBodyContext {
 		a.addError(e.Pos, "nested await is not allowed / 不允许嵌套 await")
 		return nil
 	}
-	prevAwait := a.inAwait
 	previousDepth := a.loopDepth
-	a.inAwait = true
+	a.awaitContext = awaitBodyContext
 	a.loopDepth = 0
-	defer func() { a.inAwait, a.loopDepth = prevAwait, previousDepth }()
+	defer func() { a.awaitContext, a.loopDepth = previous, previousDepth }()
 	childScope := scope.Child()
 	var elements []*ResolvedType
 	if e.Body != nil {
@@ -450,7 +491,9 @@ func (a *Analyzer) checkAwaitExpr(e *ast.AwaitExpr, scope *Scope) *ResolvedType 
 	}
 	// single expression — return its type directly, not a tuple
 	if len(elements) == 1 {
-		return elements[0]
+		result := elements[0]
+		e.NoAwaitResult = result != nil && result.Kind == TypeVoid
+		return result
 	}
 	if len(elements) > 1 {
 		return &ResolvedType{
@@ -459,7 +502,18 @@ func (a *Analyzer) checkAwaitExpr(e *ast.AwaitExpr, scope *Scope) *ResolvedType 
 			Tuple: elements,
 		}
 	}
+	e.NoAwaitResult = true
+	if previous != awaitStatementContext {
+		return a.voidResultType()
+	}
+	e.SetTypeMetadata("Void", false, false, false, false)
+	delete(a.genericExprTypes, e)
 	return nil
+}
+
+func hasNoAwaitResult(expression ast.Expr) bool {
+	await, ok := expression.(*ast.AwaitExpr)
+	return ok && await.NoAwaitResult
 }
 
 // Only authenticated handlers provide a validated identity.

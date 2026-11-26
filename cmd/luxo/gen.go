@@ -63,11 +63,7 @@ func runGen(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	files = result.Files
-	backends := codegen.EntryBackends{
-		Events: os.Getenv("LUXO_EVENT_BACKEND"),
-		Queue:  os.Getenv("LUXO_QUEUE_BACKEND"),
-		Cache:  os.Getenv("LUXO_CACHE_BACKEND"),
-	}
+	backends := generationBackends()
 	if err := backends.Validate(result); err != nil {
 		return err
 	}
@@ -167,6 +163,14 @@ func loadGenerationEnvironment(path string) error {
 		return fmt.Errorf("load generation environment: %w", err)
 	}
 	return nil
+}
+
+func generationBackends() codegen.EntryBackends {
+	return codegen.EntryBackends{
+		Events: os.Getenv("LUXO_EVENT_BACKEND"),
+		Queue:  os.Getenv("LUXO_QUEUE_BACKEND"),
+		Cache:  os.Getenv("LUXO_CACHE_BACKEND"),
+	}
 }
 
 func buildProjectGenerator(lf *lockfile.LockFile, files []*ast.File) (*codegen.GeneratorContext, error) {

@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 
+import 'native_uri.dart';
+
 /// A destination whose directory stays open until publication or close.
 class PreparedOutput {
   final File destination;
@@ -15,15 +17,16 @@ class PreparedOutput {
     Directory project,
     String output,
   ) async {
-    validateProjectRelativePath(output);
-    final root = project.absolute.uri.normalizePath();
-    final destination = File.fromUri(root.resolve(output));
+    final relative = _projectRelativeUri(output);
+    final root = nativeFileUri(project.absolute.uri.normalizePath());
+    final resolved = root.resolveUri(relative);
+    final destination = File.fromUri(resolved);
     if (await FileSystemEntity.type(destination.path, followLinks: false) !=
         FileSystemEntityType.notFound) {
       throw StateError('Output already exists: $output');
     }
     final rootCount = root.pathSegments.where((p) => p.isNotEmpty).length;
-    final parts = destination.uri.pathSegments.skip(rootCount).toList();
+    final parts = resolved.pathSegments.skip(rootCount).toList();
     if (parts.isEmpty || parts.last.isEmpty) {
       throw ArgumentError('Expected an output file: $output');
     }
@@ -72,7 +75,11 @@ void publishBuildArtifact(File artifact, PreparedOutput destination) =>
     destination._publish(artifact);
 
 void validateProjectRelativePath(String path) {
-  final uri = Uri.parse(path);
+  _projectRelativeUri(path);
+}
+
+Uri _projectRelativeUri(String path) {
+  final uri = nativeFileUri(Uri.parse(path));
   if (uri.hasScheme ||
       uri.hasAuthority ||
       uri.hasQuery ||
@@ -83,6 +90,7 @@ void validateProjectRelativePath(String path) {
       path.isEmpty) {
     throw ArgumentError('Expected a project-relative path: $path');
   }
+  return uri;
 }
 
 const _renameNoReplaceFlag = 1;
@@ -298,7 +306,12 @@ class _PosixDirectory implements _OutputDirectory {
   int? publish(File artifact, String name) {
     final from = _PosixDirectory.open(artifact.parent.absolute.path);
     try {
-      return _movePosix(from.fd, artifact.uri.pathSegments.last, fd, name);
+      return _movePosix(
+        from.fd,
+        nativeFileUri(artifact.uri).pathSegments.last,
+        fd,
+        name,
+      );
     } finally {
       from.close();
     }

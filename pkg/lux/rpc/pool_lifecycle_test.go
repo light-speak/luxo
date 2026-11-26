@@ -96,6 +96,149 @@ func TestClientExchangeCancellationInterruptsBlockedIO(t *testing.T) {
 	}
 }
 
+func TestCanceledUnaryCallReturnsAfterReleasingPoolSlot(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		options := PoolOptions{MaxIdle: 1, MaxOpen: 1, DialTimeout: time.Second}
+		client, err := NewNamedClientWithOptions("test", "unused", options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+
+		conn, peer := net.Pipe()
+		defer conn.Close()
+		defer peer.Close()
+		closing, release := make(chan struct{}), make(chan struct{})
+		allowClose := sync.OnceFunc(func() { close(release) })
+		defer allowClose()
+		tracked := &poolLifecycleConn{Conn: conn, onClose: func() {
+			conn.Close()
+			close(closing)
+			<-release
+		}}
+		client.pool.Put(tracked)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			_, callErr := client.CallWithMaskContext(ctx, "", 1, nil, []byte{42})
+			done <- callErr
+		}()
+		if _, err := ReadFrame(peer, nil); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		<-closing
+		synctest.Wait()
+		select {
+		case err := <-done:
+			t.Fatalf("canceled call returned before its pool slot was released: %v", err)
+		default:
+		}
+		allowClose()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled Call error = %v", err)
+		}
+		if open := client.pool.open.Load(); open != 0 {
+			t.Errorf("pool has %d open connections after canceled Call returned", open)
+		}
+		if n := tracked.closes.Load(); n != 1 {
+			t.Errorf("underlying Close called %d times", n)
+		}
+	})
+}
+
+func TestPoolCloseWaitersTrackEachConnection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pool := NewPool("unused", 2)
+		defer pool.Close()
+		makeHeld := func() (net.Conn, func()) {
+			closing := make(chan struct{})
+			release := make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+			pool.Put(&poolLifecycleConn{onClose: func() {
+				close(closing)
+				<-release
+			}})
+			conn, err := pool.Get()
+			if err != nil {
+				t.Fatal(err)
+			}
+			go conn.Close()
+			<-closing
+			return conn, unblock
+		}
+		first, releaseFirst := makeHeld()
+		defer releaseFirst()
+		second, releaseSecond := makeHeld()
+		defer releaseSecond()
+		firstDone, secondDone := make(chan error, 2), make(chan error, 1)
+		go func() { firstDone <- first.Close() }()
+		go func() { firstDone <- first.Close() }()
+		go func() { secondDone <- second.Close() }()
+		synctest.Wait()
+		if open := pool.open.Load(); open != 2 || len(firstDone) != 0 || len(secondDone) != 0 {
+			t.Fatalf("close returned early: open=%d first=%d second=%d", open, len(firstDone), len(secondDone))
+		}
+		releaseFirst()
+		synctest.Wait()
+		if open := pool.open.Load(); open != 1 || len(firstDone) != 2 || len(secondDone) != 0 {
+			t.Fatalf("wrong waiters released: open=%d first=%d second=%d", open, len(firstDone), len(secondDone))
+		}
+		for range 2 {
+			if err := <-firstDone; err != nil {
+				t.Fatal(err)
+			}
+		}
+		releaseSecond()
+		if err := <-secondDone; err != nil || pool.open.Load() != 0 {
+			t.Fatalf("second close did not release its slot: %v", err)
+		}
+		if len(pool.closingWaiters) != 0 {
+			t.Fatal("pool retained waiters for closed connections")
+		}
+	})
+}
+
+func TestFullPoolRejectsRawConnWithoutReservingSlot(t *testing.T) {
+	pool := NewPool("unused", 1)
+	defer pool.Close()
+	idle := &poolLifecycleConn{}
+	pool.Put(idle)
+	rejected := &poolLifecycleConn{onClose: func() {
+		if open := pool.open.Load(); open != 1 {
+			t.Errorf("rejected connection changed open reservation count to %d", open)
+		}
+	}}
+	pool.Put(rejected)
+	if rejected.closes.Load() != 1 || idle.closes.Load() != 0 || len(pool.conns) != 1 {
+		t.Fatal("full pool did not close only the rejected connection")
+	}
+}
+
+func TestPoolCloseFinishesBeforeWaiterRegistration(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pool := NewPool("unused", 1)
+		defer pool.Close()
+		raw := &poolLifecycleConn{}
+		pool.Put(raw)
+		conn, err := pool.Get()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+		// Replay a duplicate caller that saw closing before the owner finished,
+		// and reached waiter registration after the socket and slot were released.
+		pool.waitForClose(conn.(*poolConn))
+		if raw.closes.Load() != 1 || pool.open.Load() != 0 || pool.closingWaiters != nil {
+			t.Fatal("late close waiter acquired a slot or left a waiter allocation")
+		}
+	})
+}
+
 type cancelOnResponseConn struct {
 	net.Conn
 	remaining int
@@ -225,7 +368,7 @@ func TestPoolConcurrentDrainsDisposeOfLateReturns(t *testing.T) {
 	}
 	var group sync.WaitGroup
 	for range 8 {
-		group.Go(pool.closeIdle)
+		group.Go(pool.drainAfterReturn)
 	}
 	group.Wait()
 	for i := range conns {

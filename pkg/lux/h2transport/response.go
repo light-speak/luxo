@@ -25,14 +25,18 @@ type response struct {
 	err       error
 	owner     *api.ResponseBuf
 	budget    *byteBudget
+	// Zero denotes other methods. HEAD starts at -1 and counts nonempty writes.
+	headBytes int
 }
 
 func (r *response) TakeBinaryResponse(buf *api.ResponseBuf) bool {
-	if buf == nil || r.err != nil || r.owner != nil || cap(r.body) != 0 || len(buf.B) > r.limit {
+	if buf == nil || r.err != nil || r.owner != nil || cap(r.body) != 0 || len(buf.B) > r.limit || r.headBytes != 0 {
 		return false
 	}
 	if r.status == 0 {
 		r.WriteHeader(http.StatusOK)
+	} else if !responseStatusAllowsBody(r.status) {
+		return false
 	}
 	if !r.budget.take(cap(buf.B)) {
 		r.err = errQueueFull
@@ -78,6 +82,12 @@ func (r *response) Write(data []byte) (int, error) {
 	if r.err != nil {
 		return 0, r.err
 	}
+	if !responseStatusAllowsBody(r.status) {
+		return 0, http.ErrBodyNotAllowed
+	}
+	if r.headBytes != 0 {
+		return r.countHeadBytes(len(data))
+	}
 	if len(data) > r.limit-len(r.body) {
 		r.err = errResponse
 		return 0, r.err
@@ -98,22 +108,42 @@ func (r *response) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
+func (r *response) countHeadBytes(length int) (int, error) {
+	size := max(r.headBytes, 0)
+	if length > r.limit-size {
+		r.err = errResponse
+		return 0, r.err
+	}
+	if length > 0 {
+		r.headBytes = size + length
+	}
+	return length, nil
+}
+
 func (w *controlWriter) writeResponse(id uint32, r *response) error {
-	if _, exists := w.data.queue.streams[id]; !exists {
+	q := w.data.queue
+	if index := q.streams[id]; index == 0 {
 		return nil
 	} // Reset before completion.
 	if r == nil || r.err != nil {
 		return errResponse
 	}
 	if err := w.encodeResponseHead(r); err != nil {
+		// Header validation fails before changing HPACK state or emitting bytes.
+		if err == errResponse {
+			return w.abortStream(id, http2.ErrCodeInternal)
+		}
 		return err
 	}
-	if err := w.data.queue.submit(id, r.body); err != nil {
-		return err
+	bodyless := r.headBytes != 0 || !responseStatusAllowsBody(r.status)
+	if !bodyless {
+		if err := q.submit(id, r.body); err != nil {
+			return err
+		}
 	}
 	block := w.headerBlock.Bytes()
 	size := min(len(block), w.frameSize)
-	if err := w.data.framer.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:size], EndHeaders: size == len(block)}); err != nil {
+	if err := w.data.framer.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:size], EndHeaders: size == len(block), EndStream: bodyless}); err != nil {
 		return err
 	}
 	for block = block[size:]; len(block) > 0; block = block[size:] {
@@ -121,6 +151,9 @@ func (w *controlWriter) writeResponse(id uint32, r *response) error {
 		if err := w.data.framer.WriteContinuation(id, size == len(block), block[:size]); err != nil {
 			return err
 		}
+	}
+	if bodyless {
+		return q.cancel(id)
 	}
 	return nil
 }
@@ -133,10 +166,25 @@ func (w *controlWriter) encodeResponseHead(r *response) error {
 	if r.status < 200 || r.status > 599 {
 		return errResponse
 	}
-	length := strconv.Itoa(len(r.body))
-	size := uint64(42 + len(length) + 32 + 14) // :status plus content-length.
+	var length string
+	if r.headBytes != 0 || !responseStatusAllowsBody(r.status) {
+		var err error
+		length, err = r.bodylessContentLength(header)
+		if err != nil {
+			return err
+		}
+	} else {
+		length = strconv.Itoa(len(r.body))
+	}
+	size := uint64(42) // :status
+	if length != "" {
+		size += uint64(len(length) + 32 + 14) // content-length
+	}
 	for name, values := range header {
 		name = strings.ToLower(name)
+		if name == "content-length" && r.status == http.StatusNoContent {
+			continue
+		}
 		if !validResponseHeader(name, values, length) {
 			return errResponse
 		}
@@ -154,8 +202,10 @@ func (w *controlWriter) encodeResponseHead(r *response) error {
 	if err := w.encoder.WriteField(hpack.HeaderField{Name: ":status", Value: strconv.Itoa(r.status)}); err != nil {
 		return err
 	}
-	if err := w.encoder.WriteField(hpack.HeaderField{Name: "content-length", Value: length}); err != nil {
-		return err
+	if length != "" {
+		if err := w.encoder.WriteField(hpack.HeaderField{Name: "content-length", Value: length}); err != nil {
+			return err
+		}
 	}
 	for name, values := range header {
 		name = strings.ToLower(name)
@@ -169,6 +219,41 @@ func (w *controlWriter) encodeResponseHead(r *response) error {
 		}
 	}
 	return nil
+}
+
+func responseStatusAllowsBody(status int) bool {
+	switch status {
+	case http.StatusNoContent, http.StatusResetContent, http.StatusNotModified:
+		return false
+	default:
+		return true
+	}
+}
+
+func (r *response) bodylessContentLength(header http.Header) (string, error) {
+	if r.status == http.StatusNoContent {
+		return "", nil
+	}
+	var length string
+	for name, values := range header {
+		if !strings.EqualFold(name, "content-length") {
+			continue
+		}
+		for _, value := range values {
+			size, valid := parseContentLength(value)
+			if !valid || length != "" && length != value {
+				return "", errResponse
+			}
+			if r.status == http.StatusResetContent && size != 0 {
+				return "", errResponse
+			}
+			length = value
+		}
+	}
+	if length == "" && r.headBytes > 0 && r.status != http.StatusNotModified {
+		length = strconv.Itoa(r.headBytes)
+	}
+	return length, nil
 }
 
 func validResponseHeader(name string, values []string, length string) bool {

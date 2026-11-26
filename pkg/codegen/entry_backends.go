@@ -18,8 +18,13 @@ type EntryBackends struct {
 
 // Validate rejects unsupported selections before any entry is emitted.
 func (selection EntryBackends) Validate(result *semantic.Result) error {
+	_, err := selection.validatedModules(result)
+	return err
+}
+
+func (selection EntryBackends) validatedModules(result *semantic.Result) ([]moduleInfo, error) {
 	if result == nil {
-		return fmt.Errorf("codegen: backend selection requires a semantic result")
+		return nil, fmt.Errorf("codegen: backend selection requires a semantic result")
 	}
 	for _, component := range []struct{ name, value, remote string }{
 		{"events", selection.Events, "nats"}, {"queue", selection.Queue, "nats"}, {"cache", selection.Cache, "redis"},
@@ -27,18 +32,18 @@ func (selection EntryBackends) Validate(result *semantic.Result) error {
 		switch component.value {
 		case "", "none", "memory", component.remote:
 		default:
-			return fmt.Errorf("codegen: unsupported %s backend %q", component.name, component.value)
+			return nil, fmt.Errorf("codegen: unsupported %s backend %q", component.name, component.value)
 		}
 	}
 	modules := collectModules(result)
 	events, _ := entryCapabilities(modules)
 	if events && !backendEnabled(selection.Events) {
-		return fmt.Errorf("codegen: events/streams require an explicit memory or nats build backend")
+		return nil, fmt.Errorf("codegen: events/streams require an explicit memory or nats build backend")
 	}
 	if modulesNeedCache(modules) && !backendEnabled(selection.Cache) {
-		return fmt.Errorf("codegen: @cache requires an explicit memory or redis build backend")
+		return nil, fmt.Errorf("codegen: @cache requires an explicit memory or redis build backend")
 	}
-	return nil
+	return modules, nil
 }
 
 func writeCacheBackendImport(b *strings.Builder, backend string) {
