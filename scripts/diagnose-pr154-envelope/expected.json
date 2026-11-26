@@ -1,0 +1,38 @@
+{
+  "Base": [
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkBinaryErrorEnvelope/basic/encode/after-2"
+    },
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkBinaryErrorEnvelope/basic/encode/before-2"
+    },
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkBinaryErrorEnvelope/structured/encode/after-2"
+    },
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkBinaryErrorEnvelope/structured/encode/before-2"
+    }
+  ],
+  "Head": [
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkBinaryErrorEnvelope/basic/encode/after-2"
+    },
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkBinaryErrorEnvelope/basic/encode/before-2"
+    },
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkBinaryErrorEnvelope/structured/encode/after-2"
+    },
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkBinaryErrorEnvelope/structured/encode/before-2"
+    }
+  ]
+}
