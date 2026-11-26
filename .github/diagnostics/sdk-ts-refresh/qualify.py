@@ -18,14 +18,15 @@ import time
 
 HERE = Path(__file__).resolve().parent
 BASE = "77b6cdf20d424213f4c1dc90534f924ac6b176d0"
+PREVIOUS_DIAGNOSTIC = "aa0b9310049d71759a7782d11f2a91329d420ac7"
 BASE_TREE = "9014a2b7a92f5b2abbb5aca10a6a9a7d0978955f"
-CANDIDATE_TREE = "94bce1ae9b638471cc12e0bae6635f5e2795afec"
+CANDIDATE_TREE = "5ff7b34b3726c0f30a33be879997031c8904c4e1"
 PACKAGE = "packages/client"
-PACKAGES = {"A": "7ea95baf91932060edad9d0dc86709ecabed060c", "B": "3c86a7c4750b0c503b9c6da245ab22673409a493"}
+PACKAGES = {"A": "7ea95baf91932060edad9d0dc86709ecabed060c", "B": "e021c74132f2ef910dd8579791562af3319a641b"}
 CHANGED = {"src/transport.ts", "src/transport.test.ts", "src/node-http2.test.ts"}
 LOCK_SHA = "5d79ad0e70739d9440004e80bc4217b7bc7a948dd29cd908ef4bb4e01761df6f"
 PACKAGE_SHA = "618e8dbef6fc1cedcb9fc7bfaf5f780a4437cc883f8a0692b2919313b492d409"
-PATCH_SHA = "753886bcf92a85c3f131dc4ce674c86890f5d505d9dcc1f09596e194751c9911"
+PATCH_SHA = "53773091cdb2772d23e30e7fffeb3b5ca0e8ffc564bdc6334a65b8f4ce283472"
 WORKER_SHAS = {
     "timing": "5832fbac2ea245a41d286c94235583a6a395cf49b3b588d47893e1009d3ed9ef",
     "allocation": "d6f326f266c8d97db89474c4b40de3894deebaf59016a074a3ea78cddc065e4f",
@@ -61,7 +62,13 @@ def git(repo, *args, index=None, data=None):
 
 def verify_checkout(repo):
     assert git(repo, "rev-parse", "HEAD").decode().strip() == os.environ["GITHUB_SHA"]
-    assert git(repo, "rev-parse", "HEAD^").decode().strip() == BASE
+    assert git(repo, "rev-parse", "HEAD^").decode().strip() == PREVIOUS_DIAGNOSTIC
+    assert git(repo, "rev-parse", "HEAD^^").decode().strip() == BASE
+    relative = HERE.relative_to(repo)
+    delta = git(repo, "diff", "--name-status", PREVIOUS_DIAGNOSTIC, "HEAD").decode().splitlines()
+    expected = {f"M\t{relative / name}" for name in ("qualify.py", "product.patch.b64")}
+    expected.add("M\t.github/workflows/sdk-ts-refresh-cost.yml")
+    assert set(delta) == expected, delta
     names = {str(HERE.relative_to(repo) / name) for name in
              ("qualify.py", "timing-worker.mjs", "allocation-worker.mjs", "product.patch.b64")}
     names.add(".github/workflows/sdk-ts-refresh-cost.yml")
