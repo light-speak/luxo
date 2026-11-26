@@ -340,8 +340,7 @@ func TestHelmGatewayDeployment(t *testing.T) {
 		"gateway",
 		"resources:",
 		"envFrom:",
-		"configMapRef:",
-		"secretRef:",
+		`include "luxo.environmentSources" . | nindent 12`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(dep, check) {
@@ -400,6 +399,7 @@ func TestHelmModuleDeployment(t *testing.T) {
 			"/health",
 			"resources:",
 			"envFrom:",
+			`include "luxo.environmentSources" . | nindent 12`,
 		}
 		for _, check := range checks {
 			if !strings.Contains(dep, check) {
@@ -434,13 +434,101 @@ func TestHelmModuleService_Ports(t *testing.T) {
 	}
 }
 
+func TestHelmDeploymentsAnnotateConfigurationRollout(t *testing.T) {
+	result := makeHelmResult("user", "post")
+	result.Files[0].Events = []*ast.EventDecl{{Name: "UserChanged"}}
+	chart := GenerateHelmFiles(result, "myapp")
+	for _, name := range []string{"gateway", "module-user", "module-post"} {
+		_, pod, ok := strings.Cut(string(chart.Files["templates/"+name+"-deployment.yaml"]), "\n  template:\n")
+		if !ok {
+			t.Fatalf("%s has no Pod template", name)
+		}
+		metadata, _, ok := strings.Cut(pod, "\n    spec:\n")
+		if !ok || !strings.Contains(metadata, `include "luxo.chartRolloutAnnotations" . | nindent 6`) {
+			t.Errorf("%s does not include rollout annotations in Pod metadata", name)
+		}
+	}
+	var values struct {
+		Secrets struct {
+			Revision *string `yaml:"revision"`
+		} `yaml:"secrets"`
+	}
+	if err := yaml.Unmarshal(chart.Files["values.yaml"], &values); err != nil {
+		t.Fatal(err)
+	}
+	if values.Secrets.Revision == nil || *values.Secrets.Revision != "" {
+		t.Fatal("secret revision must be documented and optional")
+	}
+	helpers := string(chart.Files["templates/_helpers.tpl"])
+	_, rollout, defined := strings.Cut(helpers, `{{- define "luxo.chartRolloutAnnotations" -}}`)
+	rollout, envSources, helperEnd := strings.Cut(rollout, `{{- define "luxo.environmentSources" -}}`)
+	if !defined || !helperEnd || !strings.Contains(rollout, `checksum/config: {{ include (print .Template.BasePath "/_helpers.tpl") . | trim | sha256sum | quote }}`) ||
+		!strings.Contains(rollout, `luxo/secret-revision: {{ . | quote }}`) || !strings.Contains(rollout, `{{- with .Values.secrets }}`) ||
+		!strings.Contains(rollout, `{{- with .revision }}`) {
+		t.Fatal("rollout must use public configuration checksum and optional Secret revision")
+	}
+	envSources, _, helperEnd = strings.Cut(envSources, "{{- end }}")
+	if !helperEnd || !strings.Contains(envSources, "configMapRef:") || !strings.Contains(envSources, "secretRef:") {
+		t.Fatal("deployment containers must share the ConfigMap and Secret envFrom references")
+	}
+	public := helmPublicConfigurationBody(t, helpers)
+	if !strings.Contains(public, "DATABASE_HOST:") || strings.Contains(public, "NATS_URL") ||
+		strings.Contains(public, ".Values.database.user") || strings.Contains(public, ".Values.database.password") {
+		t.Fatal("the shared checksum input must contain public settings and exclude credentials")
+	}
+	configMap := string(chart.Files["templates/configmap.yaml"])
+	if !strings.Contains(configMap, `include (print .Template.BasePath "/_helpers.tpl") . | trim | nindent 2`) || !strings.Contains(configMap, "NATS_URL:") {
+		t.Fatal("legacy ConfigMap must retain its URL outside the shared public configuration")
+	}
+}
+
+func helmPublicConfigurationBody(t *testing.T, helpers string) string {
+	t.Helper()
+	_, public, found := strings.Cut(helpers, "\nDATABASE_DRIVER:")
+	public, _, end := strings.Cut(public, `{{- define "luxo.chartRolloutAnnotations" -}}`)
+	if !found || !end {
+		t.Fatal("the chart-local public configuration must precede the shared rollout helper")
+	}
+	return "DATABASE_DRIVER:" + public
+}
+
+func TestHelmPublicConfigurationKeepsChartAndLegacyHelpersIndependent(t *testing.T) {
+	for _, module := range []string{"user", "post"} {
+		chart := GenerateHelmFiles(makeHelmResult(module), module)
+		helpers := string(chart.Files["templates/_helpers.tpl"])
+		if strings.Contains(helpers, `define "luxo.publicConfiguration"`) ||
+			strings.Contains(helpers, `define "luxo.rolloutAnnotations"`) {
+			t.Fatal("a new chart can override an older chart's shared public templates")
+		}
+		data := helmPublicConfigurationBody(t, helpers)
+		if !strings.Contains(data, strings.ToUpper(module)+"_SERVICE_ADDR:") || strings.Count(data, "_SERVICE_ADDR:") != 1 {
+			t.Fatalf("public configuration must have only this chart's service address: %s", data)
+		}
+	}
+}
+
+func TestHelmHelpersSizeMatchesTemplates(t *testing.T) {
+	for _, modules := range [][]moduleInfo{
+		{{name: "module001"}},
+		{{name: "user"}, {name: "dotless-ı"}, {name: "latin-ɜ"}},
+	} {
+		got := len(generateHelpers(modules))
+		if predicted := helmHelpersSize(modules); predicted != got {
+			t.Errorf("helpers size = %d, want %d emitted bytes", predicted, got)
+		}
+	}
+}
+
 func TestHelmConfigMap_ServiceDiscovery(t *testing.T) {
 	result := makeHelmResult("user", "post")
 	helm := GenerateHelmFiles(result, "myapp")
 
 	cm := string(helm.Files["templates/configmap.yaml"])
+	if !strings.Contains(cm, "kind: ConfigMap") || !strings.Contains(cm, `include (print .Template.BasePath "/_helpers.tpl") . | trim | nindent 2`) {
+		t.Fatal("ConfigMap must consume the shared configuration")
+	}
+	data := helmPublicConfigurationBody(t, string(helm.Files["templates/_helpers.tpl"]))
 	checks := []string{
-		"kind: ConfigMap",
 		"DATABASE_DRIVER:",
 		"DATABASE_HOST:",
 		"DATABASE_PORT:",
@@ -452,12 +540,12 @@ func TestHelmConfigMap_ServiceDiscovery(t *testing.T) {
 		".Values.modules.post.rpcPort",
 	}
 	for _, check := range checks {
-		if !strings.Contains(cm, check) {
+		if !strings.Contains(data, check) {
 			t.Errorf("configmap.yaml missing %q", check)
 		}
 	}
 	// Ensure no hardcoded :9000
-	if strings.Contains(cm, ":9000") {
+	if strings.Contains(data, ":9000") {
 		t.Error("configmap.yaml should not have hardcoded :9000")
 	}
 }

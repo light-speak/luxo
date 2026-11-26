@@ -92,6 +92,12 @@ func writeLuviaBenchmarkOverlay(pkg, workspace string) (string, error) {
 	return writeTestOverlay(workspace, replacements)
 }
 
+const apiBinaryParamLookupFixture = "binary_param_lookup_test.go"
+
+func writeAPIBinaryParamLookupOverlay(pkg, workspace string) (string, error) {
+	return retainBenchmarkTestFiles(pkg, workspace, "API binary parameter lookup", apiBinaryParamLookupFixture)
+}
+
 func writeAPILocalRouteExportOverlay(pkg, workspace string) (string, error) {
 	return retainBenchmarkTestFiles(pkg, workspace, "API local route export", "local_input_bench_test.go")
 }

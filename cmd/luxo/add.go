@@ -46,6 +46,17 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	if moduleName == "." || !filepath.IsLocal(moduleName) || strings.ContainsAny(moduleName, "/\\\x00\r\n") || !utf8.ValidString(moduleName) {
 		return fmt.Errorf("invalid module name %q: expected one non-empty UTF-8 path component without line breaks / 模块名必须是非空UTF-8路径片段且不能换行", moduleName)
 	}
+	if !validScaffoldModuleName(moduleName) {
+		return fmt.Errorf("invalid module name %q: use ASCII letters or underscores, with digits after the first character, and avoid the lone underscore / 模块名须以 ASCII 字母或下划线开头，后续可含数字，且不能仅为下划线", moduleName)
+	}
+
+	switch moduleName {
+	case "internal", "vendor":
+		return fmt.Errorf("invalid module name %q: reserved Go import path component / 模块名 %q 是 Go 保留的导入路径片段", moduleName, moduleName)
+	}
+	if err := codegen.ValidateModuleScaffoldModelName(moduleName); err != nil {
+		return fmt.Errorf("invalid module name %q / 无效的模块名 %q: %w", moduleName, moduleName, err)
+	}
 
 	// Must be inside a Luxo project (has go.mod)
 	modulePath, err := readModulePath()
@@ -59,6 +70,22 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	}
 	printAddedModule(moduleName, paths)
 	return nil
+}
+
+// The name is emitted in both a Go import path and a Luxo model identifier.
+func validScaffoldModuleName(name string) bool {
+	if name == "" || name == "_" {
+		return false
+	}
+	for index := range len(name) {
+		ch := name[index]
+		switch {
+		case ch == '_', ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', index > 0 && ch >= '0' && ch <= '9':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func writeModuleScaffold(modulePath, moduleName string) ([]string, error) {

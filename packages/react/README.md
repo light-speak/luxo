@@ -140,11 +140,14 @@ const { mutate, loading, error, reset } = useLuxoMutation(
 
 This example assumes `createProject(name: String)` returns a project with `id` and `name`. Mutations are never deduplicated or cached. `loading` remains true until every concurrent mutation settles. `invalidateQueries` accepts static keys or a function derived from the mutation result. The hook names describe React execution behavior; Luxo does not split its API protocol into GraphQL query/mutation operation types.
 
+`mutate` resolves with the write result once success handling finishes. The hook attempts invalidation after `onSuccess` settles, including when the callback fails. Callback and invalidation failures are exposed through `postSuccessError`, with both errors available on an `AggregateError` if both steps fail. Refetch errors remain available on the corresponding query.
+
 | Return | Type | Description |
 |--------|------|-------------|
 | `mutate` | `(params) => Promise<T>` | Execute the mutation |
 | `loading` | `boolean` | `true` during mutation |
-| `error` | `Error \| null` | Error if mutation failed |
+| `error` | `Error \| null` | Error if the write failed |
+| `postSuccessError` | `Error \| null` | Error in `onSuccess` or invalidation after a successful write |
 | `reset` | `() => void` | Clear error state |
 
 ### `QueryClient`
@@ -166,6 +169,8 @@ queryClient.setQueryData(['project', id], updatedProject)
 ```
 
 Supported operations include `fetchQuery`, `prefetchQuery`, `getQueryData`, `getQueryState`, `setQueryData`, `invalidateQueries`, `cancelQueries`, `removeQueries`, and `clear`.
+
+Invalidation retires any matching in-flight read before subscribed hooks refetch. Hooks with the same key share the replacement read, and a retired read cannot update the cache. A batch of overlapping filters invalidates each matching key once.
 
 ### `LuxoProvider` + `useLuxoClient` + `useQueryClient`
 

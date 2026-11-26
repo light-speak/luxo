@@ -446,10 +446,14 @@ private object HTTPTokenRefreshScope : CoroutineScope {
     override val coroutineContext: CoroutineContext = EmptyCoroutineContext
 }
 
-internal class HTTPTokenRefresh(context: CoroutineContext, callback: suspend () -> String?) {
+internal class HTTPTokenRefresh(context: CoroutineContext, callback: suspend () -> String?) :
+    CoroutineContext.Element, CoroutineContext.Key<HTTPTokenRefresh> {
+    // Distinct keys retain ancestor flights when a callback refreshes another transport.
+    override val key: CoroutineContext.Key<*> get() = this
+
     val outcome = CompletableDeferred<Result<String?>>()
     // The refresh belongs to its waiters, not to the caller that happened to start it.
-    val worker = HTTPTokenRefreshScope.launch(context.minusKey(Job), start = CoroutineStart.LAZY) {
+    val worker = HTTPTokenRefreshScope.launch(context.minusKey(Job) + this, start = CoroutineStart.LAZY) {
         outcome.complete(runCatching {
             val token = callback()
             currentCoroutineContext().ensureActive()
@@ -646,9 +650,12 @@ class OkHttpTransport(
         val refresh = synchronized(refreshLock) {
             val current = currentHeaders
             if (current.session !== headers.session) return false
-            val active = headers.refresh ?: HTTPTokenRefresh(context, callback).also { headers.refresh = it }
-            active.waiters++
-            active
+            val active = headers.refresh
+            // A callback's own unauthorized request cannot await its callback's outcome.
+            if (active != null && !active.outcome.isCompleted && context[active] === active) return false
+            val flight = active ?: HTTPTokenRefresh(context, callback).also { headers.refresh = it }
+            flight.waiters++
+            flight
         }
         try {
             refresh.worker.start()
