@@ -6,6 +6,7 @@ on:
       - diagnostics/pr78-shutdown-7763
       - diagnostics/pr78-shutdown-9v45
       - diagnostics/pr78-shutdown-6975
+      - diagnostics/pr78-shutdown-native
 
 permissions:
   contents: read
@@ -25,11 +26,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          lane="${GITHUB_REF_NAME#diagnostics/pr78-shutdown-}"
-          expected=$(python3 scripts/diagnose-pr78-shutdown/verify.py model "$lane")
           actual=$(LC_ALL=C lscpu | awk -F: '$1 == "Model name" {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2}')
+          lane="${GITHUB_REF_NAME#diagnostics/pr78-shutdown-}"
+          if [[ "$lane" == native ]]; then
+            case "$actual" in
+              'AMD EPYC 7763 64-Core Processor') lane=7763 ;;
+              'AMD EPYC 9V45 96-Core Processor') lane=9v45 ;;
+              'Intel(R) Xeon(R) 6975P-C') lane=6975 ;;
+              *) lane=unmatched ;;
+            esac
+          fi
           matched=false
-          if [[ "$(uname -sm)" == 'Linux x86_64' && "$actual" == "$expected" ]]; then matched=true; fi
+          expected='a processor with a pinned PR 78 comparison'
+          if [[ "$lane" != unmatched ]]; then
+            expected=$(python3 scripts/diagnose-pr78-shutdown/verify.py model "$lane")
+            if [[ "$(uname -sm)" == 'Linux x86_64' && "$actual" == "$expected" ]]; then matched=true; fi
+          fi
           mkdir -p ".tmp/pr78-shutdown-evidence-$lane"
           printf 'lane=%s\nactual=%s\nexpected=%s\nmatch=%s\n' "$lane" "$actual" "$expected" "$matched" |
             tee ".tmp/pr78-shutdown-evidence-$lane/routing.txt"
