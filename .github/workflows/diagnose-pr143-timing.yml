@@ -1,0 +1,84 @@
+name: Diagnose PR 143 timing on the original processor
+
+on:
+  push:
+    branches: [diagnostics/pr143-timing]
+  workflow_dispatch:
+    inputs:
+      lane:
+        type: choice
+        options: [auto, codegen, rpc]
+        default: auto
+        description: Benchmark CPU lane
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr143-timing'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Match an original processor
+        id: route
+        env:
+          REQUESTED_LANE: ${{ inputs.lane || 'auto' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/pr143-timing-evidence
+          actual=$(LC_ALL=C lscpu | sed -n 's/^Model name:[[:space:]]*//p')
+          lane=unmatched
+          for candidate in codegen rpc; do
+            IFS=$'\t' read -r _ _ expected < <(bash scripts/diagnose-pr143-timing/run.sh "$candidate" --artifact)
+            if [[ "$actual" == "$expected" && "$(uname -sm)" == 'Linux x86_64' ]] &&
+               [[ "$REQUESTED_LANE" == auto || "$REQUESTED_LANE" == "$candidate" ]]; then
+              lane="$candidate"
+            fi
+          done
+          printf 'requested=%s\nactual=%s\nlane=%s\n' "$REQUESTED_LANE" "$actual" "$lane" > .tmp/pr143-timing-evidence/routing.txt
+          printf 'lane=%s\n' "$lane" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v7
+        if: steps.route.outputs.lane != 'unmatched'
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Replay the exact benchmark originals
+        if: steps.route.outputs.lane != 'unmatched'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LANE: ${{ steps.route.outputs.lane }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=f9ce659fd7f17bf57cfe0aee7de7ecb8d9b8f2e4
+          head=1b6c73bd67a781beb9e8b783cc7f8f631bf1276e
+          output="$PWD/.tmp/pr143-timing-evidence"
+          scratch=$(mktemp -d "$PWD/.tmp/pr143-timing-input.XXXXXXXX")
+          trap 'rm -rf -- "$scratch"' EXIT
+          git fetch --no-tags --depth=1 origin "$base" "$head"
+          IFS=$'\t' read -r id digest _ < <(bash scripts/diagnose-pr143-timing/run.sh "$LANE" --artifact)
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/45752445232/attempts/1" > "$scratch/run.json"
+          jq -e --arg head "$head" '.id == 45752445232 and .run_attempt == 1 and .head_sha == $head and .event == "workflow_dispatch"' "$scratch/run.json" > /dev/null
+          resource="repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+          gh api "$resource" > "$output/original-artifact.json"
+          jq -e --arg sha "sha256:$digest" '.digest == $sha and (.expired | not) and .workflow_run.id == 45752445232' "$output/original-artifact.json" > /dev/null
+          gh api "$resource/zip" > "$scratch/original.zip"
+          bash scripts/diagnose-pr143-timing/run.sh "$LANE" "$PWD" "$scratch/original.zip" "$output"
+      - name: Preserve source, workload and timing evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: pr143-timing-${{ steps.route.outputs.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr143-timing-evidence/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Mark an unmatched runner
+        if: always() && steps.route.outputs.lane == 'unmatched'
+        run: exit 3
