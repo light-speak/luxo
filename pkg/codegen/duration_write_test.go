@@ -1,6 +1,21 @@
 package codegen
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestGeneratedDurationWriteUsesPostgresIsolation(t *testing.T) {
+	dir := writeProtocolFixture(t, "package generated\n", durationWriteAssertions)
+	fixture, err := os.ReadFile(filepath.Join(dir, "postgres_fixture_test.go"))
+	if err != nil {
+		t.Fatalf("duration write fixture does not install PostgreSQL isolation: %v", err)
+	}
+	if string(fixture) != protocolPostgresFixture {
+		t.Fatal("duration write fixture must use the shared PostgreSQL isolation")
+	}
+}
 
 func TestGeneratedDurationWritePrecision(t *testing.T) {
 	runGeneratedFixture(t, `
@@ -24,6 +39,7 @@ import (
  "errors"
  "net"
  "net/http/httptest"
+ "os"
  "testing"
  "time"
  "github.com/jackc/pgx/v5"
@@ -40,9 +56,12 @@ import (
  "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 func TestDurationWritePrecision(t *testing.T) {
- container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
- testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
- connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+ connection:=os.Getenv("LUXO_TEST_DATABASE_URL")
+ if connection==""{
+  container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+  testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
+  connection,err=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+ }
  db,err:=pg.NewDB(t.Context(),connection);if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
  if _,err:=pg.Exec(t.Context(),db,"CREATE TABLE readings(id bigint PRIMARY KEY,elapsed interval NOT NULL,optional_elapsed interval,laps interval[] NOT NULL,optional_laps interval[])");err!=nil{t.Fatal(err)}
  for _,mode:=range []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement,pgx.QueryExecModeCacheDescribe,pgx.QueryExecModeDescribeExec,pgx.QueryExecModeExec,pgx.QueryExecModeSimpleProtocol}{
