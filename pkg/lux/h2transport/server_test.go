@@ -35,9 +35,12 @@ func TestCandidateStandardClient(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ln) }()
 	t.Cleanup(func() {
-		_ = s.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := s.Shutdown(ctx); err != nil {
+			t.Error(err)
+		}
 		<-done
-		s.workers.Wait()
 		if s.budget.used.Load() != 0 || s.streams.used.Load() != 0 {
 			t.Error("closed server leaked resource budget")
 		}
@@ -104,7 +107,7 @@ func TestServeContinuesAfterConnectionLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { cancel(); _ = s.Close(); s.workers.Done() }()
+	defer func() { cancel(); _ = s.Close(); s.retireConnection(first) }()
 	accepts := 0
 	listener := &scriptedListener{accept: func() (net.Conn, error) {
 		accepts++
