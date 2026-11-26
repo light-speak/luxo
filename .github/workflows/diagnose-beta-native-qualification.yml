@@ -13,7 +13,7 @@ jobs:
     if: github.repository == 'light-speak/luxo'
     name: native allocation ${{ matrix.allocation }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -38,11 +38,6 @@ jobs:
             exit 3
           fi
           case "$actual" in
-            'Intel(R) Xeon(R) 6975P-C')
-              lane=allocation
-              ref=36b9d02e9080f7f12eb5e8ba6ccca89247915b7e
-              depth=1
-              ;;
             'AMD EPYC 9V45 96-Core Processor')
               lane=codegen
               ref=28339729c6bcd4d4248743e202258d54c9c7b0b7
@@ -53,7 +48,10 @@ jobs:
               ref=8250b2ab76706e28fce4afe4ce23a37638526b9a
               depth=4
               ;;
-            *) exit 3 ;;
+            *)
+              printf 'lane=unmatched\n' >> "$evidence/routing.txt"
+              exit 3
+              ;;
           esac
           printf 'lane=%s\nref=%s\ndepth=%s\n' "$lane" "$ref" "$depth" | tee -a "$evidence/routing.txt" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
@@ -72,7 +70,6 @@ jobs:
           test "$(git rev-parse HEAD)" = "$PINNED_REF"
           route="$RUNNER_TEMP/beta-native-qualification"
           case "$LANE" in
-            allocation) evidence=.tmp/pr143-allocation-evidence-6975 ;;
             codegen) evidence=.tmp/pr143-timing-evidence ;;
             dart) evidence=.tmp/dart-http-refresh-evidence ;;
             *) exit 3 ;;
@@ -85,17 +82,8 @@ jobs:
           else
             cp "$route/routing.txt" "$evidence/routing.txt"
           fi
-      - uses: actions/checkout@v7
-        if: steps.route.outputs.lane == 'allocation'
-        with:
-          ref: ${{ github.sha }}
-          path: controller
-          fetch-depth: 1
-          persist-credentials: false
-          sparse-checkout: .github/diagnostics/pr143-allocation-q2.patch.b64
-          sparse-checkout-cone-mode: false
       - uses: actions/setup-go@v7
-        if: steps.route.outputs.lane != 'dart'
+        if: steps.route.outputs.lane == 'codegen'
         with:
           go-version: '1.27.1'
           cache: false
@@ -124,42 +112,6 @@ jobs:
             --repo "$PWD" --scratch "$PWD/.tmp" \
             --evidence "$PWD/.tmp/dart-http-refresh-evidence" \
             | tee .tmp/dart-http-refresh-evidence/setup.jsonl
-      - name: Verify and replay all ten original allocation leaves with Q2
-        if: steps.route.outputs.lane == 'allocation'
-        working-directory: readiness
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          LUXO_NATIVE_DIAGNOSTIC: pr143-allocation
-          LC_ALL: C
-          GOTOOLCHAIN: local
-          CGO_ENABLED: '1'
-          GOAMD64: v1
-          Q2_TREE: b1e8c5c89474ea75834b265602595022e0ecbe5d
-          Q2_PATCH_SHA: a498c3de5284f3c43eedf4886da909d8aa35f204d3f15b8a1a82506e268bcb42
-        run: |
-          set -euo pipefail
-          controller="$GITHUB_WORKSPACE/controller"
-          test "$(git -C "$controller" rev-parse HEAD)" = "$GITHUB_SHA"
-          candidate="$controller/.github/diagnostics/pr143-allocation-q2.patch.b64"
-          base64 --decode "$candidate" | sha256sum -c <(printf '%s  -\n' "$Q2_PATCH_SHA")
-          driver=scripts/diagnose-pr143-allocation
-          cp "$candidate" "$driver/entry-allocation.patch.b64"
-          printf 'head_tree=%s\npatch_sum=%s\n' "$Q2_TREE" "$Q2_PATCH_SHA" >> "$driver/settings.sh"
-          source "$driver/settings.sh"
-          git fetch --no-tags --depth=1 origin "$product_base" "$patch_parent_commit" cbf4cfb383d944ceb38f700e19cf79c4c54d3c58
-          scratch=$(mktemp -d "$PWD/.tmp/pr143-allocation-input.XXXXXXXX")
-          trap 'rm -rf -- "$scratch"' EXIT
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/45752445232/attempts/1" --jq \
-            '{id,event,run_attempt,head_sha,pull_requests:[.pull_requests[]|{number,head:.head.sha,base:.base.sha}]}' > "$scratch/run.json"
-          python3 -B scripts/diagnose-pr143-allocation/verify.py artifacts 6975 > "$scratch/refs.tsv"
-          while IFS=$'\t' read -r shard artifact digest; do
-            resource="repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact"
-            gh api "$resource" > "$scratch/$shard.json"
-            jq -e --arg sha "sha256:$digest" '.digest == $sha and (.expired | not)' "$scratch/$shard.json" > /dev/null
-            gh api "$resource/zip" > "$scratch/$shard.zip"
-          done < "$scratch/refs.tsv"
-          bash scripts/diagnose-pr78-shutdown/run.sh 6975 "$scratch"
       - name: Replay the exact benchmark originals
         if: steps.route.outputs.lane == 'codegen'
         working-directory: readiness
@@ -236,6 +188,63 @@ jobs:
             gh api "$resource/zip" > "$inputs/$shard.zip"
           done < "$inputs/refs.tsv"
           bash scripts/diagnose-pr78-shutdown/run.sh "$H2_LANE" "$inputs"
+      - uses: actions/checkout@v7
+        id: logging_checkout
+        if: ${{ !cancelled() && steps.route.outputs.lane == 'codegen' }}
+        with:
+          ref: a053c33060c66d5612282d8f1bec8b8ce9bd2b4a
+          path: logging
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Prepare the pinned request logging checkout
+        id: logging_ready
+        if: ${{ !cancelled() && steps.route.outputs.lane == 'codegen' && steps.logging_checkout.outcome == 'success' }}
+        working-directory: logging
+        env:
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = a053c33060c66d5612282d8f1bec8b8ce9bd2b4a
+          expected=$(python3 -B scripts/diagnose-pr83-f9/verify.py model 9v45)
+          actual=$(sed -n 's/^Model name:[[:space:]]*//p' "$RUNNER_TEMP/beta-native-qualification/lscpu.txt")
+          test "$actual" = "$expected"
+          evidence=.tmp/pr83-f9-evidence-9v45
+          mkdir -p "$evidence"
+          printf 'actual=%s\nexpected=%s\nmatch=true\n' "$actual" "$expected" > "$evidence/routing.txt"
+      - name: Recheck PR 83 and its original failing workloads
+        if: ${{ !cancelled() && steps.route.outputs.lane == 'codegen' && steps.logging_ready.outcome == 'success' }}
+        working-directory: logging
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LUXO_NATIVE_DIAGNOSTIC: pr83-f9
+          LC_ALL: C
+          GOTOOLCHAIN: local
+          CGO_ENABLED: '1'
+          GOAMD64: v1
+        run: |
+          set -euo pipefail
+          source scripts/diagnose-pr83-f9/settings.sh
+          sampler=cbf4cfb383d944ceb38f700e19cf79c4c54d3c58
+          for revision in "$product_base" "$sampler"; do
+            git cat-file -e "$revision^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$revision"
+          done
+          inputs=$(mktemp -d "$PWD/.tmp/pr83-f9-input.XXXXXXXX")
+          trap 'rm -rf -- "$inputs"' EXIT
+          run_metadata() {
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$1" --jq \
+              '{id,event,run_attempt,head_sha,pull_requests:[.pull_requests[]|{number,head:.head.sha,base:.base.sha}]}'
+          }
+          run_metadata 45219367507 > "$inputs/run.json"
+          run_metadata 45242193591 > "$inputs/diag-run.json"
+          python3 -B scripts/diagnose-pr83-f9/verify.py artifacts 9v45 > "$inputs/refs.tsv"
+          while IFS=$'\t' read -r shard artifact digest; do
+            resource="repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact"
+            gh api "$resource" > "$inputs/$shard.json"
+            jq -e --arg sha "sha256:$digest" '.digest == $sha and (.expired | not)' "$inputs/$shard.json" > /dev/null
+            gh api "$resource/zip" > "$inputs/$shard.zip"
+          done < "$inputs/refs.tsv"
+          bash scripts/diagnose-pr78-shutdown/run.sh 9v45 "$inputs"
       - name: Preserve the routing, samples and controls
         if: always()
         uses: actions/upload-artifact@v7.0.2
@@ -243,9 +252,9 @@ jobs:
           name: beta-native-pending-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.allocation }}
           path: |
             ${{ runner.temp }}/beta-native-qualification/
-            readiness/.tmp/pr143-allocation-evidence-6975/
             readiness/.tmp/pr143-timing-evidence/
             readiness/.tmp/dart-http-refresh-evidence/
             shutdown/.tmp/pr78-shutdown-evidence-9v45/
+            logging/.tmp/pr83-f9-evidence-9v45/
           if-no-files-found: error
           retention-days: 14
