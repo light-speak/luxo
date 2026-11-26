@@ -22,11 +22,11 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-PARENT = 'af9a2e7ab9dace32a83cebf6012c391abfab6814'
+PARENT = '5fec0b0e892de8f0697dfb19aba04718140c60c4'
 BASE = '15765dee6705d39de0b5a505d3039d59ebf43584'
 BASE_TREE = '75aebe5bd2fa6b45a1c614ace1a816ebc63e4c0a'
-ARMS = {'P': BASE_TREE, 'Q': '4f614ddcbec5f64701ad45ef57e8715189a5de8b'}
-PATCHES = {'Q': (BASE_TREE, '7cfd9d84efb6ea0abaa373358b9dddbdc21a8378817094f742109b4918eb473a')}
+ARMS = {'P': BASE_TREE, 'Q': 'c20138cf4a7c0b7f71942298abe66439f2427400'}
+PATCHES = {'Q': (BASE_TREE, 'c098ffd6cd6ac36f21883f56617ffc833df8178fd8abf4c56976a5f0e2efd85d')}
 LEAVES = {
     "first-query": {"cold-open-ping-up", "already-used-pool-up", "warm-read-only-holder-up", "used-holder-first-reuse-up"},
     "standalone": {"ordinary/up", "ordinary/up-existing", "concurrent/up", "concurrent/down"},
