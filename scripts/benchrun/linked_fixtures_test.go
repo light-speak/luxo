@@ -169,6 +169,34 @@ func TestLuviaAuthMiddlewareOverlayRejectsNonregularFixture(t *testing.T) {
 	}
 }
 
+func TestLuviaAuthMiddlewareOverlayReportsUnreadableFixtures(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read fixtures without permission bits")
+	}
+	for _, fixture := range []string{luviaAuthBenchmarkFixture, luviaAuthHelperFixture} {
+		t.Run(fixture, func(t *testing.T) {
+			root := newBenchmarkRunTree(t)
+			relative := filepath.Join(benchlayout.LuviaPackage, fixture)
+			writeBenchmarkRunFixture(t, root, relative, "package luvia")
+			filename := filepath.Join(root, relative)
+			if err := os.Chmod(filename, 0); err != nil {
+				t.Fatal(err)
+			}
+			_, cleanup, err := compileOverlay(root, benchlayout.LuviaPackage, false, benchlayout.LuviaAuthMiddlewareProfile)
+			if cleanup != nil {
+				defer func() {
+					if err := cleanup(); err != nil {
+						t.Error(err)
+					}
+				}()
+			}
+			if !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("unreadable fixture returned %v, want permission error", err)
+			}
+		})
+	}
+}
+
 func TestLuviaAuthMiddlewareOverlayRejectsChangedWorkload(t *testing.T) {
 	const pkg = "pkg/lux/luvia"
 	const profile = "luvia-auth-middleware"
