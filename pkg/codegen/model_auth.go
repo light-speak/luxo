@@ -137,7 +137,7 @@ func writeAuthClaims(b *strings.Builder, m *ast.ModelDecl, fields []*ast.FieldDe
 	for i, field := range fields {
 		fmt.Fprintf(b, "\nfunc (%s *%s) appendClaim%d(w *errors.DataWriter) {\n", recv, m.Name, i)
 		b.WriteString("\tif w.Err() != nil { return }\n")
-		writer.writeValue(b, field.Type, recv+"."+str.Capitalize(field.Name), isRelationField(field, writer.enums), false, "\t")
+		writer.writeValue(b, field.Type, recv+"."+str.Capitalize(field.Name), isRelationField(field, writer.enums), false, "\t", nil)
 		b.WriteString("}\n")
 	}
 }

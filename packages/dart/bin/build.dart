@@ -1,7 +1,9 @@
 /// Executes a Dart entry point from an isolated, call-site-transformed snapshot.
 import 'dart:io';
-import 'dart:async';
 
+import 'package:luxo_client/src/builder/artifact_publish.dart';
+import 'package:luxo_client/src/builder/dart_program.dart';
+import 'package:luxo_client/src/builder/native_uri.dart';
 import 'package:luxo_client/src/builder/selection_build.dart';
 
 Future<void> main(List<String> arguments) async {
@@ -20,13 +22,17 @@ Future<void> main(List<String> arguments) async {
         entry.pathSegments.contains('..')) {
       throw ArgumentError('Entry must be a project-relative Dart file');
     }
-    final file = File.fromUri(build.directory.uri.resolveUri(entry));
+    final file = File.fromUri(
+      nativeFileUri(build.directory.uri.resolveUri(entry)),
+    );
     if (!file.path.endsWith('.dart') || !await file.exists()) {
       throw ArgumentError('Dart entry does not exist: ${options.entry}');
     }
     exitCode = options.compile == null
-        ? await _run(build, [file.path, ...options.arguments])
+        ? await _launch(build, file, options.arguments)
         : await _compile(build, file, options.output!);
+  } on DartCompilerExit catch (failure) {
+    exitCode = failure.status;
   } catch (error) {
     stderr.writeln('[luxo] $error');
     exitCode = 1;
@@ -35,47 +41,54 @@ Future<void> main(List<String> arguments) async {
   }
 }
 
-Future<int> _run(SelectionBuild build, List<String> arguments) async {
-  final child = await Process.start(
-    Platform.resolvedExecutable,
-    arguments,
-    workingDirectory: build.directory.path,
-    mode: ProcessStartMode.inheritStdio,
+Future<int> _run(SelectionBuild build, List<String> arguments) =>
+    withDartProcess(
+      Platform.resolvedExecutable,
+      arguments,
+      build.directory,
+      ProcessStartMode.inheritStdio,
+      (child) => child.exitCode,
+    );
+
+Future<int> _launch(
+  SelectionBuild build,
+  File entry,
+  List<String> arguments,
+) async {
+  final kernel = await compileVerifiedDartProgram(
+    build.directory,
+    entry,
+    aot: false,
   );
-  final signals = <StreamSubscription<ProcessSignal>>[];
-  if (!Platform.isWindows) {
-    for (final signal in [ProcessSignal.sigint, ProcessSignal.sigterm]) {
-      signals.add(signal.watch().listen((signal) => child.kill(signal)));
-    }
-  }
-  try {
-    return await child.exitCode;
-  } finally {
-    for (final signal in signals) {
-      await signal.cancel();
-    }
-  }
+  return _run(build, [
+    '--script-uri-override=${entry.uri}',
+    kernel.uri.toString(),
+    ...arguments,
+  ]);
 }
 
 Future<int> _compile(SelectionBuild build, File entry, String output) async {
   final destination = await build.prepareOutput(output);
-  final artifact = File('${build.directory.path}/.tmp/luxo-release');
-  await artifact.parent.create(recursive: true);
-  final status = await _run(build, [
-    'compile',
-    'exe',
-    entry.path,
-    '-o',
-    artifact.path,
-  ]);
-  if (status == 0) {
-    if (await FileSystemEntity.type(destination.path, followLinks: false) !=
-        FileSystemEntityType.notFound) {
-      throw StateError('Output appeared during compilation: $output');
-    }
-    await artifact.rename(destination.path);
+  try {
+    final artifact = File('${build.directory.path}/.tmp/luxo-release');
+    await artifact.parent.create(recursive: true);
+    final kernel = await compileVerifiedDartProgram(
+      build.directory,
+      entry,
+      aot: true,
+    );
+    final status = await _run(build, [
+      'compile',
+      'exe',
+      kernel.path,
+      '-o',
+      artifact.path,
+    ]);
+    if (status == 0) publishBuildArtifact(artifact, destination);
+    return status;
+  } finally {
+    destination.close();
   }
-  return status;
 }
 
 ({

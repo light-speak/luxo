@@ -10,14 +10,19 @@ func (a *Analyzer) checkIsolatedLoopBlock(block *ast.Block, scope *Scope) {
 }
 
 func (a *Analyzer) checkAsyncExpr(expr *ast.AsyncExpr, scope *Scope) *ResolvedType {
-	if a.asyncResult == nil {
-		a.asyncResult = &ResolvedType{Kind: TypeVoid, Name: "Void"}
-	}
+	result := a.voidResultType()
 	previous := a.expectedReturn
-	a.expectedReturn = a.asyncResult
+	a.expectedReturn = result
 	a.checkIsolatedLoopBlock(expr.Body, scope.Child())
 	a.expectedReturn = previous
-	return a.asyncResult
+	return result
+}
+
+func (a *Analyzer) voidResultType() *ResolvedType {
+	if a.voidResult == nil {
+		a.voidResult = &ResolvedType{Kind: TypeVoid, Name: "Void"}
+	}
+	return a.voidResult
 }
 
 // A branch block has its own return boundary. Its result is the first

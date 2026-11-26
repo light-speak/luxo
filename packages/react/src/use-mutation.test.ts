@@ -2,8 +2,9 @@
 
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
-import { QueryClient } from './query-client'
+import { QueryClient, type QueryFunctionContext } from './query-client'
 import { useLuxoMutation } from './use-mutation'
+import { useLuxoQuery } from './use-query'
 
 describe('useLuxoMutation', () => {
   it('preserves int64 mutation inputs, results and invalidation keys', async () => {
@@ -63,6 +64,115 @@ describe('useLuxoMutation', () => {
 
     await act(async () => { await result.current.mutate(9) })
     expect(events).toEqual(['success', 'invalidated'])
+  })
+
+  it.each(['throw', 'reject'] as const)('resolves a saved mutation and refreshes active queries when onSuccess can %s', async kind => {
+    const queryClient = new QueryClient({ staleTime: Infinity, gcTime: Infinity })
+    const queryKey = ['tickets']
+    let tickets = 1
+    queryClient.setQueryData(queryKey, tickets)
+    const queryFn = vi.fn(async () => tickets)
+    const telemetryError = new Error('telemetry unavailable')
+    const mutationFn = vi.fn(async () => ++tickets)
+    const { result } = renderHook(() => ({
+      list: useLuxoQuery(queryFn, [], { queryClient, queryKey }),
+      mutation: useLuxoMutation(mutationFn, {
+        queryClient,
+        onSuccess: () => {
+          if (kind === 'throw') throw telemetryError
+          return Promise.reject(telemetryError)
+        },
+        invalidateQueries: [queryKey],
+      }),
+    }))
+
+    await act(async () => {
+      await expect(result.current.mutation.mutate(undefined)).resolves.toBe(2)
+    })
+    expect(mutationFn).toHaveBeenCalledOnce()
+    expect(queryFn).toHaveBeenCalledOnce()
+    expect(result.current.list.data).toBe(2)
+    expect(queryClient.getQueryData(queryKey)).toBe(2)
+    expect(result.current.mutation.data).toBe(2)
+    expect(result.current.mutation.error).toBeNull()
+    expect(result.current.mutation.postSuccessError).toBe(telemetryError)
+
+    act(() => result.current.mutation.reset())
+    expect(result.current.mutation.postSuccessError).toBeNull()
+  })
+
+  it('preserves both failures if the callback and deriving invalidation keys fail after a write', async () => {
+    const callbackError = new Error('telemetry unavailable')
+    const keyError = new Error('no key for response')
+    const { result } = renderHook(() => useLuxoMutation(async () => 2, {
+      onSuccess: () => { throw callbackError },
+      invalidateQueries: () => { throw keyError },
+    }))
+
+    await act(async () => {
+      await expect(result.current.mutate(undefined)).resolves.toBe(2)
+    })
+    expect(result.current.error).toBeNull()
+    expect(result.current.postSuccessError).toBeInstanceOf(AggregateError)
+    expect((result.current.postSuccessError as AggregateError).errors).toEqual([callbackError, keyError])
+  })
+
+  it('reports a rejected write as a mutation error without running success handling', async () => {
+    const writeError = new Error('write failed')
+    const onSuccess = vi.fn()
+    const invalidateQueries = vi.fn(() => [['tickets']])
+    const { result } = renderHook(() => useLuxoMutation(() => Promise.reject(writeError), {
+      onSuccess, invalidateQueries,
+    }))
+
+    await act(async () => {
+      await expect(result.current.mutate(undefined)).rejects.toBe(writeError)
+    })
+    expect(result.current.data).toBeNull()
+    expect(result.current.error).toBe(writeError)
+    expect(result.current.postSuccessError).toBeNull()
+    expect(onSuccess).not.toHaveBeenCalled()
+    expect(invalidateQueries).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { overlapping: false, disabled: false },
+    { overlapping: true, disabled: false },
+    { overlapping: false, disabled: true },
+  ])('shares a new read after mutation success ($overlapping, $disabled)', async ({ overlapping, disabled }) => {
+    const queryKey = ['tickets', 'list']
+    const queryClient = new QueryClient({ staleTime: Infinity, gcTime: Infinity })
+    queryClient.setQueryData(queryKey, 'open')
+    const reads: { signal: AbortSignal; resolve: (status: string) => void }[] = []
+    const queryFn = vi.fn(({ signal }: QueryFunctionContext) => new Promise<string>(resolve => {
+      reads.push({ signal, resolve })
+    }))
+    const first = renderHook(() => useLuxoQuery(queryFn, [], { queryClient, queryKey, enabled: !disabled }))
+    const second = renderHook(() => useLuxoQuery(queryFn, [], { queryClient, queryKey }))
+    const mutation = renderHook(() => useLuxoMutation(async () => 'closed', {
+      queryClient,
+      invalidateQueries: overlapping ? [queryKey, ['tickets'], queryKey] : [['tickets']],
+    }))
+    expect(first.result.current.data).toBe('open')
+    expect(second.result.current.data).toBe('open')
+    expect(queryFn).not.toHaveBeenCalled()
+
+    let oldRead!: Promise<void>
+    act(() => { oldRead = first.result.current.refetch() })
+    expect(queryFn).toHaveBeenCalledTimes(1)
+
+    await act(async () => { await mutation.result.current.mutate(undefined) })
+    await act(async () => { reads[1]?.resolve('closed') })
+    await act(async () => {
+      reads[0].resolve('open')
+      await oldRead
+    })
+    expect({
+      signals: reads.map(read => read.signal.aborted),
+      cached: queryClient.getQueryData(queryKey),
+      first: first.result.current.data,
+      second: second.result.current.data,
+    }).toEqual({ signals: [true, false], cached: 'closed', first: 'closed', second: 'closed' })
   })
 
   it('stays loading until every concurrent mutation settles', async () => {

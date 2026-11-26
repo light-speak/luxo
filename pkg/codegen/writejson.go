@@ -963,25 +963,55 @@ func writeMaskDirectiveAt(b *strings.Builder, f *ast.FieldDecl, goField, baseTyp
 	return maskedVar
 }
 
-func compileMaskDirectiveExpr(f *ast.FieldDecl, valueExpr, baseType string) string {
-	maskDir := findDirective(f.Directives, "mask")
-	if maskDir == nil || baseType != "String" {
-		return valueExpr
+type fieldMaskKind uint8
+
+const (
+	fieldMaskNone fieldMaskKind = iota
+	fieldMaskEmail
+	fieldMaskPartial
+	fieldMaskPattern
+)
+
+type fieldMaskRule struct {
+	kind    fieldMaskKind
+	pattern string
+}
+
+// Mask rules retain only values so cross-module codegen need not retain directives.
+func fieldMaskFor(field *ast.FieldDecl, baseType string) fieldMaskRule {
+	directive := findDirective(field.Directives, "mask")
+	if directive == nil || baseType != "String" {
+		return fieldMaskRule{}
 	}
-	if hasDirective(f.Directives, "email") {
-		return fmt.Sprintf("str.MaskEmail(%s)", valueExpr)
+	if hasDirective(field.Directives, "email") {
+		return fieldMaskRule{kind: fieldMaskEmail}
 	}
-	if len(maskDir.Args) == 0 {
-		return fmt.Sprintf("str.Mask(%s, 3, 4)", valueExpr)
+	if len(directive.Args) == 0 {
+		return fieldMaskRule{kind: fieldMaskPartial}
 	}
-	if len(maskDir.Args) != 1 {
-		return fmt.Sprintf("str.MaskPattern(%s, %q)", valueExpr, "")
+	if len(directive.Args) == 1 {
+		if pattern, ok := directive.Args[0].Value.(*ast.Literal); ok && pattern.Kind == token.String {
+			return fieldMaskRule{kind: fieldMaskPattern, pattern: pattern.Value}
+		}
 	}
-	pattern, ok := maskDir.Args[0].Value.(*ast.Literal)
-	if !ok || pattern.Kind != token.String {
-		return fmt.Sprintf("str.MaskPattern(%s, %q)", valueExpr, "")
+	return fieldMaskRule{kind: fieldMaskPattern}
+}
+
+func (mask fieldMaskRule) expression(value string) string {
+	switch mask.kind {
+	case fieldMaskEmail:
+		return fmt.Sprintf("str.MaskEmail(%s)", value)
+	case fieldMaskPartial:
+		return fmt.Sprintf("str.Mask(%s, 3, 4)", value)
+	case fieldMaskPattern:
+		return fmt.Sprintf("str.MaskPattern(%s, %q)", value, mask.pattern)
+	default:
+		return value
 	}
-	return fmt.Sprintf("str.MaskPattern(%s, %q)", valueExpr, pattern.Value)
+}
+
+func compileMaskDirectiveExpr(field *ast.FieldDecl, value, baseType string) string {
+	return fieldMaskFor(field, baseType).expression(value)
 }
 
 // writeVisibleDirective generates @visible condition check.

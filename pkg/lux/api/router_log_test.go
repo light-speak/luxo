@@ -143,6 +143,39 @@ func TestServeHTTPLogsParseErrors(t *testing.T) {
 	}
 }
 
+func TestParseFailureLogsStableName(t *testing.T) {
+	const detail = "transport supplied request detail"
+	for _, sample := range []struct {
+		name   string
+		status int
+		cause  error
+	}{
+		{"BadRequest", http.StatusBadRequest, fmt.Errorf("%s", detail)},
+		{"PayloadTooLarge", http.StatusRequestEntityTooLarge, fmt.Errorf("%s: %w", detail, errRequestBodyTooLarge)},
+		{"Unavailable", http.StatusServiceUnavailable, fmt.Errorf("%s: %w", detail, errReceiveCapacity)},
+	} {
+		for _, binaryMode := range []bool{false, true} {
+			mode := httpAbnormalMode(binaryMode)
+			t.Run(mode+"/"+sample.name, func(t *testing.T) {
+				var logs bytes.Buffer
+				rt := NewRouterWithOptions(RouterOptions{
+					RequestLogging: true, RequestLogSampleEvery: 1,
+					SynchronousRequestLogs: true, LogWriter: &logs,
+				})
+				w := httptest.NewRecorder()
+				rt.writeParseError(w, httpAbnormalRequest(binaryMode), binaryMode, nil, sample.cause)
+				checkHTTPObservedErrorResponse(t, w, binaryMode, sample.status, sample.name)
+				if !strings.Contains(w.Body.String(), detail) {
+					t.Fatalf("missing parse response detail: %q", w.Body.String())
+				}
+				if output := logs.String(); !strings.Contains(output, mode) || !strings.Contains(output, sample.name) || strings.Contains(output, detail) {
+					t.Fatalf("expected stable parse log category, got %q", output)
+				}
+			})
+		}
+	}
+}
+
 func TestLogRequest_NoModule(t *testing.T) {
 	var logs bytes.Buffer
 	rt := NewRouterWithOptions(RouterOptions{RequestLogging: true, RequestLogSampleEvery: 1, SynchronousRequestLogs: true, LogWriter: &logs})

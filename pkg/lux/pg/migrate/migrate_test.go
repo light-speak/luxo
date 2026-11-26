@@ -20,9 +20,43 @@ func TestNewPGDBRejectsInvalidConfiguration(t *testing.T) {
 	}
 }
 
+func TestPendingMigrationPreviewSkipsChecksumAndKeepsPreflight(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "001_preview.sql")
+	const up = "SELECT '-- ====== DOWN ======';"
+	const body = "-- ====== UP ======\n" + up + "\n-- ====== DOWN ======\nSELECT 0;\n"
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{path}
+	preview, err := planPendingFiles(paths, false)
+	if err != nil || len(preview) != 1 || preview[0].name != "001_preview.sql" || preview[0].sql != up || preview[0].checksum != "" {
+		t.Fatalf("preview plan should omit the checksum while preserving lexical SQL: %+v: %v", preview, err)
+	}
+	applied, err := planPendingFiles(paths, true)
+	if err != nil || len(applied) != 1 || applied[0].sql != up || applied[0].checksum != migrationChecksum([]byte(body)) {
+		t.Fatalf("applied plan should retain the full file checksum: %+v: %v", applied, err)
+	}
+
+	bad := filepath.Join(dir, "002_mixed.sql")
+	const mixed = "-- ====== UP ======\nALTER TABLE items ADD COLUMN field int;\nCREATE INDEX CONCURRENTLY ix ON items(field);\n"
+	if err := os.WriteFile(bad, []byte(mixed), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, withChecksum := range []bool{false, true} {
+		plan, err := planPendingFiles(append(paths, bad), withChecksum)
+		if !errors.Is(err, errSplitMigration) || plan != nil || !strings.Contains(err.Error(), "002_mixed.sql") {
+			t.Fatalf("checksum=%v should reject the entire mixed batch with its filename: %+v: %v", withChecksum, plan, err)
+		}
+	}
+}
+
 func TestPendingMigrationOrdinalsAfterThreeDigits(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("..", "..", "..", "..", ".tmp"))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	directory, err := os.MkdirTemp(root, "migration-order-")
@@ -300,42 +334,56 @@ func TestBuildDatabaseURLPartialEnv(t *testing.T) {
 	}
 }
 
-func TestSplitConcurrently(t *testing.T) {
-	sql := "CREATE TABLE users (id INT);\nCREATE INDEX CONCURRENTLY idx ON users (name);\nALTER TABLE users ADD COLUMN age INT;"
-	txSQL, nonTx := splitConcurrently(sql)
-
-	if len(nonTx) != 1 {
-		t.Fatalf("expected 1 non-tx, got %d", len(nonTx))
+func TestPlanMigrationSQL(t *testing.T) {
+	cases := []struct {
+		name, sql  string
+		autocommit bool
+		wantError  string
+	}{
+		{name: "empty"},
+		{name: "transaction", sql: `CREATE TABLE t (col text, "CONCURRENTLY" text);
+			/* CONCURRENTLY /* nested */ ; */ INSERT INTO t VALUES ('CONCURRENTLY;', 'value');
+			DO $body$BEGIN PERFORM 'CREATE INDEX CONCURRENTLY ignored;'; END;$body$;`},
+		{name: "create", sql: `-- standalone ; CONCURRENTLY
+			CrEaTe UNIQUE INDEX /* comments */ CONCURRENTLY "in;dex" ON t(col); -- ends section ;`, autocommit: true},
+		{name: "drop", sql: "DROP INDEX CONCURRENTLY IF EXISTS audit_idx;", autocommit: true},
+		{name: "reindex", sql: "REINDEX INDEX CONCURRENTLY audit_idx;", autocommit: true},
+		{name: "reindex options", sql: "REINDEX (VERBOSE, CONCURRENTLY TRUE) INDEX audit_idx;", autocommit: true},
+		{name: "reindex explicit false", sql: "REINDEX (CONCURRENTLY FALSE) INDEX audit_idx;"},
+		{name: "reindex quoted false", sql: "REINDEX (CONCURRENTLY 'false') INDEX audit_idx;"},
+		{name: "truncated reindex options", sql: "REINDEX ("},
+		{name: "truncated reindex option", sql: "REINDEX (VERBOSE"},
+		{name: "same identifier", sql: `CREATE INDEX "CONCURRENTLY" ON t(col); REINDEX INDEX concurrently.idx;`},
+		{name: "detach", sql: `ALTER TABLE IF EXISTS ONLY "data".t DETACH PARTITION shard.p CONCURRENTLY;`, autocommit: true},
+		{name: "parenthesized detach", sql: `ALTER TABLE ONLY ("data".t) DETACH PARTITION shard.p CONCURRENTLY;`, autocommit: true},
+		{name: "ordinary index alteration", sql: "ALTER INDEX idx RENAME TO newer;"},
+		{name: "truncated if exists", sql: "ALTER TABLE IF"},
+		{name: "unterminated only relation", sql: "ALTER TABLE ONLY (t DETACH PARTITION p CONCURRENTLY;"},
+		{name: "ordinary detach", sql: `ALTER TABLE t DETACH PARTITION "concurrently";`},
+		{name: "refresh in transaction", sql: "REFRESH MATERIALIZED VIEW CONCURRENTLY v;"},
+		{name: "mixed", sql: "ALTER TABLE t ADD col text; CREATE INDEX CONCURRENTLY idx ON t(col);", wantError: "split"},
+		{name: "mixed reversed", sql: "DROP INDEX CONCURRENTLY idx; ALTER TABLE t DROP col;", wantError: "split"},
+		{name: "multiple concurrent", sql: "CREATE INDEX CONCURRENTLY a ON t(c); CREATE INDEX CONCURRENTLY b ON t(d);", wantError: "split"},
+		{name: "guarded create", sql: `CREATE INDEX CONCURRENTLY IF NOT EXISTS "in;dex" ON "Some table".t (col);`, autocommit: true},
+		{name: "guarded using", sql: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx ON SomeSchema.t USING btree (col);`, autocommit: true},
+		{name: "missing guarded table", sql: "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx ON", wantError: "IF NOT EXISTS"},
+		{name: "missing guarded method", sql: "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx ON t USING (col);", wantError: "IF NOT EXISTS"},
+		{name: "unsupported guarded table", sql: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx ON U&"t\0061ble" (col);`, wantError: "IF NOT EXISTS"},
+		{name: "unsupported guarded target", sql: `CREATE INDEX CONCURRENTLY IF NOT EXISTS U&"in\0064ex" ON t(col);`, wantError: "IF NOT EXISTS"},
 	}
-	if !strings.Contains(nonTx[0], "CONCURRENTLY") {
-		t.Error("non-tx should contain CONCURRENTLY")
-	}
-	if strings.Contains(txSQL, "CONCURRENTLY") {
-		t.Error("tx SQL should not contain CONCURRENTLY")
-	}
-}
-
-func TestSplitConcurrentlyNone(t *testing.T) {
-	txSQL, nonTx := splitConcurrently("CREATE TABLE users (id INT);")
-	if len(nonTx) != 0 {
-		t.Errorf("expected 0 non-tx, got %d", len(nonTx))
-	}
-	if !strings.Contains(txSQL, "CREATE TABLE") {
-		t.Error("should contain all")
-	}
-}
-
-func TestSplitConcurrentlyEmpty(t *testing.T) {
-	_, nonTx := splitConcurrently("")
-	if len(nonTx) != 0 {
-		t.Errorf("expected 0, got %d", len(nonTx))
-	}
-}
-
-func TestSplitStatements(t *testing.T) {
-	stmts := splitStatements("SELECT 1; SELECT 2;  ; SELECT 3")
-	if len(stmts) != 3 {
-		t.Errorf("expected 3, got %d: %v", len(stmts), stmts)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mode, err := planMigrationSQL(tc.sql)
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("plan error: %v", err)
+				}
+				return
+			}
+			if err != nil || mode.autocommit != tc.autocommit {
+				t.Fatalf("autocommit=%t expected=%t err=%v", mode.autocommit, tc.autocommit, err)
+			}
+		})
 	}
 }
 

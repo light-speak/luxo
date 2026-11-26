@@ -184,6 +184,18 @@ func TestLoadConfigMissing(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRejectsScaffoldSecret(t *testing.T) {
+	ResetConfig()
+	t.Cleanup(ResetConfig)
+	t.Setenv("JWT_SECRET", "change-me")
+	t.Setenv("JWT_EXPIRES", "1h")
+	t.Setenv("JWT_REFRESH", "false")
+	t.Setenv("JWT_REFRESH_EXPIRES", "24h")
+	if cfg, err := LoadConfig(); cfg != nil || err == nil || !strings.Contains(err.Error(), "JWT_SECRET uses the default scaffold placeholder") {
+		t.Fatalf("expected the scaffold secret diagnostic, got %v", err)
+	}
+}
+
 func TestLoadConfigBadExpires(t *testing.T) {
 	ResetConfig()
 	os.Setenv("JWT_SECRET", "s")

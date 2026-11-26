@@ -7,25 +7,24 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 var errPoolClosed = errors.New("pool closed")
 
 // Pool bounds idle, open (including dialing), and waiting LRPC connections.
 type Pool struct {
-	addr     string
-	maxIdle  int
-	timeout  time.Duration
-	conns    chan net.Conn
-	closed   atomic.Bool
-	once     sync.Once
-	options  PoolOptions
-	open     atomic.Int64
-	waiters  atomic.Int64
-	wake     chan struct{}
-	lifetime context.Context
-	cancel   context.CancelFunc
+	addr           string
+	conns          chan net.Conn
+	closed         atomic.Bool
+	once           sync.Once
+	options        PoolOptions
+	open           atomic.Int64
+	waiters        atomic.Int64
+	wake           chan struct{}
+	lifetime       context.Context
+	cancel         context.CancelFunc
+	closingMu      sync.Mutex
+	closingWaiters map[*poolConn]*sync.WaitGroup
 }
 
 // NewPool creates a connection pool for the given address.
@@ -69,7 +68,8 @@ func (p *Pool) Put(conn net.Conn) {
 	}
 	tracked, ok := conn.(*poolConn)
 	if !ok {
-		if !reserve(&p.open, p.options.MaxOpen) {
+		// A raw connection rejected by an already full queue never owns a slot.
+		if len(p.conns) == cap(p.conns) || !reserve(&p.open, p.options.MaxOpen) {
 			conn.Close()
 			return
 		}
@@ -84,11 +84,15 @@ func (p *Pool) Put(conn net.Conn) {
 	select {
 	case p.conns <- tracked:
 		p.signal()
-		if p.closed.Load() {
-			p.closeIdle()
-		}
+		p.drainAfterReturn()
 	default:
 		tracked.Close()
+	}
+}
+
+func (p *Pool) drainAfterReturn() {
+	if p.closed.Load() {
+		p.closeIdle()
 	}
 }
 
@@ -123,7 +127,7 @@ func (p *Pool) closeIdle() {
 
 // dialContext dials with context support for cancellation and deadline propagation.
 func (p *Pool) dialContext(ctx context.Context) (net.Conn, error) {
-	d := &net.Dialer{Timeout: p.timeout}
+	d := &net.Dialer{Timeout: p.options.DialTimeout}
 	conn, err := d.DialContext(ctx, "tcp", p.addr)
 	if err != nil {
 		return nil, err
@@ -131,7 +135,7 @@ func (p *Pool) dialContext(ctx context.Context) (net.Conn, error) {
 	if tc, ok := conn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
-	if err := initiateHandshake(ctx, conn, p.timeout); err != nil {
+	if err := initiateHandshake(ctx, conn, p.options.DialTimeout); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("rpc: handshake: %w", err)
 	}

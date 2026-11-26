@@ -15,9 +15,12 @@ type Dialect struct{}
 
 var _ lux.Dialect = Dialect{}
 
+// MaxIdentifierBytes is the PostgreSQL identifier limit used by this dialect.
+const MaxIdentifierBytes = 63
+
 // ValidateIdentifier uses the standard PostgreSQL 63-byte identifier boundary.
 func (Dialect) ValidateIdentifier(name string) error {
-	if name == "" || len(name) > 63 || !utf8.ValidString(name) || strings.IndexByte(name, 0) >= 0 {
+	if name == "" || len(name) > MaxIdentifierBytes || !utf8.ValidString(name) || strings.IndexByte(name, 0) >= 0 {
 		return fmt.Errorf("PostgreSQL identifier %q must be valid UTF-8 without NUL and contain 1..63 bytes", name)
 	}
 	return nil
@@ -25,13 +28,13 @@ func (Dialect) ValidateIdentifier(name string) error {
 
 // GeneratedIdentifier retains short names and uses a stable hash of the full long name.
 func (Dialect) GeneratedIdentifier(name string) string {
-	if len(name) <= 63 {
+	if len(name) <= MaxIdentifierBytes {
 		return name
 	}
 	hash := sha256.Sum256([]byte(name))
 	var suffix [16]byte
 	hex.Encode(suffix[:], hash[:8])
-	prefix := 63 - 1 - len(suffix)
+	prefix := MaxIdentifierBytes - 1 - len(suffix)
 	for !utf8.RuneStart(name[prefix]) {
 		prefix--
 	}

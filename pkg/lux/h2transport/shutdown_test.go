@@ -7,11 +7,88 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime/pprof"
+	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"golang.org/x/net/http2"
 )
+
+func TestRepeatedTimedOutShutdownLeavesNoWaiters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, err := NewServer(http.NotFoundHandler())
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn := &faultConn{}
+		ctx, cancel, err := s.admitConnection(t.Context(), conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			// Delay retirement until after observing shutdown's waiters.
+			if err := s.runConnection(ctx, cancel, conn); !errors.Is(err, net.ErrClosed) {
+				t.Errorf("forced shutdown did not close the server: %v", err)
+			}
+		}()
+		const label = "h2-repeated-shutdown"
+		pprof.Do(t.Context(), pprof.Labels(label, "waiter"), func(parent context.Context) {
+			for range 8 {
+				deadline, stop := context.WithCancel(parent)
+				stop()
+				if err := s.Shutdown(deadline); !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			}
+		})
+		synctest.Wait()
+		var profile strings.Builder
+		if err := pprof.Lookup("goroutine").WriteTo(&profile, 1); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(profile.String(), label) {
+			t.Fatal("timed-out shutdown calls left waiting goroutines")
+		}
+	})
+}
+
+func TestShutdownWaitsForLastConnectionAfterClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, err := NewServer(http.NotFoundHandler())
+		if err != nil {
+			t.Fatal(err)
+		}
+		connections := [2]*faultConn{{}, {}}
+		for _, conn := range connections {
+			if _, _, err := s.admitConnection(t.Context(), conn); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		results := make(chan error, 2)
+		for range cap(results) {
+			go func() { results <- s.Shutdown(ctx) }()
+		}
+		synctest.Wait()
+		s.retireConnection(connections[0])
+		synctest.Wait()
+		if len(results) != 0 {
+			t.Error("shutdown returned before the second connection retired")
+		}
+		s.retireConnection(connections[1])
+		for range cap(results) {
+			if err := <-results; err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+}
 
 func TestShutdownDeadlineForcesConnectionCancellation(t *testing.T) {
 	server, peer := net.Pipe()
@@ -21,8 +98,7 @@ func TestShutdownDeadlineForcesConnectionCancellation(t *testing.T) {
 	s, _ := NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	c := newCandidateConnection(ctx, server, s.handler)
 	s.connections[server] = &serverConnection{cancel: cancel, active: c}
-	s.workers.Add(1)
-	defer s.workers.Done()
+	defer s.retireConnection(server)
 	deadline, stop := context.WithCancel(context.Background())
 	stop()
 	if err := s.Shutdown(deadline); !errors.Is(err, context.Canceled) || ctx.Err() == nil {
@@ -173,10 +249,7 @@ func TestShutdownCancelsUndrainableConnections(t *testing.T) {
 			}
 			go func() {
 				<-ctx.Done()
-				s.mu.Lock()
-				delete(s.connections, conn)
-				s.mu.Unlock()
-				s.workers.Done()
+				s.retireConnection(conn)
 			}()
 			deadline, stop := context.WithTimeout(t.Context(), time.Second)
 			defer stop()

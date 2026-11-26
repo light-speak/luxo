@@ -120,6 +120,83 @@ function response(mode: TransportMode, status = 200): Response {
   return new Response(mode === 'json' ? '{"data":true}' : Uint8Array.of(1))
 }
 
+describe.each(['json', 'binary'] as const)('%s HTTP call refresh policy', mode => {
+  it.each(['direct', 'generated'] as const)('preserves the original 401 when a %s call disables refresh', async entry => {
+    const refresh = vi.fn(async () => 'renewed')
+    const fetch = vi.fn(async (_url: string, _init: RequestInit) => response(mode))
+      .mockImplementationOnce(async () => response(mode, 401))
+    vi.stubGlobal('fetch', fetch)
+    const transport = new FetchTransport('http://localhost/api', { mode, token: 'original', onTokenExpired: refresh })
+    transport.setSchema({ echo: { id: 1 } })
+    const options = { signal: new AbortController().signal, refreshOnUnauthorized: false }
+    const request = entry === 'direct'
+      ? transport.call('echo', undefined, options)
+      : transport.callGenerated('echo', replayEncoder, undefined, options)
+    await expect(request).rejects.toMatchObject({ code: 401, error: 'Unauthorized', message: 'expired' })
+    expect(refresh).not.toHaveBeenCalled()
+    expect(fetch).toHaveBeenCalledTimes(1)
+    expect(new Headers(fetch.mock.calls[0][1].headers).get('authorization')).toBe('Bearer original')
+  })
+
+  it.each(['direct', 'generated'] as const)('keeps a same-client %s refresh call separate from other requests', async entry => {
+    vi.useFakeTimers()
+    const timeout = 12_345
+    const schedule = vi.spyOn(globalThis, 'setTimeout')
+    const cancel = vi.spyOn(globalThis, 'clearTimeout')
+    const controller = new AbortController()
+    const options = { signal: controller.signal }
+    const refreshOptions = { ...options, refreshOnUnauthorized: false }
+    const renewResponse = Promise.withResolvers<Response>()
+    const renewEncoder = { ...replayEncoder, apiID: 2 }
+    const refresh = vi.fn(async () => {
+      const renew = entry === 'direct'
+        ? transport.call('renew', undefined, refreshOptions)
+        : transport.callGenerated('renew', renewEncoder, undefined, refreshOptions)
+      await expect(renew).rejects.toMatchObject({ code: 401, error: 'Unauthorized', message: 'expired' })
+      return 'renewed'
+    })
+    const transport = new FetchTransport('http://localhost/api', { mode, timeout, token: 'original', onTokenExpired: refresh })
+    transport.setSchema({ echo: { id: 1 }, renew: { id: 2 } })
+    const authorization: (string | null)[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      const token = new Headers(init.headers).get('authorization')
+      authorization.push(token)
+      if (authorization.length === 4) return renewResponse.promise
+      return response(mode, token === 'Bearer renewed' ? 200 : 401)
+    }))
+    const calls = Promise.allSettled([
+      transport.call('echo', undefined, options),
+      transport.callGenerated('echo', replayEncoder, undefined, options),
+      transport.call('echo', undefined, options),
+    ])
+    let outcomes: PromiseSettledResult<unknown>[] | undefined
+    void calls.then(results => { outcomes = results })
+    try {
+      await vi.advanceTimersByTimeAsync(0)
+      expect(refresh).toHaveBeenCalledOnce()
+      expect(authorization).toEqual(Array.from({ length: 4 }, () => 'Bearer original'))
+      renewResponse.resolve(response(mode, 401))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(outcomes).toEqual(Array.from({ length: 3 }, () => ({
+        status: 'fulfilled', value: mode === 'json' ? true : Uint8Array.of(1),
+      })))
+      expect(refresh).toHaveBeenCalledOnce()
+      expect(authorization.slice(4)).toEqual(Array.from({ length: 3 }, () => 'Bearer renewed'))
+      const deadlines = schedule.mock.results.filter((_, i) => schedule.mock.calls[i][1] === timeout)
+      expect(deadlines).toHaveLength(4)
+      for (const deadline of deadlines) expect(cancel).toHaveBeenCalledWith(deadline.value)
+    } finally {
+      controller.abort()
+      renewResponse.resolve(response(mode, 401))
+      await calls
+      schedule.mockRestore()
+      cancel.mockRestore()
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+})
+
 describe.each(['json', 'binary'] as const)('%s HTTP request metadata', mode => {
   it('does not refresh a late unauthorized response after cancellation', async () => {
     const abort = new AbortController()

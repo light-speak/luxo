@@ -548,23 +548,22 @@ func (rt *Router) parseTransportRequestBudget(r *http.Request, binaryMode bool, 
 }
 
 func (rt *Router) writeParseError(w http.ResponseWriter, r *http.Request, binaryMode bool, trace *DebugTraceSession, err error) {
+	name, status := "BadRequest", http.StatusBadRequest
+	switch {
+	case stderrors.Is(err, errReceiveCapacity):
+		name, status = "Unavailable", http.StatusServiceUnavailable
+	case stderrors.Is(err, errRequestBodyTooLarge):
+		name, status = "PayloadTooLarge", http.StatusRequestEntityTooLarge
+	}
 	if rt.requestLogging {
 		mode := "json"
 		if binaryMode {
 			mode = "binary"
 		}
-		rt.logParseFailure(mode, err.Error())
+		rt.logParseFailure(mode, name)
 	}
 	writeDebugTraceHeaders(w.Header(), trace)
-	if stderrors.Is(err, errReceiveCapacity) {
-		rt.writeAppError(w, r, binaryMode, errors.New("Unavailable", http.StatusServiceUnavailable, err.Error()))
-		return
-	}
-	if stderrors.Is(err, errRequestBodyTooLarge) {
-		rt.writeAppError(w, r, binaryMode, errors.New("PayloadTooLarge", http.StatusRequestEntityTooLarge, err.Error()))
-		return
-	}
-	rt.writeAppError(w, r, binaryMode, errors.New("BadRequest", http.StatusBadRequest, err.Error()))
+	rt.writeAppError(w, r, binaryMode, errors.New(name, status, err.Error()))
 }
 
 func (rt *Router) executeHTTPHandler(w http.ResponseWriter, r *http.Request, req *Request, fn HandlerFunc, binaryMode bool, metrics MetricsRecorder, trace *DebugTraceSession, logStarted time.Time) {
