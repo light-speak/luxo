@@ -13,49 +13,54 @@ jobs:
     if: github.repository == 'light-speak/luxo'
     name: native allocation ${{ matrix.allocation }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
         allocation: [1, 2]
-    env:
-      LC_ALL: C
-      GOTOOLCHAIN: local
-      CGO_ENABLED: '1'
-      GOAMD64: v1
     steps:
       - name: Select an original native processor
         id: route
         env:
           RUNNER_KIND: ${{ runner.environment }}
           ALLOCATION: ${{ matrix.allocation }}
+          LC_ALL: C
         run: |
           set -euo pipefail
           evidence="$RUNNER_TEMP/beta-native-qualification"
           mkdir -p "$evidence"
           lscpu > "$evidence/lscpu.txt"
           actual=$(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/lscpu.txt")
-          printf 'allocation=%s\nimage=%s\nimage_version=%s\nactual=%s\n' \
-            "$ALLOCATION" "${ImageOS:-unknown}" "${ImageVersion:-unknown}" "$actual" > "$evidence/routing.txt"
-          [[ "$RUNNER_KIND" == github-hosted && "$(uname -sm)" == 'Linux x86_64' ]]
+          printf 'allocation=%s\nimage=%s\nimage_version=%s\nactual=%s\nrouter_sha=%s\n' \
+            "$ALLOCATION" "${ImageOS:-unknown}" "${ImageVersion:-unknown}" "$actual" "$GITHUB_SHA" > "$evidence/routing.txt"
+          if [[ "$RUNNER_KIND" != github-hosted || "$(uname -sm)" != 'Linux x86_64' ]]; then
+            exit 3
+          fi
           case "$actual" in
             'Intel(R) Xeon(R) 6975P-C')
               lane=allocation
               ref=36b9d02e9080f7f12eb5e8ba6ccca89247915b7e
+              depth=1
               ;;
             'AMD EPYC 9V45 96-Core Processor')
               lane=codegen
               ref=28339729c6bcd4d4248743e202258d54c9c7b0b7
+              depth=1
+              ;;
+            'AMD EPYC 9V74 80-Core Processor')
+              lane=dart
+              ref=8250b2ab76706e28fce4afe4ce23a37638526b9a
+              depth=4
               ;;
             *) exit 3 ;;
           esac
-          printf 'lane=%s\nref=%s\n' "$lane" "$ref" | tee -a "$evidence/routing.txt" >> "$GITHUB_OUTPUT"
+          printf 'lane=%s\nref=%s\ndepth=%s\n' "$lane" "$ref" "$depth" | tee -a "$evidence/routing.txt" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
         with:
           ref: ${{ steps.route.outputs.ref }}
           path: readiness
-          fetch-depth: 1
+          fetch-depth: ${{ steps.route.outputs.depth }}
           persist-credentials: false
       - name: Prepare the selected readiness checkout
         working-directory: readiness
@@ -69,24 +74,79 @@ jobs:
           case "$LANE" in
             allocation) evidence=.tmp/pr143-allocation-evidence-6975 ;;
             codegen) evidence=.tmp/pr143-timing-evidence ;;
+            dart) evidence=.tmp/dart-http-refresh-evidence ;;
             *) exit 3 ;;
           esac
           mkdir -p "$evidence"
-          cp "$route/routing.txt" "$evidence/routing.txt"
+          if [[ "$LANE" == dart ]]; then
+            model=$(sed -n 's/^actual=//p' "$route/routing.txt")
+            test "$model" = 'AMD EPYC 9V74 80-Core Processor'
+            printf 'model=%s\nmatch=true\n' "$model" > "$evidence/routing.txt"
+          else
+            cp "$route/routing.txt" "$evidence/routing.txt"
+          fi
+      - uses: actions/checkout@v7
+        if: steps.route.outputs.lane == 'allocation'
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: .github/diagnostics/pr143-allocation-q2.patch.b64
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-go@v7
+        if: steps.route.outputs.lane != 'dart'
         with:
           go-version: '1.27.1'
           cache: false
-      - name: Verify and replay all ten original allocation leaves
+      - uses: dart-lang/setup-dart@v1
+        if: steps.route.outputs.lane == 'dart'
+        with:
+          sdk: '3.13.4'
+      - uses: actions/setup-go@v7
+        if: steps.route.outputs.lane == 'dart'
+        with:
+          go-version-file: readiness/go.mod
+          cache: false
+      - name: Bind the locked Dart arms and take paired samples
+        if: steps.route.outputs.lane == 'dart'
+        working-directory: readiness
+        env:
+          PINNED_REF: ${{ steps.route.outputs.ref }}
+          PYTHONUTF8: '1'
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PINNED_REF"
+          mkdir -p .tmp/dart-http-refresh-evidence
+          # The replay verifier binds its checkout via GITHUB_SHA. The outer run
+          # SHA is recorded separately in runner.temp's routing receipt.
+          GITHUB_SHA="$PINNED_REF" python3 -I -B .github/diagnostics/dart-http-refresh/qualify.py collect \
+            --repo "$PWD" --scratch "$PWD/.tmp" \
+            --evidence "$PWD/.tmp/dart-http-refresh-evidence" \
+            | tee .tmp/dart-http-refresh-evidence/setup.jsonl
+      - name: Verify and replay all ten original allocation leaves with Q2
         if: steps.route.outputs.lane == 'allocation'
         working-directory: readiness
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           LUXO_NATIVE_DIAGNOSTIC: pr143-allocation
+          LC_ALL: C
+          GOTOOLCHAIN: local
+          CGO_ENABLED: '1'
+          GOAMD64: v1
+          Q2_TREE: b1e8c5c89474ea75834b265602595022e0ecbe5d
+          Q2_PATCH_SHA: a498c3de5284f3c43eedf4886da909d8aa35f204d3f15b8a1a82506e268bcb42
         run: |
           set -euo pipefail
-          source scripts/diagnose-pr143-allocation/settings.sh
+          controller="$GITHUB_WORKSPACE/controller"
+          test "$(git -C "$controller" rev-parse HEAD)" = "$GITHUB_SHA"
+          candidate="$controller/.github/diagnostics/pr143-allocation-q2.patch.b64"
+          base64 --decode "$candidate" | sha256sum -c <(printf '%s  -\n' "$Q2_PATCH_SHA")
+          driver=scripts/diagnose-pr143-allocation
+          cp "$candidate" "$driver/entry-allocation.patch.b64"
+          printf 'head_tree=%s\npatch_sum=%s\n' "$Q2_TREE" "$Q2_PATCH_SHA" >> "$driver/settings.sh"
+          source "$driver/settings.sh"
           git fetch --no-tags --depth=1 origin "$product_base" "$patch_parent_commit" cbf4cfb383d944ceb38f700e19cf79c4c54d3c58
           scratch=$(mktemp -d "$PWD/.tmp/pr143-allocation-input.XXXXXXXX")
           trap 'rm -rf -- "$scratch"' EXIT
@@ -107,6 +167,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           LANE: codegen
+          LC_ALL: C
+          GOTOOLCHAIN: local
+          CGO_ENABLED: '1'
+          GOAMD64: v1
         run: |
           set -euo pipefail
           base=f9ce659fd7f17bf57cfe0aee7de7ecb8d9b8f2e4
@@ -134,6 +198,8 @@ jobs:
         id: shutdown_ready
         if: ${{ !cancelled() && steps.route.outputs.lane == 'codegen' }}
         working-directory: shutdown
+        env:
+          LC_ALL: C
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = 78f15da278fd12bc4db460c47f0a9a444f8c900a
@@ -150,6 +216,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           H2_LANE: 9v45
+          LC_ALL: C
+          GOTOOLCHAIN: local
+          CGO_ENABLED: '1'
+          GOAMD64: v1
         run: |
           set -euo pipefail
           inputs=$(mktemp -d "$PWD/.tmp/pr78-shutdown-input.XXXXXXXX")
@@ -175,6 +245,7 @@ jobs:
             ${{ runner.temp }}/beta-native-qualification/
             readiness/.tmp/pr143-allocation-evidence-6975/
             readiness/.tmp/pr143-timing-evidence/
+            readiness/.tmp/dart-http-refresh-evidence/
             shutdown/.tmp/pr78-shutdown-evidence-9v45/
           if-no-files-found: error
           retention-days: 14
