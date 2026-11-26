@@ -19,7 +19,7 @@ func (g *errorDataGenerator) writeSealedObject(b *strings.Builder, owner *ast.Se
 		for _, field := range variant.Fields {
 			id := g.owner.modelFieldID(owner.Name+"."+variant.Name, field.Name)
 			fmt.Fprintf(b, "func %s(w *errors.DataWriter,value %s){if w.Err()!=nil{return};\n", g.sealedErrorField(owner.Name, tag, id), compiledFunctionGoType(field.Type, g.owner.modelDeclarations))
-			g.writeValue(b, field.Type, "value", g.models[field.Type.Name], false, "")
+			g.writeValue(b, field.Type, "value", g.models[field.Type.Name], false, "", nil)
 			b.WriteString("}\n")
 		}
 	}

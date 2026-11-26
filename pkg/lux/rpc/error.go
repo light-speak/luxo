@@ -10,20 +10,9 @@ import (
 
 // decodeError rejects malformed envelopes before constructing an application error.
 func decodeError(data []byte) error {
-	fields, err := readRPCErrorFields(data)
+	fields, err := validateRPCErrorEnvelope(data)
 	if err != nil {
 		return err
-	}
-	if fields.code < 400 || fields.code > 599 {
-		return fmt.Errorf("rpc: error status code must be between 400 and 599")
-	}
-	if !utf8.Valid(fields.name) || !utf8.Valid(fields.message) {
-		return fmt.Errorf("rpc: error envelope contains invalid UTF-8")
-	}
-	if fields.data != nil || fields.text != nil {
-		if err := validateRPCErrorData(fields.data, fields.text); err != nil {
-			return err
-		}
 	}
 	// Copy only validated text; each string owns its storage independently.
 	value := &luxerrors.AppError{Code: int(fields.code), Name: string(fields.name), Message: string(fields.message)}
@@ -35,6 +24,25 @@ func decodeError(data []byte) error {
 		value.Data = ownRPCErrorData(fields.data, fields.text)
 	}
 	return value
+}
+
+func validateRPCErrorEnvelope(data []byte) (rpcErrorEnvelope, error) {
+	fields, err := readRPCErrorFields(data)
+	if err != nil {
+		return rpcErrorEnvelope{}, err
+	}
+	if fields.code < 400 || fields.code > 599 {
+		return rpcErrorEnvelope{}, fmt.Errorf("rpc: error status code must be between 400 and 599")
+	}
+	if !utf8.Valid(fields.name) || !utf8.Valid(fields.message) {
+		return rpcErrorEnvelope{}, fmt.Errorf("rpc: error envelope contains invalid UTF-8")
+	}
+	if fields.data != nil || fields.text != nil {
+		if err := validateRPCErrorData(fields.data, fields.text); err != nil {
+			return rpcErrorEnvelope{}, err
+		}
+	}
+	return fields, nil
 }
 
 type rpcErrorEnvelope struct {

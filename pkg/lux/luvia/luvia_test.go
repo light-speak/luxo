@@ -666,6 +666,26 @@ func TestServeRejectsInvalidJWTConfiguration(t *testing.T) {
 	}
 }
 
+func TestServeRejectsScaffoldJWTSecret(t *testing.T) {
+	auth.ResetConfig()
+	t.Cleanup(auth.ResetConfig)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("DEPLOY_MODE", "embedded")
+	t.Setenv("GRACEFUL_TIMEOUT", "30s")
+	t.Setenv("JWT_SECRET", "change-me")
+	t.Setenv("JWT_EXPIRES", "1h")
+	t.Setenv("JWT_REFRESH", "false")
+	t.Setenv("JWT_REFRESH_EXPIRES", "24h")
+	t.Setenv("LUXO_STUDIO_URL", "")
+	// Keep the test from opening a listener if JWT validation regresses.
+	t.Setenv("CORS_ORIGIN", "https://app.example/path")
+	gateway := New()
+	err := gateway.Serve("test-v1")
+	if err == nil || !strings.Contains(err.Error(), "invalid JWT configuration: JWT_SECRET uses the default scaffold placeholder") || gateway.server != nil {
+		t.Fatalf("expected startup to reject the scaffold JWT secret, got %v", err)
+	}
+}
+
 func TestValidateJWTConfigurationAcceptsValidConfiguration(t *testing.T) {
 	auth.ResetConfig()
 	t.Cleanup(auth.ResetConfig)

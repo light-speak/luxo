@@ -1,6 +1,11 @@
 package codegen
 
 import (
+	"errors"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -18,6 +23,71 @@ func TestDebugQueriesRealDB(t *testing.T) {
 		"Node": {"id": 1, "name": 2, "parentId": 3, "parent": 4},
 	}})
 }
+
+func TestDebugQueryFixtureUsesPostgresIsolation(t *testing.T) {
+	dir := writeProtocolFixture(t, "package generated\n", debugQueryImports+debugQueryAssertions)
+	fixture, err := os.ReadFile(filepath.Join(dir, "postgres_fixture_test.go"))
+	if err != nil {
+		t.Fatalf("debug query fixture did not request isolated PostgreSQL: %v", err)
+	}
+	if string(fixture) != protocolPostgresFixture {
+		t.Fatal("debug query fixture does not use the shared PostgreSQL isolation helper")
+	}
+}
+
+func TestDebugQueryFixtureDatabaseConnection(t *testing.T) {
+	dir := writeProtocolFixture(t, "package generated\n", debugQueryConnectionProbe+debugQueryConnectionSelector)
+	binary := filepath.Join(dir, "debug-query-probe.exe")
+	build := exec.CommandContext(t.Context(), "go", "test", "-c", "-o", binary, ".")
+	build.Dir = dir
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build debug query connection probe: %v\n%s", err, output)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	for _, sample := range []struct{ name, url, failure string }{
+		{name: "selection"},
+		{name: "invalid", url: "invalid://configured-fixture", failure: "postgres fixture: invalid database URL"},
+		{name: "unavailable", url: "postgres://probe@" + listener.Addr().String() + "/probe?sslmode=disable", failure: "postgres fixture: failed to connect"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			command := exec.CommandContext(t.Context(), binary, "-test.run=^TestDebugConnectionSelection$", "-test.v", "-test.timeout=25s")
+			command.Dir = dir
+			command.Env = append(command.Environ(), "LUXO_TEST_DATABASE_URL="+sample.url, "DATABASE_TIMEOUT=1s")
+			output, err := command.CombinedOutput()
+			if sample.failure == "" {
+				if err != nil || !strings.Contains(string(output), "--- PASS: TestDebugConnectionSelection") {
+					t.Fatalf("connection selection did not run successfully: %v\n%s", err, output)
+				}
+				return
+			}
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) || exit.ExitCode() != 1 || !strings.Contains(string(output), sample.failure) || strings.Contains(string(output), "=== RUN") {
+				t.Fatalf("configured connection failed to stop the fixture: %v\n%s", err, output)
+			}
+		})
+	}
+}
+
+const debugQueryConnectionProbe = `package generated
+import ("os"; "testing")
+func TestDebugConnectionSelection(t *testing.T) {
+ const configured = "postgres://probe@db.invalid/probe?search_path=luxo_fixture_probe"
+ calls := 0
+ fallback := func() string { calls++; return "container fixture" }
+ t.Setenv("LUXO_TEST_DATABASE_URL", configured)
+ if connection := debugQueryConnection(fallback); connection != configured || calls != 0 {
+  t.Fatalf("configured connection=%q; fallback calls=%d", connection, calls)
+ }
+ t.Setenv("LUXO_TEST_DATABASE_URL", "")
+ if connection := debugQueryConnection(fallback); connection != "container fixture" || calls != 1 {
+  t.Fatalf("missing connection=%q; fallback calls=%d", connection, calls)
+ }
+}
+`
 
 func TestDebugPaginationFormalGeneration(t *testing.T) {
 	for _, body := range []string{
@@ -56,7 +126,7 @@ api statementPage(): [Node] @paginate { val rows = Node.select().orderBy(id.asc)
 `
 
 const debugQueryImports = `package generated
-import("bytes";"context";"encoding/json";"fmt";"net";"net/http/httptest";"strings";"sync";"testing";
+import("bytes";"context";"encoding/json";"fmt";"net";"net/http/httptest";"os";"strings";"sync";"testing";
 "github.com/jackc/pgx/v5";"github.com/jackc/pgx/v5/pgxpool";
 "github.com/light-speak/luxo/internal/testutil";"github.com/light-speak/luxo/pkg/lux/api";
 "github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/dataloader";"github.com/light-speak/luxo/pkg/lux/luxolog";
@@ -65,13 +135,31 @@ import("bytes";"context";"encoding/json";"fmt";"net";"net/http/httptest";"string
 "github.com/testcontainers/testcontainers-go";"github.com/testcontainers/testcontainers-go/modules/postgres")
 `
 
-const debugQueryAssertions = `
+const debugQueryConnectionSelector = `
+func debugQueryConnection(startContainer func() string) string {
+ if connection := os.Getenv("LUXO_TEST_DATABASE_URL"); connection != "" {
+  return connection
+ }
+ return startContainer()
+}
+`
+
+const debugQueryAssertions = debugQueryConnectionSelector + `
 func TestDebugQuerySQL(t *testing.T) {
- container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("debug_query"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
- testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
- connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+ connection:=debugQueryConnection(func() string {
+  container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("debug_query"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+  testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
+  connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+  return connection
+ })
  cfg,err:=pgxpool.ParseConfig(connection);if err!=nil{t.Fatal(err)};queries:=&pageSQLLog{};cfg.ConnConfig.Tracer=queries
  pool,err:=pgxpool.NewWithConfig(t.Context(),cfg);if err!=nil{t.Fatal(err)};db:=pg.NewDBFromPool(pool);t.Cleanup(db.Close)
+ if os.Getenv("LUXO_TEST_DATABASE_URL") != "" {
+  schema,err:=pg.QueryScalar[string](t.Context(),db,"SELECT current_schema()")
+  if err!=nil || schema!=cfg.ConnConfig.RuntimeParams["search_path"] || !strings.HasPrefix(schema,"luxo_fixture_") {
+   t.Fatalf("debug query fixture requires its private PostgreSQL schema, got %q: %v",schema,err)
+  }
+ }
  if _,err:=pg.Exec(t.Context(),db,"CREATE TABLE nodes(id bigint PRIMARY KEY,name text NOT NULL,parent_id bigint);INSERT INTO nodes VALUES(1,'one',NULL),(2,'two',1),(3,'three',1)");err!=nil{t.Fatal(err)}
  app:=NewFromDB(db);app.SetLoaders(NewDefaultLoaders(app,dataloader.DefaultConfig()))
  router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)};if err:=RegisterHandlers(router,app);err!=nil{t.Fatal(err)};if err:=router.Prepare();err!=nil{t.Fatal(err)}

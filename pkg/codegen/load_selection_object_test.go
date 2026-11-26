@@ -140,13 +140,30 @@ fn fetchBox(): Box<Node?> { return Box<Node?>(value: Node.select().first()) }
 api direct(): Box<Node?> { return fetchBox() }
 api nested(): Box<Box<Node?>> { return Box<Box<Node?>>(value: fetchBox()) }
 api extracted(): Node? { val box = fetchBox() return box.value }
+api destructuredCopy(): Node? {
+ val (left, right) = Box<Node?>(value: Node.select().first())
+ left.value = null
+ return right.value
+}
+api destructuredAwait(): Node? {
+ val (row, _) = await { Node.select().first() 42 }
+ return row
+}
+api earlyAwait(): Node? {
+ val row = await {
+  val early = Node.select().where(id: 1).first()
+  if early != null { return early }
+  Node.select().where(id: 2).first()
+ }
+ return row
+}
 api same(): Boolean { val row = Node.select().first() ?: throw error.NotFound val left = Holder.Model(value: row) val right = Holder.Model(value: row) return left == right }
 api sameLabeled(): Boolean { val row = Node.select().first() ?: throw error.NotFound val left = Holder.Labeled(value: row,label: row.name) val right = Holder.Labeled(value: row,label: row.name) return left == right }
 `, genericFunctionSelectionAssertions, StableIDs{ModelFields: map[string]map[string]int{"Node": {"id": 1, "name": 2, "secret": 3}, "Box": {"value": 1}, "Holder": {"Model": 1, "Labeled": 2}, "Holder.Model": {"value": 1}, "Holder.Labeled": {"value": 1, "label": 2}}})
 }
 
 const genericFunctionSelectionAssertions = `package generated
-import("bytes";"context";"encoding/json";"fmt";"net/http/httptest";"strings";"testing";
+import("bytes";"context";"encoding/json";"fmt";"net/http/httptest";"os";"strings";"testing";
 "github.com/light-speak/luxo/internal/testutil";"github.com/light-speak/luxo/pkg/lux";
 "github.com/light-speak/luxo/pkg/lux/api";"github.com/light-speak/luxo/pkg/lux/codec";"github.com/light-speak/luxo/pkg/lux/pg";
 "github.com/light-speak/luxo/pkg/lux/schema";"github.com/light-speak/luxo/pkg/lux/selection";
@@ -160,14 +177,17 @@ func(*genericFunctionTrace)FinishDatabaseQuery(context.Context,lux.DatabaseTrace
 func(*genericFunctionTrace)StartDatabaseAcquire(ctx context.Context,_ lux.DatabasePoolTraceMeta)context.Context{return ctx}
 func(*genericFunctionTrace)FinishDatabaseAcquire(context.Context,error){}
 func TestGenericFunctionSelectionSQL(t *testing.T){
- container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("generic_fn"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
- testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
- connection,err:=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+ connection:=os.Getenv("LUXO_TEST_DATABASE_URL")
+ if connection==""{
+  container,err:=postgres.Run(t.Context(),testutil.PostgresImage(),postgres.WithDatabase("generic_fn"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+  testcontainers.CleanupContainer(t,container);if err!=nil{t.Fatal(err)}
+  connection,err=container.ConnectionString(t.Context(),"sslmode=disable");if err!=nil{t.Fatal(err)}
+ }
  db,err:=pg.NewDB(t.Context(),connection);if err!=nil{t.Fatal(err)};t.Cleanup(db.Close)
  if _,err:=pg.Exec(t.Context(),db,"CREATE TABLE nodes(id bigint PRIMARY KEY,name text NOT NULL,secret text NOT NULL); INSERT INTO nodes VALUES(1,'Ada','private')");err!=nil{t.Fatal(err)}
  router:=api.NewRouter();if err:=RegisterSchema(router.Schema);err!=nil{t.Fatal(err)}
  if err:=RegisterHandlers(router,NewFromDB(db));err!=nil{t.Fatal(err)};if err:=router.Prepare();err!=nil{t.Fatal(err)}
- for _,sample:=range []struct{name,fields,want string}{{"direct","value{name}",` + "`" + `{"value":{"name":"Ada"}}` + "`" + `},{"nested","value{value{name}}",` + "`" + `{"value":{"value":{"name":"Ada"}}}` + "`" + `},{"extracted","name",` + "`" + `{"name":"Ada"}` + "`" + `}}{for _,binary:=range []bool{false,true}{
+ for _,sample:=range []struct{name,fields,want string}{{"direct","value{name}",` + "`" + `{"value":{"name":"Ada"}}` + "`" + `},{"nested","value{value{name}}",` + "`" + `{"value":{"value":{"name":"Ada"}}}` + "`" + `},{"extracted","name",` + "`" + `{"name":"Ada"}` + "`" + `},{"destructuredCopy","name",` + "`" + `{"name":"Ada"}` + "`" + `},{"destructuredAwait","name",` + "`" + `{"name":"Ada"}` + "`" + `},{"earlyAwait","name",` + "`" + `{"name":"Ada"}` + "`" + `}}{for _,binary:=range []bool{false,true}{
   t.Run(fmt.Sprintf("%s/%t",sample.name,binary),func(t *testing.T){
    declaration:=router.Schema.APIs[sample.name];model:=router.Schema.LookupModel(declaration.ReturnType)
    body,err:=json.Marshal(map[string]string{"$api":sample.name,"$select":sample.fields});if err!=nil{t.Fatal(err)}
@@ -204,10 +224,25 @@ func TestSelectedQueryObjectStorage(t *testing.T) {
 		{"nested", `val box = Outer { box: Box { rows: Node.select().all() } } return box.box.rows`, "", true},
 		{"assignment", `val box = Box { rows: [] } box.rows = Node.select().all() return box.rows`, "", true},
 		{"copy", `val box = Box { rows: Node.select().all() } val copy = box box.rows = [] return copy.rows`, "", true},
+		{"destructured_copy", `val (left, right) = Box { rows: Node.select().all() } left.rows = [] return right.rows`, "", true},
+		{"destructured_many_with_discards", `val (_, left, _, middle, right) = Box { rows: Node.select().all() } left.rows = [] right.rows = [] return middle.rows`, "", true},
+		{"destructured_existing_copy", `val box = Box { rows: Node.select().all() } val (left, right) = box right.rows = [] return left.rows`, "", true},
+		{"destructured_discard", `val (_, box) = Box { rows: Node.select().all() } return box.rows`, "", true},
+		{"destructured_nullable", `val (left, right): Box? = Box { rows: Node.select().all() } return (right ?: throw error.NotFound).rows`, "", true},
+		{"await_scalar_copy", `val (left, right) = await { Box { rows: Node.select().all() } } left.rows = [] return right.rows`, "", true},
+		{"await_scalar_discard", `val (_, box) = await { Box { rows: Node.select().all() } } return box.rows`, "", true},
+		{"await_scalar", `val box = await { Box { rows: Node.select().all() } } return box.rows`, "", true},
+		{"await_tuple_first", `val (rows, count) = await { Node.select().all() 42 } return rows`, "", true},
+		{"await_tuple_last", `val (_, box) = await { 42 Box { rows: Node.select().all() } } return box.rows`, "", true},
+		{"await_tuple_third", `val (_, _, rows) = await { 42 false Node.select().all() } return rows`, "", true},
+		{"await_tuple_discard", `val (_, box) = await { Node.select().all() Box { rows: [] } } return box.rows`, "", false},
 		{"nested_copy", `val outer = Outer { box: Box { rows: Node.select().all() } } val copy = outer.box outer.box.rows = [] return copy.rows`, "", true},
 		{"nested_shared", `val outer = Outer { box: Box { rows: Node.select().all() } } val copy = outer copy.box.rows = [] return outer.box.rows`, "", false},
+		{"destructured_nested_shared", `val (left, right) = Outer { box: Box { rows: Node.select().all() } } left.box.rows = [] return right.box.rows`, "", false},
+		{"destructured_nested_replaced", `val (left, right) = Outer { box: Box { rows: Node.select().all() } } left.box = Box { rows: [] } return right.box.rows`, "", true},
 		{"reference", `val holder = Holder { id: 1, rows: [] } val alias = holder holder.rows = Node.select().all() return alias.rows`, "", true},
 		{"reference_empty", `val holder = Holder { id: 1, rows: Node.select().all() } val alias = holder holder.rows = [] return alias.rows`, "", false},
+		{"destructured_reference", `val (holder, alias) = Holder { id: 1, rows: Node.select().all() } holder.rows = [] return alias.rows`, "", false},
 		{"cycle", `val holder = Holder { id: 1, rows: Node.select().all() } holder.parent = holder return holder.parent?.rows ?: []`, "", true},
 		{"function_reference", `val holder = makeHolder() val alias = holder holder.rows = Node.select().all() return alias.rows`, "", true},
 		{"nullable_copy", `val box: Box? = Box { rows: Node.select().all() } val copy = box ?: throw error.NotFound copy.rows = [] return (box ?: throw error.NotFound).rows`, "", true},
@@ -282,6 +317,22 @@ func TestSelectedQueryObjectSourcesStayIndependent(t *testing.T) {
 		first, last loadProjection
 	}{
 		{"copy", `val box = Box { rows: Node.select().all() } val copy = box box.rows = Node.select().all() val names = copy.rows.map { it.name } return box.rows`, loadProjection{columns: [][]string{{"name"}}}, loadProjection{client: true}},
+		{"await_tuple", `val (left, right) = await { Node.select().all() Node.select().all() } val names = left.map { it.name } return right`, loadProjection{columns: [][]string{{"name"}}}, loadProjection{client: true}},
+		{"await_local_scope", `val rows = Node.select().all()
+val result = await {
+ val rows = Node.select().all()
+ rows
+}
+val names = rows.map { it.name }
+return result`, loadProjection{columns: [][]string{{"name"}}}, loadProjection{client: true}},
+		{"await_local_scalar_aliases", `val rows = Node.select().all()
+val (_, result) = await {
+ val rows = Node.select().all()
+ rows
+}
+val names = rows.map { it.name }
+return result`, loadProjection{columns: [][]string{{"name"}}}, loadProjection{client: true}},
+		{"await_tuple_outer_scope", `val rows = Node.select().all() if flag { val (rows, old) = await { Node.select().all() rows } return old } return rows`, loadProjection{client: true}, loadProjection{}},
 		{"reference", `val holder = Holder { id: 1, rows: Node.select().all() } val alias = holder holder.rows = Node.select().all() val names = alias.rows.map { it.name } return holder.rows`, loadProjection{}, loadProjection{client: true, columns: [][]string{{"name"}}}},
 		{"nested_shared", `val outer = Outer { box: Box { rows: Node.select().all() } } val copy = outer copy.box.rows = Node.select().all() val names = outer.box.rows.map { it.name } return copy.box.rows`, loadProjection{}, loadProjection{client: true, columns: [][]string{{"name"}}}},
 		{"nested_copy", `val outer = Outer { box: Box { rows: Node.select().all() } } val copy = outer.box outer.box.rows = Node.select().all() val names = copy.rows.map { it.name } return outer.box.rows`, loadProjection{columns: [][]string{{"name"}}}, loadProjection{client: true}},
@@ -300,6 +351,65 @@ func TestSelectedQueryObjectSourcesStayIndependent(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSelectedQueryAwaitConditionalScopeKeepsEffect(t *testing.T) {
+	projections := selectedObjectProjections(t, `val result = await {
+ if flag {
+  val rows = Node.select().all()
+  val names = rows.map { it.name }
+ }
+ Node.select().all()
+}
+return result`, "[Node]")
+	if len(projections) != 2 || projections[0].client || queryColumnArguments(projections[0].columns) != `, "name"` || !projections[1].client {
+		t.Fatalf("conditional await lost its local effect or result projection: %+v", projections)
+	}
+}
+
+func TestSelectedQueryAwaitLocalConditionalAssignment(t *testing.T) {
+	projections := selectedObjectProjections(t, `val result = await {
+ var local = Node.select().all()
+ if flag {
+  local = Node.select().all()
+ }
+ local
+}
+return result`, "[Node]")
+	if len(projections) != 2 || !projections[0].client || !projections[1].client {
+		t.Fatalf("conditional local assignment lost a returned query source: %+v", projections)
+	}
+}
+
+func TestSelectedQueryEmptyAwaitBindingShadowsOuterBinding(t *testing.T) {
+	outer := []loadOrigin{{demand: &loadDemand{model: "Node"}}}
+	for _, await := range []*ast.AwaitExpr{
+		{},
+		{Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{}}}},
+		{Body: &ast.Block{Stmts: []ast.Stmt{&ast.ValStmt{Name: "local", Value: &ast.Literal{}}, nil, &ast.ExprStmt{}}}},
+	} {
+		analysis := loadDemandAnalysis{scopes: []map[string][]loadOrigin{{"row": outer}, {}}}
+		analysis.statement(&ast.ValStmt{Name: "row", Value: await}, false)
+		if _, exists := analysis.lookup("local"); exists || len(analysis.scopes) != 2 || analysis.controlDepth != 0 {
+			t.Fatal("partial await body leaked its scope")
+		}
+		if origins, exists := analysis.lookup("row"); !exists || len(origins) != 0 {
+			t.Fatal("invalid await binding inherited an outer query", origins)
+		}
+	}
+}
+
+func TestSelectedQueryAliasCopyPreservesDirectOrigins(t *testing.T) {
+	object := newLoadObject(nil)
+	direct := loadOrigin{demand: &loadDemand{model: "Node"}, path: []string{"name"}}
+	origins := []loadOrigin{loadObjectOrigin(object), direct}
+	bound := copyLoadObjectSlots(origins, true)
+	if bound[0].demand.object == object || origins[0].demand.object != object {
+		t.Fatal("copy did not preserve independent object slots")
+	}
+	if bound[1].demand != direct.demand || len(bound[1].path) != 1 || bound[1].path[0] != "name" {
+		t.Fatal("copy lost a direct query origin", bound[1])
 	}
 }
 

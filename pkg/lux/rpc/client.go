@@ -32,16 +32,22 @@ type TraceTarget struct {
 	Dependency api.TraceDependency
 }
 
+const (
+	subscriptionActive uint32 = iota
+	subscriptionFinishing
+	subscriptionResultPublished
+)
+
 // Subscription is a dedicated server-streaming RPC connection.
 type Subscription struct {
-	messages chan []byte
-	errors   chan error
-	conn     net.Conn
-	cancel   context.CancelFunc
-	stop     func() bool
-	once     sync.Once
-	finished atomic.Bool
-	result   error // published by finished; immutable afterward
+	messages  chan []byte
+	errors    chan error
+	conn      net.Conn
+	cancel    context.CancelFunc
+	stop      func() bool
+	closeOnce sync.Once
+	terminal  atomic.Uint32
+	result    error // published by terminal; immutable afterward
 }
 
 // Messages returns canonical Luxo binary stream payloads.
@@ -58,7 +64,7 @@ func (s *Subscription) Errors() <-chan error {
 // Err returns the terminal result without consuming it. Drain Messages before
 // interpreting nil as successful completion; an active stream also returns nil.
 func (s *Subscription) Err() error {
-	if s.finished.Load() {
+	if s.terminal.Load() == subscriptionResultPublished {
 		return s.result
 	}
 	return nil
@@ -67,7 +73,12 @@ func (s *Subscription) Err() error {
 // Close cancels the subscription and closes its dedicated connection.
 func (s *Subscription) Close() {
 	s.cancel()
-	s.conn.Close()
+	s.closeConnection()
+}
+
+func (s *Subscription) closeConnection() {
+	// Wait for the first Close to finish releasing the pool's open slot.
+	s.closeOnce.Do(func() { s.conn.Close() })
 }
 
 // NewClient creates an RPC client for the given service address.
@@ -167,7 +178,7 @@ func (c *Client) SubscribeContext(ctx context.Context, bearerToken string, apiID
 		conn:     conn,
 		cancel:   cancel,
 	}
-	subscription.stop = context.AfterFunc(streamCtx, func() { conn.Close() })
+	subscription.stop = context.AfterFunc(streamCtx, subscription.closeConnection)
 	if err := writePreparedFrame(conn, payload); err != nil {
 		if contextErr := contextErrorAfterIO(ctx, err); contextErr != nil {
 			err = contextErr
@@ -249,20 +260,21 @@ func (s *Subscription) readLoop(ctx context.Context) {
 }
 
 func (s *Subscription) finish(err error) {
-	s.once.Do(func() {
-		s.result = err
-		s.finished.Store(true)
-		if s.stop != nil {
-			s.stop()
-		}
-		s.cancel()
-		s.conn.Close()
-		if err != nil {
-			s.errors <- err
-		}
-		close(s.messages)
-		close(s.errors)
-	})
+	if !s.terminal.CompareAndSwap(subscriptionActive, subscriptionFinishing) {
+		return
+	}
+	s.result = err
+	s.terminal.Store(subscriptionResultPublished)
+	if s.stop != nil {
+		s.stop()
+	}
+	s.cancel()
+	s.closeConnection()
+	if err != nil {
+		s.errors <- err
+	}
+	close(s.messages)
+	close(s.errors)
 }
 
 func (c *Client) callRequest(ctx context.Context, request callRequest) ([]byte, error) {
@@ -402,6 +414,9 @@ func (e tracePayloadError) Error() string {
 
 func (e tracePayloadError) Unwrap() error { return e.error }
 
+// An invalid business error body retires the lease and preserves the trace failure.
+type invalidTracedErrorBody struct{ tracePayloadError }
+
 func decodeTracedResponse(resp []byte) ([]byte, api.DebugTraceSnapshot, error) {
 	if len(resp) == 0 {
 		return nil, api.DebugTraceSnapshot{}, fmt.Errorf("rpc: empty traced response")
@@ -422,11 +437,17 @@ func decodeTracedResponse(resp []byte) ([]byte, api.DebugTraceSnapshot, error) {
 		return nil, api.DebugTraceSnapshot{}, fmt.Errorf("rpc: traced response length exceeds frame")
 	}
 	end := start + int(traceLength)
+	body := resp[end:]
 	trace, err := api.DecodeDebugTrace(resp[start:end])
 	if err != nil {
-		return nil, api.DebugTraceSnapshot{}, tracePayloadError{err}
+		traceErr := tracePayloadError{err}
+		if status == statusTraceError {
+			if _, bodyErr := validateRPCErrorEnvelope(body); bodyErr != nil {
+				return nil, api.DebugTraceSnapshot{}, invalidTracedErrorBody{traceErr}
+			}
+		}
+		return nil, api.DebugTraceSnapshot{}, traceErr
 	}
-	body := resp[end:]
 	if status == statusTraceError {
 		return nil, trace, decodeError(body)
 	}

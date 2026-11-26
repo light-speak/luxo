@@ -101,8 +101,13 @@ export function useLuxoQuery<T>(
     }
     const unsubscribe = queryClient.subscribe(queryKeyRef.current, event => {
       if (!mountedRef.current) return
-      if (event.type === 'invalidated' && enabled) {
-        void execute()
+      if (event.type === 'invalidated') {
+        if (enabled) {
+          void execute()
+        } else {
+          versionRef.current++
+          syncState()
+        }
         return
       }
       if (

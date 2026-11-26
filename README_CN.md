@@ -393,7 +393,7 @@ Luxo 的追踪是请求级、跨网关、服务、DataLoader 与数据库的执�
 
 ### 发布与稳定性规范
 
-跨仓库 Swift CI 固定检出提交 `40aa5cc7948a0b74cfc59bc97dfbbc85371f4705`，并验证 Swift 与核心的 `VERSION` 一致。该修订已在本地验证 JSON 和 Binary 下的直连、网关调用、WebSocket 令牌续期和枚举滚动升级。发行验收还需完成远端检出及完整发行门禁。每次升级候选版本时记录受测提交和兼容矩阵。
+跨仓库 Swift CI 固定检出提交 `d6578969bcef258141c7c99cb6cface30a22a0e2`，并验证 Swift 与核心的 `VERSION` 一致。该兼容性门禁覆盖 JSON 和 Binary 下的直连、网关调用、WebSocket 令牌续期和枚举滚动升级。发行验收还需完成远端检出及完整发行门禁。每次升级候选版本时记录受测提交和兼容矩阵。
 
 下一发布目标为 **`v1.0.0-beta.1`**，不是已经发布的稳定版。Luxo 遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)：Git tag 使用 `v` 前缀，包版本采用各生态要求的格式。
 
@@ -595,12 +595,20 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 - [x] `@hidden` 默认 SELECT 排除（API 响应不含 password）
 - [x] `@by` 关联注解 + 自动推断（belongsTo/hasMany/hasOne）
 - [x] 迁移引擎（声明式 diff · 改名检测 · 安全警告 · `--dry-run`）
-- [x] 并发锁 + 校验和验证 + `CREATE INDEX CONCURRENTLY` 自动拆分
+- [x] 并发锁 + 校验和验证 + 独立的 `CREATE INDEX CONCURRENTLY` 迁移
 - [x] 认证运行时（JWT 签发/验证/刷新、Luvia `AuthMiddleware`、`Identity(ctx)`）
 - [x] 标准库（str · slice · math · datetime · crypto · jsonutil · httputil · convert）
 - [x] 项目骨架（`luxo init` + `luxo add` + `luxo gen` + `luxo run`）
 - [x] Dialect 接口可插拔（PostgreSQL 已实现；MySQL、SQLite、MongoDB 为规划目标）
 - [x] `luxo deploy compose` — Dockerfile + docker-compose.yml 生成
+
+PostgreSQL 迁移中，`CREATE INDEX CONCURRENTLY` 等受支持的事务外语句须放在独立的编号 SQL 文件中。例如先在 `002_add_column.sql` 添加列，再在 `003_create_index.sql` 创建索引。每个 `UP` 或 `DOWN` 段可以包含多条普通事务 SQL，或单条事务外语句。Luxo 在执行任何迁移或回滚前检查本次涉及的段。回滚还会核对所选文件已记录的校验和。`luxo migrate up --dry-run` 只读预览待执行计划，不会创建历史表或执行迁移 SQL。
+
+每次操作开始时，Luxo 使用 PostgreSQL 的 `current_schema()` 选定 `_migrations` 所在的 schema。预览、执行和回滚请配置同一 `search_path`。迁移 SQL 要求 PostgreSQL 默认设置 `standard_conforming_strings=on`。需要反斜杠转义时使用显式的 `E'...'` 字符串。
+
+如果已应用文件的 `DOWN` 段混用了两类语句，保留已记录文件，按依赖顺序新建补偿迁移。并发索引构建失败时，PostgreSQL 可能留下无效索引。重试前先检查并处理该索引。并发的 `CREATE INDEX IF NOT EXISTS` 只有在索引有效且属于目标表时才记为成功。
+
+PostgreSQL 的独立事务外语句和迁移历史分开提交。失败可能发生在语句成功尚未确认、语句已返回成功但历史未提交，或历史提交尚未确认三个阶段。重试前先核对受影响的数据库对象和迁移历史。保留已应用的迁移文件原样。
 
 ### Phase 3 — 多服务 + Binary ✅
 - [x] Binary 协议（varint · svarint · fixed64 · field mask · 列式编码）

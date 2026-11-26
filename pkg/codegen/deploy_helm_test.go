@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"bytes"
+	"strconv"
 	"strings"
 	"testing"
 	"text/template"
@@ -11,6 +12,80 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 	"gopkg.in/yaml.v3"
 )
+
+func TestHelmReferencesExistingJWTSecretForApplicationServices(t *testing.T) {
+	helm := GenerateHelmFiles(makeHelmResult("user", "post"), "myapp")
+	var values struct {
+		JWT struct {
+			ExistingSecret *string `yaml:"existingSecret"`
+		} `yaml:"jwt"`
+	}
+	if err := yaml.Unmarshal(helm.Files["values.yaml"], &values); err != nil {
+		t.Fatal(err)
+	}
+	if values.JWT.ExistingSecret == nil || *values.JWT.ExistingSecret != "" {
+		t.Fatal("the JWT Secret must be opt-in")
+	}
+	for _, name := range []string{"gateway", "module-user", "module-post"} {
+		deployment := string(helm.Files["templates/"+name+"-deployment.yaml"])
+		if !strings.Contains(deployment, "include \"luxo.jwtEnvironment\" . | nindent 12 }}\n          envFrom:") {
+			t.Errorf("%s does not use the JWT Secret helper in the container environment", name)
+		}
+	}
+	if bytes.Contains(helm.Files["templates/secret.yaml"], []byte("JWT_SECRET")) {
+		t.Fatal("the chart must not create its own JWT signing key")
+	}
+	const definition = "{{- define \"luxo.jwtEnvironment\" -}}"
+	_, body, found := strings.Cut(string(helm.Files["templates/_helpers.tpl"]), definition)
+	if !found {
+		t.Fatal("missing the JWT Secret helper definition")
+	}
+	tmpl, err := template.New("auth").Funcs(template.FuncMap{"quote": strconv.Quote}).Parse(definition + body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkHelmJWTEnvironment(t, tmpl, "")
+	checkHelmJWTEnvironment(t, tmpl, "application-jwt")
+}
+
+func checkHelmJWTEnvironment(t *testing.T, tmpl *template.Template, secret string) {
+	t.Helper()
+	var rendered bytes.Buffer
+	values := map[string]any{"Values": map[string]any{"jwt": map[string]string{"existingSecret": secret}}}
+	if err := tmpl.ExecuteTemplate(&rendered, "luxo.jwtEnvironment", values); err != nil {
+		t.Fatal(err)
+	}
+	var environment []struct {
+		Name      string
+		ValueFrom struct {
+			SecretKeyRef struct {
+				Name     string
+				Key      string
+				Optional bool
+			} `yaml:"secretKeyRef"`
+		} `yaml:"valueFrom"`
+	}
+	if err := yaml.Unmarshal(rendered.Bytes(), &environment); err != nil {
+		t.Fatal(err)
+	}
+	if secret == "" {
+		if len(environment) != 0 {
+			t.Fatalf("JWT is disabled, found env: %s", rendered.String())
+		}
+		return
+	}
+	keys := []string{"JWT_SECRET", "JWT_EXPIRES", "JWT_REFRESH", "JWT_REFRESH_EXPIRES"}
+	if len(environment) != len(keys) {
+		t.Fatalf("incorrect JWT env: %s", rendered.String())
+	}
+	for i, key := range keys {
+		entry := environment[i]
+		ref := entry.ValueFrom.SecretKeyRef
+		if entry.Name != key || ref.Key != key || ref.Name != secret || ref.Optional != (key != "JWT_SECRET") {
+			t.Errorf("incorrect Secret reference for %s: %+v", key, entry)
+		}
+	}
+}
 
 func TestHelmConditionalResourceHeader(t *testing.T) {
 	helm := GenerateHelmFiles(makeHelmResult("user"), "probe")
@@ -108,6 +183,58 @@ func TestHelmGenerateFiles_Empty(t *testing.T) {
 	helm := GenerateHelmFiles(result, "myapp")
 	if helm != nil {
 		t.Error("should return nil for empty project")
+	}
+}
+
+func TestHelmCheckedBackendSelection(t *testing.T) {
+	result := makeHelmResult("user")
+	result.Files[0].APIs = []*ast.ApiDecl{{Name: "watch", Directives: []*ast.Directive{{Name: "stream"}}}}
+	result.Files = append(result.Files, &ast.File{Name: "origin/read.luxo", APIs: []*ast.ApiDecl{{Name: "readValue", Directives: []*ast.Directive{{Name: "cache"}}}}})
+	for _, sample := range []struct {
+		selection                     EntryBackends
+		gatewayNATS, watchNATS, redis bool
+	}{
+		{EntryBackends{Events: "memory", Cache: "memory"}, false, false, false},
+		{EntryBackends{Events: "memory", Queue: "nats", Cache: "memory"}, false, true, false},
+		{EntryBackends{Events: "nats", Cache: "redis"}, true, true, true},
+	} {
+		chart, err := GenerateHelmFilesChecked(result, "audit", sample.selection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, check := range []struct {
+			file, env string
+			want      bool
+		}{
+			{"gateway", "NATS_URL", sample.gatewayNATS},
+			{"module-user", "NATS_URL", sample.watchNATS},
+			{"module-user", "LUXO_CACHE_PROJECT", false},
+			{"module-read", "REDIS_URL", sample.redis},
+			{"module-read", "LUXO_CACHE_PROJECT", true},
+		} {
+			source := chart.Files["templates/"+check.file+"-deployment.yaml"]
+			if strings.Contains(string(source), "name: "+check.env+"\n") != check.want {
+				t.Errorf("selection %+v: %s requires %s = %v", sample.selection, check.file, check.env, check.want)
+			}
+		}
+	}
+}
+
+func TestHelmCheckedRejectsInvalidInput(t *testing.T) {
+	invalid := analyzePermissionFixture(t, "type Detail { level: Int }\nmodel Record { id: Int @id detail: Detail }")
+	for _, sample := range []struct {
+		result     *semantic.Result
+		options    EntryBackends
+		diagnostic string
+	}{
+		{nil, EntryBackends{}, "requires a semantic result"},
+		{invalid, EntryBackends{}, "has no database mapping"},
+		{makeHelmResult("user"), EntryBackends{Queue: "unsupported"}, "unsupported queue backend"},
+	} {
+		chart, err := GenerateHelmFilesChecked(sample.result, "audit", sample.options)
+		if chart != nil || err == nil || !strings.Contains(err.Error(), sample.diagnostic) {
+			t.Fatalf("invalid result: generated=%v error=%v", chart != nil, err)
+		}
 	}
 }
 

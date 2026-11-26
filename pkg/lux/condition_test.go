@@ -889,6 +889,48 @@ func TestRawConditionArgRebase(t *testing.T) {
 	}
 }
 
+func TestRawConditionPreservesPostgresLiteralText(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{"identifiers", `"item$1" = $1 AND item$2 = $2`, `("item$1" = $3 AND item$2 = $4)`},
+		{"strings", `label = 'Kit ''$1''' AND kind = $1 AND price = $2`, `(label = 'Kit ''$1''' AND kind = $3 AND price = $4)`},
+		{"escaped strings", `label = E'Kit\'$1' AND kind = $1 AND price = $2`, `(label = E'Kit\'$1' AND kind = $3 AND price = $4)`},
+		{"continued escape string", "label = E'North'\n'Star\\'$1' AND kind = $1 AND price = $2", "(label = E'North'\n'Star\\'$1' AND kind = $3 AND price = $4)"},
+		{"dollar quotes", `label IN ($$Kit $1$$, $tag$Kit $2$tag$, $1) AND price = $2`, `(label IN ($$Kit $1$$, $tag$Kit $2$tag$, $3) AND price = $4)`},
+		{"comments", "label = $1 -- label $1\nAND price = $2 /* outer $1 /* inner $2 */ */", "(label = $3 -- label $1\nAND price = $4 /* outer $1 /* inner $2 */ */)"},
+	}
+	values := []any{"Kit", 42}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, args := RawCondition(test.sql, values...).ToSQL(3)
+			if got != test.want || !reflect.DeepEqual(args, values) {
+				t.Fatalf("ToSQL() = %q, %v, want %q, %v", got, args, test.want, values)
+			}
+		})
+	}
+}
+
+func TestRawConditionTerminatesTrailingLineComment(t *testing.T) {
+	condition := RawCondition("label = $1 -- public report label", "Kit")
+	got, args := BuildSelectSQL("items", nil, []Condition{condition, NewIntField("price").Eq(42)}, nil, 0, 0)
+	want := "SELECT * FROM items WHERE (label = $1 -- public report label\n) AND price = $2"
+	if got != want || !reflect.DeepEqual(args, []any{"Kit", int64(42)}) {
+		t.Fatalf("query = %q, %v, want %q", got, args, want)
+	}
+}
+
+func TestRawConditionPreservesInvalidNumericToken(t *testing.T) {
+	const fragment = `id = $01 AND seq = $0 AND n = $9223372036854775807 AND m = $9223372036854775808 AND label = $unfinished`
+	got, _ := RawCondition(fragment, 4).ToSQL(2)
+	want := `(id = $2 AND seq = $0 AND n = $9223372036854775807 AND m = $9223372036854775808 AND label = $unfinished)`
+	if got != want {
+		t.Fatalf("ToSQL() = %q, want %q", got, want)
+	}
+}
+
 func TestRawConditionMultiDigitPlaceholders(t *testing.T) {
 	// $10 should not be mis-parsed as $1 followed by "0"
 	cond := RawCondition("x IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)", 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)

@@ -100,6 +100,7 @@ func TestClientClosesConnectionOnTrailingResponseBytes(t *testing.T) {
 }
 
 func TestClientRetiresLeaseAfterInvalidResponse(t *testing.T) {
+	invalidErrorFields := rpcErrorFields(399, "Invalid", "invalid status code")
 	for _, sample := range []struct {
 		name   string
 		frame  []byte
@@ -110,6 +111,10 @@ func TestClientRetiresLeaseAfterInvalidResponse(t *testing.T) {
 		{name: "stream status", frame: []byte{statusStream, 1}},
 		{name: "malformed error", frame: []byte{statusError, 0}},
 		{name: "broken trace", frame: []byte{statusTraceOK, 3}, traced: true},
+		{name: "bad trace with success body", frame: []byte{statusTraceOK, 1, 0xff, 42}, traced: true, keep: true},
+		{name: "bad trace with incomplete error body", frame: []byte{statusTraceError, 1, 0xff, 0}, traced: true},
+		{name: "bad trace with invalid error status", frame: append([]byte{statusTraceError, 1, 0xff}, rpcErrorBody(invalidErrorFields[:]...)...), traced: true},
+		{name: "bad trace with valid error body", frame: append([]byte{statusTraceError, 1, 0xff}, encodeError(409, "Conflict", "conflict")[1:]...), traced: true, keep: true},
 		{name: "application error", frame: encodeError(409, "Conflict", "conflict"), keep: true},
 		{name: "traced application error", frame: encodeError(409, "Conflict", "conflict"), traced: true, keep: true},
 	} {

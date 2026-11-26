@@ -5,13 +5,17 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 )
 
+const connBorrowed uint32 = 0
+
 const (
-	connBorrowed uint32 = iota
-	connIdle
+	connIdle uint32 = 1 << iota
+	connClosing
 	connClosed
+	connCloseWaiter
 )
 
 // One wrapper per physical connection accounts for every direct Close path,
@@ -78,11 +82,46 @@ func partialResponseError(received int, err error) error {
 }
 
 func (c *poolConn) Close() error {
-	if c.state.Swap(connClosed) == connClosed {
+	if state := c.state.Or(connClosing); state&connClosing != 0 {
+		if state&connClosed == 0 {
+			c.pool.waitForClose(c)
+		}
 		return nil
 	}
-	err := c.Conn.Close()
-	c.pool.open.Add(-1)
-	c.pool.signal()
-	return err
+	defer c.finishClose()
+	return c.Conn.Close()
+}
+
+func (c *poolConn) finishClose() {
+	p := c.pool
+	p.open.Add(-1)
+	p.signal()
+	if c.state.Or(connClosed)&connCloseWaiter == 0 {
+		return
+	}
+	// A waiter marks the state and registers under this same lock.
+	p.closingMu.Lock()
+	waiter := p.closingWaiters[c]
+	delete(p.closingWaiters, c)
+	p.closingMu.Unlock()
+	waiter.Done()
+}
+
+func (p *Pool) waitForClose(c *poolConn) {
+	p.closingMu.Lock()
+	if c.state.Or(connCloseWaiter)&connClosed != 0 {
+		p.closingMu.Unlock()
+		return
+	}
+	waiter := p.closingWaiters[c]
+	if waiter == nil {
+		waiter = new(sync.WaitGroup)
+		waiter.Add(1)
+		if p.closingWaiters == nil {
+			p.closingWaiters = make(map[*poolConn]*sync.WaitGroup)
+		}
+		p.closingWaiters[c] = waiter
+	}
+	p.closingMu.Unlock()
+	waiter.Wait()
 }

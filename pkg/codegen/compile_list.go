@@ -8,8 +8,11 @@ import (
 	"github.com/light-speak/luxo/pkg/ast"
 )
 
-// Select the expected list representation before compiling any element side effects.
+// Select a contextual representation before lowering any expression effects.
 func (c *compiler) compileExpectedExpr(expr ast.Expr, expected *ast.TypeRef) string {
+	if await, ok := expr.(*ast.AwaitExpr); ok {
+		return c.compileAwaitValue(await, expected)
+	}
 	if list, ok := expr.(*ast.ListExpr); ok && expected != nil && expected.IsList {
 		return c.compileTypedList(list, expected)
 	}
@@ -18,6 +21,66 @@ func (c *compiler) compileExpectedExpr(expr ast.Expr, expected *ast.TypeRef) str
 		return value
 	}
 	return c.compileExpr(expr)
+}
+
+// Await values use the same task join and error return as local bindings.
+// Only context-dependent results borrow the consumer's concrete type.
+func (c *compiler) compileAwaitValue(expr *ast.AwaitExpr, expected *ast.TypeRef) string {
+	value := singleAwaitValue(expr)
+	name := c.discardedBindingName()
+	c.compileAwaitBindings(expr, []string{name}, awaitValueRepresentation(value, expected))
+	if value.GetTypeTag() == "null" && !concreteAwaitType(expected) {
+		// Keep the joined result slot valid even when the consumer needs an untyped nil.
+		c.write("_ = %s", c.bindings.name(name))
+		return "nil"
+	}
+	return c.bindings.name(name)
+}
+
+func singleAwaitValue(expr *ast.AwaitExpr) ast.Expr {
+	const invalid = "await in a value position requires a single result"
+	if expr.Body == nil || expr.NoAwaitResult {
+		panic(&InternalCompilerError{Detail: invalid})
+	}
+	var result ast.Expr
+	for _, statement := range expr.Body.Stmts {
+		value, ok := statement.(*ast.ExprStmt)
+		if !ok || value.Expr == nil {
+			continue
+		}
+		if result != nil {
+			panic(&InternalCompilerError{Detail: invalid})
+		}
+		result = value.Expr
+	}
+	if result == nil {
+		panic(&InternalCompilerError{Detail: invalid})
+	}
+	return result
+}
+
+func awaitValueRepresentation(value ast.Expr, expected *ast.TypeRef) *ast.TypeRef {
+	if value.GetTypeTag() == "null" {
+		ref := ast.TypeRef{Name: "struct{}"}
+		if concreteAwaitType(expected) {
+			ref = *expected
+		}
+		ref.Nullable = true
+		return &ref
+	}
+	if value.IsListType() && value.GetTypeTag() == "" {
+		ref := ast.TypeRef{Name: "struct{}", IsList: true}
+		if concreteAwaitType(expected) && expected.IsList {
+			ref = *expected
+		}
+		ref.Nullable = false
+		return &ref
+	}
+	return nil
+}
+
+func concreteAwaitType(ref *ast.TypeRef) bool {
+	return ref != nil && ref.Name != "" && ref.Name != "null"
 }
 
 // Empty debug chains inherit the surrounding concrete list type, just like [].

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -273,6 +274,170 @@ func TestPoolStreamOccupiesSlotUntilTermination(t *testing.T) {
 	if _, err := client.CallWithMaskContext(ctx, "", 2, nil, nil); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// Closing the pipe can wake the reader before the underlying Close returns.
+type pausedStreamCloseConn struct {
+	net.Conn
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *pausedStreamCloseConn) Close() error {
+	err := c.Conn.Close()
+	close(c.started)
+	<-c.release
+	return err
+}
+
+func TestPoolStreamTerminalWaitsForSlotRelease(t *testing.T) {
+	for _, source := range []string{"parent cancellation", "explicit close"} {
+		t.Run(source, func(t *testing.T) {
+			armResult, resultDeadline := poolCloseWatchdog(t, 5*time.Second)
+			armObservation, observationDone := poolCloseWatchdog(t, 100*time.Millisecond)
+			synctest.Test(t, func(t *testing.T) {
+				opts := DefaultPoolOptions()
+				opts.MaxIdle, opts.MaxOpen, opts.MaxWaiters = 1, 1, 0
+				client, err := NewNamedClientWithOptions("test", "unused", opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer client.Close()
+				conn, peer := net.Pipe()
+				defer peer.Close()
+				closeStarted, allowClose := make(chan struct{}), make(chan struct{})
+				release := sync.OnceFunc(func() { close(allowClose) })
+				defer release()
+				client.pool.Put(&pausedStreamCloseConn{Conn: conn, started: closeStarted, release: allowClose})
+				streamPeer := replyToPoolRequest(peer, []byte{statusOK})
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				sub, err := client.SubscribeContext(ctx, "", 1, nil, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := <-streamPeer; err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+
+				explicit := make(chan struct{})
+				if source == "explicit close" {
+					go func() {
+						sub.Close()
+						close(explicit)
+					}()
+				} else {
+					cancel()
+				}
+				<-closeStarted
+				close(armResult)
+				for sub.Err() == nil {
+					select {
+					case <-resultDeadline:
+						t.Fatal("terminal result not published while physical close was paused")
+					default:
+						runtime.Gosched()
+					}
+				}
+				if !errors.Is(sub.Err(), context.Canceled) {
+					t.Fatalf("lost early cancellation result: %v", sub.Err())
+				}
+				if _, err := client.CallWithMaskContext(t.Context(), "", 2, nil, nil); !errors.Is(err, ErrPoolExhausted) {
+					t.Fatalf("slot released during physical close: %v", err)
+				}
+				close(armObservation)
+				assertPoolStreamTerminalPending(t, sub, explicit, observationDone)
+
+				release()
+				for message := range sub.Messages() {
+					t.Errorf("unexpected stream data: %x", message)
+				}
+				if err := <-sub.Errors(); !errors.Is(err, context.Canceled) || err != sub.Err() {
+					t.Fatalf("terminal cancellation: channel=%v Err=%v", err, sub.Err())
+				}
+				if _, open := <-sub.Errors(); open {
+					t.Fatal("terminal error reported more than once")
+				}
+				if source == "explicit close" {
+					<-explicit
+				}
+				if client.pool.open.Load() != 0 {
+					t.Fatal("terminal notification preceded capacity release")
+				}
+
+				replacement, unaryPeer := net.Pipe()
+				defer unaryPeer.Close()
+				client.pool.Put(replacement)
+				if len(client.pool.conns) != 1 {
+					t.Fatal("released slot cannot accept another connection")
+				}
+				unary := replyToPoolRequest(unaryPeer, []byte{statusOK, 7})
+				if data, err := client.CallWithMaskContext(t.Context(), "", 2, nil, nil); err != nil || len(data) != 1 || data[0] != 7 {
+					t.Fatalf("unary did not acquire the released slot: %x %v", data, err)
+				}
+				if err := <-unary; err != nil {
+					t.Fatal(err)
+				}
+			})
+		})
+	}
+}
+
+func assertPoolStreamTerminalPending(t *testing.T, sub *Subscription, explicit, observationDone <-chan struct{}) {
+	t.Helper()
+	select {
+	case err := <-sub.Errors():
+		t.Fatalf("errors notified before pool slot release: %v", err)
+	case <-observationDone:
+	}
+	// Check again in case the timer and a terminal channel became ready together.
+	select {
+	case _, open := <-sub.Messages():
+		t.Fatalf("messages notified before pool slot release: open=%t", open)
+	case err := <-sub.Errors():
+		t.Fatalf("errors notified before pool slot release: %v", err)
+	case <-explicit:
+		t.Fatal("Close returned before pool slot release")
+	default:
+	}
+}
+
+// A goroutine joining sync.Once is not durably blocked for synctest. Arm a
+// real watchdog outside the bubble only after the pipe close is paused.
+func poolCloseWatchdog(t *testing.T, timeout time.Duration) (arm, fired chan struct{}) {
+	arm, fired = make(chan struct{}), make(chan struct{})
+	ctx := t.Context()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-arm:
+		case <-ctx.Done():
+			return
+		}
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			close(fired)
+		case <-ctx.Done():
+		}
+	}()
+	t.Cleanup(func() { <-done })
+	return arm, fired
+}
+
+func replyToPoolRequest(peer net.Conn, response []byte) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := ReadFrame(peer, nil)
+		if err == nil {
+			err = WriteFrame(peer, response)
+		}
+		done <- err
+	}()
+	return done
 }
 
 func TestPoolWaiterWakeupChain(t *testing.T) {

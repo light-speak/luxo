@@ -125,11 +125,57 @@ func TestResponseHeaderValidation(t *testing.T) {
 	if err := w.writeResponse(1, nil); !errors.Is(err, errResponse) {
 		t.Fatal(err)
 	}
-	if err := w.writeResponse(1, &response{status: 100}); !errors.Is(err, errResponse) {
+	if err := w.writeResponse(1, &response{status: 100}); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.writeResponse(1, &response{status: 200, body: make([]byte, 9)}); !errors.Is(err, errQueueFull) {
+	if err := w.data.buffer.Flush(); err != nil {
 		t.Fatal(err)
+	}
+	frame, err := http2.NewFramer(nil, &wire).ReadFrame()
+	reset, ok := frame.(*http2.RSTStreamFrame)
+	if err != nil || !ok || reset.StreamID != 1 || reset.ErrCode != http2.ErrCodeInternal || len(q.streams) != 0 {
+		t.Fatal("invalid response did not reset and release the stream", frame, err)
+	}
+	if err := q.open(3, 65535); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.writeResponse(3, &response{status: 200, body: make([]byte, 9)}); !errors.Is(err, errQueueFull) {
+		t.Fatal(err)
+	}
+}
+
+func TestBodylessResponseRejectsInvalidRepresentationLength(t *testing.T) {
+	q, _ := testQueue(t, 1, 32)
+	var wire bytes.Buffer
+	w := newControlWriter(newDataWriter(q, &wire, 32))
+	for _, sample := range []struct {
+		status, headBytes int
+		lengths           []string
+	}{
+		{status: http.StatusOK, headBytes: -1, lengths: []string{"-1"}},
+		{status: http.StatusOK, headBytes: -1, lengths: []string{"4", "5"}},
+		{status: http.StatusResetContent, lengths: []string{"4"}},
+	} {
+		r := &response{status: sample.status, headBytes: sample.headBytes, header: http.Header{"Content-Length": sample.lengths}}
+		if err := w.encodeResponseHead(r); !errors.Is(err, errResponse) {
+			t.Fatalf("status %d accepted invalid lengths %q: %v", sample.status, sample.lengths, err)
+		}
+	}
+}
+
+func TestHeadResponseCountsWritesWithoutCapturingBody(t *testing.T) {
+	budget := &byteBudget{limit: 4}
+	r := &response{status: http.StatusOK, headBytes: -1, limit: 4, budget: budget}
+	for _, data := range [][]byte{nil, []byte("abc"), []byte("d")} {
+		if n, err := r.Write(data); err != nil || n != len(data) {
+			t.Fatalf("write length %d: %d, %v", len(data), n, err)
+		}
+	}
+	if n, err := r.Write([]byte("e")); n != 0 || !errors.Is(err, errResponse) {
+		t.Fatalf("over-limit HEAD write: %d, %v", n, err)
+	}
+	if r.headBytes != 4 || r.body != nil || budget.used.Load() != 0 {
+		t.Fatal("HEAD changed its length or reserved body storage")
 	}
 }
 

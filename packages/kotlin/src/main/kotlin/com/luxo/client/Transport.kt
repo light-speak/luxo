@@ -1,6 +1,13 @@
 package com.luxo.client
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.ensureActive
@@ -11,7 +18,8 @@ import okhttp3.MediaType.Companion.toMediaType
 import java.io.IOException
 import java.util.Base64
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.time.Duration.Companion.milliseconds
@@ -403,24 +411,57 @@ interface Transport {
     fun setToken(token: String)
 }
 
-/** Immutable mode-specific headers; configuration and token changes stay off the request path. */
-internal class HttpProtocolHeaders private constructor(base: Headers) {
-    val json: Headers = base.newBuilder().set("Content-Type", JSON_MEDIA_TYPE.toString())
-        .set("X-Luxo-Mode", "json").build()
-    val binary: Headers = base.newBuilder().set("Content-Type", BINARY_MEDIA_TYPE.toString())
-        .set("X-Luxo-Mode", "binary").build()
+/** Mode-specific headers and their HTTP credential generation. */
+internal class HttpProtocolHeaders private constructor(
+    val json: Headers,
+    val binary: Headers,
+    val session: Any,
+) {
+    // Accessed only under the owning transport's refresh lock.
+    internal var refresh: HTTPTokenRefresh? = null
+
+    private constructor(base: Headers, session: Any) : this(
+        base.newBuilder().set("Content-Type", JSON_MEDIA_TYPE.toString()).set("X-Luxo-Mode", "json").build(),
+        base.newBuilder().set("Content-Type", BINARY_MEDIA_TYPE.toString()).set("X-Luxo-Mode", "binary").build(),
+        session,
+    )
 
     internal constructor(headers: Map<String, String>, token: String?) : this(Headers.Builder().apply {
         for ((name, value) in headers) set(name, value)
         if (token != null) set("Authorization", "Bearer $token")
-    }.build())
+    }.build(), Any())
 
-    fun withToken(token: String): HttpProtocolHeaders =
-        HttpProtocolHeaders(json.newBuilder().set("Authorization", "Bearer $token").build())
+    fun withToken(token: String, session: Any = Any()): HttpProtocolHeaders =
+        HttpProtocolHeaders(json.newBuilder().set("Authorization", "Bearer $token").build(), session)
+
+    fun nextGeneration(): HttpProtocolHeaders = HttpProtocolHeaders(json, binary, session)
 
     companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val BINARY_MEDIA_TYPE = "application/x-luxo".toMediaType()
+    }
+}
+
+private object HTTPTokenRefreshScope : CoroutineScope {
+    override val coroutineContext: CoroutineContext = EmptyCoroutineContext
+}
+
+internal class HTTPTokenRefresh(context: CoroutineContext, callback: suspend () -> String?) {
+    val outcome = CompletableDeferred<Result<String?>>()
+    // The refresh belongs to its waiters, not to the caller that happened to start it.
+    val worker = HTTPTokenRefreshScope.launch(context.minusKey(Job), start = CoroutineStart.LAZY) {
+        outcome.complete(runCatching {
+            val token = callback()
+            currentCoroutineContext().ensureActive()
+            token
+        })
+    }
+    var waiters = 0
+    var discarded = false
+
+    fun discard() {
+        outcome.complete(Result.success(null))
+        worker.cancel()
     }
 }
 
@@ -464,7 +505,8 @@ class OkHttpTransport(
     private val endpointURL by lazy { Request.Builder().url(endpoint).build().url }
 
     private val client: OkHttpClient = client?.let(::directHTTPClient) ?: defaultHTTPClient(timeoutSeconds, maxConcurrentRequests)
-    private val currentHeaders = AtomicReference(HttpProtocolHeaders(headers, token))
+    private val refreshLock = Any()
+    @Volatile private var currentHeaders = HttpProtocolHeaders(headers, token)
     @Volatile private var currentMode: TransportMode = mode
     @Volatile private var currentSchema: Map<String, APISchemaEntry> = snapshotAPISchema(schema)
 
@@ -475,16 +517,18 @@ class OkHttpTransport(
     override fun setSchema(schema: Map<String, APISchemaEntry>) { currentSchema = snapshotAPISchema(schema) }
     override fun setMode(mode: TransportMode) { currentMode = mode }
     override fun setToken(token: String) {
-        while (true) {
-            val previous = currentHeaders.get()
-            if (currentHeaders.compareAndSet(previous, previous.withToken(token))) return
+        val stale = synchronized(refreshLock) {
+            val previous = currentHeaders
+            currentHeaders = previous.withToken(token)
+            previous.refresh?.also { it.discarded = true }
         }
+        stale?.discard()
     }
 
     override suspend fun call(api: String, params: Map<String, Any?>): Any {
         val started = if (requestTimeoutMillis == 0L) 0L else System.nanoTime()
         val mode = currentMode
-        val headers = currentHeaders.get()
+        val headers = currentHeaders
         val meta = currentSchema[api]
         val body = if (mode == TransportMode.BINARY) encodeBinaryRequest(api, params, null)
             else encodeJSONRequest(meta, api, params)
@@ -495,12 +539,12 @@ class OkHttpTransport(
         val started = if (requestTimeoutMillis == 0L) 0L else System.nanoTime()
         val mode = currentMode
         if (mode == TransportMode.BINARY) {
-            val headers = currentHeaders.get()
+            val headers = currentHeaders
             return dispatchPrepared(encodeBinaryRequest(api, emptyMap(), request), mode, headers, started, null)
         }
         val meta = currentSchema[api]
         val body = encodeGeneratedJSONRequest(api, request, meta)
-        return dispatchPrepared(body, mode, currentHeaders.get(), started, meta)
+        return dispatchPrepared(body, mode, currentHeaders, started, meta)
     }
 
     private suspend inline fun dispatchPrepared(body: RequestBody, mode: TransportMode, headers: HttpProtocolHeaders, started: Long, schema: APISchemaEntry?): Any {
@@ -543,13 +587,10 @@ class OkHttpTransport(
                 return json["data"] ?: throw LuxoError("ParseError", response.code, "missing JSON response data")
             }
             val error = decoded ?: LuxoError("ParseError", response.code, "missing JSON error envelope")
-            if (currentHeaders.get() !== headers) throw error
-            val newToken = refreshFor(response.code, error, isRetry)?.invoke()
-            if (newToken != null) {
+            if (refreshUnauthorized(response.code, error, isRetry, headers)) {
                 currentCoroutineContext().ensureActive()
-                val renewed = headers.withToken(newToken)
-                if (!currentHeaders.compareAndSet(headers, renewed)) throw error
-                return callJSON(body, renewed, schema, isRetry = true)
+                val renewed = currentHeaders
+                if (renewed.session === headers.session) return callJSON(body, renewed, schema, isRetry = true)
             }
             throw error
         } finally { body.release() }
@@ -566,13 +607,10 @@ class OkHttpTransport(
                 return response.body
             }
             val error = LuxoBinaryProtocol.decodeError(response.body, response.code)
-            if (currentHeaders.get() !== headers) throw error
-            val newToken = refreshFor(response.code, error, isRetry)?.invoke()
-            if (newToken != null) {
+            if (refreshUnauthorized(response.code, error, isRetry, headers)) {
                 currentCoroutineContext().ensureActive()
-                val renewed = headers.withToken(newToken)
-                if (!currentHeaders.compareAndSet(headers, renewed)) throw error
-                return callBinary(body, renewed, isRetry = true)
+                val renewed = currentHeaders
+                if (renewed.session === headers.session) return callBinary(body, renewed, isRetry = true)
             }
             throw error
         } finally { body.release() }
@@ -600,8 +638,50 @@ class OkHttpTransport(
         return HTTPRequestBody(body, HttpProtocolHeaders.BINARY_MEDIA_TYPE)
     }
 
-    private fun refreshFor(status: Int, error: LuxoError, isRetry: Boolean): (suspend () -> String?)? =
-        if (!isRetry && status == 401 && error.code == 401 && error.error != "ParseError") onTokenExpired else null
+    private suspend fun refreshUnauthorized(status: Int, error: LuxoError, isRetry: Boolean, headers: HttpProtocolHeaders): Boolean {
+        if (isRetry || status != 401 || error.code != 401 || error.error == "ParseError") return false
+        val callback = onTokenExpired ?: return false
+        val context = currentCoroutineContext()
+        context.ensureActive()
+        val refresh = synchronized(refreshLock) {
+            val current = currentHeaders
+            if (current.session !== headers.session) return false
+            val active = headers.refresh ?: HTTPTokenRefresh(context, callback).also { headers.refresh = it }
+            active.waiters++
+            active
+        }
+        try {
+            refresh.worker.start()
+            val outcome = refresh.outcome.await()
+            context.ensureActive()
+            synchronized(refreshLock) {
+                if (currentHeaders.session !== headers.session || refresh.discarded) return false
+                if (currentHeaders === headers) {
+                    // Retain this outcome for already-sent requests. A failed refresh
+                    // gives future requests a new generation with unchanged headers.
+                    val token = outcome.getOrNull()
+                    currentHeaders = if (token == null) headers.nextGeneration()
+                        else headers.withToken(token, headers.session)
+                }
+            }
+            return outcome.getOrThrow() != null
+        } finally {
+            val abandoned = synchronized(refreshLock) {
+                refresh.waiters--
+                if (refresh.waiters == 0 && currentHeaders === headers) {
+                    refresh.discarded = true
+                    // A response still in flight can start the replacement refresh.
+                    headers.refresh = null
+                    true
+                } else false
+            }
+            if (abandoned) {
+                refresh.discard()
+                // Keep the last caller's structured cleanup semantics.
+                withContext(NonCancellable) { refresh.worker.join() }
+            }
+        }
+    }
 }
 
 /** Internal response wrapper carrying HTTP status code. */

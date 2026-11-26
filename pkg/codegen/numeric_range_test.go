@@ -1,10 +1,14 @@
 package codegen
 
 import (
+	"crypto/sha256"
+	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/semantic"
 	"github.com/light-speak/luxo/pkg/token"
 )
 
@@ -201,3 +205,120 @@ func testAcceptedSignedRanges(t *testing.T, app *App, router *api.Router, binary
  }
 }
 `
+
+func numericRangeEmissionCases() []struct{ name, kind, bounds, condition, label string } {
+	return []struct{ name, kind, bounds, condition, label string }{
+		{"none", "Int", "", "", ""},
+		{"positive", "Int", "0, 100", "value < 0 || value > 100", "0, 100"},
+		{"signed_int", "Int", "-010, 020", "value < -(10) || value > 20", "-010, 020"},
+		{"negative_int", "Int", "-20, -10", "value < -(20) || value > -(10)", "-20, -10"},
+		{"nested_sign", "Int", "--1, 010", "value < -(-(1)) || value > 10", "--1, 010"},
+		{"positive_float", "Float", "0.0, 1.5", "value < float64(0.0) || value > float64(1.5)", "0.0, 1.5"},
+		{"signed_float", "Float", "-1.5, 1.5", "value < func(value float64) float64 { return -value }((float64(1.5))) || value > float64(1.5)", "-1.5, 1.5"},
+		{"negative_zero", "Float", "-0.0, 1.0", "value < func(value float64) float64 { return -value }((float64(0.0))) || value > float64(1.0)", "-0.0, 1.0"},
+		{"leading_zero_float", "Float", "00.25, 01.5", "value < float64(00.25) || value > float64(01.5)", "00.25, 01.5"},
+	}
+}
+
+func numericRangeEmissionInput(t testing.TB, kind, bounds string) *semantic.Result {
+	t.Helper()
+	annotation := ""
+	if bounds != "" {
+		annotation = " @range(" + bounds + ")"
+	}
+	input := analyzePermissionFixture(t, "model Probe @noTime @crud { id: Int @id value: "+kind+annotation+" }")
+	if len(input.Errors) != 0 {
+		t.Fatal(input.Errors)
+	}
+	return input
+}
+
+func TestNumericRangeValidationSource(t *testing.T) {
+	for _, sample := range numericRangeEmissionCases() {
+		t.Run(sample.name, func(t *testing.T) {
+			input := numericRangeEmissionInput(t, sample.kind, sample.bounds)
+			for _, indent := range []string{"", "\t\t"} {
+				var output strings.Builder
+				generateNumericValidation(&output, input.Files[0].Models[0].Fields[1], "value", indent)
+				want := ""
+				if sample.bounds != "" {
+					want = indent + "if " + sample.condition + " {\n" + indent + "\treturn errors.BadRequest.WithData(errors.ParamError{Param: \"value\", Error: \"out of range [" + sample.label + "]\"})\n" + indent + "}\n"
+				}
+				if output.String() != want {
+					t.Fatalf("validation bytes changed:\ngot %q\nwant %q", output.String(), want)
+				}
+			}
+		})
+	}
+}
+
+func TestValidationCheckSource(t *testing.T) {
+	for _, sample := range []struct{ field, message, wantField, wantMessage string }{
+		{"value", "out of range [0, 10]", `"value"`, `"out of range [0, 10]"`},
+		{"quote\"\\\n\t", "line\n\t\x00\"\\", `"quote\"\\\n\t"`, `"line\n\t\x00\"\\"`},
+		{"数值", "范围 café\u2028", `"数值"`, `"范围 café\u2028"`},
+		{"\xff", "\x7f", `"\xff"`, `"\x7f"`},
+		{strings.Repeat("x", 256), strings.Repeat("\x00", 64), `"` + strings.Repeat("x", 256) + `"`, `"` + strings.Repeat(`\x00`, 64) + `"`},
+	} {
+		for _, prefix := range []string{"", "prefix\n"} {
+			var output strings.Builder
+			output.WriteString(prefix)
+			writeValidationCheck(&output, "\t", sample.field, "value < 0", sample.message)
+			want := prefix + "\tif value < 0 {\n\t\treturn errors.BadRequest.WithData(errors.ParamError{Param: " + sample.wantField + ", Error: " + sample.wantMessage + "})\n\t}\n"
+			if output.String() != want {
+				t.Fatalf("quoted validation changed: %q want %q", output.String(), want)
+			}
+		}
+	}
+}
+
+func numericRangeGeneratedSource(t testing.TB, kind, bounds string) map[string]string {
+	t.Helper()
+	input := numericRangeEmissionInput(t, kind, bounds)
+	ids := completeFixtureAPIIDs(input, StableIDs{ModelFields: map[string]map[string]int{"Probe": {"id": 1, "value": 2}}})
+	output, err := Generate(input, "generated", GeneratorConfig{Driver: DriverPG, IDs: ids})
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[string]string, len(output.Files))
+	for name, content := range output.Files {
+		files[name] = string(content)
+	}
+	return files
+}
+
+func numericRangeGeneratedDigest(files map[string]string) string {
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	digest := sha256.New()
+	for _, name := range names {
+		fmt.Fprintf(digest, "%d:%s%d:%s", len(name), name, len(files[name]), files[name])
+	}
+	return fmt.Sprintf("%x", digest.Sum(nil))
+}
+
+// These hashes pin every generated file from the original emitter.
+func TestNumericRangeGeneratedSource(t *testing.T) {
+	expected := map[string]string{
+		"none":               "35e9958073d50868a153860c9542f0622d94a6694ef4f690c6a55e264a37ef3e",
+		"positive":           "230a1f4b8b14746725b1d6f118b4b593186cf15bbc792c78501f6297575b41ec",
+		"signed_int":         "a6cefb9f596004e5730d1213c2b24dccfe83650370776197f300810c03235f90",
+		"negative_int":       "fec133ee7fc17ce74001f13a80af5f99b754f525d26e9e4fd18367349bead7ea",
+		"nested_sign":        "6eb1c6c27b83efaa78c3f44c133e7cb0bec51db2ee05fb51eb501ef5972d92be",
+		"positive_float":     "356ce7c0ee42161af9935395851f383221339c032d46bd60190304b7e89a681b",
+		"signed_float":       "24953eb249614d1f00609f1c47181cf3a22fb9f27a6332b4b1fd956cf2c1d8df",
+		"negative_zero":      "a8d6078bd1e699a8fd5c5d32e2f2bf882df5726cb92ec5900b57f48871fedc63",
+		"leading_zero_float": "29d4f23c1ff517b00dd8f70cf0bcc258615e685393fe5e8333b55b0a85e94fd9",
+	}
+	for _, sample := range numericRangeEmissionCases() {
+		t.Run(sample.name, func(t *testing.T) {
+			files := numericRangeGeneratedSource(t, sample.kind, sample.bounds)
+			if got := numericRangeGeneratedDigest(files); got != expected[sample.name] {
+				t.Fatalf("generated bytes changed: %s want %s", got, expected[sample.name])
+			}
+		})
+	}
+}

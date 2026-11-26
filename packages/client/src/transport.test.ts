@@ -3835,6 +3835,197 @@ describe('FetchTransport refresh cancellation', () => {
     } finally { vi.clearAllTimers(); vi.useRealTimers() }
   })
 
+  it.each(['json', 'binary'] as const)('shares one refresh and retries all three expired %s calls', async mode => {
+    vi.useFakeTimers()
+    try {
+      const renewal = Promise.withResolvers<string | null>()
+      const refresh = vi.fn(() => renewal.promise)
+      const transport = new FetchTransport('http://localhost/api', { mode, token: 'expired', onTokenExpired: refresh })
+      transport.setSchema({ health: { id: 1 } })
+      mockFetch.mockImplementation(async (_url, init) => {
+        if (new Headers(init.headers).get('authorization') === 'Bearer expired') return unauthorized(mode)
+        return new Response(mode === 'json' ? '{"data":42}' : new Uint8Array([84]), { status: 200 })
+      })
+      const calls = Promise.allSettled([transport.call('health'), transport.call('health'), transport.call('health')])
+      await vi.advanceTimersByTimeAsync(0)
+      const observedRefreshes = refresh.mock.calls.length
+      renewal.resolve('fresh')
+      const outcomes = (await calls).map(result => result.status === 'fulfilled' ? result.value : (result.reason as LuxoError).code)
+      expect({ observedRefreshes, outcomes, sends: mockFetch.mock.calls.length }).toEqual({
+        observedRefreshes: 1,
+        outcomes: Array.from({ length: 3 }, () => mode === 'json' ? 42 : new Uint8Array([84])),
+        sends: 6,
+      })
+    } finally { vi.useRealTimers() }
+  })
+
+  it.each(['json', 'binary'] as const)('keeps %s refresh retry order after the first of two waiters cancels', async mode => {
+    vi.useFakeTimers()
+    const renewal = Promise.withResolvers<string | null>()
+    try {
+      const refresh = vi.fn(() => renewal.promise)
+      const transport = new FetchTransport('http://localhost/api', { mode, token: 'expired', onTokenExpired: refresh })
+      transport.setSchema({ first: { id: 1 }, second: { id: 2 }, third: { id: 3 } })
+      const sent: Array<RequestInit['body']> = []
+      const retried: Array<RequestInit['body']> = []
+      mockFetch.mockImplementation(async (_url, init) => {
+        if (new Headers(init?.headers).get('authorization') === 'Bearer expired') {
+          sent.push(init?.body)
+          return unauthorized(mode)
+        }
+        retried.push(init?.body)
+        return new Response(mode === 'json' ? '{"data":42}' : new Uint8Array([84]))
+      })
+      const controller = new AbortController()
+      const cancelled = expect(transport.call('first', undefined, { signal: controller.signal })).rejects
+        .toMatchObject({ error: 'CancelledError' })
+      await vi.advanceTimersByTimeAsync(0)
+      const second = transport.call('second')
+      await vi.advanceTimersByTimeAsync(0)
+      expect(sent).toHaveLength(2)
+      controller.abort()
+      await cancelled
+      const third = transport.call('third')
+      await vi.advanceTimersByTimeAsync(0)
+      expect(sent).toHaveLength(3)
+      expect(refresh).toHaveBeenCalledOnce()
+      renewal.resolve('fresh')
+      const value = mode === 'json' ? 42 : new Uint8Array([84])
+      expect(await Promise.all([second, third])).toEqual([value, value])
+      expect(retried).toHaveLength(2)
+      expect(retried[0]).toBe(sent[1])
+      expect(retried[1]).toBe(sent[2])
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      renewal.resolve(null)
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['json', 'binary'] as const)('retries a late %s 401 with the renewed token once', async mode => {
+    const late = Promise.withResolvers<Response>()
+    const refresh = vi.fn(async () => 'renewed')
+    const transport = new FetchTransport('http://localhost/api', { mode, token: 'expired', onTokenExpired: refresh })
+    transport.setSchema({ health: { id: 1 } })
+    mockFetch.mockReturnValueOnce(late.promise)
+      .mockResolvedValueOnce(unauthorized(mode))
+      .mockResolvedValueOnce(new Response(mode === 'json' ? '{"data":42}' : new Uint8Array([84])))
+      .mockResolvedValueOnce(unauthorized(mode))
+    const lateResult = expect(transport.call('health')).rejects.toMatchObject({ error: 'Unauthorized', code: 401 })
+    await transport.call('health')
+    late.resolve(unauthorized(mode))
+    await lateResult
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(mockFetch.mock.calls.map(([, init]) => new Headers(init.headers).get('authorization'))).toEqual([
+      'Bearer expired', 'Bearer expired', 'Bearer renewed', 'Bearer renewed',
+    ])
+  })
+
+  it.each(['json', 'binary'] as const)('shares a null %s refresh with old responses and allows a later attempt', async mode => {
+    const late = Promise.withResolvers<Response>()
+    const refresh = vi.fn<() => Promise<string | null>>().mockResolvedValueOnce(null).mockResolvedValueOnce('fresh')
+    const transport = new FetchTransport('http://localhost/api', { mode, token: 'expired', onTokenExpired: refresh })
+    transport.setSchema({ health: { id: 1 } })
+    mockFetch.mockReturnValueOnce(late.promise)
+      .mockResolvedValueOnce(unauthorized(mode))
+      .mockResolvedValueOnce(unauthorized(mode))
+      .mockResolvedValueOnce(new Response(mode === 'json' ? '{"data":42}' : new Uint8Array([84])))
+    const lateResult = expect(transport.call('health')).rejects.toMatchObject({ error: 'Unauthorized', code: 401 })
+    await expect(transport.call('health')).rejects.toMatchObject({ error: 'Unauthorized', code: 401 })
+    late.resolve(unauthorized(mode))
+    await lateResult
+    expect(refresh).toHaveBeenCalledOnce()
+    await expect(transport.call('health')).resolves.toEqual(mode === 'json' ? 42 : new Uint8Array([84]))
+    expect(refresh).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    ['json', 'null'], ['binary', 'null'], ['json', 'reject'], ['binary', 'reject'],
+  ] as const)('preserves a late %s refresh %s after the next generation succeeds', async (mode, outcome) => {
+    const late = Promise.withResolvers<Response>()
+    const failure = new Error('refresh rejected')
+    const refresh = vi.fn<() => Promise<string | null>>()
+    if (outcome === 'reject') refresh.mockRejectedValueOnce(failure)
+    else refresh.mockResolvedValueOnce(null)
+    refresh.mockResolvedValueOnce('fresh')
+    const transport = new FetchTransport('http://localhost/api', { mode, token: 'expired', onTokenExpired: refresh })
+    transport.setSchema({ health: { id: 1 } })
+    const success = () => new Response(mode === 'json' ? '{"data":42}' : new Uint8Array([84]))
+    mockFetch.mockReturnValueOnce(late.promise)
+      .mockResolvedValueOnce(unauthorized(mode))
+      .mockResolvedValueOnce(unauthorized(mode))
+      .mockImplementation(async () => success())
+
+    const observed = transport.call('health').catch((error: unknown) => error)
+    const first = expect(transport.call('health')).rejects
+    if (outcome === 'reject') await first.toBe(failure)
+    else await first.toMatchObject({ error: 'Unauthorized', code: 401 })
+    await expect(transport.call('health')).resolves.toEqual(mode === 'json' ? 42 : new Uint8Array([84]))
+    late.resolve(unauthorized(mode))
+    if (outcome === 'reject') expect(await observed).toBe(failure)
+    else expect(await observed).toMatchObject({ error: 'Unauthorized', code: 401 })
+    expect(refresh).toHaveBeenCalledTimes(2)
+    expect(mockFetch).toHaveBeenCalledTimes(4)
+  })
+
+  it.each(['json', 'binary'] as const)('lets a late %s 401 refresh after its sole peer cancelled', async mode => {
+    const late = Promise.withResolvers<Response>()
+    const entered = Promise.withResolvers<void>()
+    const obsolete = Promise.withResolvers<string | null>()
+    const controller = new AbortController()
+    const refresh = vi.fn<() => Promise<string | null>>()
+      .mockImplementationOnce(() => { entered.resolve(); return obsolete.promise })
+      .mockResolvedValueOnce('renewed')
+    const transport = new FetchTransport('http://localhost/api', { mode, token: 'expired', onTokenExpired: refresh })
+    transport.setSchema({ health: { id: 1 } })
+    mockFetch.mockReturnValueOnce(late.promise)
+      .mockResolvedValueOnce(unauthorized(mode))
+      .mockResolvedValueOnce(new Response(mode === 'json' ? '{"data":42}' : new Uint8Array([84])))
+
+    const pending = transport.call('health')
+    const cancelled = expect(transport.call('health', undefined, { signal: controller.signal })).rejects
+      .toMatchObject({ error: 'CancelledError' })
+    await entered.promise
+    controller.abort()
+    await cancelled
+    obsolete.resolve('obsolete')
+    late.resolve(unauthorized(mode))
+    await expect(pending).resolves.toEqual(mode === 'json' ? 42 : new Uint8Array([84]))
+    expect(refresh).toHaveBeenCalledTimes(2)
+    expect(mockFetch.mock.calls.map(([, init]) => new Headers(init.headers).get('authorization'))).toEqual([
+      'Bearer expired', 'Bearer expired', 'Bearer renewed',
+    ])
+  })
+
+  it.each([
+    ['json', null], ['binary', null], ['json', 'different-user'], ['binary', 'different-user'],
+  ] as const)('invalidates all waiting %s calls when the session changes to %s', async (mode, replacement) => {
+    vi.useFakeTimers()
+    try {
+      const renewal = Promise.withResolvers<string | null>()
+      const refresh = vi.fn(() => renewal.promise)
+      const transport = new FetchTransport('http://localhost/api', { mode, token: 'expired', onTokenExpired: refresh })
+      transport.setSchema({ health: { id: 1 } })
+      mockFetch.mockImplementation(async (_url, init) => {
+        if (new Headers(init?.headers).get('authorization') === 'Bearer expired') return unauthorized(mode)
+        return new Response(mode === 'json' ? '{"data":42}' : new Uint8Array([84]))
+      })
+      const calls = Promise.allSettled([transport.call('health'), transport.call('health'), transport.call('health')])
+      await vi.advanceTimersByTimeAsync(0)
+      transport.setToken(replacement)
+      expect(await calls).toEqual(Array.from({ length: 3 }, () => ({
+        status: 'rejected', reason: expect.objectContaining({ code: 401 }),
+      })))
+      renewal.resolve('stale')
+      expect(refresh).toHaveBeenCalledOnce()
+      expect(mockFetch).toHaveBeenCalledTimes(3)
+      await transport.call('health')
+      expect(new Headers(mockFetch.mock.calls[3][1]?.headers).get('authorization'))
+        .toBe(replacement ? `Bearer ${replacement}` : null)
+    } finally { vi.useRealTimers() }
+  })
+
   it.each(['json', 'binary'] as const)('cancels %s when the refresh callback synchronously aborts its caller', async mode => {
     vi.useFakeTimers()
     const controller = new AbortController()
@@ -3863,6 +4054,98 @@ describe('FetchTransport refresh cancellation', () => {
       expect(mockFetch).toHaveBeenCalledTimes(1)
       expect(vi.getTimerCount()).toBe(0)
     } finally { vi.clearAllTimers(); vi.useRealTimers() }
+  })
+
+  it.each([
+    ['json', null], ['binary', null], ['json', 'new-session'], ['binary', 'new-session'],
+  ] as const)('does not retry after a reentrant %s setter replaces the refresh token with %s', async (mode, replacement) => {
+    const transport = new class extends FetchTransport {
+      override setToken(_token: string | null): void { super.setToken(replacement) }
+    }('http://localhost/api', { mode, token: 'expired', onTokenExpired: async () => 'fresh' })
+    transport.setSchema({ live: { id: 7 } })
+    mockFetch
+      .mockResolvedValueOnce(unauthorized(mode))
+      .mockResolvedValueOnce(new Response(mode === 'json' ? '{"data":42}' : new Uint8Array([84])))
+
+    await expect(transport.call('live')).rejects.toMatchObject({ code: 401 })
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+    await transport.call('live')
+    expect(new Headers(mockFetch.mock.calls[1][1]?.headers).get('authorization'))
+      .toBe(replacement ? `Bearer ${replacement}` : null)
+  })
+
+  it.each(['json', 'binary'] as const)('does not retry after a reentrant %s setter advances the session twice', async mode => {
+    const refresh = vi.fn(async () => 'fresh')
+    const transport = new class extends FetchTransport {
+      override setToken(token: string | null): void {
+        super.setToken(token)
+        super.setToken(token)
+      }
+    }('http://localhost/api', { mode, token: 'expired', onTokenExpired: refresh })
+    transport.setSchema({ live: { id: 7 } })
+    mockFetch
+      .mockResolvedValueOnce(unauthorized(mode))
+      .mockResolvedValueOnce(new Response(mode === 'json' ? '{"data":42}' : new Uint8Array([84])))
+
+    await expect(transport.call('live')).rejects.toMatchObject({ code: 401 })
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(mockFetch).toHaveBeenCalledTimes(1)
+    await transport.call('live')
+    expect(new Headers(mockFetch.mock.calls[1][1]?.headers).get('authorization')).toBe('Bearer fresh')
+  })
+
+  it.each([
+    ['json', 'none'], ['binary', 'none'], ['json', 'pending'], ['binary', 'pending'], ['json', 'throws'], ['binary', 'throws'],
+  ] as const)('preserves the settled %s refresh for a late 401 during %s replacement', async (mode, replacement) => {
+    const delayed = Promise.withResolvers<Response>()
+    const entered = Promise.withResolvers<void>()
+    const next = Promise.withResolvers<string | null>()
+    const token = 'fresh-'.padEnd(1990, 'a')
+    const setterFailure = new Error('setter failed')
+    const wantsNewer = replacement !== 'none'
+    const refresh = vi.fn<() => Promise<string | null>>()
+      .mockResolvedValueOnce(token)
+      .mockImplementationOnce(() => { entered.resolve(); return next.promise })
+    let setterCalls = 0
+    const transport = new class extends FetchTransport {
+      override setToken(value: string | null): void {
+        setterCalls++
+        if (setterCalls === 2 && replacement === 'throws') throw setterFailure
+        if (setterCalls > 1) super.setToken(value)
+      }
+    }('http://localhost/api', { mode, token: 'expired', onTokenExpired: refresh })
+    transport.setSchema({ live: { id: 7 } })
+    mockFetch
+      .mockReturnValueOnce(delayed.promise)
+      .mockResolvedValueOnce(unauthorized(mode))
+    const late = transport.call('live')
+    await expect(transport.call('live')).rejects.toMatchObject({ code: 401 })
+
+    let waiting: Promise<unknown> | undefined
+    if (wantsNewer) {
+      mockFetch.mockResolvedValueOnce(unauthorized(mode))
+      waiting = transport.call('live').catch((error: unknown) => error)
+      await entered.promise
+    }
+    mockFetch.mockResolvedValueOnce(new Response(mode === 'json' ? '{"data":42}' : new Uint8Array([84])))
+    delayed.resolve(unauthorized(mode))
+    const expectedResult = mode === 'json' ? 42 : new Uint8Array([84])
+    let expectedToken = token
+    try {
+      if (replacement === 'throws') {
+        await expect(late).rejects.toBe(setterFailure)
+        expectedToken = 'newer'
+        next.resolve(expectedToken)
+        expect(await waiting).toEqual(expectedResult)
+      } else {
+        await expect(late).resolves.toEqual(expectedResult)
+        if (waiting) expect(await waiting).toMatchObject({ code: 401 })
+      }
+      expect(setterCalls).toBe(replacement === 'throws' ? 3 : 2)
+      expect(refresh).toHaveBeenCalledTimes(wantsNewer ? 2 : 1)
+      expect(mockFetch).toHaveBeenCalledTimes(wantsNewer ? 4 : 3)
+      expect(new Headers(mockFetch.mock.lastCall?.[1]?.headers).get('authorization')).toBe(`Bearer ${expectedToken}`)
+    } finally { next.resolve('discarded') }
   })
 
   it.each(['json', 'binary'] as const)('does not enter refresh after its %s transport lifecycle ends', async mode => {

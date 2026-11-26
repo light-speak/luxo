@@ -167,6 +167,8 @@ queryClient.setQueryData(['project', id], updatedProject)
 
 Supported operations include `fetchQuery`, `prefetchQuery`, `getQueryData`, `getQueryState`, `setQueryData`, `invalidateQueries`, `cancelQueries`, `removeQueries`, and `clear`.
 
+Invalidation retires any matching in-flight read before subscribed hooks refetch. Hooks with the same key share the replacement read, and a retired read cannot update the cache. A batch of overlapping filters invalidates each matching key once.
+
 ### `LuxoProvider` + `useLuxoClient` + `useQueryClient`
 
 Optional context-based transport injection:

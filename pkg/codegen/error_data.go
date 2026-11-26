@@ -10,14 +10,66 @@ import (
 )
 
 type errorDataGenerator struct {
-	objectPrefix string
-	objects      map[string][]*ast.FieldDecl
-	models       map[string]bool
-	enums        map[string]bool
-	queued       map[string]bool
-	queue        []string
-	imports      generatedImports
-	owner        *GeneratorContext
+	publicErrorData bool
+	objectPrefix    string
+	objects         map[string][]*ast.FieldDecl
+	models          map[string]bool
+	enums           map[string]bool
+	queued          map[string]bool
+	queue           []string
+	imports         generatedImports
+	owner           *GeneratorContext
+}
+
+type errorFieldPolicy struct {
+	omit bool
+	mask fieldMaskRule
+}
+
+func errorPolicyFor(field *ast.FieldDecl, public bool) errorFieldPolicy {
+	if hasDirective(field.Directives, "hidden") || hasDirective(field.Directives, "internal") ||
+		(public && hasDirective(field.Directives, "visible")) {
+		return errorFieldPolicy{omit: true}
+	}
+	if public && field.Type != nil {
+		return errorFieldPolicy{mask: fieldMaskFor(field, field.Type.Name)}
+	}
+	return errorFieldPolicy{}
+}
+
+func (context *EventContext) recordProjectedErrorPolicies(files []*ast.File) {
+	if len(context.remotePKModels) == 0 {
+		return
+	}
+	for _, file := range files {
+		for _, model := range file.Models {
+			if !context.remotePKModels[model.Name] {
+				continue
+			}
+			for _, field := range model.Fields {
+				context.recordErrorFieldPolicy(model.Name, field)
+			}
+		}
+	}
+}
+
+func (context *EventContext) recordErrorFieldPolicy(model string, field *ast.FieldDecl) {
+	if len(field.Directives) == 0 {
+		return
+	}
+	policy := errorPolicyFor(field, true)
+	if policy == (errorFieldPolicy{}) {
+		return
+	}
+	if context.modelErrorPolicies == nil {
+		context.modelErrorPolicies = make(map[string]map[string]errorFieldPolicy)
+	}
+	fields := context.modelErrorPolicies[model]
+	if fields == nil {
+		fields = make(map[string]errorFieldPolicy)
+		context.modelErrorPolicies[model] = fields
+	}
+	fields[field.Name] = policy
 }
 
 func newErrorDataGenerator(result *semantic.Result, generator *GeneratorContext) *errorDataGenerator {
@@ -87,7 +139,7 @@ func (g *errorDataGenerator) writeData(b *strings.Builder, e *ast.ErrorDecl) {
 	for i, field := range e.Fields {
 		fmt.Fprintf(b, "func (data *%s) appendField%d(w *errors.DataWriter, text bool) {\n", name, i)
 		b.WriteString("\tif w.Err() != nil { return }\n")
-		g.writeValue(b, field.Type, fmt.Sprintf("data.field%d", i), field.Type.IsList && g.models[field.Type.Name], true, "\t")
+		g.writeValue(b, field.Type, fmt.Sprintf("data.field%d", i), field.Type.IsList && g.models[field.Type.Name], true, "\t", nil)
 		b.WriteString("}\n\n")
 	}
 }
@@ -100,7 +152,7 @@ func writeErrorFieldName(b *strings.Builder, name string, index int, indent stri
 	fmt.Fprintf(b, "%sw.Token(%q)\n", indent, fmt.Sprintf("%s%q:", prefix, name))
 }
 
-func (g *errorDataGenerator) writeValue(b *strings.Builder, ref *ast.TypeRef, value string, pointer, text bool, indent string) {
+func (g *errorDataGenerator) writeValue(b *strings.Builder, ref *ast.TypeRef, value string, pointer, text bool, indent string, mask *fieldMaskRule) {
 	if ref.IsList {
 		empty := "[]"
 		if ref.Nullable {
@@ -116,6 +168,9 @@ func (g *errorDataGenerator) writeValue(b *strings.Builder, ref *ast.TypeRef, va
 			fmt.Fprintf(b, "%s\tif %s == nil { w.Reject(%q); return }\n", indent, element, "model list element is nil")
 			element = "(*" + element + ")"
 		}
+		if mask != nil {
+			element = mask.expression(element)
+		}
 		g.writeScalar(b, &base, element, false, indent+"\t")
 		fmt.Fprintf(b, "%s}\n%sw.Token(\"]\")\n", indent, indent)
 		return
@@ -127,6 +182,9 @@ func (g *errorDataGenerator) writeValue(b *strings.Builder, ref *ast.TypeRef, va
 			fmt.Fprintf(b, "%sif %s == nil { w.Reject(%q); return }\n", indent, value, "required object is nil")
 		}
 		value = "(*" + value + ")"
+	}
+	if mask != nil {
+		value = mask.expression(value)
 	}
 	g.writeScalar(b, ref, value, text, indent)
 }
@@ -188,7 +246,7 @@ func (g *errorDataGenerator) writeObjects(b *strings.Builder) {
 		b.WriteString("\tif value == nil { w.Token(\"null\"); return }\n\tif !w.Enter() { return }\n\tw.Token(\"{\")\n")
 		index := 0
 		for _, field := range g.objects[name] {
-			if hasDirective(field.Directives, "hidden") || hasDirective(field.Directives, "internal") {
+			if g.objectFieldPolicy(name, field).omit {
 				continue
 			}
 			writeErrorFieldName(b, field.Name, index, "\t")
@@ -198,14 +256,40 @@ func (g *errorDataGenerator) writeObjects(b *strings.Builder) {
 		b.WriteString("\tw.Token(\"}\")\n\tw.Leave()\n}\n\n")
 		index = 0
 		for _, field := range g.objects[name] {
-			if hasDirective(field.Directives, "hidden") || hasDirective(field.Directives, "internal") {
+			policy := g.objectFieldPolicy(name, field)
+			if policy.omit {
 				continue
 			}
 			fmt.Fprintf(b, "func append%s%sField%d(w *errors.DataWriter, value *%s) {\n", g.objectPrefix, name, index, name)
 			b.WriteString("\tif w.Err() != nil { return }\n")
-			g.writeValue(b, field.Type, "value."+str.Capitalize(field.Name), isRelationField(field, g.enums), false, "\t")
+			var mask *fieldMaskRule
+			if policy.mask.kind != fieldMaskNone {
+				mask = &policy.mask
+				g.imports |= generatedPackageBit("str")
+			}
+			g.writeValue(b, field.Type, "value."+str.Capitalize(field.Name), isRelationField(field, g.enums), false, "\t", mask)
 			b.WriteString("}\n\n")
 			index++
 		}
+	}
+}
+
+func (g *errorDataGenerator) objectFieldPolicy(model string, field *ast.FieldDecl) errorFieldPolicy {
+	local := errorPolicyFor(field, g.publicErrorData)
+	if local.omit || !g.publicErrorData || g.owner.events == nil || !g.models[model] ||
+		g.owner.modelDeclarations[model] != nil {
+		return local
+	}
+	owner := g.owner.events.modelErrorPolicies[model][field.Name]
+	switch {
+	case owner.omit:
+		return owner
+	case owner.mask.kind == fieldMaskNone:
+		return local
+	case local.mask.kind == fieldMaskNone, local.mask == owner.mask:
+		return owner
+	default:
+		// A context-free error cannot choose between incompatible masks.
+		return errorFieldPolicy{omit: true}
 	}
 }
