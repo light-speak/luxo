@@ -20,14 +20,16 @@ INPUT = Path(__file__).resolve().parent
 ROOT = INPUT.parents[1]
 OUT = ROOT / '.tmp/pr158-attribution'
 RUN_CONFIG_SHA = 'bf3be34db7cca43489c678e725e5baa66ca03e323c4a282df9e8650db93cdc81'
-DIAGNOSTIC_PARENT = 'd586d4283c290501fb9f4e911996be13aa6945d7'
+DIAGNOSTIC_PARENT = '2c5890285ef03d2fb7e55211550cba4bc06cc0b6'
+PROFILE_PARENT = 'd586d4283c290501fb9f4e911996be13aa6945d7'
 ORIGINAL_WITNESS = '5d63fd896bcc88aa35968e986985bb387e7de661'
 DIAGNOSTIC_REF = 'refs/heads/diagnostics/pr158-attribution'
 CONFIG = json.loads((INPUT / 'routes.json').read_bytes())
 PATHS = ('.github/workflows/diagnose-pr158-attribution.yml',
-         *('scripts/diagnose-pr158/' + name for name in ('arm-b.patch.b64', 'go-capture.py', 'h2_profile.py', 'routes.json', 'run.py')))
+         *('scripts/diagnose-pr158/' + name for name in (
+             'arm-b.patch.b64', 'go-capture.py', 'h2_metrics.py', 'h2_profile.py', 'routes.json', 'run.py')))
 FOLLOWUP_PATHS = ('M\t.github/workflows/diagnose-pr158-attribution.yml',
-                  'A\tscripts/diagnose-pr158/h2_profile.py', 'M\tscripts/diagnose-pr158/run.py')
+                  'A\tscripts/diagnose-pr158/h2_metrics.py', 'M\tscripts/diagnose-pr158/run.py')
 PAIRS = ('AA', 'BB', 'CC', 'AB', 'BC', 'AC')
 METRICS = '.unit:(sec/op OR B/op OR allocs/op)'
 HOT = {
@@ -99,7 +101,8 @@ def verify_provenance():
     active = git('rev-parse', 'HEAD')
     need(active == os.environ.get('GITHUB_SHA') and git('show', '-s', '--format=%P', active) == DIAGNOSTIC_PARENT,
          'the diagnostic must append one commit to the published witness')
-    need(git('show', '-s', '--format=%P', DIAGNOSTIC_PARENT) == ORIGINAL_WITNESS and
+    need(git('show', '-s', '--format=%P', DIAGNOSTIC_PARENT) == PROFILE_PARENT and
+         git('show', '-s', '--format=%P', PROFILE_PARENT) == ORIGINAL_WITNESS and
          git('show', '-s', '--format=%P', ORIGINAL_WITNESS) == CONFIG['candidateCommit'],
          'the published witness must descend directly from the historical candidate')
     need(git('show', '-s', '--format=%P', CONFIG['candidateCommit']) == CONFIG['baseCommit'], 'target ancestry changed')
@@ -256,7 +259,8 @@ def gate(tools, expected):
 def main():
     args = sys.argv[1:]
     probe = args[:1] == ['--probe']
-    if probe:
+    tiny = args[:1] == ['--tiny']
+    if probe or tiny:
         args = args[1:]
     need(args == ['epyc'], 'this witness requires the original EPYC route')
     selected, cpu = route_guard(args[0])
@@ -280,6 +284,13 @@ def main():
     json_file(expected, {'Base': rows, 'Head': rows})
     with tempfile.TemporaryDirectory(prefix='pr158-witness.', dir=OUT.parent) as temp:
         work = Path(temp)
+        if tiny:
+            arms = materialize(work)
+            measure_tiny = runpy.run_path(str(INPUT / 'h2_metrics.py'))['capture']
+            processes = measure_tiny(go, call, json_file, need, OUT, arms, work, CONFIG['trees'])
+            json_file(OUT / 'status.json', {'matched': True, 'route': selected, 'cpu': cpu,
+                                          'counterProcesses': processes, 'timedComparison': False})
+            return
         tools, wrapper = work / 'bin', work / 'wrapper'
         tools.mkdir()
         wrapper.mkdir()
