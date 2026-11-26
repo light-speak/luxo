@@ -60,7 +60,7 @@ func TestPairedBenchmarkProfilesRequireTheirExactInventories(t *testing.T) {
 		pkg, profile, root, defaultRoot string
 		inputs                          []string
 	}{
-		{"pkg/lux/rpc", "rpc-prepared-frame", "BenchmarkLRPCPreparedFrame", "BenchmarkLRPCConnectionFrameReuseCandidate", []string{"0", "128", "4096", "65536"}},
+		{"pkg/lux/rpc", "rpc-prepared-frame", "BenchmarkLRPCPreparedFrame", "BenchmarkRPCUUIDTraceGuard", []string{"0", "128", "4096", "65536"}},
 		{"pkg/lux/queue", "queue-stream-name", "BenchmarkQueueStreamName", "BenchmarkMemoryRepeatedClose", []string{"tasks", "email.send", "email_send"}},
 	} {
 		t.Run(tc.profile, func(t *testing.T) {

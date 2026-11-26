@@ -32,6 +32,7 @@ const (
 	rpcNilContextGuardSHA       = "cd1b4a5dd0d0622ce19cfc144057482a1059cd61245cf38cf9205f46aaece2c3"
 	// Discovery and sampling must consume the same benchmark compilation profile.
 	performanceProfile = "rpc-boundary-overlay-v2 " + rpcBoundarySHA +
+		compactBenchmarkFingerprint +
 		"\ncodec-reader-overlay-v1\napi-non-identity-overlay-v1\nluvia-primary-trace-overlay-v1\ncodegen-integer-literals-overlay-v1" +
 		"\ncodegen-global-receiver-overlay-v1 " + codegenReceiverProjectionSHA +
 		"\nluvia-gateway-identity-overlay-v1 " + luviaGatewayIdentityProjectionSHA +

@@ -19,6 +19,7 @@ import (
 func TestIsolationProfileCommand(t *testing.T) {
 	for _, tc := range []struct{ pkg, want string }{
 		{"pkg/lux/api", "api-non-identity\t.\napi-local-route-export\t^BenchmarkLocalRouteExport$\n" +
+			"api-static-value-params\t^BenchmarkStaticValueParams$\n" +
 			"api-canonical-json\t^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$\n" +
 			"api-binary-param-lookup\t^BenchmarkBinaryParamLookup$\n" +
 			"api-request-log\t^BenchmarkRequestLogBoundary$|^BenchmarkRequestLogDelivered$\n" +
@@ -40,7 +41,9 @@ func TestIsolationProfileCommand(t *testing.T) {
 		{"pkg/lux/rpc", "rpc-owned-request\t^BenchmarkLRPCOwnedRequest$\n" +
 			"rpc-deadline-classification\t^BenchmarkRPCDeadlineClassification$\n" +
 			"rpc-nil-context-guard\t^BenchmarkRPCNilContextGuard$\n" +
-			"rpc-prepared-frame\t^BenchmarkLRPCPreparedFrame$\n"},
+			"rpc-prepared-frame\t^BenchmarkLRPCPreparedFrame$\n" +
+			"rpc-frame-reuse\t^BenchmarkLRPCConnectionFrameReuseCandidate$\n"},
+		{"pkg/lux/pg", "pg-duration-write-reject\t^BenchmarkDurationWriteReject$\n"},
 		{"pkg/lux/queue", "queue-stream-name\t^BenchmarkQueueStreamName$\n"},
 	} {
 		var output bytes.Buffer
