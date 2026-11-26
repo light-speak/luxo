@@ -2,6 +2,7 @@ package api
 
 import (
 	"io"
+	"sync/atomic"
 )
 
 // BufferedBody exposes transport-owned, fully received storage to the Binary
@@ -11,14 +12,14 @@ import (
 type BufferedBody struct {
 	data   []byte
 	offset int
-	closed bool
+	closed uint32
 }
 
 // NewBufferedBody borrows data; it does not transfer ownership or copy bytes.
 func NewBufferedBody(data []byte) *BufferedBody { return &BufferedBody{data: data} }
 
 func (b *BufferedBody) Read(dst []byte) (int, error) {
-	if b.closed {
+	if atomic.LoadUint32(&b.closed) != 0 {
 		return 0, io.ErrClosedPipe
 	}
 	if b.offset == len(b.data) {
@@ -30,12 +31,12 @@ func (b *BufferedBody) Read(dst []byte) (int, error) {
 }
 
 func (b *BufferedBody) Close() error {
-	b.closed = true
+	atomic.StoreUint32(&b.closed, 1)
 	return nil
 }
 
 func (b *BufferedBody) borrow(limit int) ([]byte, error) {
-	if b.closed {
+	if atomic.LoadUint32(&b.closed) != 0 {
 		return nil, io.ErrClosedPipe
 	}
 	if len(b.data)-b.offset > limit {
