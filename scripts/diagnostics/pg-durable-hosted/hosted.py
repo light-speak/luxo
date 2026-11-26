@@ -22,19 +22,24 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-PARENT = 'c42585f01e1b9eb2809f143ac3fc6ab450095720'
+PARENT = '506e4799fbcefc651ffae53ae734b466beb66a16'
 BASE = '15765dee6705d39de0b5a505d3039d59ebf43584'
 BASE_TREE = '75aebe5bd2fa6b45a1c614ace1a816ebc63e4c0a'
-ARMS = {'P': 'ecf4e236c68a5258c618e98477a9bb0ce61b4f54', 'Q': '9de3751abeb80e679530e87199ba1cb71b933e37'}
-PATCHES = {'P': (BASE_TREE, 'f0d57d8382cfaa8586b805a629f5e0304ddb809d45dc4c3c2a71f7d87c79f00a'),
-           'Q': (ARMS['P'], 'd55d86cfd0138488e6fe4b77f9c635627cbdaa1f227226578c967c83e0818eb1')}
-ACTIVE_LANES = ('recovery',)
-TYPED_TEST_TREE = "521ae46124a492c0e38c009f31f10eca9cfa5fba"
-TYPED_TEST_PATH = "pkg/lux/pg/migrate/migration_execution_test.go"
-TYPED_SOURCES = {
-    "pkg/lux/pg/migrate/migration_execution.go": "509b4f19a52b70a694fbd070712d066b0fedd24be3aef870b54a129df267143d",
-    TYPED_TEST_PATH: "e64cb117282d7330f7b92a2bfd992d260fde731150d8f497fb1dee17037a4823",
+PROJECTION = {
+    "main": "5017b587f4cf71d30ebba8b542267aed597bb573",
+    "mainTree": "f4b13c19316c9fd4cbb0be56d9ba31eab3f98e7f",
+    "reviewHead": "411917fe2460a89b60233db8ab85fd7c83ab3955",
+    "reviewTree": "cbdacf807d633ba5383b680330be612d7d3588d1",
+    "mergeBase": "f83f9c78f9ee03a5d73b7d0a41bae5280a250bfd",
+    "mergeBaseTree": "0f97d642325769e2882fd0235c1575af71e3fc3c",
+    "mergeTree": "32ec7a87d7797d1017ae338946540f039f0a9efa",
+    "priorNativeRun": 45857286205,
+    "priorNativeArtifact": 15136741248,
+    "priorNativeSHA256": "d68266e78585d107a2371a52f94b5736f35ce73fbaa6ba3132a7341412f24dc8",
 }
+ARMS = {'P': BASE_TREE, 'Q': '13a0159134235571a8a1a431d02d6afd362b4718'}
+PATCHES = {'Q': (PROJECTION["mergeTree"], 'a2c84ab8db37a7965c63f0a87befc0c5ab3875da2fb49235cc448b8975d8dccd')}
+MODULE_PINS = ("github.com/jackc/pgx/v5 v5.10.0", "golang.org/x/net v0.58.0")
 LEAVES = {
     "first-query": {"cold-open-ping-up", "already-used-pool-up", "warm-read-only-holder-up", "used-holder-first-reuse-up"},
     "standalone": {"ordinary/up", "ordinary/up-existing", "concurrent/up", "concurrent/down"},
@@ -74,7 +79,7 @@ def put(path, value):
 
 def payload():
     names = {"shared.py", "advisory_pair_test.go", "first_query_test.go", "migration_pair_test.go",
-             "durable_reset_test.go", "used_holder_reuse_test.go", "capacity_public_test.go", "recovery_test.go", "arm-P.patch.gz.b64", "arm-Q.patch.gz.b64"}
+             "durable_reset_test.go", "used_holder_reuse_test.go", "capacity_public_test.go", "recovery_test.go", "arm-Q.patch.gz.b64"}
     entries = {}
     for line in (PAYLOAD / "inputs.sha256").read_text().splitlines():
         digest, name = line.split("  ", 1)
@@ -88,13 +93,21 @@ def payload():
 
 def trees(repo, root):
     checkout = ("git", "-C", str(repo))
-    if run(*checkout, "rev-parse", BASE + "^{tree}", text=True).strip() != BASE_TREE:
-        raise RuntimeError("unexpected source commit or base tree")
+    expected = {BASE: BASE_TREE, PROJECTION["main"]: PROJECTION["mainTree"],
+                PROJECTION["reviewHead"]: PROJECTION["reviewTree"],
+                PROJECTION["mergeBase"]: PROJECTION["mergeBaseTree"]}
+    for commit, tree in expected.items():
+        if run(*checkout, "rev-parse", "--verify", commit + "^{tree}", text=True).strip() != tree:
+            raise RuntimeError(f"unexpected source tree for {commit}")
     objects = run(*checkout, "rev-parse", "--path-format=absolute", "--git-path", "objects", text=True).strip()
     bare = root / "objects.git"
     run("git", "init", "--bare", "--quiet", str(bare))
     (bare / "objects/info/alternates").write_text(objects + "\n")
-    git = ("git", f"--git-dir={bare}")
+    git = ("git", "--no-replace-objects", f"--git-dir={bare}")
+    merged = run(*git, "merge-tree", "--write-tree", "--merge-base=" + PROJECTION["mergeBase"],
+                 PROJECTION["reviewHead"], PROJECTION["main"], text=True).strip()
+    if merged != PROJECTION["mergeTree"]:
+        raise RuntimeError("unexpected #151 merge projection")
     for arm, (preimage, digest) in PATCHES.items():
         run(*git, "read-tree", preimage)
         encoded = (PAYLOAD / f"arm-{arm}.patch.gz.b64").read_bytes()
@@ -104,15 +117,6 @@ def trees(repo, root):
         run(*git, "apply", "--cached", "--whitespace=error", "-", input=patch)
         if run(*git, "write-tree", text=True).strip() != ARMS[arm]:
             raise RuntimeError(f"{arm} patch did not produce the expected tree")
-    for path, digest in TYPED_SOURCES.items():
-        if sha(run(*git, "show", ARMS["Q"] + ":" + path)) != digest:
-            raise RuntimeError(f"unexpected typed retry source for {path}")
-    run(*git, "read-tree", ARMS["P"])
-    test_only = run(*git, "ls-tree", "-z", ARMS["Q"], "--", TYPED_TEST_PATH)
-    run(*git, "update-index", "-z", "--index-info", input=test_only)
-    if run(*git, "write-tree", text=True).strip() != TYPED_TEST_TREE:
-        raise RuntimeError("unexpected retry regression-only tree")
-    run(*git, "read-tree", ARMS["Q"])
     return git
 
 
@@ -158,9 +162,14 @@ def prepare_arm(git, root, arm, env, evidence):
         archive_source(git, src, ARMS[arm])
         run("sh", "scripts/setup-modules.sh", str(src), cwd=src, env=env)
         workspace = env | {"GOWORK": str(src / "go.work")}
+        if not (src / "go.mod").read_text().splitlines().count("go 1.27.1") == 1:
+            raise RuntimeError(f"unexpected Go module directive for {arm}")
+        modules = run("go", "list", "-mod=readonly", "-m", *(entry.split()[0] for entry in MODULE_PINS),
+                      cwd=src, env=workspace, text=True).splitlines()
+        if tuple(modules) != MODULE_PINS:
+            raise RuntimeError(f"unexpected effective modules for {arm}: {modules}")
         lanes = {"first-query": "advispair", "standalone": "migratepair",
                  "public": "capacitypair", "recovery": "recoverypair"}
-        lanes = {lane: lanes[lane] for lane in ACTIVE_LANES}
         for lane, folder in lanes.items():
             target = src / "pkg/lux/pg" / folder
             target.mkdir()
@@ -190,7 +199,8 @@ def prepare_arm(git, root, arm, env, evidence):
             run("go", "test", "-c", "-trimpath", "-o", str(path), "./pkg/lux/pg/" + folder, cwd=src, env=offline)
             result[lane] = {"tree": ARMS[arm], "binary": path.name, "sha256": sha(path.read_bytes())}
     put(evidence / f"source-{arm}.json", {"tree": ARMS[arm], "graphSHA256": sha(graph), "modules": verified,
-                                        "arms": result, "standaloneFixtureSHA256": sha(standalone_fixture().encode())})
+                                        "arms": result, "modulePins": modules,
+                                        "standaloneFixtureSHA256": sha(standalone_fixture().encode())})
     return result
 
 
@@ -399,8 +409,6 @@ def replay(repo, root, evidence, entries):
     cpu = json.loads(run("lscpu", "-J"))
     put(evidence / "host-cpu.json", cpu)
     require_cpu(cpu)
-    if sorted(os.sched_getaffinity(0)) != [0, 1, 2, 3]:
-        raise RuntimeError("unexpected hosted CPU affinity")
     env = {key: value for key, value in os.environ.items() if not key.startswith(("LUXO_MIGPAIR_", "LUXO_ADVISORY_", "LUXO_DURABLE_", "LUXO_CAPACITY_"))}
     env |= {"GOTOOLCHAIN": "local", "GOWORK": "off", "GOFLAGS": "-p=1", "GOMAXPROCS": "2", "CGO_ENABLED": "0",
             "GOENV": "off", "GOARM64": "v8.0", "GOCACHE": str(root / "cache"), "GOMODCACHE": str(root / "modules"),
@@ -409,7 +417,7 @@ def replay(repo, root, evidence, entries):
         raise RuntimeError("unexpected Go toolchain")
     put(evidence / "inputs.json", {"base": BASE, "baseTree": BASE_TREE, "products": ARMS,
                                   "patches": PATCHES, "payload": entries, "go": "go1.27.1 linux/arm64",
-                                  "typedRetry": {"testOnlyTree": TYPED_TEST_TREE, "sources": TYPED_SOURCES}})
+                                  "projection": PROJECTION, "modulePins": MODULE_PINS})
     git = trees(repo, root)
     identities = {arm: prepare_arm(git, root, arm, env, evidence) for arm in ARMS}
     shared = runpy.run_path(str(PAYLOAD / "shared.py"))
@@ -417,9 +425,10 @@ def replay(repo, root, evidence, entries):
     shared["admin"].__globals__["admin"] = lambda sql: SERVER["admin"](scope, sql)
     helper = SimpleNamespace(**shared)
     put(evidence / "server.json", SERVER["start_owned"]())
+    capacity_smoke(root, evidence, helper, identities)
     for phase in ("smoke", "formal"):
         failures = {}
-        for lane in ACTIVE_LANES:
+        for lane in LEAVES:
             try:
                 run_lane(root, evidence, helper, lane, identities, phase == "smoke")
             except (RuntimeError, subprocess.SubprocessError) as err:

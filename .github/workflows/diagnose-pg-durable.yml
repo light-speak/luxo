@@ -1,4 +1,4 @@
-name: Compare PostgreSQL recovery snapshot costs
+name: Compare PostgreSQL connection capacity and recovery
 
 on:
   push:
@@ -25,18 +25,23 @@ jobs:
         with:
           fetch-depth: 2
           persist-credentials: false
-      - name: Fetch the exact common product source
+      - name: Fetch the exact baseline and candidate merge parents
         run: |
           set -euo pipefail
           base=15765dee6705d39de0b5a505d3039d59ebf43584
-          git fetch --depth=1 --no-tags origin "$base"
-          test "$(git rev-parse FETCH_HEAD)" = "$base"
+          main=5017b587f4cf71d30ebba8b542267aed597bb573
+          review=411917fe2460a89b60233db8ab85fd7c83ab3955
+          merge_base=f83f9c78f9ee03a5d73b7d0a41bae5280a250bfd
+          git fetch --depth=1 --no-tags origin "$base" "$main" "$review" "$merge_base"
+          for commit in "$base" "$main" "$review" "$merge_base"; do
+            test "$(git rev-parse --verify "$commit^{commit}")" = "$commit"
+          done
       - uses: actions/setup-go@v7
         with:
           go-version: '1.27.1'
           check-latest: false
           cache: false
-      - name: Measure four recovery scenarios in independent sample batches
+      - name: Measure capacity and journal recovery in independent sample batches
         timeout-minutes: 40
         run: python3 -I -B scripts/diagnostics/pg-durable-hosted/hosted.py run
       - name: Confirm task-owned PostgreSQL resources returned to zero
@@ -46,7 +51,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: hosted-pg-durable-retry-snapshot-${{ github.run_id }}-${{ github.run_attempt }}
+          name: hosted-pg-durable-capacity-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/pg-durable-hosted-evidence/
           if-no-files-found: error
           retention-days: 14
