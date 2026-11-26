@@ -7,17 +7,20 @@ cd "${GITHUB_WORKSPACE:?}"
 repo=$(pwd -P)
 base=59a4167f129f0bff0e8425125fa02eae87fd347b
 head=7f71dca0b5c99a07f11c3307131d1f634b8abae2
+witness_parent=099afa428cd0fa877722d378017359466e8aafdf
 out="$repo/.tmp/pr157-json-list"
 input="$repo/scripts/diagnose-pr157-json-list"
 base_src="$repo/.tmp/base"
 head_src="$repo/.tmp/head"
 
 test "${RUNNER_KIND:?}" = github-hosted
-test "$(cat "$out/cpu.txt")" = 'AMD EPYC 9V45 96-Core Processor'
+cpu=$(cat "$out/cpu.txt")
+test -n "$cpu"
 grep -Fxq 'VERSION_ID="24.04"' /etc/os-release
 test "$(getconf _NPROCESSORS_ONLN)" = 4
 test "$(git rev-parse HEAD)" = "${GITHUB_SHA:?}"
-test "$(git show -s --format=%P HEAD)" = "$head"
+test "$(git show -s --format=%P HEAD)" = "$witness_parent"
+test "$(git show -s --format=%P "$witness_parent")" = "$head"
 test "$(git show -s --format=%P "$head")" = "$base"
 test "$(git -C "$base_src" rev-parse HEAD)" = "$base"
 test "$(git rev-parse "$base^{tree}")" = c96b8db43227f6ed447d10b0b32deb39284c7f28
@@ -101,6 +104,10 @@ elif cmp -s "$work/base.text" "$work/head.text"; then
     echo 'ELF identity: different file, byte-identical .text' > "$out/elf-identity.txt"
 else
     echo 'ELF identity: different .text' > "$out/elf-identity.txt"
+fi
+if [[ "$cpu" != 'AMD EPYC 9V45 96-Core Processor' ]]; then
+    printf 'verification=elf-only\nbenchmark_processes=0\n' > "$out/status.txt"
+    exit 0
 fi
 
 sample() {

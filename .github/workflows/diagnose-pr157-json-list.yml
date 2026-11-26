@@ -14,38 +14,29 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
 
-      - id: route
-        name: Require the original EPYC 9V45 processor
+      - name: Record the runner CPU model
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p .tmp/pr157-json-list
           cpu=$(awk -F ': *' '/^model name[[:space:]]*:/ {sub(/[[:space:]]+$/, "", $2); print $2; exit}' /proc/cpuinfo)
+          test -n "$cpu"
           printf '%s\n' "$cpu" > .tmp/pr157-json-list/cpu.txt
-          if [[ "$cpu" == "AMD EPYC 9V45 96-Core Processor" ]]; then
-            echo "matched=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "matched=false" >> "$GITHUB_OUTPUT"
-            echo "CPU did not match; no benchmark binaries or samples were produced." > .tmp/pr157-json-list/status.txt
-          fi
 
-      - if: steps.route.outputs.matched == 'true'
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           ref: 59a4167f129f0bff0e8425125fa02eae87fd347b
           path: .tmp/base
           persist-credentials: false
 
-      - if: steps.route.outputs.matched == 'true'
-        uses: actions/setup-go@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
-      - if: steps.route.outputs.matched == 'true'
-        name: Verify exact ELF and replay four original leaves
+      - name: Verify exact ELF and replay timing on the original CPU model
         shell: bash
         env:
           RUNNER_KIND: ${{ runner.environment }}
