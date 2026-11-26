@@ -442,7 +442,8 @@ func decodeTracedResponse(resp []byte) ([]byte, api.DebugTraceSnapshot, error) {
 	if err != nil {
 		traceErr := tracePayloadError{err}
 		if status == statusTraceError {
-			if _, bodyErr := validateRPCErrorEnvelope(body); bodyErr != nil {
+			fields, bodyErr := readRPCErrorFields(body)
+			if bodyErr != nil || fields.validate() != nil {
 				return nil, api.DebugTraceSnapshot{}, invalidTracedErrorBody{traceErr}
 			}
 		}

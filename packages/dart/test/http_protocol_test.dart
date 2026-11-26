@@ -134,6 +134,536 @@ void main() {
       }
     },
   );
+  for (final mode in TransportMode.values) {
+    for (final lateUnauthorized in [false, true]) {
+      test(
+        '$mode three requests share refresh with a late 401=$lateUnauthorized',
+        () async {
+          final initial = List.generate(3, (_) => Completer<http.Response>());
+          final sent = <String?>[];
+          final allSent = Completer<void>();
+          final refreshStarted = Completer<void>();
+          final refresh = Completer<String?>();
+          var initialRequests = 0, refreshes = 0;
+          final transport = HttpTransport(
+            'http://localhost/api',
+            client: MockClient((request) async {
+              final token = request.headers['authorization'];
+              sent.add(token);
+              if (token == 'Bearer expired') {
+                final index = initialRequests++;
+                if (index == 2) allSent.complete();
+                return initial[index].future;
+              }
+              return _success(mode);
+            }),
+            options: TransportOptions(mode: mode, token: 'expired'),
+            onTokenExpired: () {
+              if (++refreshes == 1) refreshStarted.complete();
+              return refresh.future;
+            },
+          )..setSchema({'echo': const APISchemaEntry(7)});
+          addTearDown(transport.close);
+
+          final outcomes = List.generate(
+            3,
+            (_) => transport
+                .call<Object?>('echo')
+                .then<Object?>((_) => null, onError: (Object error) => error),
+          );
+          await allSent.future;
+          initial[0].complete(_errorResponse(mode));
+          initial[1].complete(_errorResponse(mode));
+          if (!lateUnauthorized) initial[2].complete(_errorResponse(mode));
+          await refreshStarted.future;
+          // Drain the already delivered responses while the shared callback is held.
+          await Future<void>.delayed(Duration.zero);
+          refresh.complete('renewed');
+          if (lateUnauthorized) {
+            expect(await outcomes[0], isNull);
+            initial[2].complete(_errorResponse(mode));
+          }
+          final results = await Future.wait(outcomes);
+          expect(
+            [
+              refreshes,
+              results.where((value) => value == null).length,
+              results
+                  .whereType<LuxoError>()
+                  .map((value) => value.code)
+                  .toList(),
+            ],
+            [1, 3, <int>[]],
+          );
+          expect(sent, [
+            'Bearer expired',
+            'Bearer expired',
+            'Bearer expired',
+            'Bearer renewed',
+            'Bearer renewed',
+            'Bearer renewed',
+          ]);
+        },
+      );
+    }
+  }
+
+  for (final mode in TransportMode.values) {
+    for (final replaceCredential in [false, true]) {
+      test('$mode refresh callback settles after reentrant identity change: '
+          'replace=$replaceCredential', () async {
+        final refresh = Completer<String?>();
+        final sent = <String?>[];
+        var refreshes = 0;
+        late final HttpTransport transport;
+        transport = HttpTransport(
+          'http://localhost/api',
+          client: MockClient((request) async {
+            final token = request.headers['authorization'];
+            sent.add(token);
+            return token == 'Bearer replacement'
+                ? _success(mode)
+                : _errorResponse(mode);
+          }),
+          options: TransportOptions(mode: mode, token: 'expired'),
+          onTokenExpired: () {
+            refreshes++;
+            if (replaceCredential) {
+              transport.setToken('replacement');
+            } else {
+              transport.close();
+            }
+            return refresh.future;
+          },
+        )..setSchema({'echo': const APISchemaEntry(7)});
+        addTearDown(transport.close);
+
+        await expectLater(
+          transport.call<Object?>('echo'),
+          replaceCredential
+              ? _error('Unauthorized', 401)
+              : _error('CancelledError', 0),
+        ).timeout(const Duration(seconds: 2));
+        expect(sent, ['Bearer expired']);
+
+        if (replaceCredential) {
+          refresh.complete('stale-result');
+          await Future<void>.delayed(Duration.zero);
+          await transport.call<Object?>('echo');
+          expect(sent, ['Bearer expired', 'Bearer replacement']);
+        } else {
+          refresh.completeError(StateError('late callback error'));
+          await Future<void>.delayed(Duration.zero);
+          expect(sent, ['Bearer expired']);
+        }
+        expect(refreshes, 1);
+      });
+    }
+
+    test(
+      '$mode refresh request returns its own 401 when it reenters the transport',
+      () async {
+        var refreshing = false;
+        var requests = 0;
+        late final HttpTransport transport;
+        transport =
+            HttpTransport(
+              'http://localhost/api',
+              timeout: const Duration(milliseconds: 300),
+              client: MockClient((_) async {
+                final message = ++requests == 1 ? 'expired' : 'refresh denied';
+                return _errorResponse(mode, message: message);
+              }),
+              options: TransportOptions(mode: mode, token: 'expired'),
+              onTokenExpired: () async {
+                if (refreshing) return null;
+                refreshing = true;
+                try {
+                  return await transport.call<String?>('refresh');
+                } finally {
+                  refreshing = false;
+                }
+              },
+            )..setSchema({
+              'echo': const APISchemaEntry(7),
+              'refresh': const APISchemaEntry(8),
+            });
+        addTearDown(transport.close);
+
+        await expectLater(
+          transport.call<Object?>('echo'),
+          throwsA(
+            isA<LuxoError>()
+                .having((error) => error.error, 'name', 'Unauthorized')
+                .having((error) => error.code, 'code', 401)
+                .having((error) => error.message, 'message', 'refresh denied'),
+          ),
+        );
+        expect(requests, 2);
+      },
+    );
+
+    test(
+      '$mode a completed refresh does not block a later callback task',
+      () async {
+        final startLaterRequest = Completer<void>();
+        final sent = <String?>[];
+        var refreshes = 0;
+        late final Future<Object?> laterRequest;
+        late final HttpTransport transport;
+        transport = HttpTransport(
+          'http://localhost/api',
+          client: MockClient((request) async {
+            sent.add(request.headers['authorization']);
+            return sent.length.isOdd ? _errorResponse(mode) : _success(mode);
+          }),
+          options: TransportOptions(mode: mode, token: 'expired'),
+          onTokenExpired: () async {
+            if (++refreshes == 1) {
+              laterRequest = startLaterRequest.future.then(
+                (_) => transport.call<Object?>('echo'),
+              );
+            }
+            return 'fresh-$refreshes';
+          },
+        )..setSchema({'echo': const APISchemaEntry(7)});
+        addTearDown(transport.close);
+
+        await transport.call<Object?>('echo');
+        final later = expectLater(laterRequest, completes);
+        startLaterRequest.complete();
+        await later;
+        expect(refreshes, 2);
+        expect(sent, [
+          'Bearer expired',
+          'Bearer fresh-1',
+          'Bearer fresh-1',
+          'Bearer fresh-2',
+        ]);
+      },
+    );
+
+    test('$mode close settles all waiters on one stalled refresh', () async {
+      final initial = List.generate(2, (_) => Completer<http.Response>());
+      final sent = Completer<void>();
+      final started = Completer<void>();
+      final refresh = Completer<String?>();
+      var requests = 0, refreshes = 0;
+      final transport = HttpTransport(
+        'http://localhost/api',
+        client: MockClient((_) async {
+          final index = requests++;
+          if (requests == initial.length) sent.complete();
+          return initial[index].future;
+        }),
+        options: TransportOptions(mode: mode, token: 'expired'),
+        onTokenExpired: () {
+          if (++refreshes == 1) started.complete();
+          return refresh.future;
+        },
+      )..setSchema({'echo': const APISchemaEntry(7)});
+      addTearDown(transport.close);
+
+      final waiters = List.generate(
+        initial.length,
+        (_) => expectLater(
+          transport.call<Object?>('echo').timeout(const Duration(seconds: 2)),
+          _error('CancelledError', 0),
+        ),
+      );
+      await sent.future;
+      for (final response in initial) {
+        response.complete(_errorResponse(mode));
+      }
+      await started.future;
+      await Future<void>.delayed(Duration.zero);
+      expect(refreshes, 1);
+      transport.close();
+      await Future.wait(waiters);
+
+      refresh.complete('late-result');
+      await Future<void>.delayed(Duration.zero);
+      expect(requests, initial.length);
+    });
+  }
+
+  for (final mode in TransportMode.values) {
+    test('$mode a timed-out waiter leaves the shared refresh usable', () async {
+      final started = Completer<void>();
+      final refresh = Completer<String?>();
+      var refreshes = 0;
+      final transport = HttpTransport(
+        'http://localhost/api',
+        timeout: const Duration(milliseconds: 600),
+        client: MockClient((request) async {
+          return request.headers['authorization'] == 'Bearer renewed'
+              ? _success(mode)
+              : _errorResponse(mode);
+        }),
+        options: TransportOptions(mode: mode, token: 'expired'),
+        onTokenExpired: () {
+          if (++refreshes == 1) started.complete();
+          return refresh.future;
+        },
+      )..setSchema({'echo': const APISchemaEntry(7)});
+      addTearDown(transport.close);
+
+      final first = expectLater(
+        transport.call<Object?>('echo'),
+        _error('TimeoutError', 0),
+      );
+      await started.future;
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      final second = transport.call<Object?>('echo');
+      await first;
+      refresh.complete('renewed');
+      await second;
+      expect(refreshes, 1);
+    });
+
+    test(
+      '$mode a late 401 can refresh after its sole peer times out',
+      () async {
+        final started = Completer<void>();
+        final lateSent = Completer<void>();
+        final late = Completer<http.Response>();
+        final obsolete = Completer<String?>();
+        final sent = <String?>[];
+        var refreshes = 0;
+        final transport = HttpTransport(
+          'http://localhost/api',
+          timeout: const Duration(milliseconds: 600),
+          client: MockClient((request) async {
+            final token = request.headers['authorization'];
+            sent.add(token);
+            if (sent.length == 1) return _errorResponse(mode);
+            if (sent.length == 2) {
+              lateSent.complete();
+              return late.future;
+            }
+            return _success(mode);
+          }),
+          options: TransportOptions(mode: mode, token: 'expired'),
+          onTokenExpired: () {
+            if (++refreshes != 1) return Future.value('renewed');
+            started.complete();
+            return obsolete.future;
+          },
+        )..setSchema({'echo': const APISchemaEntry(7)});
+        addTearDown(transport.close);
+
+        final first = expectLater(
+          transport.call<Object?>('echo'),
+          _error('TimeoutError', 0),
+        );
+        await started.future;
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        final pending = transport.call<Object?>('echo');
+        await lateSent.future;
+        await first;
+        obsolete.complete('obsolete');
+        late.complete(_errorResponse(mode));
+        await pending;
+        expect(refreshes, 2);
+        expect(sent, ['Bearer expired', 'Bearer expired', 'Bearer renewed']);
+      },
+    );
+
+    for (final replacement in ['replacement', 'expired']) {
+      test(
+        '$mode invalidates the shared refresh on setToken($replacement)',
+        () async {
+          final started = List.generate(2, (_) => Completer<void>());
+          final refresh = List.generate(2, (_) => Completer<String?>());
+          final sent = <String?>[];
+          var refreshes = 0;
+          final transport = HttpTransport(
+            'http://localhost/api',
+            client: MockClient((request) async {
+              final token = request.headers['authorization'];
+              sent.add(token);
+              return token == 'Bearer renewed'
+                  ? _success(mode)
+                  : _errorResponse(mode);
+            }),
+            options: TransportOptions(mode: mode, token: 'expired'),
+            onTokenExpired: () {
+              final index = refreshes++;
+              started[index].complete();
+              return refresh[index].future;
+            },
+          )..setSchema({'echo': const APISchemaEntry(7)});
+          addTearDown(transport.close);
+
+          final stale = List.generate(
+            2,
+            (_) => expectLater(
+              transport.call<Object?>('echo'),
+              _error('Unauthorized', 401),
+            ),
+          );
+          await started[0].future;
+          await Future<void>.delayed(Duration.zero);
+          transport.setToken(replacement);
+          await Future.wait(stale).timeout(const Duration(seconds: 2));
+
+          final fresh = transport.call<Object?>('echo');
+          await started[1].future;
+          refresh[0].complete('stale-result');
+          refresh[1].complete('renewed');
+          await fresh;
+          expect(sent, [
+            'Bearer expired',
+            'Bearer expired',
+            'Bearer $replacement',
+            'Bearer renewed',
+          ]);
+        },
+      );
+    }
+  }
+  for (final mode in TransportMode.values) {
+    for (final throws in [false, true]) {
+      test(
+        '$mode late 401 shares settled refresh failure, throws=$throws',
+        () async {
+          final initial = List.generate(3, (_) => Completer<http.Response>());
+          final allSent = Completer<void>();
+          final refreshStarted = Completer<void>();
+          final refresh = Completer<String?>();
+          final failure = StateError('refresh failed');
+          var issued = 0, refreshes = 0;
+          final transport = HttpTransport(
+            'http://localhost/api',
+            client: MockClient((request) async {
+              if (request.headers['authorization'] == 'Bearer renewed') {
+                return _success(mode);
+              }
+              final index = issued++;
+              if (index == 2) allSent.complete();
+              return index < initial.length
+                  ? initial[index].future
+                  : _errorResponse(mode);
+            }),
+            options: TransportOptions(mode: mode, token: 'expired'),
+            onTokenExpired: () {
+              if (++refreshes != 1) return Future.value('renewed');
+              refreshStarted.complete();
+              return refresh.future;
+            },
+          )..setSchema({'echo': const APISchemaEntry(7)});
+          addTearDown(transport.close);
+
+          final stale = List.generate(
+            3,
+            (_) => transport
+                .call<Object?>('echo')
+                .then<Object?>((_) => null, onError: (Object error) => error),
+          );
+          await allSent.future;
+          initial[0].complete(_errorResponse(mode));
+          initial[1].complete(_errorResponse(mode));
+          await refreshStarted.future;
+          await Future<void>.delayed(Duration.zero);
+          if (throws) {
+            refresh.completeError(failure);
+          } else {
+            refresh.complete(null);
+          }
+          await stale.first;
+          initial[2].complete(_errorResponse(mode));
+          final results = await Future.wait(stale);
+          for (final result in results) {
+            if (throws) {
+              expect(result, same(failure));
+            } else {
+              expect(
+                result,
+                isA<LuxoError>().having((e) => e.code, 'code', 401),
+              );
+            }
+          }
+          expect(refreshes, 1);
+          await transport.call<Object?>('echo');
+          expect(refreshes, 2);
+        },
+      );
+    }
+  }
+  for (final mode in TransportMode.values) {
+    for (final close in [false, true]) {
+      test(
+        '$mode settled refresh loses to same-turn invalidation, close=$close',
+        () async {
+          final started = Completer<void>();
+          final refresh = Completer<String?>.sync();
+          final sent = <String?>[];
+          final transport = HttpTransport(
+            'http://localhost/api',
+            client: MockClient((request) async {
+              final token = request.headers['authorization'];
+              sent.add(token);
+              return token == 'Bearer replacement'
+                  ? _success(mode)
+                  : _errorResponse(mode);
+            }),
+            options: TransportOptions(mode: mode, token: 'expired'),
+            onTokenExpired: () {
+              started.complete();
+              return refresh.future;
+            },
+          )..setSchema({'echo': const APISchemaEntry(7)});
+          addTearDown(transport.close);
+
+          final pending = expectLater(
+            transport.call<Object?>('echo'),
+            close ? _error('CancelledError', 0) : _error('Unauthorized', 401),
+          );
+          await started.future;
+          refresh.complete('obsolete');
+          if (close) {
+            transport.close();
+          } else {
+            transport.setToken('replacement');
+          }
+          await pending;
+          expect(sent, ['Bearer expired']);
+          if (!close) {
+            await transport.call<Object?>('echo');
+            expect(sent, ['Bearer expired', 'Bearer replacement']);
+          }
+        },
+      );
+    }
+
+    test('$mode synchronous String refresh error keeps its stack', () async {
+      const failure = 'refresh threw a String';
+      const marker = 'refresh-callback-test-stack';
+      final stack = StackTrace.fromString(marker);
+      var sends = 0;
+      final transport = HttpTransport(
+        'http://localhost/api',
+        client: MockClient((_) async {
+          sends++;
+          return _errorResponse(mode);
+        }),
+        options: TransportOptions(mode: mode, token: 'expired'),
+        onTokenExpired: () => Error.throwWithStackTrace(failure, stack),
+      )..setSchema({'echo': const APISchemaEntry(7)});
+      addTearDown(transport.close);
+
+      await transport
+          .call<Object?>('echo')
+          .then<void>(
+            (_) => fail('refresh error was accepted as a token'),
+            onError: (Object error, StackTrace trace) {
+              expect(error, same(failure));
+              expect(trace.toString(), contains(marker));
+            },
+          );
+      expect(sends, 1);
+    });
+  }
   for (final mode in [TransportMode.json, TransportMode.binary]) {
     test('$mode stale 401 cannot refresh a replacement identity', () async {
       final entered = Completer<void>();

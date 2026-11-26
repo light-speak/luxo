@@ -66,7 +66,10 @@ func TestAddPreservesExistingModuleFiles(t *testing.T) {
 }
 
 func TestAddRejectsModulePathBeforeWriting(t *testing.T) {
-	for _, name := range []string{"../victim", "nested/name", `nested\name`, "", ".", "..", "line\nbreak", "line\rbreak", "nul\x00name", string([]byte{0xff})} {
+	for _, name := range []string{
+		"../victim", "nested/name", `nested\name`, "", ".", "..", "line\nbreak", "line\rbreak", "nul\x00name", string([]byte{0xff}),
+		"billing-v2", "billing.v2", "2billing", "sales report", "订单", "_",
+	} {
 		t.Run(strconv.Quote(name), func(t *testing.T) {
 			prepareAddProject(t)
 			before := addProjectSnapshot(t)
@@ -76,6 +79,34 @@ func TestAddRejectsModulePathBeforeWriting(t *testing.T) {
 			}
 			assertAddProjectSnapshot(t, before)
 		})
+	}
+}
+
+func TestAddRejectsReservedScaffoldNamesBeforeWriting(t *testing.T) {
+	tests := []struct {
+		names      []string
+		diagnostic string
+	}{
+		{[]string{
+			"int", "string", "float", "boolean", "dateTime", "duration", "uUID",
+			"decimal", "bytes", "jSON", "result", "channel", "page", "cursor", "identity",
+			"app", "new", "newFromDB", "registerSchema", "queue", "close", "tx", "dB",
+		}, "model name"},
+		{[]string{"internal", "vendor"}, "Go import path"},
+		{[]string{strings.Repeat("a", 63)}, "database table name"},
+	}
+	for _, test := range tests {
+		for _, name := range test.names {
+			t.Run(name, func(t *testing.T) {
+				prepareAddProject(t)
+				before := addProjectSnapshot(t)
+				output, err := captureCLIResponse(t, func() error { return runAdd(nil, []string{name}) })
+				if err == nil || !strings.Contains(err.Error(), "module name") || !strings.Contains(err.Error(), test.diagnostic) || output != "" {
+					t.Fatalf("reserved name %q lost its diagnostic or published success: output=%q error=%v", name, output, err)
+				}
+				assertAddProjectSnapshot(t, before)
+			})
+		}
 	}
 }
 
@@ -160,26 +191,41 @@ func TestAddWriteFailureRemovesNewFiles(t *testing.T) {
 }
 
 func TestAddModuleGeneratesBuildableProject(t *testing.T) {
+	for _, name := range []string{"user_v2", "testdata", "_sample"} {
+		t.Run(name, func(t *testing.T) {
+			writeGlobalGenerationProject(t, nil)
+			output, err := captureCLIResponse(t, func() error { return runAdd(nil, []string{name}) })
+			if err != nil || !strings.Contains(output, "Module "+name+" added") {
+				t.Fatal("valid add failed", output, err)
+			}
+			modulePath, err := readModulePath()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for path, want := range codegen.AddModule(modulePath, name).Files {
+				if data, err := os.ReadFile(path); err != nil || !bytes.Equal(data, want) {
+					t.Fatal("scaffold bytes changed", path, err)
+				}
+			}
+			if output, err := captureCLIResponse(t, func() error { return runGen(nil, nil) }); err != nil {
+				t.Fatal("added module did not generate", output, err)
+			}
+			command := exec.Command("go", "build", "-o", "entry.test", "./lucis/"+name)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("added module did not build: %v\n%s", err, output)
+			}
+		})
+	}
+}
+
+func TestAddPreservesMaximumLengthTableName(t *testing.T) {
 	writeGlobalGenerationProject(t, nil)
-	output, err := captureCLIResponse(t, func() error { return runAdd(nil, []string{"user"}) })
-	if err != nil || !strings.Contains(output, "Module user added") {
-		t.Fatal("valid add failed", output, err)
-	}
-	modulePath, err := readModulePath()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for path, want := range codegen.AddModule(modulePath, "user").Files {
-		if data, err := os.ReadFile(path); err != nil || !bytes.Equal(data, want) {
-			t.Fatal("scaffold bytes changed", path, err)
-		}
+	name := strings.Repeat("a", 62)
+	if output, err := captureCLIResponse(t, func() error { return runAdd(nil, []string{name}) }); err != nil {
+		t.Fatal("valid table name rejected", output, err)
 	}
 	if output, err := captureCLIResponse(t, func() error { return runGen(nil, nil) }); err != nil {
-		t.Fatal("added module did not generate", output, err)
-	}
-	command := exec.Command("go", "build", "./service/user/...")
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("added module did not build: %v\n%s", err, output)
+		t.Fatal("valid table name did not generate", output, err)
 	}
 }
 

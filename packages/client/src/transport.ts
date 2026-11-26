@@ -383,6 +383,8 @@ export interface GeneratedTransport extends Transport {
 
 export interface CallOptions {
   signal?: AbortSignal
+  /** Use false to skip automatic refresh and retry for this Fetch or Node HTTP/2 call. */
+  refreshOnUnauthorized?: boolean
 }
 
 /** Terminal notifications after acknowledgement; setup failures reject subscribe(). */
@@ -674,7 +676,7 @@ export class FetchTransport implements Transport {
         return json.data
       }
       const error = jsonResponseError(json, resp.status)
-      const refresh = !parent && this.refreshAfterUnauthorized(error, scope, credentials, options?.signal)
+      const refresh = !parent && this.refreshAfterUnauthorized(error, scope, credentials, options)
       if (refresh && await refresh && this.mayRetry(scope, credentials!, options?.signal)) {
         return await this.jsonRequest(body, responsePlan, options, scope)
       }
@@ -726,7 +728,7 @@ export class FetchTransport implements Transport {
         return data
       }
       const error = decodeBinaryError(data, scope.response.status)
-      const refresh = !parent && this.refreshAfterUnauthorized(error, scope, credentials, options?.signal)
+      const refresh = !parent && this.refreshAfterUnauthorized(error, scope, credentials, options)
       if (refresh && await refresh && this.mayRetry(scope, credentials!, options?.signal)) {
         return await this.binaryRequest(body, options, scope)
       }
@@ -737,13 +739,15 @@ export class FetchTransport implements Transport {
   }
 
   private refreshAfterUnauthorized(
-    error: LuxoError, scope: ResponseScope, credentials: HTTPCredentials | undefined, signal?: AbortSignal,
+    error: LuxoError, scope: ResponseScope, credentials: HTTPCredentials | undefined, options?: CallOptions,
   ): Promise<boolean> | undefined {
+    const signal = options?.signal
     // Only a validated 401 envelope may refresh; body failures never reach here.
-    const current = this.httpCredentials
-    if (scope.response.status !== 401 || error.code !== 401 || error.error === 'ParseError' ||
-      !credentials || !current || current.session !== credentials.session) return undefined
+    if (scope.response.status !== 401 || error.code !== 401 || error.error === 'ParseError' || !credentials) return undefined
+    const refresh = options?.refreshOnUnauthorized !== false
+    if (this.httpCredentials?.session !== credentials.session) return undefined
     this.checkRefreshCancellation(scope, signal)
+    if (!refresh) return undefined
     const flight = credentials.flight ?? this.startHTTPRefresh(credentials)
     return this.joinHTTPRefresh(credentials, flight, scope, signal)
   }

@@ -28,6 +28,8 @@ type schemaAPIInfo struct {
 	query           *schema.QueryCapabilities
 }
 
+const generatedSchemaRegisterName = "RegisterSchema"
+
 func generateSchemaFile(result *semantic.Result, packageName string, enums map[string]bool) []byte {
 	return defaultGenerator().generateSchemaFile(result, packageName, enums)
 }
@@ -83,7 +85,7 @@ func (g *GeneratorContext) generateSchemaFile(result *semantic.Result, packageNa
 
 	b.WriteString("// RegisterSchema registers all model and API metadata with the schema registry.\n")
 	b.WriteString("// Used by Luvia for schema-driven Binary↔JSON conversion.\n")
-	b.WriteString("func RegisterSchema(s *schema.Schema) error {\n")
+	b.WriteString("func " + generatedSchemaRegisterName + "(s *schema.Schema) error {\n")
 
 	// Register models
 	allModels := append(models, stubs...)

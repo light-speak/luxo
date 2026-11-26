@@ -1210,6 +1210,66 @@ class HttpProtocolTest {
     }
 
     @Test
+    fun `reentrant JSON refresh delivers the inner unauthorized response`() = runBlocking {
+        expectReentrantUnauthorized(TransportMode.JSON)
+    }
+
+    @Test
+    fun `reentrant Binary refresh delivers the inner unauthorized response`() = runBlocking {
+        expectReentrantUnauthorized(TransportMode.BINARY)
+    }
+
+    @Test
+    fun `nested transports retain the ancestor refresh flight`() = runBlocking {
+        expectReentrantUnauthorized(TransportMode.BINARY, throughPeer = true)
+    }
+
+    private suspend fun expectReentrantUnauthorized(mode: TransportMode, throughPeer: Boolean = false) {
+        val requests = if (throughPeer) 3 else 2
+        val refreshes = AtomicInteger()
+        val peerRefreshes = AtomicInteger()
+        val refreshFinished = CompletableDeferred<Unit>()
+        val peerFinished = CompletableDeferred<Unit>()
+        val requestSchema = mapOf("echo" to APISchemaEntry(1), "refresh" to APISchemaEntry(2))
+        withClient({ request, count ->
+            val message = if (count == requests) "refresh denied" else "expired"
+            response(request, 401, errorBody(mode, 401, message = message))
+        }) { client, sent ->
+            lateinit var transport: OkHttpTransport
+            val peer = if (throughPeer) {
+                OkHttpTransport(endpoint, client = client, mode = mode, schema = requestSchema, timeoutSeconds = 0,
+                    onTokenExpired = {
+                        peerRefreshes.incrementAndGet()
+                        try { transport.call("refresh"); null } finally { peerFinished.complete(Unit) }
+                    })
+            } else null
+            transport = OkHttpTransport(endpoint, client = client, mode = mode, schema = requestSchema, timeoutSeconds = 0,
+                onTokenExpired = {
+                    if (refreshes.incrementAndGet() != 1) null else try {
+                        (peer ?: transport).call("refresh")
+                        null
+                    } finally { refreshFinished.complete(Unit) }
+                })
+            val error = try {
+                assertFailsWith<LuxoError> { withTimeout(3000) { transport.call("echo") } }
+            } finally {
+                transport.setToken("cleanup")
+                peer?.setToken("cleanup")
+                withTimeout(3000) {
+                    if (refreshes.get() != 0) refreshFinished.await()
+                    if (peerRefreshes.get() != 0) peerFinished.await()
+                }
+            }
+            assertEquals("Unauthorized", error.error)
+            assertEquals(401, error.code)
+            assertEquals("refresh denied", error.message)
+            assertEquals(requests, sent.size)
+            assertEquals(1, refreshes.get())
+            assertEquals(if (throughPeer) 1 else 0, peerRefreshes.get())
+        }
+    }
+
+    @Test
     fun `cooperative refresh cancellation terminates without retry`() = runBlocking {
         for (mode in TransportMode.entries) {
             val entered = CompletableDeferred<Unit>()

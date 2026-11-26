@@ -54,9 +54,25 @@ func TestRPCErrorRejectsInvalidStatus(t *testing.T) {
 
 func TestRPCErrorRejectsDuplicateFields(t *testing.T) {
 	fields := rpcErrorFields(422, "Rejected", "error.rejected")
-	for i, duplicate := range rpcErrorFields(403, "Different", "different message") {
+	different := rpcErrorFields(403, "Different", "different message")
+	data := codec.AppendBytes([]byte{4}, []byte("{}"))
+	text := codec.AppendBytes([]byte{5}, []byte(`"detail"`))
+	duplicates := [][]byte{different[0], different[1], different[2], data, text, {6, 0}}
+	for i, duplicate := range duplicates {
 		t.Run(strconv.Itoa(i+1), func(t *testing.T) {
-			requireRPCEnvelopeFailure(t, rpcErrorBody(fields[0], fields[1], fields[2], duplicate))
+			bodyFields := fields[:]
+			if i >= len(fields) {
+				bodyFields = append(bodyFields, duplicate)
+			}
+			body := rpcErrorBody(append(bodyFields, duplicate)...)
+			err := decodeError(body)
+			requireRPCProtocolError(t, err)
+			if want := fmt.Sprintf("rpc: duplicate error field %d", i+1); err.Error() != want {
+				t.Fatalf("decode error = %q, want %q", err, want)
+			}
+			if stderrors.Is(decodeError(body), err) {
+				t.Fatal("duplicate-field error reused across decodes")
+			}
 		})
 	}
 }
@@ -70,6 +86,46 @@ func TestRPCErrorRejectsInvalidText(t *testing.T) {
 				requireRPCEnvelopeFailure(t, rpcErrorBody(fields[:]...))
 			})
 		}
+	}
+}
+
+func TestRPCErrorFramingAndValidationOrder(t *testing.T) {
+	invalidStatus := rpcErrorFields(399, "Rejected", "\xff")
+	invalidText := rpcErrorFields(422, "Rejected", "\xff")
+	valid := rpcErrorFields(422, "Rejected", "error.rejected")
+	invalidData := codec.AppendBytes([]byte{4}, []byte("{"))
+	for _, sample := range []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{"duplicate before status", rpcErrorBody(invalidStatus[0], invalidStatus[1], invalidStatus[2], invalidStatus[0]),
+			"rpc: duplicate error field 1"},
+		{"trailing before status", append(rpcErrorBody(invalidStatus[:]...), 0), "rpc: error envelope has trailing bytes"},
+		{"status before text", rpcErrorBody(invalidStatus[:]...), "rpc: error status code must be between 400 and 599"},
+		{"text before data", rpcErrorBody(invalidText[0], invalidText[1], invalidText[2], invalidData),
+			"rpc: error envelope contains invalid UTF-8"},
+		{"invalid data", rpcErrorBody(valid[0], valid[1], valid[2], invalidData), "rpc: invalid error data JSON"},
+		{"valid structured body", rpcErrorBody(valid[0], valid[1], valid[2], codec.AppendBytes([]byte{4}, []byte("{}"))), ""},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			err := decodeError(sample.body)
+			if sample.want == "" {
+				appErr, ok := stderrors.AsType[*luxerrors.AppError](err)
+				if !ok || appErr.Code != 422 || appErr.Data == nil {
+					t.Fatalf("valid structured error was not decoded: %v", err)
+				}
+			} else if err == nil || err.Error() != sample.want {
+				t.Fatalf("decode error = %v, want %q", err, sample.want)
+			}
+			frame := append([]byte{statusTraceError, 1, 0}, sample.body...)
+			_, _, traceErr := decodeTracedResponse(frame)
+			_, invalidBody := traceErr.(invalidTracedErrorBody)
+			if invalidBody != (sample.want != "") || traceErr == nil ||
+				traceErr.Error() != "rpc: decode traced response: invalid debug trace envelope" {
+				t.Fatalf("traced error lost body classification or trace cause: %T: %v", traceErr, traceErr)
+			}
+		})
 	}
 }
 
