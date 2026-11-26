@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
 }))
 
 vi.mock('./codegen', () => ({ generateTypes: mocks.generateTypes }))
-vi.mock('fs', () => ({ readFileSync: mocks.readSchema }))
+vi.mock('fs', () => ({ readFileSync: mocks.readSchema, existsSync: () => true }))
 vi.mock('./call-identity', async () => {
   const { BuildOwner } = await vi.importActual<typeof import('./call-identity')>('./call-identity')
   return { BuildOwner, CallIdentity: class {
@@ -18,12 +18,22 @@ vi.mock('./call-identity', async () => {
   } }
 })
 
-import { generateSDK, luxo } from './index'
+import { generateSDK, luxo as createPlugin, type LuxoPluginOptions } from './index'
 import { resolve } from 'node:path'
 import { createServer } from 'node:http'
 import { once } from 'node:events'
 import { SourceMap, type SourceMapPayload } from 'node:module'
 import { analyzeVerifiedCalls } from './analyzer'
+
+function luxo(options: LuxoPluginOptions) {
+  const plugin = createPlugin(options)
+  const context = { addWatchFile: vi.fn() }
+  return {
+    ...plugin,
+    buildStart: (plugin.buildStart as () => Promise<void>).bind(context),
+    transform: (plugin.transform as (code: string, id: string) => Promise<unknown>).bind(context),
+  }
+}
 
 beforeEach(() => {
   mocks.generateTypes.mockReset()
@@ -129,7 +139,7 @@ describe('schema introspection', () => {
     ;(plugin.configResolved as (config: { root: string }) => void)({ root: '/workspace/app' })
     await (plugin.buildStart as () => Promise<void>)()
     expect(mocks.readSchema).toHaveBeenCalledWith('/workspace/app/schema.json')
-    expect(mocks.generateTypes).toHaveBeenCalledWith(schema, '/workspace/app/src/luxo')
+    expect(mocks.generateTypes).toHaveBeenCalledWith(schema, '/workspace/app/src/luxo', { onWrite: expect.any(Function) })
     expect(warning).toHaveBeenCalled()
   })
 
@@ -215,7 +225,8 @@ describe.each(['file', 'network'])('strict %s schema documents', source => {
     const bytes = Buffer.from((bom ? '\uFEFF' : '') + JSON.stringify(schemaWithText))
     const plugin = schemaInput(source, bytes)
     await (plugin.buildStart as () => Promise<void>)()
-    expect(mocks.generateTypes).toHaveBeenCalledWith(schemaWithText, expect.any(String))
+    const options = source === 'file' ? [{ onWrite: expect.any(Function) }] : []
+    expect(mocks.generateTypes).toHaveBeenCalledWith(schemaWithText, expect.any(String), ...options)
   })
 
   it.each([
@@ -267,7 +278,7 @@ it('warns before using an explicit file fallback after corrupt network bytes', a
   const plugin = luxo({ endpoint: 'https://api.example.com/luvia', schema: 'schema.json' })
   await (plugin.buildStart as () => Promise<void>)()
   expect(warning).toHaveBeenCalledOnce()
-  expect(mocks.generateTypes).toHaveBeenCalledWith(schemaWithText, expect.any(String))
+  expect(mocks.generateTypes).toHaveBeenCalledWith(schemaWithText, expect.any(String), { onWrite: expect.any(Function) })
 })
 
 it('preserves endpoint query parameters and sets schema discovery exactly once', async () => {
@@ -386,6 +397,23 @@ describe('semantic build ownership', () => {
     await (plugin.closeBundle as () => Promise<void>)()
   })
 
+  it('reads a changed local schema in build order and generates each revision once', async () => {
+    let release!: () => void
+    const first = { models: {}, apis: {} }
+    mockSchemaFile(Buffer.from(JSON.stringify(first)))
+    mocks.generateTypes.mockImplementationOnce(async () => await new Promise<void>(resolve => { release = resolve }))
+    const plugin = luxo({ schema: 'schema.json' })
+    const pending = plugin.buildStart()
+    await vi.waitFor(() => expect(mocks.generateTypes).toHaveBeenCalledOnce())
+    const rebuild = plugin.buildStart()
+    const duplicate = plugin.buildStart()
+    mockSchemaFile(Buffer.from(JSON.stringify(schemaWithText)))
+    release()
+    await Promise.all([pending, rebuild, duplicate])
+    expect(mocks.generateTypes.mock.calls.map(args => args[0])).toEqual([first, schemaWithText])
+    await (plugin.closeBundle as () => Promise<void>)()
+  })
+
   it('keeps a failed close owned for retry and retires its schema', async () => {
     const plugin = await preparePlugin()
     mocks.close.mockRejectedValueOnce(new Error('compiler cleanup failed'))
@@ -409,14 +437,18 @@ describe('semantic build ownership', () => {
   it('handles candidates absent from the Vite graph and forgets deleted callers', async () => {
     const plugin = await preparePlugin()
     const getModulesByFile = vi.fn().mockReturnValue(undefined)
-    const server = { moduleGraph: { getModulesByFile, invalidateModule: vi.fn() } } as unknown as ViteDevServer
+    const server = {
+      watcher: { add: vi.fn() }, moduleGraph: { getModulesByFile, invalidateModule: vi.fn() },
+    } as unknown as ViteDevServer
     ;(plugin.configureServer as (server: ViteDevServer) => void)(server)
     await (plugin.transform as (code: string, file: string) => Promise<unknown>)(code, '/workspace/view.ts')
     const update = plugin.watchChange as (file: string, change: { event: 'delete' | 'update' }) => Promise<void>
     await update('/workspace/helper.d.ts', { event: 'update' })
     expect(getModulesByFile).toHaveBeenCalledWith('/workspace/view.ts')
-    const hotUpdate = plugin.handleHotUpdate as (context: HmrContext) => unknown[]
-    expect(hotUpdate({ modules: [] } as unknown as HmrContext)).toEqual([])
+    const hotUpdate = plugin.handleHotUpdate as (context: HmrContext) => Promise<unknown[]>
+    await expect(hotUpdate({
+      file: '/workspace/helper.d.ts', modules: [], server, timestamp: 0, read: async () => '',
+    })).resolves.toEqual([])
     getModulesByFile.mockClear()
     await update('/workspace/view.ts', { event: 'delete' })
     expect(getModulesByFile).not.toHaveBeenCalled()

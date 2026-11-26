@@ -8,6 +8,7 @@ const outputs = vi.hoisted(() => new Map<string, string>())
 vi.mock('fs', () => ({
   existsSync: () => true,
   mkdirSync: vi.fn(),
+  statSync: (path: string) => outputs.has(path) ? { isFile: () => true } : undefined,
   writeFileSync: (path: string, data: string) => outputs.set(path, data),
 }))
 

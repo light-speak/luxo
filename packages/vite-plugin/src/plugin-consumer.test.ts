@@ -203,32 +203,38 @@ try {
       endpoint: 'http://127.0.0.1:' + server.address().port + '/luvia?tenant=a%20b&%24schema=old#ignored', introspectionKey: 'test-key',
     }
     const plugin = luxo({ ...options, outDir })
+    const watchFiles = new Set()
+    const hookContext = { addWatchFile: file => watchFiles.add(file) }
+    const buildStart = plugin.buildStart.bind(hookContext)
+    const transform = plugin.transform.bind(hookContext)
     const setPayload = bytes => { payload = bytes; writeFileSync(schemaFile, bytes) }
     setPayload(invalid[0])
-    await assert.rejects(plugin.buildStart(), AggregateError)
+    await assert.rejects(buildStart(), AggregateError)
     assert.equal(existsSync(outDir), false)
     setPayload(valid)
-    await plugin.buildStart()
+    await buildStart()
     const files = readdirSync(outDir).sort()
     assert.deepEqual(files, ['client.ts', 'queries.ts', 'requests.ts', 'schema.ts', 'types.ts'])
     const before = files.map(file => readFileSync(join(outDir, file), 'utf8'))
     setPayload(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), valid]))
-    await plugin.buildStart()
+    await buildStart()
     assert.deepEqual(files.map(file => readFileSync(join(outDir, file), 'utf8')), before)
     for (const bytes of invalid) {
       setPayload(bytes)
-      await assert.rejects(plugin.buildStart(), AggregateError)
+      await assert.rejects(buildStart(), AggregateError)
       assert.deepEqual(files.map(file => readFileSync(join(outDir, file), 'utf8')), before)
-      assert.equal(await plugin.transform('async function f() { const m = await client.getMetric({id: 1n}); console.log(m.label) }', join(directory, 'src/view.ts')), null)
+      assert.equal(await transform('async function f() { const m = await client.getMetric({id: 1n}); console.log(m.label) }', join(directory, 'src/view.ts')), null)
     }
     setPayload(valid)
     if (source === 'network') {
       status = 503
-      await assert.rejects(plugin.buildStart(), AggregateError)
+      await assert.rejects(buildStart(), AggregateError)
       assert.deepEqual(files.map(file => readFileSync(join(outDir, file), 'utf8')), before)
       status = 200
     }
-    await plugin.buildStart()
+    await buildStart()
+    assert.deepEqual([...watchFiles], source === 'file' ? [schemaFile.replaceAll('\\\\', '/')] : [])
+    await plugin.closeBundle()
   }
   for (const request of requests) {
     const url = new URL(request.url, 'http://localhost')
