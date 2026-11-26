@@ -61,13 +61,9 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           read -r head parent extra <<< "$(git rev-list --parents -n 1 HEAD)"
           test "$head" = "$GITHUB_SHA"
-          test "$parent" = 5c0d1f82643e224477c601ec236fb4b09c0b8ddf
+          test "$parent" = 14d6c0b37aff33bd052dcb990ab70b126ead093b
           test -z "$extra"
-          test "$(git diff --no-renames --name-only "$parent" HEAD)" = "$(printf '%s\n' \
-            .github/workflows/diagnose-pr81-error-validation.yml \
-            scripts/diagnose-pr81-error-validation/product.patch.b64 \
-            scripts/diagnose-pr81-error-validation/run.sh \
-            scripts/diagnose-pr81-error-validation/verify.py)"
+          test "$(git diff --no-renames --name-only "$parent" HEAD)" = .github/workflows/diagnose-pr81-error-validation.yml
       - uses: actions/setup-go@v7
         with:
           go-version: '1.27.1'
@@ -97,10 +93,14 @@ jobs:
             gh api "$prefix/artifacts/$id/zip" > "$inputs/$key.zip"
           done < "$inputs/artifacts.tsv"
           unset GH_TOKEN
-          git fetch --no-tags --depth=1 origin \
-            0a6b143ad667c84f0e517b9ef0a9e9d5bd6ec367 \
-            1f5ce302d3bcf1af0b21e55cb3070c424e96cbc4 \
-            cbf4cfb383d944ceb38f700e19cf79c4c54d3c58
+          base=0a6b143ad667c84f0e517b9ef0a9e9d5bd6ec367
+          head=1f5ce302d3bcf1af0b21e55cb3070c424e96cbc4
+          # The private archive store cannot lazy-fetch blobs promised by the sparse checkout.
+          git fetch --refetch --no-filter --no-tags --depth=1 origin \
+            "$base" "$head" cbf4cfb383d944ceb38f700e19cf79c4c54d3c58
+          git rev-list --objects --missing=print "$base^{tree}" "$head^{tree}" |
+            awk '/^\?/ { ++missing } END { printf "missing_objects=%d\n", missing; exit (missing > 0) }' |
+            tee "$evidence/source-object-check.txt"
           bash "$driver/run.sh" "$LANE" "$PWD" "$inputs" "$evidence"
       - name: Preserve routing and measurements
         if: always()
