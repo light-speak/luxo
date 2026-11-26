@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"errors"
 	"fmt"
 	"unicode/utf8"
 
@@ -14,16 +15,8 @@ func decodeError(data []byte) error {
 	if err != nil {
 		return err
 	}
-	if fields.code < 400 || fields.code > 599 {
-		return fmt.Errorf("rpc: error status code must be between 400 and 599")
-	}
-	if !utf8.Valid(fields.name) || !utf8.Valid(fields.message) {
-		return fmt.Errorf("rpc: error envelope contains invalid UTF-8")
-	}
-	if fields.data != nil || fields.text != nil {
-		if err := validateRPCErrorData(fields.data, fields.text); err != nil {
-			return err
-		}
+	if err := fields.validate(); err != nil {
+		return err
 	}
 	// Copy only validated text; each string owns its storage independently.
 	value := &luxerrors.AppError{Code: int(fields.code), Name: string(fields.name), Message: string(fields.message)}
@@ -44,6 +37,28 @@ type rpcErrorEnvelope struct {
 	internal      bool
 }
 
+var duplicateRPCErrorFieldMessages = [...]string{
+	1: "rpc: duplicate error field 1",
+	2: "rpc: duplicate error field 2",
+	3: "rpc: duplicate error field 3",
+	4: "rpc: duplicate error field 4",
+	5: "rpc: duplicate error field 5",
+	6: "rpc: duplicate error field 6",
+}
+
+func (e *rpcErrorEnvelope) validate() error {
+	if e.code < 400 || e.code > 599 {
+		return fmt.Errorf("rpc: error status code must be between 400 and 599")
+	}
+	if !utf8.Valid(e.name) || !utf8.Valid(e.message) {
+		return fmt.Errorf("rpc: error envelope contains invalid UTF-8")
+	}
+	if e.data != nil || e.text != nil {
+		return validateRPCErrorData(e.data, e.text)
+	}
+	return nil
+}
+
 func readRPCErrorFields(data []byte) (rpcErrorEnvelope, error) {
 	var value rpcErrorEnvelope
 	var seen uint8
@@ -57,12 +72,12 @@ func readRPCErrorFields(data []byte) (rpcErrorEnvelope, error) {
 		if field == 0 {
 			break
 		}
-		if field > 6 {
+		if field >= uint64(len(duplicateRPCErrorFieldMessages)) {
 			return value, fmt.Errorf("rpc: unknown error field %d", field)
 		}
 		bit := uint8(1 << field)
 		if seen&bit != 0 {
-			return value, fmt.Errorf("rpc: duplicate error field %d", field)
+			return value, errors.New(duplicateRPCErrorFieldMessages[field])
 		}
 		seen |= bit
 		size = value.readField(data, offset, field)

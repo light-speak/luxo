@@ -1942,10 +1942,31 @@ func TestRPCTruncatedBoolParam(t *testing.T) {
 
 // --- Server: unknown param field ID ---
 
-// --- Client: WriteFrame error (connection closed before write) ---
-
 func TestClientCallWriteError(t *testing.T) {
-	// Start a listener that accepts and immediately closes connections
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	if err := peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	closed := &poolLifecycleConn{Conn: conn, onClose: func() { _ = conn.Close() }}
+	client := NewClient("unused")
+	defer client.Close()
+	client.pool.Put(closed)
+
+	ctx := t.Context()
+	body, err := client.CallWithMaskContext(ctx, "", 1, nil, nil)
+	if body != nil || ctx.Err() != nil || !stderrors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("write returned %x, %v with context %v", body, err, ctx.Err())
+	}
+	closes, idle, open := closed.closes.Load(), len(client.pool.conns), client.pool.open.Load()
+	if closes != 1 || idle != 0 || open != 0 {
+		t.Fatalf("failed write retained connection: closes=%d idle=%d open=%d", closes, idle, open)
+	}
+}
+
+func TestClientCallClosedPeerError(t *testing.T) {
+	// Close each connection after the handshake without answering a request.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1958,7 +1979,7 @@ func TestClientCallWriteError(t *testing.T) {
 				return
 			}
 			acceptTestHandshake(t, c)
-			c.Close() // close after handshake so client write fails
+			c.Close()
 		}
 	}()
 
@@ -1966,19 +1987,17 @@ func TestClientCallWriteError(t *testing.T) {
 	client := &Client{pool: pool}
 	defer client.Close()
 
-	// Get a connection, then close it ourselves before calling
+	// Retire the first lease before making the call.
 	conn, err := pool.Get()
 	if err != nil {
 		t.Fatal(err)
 	}
 	conn.Close()
-	// Put the broken conn back so CallWithMask gets it
 	pool.Put(conn)
 
-	// Now CallWithMask should fail on WriteFrame
 	_, err = client.CallWithMask(1, nil, nil)
 	if err == nil {
-		t.Fatal("should error on write to closed conn")
+		t.Fatal("call unexpectedly succeeded after peer closed")
 	}
 }
 
