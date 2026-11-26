@@ -56,3 +56,27 @@ func TestBufferedBodyLimitsAndClose(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestBufferedBodyConcurrentReadAndClose(t *testing.T) {
+	for range 16 {
+		body := NewBufferedBody([]byte("abc"))
+		start, closed := make(chan struct{}), make(chan struct{})
+		go func() {
+			<-start
+			_ = body.Close()
+			close(closed)
+		}()
+		var dst [1]byte
+		close(start)
+		n, err := body.Read(dst[:])
+		<-closed
+		validRead := err == nil && n == 1 && dst[0] == 'a'
+		closedRead := err == io.ErrClosedPipe && n == 0
+		if !validRead && !closedRead {
+			t.Fatalf("concurrent read returned %d, %v", n, err)
+		}
+		if n, err := body.Read(dst[:]); n != 0 || err != io.ErrClosedPipe {
+			t.Fatalf("read after close returned %d, %v", n, err)
+		}
+	}
+}
