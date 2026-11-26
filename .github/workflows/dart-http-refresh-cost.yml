@@ -12,29 +12,45 @@ permissions:
 
 jobs:
   refresh:
-    name: Dart HTTP refresh / Linux x64
+    name: Dart HTTP refresh / Linux x64 (${{ matrix.slot }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2]
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 4
+          fetch-depth: 5
           persist-credentials: false
 
       - name: Require the original AMD processor
         id: cpu
         shell: bash
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
         run: |
           set -euo pipefail
           evidence=.tmp/dart-http-refresh-evidence
           mkdir -p "$evidence"
           model=$(LC_ALL=C lscpu | awk -F: '$1 == "Model name" {sub(/^[[:space:]]+/, "", $2); sub(/[[:space:]]+$/, "", $2); print $2}')
           match=false
-          if [[ "$(uname -sm)" == 'Linux x86_64' && "$model" == 'AMD EPYC 9V74 80-Core Processor' ]]; then
+          if [[ "$RUNNER_KIND" == github-hosted && "$(uname -sm)" == 'Linux x86_64' && "$model" == 'AMD EPYC 9V74 80-Core Processor' ]]; then
             match=true
           fi
           printf 'model=%s\nmatch=%s\n' "$model" "$match" | tee "$evidence/routing.txt"
           printf 'match=%s\n' "$match" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch the exact published product base
+        if: steps.cpu.outputs.match == 'true'
+        env:
+          CORE_BASE: c9bf5b75b8bfec4d9a65e90c135376f130fb6307
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$CORE_BASE"
+          test "$(git rev-parse FETCH_HEAD)" = "$CORE_BASE"
 
       - uses: dart-lang/setup-dart@v1
         if: steps.cpu.outputs.match == 'true'
@@ -62,10 +78,38 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: dart-http-refresh-linux-x64-${{ github.run_attempt }}
+          name: dart-http-refresh-linux-x64-${{ github.run_attempt }}-${{ matrix.slot }}-${{ steps.cpu.outputs.match == 'true' && 'matched' || 'mismatch' }}
           path: .tmp/dart-http-refresh-evidence/
           if-no-files-found: error
           retention-days: 14
-      - name: Report a processor mismatch after preserving the routing receipt
-        if: ${{ always() && steps.cpu.outputs.match == 'false' }}
-        run: exit 3
+
+  qualification:
+    name: Require a passing EPYC 9V74 sample
+    needs: refresh
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    steps:
+      - name: Verify the current attempt's sampling and routing receipts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SAMPLE_RESULT: ${{ needs.refresh.result }}
+        run: |
+          set -euo pipefail
+          test "$SAMPLE_RESULT" = success
+          receipts=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.expired == false) | .name')
+          matched=0
+          for slot in 1 2; do
+            prefix="dart-http-refresh-linux-x64-$GITHUB_RUN_ATTEMPT-$slot-"
+            receipt=$(awk -v p="$prefix" '$0==p"matched" || $0==p"mismatch" { print substr($0, length(p)+1) }' <<<"$receipts")
+            case "$receipt" in
+              matched) matched=$((matched + 1)) ;;
+              mismatch) ;;
+              *) printf 'Missing or ambiguous receipt for slot %s\n' "$slot" >&2; exit 1 ;;
+            esac
+          done
+          printf 'Matched EPYC 9V74 sampling slots: %s/2\n' "$matched"
+          if [[ "$matched" == 0 ]]; then exit 3; fi
