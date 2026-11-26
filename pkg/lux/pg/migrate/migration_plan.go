@@ -1,6 +1,8 @@
 package migrate
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -19,6 +21,7 @@ type plannedMigration struct {
 	name     string
 	sql      string
 	checksum string
+	digest   string
 	mode     migrationMode
 }
 
@@ -67,8 +70,11 @@ func planMigration(path, direction string, withChecksum bool, recordedChecksum *
 		return plannedMigration{}, err
 	}
 	var checksum string
-	if withChecksum || recordedChecksum != nil {
-		checksum = migrationChecksum(data)
+	var sum [sha256.Size]byte
+	hashed := withChecksum || recordedChecksum != nil
+	if hashed {
+		sum = sha256.Sum256(data)
+		checksum = hex.EncodeToString(sum[:16])
 		if recordedChecksum != nil && *recordedChecksum != checksum {
 			return plannedMigration{}, fmt.Errorf("migration file has been modified (checksum mismatch: stored=%s, current=%s)", *recordedChecksum, checksum)
 		}
@@ -81,7 +87,14 @@ func planMigration(path, direction string, withChecksum bool, recordedChecksum *
 	if err != nil {
 		return plannedMigration{}, err
 	}
-	return plannedMigration{name: filepath.Base(path), sql: sql, checksum: checksum, mode: mode}, nil
+	var digest string
+	if mode.autocommit && (withChecksum || direction == "DOWN") {
+		if !hashed {
+			sum = sha256.Sum256(data)
+		}
+		digest = hex.EncodeToString(sum[:])
+	}
+	return plannedMigration{name: filepath.Base(path), sql: sql, checksum: checksum, digest: digest, mode: mode}, nil
 }
 
 func migrationSection(content, direction string) (string, error) {
@@ -122,6 +135,7 @@ const (
 	migrationSQLTransaction
 	migrationSQLAutocommit
 	migrationSQLGuardedCreate
+	migrationSQLBoundary
 )
 
 func planMigrationSQL(sql string) (migrationMode, error) {
@@ -137,6 +151,9 @@ func planMigrationSQL(sql string) (migrationMode, error) {
 			continue
 		}
 		statements++
+		if kind == migrationSQLBoundary {
+			return migrationMode{}, fmt.Errorf("statement %d controls a transaction boundary managed by Luxo", statements)
+		}
 		if kind == migrationSQLTransaction || firstAutocommit != 0 {
 			continue
 		}
@@ -262,6 +279,23 @@ func (c *migrationTokens) firstStatementKind() migrationSQLKind {
 	case strings.EqualFold(token, "ALTER"):
 		if c.concurrentDetach() {
 			return migrationSQLAutocommit
+		}
+	case strings.EqualFold(token, "BEGIN"), strings.EqualFold(token, "START"),
+		strings.EqualFold(token, "COMMIT"), strings.EqualFold(token, "END"), strings.EqualFold(token, "ABORT"):
+		return migrationSQLBoundary
+	case strings.EqualFold(token, "ROLLBACK"):
+		if !c.accept("WORK") {
+			c.accept("TRANSACTION")
+		}
+		if !c.accept("TO") {
+			return migrationSQLBoundary
+		}
+	case strings.EqualFold(token, "PREPARE"):
+		if c.accept("TRANSACTION") {
+			next := c.next()
+			if !strings.EqualFold(next, "AS") && next != "(" {
+				return migrationSQLBoundary
+			}
 		}
 	}
 	return migrationSQLTransaction

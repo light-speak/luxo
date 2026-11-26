@@ -77,7 +77,7 @@ func TestPendingMigrationOrdinalsAfterThreeDigits(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	runner := &Runner{dir: directory}
+	runner := &migrationOperation{dir: directory}
 	files, err := runner.pendingFiles(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +164,7 @@ func BenchmarkPendingMigrationFiles(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
-			runner := &Runner{dir: dir}
+			runner := &migrationOperation{dir: dir}
 			b.ReportAllocs()
 			for b.Loop() {
 				files, err := runner.pendingFiles(nil)

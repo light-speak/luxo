@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"errors"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -10,7 +11,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/light-speak/luxo/pkg/lux"
 )
 
@@ -24,20 +24,22 @@ func migrationSessionFixture(t *testing.T, standardStrings string) (*Runner, str
 	cleanupTestDatabase(t, admin, name)
 	config := lux.DBConfigFromEnv()
 	config.DBName = name
-	poolConfig, err := pgxpool.ParseConfig(config.ConnectionString())
+	dsn, err := url.Parse(config.ConnectionString())
 	if err != nil {
 		t.Fatal(err)
 	}
 	schema := pgx.Identifier{`tenant "app"`}.Sanitize()
-	poolConfig.MaxConns = 1
-	poolConfig.ConnConfig.RuntimeParams["search_path"] = schema + ", public"
-	poolConfig.ConnConfig.RuntimeParams["standard_conforming_strings"] = standardStrings
-	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	params := dsn.Query()
+	params.Set("pool_max_conns", "1")
+	params.Set("search_path", schema+", public")
+	params.Set("standard_conforming_strings", standardStrings)
+	dsn.RawQuery = params.Encode()
+	db, err := NewPGDB(ctx, dsn.String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	runner := NewFromDB(&PGDB{pool: pool}, dir)
+	runner := NewFromDB(db, dir)
 	t.Cleanup(runner.Close)
 	if err := runner.db.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
 		t.Fatal(err)
@@ -137,6 +139,7 @@ func TestIntegrationMigrationChecksStringModeOnExecutionConnection(t *testing.T)
 			if err := runner.db.QueryRow(ctx, "SELECT pg_catalog.to_regclass($1) IS NOT NULL", schema+".second_object").Scan(&changed); err != nil || changed {
 				t.Fatalf("second migration changed the database: %t %v", changed, err)
 			}
+			assertMigrationMetadataRelation(t, runner, pgx.Identifier{`tenant "app"`, migrationAttemptTable}, false)
 		})
 	}
 }
@@ -170,5 +173,147 @@ func TestIntegrationMigrationStandaloneAcquireHonorsCancellation(t *testing.T) {
 	cancel()
 	if err := db.execMigrationStatement(ctx, "SELECT 1"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("standalone query on a canceled pool acquire: %v", err)
+	}
+}
+
+func setupPingLockTest(t *testing.T) (*PGDB, uint32) {
+	t.Helper()
+	ctx, admin := databaseTestAdmin(t)
+	name := "luxo_ping_lock_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	cleanupTestDatabase(t, admin, name)
+	config := lux.DBConfigFromEnv()
+	config.DBName = name
+	dsn, err := url.Parse(config.ConnectionString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := dsn.Query()
+	params.Set("pool_max_conns", "1")
+	params.Set("application_name", "ping-lock-fresh")
+	dsn.RawQuery = params.Encode()
+	db, err := NewPGDB(ctx, dsn.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(db.Close)
+	initial := db.pool.AcquireAllIdle(ctx)
+	for _, conn := range initial {
+		defer conn.Release()
+	}
+	if len(initial) != 1 {
+		t.Fatalf("idle connections after Ping = %d, want 1", len(initial))
+	}
+	return db, initial[0].Conn().PgConn().PID()
+}
+
+func TestIntegrationPGDBUsesPingSessionForFirstLock(t *testing.T) {
+	db, initialPID := setupPingLockTest(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	cancelled, stop := context.WithCancel(ctx)
+	stop()
+	if err := db.AcquireLock(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled first acquire: %v", err)
+	}
+	if err := db.AcquireLock(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer db.ReleaseLock(ctx)
+	if holderPID := db.lockConn.PgConn().PID(); holderPID != initialPID {
+		t.Fatalf("first holder used PID %d, want Ping PID %d", holderPID, initialPID)
+	}
+	var readerPID uint32
+	if err := db.QueryRow(ctx, "SELECT pg_catalog.pg_backend_pid()").Scan(&readerPID); err != nil || readerPID == initialPID {
+		t.Fatalf("public query did not get an independent session: PID %d, err %v", readerPID, err)
+	}
+	closed := make(chan struct{})
+	go func() {
+		db.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("Close waited for the transferred connection to return to the pool")
+	}
+}
+
+func TestIntegrationPGDBFirstLockIgnoresUsedPoolSession(t *testing.T) {
+	const change = "SET application_name = 'ping-lock-public'"
+	const query = "SELECT pg_catalog.set_config('application_name', 'ping-lock-public', false)"
+	for _, tc := range []struct {
+		name string
+		use  func(context.Context, *PGDB) error
+	}{
+		{"exec", func(ctx context.Context, db *PGDB) error { return db.Exec(ctx, change) }},
+		{"query", func(ctx context.Context, db *PGDB) error {
+			rows, err := db.Query(ctx, query)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+			}
+			rows.Close()
+			return migrationRowsError(rows)
+		}},
+		{"query-row", func(ctx context.Context, db *PGDB) error {
+			var name string
+			return db.QueryRow(ctx, query).Scan(&name)
+		}},
+		{"begin", func(ctx context.Context, db *PGDB) error {
+			tx, err := db.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback(ctx)
+			if err := tx.Exec(ctx, change); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}},
+		{"migration-statement", func(ctx context.Context, db *PGDB) error { return db.execMigrationStatement(ctx, change) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, initialPID := setupPingLockTest(t)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			if err := tc.use(ctx, db); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.AcquireLock(ctx); err != nil {
+				t.Fatal(err)
+			}
+			defer db.ReleaseLock(ctx)
+			var holderName string
+			if err := db.lockConn.QueryRow(ctx, "SHOW application_name").Scan(&holderName); err != nil {
+				t.Fatal(err)
+			}
+			if holderPID := db.lockConn.PgConn().PID(); holderPID == initialPID || holderName != "ping-lock-fresh" {
+				t.Fatalf("holder inherited public session: PID %d, name %q", holderPID, holderName)
+			}
+		})
+	}
+}
+
+func TestIntegrationPGDBRetiresAdoptedSessionAfterWrite(t *testing.T) {
+	db, initialPID := setupPingLockTest(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	const name = "001_holder.sql"
+	writeMigration(t, dir, name, "CREATE TABLE holder_pid AS SELECT pg_catalog.pg_backend_pid() AS pid;", "DROP TABLE holder_pid;")
+	runner := NewFromDB(db, dir)
+	if done, err := runner.Up(ctx); err != nil || !slices.Equal(done, []string{name}) {
+		t.Fatalf("apply: %v, %v", done, err)
+	}
+	if db.lockIdle != nil || db.pool.Stat().TotalConns() != 0 {
+		t.Fatal("writable Ping holder remained cached")
+	}
+	var pid uint32
+	if err := db.QueryRow(ctx, "SELECT pid FROM holder_pid").Scan(&pid); err != nil || pid != initialPID {
+		t.Fatalf("DDL used PID %d, want Ping PID %d: %v", pid, initialPID, err)
 	}
 }

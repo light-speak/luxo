@@ -1,17 +1,11 @@
 package migrate
 
 import (
-	"context"
 	"errors"
-	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
 func TestPlanReindexTransactionMode(t *testing.T) {
@@ -117,39 +111,9 @@ func TestDecodeReindexBackslashHex(t *testing.T) {
 }
 
 func TestIntegrationReindexMigrationTransactionMode(t *testing.T) {
-	ctx, admin := databaseTestAdmin(t)
-	schema := "luxo_reindex_" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	scope := pgx.Identifier{schema}.Sanitize()
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+scope); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		dropCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, err := admin.Exec(dropCtx, "DROP SCHEMA "+scope+" CASCADE"); err != nil {
-			t.Error("drop test schema", err)
-			return
-		}
-		var found bool
-		if err := admin.QueryRow(dropCtx, "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)", schema).Scan(&found); err != nil || found {
-			t.Errorf("test schema cleanup: found=%v err=%v", found, err)
-		}
-	})
-	connURL, err := url.Parse(BuildDatabaseURL())
-	if err != nil {
-		t.Fatal(err)
-	}
-	connURL.Path = "/postgres"
-	params := connURL.Query()
-	params.Set("search_path", schema)
-	connURL.RawQuery = params.Encode()
-	db, err := NewPGDB(ctx, connURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	runner := NewFromDB(db, dir)
-	t.Cleanup(runner.Close)
+	runner, dir, scope := migrationSessionFixture(t, "on")
+	ctx := t.Context()
+	db := runner.db
 	if err := db.Exec(ctx, "CREATE TABLE items(id int); CREATE INDEX items_idx ON items(id);"); err != nil {
 		t.Fatal(err)
 	}

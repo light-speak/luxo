@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -208,7 +209,7 @@ func setupTestRunner(t *testing.T) (*Runner, string) {
 	runner := NewFromDB(db, dir)
 
 	t.Cleanup(func() {
-		db.Exec(context.Background(), "DROP TABLE IF EXISTS _migrations")
+		db.Exec(context.Background(), "DROP TABLE IF EXISTS _luxo_migration_attempt, _migrations")
 		db.Exec(context.Background(), "DROP TABLE IF EXISTS test_users")
 		db.Exec(context.Background(), "DROP TABLE IF EXISTS test_posts")
 		runner.Close()
@@ -769,8 +770,12 @@ func TestIntegrationConcurrentIndexRetryDoesNotRecordInvalidIndex(t *testing.T) 
 	assertConcurrentIndexState(t, runner, false, 1)
 
 	applied, err = runner.Up(ctx)
-	if len(applied) != 0 || err == nil || !strings.Contains(err.Error(), "index") || !strings.Contains(err.Error(), "invalid") {
-		t.Fatalf("invalid existing index was recorded: %v %v", applied, err)
+	var pending *MigrationReconciliationError
+	if len(applied) != 0 || !errors.As(err, &pending) || pending.Attempt.HistoryCommitted {
+		t.Fatalf("ordinary Up retried an unresolved index: %v %v", applied, err)
+	}
+	if err := runner.Reconcile(ctx, pending.Attempt.ID, RetryMigration); err == nil || !strings.Contains(err.Error(), "index") || !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("named retry accepted invalid existing index: %v", err)
 	}
 	assertConcurrentIndexState(t, runner, false, 1)
 
@@ -782,9 +787,8 @@ func TestIntegrationConcurrentIndexRetryDoesNotRecordInvalidIndex(t *testing.T) 
 	if err := runner.db.Exec(ctx, `CREATE UNIQUE INDEX "retry;index" ON test_users (label);`); err != nil {
 		t.Fatal(err)
 	}
-	applied, err = runner.Up(ctx)
-	if len(applied) != 1 || applied[0] != "002_idx.sql" || err != nil {
-		t.Fatalf("valid existing index: %v %v", applied, err)
+	if err := runner.Reconcile(ctx, pending.Attempt.ID, RetryMigration); err != nil {
+		t.Fatalf("valid existing index was rejected: %v", err)
 	}
 	assertConcurrentIndexState(t, runner, true, 2)
 }
@@ -871,6 +875,324 @@ func TestIntegrationAdvisoryLock(t *testing.T) {
 	// Should not panic or error
 }
 
+func TestIntegrationAdvisoryLockReleasedWhenOperationContextIsCanceled(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	ctx := t.Context()
+	probe, err := pgx.Connect(ctx, BuildDatabaseURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Close(ctx)
+	operationCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := runner.db.AcquireLock(operationCtx); err != nil {
+		t.Fatal(err)
+	}
+	tryLock := func() bool {
+		t.Helper()
+		var locked bool
+		if err := probe.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, pgLockID).Scan(&locked); err != nil {
+			t.Fatal(err)
+		}
+		if locked {
+			if _, err := probe.Exec(ctx, `SELECT pg_advisory_unlock($1)`, pgLockID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return locked
+	}
+	if tryLock() {
+		t.Error("a different session acquired the lock during migration")
+	}
+	cancel()
+	runner.db.ReleaseLock(operationCtx)
+	if !tryLock() {
+		t.Error("a different session could not acquire the lock after cancellation")
+	}
+}
+
+func TestIntegrationAdvisoryLockWaitersStopOnCancelAndClose(t *testing.T) {
+	for _, name := range []string{"new-session", "reused-session"} {
+		t.Run(name, func(t *testing.T) { assertAdvisoryLockWaitersStop(t, name == "reused-session") })
+	}
+}
+
+func assertAdvisoryLockWaitersStop(t *testing.T, reuse bool) {
+	t.Helper()
+	runner, _ := setupTestRunner(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := runner.db.AcquireLock(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer runner.db.ReleaseLock(ctx)
+	waitCtx, stopWaiting := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer stopWaiting()
+	if err := runner.db.AcquireLock(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("same adapter granted overlapping lock or lost cancellation: %v", err)
+	}
+	other, err := NewPGDB(ctx, BuildDatabaseURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if reuse {
+		runner.db.ReleaseLock(ctx)
+		if err := other.AcquireLock(ctx); err != nil {
+			t.Fatal(err)
+		}
+		other.ReleaseLock(ctx)
+		if err := runner.db.AcquireLock(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result := make(chan error, 1)
+	go func() { result <- other.AcquireLock(ctx) }()
+	waitForAdvisoryLockQuery(t, ctx, runner.db)
+	other.Close()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("close did not cancel pending database lock: %v", err)
+	}
+	keeper := runner.db.(*PGDB)
+	keeper.stopLocks()
+	if err := keeper.AcquireLock(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("closing adapter reported %v while its lock was still held", err)
+	}
+}
+
+func waitForAdvisoryLockQuery(t *testing.T, ctx context.Context, db DB) {
+	t.Helper()
+	for {
+		var waiting bool
+		err := db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+			    AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+			    AND classid = 0 AND objid = $1::oid AND objsubid = 1)`, pgLockID).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestIntegrationAdvisoryLockReusesOnlyHealthyUnlockedSession(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	db := runner.db.(*PGDB)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	acquire := func() *pgx.Conn {
+		t.Helper()
+		if err := db.AcquireLock(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return db.lockConn
+	}
+	first := acquire()
+	db.ReleaseLock(ctx)
+	if second := acquire(); second != first {
+		t.Fatal("healthy lock session was dialed again")
+	}
+	db.ReleaseLock(ctx)
+	if err := first.PgConn().Conn().Close(); err != nil {
+		t.Fatal(err)
+	}
+	third := acquire()
+	if third == first {
+		t.Fatal("disconnected lock session was reused")
+	}
+	if _, err := third.Exec(ctx, `SELECT pg_advisory_unlock($1)`, pgLockID); err != nil {
+		t.Fatal(err)
+	}
+	db.ReleaseLock(ctx)
+	if db.lockIdle != nil || !third.IsClosed() {
+		t.Fatal("unconfirmed unlock put the owning session back in use")
+	}
+}
+
+func freshAdvisoryLockConfig(t *testing.T, ctx context.Context, db *PGDB) *pgx.ConnConfig {
+	t.Helper()
+	// Exercise the dial and tracer on a fresh holder after ordinary pool use.
+	var one int
+	if err := db.QueryRow(ctx, "SELECT 1").Scan(&one); err != nil {
+		t.Fatal(err)
+	}
+	db.lockConfig = db.lockConfig.Copy()
+	return db.lockConfig
+}
+
+func TestIntegrationAdvisoryLockConnectFailureReleasesReservation(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	db := runner.db.(*PGDB)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	config := db.lockConfig
+	fresh := freshAdvisoryLockConfig(t, ctx, db)
+	dialError := errors.New("test dial failure")
+	fresh.DialFunc = func(context.Context, string, string) (net.Conn, error) { return nil, dialError }
+	if err := db.AcquireLock(ctx); !errors.Is(err, dialError) {
+		t.Fatalf("advisory-lock dial error = %v", err)
+	}
+	db.lockConfig = config
+	if err := db.AcquireLock(ctx); err != nil {
+		t.Fatalf("failed dial retained reservation: %v", err)
+	}
+	db.ReleaseLock(ctx)
+}
+
+func TestIntegrationAdvisoryLockCloseAfterReservation(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	db := runner.db.(*PGDB)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	result := make(chan error, 1)
+	db.lockMu.Lock()
+	go func() { result <- db.AcquireLock(ctx) }()
+	for len(db.lockSlot) == 0 && ctx.Err() == nil {
+		time.Sleep(time.Millisecond)
+	}
+	reserved := len(db.lockSlot) == 1
+	closed := closeAdvisoryAdapter(db)
+	select {
+	case <-db.lockLifetime.Done():
+	case <-ctx.Done():
+	}
+	db.lockMu.Unlock()
+
+	if err := <-result; !reserved || !errors.Is(err, context.Canceled) {
+		t.Fatalf("advisory-lock reservation=%v, error=%v", reserved, err)
+	}
+	waitForAdvisoryClose(t, ctx, closed)
+	if len(db.lockSlot) != 0 {
+		t.Fatal("closed adapter retained the reservation")
+	}
+}
+
+func closeAdvisoryAdapter(db *PGDB) <-chan struct{} {
+	closed := make(chan struct{})
+	go func() {
+		db.Close()
+		close(closed)
+	}()
+	return closed
+}
+
+func waitForAdvisoryClose(t *testing.T, ctx context.Context, closed <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatalf("adapter did not close: %v", ctx.Err())
+	}
+}
+
+type advisoryLockQueryEnd func()
+
+func (advisoryLockQueryEnd) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
+	return ctx
+}
+
+func (notify advisoryLockQueryEnd) TraceQueryEnd(_ context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
+	if data.Err == nil {
+		notify()
+	}
+}
+
+func TestIntegrationAdvisoryLockCloseAfterServerGrant(t *testing.T) {
+	t.Run("explicit", func(t *testing.T) {
+		assertAdvisoryLockCloseAfterGrant(t, false)
+	})
+	t.Run("migration", func(t *testing.T) {
+		assertAdvisoryLockCloseAfterGrant(t, true)
+	})
+}
+
+func assertAdvisoryLockCloseAfterGrant(t *testing.T, migration bool) {
+	t.Helper()
+	runner, _ := setupTestRunner(t)
+	db := runner.db.(*PGDB)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	var closed <-chan struct{}
+	freshAdvisoryLockConfig(t, ctx, db).Tracer = advisoryLockQueryEnd(func() {
+		closed = closeAdvisoryAdapter(db)
+		select {
+		case <-db.lockLifetime.Done():
+		case <-ctx.Done():
+		}
+	})
+	var err error
+	if migration {
+		_, err = runner.Up(ctx)
+	} else {
+		err = db.AcquireLock(ctx)
+	}
+	if !errors.Is(err, context.Canceled) || closed == nil {
+		t.Fatalf("successfully granted lock did not race with Close: %v", err)
+	}
+	waitForAdvisoryClose(t, ctx, closed)
+	if db.lockConn != nil || len(db.lockSlot) != 0 {
+		t.Fatal("closed adapter kept the granted session")
+	}
+	probe, err := NewPGDB(ctx, BuildDatabaseURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Close()
+	if err := probe.AcquireLock(ctx); err != nil {
+		t.Fatalf("independent adapter could not take the released database lock: %v", err)
+	}
+	probe.ReleaseLock(ctx)
+}
+
+func TestIntegrationMigrationsSerializeWithOneQueryConnection(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	otherDB, err := NewPGDB(ctx, BuildDatabaseURL()+"&pool_max_conns=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherDB.Close()
+	other := NewFromDB(otherDB, dir)
+	writeMigration(t, dir, "001_create_users.sql", `CREATE TABLE test_users (id bigint);`, `DROP TABLE test_users;`)
+	start := make(chan struct{})
+	type result struct {
+		names []string
+		err   error
+	}
+	results := make(chan result, 2)
+	for _, candidate := range []*Runner{runner, other} {
+		go func() {
+			<-start
+			names, err := candidate.Up(ctx)
+			results <- result{names, err}
+		}()
+	}
+	close(start)
+	applied := 0
+	for range 2 {
+		got := <-results
+		if got.err != nil {
+			t.Error(got.err)
+		}
+		applied += len(got.names)
+	}
+	if applied != 1 {
+		t.Fatalf("concurrent runners reported %d applied migrations", applied)
+	}
+	if names, err := other.Down(ctx, 1); err != nil || len(names) != 1 {
+		t.Fatalf("down with one query connection: %v, %v", names, err)
+	}
+}
+
 func TestIntegrationVerify(t *testing.T) {
 	runner, dir := setupTestRunner(t)
 	ctx := context.Background()
@@ -912,11 +1234,11 @@ func TestIntegrationUpAfterClose(t *testing.T) {
 		"CREATE TABLE test_users (id SERIAL PRIMARY KEY);",
 		"DROP TABLE IF EXISTS test_users;")
 
-	runner.db.(*PGDB).pool.Close()
+	runner.Close()
 
 	_, err := runner.Up(ctx)
-	if err == nil {
-		t.Fatal("should fail on closed pool")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("closed runner: %v", err)
 	}
 }
 
@@ -924,11 +1246,11 @@ func TestIntegrationDownAfterClose(t *testing.T) {
 	runner, _ := setupTestRunner(t)
 	ctx := context.Background()
 
-	runner.db.(*PGDB).pool.Close()
+	runner.Close()
 
 	_, err := runner.Down(ctx, 1)
-	if err == nil {
-		t.Fatal("should fail on closed pool")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("closed runner: %v", err)
 	}
 }
 
@@ -1210,5 +1532,243 @@ func TestIntegrationVerifyUnexpectedTable(t *testing.T) {
 	}
 	if !hasUnexpected {
 		t.Errorf("should detect unexpected table, drifts: %v", drifts)
+	}
+}
+
+func TestIntegrationMigrationStopsWhenHolderDisconnects(t *testing.T) {
+	for _, operation := range []string{"up", "down"} {
+		for _, phase := range []string{"acquired", "ddl-complete"} {
+			t.Run(operation+"/"+phase, func(t *testing.T) {
+				assertMigrationStopsWhenHolderDisconnects(t, operation == "down", phase == "ddl-complete")
+			})
+		}
+	}
+}
+
+func assertMigrationStopsWhenHolderDisconnects(t *testing.T, down, afterDDL bool) {
+	t.Helper()
+	runner, dir := setupTestRunner(t)
+	ctx := t.Context()
+	writeMigration(t, dir, "001_users.sql", "CREATE TABLE test_users (id int);", "DROP TABLE test_users;")
+	if _, err := runner.Up(ctx); err != nil {
+		t.Fatal("set up initial migration", err)
+	}
+	const create = "CREATE INDEX CONCURRENTLY holder_idx ON test_users (id);"
+	const drop = "DROP INDEX CONCURRENTLY holder_idx;"
+	writeMigration(t, dir, "002_holder.sql", create, drop)
+	if down {
+		if _, err := runner.Up(ctx); err != nil {
+			t.Fatal("set up rollback", err)
+		}
+	}
+
+	db := runner.db.(*PGDB)
+	// The lock session is already idle. Discard it before installing a tracer for
+	// the next lock session. The reader pool keeps its original configuration.
+	if db.lockIdle != nil {
+		if err := db.lockIdle.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cut := &migrationHolderCut{testing: t, statement: "SELECT pg_advisory_lock("}
+	if afterDDL {
+		cut.statement = create
+		if down {
+			cut.statement = drop
+		}
+	}
+	db.lockConfig = db.lockConfig.Copy()
+	db.lockConfig.Tracer = cut
+
+	var changed []string
+	var err error
+	if down {
+		changed, err = runner.Down(ctx, 1)
+	} else {
+		changed, err = runner.Up(ctx)
+	}
+	if !cut.disconnected || len(changed) != 0 || err == nil {
+		t.Errorf("holder loss: disconnected=%t, changed=%v, error=%v", cut.disconnected, changed, err)
+	}
+	var indexExists bool
+	var history int
+	err = db.QueryRow(ctx, `SELECT to_regclass('holder_idx') IS NOT NULL,
+		(SELECT count(*) FROM _migrations)`).Scan(&indexExists, &history)
+	wantHistory := 1
+	if down {
+		wantHistory = 2
+	}
+	if err != nil || indexExists != (down != afterDDL) || history != wantHistory {
+		t.Fatalf("pool observation: index=%t, history=%d, error=%v", indexExists, history, err)
+	}
+
+	probe, err := pgx.Connect(ctx, BuildDatabaseURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer probe.Close(ctx)
+	assertProbeMigrationLock(t, ctx, probe, true)
+}
+
+type migrationHolderCut struct {
+	testing      *testing.T
+	statement    string
+	disconnected bool
+}
+
+type migrationHolderTraceKey struct{}
+
+func (cut *migrationHolderCut) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	return context.WithValue(ctx, migrationHolderTraceKey{}, data.SQL)
+}
+
+func (cut *migrationHolderCut) TraceQueryEnd(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryEndData) {
+	sql, _ := ctx.Value(migrationHolderTraceKey{}).(string)
+	if cut.disconnected || data.Err != nil || !strings.HasPrefix(sql, cut.statement) {
+		return
+	}
+	if err := conn.PgConn().Conn().Close(); err != nil {
+		cut.testing.Error(err)
+		return
+	}
+	cut.disconnected = true
+}
+
+func TestIntegrationMigrationHolderCancellationLeavesPreviewIndependent(t *testing.T) {
+	for _, closeRunner := range []bool{false, true} {
+		name := "cancel"
+		if closeRunner {
+			name = "close"
+		}
+		t.Run(name, func(t *testing.T) {
+			assertMigrationHolderStopsActiveWork(t, closeRunner)
+		})
+	}
+}
+
+func assertMigrationHolderStopsActiveWork(t *testing.T, closeRunner bool) {
+	t.Helper()
+	runner, dir := setupTestRunner(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	observer, err := pgx.Connect(ctx, BuildDatabaseURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupMigrationHolderObserver(t, observer)
+	const name = "001_cancellable.sql"
+	const upSQL = "CREATE TABLE test_users (id int); SELECT pg_sleep(30);"
+	writeMigration(t, dir, name, upSQL, "DROP TABLE test_users;")
+
+	db := runner.db.(*PGDB)
+	started := make(migrationHolderStarted, 1)
+	freshAdvisoryLockConfig(t, ctx, db).Tracer = started
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	result := make(chan error, 1)
+	go func() {
+		_, err := runner.Up(runCtx)
+		result <- err
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("no running holder statement", ctx.Err())
+	}
+	if names, _, err := runner.DryRun(ctx); err != nil || len(names) != 1 || names[0] != name {
+		t.Fatalf("concurrent read-only preview: %v %v", names, err)
+	}
+	assertProbeMigrationLock(t, ctx, observer, false)
+	if closeRunner {
+		db.Close()
+	} else {
+		stop()
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("holder cancellation: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("migration ignored cancellation", ctx.Err())
+	}
+	assertProbeMigrationLock(t, ctx, observer, true)
+
+	var tableExists bool
+	var history int
+	err = observer.QueryRow(ctx, `SELECT to_regclass('test_users') IS NOT NULL,
+		(SELECT count(*) FROM _migrations)`).Scan(&tableExists, &history)
+	if err != nil || tableExists || history != 0 {
+		t.Fatalf("canceled transaction: table=%t, history=%d, error=%v", tableExists, history, err)
+	}
+}
+
+func assertProbeMigrationLock(t *testing.T, ctx context.Context, observer *pgx.Conn, want bool) {
+	t.Helper()
+	if want {
+		lockCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if _, err := observer.Exec(lockCtx, "SELECT pg_advisory_lock($1)", pgLockID); err != nil {
+			t.Fatal("advisory lock was not released", err)
+		}
+		if _, err := observer.Exec(lockCtx, "SELECT pg_advisory_unlock($1)", pgLockID); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	var locked bool
+	err := observer.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", pgLockID).Scan(&locked)
+	if err != nil || locked {
+		t.Fatalf("active holder lost the advisory lock: acquired=%t, error=%v", locked, err)
+	}
+}
+
+func cleanupMigrationHolderObserver(t *testing.T, observer *pgx.Conn) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := observer.Exec(ctx, "DROP TABLE IF EXISTS _migrations, test_users"); err != nil {
+		t.Error(err)
+	}
+	if err := observer.Close(ctx); err != nil {
+		t.Error(err)
+	}
+}
+
+type migrationHolderStarted chan struct{}
+
+func (started migrationHolderStarted) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(data.SQL, "pg_sleep(30)") {
+		started <- struct{}{}
+	}
+	return ctx
+}
+
+func (migrationHolderStarted) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func TestIntegrationMigrationHolderReusesOnlyReadOnlySession(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := t.Context()
+	if err := runner.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	db := runner.db.(*PGDB)
+	if _, err := runner.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	original := db.lockIdle
+	if original == nil {
+		t.Fatal("read-only migration preflight discarded its healthy connection")
+	}
+	if _, err := runner.Up(ctx); err != nil || db.lockIdle != original {
+		t.Fatalf("no-op Up did not reuse the migration connection: %v", err)
+	}
+
+	writeMigration(t, dir, "001_session.sql", "SET application_name = 'luxo_migration_holder_test';", "SELECT 1;")
+	if _, err := runner.Up(ctx); err != nil || db.lockIdle != nil || !original.IsClosed() {
+		t.Fatalf("completed writable holder was not closed: %v", err)
+	}
+	if _, err := runner.Down(ctx, 1); err != nil {
+		t.Fatal(err)
 	}
 }
