@@ -1,4 +1,4 @@
-name: Qualify pending beta comparisons on matching native processors
+name: Qualify pending beta comparisons on EPYC 9V45
 
 on:
   push:
@@ -16,11 +16,11 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 6
       matrix:
-        allocation: [1, 2]
+        allocation: [1, 2, 3, 4, 5, 6]
     steps:
-      - name: Select an original native processor
+      - name: Match the original EPYC 9V45 processor
         id: route
         env:
           RUNNER_KIND: ${{ runner.environment }}
@@ -31,89 +31,75 @@ jobs:
           evidence="$RUNNER_TEMP/beta-native-qualification"
           mkdir -p "$evidence"
           lscpu > "$evidence/lscpu.txt"
-          actual=$(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/lscpu.txt")
-          printf 'allocation=%s\nimage=%s\nimage_version=%s\nactual=%s\nrouter_sha=%s\n' \
-            "$ALLOCATION" "${ImageOS:-unknown}" "${ImageVersion:-unknown}" "$actual" "$GITHUB_SHA" > "$evidence/routing.txt"
-          if [[ "$RUNNER_KIND" != github-hosted || "$(uname -sm)" != 'Linux x86_64' ]]; then
+          mapfile -t models < <(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/lscpu.txt" | sed 's/[[:space:]]*$//')
+          actual=${models[0]:-unknown}
+          platform=$(uname -sm)
+          printf 'allocation=%s\nimage=%s\nimage_version=%s\nactual=%s\nrunner_kind=%s\nplatform=%s\nrouter_sha=%s\n' \
+            "$ALLOCATION" "${ImageOS:-unknown}" "${ImageVersion:-unknown}" "$actual" "$RUNNER_KIND" "$platform" "$GITHUB_SHA" > "$evidence/routing.txt"
+          if [[ "$RUNNER_KIND" != github-hosted || "$platform" != 'Linux x86_64' ]]; then
+            printf 'lane=unmatched\nmatch=false\nreason=platform\n' >> "$evidence/routing.txt"
             exit 3
           fi
-          case "$actual" in
-            'AMD EPYC 9V45 96-Core Processor')
-              lane=codegen
-              ref=28339729c6bcd4d4248743e202258d54c9c7b0b7
-              depth=1
-              ;;
-            'AMD EPYC 9V74 80-Core Processor')
-              lane=dart
-              ref=8250b2ab76706e28fce4afe4ce23a37638526b9a
-              depth=4
-              ;;
-            *)
-              printf 'lane=unmatched\n' >> "$evidence/routing.txt"
-              exit 3
-              ;;
-          esac
-          printf 'lane=%s\nref=%s\ndepth=%s\n' "$lane" "$ref" "$depth" | tee -a "$evidence/routing.txt" >> "$GITHUB_OUTPUT"
+          if [[ "${#models[@]}" != 1 || "$actual" != 'AMD EPYC 9V45 96-Core Processor' ]]; then
+            printf 'lane=unmatched\nmatch=false\nreason=processor\n' >> "$evidence/routing.txt"
+            exit 3
+          fi
+          printf 'lane=9v45\nmatch=true\n' | tee -a "$evidence/routing.txt" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v7
+        id: control_checkout
+        if: steps.route.outputs.match == 'true'
         with:
-          ref: ${{ steps.route.outputs.ref }}
-          path: readiness
-          fetch-depth: ${{ steps.route.outputs.depth }}
+          ref: ${{ github.sha }}
+          path: controller
+          fetch-depth: 2
           persist-credentials: false
-      - name: Prepare the selected readiness checkout
-        working-directory: readiness
+          sparse-checkout: /.github/workflows/diagnose-beta-native-qualification.yml
+          sparse-checkout-cone-mode: false
+      - name: Bind the cumulative controller commit
+        id: control
+        if: steps.control_checkout.outcome == 'success'
+        working-directory: controller
         env:
-          PINNED_REF: ${{ steps.route.outputs.ref }}
-          LANE: ${{ steps.route.outputs.lane }}
+          ROUTER_PARENT: 5c672243495860f41e1cf697cc87d75e3eb9a2d6
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$PINNED_REF"
-          route="$RUNNER_TEMP/beta-native-qualification"
-          case "$LANE" in
-            codegen) evidence=.tmp/pr143-timing-evidence ;;
-            dart) evidence=.tmp/dart-http-refresh-evidence ;;
-            *) exit 3 ;;
-          esac
-          mkdir -p "$evidence"
-          if [[ "$LANE" == dart ]]; then
-            model=$(sed -n 's/^actual=//p' "$route/routing.txt")
-            test "$model" = 'AMD EPYC 9V74 80-Core Processor'
-            printf 'model=%s\nmatch=true\n' "$model" > "$evidence/routing.txt"
-          else
-            cp "$route/routing.txt" "$evidence/routing.txt"
-          fi
+          workflow=.github/workflows/diagnose-beta-native-qualification.yml
+          test "$GITHUB_REF" = refs/heads/diagnostics/beta-native-qualification
+          read -r checked parent extra <<< "$(git rev-list --parents --max-count=1 HEAD)"
+          test "$checked" = "$GITHUB_SHA"
+          test "$parent" = "$ROUTER_PARENT"
+          test -z "$extra"
+          test "$(git diff --no-renames --name-only "$ROUTER_PARENT" HEAD --)" = "$workflow"
+          tree=$(git rev-parse HEAD^{tree})
+          blob=$(git rev-parse "HEAD:$workflow")
+          printf 'router_parent=%s\nrouter_tree=%s\nrouter_workflow_blob=%s\n' \
+            "$parent" "$tree" "$blob" >> "$RUNNER_TEMP/beta-native-qualification/routing.txt"
       - uses: actions/setup-go@v7
-        if: steps.route.outputs.lane == 'codegen'
+        id: go_setup
+        if: steps.control.outcome == 'success'
         with:
           go-version: '1.27.1'
           cache: false
-      - uses: dart-lang/setup-dart@v1
-        if: steps.route.outputs.lane == 'dart'
+      - uses: actions/checkout@v7
+        id: scanner_checkout
+        if: ${{ !cancelled() && steps.go_setup.outcome == 'success' }}
         with:
-          sdk: '3.13.4'
-      - uses: actions/setup-go@v7
-        if: steps.route.outputs.lane == 'dart'
-        with:
-          go-version-file: readiness/go.mod
-          cache: false
-      - name: Bind the locked Dart arms and take paired samples
-        if: steps.route.outputs.lane == 'dart'
+          ref: 28339729c6bcd4d4248743e202258d54c9c7b0b7
+          path: readiness
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Prepare the pinned scanner checkout
+        id: scanner_ready
+        if: ${{ !cancelled() && steps.scanner_checkout.outcome == 'success' }}
         working-directory: readiness
-        env:
-          PINNED_REF: ${{ steps.route.outputs.ref }}
-          PYTHONUTF8: '1'
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$PINNED_REF"
-          mkdir -p .tmp/dart-http-refresh-evidence
-          # The replay verifier binds its checkout via GITHUB_SHA. The outer run
-          # SHA is recorded separately in runner.temp's routing receipt.
-          GITHUB_SHA="$PINNED_REF" python3 -I -B .github/diagnostics/dart-http-refresh/qualify.py collect \
-            --repo "$PWD" --scratch "$PWD/.tmp" \
-            --evidence "$PWD/.tmp/dart-http-refresh-evidence" \
-            | tee .tmp/dart-http-refresh-evidence/setup.jsonl
+          test "$(git rev-parse HEAD)" = 28339729c6bcd4d4248743e202258d54c9c7b0b7
+          evidence=.tmp/pr143-timing-evidence
+          mkdir -p "$evidence"
+          cp "$RUNNER_TEMP/beta-native-qualification/routing.txt" "$evidence/routing.txt"
       - name: Replay the exact benchmark originals
-        if: steps.route.outputs.lane == 'codegen'
+        if: ${{ !cancelled() && steps.scanner_ready.outcome == 'success' }}
         working-directory: readiness
         shell: bash
         env:
@@ -140,7 +126,8 @@ jobs:
           gh api "$resource/zip" > "$scratch/original.zip"
           bash scripts/diagnose-pr143-timing/run.sh "$LANE" "$PWD" "$scratch/original.zip" "$output"
       - uses: actions/checkout@v7
-        if: ${{ !cancelled() && steps.route.outputs.lane == 'codegen' }}
+        id: shutdown_checkout
+        if: ${{ !cancelled() && steps.go_setup.outcome == 'success' }}
         with:
           ref: 78f15da278fd12bc4db460c47f0a9a444f8c900a
           path: shutdown
@@ -148,7 +135,7 @@ jobs:
           persist-credentials: false
       - name: Prepare the pinned shutdown checkout
         id: shutdown_ready
-        if: ${{ !cancelled() && steps.route.outputs.lane == 'codegen' }}
+        if: ${{ !cancelled() && steps.shutdown_checkout.outcome == 'success' }}
         working-directory: shutdown
         env:
           LC_ALL: C
@@ -156,13 +143,13 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = 78f15da278fd12bc4db460c47f0a9a444f8c900a
           expected=$(python3 -B scripts/diagnose-pr78-shutdown/verify.py model 9v45)
-          actual=$(sed -n 's/^Model name:[[:space:]]*//p' "$RUNNER_TEMP/beta-native-qualification/lscpu.txt")
+          actual=$(sed -n 's/^actual=//p' "$RUNNER_TEMP/beta-native-qualification/routing.txt")
           test "$actual" = "$expected"
           evidence=.tmp/pr78-shutdown-evidence-9v45
           mkdir -p "$evidence"
           printf 'lane=9v45\nactual=%s\nexpected=%s\nmatch=true\n' "$actual" "$expected" > "$evidence/routing.txt"
       - name: Replay pinned product and compare strictly
-        if: ${{ !cancelled() && steps.route.outputs.lane == 'codegen' && steps.shutdown_ready.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.shutdown_ready.outcome == 'success' }}
         working-directory: shutdown
         shell: bash
         env:
@@ -190,7 +177,7 @@ jobs:
           bash scripts/diagnose-pr78-shutdown/run.sh "$H2_LANE" "$inputs"
       - uses: actions/checkout@v7
         id: logging_checkout
-        if: ${{ !cancelled() && steps.route.outputs.lane == 'codegen' }}
+        if: ${{ !cancelled() && steps.go_setup.outcome == 'success' }}
         with:
           ref: a053c33060c66d5612282d8f1bec8b8ce9bd2b4a
           path: logging
@@ -198,7 +185,7 @@ jobs:
           persist-credentials: false
       - name: Prepare the pinned request logging checkout
         id: logging_ready
-        if: ${{ !cancelled() && steps.route.outputs.lane == 'codegen' && steps.logging_checkout.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.logging_checkout.outcome == 'success' }}
         working-directory: logging
         env:
           LC_ALL: C
@@ -206,13 +193,13 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = a053c33060c66d5612282d8f1bec8b8ce9bd2b4a
           expected=$(python3 -B scripts/diagnose-pr83-f9/verify.py model 9v45)
-          actual=$(sed -n 's/^Model name:[[:space:]]*//p' "$RUNNER_TEMP/beta-native-qualification/lscpu.txt")
+          actual=$(sed -n 's/^actual=//p' "$RUNNER_TEMP/beta-native-qualification/routing.txt")
           test "$actual" = "$expected"
           evidence=.tmp/pr83-f9-evidence-9v45
           mkdir -p "$evidence"
           printf 'actual=%s\nexpected=%s\nmatch=true\n' "$actual" "$expected" > "$evidence/routing.txt"
       - name: Recheck PR 83 and its original failing workloads
-        if: ${{ !cancelled() && steps.route.outputs.lane == 'codegen' && steps.logging_ready.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.logging_ready.outcome == 'success' }}
         working-directory: logging
         shell: bash
         env:
@@ -253,7 +240,6 @@ jobs:
           path: |
             ${{ runner.temp }}/beta-native-qualification/
             readiness/.tmp/pr143-timing-evidence/
-            readiness/.tmp/dart-http-refresh-evidence/
             shutdown/.tmp/pr78-shutdown-evidence-9v45/
             logging/.tmp/pr83-f9-evidence-9v45/
           if-no-files-found: error
