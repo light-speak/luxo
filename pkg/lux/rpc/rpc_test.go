@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
@@ -60,31 +61,36 @@ func TestServerRecordsRPCHandlerMetrics(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			router := api.NewRouter()
-			recorder := &rpcMetricsRecorder{}
-			router.Handle("tracked", tt.handler)
-			router.Registry.Register("tracked", 1)
-			router.Registry.RegisterParams("tracked", nil)
+			synctest.Test(t, func(t *testing.T) {
+				router := api.NewRouter()
+				recorder := &rpcMetricsRecorder{}
+				router.Handle("tracked", func(ctx context.Context, req *api.Request) error {
+					time.Sleep(time.Millisecond)
+					return tt.handler(ctx, req)
+				})
+				router.Registry.Register("tracked", 1)
+				router.Registry.RegisterParams("tracked", nil)
 
-			server := NewServer(router)
-			// Generated services start the RPC listener before Gateway.Serve
-			// configures Studio metrics, so late binding must be supported.
-			router.SetMetricsCollector(recorder)
-			payload := codec.AppendVarint(nil, 1)
-			payload = codec.AppendVarint(payload, 0)
-			payload = append(payload, 0)
-			testProcessRequest(t, server, payload)
+				server := NewServer(router)
+				// Generated services start the RPC listener before Gateway.Serve
+				// configures Studio metrics, so late binding must be supported.
+				router.SetMetricsCollector(recorder)
+				payload := codec.AppendVarint(nil, 1)
+				payload = codec.AppendVarint(payload, 0)
+				payload = append(payload, 0)
+				testProcessRequest(t, server, payload)
 
-			if len(recorder.calls) != 1 {
-				t.Fatalf("recorded metrics = %d, want 1", len(recorder.calls))
-			}
-			got := recorder.calls[0]
-			if got.apiName != "tracked" || got.isError != tt.wantError {
-				t.Fatalf("recorded metric = %+v", got)
-			}
-			if got.duration <= 0 {
-				t.Fatalf("recorded duration = %s, want positive", got.duration)
-			}
+				if len(recorder.calls) != 1 {
+					t.Fatalf("recorded metrics = %d, want 1", len(recorder.calls))
+				}
+				got := recorder.calls[0]
+				if got.apiName != "tracked" || got.isError != tt.wantError {
+					t.Fatalf("recorded metric = %+v", got)
+				}
+				if got.duration != time.Millisecond {
+					t.Fatalf("recorded duration = %s, want 1ms", got.duration)
+				}
+			})
 		})
 	}
 }
