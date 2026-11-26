@@ -66,6 +66,75 @@ describe('useLuxoMutation', () => {
     expect(events).toEqual(['success', 'invalidated'])
   })
 
+  it.each(['throw', 'reject'] as const)('resolves a saved mutation and refreshes active queries when onSuccess can %s', async kind => {
+    const queryClient = new QueryClient({ staleTime: Infinity, gcTime: Infinity })
+    const queryKey = ['tickets']
+    let tickets = 1
+    queryClient.setQueryData(queryKey, tickets)
+    const queryFn = vi.fn(async () => tickets)
+    const telemetryError = new Error('telemetry unavailable')
+    const mutationFn = vi.fn(async () => ++tickets)
+    const { result } = renderHook(() => ({
+      list: useLuxoQuery(queryFn, [], { queryClient, queryKey }),
+      mutation: useLuxoMutation(mutationFn, {
+        queryClient,
+        onSuccess: () => {
+          if (kind === 'throw') throw telemetryError
+          return Promise.reject(telemetryError)
+        },
+        invalidateQueries: [queryKey],
+      }),
+    }))
+
+    await act(async () => {
+      await expect(result.current.mutation.mutate(undefined)).resolves.toBe(2)
+    })
+    expect(mutationFn).toHaveBeenCalledOnce()
+    expect(queryFn).toHaveBeenCalledOnce()
+    expect(result.current.list.data).toBe(2)
+    expect(queryClient.getQueryData(queryKey)).toBe(2)
+    expect(result.current.mutation.data).toBe(2)
+    expect(result.current.mutation.error).toBeNull()
+    expect(result.current.mutation.postSuccessError).toBe(telemetryError)
+
+    act(() => result.current.mutation.reset())
+    expect(result.current.mutation.postSuccessError).toBeNull()
+  })
+
+  it('preserves both failures if the callback and deriving invalidation keys fail after a write', async () => {
+    const callbackError = new Error('telemetry unavailable')
+    const keyError = new Error('no key for response')
+    const { result } = renderHook(() => useLuxoMutation(async () => 2, {
+      onSuccess: () => { throw callbackError },
+      invalidateQueries: () => { throw keyError },
+    }))
+
+    await act(async () => {
+      await expect(result.current.mutate(undefined)).resolves.toBe(2)
+    })
+    expect(result.current.error).toBeNull()
+    expect(result.current.postSuccessError).toBeInstanceOf(AggregateError)
+    expect((result.current.postSuccessError as AggregateError).errors).toEqual([callbackError, keyError])
+  })
+
+  it('reports a rejected write as a mutation error without running success handling', async () => {
+    const writeError = new Error('write failed')
+    const onSuccess = vi.fn()
+    const invalidateQueries = vi.fn(() => [['tickets']])
+    const { result } = renderHook(() => useLuxoMutation(() => Promise.reject(writeError), {
+      onSuccess, invalidateQueries,
+    }))
+
+    await act(async () => {
+      await expect(result.current.mutate(undefined)).rejects.toBe(writeError)
+    })
+    expect(result.current.data).toBeNull()
+    expect(result.current.error).toBe(writeError)
+    expect(result.current.postSuccessError).toBeNull()
+    expect(onSuccess).not.toHaveBeenCalled()
+    expect(invalidateQueries).not.toHaveBeenCalled()
+  })
+
   it.each([
     { overlapping: false, disabled: false },
     { overlapping: true, disabled: false },
