@@ -18,6 +18,9 @@ const (
 	CodegenLiteralProfile         = "codegen-integer-literals"
 	CodegenReceiverProfile        = "codegen-global-receiver"
 	CodecPackage                  = "pkg/lux/codec"
+	RPCPackage                    = "pkg/lux/rpc"
+	RPCOwnedRequestProfile        = "rpc-owned-request"
+	RPCOwnedRequestBenchmark      = "BenchmarkLRPCOwnedRequest"
 	CodecReaderBenchmark          = "BenchmarkElementPayload"
 	APIPackage                    = "pkg/lux/api"
 	LuviaPackage                  = "pkg/lux/luvia"
@@ -38,6 +41,9 @@ const (
 
 	LuviaResolvedFieldsProfile   = "luvia-resolved-fields"
 	LuviaResolvedFieldsBenchmark = "BenchmarkValidateResolvedFields"
+
+	LuviaConvenienceKeysProfile   = "luvia-convenience-keys"
+	LuviaConvenienceKeysBenchmark = "BenchmarkConvenienceKeyParentValidation"
 )
 
 var apiIdentityRoots = []string{
@@ -62,6 +68,10 @@ func ProfileForBenchmark(pkg, name string) string {
 		if root == CodecReaderBenchmark {
 			return CodecReaderProfile
 		}
+	case RPCPackage:
+		if root == RPCOwnedRequestBenchmark {
+			return RPCOwnedRequestProfile
+		}
 	case APIPackage:
 		if root == APILocalRouteExportBenchmark {
 			return APILocalRouteExportProfile
@@ -80,6 +90,8 @@ func ProfileForBenchmark(pkg, name string) string {
 			return LuviaMergeDestinationProfile
 		case LuviaResolvedFieldsBenchmark:
 			return LuviaResolvedFieldsProfile
+		case LuviaConvenienceKeysBenchmark:
+			return LuviaConvenienceKeysProfile
 		}
 		if slices.Contains(luviaIsolatedRoots, root) {
 			return LuviaPrimaryTraceProfile
@@ -109,6 +121,8 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 		return []IsolationSpec{{LuxShortPathProfile, "^" + LuxStrictFilterBenchmark + "$|^" + LuxDecimalAlignmentBenchmark + "$"}}
 	case CodecPackage:
 		return []IsolationSpec{{CodecReaderProfile, "."}}
+	case RPCPackage:
+		return []IsolationSpec{{RPCOwnedRequestProfile, "^" + RPCOwnedRequestBenchmark + "$"}}
 	case APIPackage:
 		return []IsolationSpec{
 			{APINonIdentityProfile, "."},
@@ -121,6 +135,7 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{LuviaGatewayIdentityProfile, "^" + LuviaGatewayIdentityBenchmark + "$"},
 			{LuviaMergeDestinationProfile, "^" + LuviaMergeDestinationBenchmark + "$"},
 			{LuviaResolvedFieldsProfile, "^" + LuviaResolvedFieldsBenchmark + "$"},
+			{LuviaConvenienceKeysProfile, "^" + LuviaConvenienceKeysBenchmark + "$"},
 		}
 	case CodegenPackage:
 		return []IsolationSpec{

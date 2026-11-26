@@ -161,6 +161,19 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 		}
 	case benchlayout.LuviaResolvedFieldsProfile:
 		return verifyResolvedFieldsInventory(isolated)
+	case benchlayout.RPCOwnedRequestProfile:
+		const root = benchlayout.RPCOwnedRequestBenchmark
+		leaves := benchmarkCaseProduct([]string{"0", "128", "4096", "65536"}, []string{"before", "owned"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("RPC owned-request profile requires the eight verified benchmark leaves")
+		}
+	case benchlayout.LuviaConvenienceKeysProfile:
+		const root = benchlayout.LuviaConvenienceKeysBenchmark
+		leaves := benchmarkCaseProduct([]string{"row-small", "row-wide", "column-small", "column-batch", "column-many"},
+			[]string{"keyLast=false/before", "keyLast=false/current", "keyLast=true/before", "keyLast=true/current"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("Luvia convenience keys profile requires the twenty verified benchmark leaves")
+		}
 	}
 	return nil
 }
