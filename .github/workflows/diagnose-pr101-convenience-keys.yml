@@ -10,7 +10,13 @@ permissions:
 
 jobs:
   native:
+    name: native allocation ${{ matrix.allocation }}
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        allocation: [1, 2, 3, 4]
     timeout-minutes: 25
     env:
       LC_ALL: C
@@ -21,11 +27,14 @@ jobs:
       - name: Require the original hosted CPU
         env:
           RUNNER_KIND: ${{ runner.environment }}
+          ALLOCATION: ${{ matrix.allocation }}
         run: |
           set -euo pipefail
           evidence=.tmp/pr101-convenience-keys-evidence
           mkdir -p "$evidence"
           lscpu > "$evidence/lscpu.txt"
+          printf 'allocation=%s\nimage=%s\nimage_version=%s\n' \
+            "$ALLOCATION" "${ImageOS:-unknown}" "${ImageVersion:-unknown}" > "$evidence/allocation.txt"
           cpu=$(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/lscpu.txt")
           printf 'actual=%s\nexpected=INTEL(R) XEON(R) PLATINUM 8573C\n' "$cpu" | tee "$evidence/routing.txt"
           [[ "$RUNNER_KIND" == github-hosted && "$(uname -sm)" == 'Linux x86_64' ]]
@@ -59,7 +68,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: pr101-convenience-keys-${{ github.run_id }}-${{ github.run_attempt }}
+          name: pr101-convenience-keys-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.allocation }}
           path: .tmp/pr101-convenience-keys-evidence/
           if-no-files-found: error
           retention-days: 14
