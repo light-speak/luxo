@@ -1,0 +1,112 @@
+name: Qualify PR 81 error decoding on its original processors
+
+on:
+  push:
+    branches: [diagnostics/pr81-error-validation]
+    paths:
+      - .github/workflows/diagnose-pr81-error-validation.yml
+      - scripts/diagnose-pr81-error-validation/**
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  native:
+    if: github.repository == 'light-speak/luxo'
+    name: native error decoding slot ${{ matrix.slot }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        slot: [1, 2, 3, 4]
+    steps:
+      - name: Select an original native processor
+        id: route
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/pr81-error-validation"
+          mkdir -p "$evidence"
+          lscpu > "$evidence/lscpu.txt"
+          actual=$(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/lscpu.txt" | sed 's/[[:space:]]*$//')
+          os_arch=$(uname -sm)
+          printf 'processor=%s\nplatform=%s\nrunner=%s\nworkflow_sha=%s\n' \
+            "$actual" "$os_arch" "$RUNNER_KIND" "$GITHUB_SHA" > "$evidence/routing.txt"
+          lane=unmatched
+          if [[ "$RUNNER_KIND" == github-hosted && "$os_arch" == 'Linux x86_64' ]]; then
+            case "$actual" in
+              'Intel(R) Xeon(R) 6975P-C') lane=6975 ;;
+              'AMD EPYC 7763 64-Core Processor') lane=7763 ;;
+            esac
+          fi
+          printf 'lane=%s\n' "$lane" >> "$evidence/routing.txt"
+          if [[ "$lane" == unmatched ]]; then exit 3; fi
+          printf 'lane=%s\n' "$lane" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          sparse-checkout: |
+            /.github/workflows/diagnose-pr81-error-validation.yml
+            /scripts/diagnose-pr81-error-validation/
+          sparse-checkout-cone-mode: false
+      - name: Verify exact diagnostic checkout
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          read -r head parent extra <<< "$(git rev-list --parents -n 1 HEAD)"
+          test "$head" = "$GITHUB_SHA"
+          test "$parent" = 5c0d1f82643e224477c601ec236fb4b09c0b8ddf
+          test -z "$extra"
+          test "$(git diff --no-renames --name-only "$parent" HEAD)" = "$(printf '%s\n' \
+            .github/workflows/diagnose-pr81-error-validation.yml \
+            scripts/diagnose-pr81-error-validation/product.patch.b64 \
+            scripts/diagnose-pr81-error-validation/run.sh \
+            scripts/diagnose-pr81-error-validation/verify.py)"
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Sample the exact three source trees
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNNER_KIND: ${{ runner.environment }}
+          LANE: ${{ steps.route.outputs.lane }}
+          GOAMD64: v1
+          CGO_ENABLED: '1'
+          GOTOOLCHAIN: local
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          driver=scripts/diagnose-pr81-error-validation
+          evidence="$RUNNER_TEMP/pr81-error-validation"
+          mkdir -p "$GITHUB_WORKSPACE/.tmp"
+          inputs=$(mktemp -d "$GITHUB_WORKSPACE/.tmp/pr81-error-input.XXXXXXXX")
+          trap 'rm -rf -- "$inputs"' EXIT
+          prefix="repos/$GITHUB_REPOSITORY/actions"
+          gh api "$prefix/runs/45785939660/attempts/1" --jq '{id,run_attempt,event,head_sha}' > "$inputs/run.json"
+          python3 -B "$driver/verify.py" artifacts "$LANE" > "$inputs/artifacts.tsv"
+          while IFS=$'\t' read -r key id digest; do
+            gh api "$prefix/artifacts/$id" > "$inputs/$key.json"
+            jq -e --arg digest "sha256:$digest" '.digest == $digest and (.expired | not)' "$inputs/$key.json" > /dev/null
+            gh api "$prefix/artifacts/$id/zip" > "$inputs/$key.zip"
+          done < "$inputs/artifacts.tsv"
+          unset GH_TOKEN
+          git fetch --no-tags --depth=1 origin \
+            0a6b143ad667c84f0e517b9ef0a9e9d5bd6ec367 \
+            1f5ce302d3bcf1af0b21e55cb3070c424e96cbc4 \
+            cbf4cfb383d944ceb38f700e19cf79c4c54d3c58
+          bash "$driver/run.sh" "$LANE" "$PWD" "$inputs" "$evidence"
+      - name: Preserve routing and measurements
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr81-error-validation-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slot }}
+          path: ${{ runner.temp }}/pr81-error-validation/
+          if-no-files-found: error
+          retention-days: 14
