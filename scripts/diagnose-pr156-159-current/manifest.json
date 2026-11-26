@@ -1,37 +1,75 @@
 {
-  "baseline": "aeba06f3edb5a5111c1d69472f0e7e96dee11b17",
-  "baselineTree": "0a67c45c848fd88e4ccbf2db85f580605ac2f401",
+  "baseline": "43dd9d4e5eb8fb59573fd3bdfd7de7b5b6814879",
+  "baselineTree": "a6e89a783c0f8202b1233078c1c3fbc204aba1f5",
   "oldBaseline": "59a4167f129f0bff0e8425125fa02eae87fd347b",
-  "awaitHead": "0f3e233220962fbdc96a6ecc4f55750074f03861",
-  "awaitTree": "5d9fa584a66f7b5a4f284a1aaf7e19a1f550b520",
-  "awaitProjection": "b7071c32b722321b7475d07428217b52dab1e2af",
   "sealedHead": "8c1b0fc2a868cd8f7e176865982df311340dce61",
   "sealedTree": "63dd6d47bcf97d8246fab77a3b845105e2bd6dae",
-  "sealedProjection": "188c211f9ccc6fab520bb56a24c8061236930c17",
-  "compileProfileSHA256": "2def07c8d8706eaa0de3bb81da4635c4b4264ad67fc98e2fcdf40a06a63d9e18",
+  "sealedProjection": "11016dfea033908369598f73ca3ef47933e3805a",
+  "compileProfileSHA256": "66f667fe32c2e5cb6d4379d7efb160494d221d5fe0e39ca2a39ebcbc70f3a857",
   "originalArtifacts": {
-    "await-7763": [45862942193, "02", 15140548521, "e5ff2b58fad22e60c7494965edacaf6b07ccbf21c300a4b0f247ebde46fb1b75"],
-    "sealed-9v74": [45872054757, "02", 15143663716, "840e0d332c75d7800c31c6d9dacefed37ed479f6a09340be54c968932917fe0c"],
-    "sealed-7763-range-and-event": [45872054757, "05", 15145740745, "595eea17c6cfebe15fdaacbb44c80e539ffd340eef31e84bf978c08940123fb0"],
-    "sealed-7763-find": [45872054757, "08", 15144894472, "e277b0a1e961ac1d28bf2a8da541eb74eae416318f31bf751781810160bd2790"]
+    "sealed-7763-range-and-event": [
+      45872054757,
+      "05",
+      15145740745,
+      "595eea17c6cfebe15fdaacbb44c80e539ffd340eef31e84bf978c08940123fb0"
+    ],
+    "sealed-7763-find": [
+      45872054757,
+      "08",
+      15144894472,
+      "e277b0a1e961ac1d28bf2a8da541eb74eae416318f31bf751781810160bd2790"
+    ]
   },
   "routes": {
     "7763": {
       "model": "AMD EPYC 7763 64-Core Processor",
-      "await": [
-        ["pkg/codegen", "BenchmarkRelationLoaderGeneration/1/metadata-2"],
-        ["pkg/semantic", "BenchmarkCollectEventEmits/direct_1/recursive=true-2"],
-        ["pkg/semantic", "BenchmarkCollectEventEmits/direct_128/recursive=true-2"]
-      ],
       "sealed": [
-        ["pkg/codegen", "BenchmarkFindRead-2"],
-        ["pkg/codegen", "BenchmarkNumericRangeValidation/none-2"],
-        ["pkg/semantic", "BenchmarkEventSnapshotContract/nested_types_0-2"]
+        [
+          "pkg/codegen",
+          "BenchmarkFindRead-2"
+        ],
+        [
+          "pkg/codegen",
+          "BenchmarkNumericRangeValidation/none-2"
+        ],
+        [
+          "pkg/semantic",
+          "BenchmarkEventSnapshotContract/nested_types_0-2"
+        ]
       ]
+    }
+  },
+  "projectorSHA256": "1d435c5b4f23a83756e9807327610e85ed14b7712222a8f07679c48b3580ef2d",
+  "nativeStockArtifact": [
+    45889948793,
+    "slot-1",
+    "061ee74c282c2fcc3cfb1afc98c0a54da576d47944e6fad5c186065fe80a3646"
+  ],
+  "expectedProjections": {
+    "EventSnapshotContract": {
+      "Family": "EventSnapshotContract",
+      "Projected": {
+        "event_contract_test.go": "07f8dad5b54ebc212c0afcd207a96aca629cc4d6c9ca7093739f37b227fe6dda"
+      },
+      "Removed": 47
     },
-    "9v74": {
-      "model": "AMD EPYC 9V74 80-Core Processor",
-      "sealed": [["pkg/codegen", "BenchmarkRelationLoaderGeneration/1/metadata-2"]]
+    "FindRead": {
+      "Family": "FindRead",
+      "Projected": {
+        "codegen_bench_test.go": "e78e8f6209b54ea83f55f336b46451625877d09e3017c0467caf25c852461a73",
+        "compile_test.go": "02e35cb4368719d35429571cac6b44526e22927db2b6bf0b7d7c98fe4d34f2b6",
+        "handler_test.go": "070a9601e730dd89d2cc70fa0fd9f44ff2475a76d374451d4b6244a89ad9bee7"
+      },
+      "Removed": 204
+    },
+    "NumericRangeValidation": {
+      "Family": "NumericRangeValidation",
+      "Projected": {
+        "compile_auth_test.go": "7e79498429abd0a3d8d364e1e783bc5af00a7781f6b67c7d457e2c4e69761a84",
+        "numeric_literal_bench_test.go": "7e978e414df41e93ff919b0396f81cdbd83ff3adaa4623881b40aff156762129",
+        "numeric_range_bench_test.go": "e9c98c6cbdda0c1470ee30911b8825c935de96058689a30dfbdfe7350ac168ed"
+      },
+      "Removed": 204
     }
   }
 }

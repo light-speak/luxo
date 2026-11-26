@@ -1,4 +1,4 @@
-name: Recheck current await and sealed compiler performance on original EPYC CPUs
+name: Recheck sealed compiler performance on EPYC 7763
 
 on:
   push:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 4
+          fetch-depth: 5
           persist-credentials: false
 
       - id: route
@@ -28,16 +28,8 @@ jobs:
       - if: steps.route.outputs.cpu != ''
         uses: actions/checkout@v7
         with:
-          ref: aeba06f3edb5a5111c1d69472f0e7e96dee11b17
+          ref: 43dd9d4e5eb8fb59573fd3bdfd7de7b5b6814879
           path: .tmp/current-a
-          persist-credentials: false
-
-      - if: steps.route.outputs.cpu == '7763'
-        uses: actions/checkout@v7
-        with:
-          ref: 0f3e233220962fbdc96a6ecc4f55750074f03861
-          fetch-depth: 3
-          path: .tmp/await-old
           persist-credentials: false
 
       - if: steps.route.outputs.cpu != ''
@@ -74,7 +66,7 @@ jobs:
           sparse-checkout: scripts/diagnose-pr156-159-current
           persist-credentials: false
 
-      - name: Require both original CPU routes and successful stock gates
+      - name: Verify the original CPU and both strict gate receipts
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

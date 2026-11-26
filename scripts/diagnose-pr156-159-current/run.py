@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the signed compiler leaves on their original EPYC models."""
+"""Compare stock and independently isolated sealed compiler workloads on EPYC 7763."""
 
 from collections import Counter
 from hashlib import sha256
@@ -17,23 +17,14 @@ INPUT = Path(__file__).resolve().parent
 ROOT = INPUT.parents[1]
 OUT = ROOT / '.tmp/pr156-159-current'
 CONFIG = json.loads((INPUT / 'manifest.json').read_text())
-PARENT = '3dc591f2bd0192f4613a641d18a41c8a1058916f'
+PARENT = '835419cbea94c32d22cc269c2c64e7de5fe99763'
 ROLE_PAIRS = ('AA', 'HH', 'AH')
 PROBE_ROWS = re.compile(r'^Benchmark\S+-2\s+1\s+\S+\s+ns/op\s+\S+\s+B/op\s+\S+\s+allocs/op$', re.M)
 HOT = {
-    'pkg/codegen': 'BenchmarkRelationLoaderGeneration|collectDataLoaderInputs|analyzeRelations|'
-                   'BenchmarkFindRead|compileCall|BenchmarkNumericRangeValidation|generateNumericValidation',
-    'pkg/semantic': 'BenchmarkCollectEventEmits|collectReachableEmits|'
-                    'BenchmarkEventSnapshotContract|validateEventSnapshots',
+    'pkg/codegen': 'BenchmarkFindRead|compileCall|BenchmarkNumericRangeValidation|generateNumericValidation',
+    'pkg/semantic': 'BenchmarkEventSnapshotContract|validateEventSnapshots',
 }
 FAMILIES = {
-    'BenchmarkRelationLoaderGeneration': [
-        f'BenchmarkRelationLoaderGeneration/{n}/{kind}-2' for n in (1,128) for kind in ('metadata','source')
-    ],
-    'BenchmarkCollectEventEmits': [
-        f'BenchmarkCollectEventEmits/direct_{n}/recursive={recursive}-2'
-        for n in (0,1,128) for recursive in ('true','false')
-    ],
     'BenchmarkNumericRangeValidation': [
         f'BenchmarkNumericRangeValidation/{name}-2' for name in ('none','positive','signed_int','signed_float')
     ],
@@ -42,7 +33,7 @@ FAMILIES = {
     ],
     'BenchmarkFindRead': ['BenchmarkFindRead-2'],
 }
-PROJECT = ROOT / 'scripts/diagnose-relation-loader/project.go'
+PROJECT = INPUT / 'project.go'
 
 
 def require(ok, detail):
@@ -96,12 +87,12 @@ def verify_run(route):
     require(git(ROOT, 'rev-parse', 'HEAD').decode().strip() == os.environ['GITHUB_SHA'], 'wrong workflow SHA')
     require(git(ROOT, 'show', '-s', '--format=%P', 'HEAD').decode().strip() == PARENT, 'wrong stage parent')
     require(git(ROOT, 'diff', '--name-status', PARENT, 'HEAD').decode().splitlines() == [
-        'A\t.github/workflows/diagnose-pr156-159-current.yml',
-        'A\tscripts/diagnose-pr156-159-current/manifest.json',
-        'A\tscripts/diagnose-pr156-159-current/run.py',
+        'M\t.github/workflows/diagnose-pr156-159-current.yml',
+        'M\tscripts/diagnose-pr156-159-current/manifest.json',
+        'A\tscripts/diagnose-pr156-159-current/project.go',
+        'M\tscripts/diagnose-pr156-159-current/run.py',
     ], 'unexpected diagnostic paths')
-    require(digest(PROJECT) == 'be83904923c90961a15ac69e374702a47a9347ace53fc88cd31a5f1b7312649f',
-            'existing tested projector changed')
+    require(digest(PROJECT) == CONFIG['projectorSHA256'], 'the locally verified projector changed')
     fields = 'GOVERSION GOHOSTOS GOHOSTARCH GOOS GOARCH GOAMD64 CGO_ENABLED GOFLAGS GOTOOLCHAIN'.split()
     go_env = call('go', 'env', *fields).decode().splitlines()
     require(go_env == ['go1.27.1', 'linux', 'amd64', 'linux', 'amd64', 'v1', '1', '', 'local'],
@@ -168,6 +159,16 @@ def plan(tools, directory, cases):
     return expected, batches
 
 
+def independent_batches(tools, directory, cases):
+    batches = []
+    for package, name in cases:
+        family = name.split('/')[0].removeprefix('Benchmark').removesuffix('-2')
+        _, rows = plan(tools, directory/family, [(package, name)])
+        require(len(rows) == 1 and rows[0][0] == package, 'projection selector package differs')
+        batches.append((package, family, rows[0][2]))
+    return batches
+
+
 def check_inventory(data, expected):
     text = data.decode()
     all_rows = [line for line in text.splitlines() if line.startswith('Benchmark')]
@@ -202,25 +203,33 @@ def compile_bins(tools, scope, roots, batches, cases, work, projected):
         binaries = work/(scope.parent.name+'-'+scope.name+'-'+role)
         binaries.mkdir()
         for pkg,profile,_ in batches:
-            family = pkg.rsplit('/',1)[-1]
+            family = profile if projected else pkg.rsplit('/',1)[-1]
             destination = scope/(role+'-'+family)
             destination.mkdir()
-            output = binaries/(pkg.replace('/','-')+'.test')
+            suffix = '-' + family if projected else ''
+            output = binaries/(pkg.replace('/','-')+suffix+'.test')
             if projected:
                 overlay = binaries/(family+'-overlay')
-                (destination/'projection.json').write_bytes(call(tools/'project',source,overlay,family))
+                projection = call(tools/'project',source,overlay,family)
+                require(json.loads(projection) == CONFIG['expectedProjections'][family],
+                        f'{role} {family} projection differs from the verified 1x fixture')
+                (destination/'projection.json').write_bytes(projection)
                 call('go','test','-trimpath','-c','-overlay='+str(overlay/'overlay.json'),'./'+pkg,'-o',output,cwd=source,
                      env=dict(os.environ,GOWORK=str(source/'go.work')))
+                require(call(output, '-test.list=.*', cwd=source/pkg).decode().splitlines() == ['Benchmark'+family],
+                        'the projected binary registered an unrelated benchmark or test')
             else:
                 command = 'compile-performance-baseline' if role == 'A' else 'compile-performance'
                 call(tools/'benchrun',command,source,binaries,pkg,profile)
             elf(output,destination,pkg,work)
-            family_roots = sorted({name.split('/')[0].removesuffix('-2') for package,name in cases if package==pkg})
+            family_roots = ['Benchmark'+family] if projected else sorted({
+                name.split('/')[0].removesuffix('-2') for package,name in cases if package==pkg
+            })
             for root in family_roots:
                 data = sample(output,source,pkg,'^'+root+'$','1x')
                 check_inventory(data,FAMILIES[root])
                 (destination/(root+'.raw')).write_bytes(data)
-            built[role,pkg] = output
+            built[role,pkg,profile] = output
     return built
 
 
@@ -228,18 +237,18 @@ def schedule(batches):
     for block, pair, arms in product((1,2),range(1,11),ROLE_PAIRS):
         indexes = (0,1) if (block+pair)%2==0 else (1,0)
         for side in indexes:
-            for package, _, selector in batches:
-                yield block,pair,arms,('left','right')[side],arms[side],package,selector
+            for package, profile, selector in batches:
+                yield block,pair,arms,('left','right')[side],arms[side],package,profile,selector
 
 
 def measure(scope, roots, bins, batches):
     process = 0
     with (scope/'order.tsv').open('x') as order:
-        for block,pair,arms,side,role,pkg,selector in schedule(batches):
+        for block,pair,arms,side,role,pkg,profile,selector in schedule(batches):
             process += 1
-            order.write(f'{process}\t{block}\t{pair}\t{arms}\t{side}\t{role}\t{pkg}\n')
+            order.write(f'{process}\t{block}\t{pair}\t{arms}\t{side}\t{role}\t{pkg}\t{profile}\n')
             with (scope/f'{arms}-{block}.{side}.raw').open('ab') as stream:
-                stream.write(sample(bins[role,pkg],roots[role],pkg,selector,'200ms'))
+                stream.write(sample(bins[role,pkg,profile],roots[role],pkg,selector,'200ms'))
     require(process==120*len(batches),'wrong number of timed processes')
     return process
 
@@ -273,6 +282,8 @@ def enforce(tools, scope, stem, options, *csv):
 
 def work_pair(tools, folder, anchor, tested, cases, work, projected=False):
     expected, batches = plan(tools,folder,cases)
+    if projected:
+        batches = independent_batches(tools,folder,cases)
     roots = {'A':anchor,'H':tested}
     bins = compile_bins(tools,folder,roots,batches,cases,work,projected)
     n = measure(folder,roots,bins,batches)
@@ -295,21 +306,17 @@ def main(route):
         os.environ.update(TMPDIR=str(work/'temp'),GOTMPDIR=str(work/'temp'))
         tools = build_tools(anchor,work)
         call('sh',anchor/'scripts/setup-modules.sh',anchor,cwd=anchor)
-        for role, cases in CONFIG['routes'][route].items():
-            if role == 'model':
-                continue
-            old = ROOT/'.tmp/await-old' if role=='await' else ROOT
-            tested = materialize(work,anchor,old,role)
-            call('sh',anchor/'scripts/setup-modules.sh',tested,cwd=anchor)
-            require((anchor/'go.work').read_bytes()==(tested/'go.work').read_bytes(),'workspace inputs differ')
-            target = OUT/role
-            target.mkdir()
-            stock = work_pair(tools,target/'stock',anchor,tested,cases,work)
-            results[role] = {'stock':stock}
-            controls = {name:code for name,code in stock['gates'].items() if name!='AH'}
-            # Only the two existing AST projections have a qualified diagnostic fixture.
-            if stock['gates']['AH'] and not any(controls.values()) and (role=='await' or route=='9v74'):
-                results[role]['projected'] = work_pair(tools,target/'projected',anchor,tested,cases,work,True)
+        cases = CONFIG['routes'][route]['sealed']
+        tested = materialize(work,anchor,ROOT,'sealed')
+        call('sh',anchor/'scripts/setup-modules.sh',tested,cwd=anchor)
+        require((anchor/'go.work').read_bytes()==(tested/'go.work').read_bytes(),'workspace inputs differ')
+        target = OUT/'sealed'
+        target.mkdir()
+        stock = work_pair(tools,target/'stock',anchor,tested,cases,work)
+        controls = {name:code for name,code in stock['gates'].items() if name!='AH'}
+        results['sealed'] = {'stock':stock}
+        if not any(controls.values()):
+            results['sealed']['projected'] = work_pair(tools,target/'projected',anchor,tested,cases,work,True)
     dump(OUT/'status.json',{'matched':True,'route':route,'comparisons':results})
     # Stock failures remain visible even when the projected experiment is green.
     return int(any(code for row in results.values() for mode in row.values() for code in mode['gates'].values()))
@@ -328,18 +335,18 @@ def summarize(directory):
         route = status['route']
         binding = json.loads((path.parent/'route.json').read_text())
         require(route_for(binding['cpu'])==route, 'receipt came from an unexpected CPU')
-        roles = {'await','sealed'} if route=='7763' else {'sealed'}
-        require(set(status['comparisons'])==roles, 'incomplete CPU receipt')
+        require(set(status['comparisons'])=={'sealed'}, 'incomplete CPU receipt')
         seen.add(route)
         for role, modes in status['comparisons'].items():
-            stock = modes['stock']
-            require(stock['timedProcesses']==(240 if route=='7763' else 120)
-                    and len(stock['gates'])==9 and 'AH' in stock['gates'], 'incomplete stock results')
+            require(set(modes)=={'stock','projected'}, 'incomplete stock/projected comparison')
             for mode, tested in modes.items():
+                require(tested['timedProcesses']==(240 if mode=='stock' else 360)
+                        and len(tested['gates'])==9 and 'AH' in tested['gates'],
+                        f'incomplete {mode} results')
                 if any(tested['gates'].values()):
                     failures.append((route,role,mode))
     print(json.dumps({'measuredRoutes':sorted(seen),'failedComparisons':failures},sort_keys=True))
-    require(seen==set(CONFIG['routes']), 'no valid evidence for one or both original CPUs')
+    require(seen==set(CONFIG['routes']), 'no valid evidence on the original EPYC 7763')
     require(not failures, 'a matched runner reported a real gate failure')
 
 
