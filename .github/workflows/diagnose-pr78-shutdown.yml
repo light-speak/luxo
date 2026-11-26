@@ -1,0 +1,74 @@
+name: Diagnose PR 78 shutdown and linked benchmark timing
+
+on:
+  push:
+    branches:
+      - diagnostics/pr78-shutdown-7763
+      - diagnostics/pr78-shutdown-9v45
+      - diagnostics/pr78-shutdown-6975
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify original processor model
+        id: cpu
+        shell: bash
+        run: |
+          set -euo pipefail
+          lane="${GITHUB_REF_NAME#diagnostics/pr78-shutdown-}"
+          expected=$(python3 scripts/diagnose-pr78-shutdown/verify.py model "$lane")
+          actual=$(LC_ALL=C lscpu | awk -F: '$1 == "Model name" {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2}')
+          matched=false
+          if [[ "$(uname -sm)" == 'Linux x86_64' && "$actual" == "$expected" ]]; then matched=true; fi
+          mkdir -p ".tmp/pr78-shutdown-evidence-$lane"
+          printf 'lane=%s\nactual=%s\nexpected=%s\nmatch=%s\n' "$lane" "$actual" "$expected" "$matched" |
+            tee ".tmp/pr78-shutdown-evidence-$lane/routing.txt"
+          printf 'lane=%s\nmatch=%s\n' "$lane" "$matched" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v7
+        if: steps.cpu.outputs.match == 'true'
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Replay pinned product and compare strictly
+        if: steps.cpu.outputs.match == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          H2_LANE: ${{ steps.cpu.outputs.lane }}
+        run: |
+          set -euo pipefail
+          inputs=$(mktemp -d "$GITHUB_WORKSPACE/.tmp/pr78-shutdown-input.XXXXXXXX")
+          trap 'rm -rf -- "$inputs"' EXIT
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/45227864247" --jq '
+            {id,event,run_attempt,head_sha,
+             pull_requests:[.pull_requests[]|{number,head:.head.sha,base:.base.sha}]}
+          ' > "$inputs/run.json"
+          python3 scripts/diagnose-pr78-shutdown/verify.py artifacts "$H2_LANE" > "$inputs/refs.tsv"
+          while IFS=$'\t' read -r shard artifact digest; do
+            resource="repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact"
+            gh api "$resource" > "$inputs/$shard.json"
+            jq -e --arg sha "sha256:$digest" '.digest == $sha and (.expired | not)' "$inputs/$shard.json" > /dev/null
+            gh api "$resource/zip" > "$inputs/$shard.zip"
+          done < "$inputs/refs.tsv"
+          bash scripts/diagnose-pr78-shutdown/run.sh "$H2_LANE" "$inputs"
+      - name: Preserve evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: pr78-shutdown-${{ steps.cpu.outputs.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr78-shutdown-evidence-${{ steps.cpu.outputs.lane }}/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Report an unmatched runner
+        if: ${{ always() && steps.cpu.outputs.match == 'false' }}
+        run: exit 3

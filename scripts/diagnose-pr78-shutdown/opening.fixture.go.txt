@@ -1,0 +1,54 @@
+package h2transport
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"testing"
+	"time"
+)
+
+func BenchmarkShutdownOneOpeningConnection(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		b.StopTimer()
+		benchmarkShutdownOpeningConnection(b)
+		b.StartTimer()
+	}
+}
+
+func benchmarkShutdownOpeningConnection(b *testing.B) {
+	b.Helper()
+	server, err := NewServer(http.NotFoundHandler())
+	if err != nil {
+		b.Fatal(err)
+	}
+	accepted, peer := net.Pipe()
+	defer peer.Close()
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(b.Context(), 3*time.Second)
+	defer cancel()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		_ = server.ServeConn(ctx, accepted)
+	}()
+	if err := peer.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		b.Fatal(err)
+	}
+	// The opening read proves that ServeConn has registered the connection.
+	if _, err := peer.Write([]byte("P")); err != nil {
+		b.Fatal(err)
+	}
+	b.StartTimer()
+	shutdownErr := server.Shutdown(ctx)
+	b.StopTimer()
+	if shutdownErr != nil {
+		b.Fatal(shutdownErr)
+	}
+	select {
+	case <-served:
+	case <-ctx.Done():
+		b.Fatal("opening connection did not retire")
+	}
+}
