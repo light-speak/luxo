@@ -1,0 +1,90 @@
+name: Replay PR 84 binary parameter lookup on the original CPU
+
+on:
+  push:
+    branches: [diagnostics/pr84-binary-lookup-6975]
+    paths:
+      - '.github/workflows/diagnose-pr84-binary-lookup.yml'
+      - 'scripts/diagnose-pr84-binary-lookup.sh'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  replay:
+    if: github.repository == 'light-speak/luxo'
+    name: API binary lookup replay (${{ matrix.slot }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        slot: [1, 2]
+    steps:
+      - name: Require the original Intel 6975P-C
+        id: route
+        shell: bash
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          expected='Intel(R) Xeon(R) 6975P-C'
+          actual=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | sed 's/[[:space:]]*$//')
+          match=false
+          if [[ "$RUNNER_KIND" == github-hosted && "$(uname -sm)" == 'Linux x86_64' && "$actual" == "$expected" ]]; then
+            match=true
+          fi
+          mkdir -p .tmp/pr84-binary-lookup-evidence
+          printf 'workflow=%s\nshard=06\nexpected=%s\nactual=%s\nmatch=%s\n' \
+            "$GITHUB_SHA" "$expected" "$actual" "$match" > .tmp/pr84-binary-lookup-evidence/runner-route.txt
+          printf 'match=%s\n' "$match" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          ref: ${{ github.sha }}
+          path: .tmp/pr84-control
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          ref: f83f9c78f9ee03a5d73b7d0a41bae5280a250bfd
+          path: .tmp/pr84-base
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          ref: c7dc905ecbd2b6ed9e307f4b5b52426fe65e1bee
+          path: .tmp/pr84-head
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Verify original evidence and replay the BinaryParamLookup inventory
+        if: steps.route.outputs.match == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .tmp/pr84-control/scripts/diagnose-pr84-binary-lookup.sh
+
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: pr84-binary-lookup-${{ matrix.slot }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr84-binary-lookup-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Report wrong processor without sampling
+        if: ${{ always() && steps.route.outputs.match == 'false' }}
+        run: exit 3
