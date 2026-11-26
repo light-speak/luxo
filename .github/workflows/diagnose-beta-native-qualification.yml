@@ -1,0 +1,140 @@
+name: Qualify beta changes on matching native processors
+
+on:
+  push:
+    branches: [diagnostics/beta-native-qualification]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  native:
+    name: native allocation ${{ matrix.allocation }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        allocation: [1, 2, 3, 4]
+    env:
+      LC_ALL: C
+      GOTOOLCHAIN: local
+      CGO_ENABLED: '1'
+      GOAMD64: v1
+    steps:
+      - name: Select an exact native qualification
+        id: route
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+          ALLOCATION: ${{ matrix.allocation }}
+        run: |
+          set -euo pipefail
+          route="$RUNNER_TEMP/beta-native-qualification"
+          mkdir -p "$route"
+          lscpu > "$route/lscpu.txt"
+          actual=$(sed -n 's/^Model name:[[:space:]]*//p' "$route/lscpu.txt")
+          printf 'allocation=%s\nimage=%s\nimage_version=%s\nactual=%s\n' \
+            "$ALLOCATION" "${ImageOS:-unknown}" "${ImageVersion:-unknown}" "$actual" > "$route/routing.txt"
+          [[ "$RUNNER_KIND" == github-hosted && "$(uname -sm)" == 'Linux x86_64' ]]
+          case "${actual^^}" in
+            'INTEL(R) XEON(R) PLATINUM 8573C')
+              scope=pr101
+              lane=8573c
+              ref=74745bf22d0053e15adf209474b37624975795c4
+              depth=1
+              mkdir -p "$RUNNER_TEMP/pr101-convenience-keys-evidence"
+              ;;
+            'AMD EPYC 7763 64-CORE PROCESSOR'|'AMD EPYC 9V45 96-CORE PROCESSOR')
+              scope=pr78
+              case "$actual" in
+                'AMD EPYC 7763 64-Core Processor') lane=7763 ;;
+                'AMD EPYC 9V45 96-Core Processor') lane=9v45 ;;
+                *) exit 3 ;;
+              esac
+              ref=78f15da278fd12bc4db460c47f0a9a444f8c900a
+              depth=0
+              ;;
+            *) exit 3 ;;
+          esac
+          printf 'scope=%s\nlane=%s\nref=%s\nfetch_depth=%s\n' "$scope" "$lane" "$ref" "$depth" |
+            tee -a "$route/routing.txt" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.route.outputs.ref }}
+          fetch-depth: ${{ steps.route.outputs.fetch_depth }}
+          persist-credentials: false
+      - name: Prepare the pinned sampler
+        env:
+          PINNED_REF: ${{ steps.route.outputs.ref }}
+          NATIVE_SCOPE: ${{ steps.route.outputs.scope }}
+          H2_LANE: ${{ steps.route.outputs.lane }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PINNED_REF"
+          if [[ "$NATIVE_SCOPE" == pr78 ]]; then
+            expected=$(python3 scripts/diagnose-pr78-shutdown/verify.py model "$H2_LANE")
+            actual=$(sed -n 's/^Model name:[[:space:]]*//p' "$RUNNER_TEMP/beta-native-qualification/lscpu.txt")
+            test "$actual" = "$expected"
+            evidence=".tmp/pr78-shutdown-evidence-$H2_LANE"
+            mkdir -p "$evidence"
+            printf 'lane=%s\nactual=%s\nexpected=%s\nmatch=true\n' "$H2_LANE" "$actual" "$expected" > "$evidence/routing.txt"
+          fi
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Bind exact product and qualification input
+        if: steps.route.outputs.scope == 'pr101'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/pr101-convenience-keys-evidence"
+          git fetch --no-tags --depth=1 origin f9ce659fd7f17bf57cfe0aee7de7ecb8d9b8f2e4 39d329d07d7729b4b4ddb5915e08bf9d5d07ea9d
+          artifact="repos/$GITHUB_REPOSITORY/actions/artifacts/15083004141"
+          gh api "$artifact" > "$evidence/original-metadata.json"
+          jq -e '
+            .id == 15083004141 and .name == "performance-evidence-02-1" and (.expired | not)
+            and .digest == "sha256:5709c8ca778e8661d9331afe083092972eed88162501999488c8a41cfefec94d"
+            and .workflow_run.id == 45745353238
+            and .workflow_run.head_sha == "39d329d07d7729b4b4ddb5915e08bf9d5d07ea9d"
+          ' "$evidence/original-metadata.json"
+          gh api "$artifact/zip" > "$evidence/original.zip"
+      - name: Measure default and test-isolated layouts
+        if: steps.route.outputs.scope == 'pr101'
+        run: bash scripts/diagnose-pr101-convenience-keys.sh "$RUNNER_TEMP/pr101-convenience-keys-evidence" --also-isolate
+      - name: Replay pinned product and compare strictly
+        if: steps.route.outputs.scope == 'pr78'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          H2_LANE: ${{ steps.route.outputs.lane }}
+        run: |
+          set -euo pipefail
+          inputs=$(mktemp -d "$GITHUB_WORKSPACE/.tmp/pr78-shutdown-input.XXXXXXXX")
+          trap 'rm -rf -- "$inputs"' EXIT
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/45227864247" --jq '
+            {id,event,run_attempt,head_sha,
+             pull_requests:[.pull_requests[]|{number,head:.head.sha,base:.base.sha}]}
+          ' > "$inputs/run.json"
+          python3 scripts/diagnose-pr78-shutdown/verify.py artifacts "$H2_LANE" > "$inputs/refs.tsv"
+          while IFS=$'\t' read -r shard artifact digest; do
+            resource="repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact"
+            gh api "$resource" > "$inputs/$shard.json"
+            jq -e --arg sha "sha256:$digest" '.digest == $sha and (.expired | not)' "$inputs/$shard.json" > /dev/null
+            gh api "$resource/zip" > "$inputs/$shard.zip"
+          done < "$inputs/refs.tsv"
+          bash scripts/diagnose-pr78-shutdown/run.sh "$H2_LANE" "$inputs"
+      - name: Preserve routing, samples and linker receipts
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: beta-native-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.allocation }}
+          path: |
+            ${{ runner.temp }}/beta-native-qualification/
+            ${{ runner.temp }}/pr101-convenience-keys-evidence/
+            .tmp/pr78-shutdown-evidence-${{ steps.route.outputs.lane }}/
+          if-no-files-found: error
+          retention-days: 14
