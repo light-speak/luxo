@@ -1,0 +1,61 @@
+name: Recheck #160 stream parameter lookup on EPYC 7763
+
+on:
+  push:
+    branches: [diagnostics/pr160-api-float-7763]
+
+permissions:
+  contents: read
+
+jobs:
+  witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+
+      - id: route
+        name: Require the original EPYC 7763 processor
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/pr160-stream-float
+          cpu=$(awk -F ': *' '/^model name[[:space:]]*:/ {sub(/[[:space:]]+$/, "", $2); print $2; exit}' /proc/cpuinfo)
+          printf '%s\n' "$cpu" > .tmp/pr160-stream-float/cpu.txt
+          if [[ "$cpu" == "AMD EPYC 7763 64-Core Processor" ]]; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+            printf 'matched=false\nbenchmark_processes=0\n' > .tmp/pr160-stream-float/status.txt
+          fi
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: 5017b587f4cf71d30ebba8b542267aed597bb573
+          path: .tmp/base
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - if: steps.route.outputs.matched == 'true'
+        name: Verify exact ELF and replay four original leaves
+        shell: bash
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: bash scripts/diagnose-pr160-stream-float/run.sh
+
+      - if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr160-api-float-7763-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr160-stream-float
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14

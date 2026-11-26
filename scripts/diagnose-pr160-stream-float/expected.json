@@ -1,0 +1,38 @@
+{
+  "Base": [
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkStreamParamsLookupFloat/integer-control-2"
+    },
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkStreamParamsLookupFloat/maximum-2"
+    },
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkStreamParamsLookupFloat/ordinary-2"
+    },
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkStreamParamsLookupFloat/subnormal-2"
+    }
+  ],
+  "Head": [
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkStreamParamsLookupFloat/integer-control-2"
+    },
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkStreamParamsLookupFloat/maximum-2"
+    },
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkStreamParamsLookupFloat/ordinary-2"
+    },
+    {
+      "Package": "pkg/lux/api",
+      "Name": "BenchmarkStreamParamsLookupFloat/subnormal-2"
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+pkg/lux/api	api-non-identity	^BenchmarkStreamParamsLookupFloat$/^integer-control$|^BenchmarkStreamParamsLookupFloat$/^maximum$|^BenchmarkStreamParamsLookupFloat$/^ordinary$|^BenchmarkStreamParamsLookupFloat$/^subnormal$
