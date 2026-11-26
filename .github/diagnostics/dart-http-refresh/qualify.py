@@ -26,14 +26,15 @@ CONTROL_BASE = "77b6cdf20d424213f4c1dc90534f924ac6b176d0"
 PREVIOUS_DIAGNOSTIC = "363248532f038736753f6945d5ad6300faadcfc7"
 OPTIMIZED_DIAGNOSTIC = "b274e92be61e5c0e96ef917fb48bacfff248c5a1"
 ROUTED_DIAGNOSTIC = "8250b2ab76706e28fce4afe4ce23a37638526b9a"
-TREES = {"A": "23cb6e837c454388a1c36c5de4d8e7ab43c15a0e", "B": "82f4b54613e15456f07fd1a1859ebf683be9d326"}
-PACKAGES = {"A": "df0c6caf50a9e5bad4b0ab8c2f7608128e4b6314", "B": "53aafbb72447140780acc846529adfd2aaf79b0e"}
+REENTRANT_DIAGNOSTIC = "247046fc192403f9696883784e1ce57a9852406e"
+TREES = {"A": "23cb6e837c454388a1c36c5de4d8e7ab43c15a0e", "B": "d0fa996e087f8f3a34fb29ba0aa05c626a6e5db0"}
+PACKAGES = {"A": "df0c6caf50a9e5bad4b0ab8c2f7608128e4b6314", "B": "608cc9d6e55b5e61e16060a6c1cf581b746c0ea3"}
 PACKAGE = "packages/dart"
 PATHS = {"lib/src/transport.dart", "test/http_protocol_test.dart"}
-PATCH = "afdcfe28da03b3cee5a70e74690098ff906e272d4a5270da4919ef58579ce426"
+PATCH = "ba907c5d5601c8ea603dda173431eced90dfb98bd797dc5b6ce4c00a1d151d20"
 PUBSPEC = "294368c6b2cc61a62c83880cdca56d1137de356ef9a7682a6396d4fcce9dc5f9"
 LOCK_SHA = "0d107eca2444e58cd48cb37abc48bf7115ed04f5101e6ba753ab13dea7e3f8bc"
-TRANSPORT = "64359a1cf237526b39f5ed59527f73c3e30883607ce85f9234cb7e30cbe15aaf"
+TRANSPORT = "33fe3c62f0e771e52e80b5915f0b85b82ca3433804a13b5ea5110aa671681136"
 PREVIOUS_NORMALIZED_CONFIG = "7024bc299c7dfa13991b87ac0a8247ec428fa91d583cdb0bc6daf99ad3d49120"
 REVISION = "b530c21f7de367b94fb04787bfed9d8e989d75e8"
 BENCHSTAT = "golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70"
@@ -66,7 +67,7 @@ def git(repo, *args, index=None, data=None):
 def verify_checkout(repo):
     head = git(repo, "rev-parse", "HEAD").decode().strip()
     assert head == os.environ["GITHUB_SHA"]
-    chain = (head, ROUTED_DIAGNOSTIC, OPTIMIZED_DIAGNOSTIC, PREVIOUS_DIAGNOSTIC, CONTROL_BASE)
+    chain = (head, REENTRANT_DIAGNOSTIC, ROUTED_DIAGNOSTIC, OPTIMIZED_DIAGNOSTIC, PREVIOUS_DIAGNOSTIC, CONTROL_BASE)
     for child, parent in zip(chain, chain[1:]):
         assert git(repo, "rev-list", "--parents", "-n", "1", child).decode().split() == [child, parent]
     paths = {str(HERE.relative_to(repo) / name) for name in (*FIXTURES, "qualify.py", "product.patch.b64")}
@@ -74,7 +75,7 @@ def verify_checkout(repo):
     paths.add(workflow)
     changes = git(repo, "diff", "--name-status", CONTROL_BASE, "HEAD").decode().splitlines()
     assert set(changes) == {f"A\t{path}" for path in paths}, changes
-    changed = git(repo, "diff", "--name-status", ROUTED_DIAGNOSTIC, "HEAD").decode().splitlines()
+    changed = git(repo, "diff", "--name-status", REENTRANT_DIAGNOSTIC, "HEAD").decode().splitlines()
     expected = {workflow, str(HERE.relative_to(repo) / "qualify.py"),
                 str(HERE.relative_to(repo) / "product.patch.b64")}
     assert set(changed) == {f"M\t{path}" for path in expected}, changed

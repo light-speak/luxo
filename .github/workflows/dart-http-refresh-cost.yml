@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 5
+          fetch-depth: 6
           persist-credentials: false
 
       - name: Require the original AMD processor
