@@ -46,49 +46,106 @@ func TestFrameInputKeepsAdjacentFramesOwned(t *testing.T) {
 }
 
 func TestClientResponseWindowMatchesDirectRead(t *testing.T) {
-	var wire bytes.Buffer
 	payloads := [][]byte{{statusOK, 42}, nil, bytes.Repeat([]byte{21}, 14), bytes.Repeat([]byte{9}, 256)}
-	for _, payload := range payloads {
-		if err := WriteFrame(&wire, payload); err != nil {
-			t.Fatal(err)
-		}
-	}
 	for _, read := range []func(io.Reader) io.Reader{iotest.DataErrReader, iotest.HalfReader, iotest.OneByteReader} {
-		for end := 0; end <= wire.Len(); end++ {
-			data := wire.Bytes()[:end]
-			plain := read(bytes.NewReader(data))
-			conn := &poolConn{Conn: &prefaceTestConn{reader: read(bytes.NewReader(data))}}
-			scratch := make([]byte, 20)
-			var retained [][]byte
-			for range len(payloads) + 1 {
+		scratch := make([]byte, 20)
+		var retained [][]byte
+		for _, payload := range payloads {
+			var wire bytes.Buffer
+			if err := WriteFrame(&wire, payload); err != nil {
+				t.Fatal(err)
+			}
+			for end := 0; end <= wire.Len(); end++ {
+				data := wire.Bytes()[:end]
+				plain := read(bytes.NewReader(data))
+				conn := &poolConn{Conn: &prefaceTestConn{reader: read(bytes.NewReader(data))}}
 				want, wantErr := ReadFrame(plain, nil)
 				got, err := readClientFrame(conn, scratch)
 				if err != wantErr || !bytes.Equal(got, want) || (got == nil) != (want == nil) {
 					t.Fatalf("cut %d: got %x, %v, want %x, %v", end, got, err, want, wantErr)
 				}
-				if wantErr != nil {
-					break
+				if end == wire.Len() {
+					retained = append(retained, got)
 				}
-				retained = append(retained, got)
 				clear(scratch)
 			}
-			for i, want := range payloads[:len(retained)] {
-				if !bytes.Equal(retained[i], want) {
-					t.Fatalf("cut %d: retained response %d changed: %x", end, i, retained[i])
-				}
+		}
+		for i, want := range payloads {
+			if !bytes.Equal(retained[i], want) {
+				t.Fatalf("retained response %d changed: %x", i, retained[i])
 			}
 		}
 	}
 }
 
-func TestClientResponseWindowCarriesLookaheadToStream(t *testing.T) {
-	wire := []byte{0, 0, 0, 2, statusOK, 42, 0, 0, 0, 1, statusOK}
-	conn := &poolConn{Conn: &prefaceTestConn{reader: bytes.NewReader(wire)}}
-	if got, err := readClientFrame(conn, make([]byte, len(wire))); err != nil || !bytes.Equal(got, []byte{statusOK, 42}) {
-		t.Fatalf("unary response %x: %v", got, err)
+func TestClientClosesConnectionOnTrailingResponseBytes(t *testing.T) {
+	for _, tail := range [][]byte{{0}, {0, 0, 0, 1, statusOK}} {
+		var wire bytes.Buffer
+		if err := WriteFrame(&wire, []byte{statusOK, 42}); err != nil {
+			t.Fatal(err)
+		}
+		wire.Write(tail)
+		conn, peer := net.Pipe()
+		t.Cleanup(func() { _ = conn.Close(); _ = peer.Close() })
+		client := NewClient("unused")
+		t.Cleanup(client.Close)
+		client.pool.Put(&prefaceTestConn{Conn: conn, reader: &wire, writer: io.Discard})
+		if got, err := client.CallWithMaskContext(t.Context(), "", 1, nil, nil); err == nil || got != nil {
+			t.Errorf("accepted trailing bytes %x: body=%x err=%v", tail, got, err)
+		}
+		if client.pool.open.Load() != 0 || len(client.pool.conns) != 0 {
+			t.Error("retained a connection whose exchange boundary was invalid")
+		}
 	}
-	if got, err := ReadFrame(streamResponseConn(conn), nil); err != nil || !bytes.Equal(got, []byte{statusOK}) {
-		t.Fatalf("stream acknowledgement %x: %v", got, err)
+}
+
+func TestClientRetiresLeaseAfterInvalidResponse(t *testing.T) {
+	invalidErrorFields := rpcErrorFields(399, "Invalid", "invalid status code")
+	for _, sample := range []struct {
+		name   string
+		frame  []byte
+		traced bool
+		keep   bool
+	}{
+		{name: "empty"},
+		{name: "stream status", frame: []byte{statusStream, 1}},
+		{name: "malformed error", frame: []byte{statusError, 0}},
+		{name: "broken trace", frame: []byte{statusTraceOK, 3}, traced: true},
+		{name: "bad trace with success body", frame: []byte{statusTraceOK, 1, 0xff, 42}, traced: true, keep: true},
+		{name: "bad trace with incomplete error body", frame: []byte{statusTraceError, 1, 0xff, 0}, traced: true},
+		{name: "bad trace with invalid error status", frame: append([]byte{statusTraceError, 1, 0xff}, rpcErrorBody(invalidErrorFields[:]...)...), traced: true},
+		{name: "bad trace with valid error body", frame: append([]byte{statusTraceError, 1, 0xff}, encodeError(409, "Conflict", "conflict")[1:]...), traced: true, keep: true},
+		{name: "application error", frame: encodeError(409, "Conflict", "conflict"), keep: true},
+		{name: "traced application error", frame: encodeError(409, "Conflict", "conflict"), traced: true, keep: true},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			var wire bytes.Buffer
+			if err := WriteFrame(&wire, sample.frame); err != nil {
+				t.Fatal(err)
+			}
+			conn, peer := net.Pipe()
+			t.Cleanup(func() { _ = conn.Close(); _ = peer.Close() })
+			client := NewClient("unused")
+			t.Cleanup(client.Close)
+			client.pool.Put(&prefaceTestConn{Conn: conn, reader: &wire, writer: io.Discard})
+			var err error
+			if sample.traced {
+				payload := prepareTracedCallFrame("", "trace", "", false, 1, nil, nil)
+				_, _, err = client.callTracedPayload(t.Context(), payload)
+			} else {
+				_, err = client.CallWithMaskContext(t.Context(), "", 1, nil, nil)
+			}
+			if err == nil {
+				t.Fatal("expected an error response")
+			}
+			var retained int
+			if sample.keep {
+				retained = 1
+			}
+			if open := client.pool.open.Load(); open != int64(retained) || len(client.pool.conns) != retained {
+				t.Fatalf("open=%d idle=%d, want %d", open, len(client.pool.conns), retained)
+			}
+		})
 	}
 }
 
