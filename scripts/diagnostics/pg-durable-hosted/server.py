@@ -38,7 +38,10 @@ def scope():
     run_id, attempt = (os.environ[key] for key in ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
     if not all(re.fullmatch(r"[0-9]{1,20}", x) for x in (run_id, attempt)):
         raise RuntimeError("unexpected GitHub attempt identity")
-    name = f"luxo-pg-durable-{run_id}-{attempt}"
+    lane = os.environ.get("LUXO_PG_DURABLE_LANE")
+    if lane not in ("retry", "lifecycle"):
+        raise RuntimeError("expected a dedicated PostgreSQL diagnostic lane")
+    name = f"luxo-pg-durable-{run_id}-{attempt}-{lane}"
     return name, f"{name}-data"
 
 

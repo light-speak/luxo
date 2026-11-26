@@ -1,4 +1,4 @@
-name: Compare PostgreSQL retry snapshot costs
+name: Compare PostgreSQL migration catalog SQL costs
 
 on:
   push:
@@ -18,8 +18,15 @@ concurrency:
 jobs:
   pg-durable:
     if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-pg-durable-0a6b'
+    name: pg-durable (${{ matrix.lane }})
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 48
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [retry, lifecycle]
+    env:
+      LUXO_PG_DURABLE_LANE: ${{ matrix.lane }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -41,7 +48,7 @@ jobs:
           go-version: '1.27.1'
           check-latest: false
           cache: false
-      - name: Measure invalid-index retry and smoke-check journal creation
+      - name: Measure the bound migration path
         timeout-minutes: 40
         run: python3 -I -B scripts/diagnostics/pg-durable-hosted/hosted.py run
       - name: Confirm task-owned PostgreSQL resources returned to zero
@@ -51,7 +58,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: hosted-pg-durable-retry-snapshot-${{ github.run_id }}-${{ github.run_attempt }}
+          name: hosted-pg-durable-catalog-${{ matrix.lane }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/pg-durable-hosted-evidence/
           if-no-files-found: error
           retention-days: 14
