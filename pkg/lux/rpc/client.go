@@ -99,6 +99,23 @@ func NewNamedClientWithOptions(name, addr string, options PoolOptions) (*Client,
 	return &Client{name: name, pool: pool}, nil
 }
 
+// CheckReady verifies a fresh LRPC handshake without taking a connection from
+// the business request pool or invoking a business operation.
+func (c *Client) CheckReady(ctx context.Context) error {
+	if c.pool.closed.Load() {
+		return errPoolClosed
+	}
+	conn, err := c.pool.dialContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if c.pool.closed.Load() {
+		return errPoolClosed
+	}
+	return ctx.Err()
+}
+
 // Call sends a binary-encoded request and returns the response body.
 // apiID: from luxo.lock. params: pre-encoded binary (fieldID+value pairs + 0x00).
 // Returns the response body (without status byte) and any error.

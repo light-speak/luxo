@@ -211,6 +211,9 @@ func TestHelmCheckedBackendSelection(t *testing.T) {
 			{"module-user", "LUXO_CACHE_PROJECT", false},
 			{"module-read", "REDIS_URL", sample.redis},
 			{"module-read", "LUXO_CACHE_PROJECT", true},
+			{"gateway", "LUXO_INTERNAL_COMPOSE_JETSTREAM", false},
+			{"module-user", "LUXO_INTERNAL_COMPOSE_JETSTREAM", false},
+			{"module-read", "LUXO_INTERNAL_COMPOSE_JETSTREAM", false},
 		} {
 			source := chart.Files["templates/"+check.file+"-deployment.yaml"]
 			if strings.Contains(string(source), "name: "+check.env+"\n") != check.want {
@@ -343,6 +346,18 @@ func TestHelmGatewayDeployment(t *testing.T) {
 	for _, check := range checks {
 		if !strings.Contains(dep, check) {
 			t.Errorf("gateway-deployment.yaml missing %q", check)
+		}
+	}
+}
+
+func TestHelmProbesHaveSeparatePaths(t *testing.T) {
+	helm := GenerateHelmFiles(makeHelmResult("user"), "myapp")
+	for _, name := range []string{"gateway-deployment.yaml", "module-user-deployment.yaml"} {
+		file := string(helm.Files["templates/"+name])
+		sections := strings.SplitN(file, "readinessProbe:", 2)
+		if len(sections) != 2 || !strings.Contains(sections[0], "livenessProbe:\n            httpGet:\n              path: /health\n") ||
+			!strings.Contains(sections[1], "path: /ready\n") {
+			t.Errorf("%s must probe /health for liveness and /ready for readiness", name)
 		}
 	}
 }

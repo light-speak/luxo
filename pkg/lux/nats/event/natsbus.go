@@ -7,6 +7,7 @@ import (
 	"github.com/light-speak/luxo/internal/diagnostics"
 	coreevent "github.com/light-speak/luxo/pkg/lux/event"
 	"sync"
+	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/codec"
 	"github.com/nats-io/nats.go"
@@ -39,6 +40,19 @@ func NewNATSBus(url string) (*NATSBus, error) {
 		return nil, fmt.Errorf("nats connect: %w", err)
 	}
 	return &NATSBus{conn: conn}, nil
+}
+
+// CheckReady verifies the broker acknowledges this bus's connection.
+func (b *NATSBus) CheckReady(ctx context.Context) error {
+	b.mu.RLock()
+	closed := b.closed
+	b.mu.RUnlock()
+	if closed {
+		return coreevent.ErrBusClosed
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	return b.conn.FlushWithContext(ctx)
 }
 
 // Emit publishes a Luxo binary or pre-encoded payload to NATS.

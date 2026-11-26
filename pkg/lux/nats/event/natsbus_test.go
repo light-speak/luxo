@@ -250,6 +250,25 @@ func TestNATSBusClose(t *testing.T) {
 	bus.Close() // double close should not panic
 }
 
+func TestNATSBusReadiness(t *testing.T) {
+	bus, err := NewNATSBus(natsURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bus.Close() })
+	if err := bus.CheckReady(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	bus.conn.Close()
+	if err := bus.CheckReady(t.Context()); err == nil {
+		t.Fatal("closed broker connection still ready")
+	}
+	_ = bus.Close()
+	if err := bus.CheckReady(t.Context()); err == nil {
+		t.Fatal("closed event bus still ready")
+	}
+}
+
 func TestNATSBusOnAfterClose(t *testing.T) {
 	bus, err := NewNATSBus(natsURL(t))
 	if err != nil {

@@ -274,6 +274,10 @@ func checkComposeBackends(t *testing.T, manifest []byte, natsConsumers []string,
 	for _, name := range []string{"watch", "order", "read", "gateway"} {
 		service := config.Services[name]
 		checkComposeServiceConnection(t, name, "NATS_URL", "nats://nats:4222", service.Environment, service.DependsOn["nats"].Condition, slices.Contains(natsConsumers, name))
+		flag, hasFlag := service.Environment["LUXO_INTERNAL_COMPOSE_JETSTREAM"]
+		if want := jetstream && name != "gateway"; hasFlag != want || hasFlag && flag != "1" {
+			t.Fatalf("service %s: managed JetStream flag = %q (%v), want present=%v", name, flag, hasFlag, want)
+		}
 		checkComposeServiceConnection(t, name, "REDIS_URL", "redis://redis:6379", service.Environment, service.DependsOn["redis"].Condition, redis && name == "read")
 		if name != "read" && service.Environment["LUXO_CACHE_PROJECT"] != "" {
 			t.Fatalf("service %s got cache settings", name)

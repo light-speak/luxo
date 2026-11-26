@@ -48,6 +48,11 @@ type composeBackends struct {
 	legacyRedis bool
 }
 
+const (
+	composeNATSURL               = "nats://nats:4222"
+	composeJetStreamReadinessEnv = "LUXO_INTERNAL_COMPOSE_JETSTREAM"
+)
+
 const composeCacheSettings = `      LUXO_CACHE_PROJECT: "${LUXO_CACHE_PROJECT:?set LUXO_CACHE_PROJECT}"
       LUXO_CACHE_ENVIRONMENT: "${LUXO_CACHE_ENVIRONMENT:?set LUXO_CACHE_ENVIRONMENT}"
       LUXO_CACHE_REVISION: "${LUXO_CACHE_REVISION:?set LUXO_CACHE_REVISION}"
@@ -193,7 +198,8 @@ func writeComposeHealthcheck(b *bytes.Buffer, command string) {
 }
 
 func writeComposeModule(b *bytes.Buffer, module moduleInfo, projectName string, backends composeBackends) {
-	nats := backends.selection.Queue == "nats" || backends.selection.Events == "nats" && module.usesEventBus()
+	queueNATS := backends.selection.Queue == "nats"
+	nats := queueNATS || backends.selection.Events == "nats" && module.usesEventBus()
 	cache := backendEnabled(backends.selection.Cache) && module.hasCache
 	redis := cache && backends.selection.Cache == "redis"
 	fmt.Fprintf(b, "  %s:\n    build: { context: ., target: %s-run }\n", module.name, module.name)
@@ -208,7 +214,10 @@ func writeComposeModule(b *bytes.Buffer, module moduleInfo, projectName string, 
 	b.WriteString("      APP_PORT: \"4000\"\n")
 	b.WriteString("      LUXO_PORT: \"9000\"\n")
 	if nats || backends.legacyNATS {
-		b.WriteString("      NATS_URL: nats://nats:4222\n")
+		b.WriteString("      NATS_URL: " + composeNATSURL + "\n")
+	}
+	if queueNATS {
+		b.WriteString("      " + composeJetStreamReadinessEnv + ": \"1\"\n")
 	}
 	if redis {
 		b.WriteString("      REDIS_URL: redis://redis:6379\n")
@@ -238,7 +247,7 @@ func writeComposeGateway(b *bytes.Buffer, modules []moduleInfo, nats bool) {
 	b.WriteString("      APP_PORT: \"4000\"\n")
 	b.WriteString("      CORS_ORIGIN: \"${CORS_ORIGIN:-*}\"\n")
 	if nats {
-		b.WriteString("      NATS_URL: nats://nats:4222\n")
+		b.WriteString("      NATS_URL: " + composeNATSURL + "\n")
 	}
 	writeComposeJWTEnvironment(b)
 	b.WriteString("    depends_on:\n")

@@ -34,6 +34,92 @@ func (l *acceptTestListener) Close() error {
 
 type temporaryAcceptError struct{ permanent bool }
 
+func TestLRPCReadiness(t *testing.T) {
+	server := NewServer(api.NewRouter())
+	if err := server.CheckReady(t.Context()); err == nil {
+		t.Fatal("unstarted LRPC server reported ready")
+	}
+	client := NewClient(startTestRPCServer(t, server))
+	t.Cleanup(client.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := client.CheckReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.CheckReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if open := client.pool.open.Load(); open != 0 {
+		t.Fatalf("readiness used the business connection pool: open=%d", open)
+	}
+	stop, stopCancel := context.WithCancel(t.Context())
+	stopCancel()
+	for _, check := range []func(context.Context) error{client.CheckReady, server.CheckReady} {
+		if err := check(stop); !errors.Is(err, context.Canceled) {
+			t.Fatalf("checked readiness after cancellation: %v", err)
+		}
+	}
+	server.Close()
+	if server.CheckReady(ctx) == nil || client.CheckReady(ctx) == nil {
+		t.Fatal("stopped LRPC listener reported ready")
+	}
+	client.Close()
+	if err := client.CheckReady(ctx); !errors.Is(err, errPoolClosed) {
+		t.Fatalf("closed client readiness: %v", err)
+	}
+}
+
+func TestLRPCReadinessClosesHandshakeWhenClientCloses(t *testing.T) {
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	deadline := time.Now().Add(3 * time.Second)
+	if err := listener.SetDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithDeadline(t.Context(), deadline)
+	defer cancel()
+
+	client := NewClient(listener.Addr().String())
+	t.Cleanup(client.Close)
+	readiness := make(chan error, 1)
+	go func() { readiness <- client.CheckReady(ctx) }()
+
+	peer, err := listener.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	if err := peer.SetDeadline(deadline); err != nil {
+		t.Fatal(err)
+	}
+	var preface [12]byte
+	if _, err := io.ReadFull(peer, preface[:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePreface(preface); err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+	reply := protocolPreface()
+	if err := writePreface(peer, &reply); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-readiness:
+		if !errors.Is(err, errPoolClosed) {
+			t.Fatalf("closed client readiness = %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("readiness completed after its deadline: %v", ctx.Err())
+	}
+	if _, err := peer.Read(preface[:]); !errors.Is(err, io.EOF) {
+		t.Fatalf("ready handshake connection stayed open: %v", err)
+	}
+}
+
 type startupValidationListener struct {
 	net.Listener
 	accepts int

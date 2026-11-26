@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -81,6 +82,43 @@ func TestHandleHealth(t *testing.T) {
 	if w.Body.String() != `{"status":"ok"}` {
 		t.Errorf("body = %q", w.Body.String())
 	}
+}
+
+func TestProbesKeepLivenessIndependentOfDependencies(t *testing.T) {
+	var offline atomic.Bool
+	offline.Store(true)
+	gw := New()
+	gw.AddReadinessCheck(func(ctx context.Context) error {
+		if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) >= time.Second {
+			t.Error("readiness probe must have a deadline shorter than the external probe timeout")
+		}
+		if offline.Load() {
+			return fmt.Errorf("private-db.internal")
+		}
+		return nil
+	})
+
+	check := func(mux http.Handler, path string, status int, body string) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != status || response.Body.String() != body {
+			t.Errorf("GET %s: got %d %q, want %d %q", path, response.Code, response.Body.String(), status, body)
+		}
+	}
+	mux, _, err := gw.buildMux(testReadinessHandler(t, gw), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(mux, "/health", http.StatusOK, `{"status":"ok"}`)
+	check(mux, "/ready", http.StatusServiceUnavailable, `{"status":"unavailable"}`)
+
+	offline.Store(false)
+	mux, _, err = gw.buildMux(testReadinessHandler(t, gw), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(mux, "/ready", http.StatusOK, `{"status":"ok"}`)
 }
 
 func TestNewGateway(t *testing.T) {

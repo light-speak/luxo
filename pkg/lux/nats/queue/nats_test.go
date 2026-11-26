@@ -54,6 +54,30 @@ func TestNATSQueueFromNilConn(t *testing.T) {
 	}
 }
 
+func TestNATSQueueReadiness(t *testing.T) {
+	conn, err := nats.Connect(natsTestURL(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(conn.Close)
+	queue, err := NewNATSQueueFromConn(conn, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = queue.Close() })
+	if err := queue.CheckReady(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	if err := queue.CheckReady(t.Context()); !errors.Is(err, nats.ErrConnectionClosed) {
+		t.Fatalf("closed broker connection readiness: %v", err)
+	}
+	_ = queue.Close()
+	if err := queue.CheckReady(t.Context()); err == nil {
+		t.Fatal("closed queue still ready")
+	}
+}
+
 func TestNATSQueueCloseReportsClosedOwnedConnection(t *testing.T) {
 	q, err := NewNATSQueue(natsTestURL(t), DefaultConfig())
 	if err != nil {

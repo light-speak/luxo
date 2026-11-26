@@ -407,6 +407,7 @@ func writeEmbeddedRPCWiring(b *strings.Builder, modules []moduleInfo, hasService
 	b.WriteString("\t// RPC server — only in cluster mode (other services call via Luxo protocol)\n")
 	b.WriteString("\tif deployMode == \"cluster\" {\n")
 	b.WriteString("\t\trpcServer := rpc.NewServer(gw.Router)\n")
+	b.WriteString("\t\tgw.AddReadinessCheck(rpcServer.CheckReady)\n")
 	b.WriteString("\t\tgo func() {\n")
 	b.WriteString("\t\t\trpcAddr := \":\" + env.GetOrDefault(\"LUXO_PORT\", \"9000\")\n")
 	b.WriteString("\t\t\tif err := rpcServer.ListenAndServe(rpcAddr); err != nil {\n")
@@ -427,7 +428,8 @@ func writeModuleApps(b *strings.Builder, modules []moduleInfo) {
 		b.WriteString("\t\tos.Exit(1)\n")
 		b.WriteString("\t}\n")
 		b.WriteString("\tdefer db.Close()\n\n")
-		b.WriteString("\tgw.SetRuntimeDependencyStatsProvider(db)\n\n")
+		b.WriteString("\tgw.SetRuntimeDependencyStatsProvider(db)\n")
+		b.WriteString("\tgw.AddReadinessCheck(db.CheckReady)\n\n")
 	}
 
 	for _, m := range modules {
@@ -645,7 +647,8 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 	b.WriteString("\t}\n")
 	b.WriteString("\tdefer app.Close()\n\n")
 	if target.hasDatabase {
-		b.WriteString("\tgw.SetRuntimeDependencyStatsProvider(app.DB)\n\n")
+		b.WriteString("\tgw.SetRuntimeDependencyStatsProvider(app.DB)\n")
+		b.WriteString("\tgw.AddReadinessCheck(app.DB.CheckReady)\n\n")
 	}
 	fmt.Fprintf(&b, "\t%s_resolver.Setup(app)\n\n", target.name)
 
@@ -715,6 +718,7 @@ func generateSingleModuleEntry(target moduleInfo, allModules []moduleInfo, resul
 
 	// RPC server (cluster mode — other services call us)
 	b.WriteString("\trpcServer := rpc.NewServer(gw.Router)\n")
+	b.WriteString("\tgw.AddReadinessCheck(rpcServer.CheckReady)\n")
 	b.WriteString("\tgo func() {\n")
 	b.WriteString("\t\trpcAddr := \":\" + env.GetOrDefault(\"LUXO_PORT\", \"9000\")\n")
 	b.WriteString("\t\tif err := rpcServer.ListenAndServe(rpcAddr); err != nil {\n")
@@ -797,6 +801,9 @@ func generateGatewayEntry(result *semantic.Result, modulePath string, backends E
 
 	// Gateway
 	b.WriteString("\tgw := luvia.New()\n\n")
+	for _, m := range allModules {
+		fmt.Fprintf(&b, "\tgw.AddReadinessCheck(rpcClients[%q].CheckReady)\n", m.name)
+	}
 	if anyStreams {
 		writeSelectedEventBus(&b, backends.Events)
 		for _, module := range allModules {

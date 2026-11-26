@@ -29,6 +29,7 @@ type Gateway struct {
 	metrics         *MetricsCollector
 	registrar       *GatewayRegistrar
 	dependencyStats lux.RuntimeDependencyStatsProvider
+	readinessChecks []func(context.Context) error
 }
 
 // New creates a new Luvia gateway.
@@ -118,7 +119,9 @@ func (g *Gateway) serve(version string, quit <-chan os.Signal) (serveResult erro
 			return err
 		}
 	}
-	mux, port, err := g.buildMux(version)
+	readiness := g.startReadiness()
+	defer readiness.stop()
+	mux, port, err := g.buildMux(readiness, version)
 	if err != nil {
 		return err
 	}
@@ -151,7 +154,7 @@ func (g *Gateway) serve(version string, quit <-chan os.Signal) (serveResult erro
 	}
 
 	g.server = server
-	return g.waitForShutdown(quit, serveErr, shutdownTimeout)
+	return g.waitForShutdown(quit, serveErr, shutdownTimeout, readiness.stop)
 }
 
 func validateDeploymentMode() error {
@@ -263,7 +266,7 @@ func positiveDurationEnv(name string, fallback time.Duration) (time.Duration, er
 }
 
 // waitForShutdown blocks until SIGTERM, SIGINT, or a server failure, then gracefully shuts down.
-func (g *Gateway) waitForShutdown(quit <-chan os.Signal, serveErr <-chan error, timeout time.Duration) error {
+func (g *Gateway) waitForShutdown(quit <-chan os.Signal, serveErr <-chan error, timeout time.Duration, stopReadiness context.CancelFunc) error {
 	var sig os.Signal
 	select {
 	case err := <-serveErr:
@@ -272,6 +275,7 @@ func (g *Gateway) waitForShutdown(quit <-chan os.Signal, serveErr <-chan error, 
 		}
 		return fmt.Errorf("serve: %w", err)
 	case sig = <-quit:
+		stopReadiness()
 	}
 	fmt.Printf("\n  Received %s, shutting down...\n", sig)
 
@@ -290,7 +294,7 @@ func (g *Gateway) waitForShutdown(quit <-chan os.Signal, serveErr <-chan error, 
 
 // buildMux creates the HTTP mux with all routes and middleware.
 // Returns the mux and the port string. Extracted for testability.
-func (g *Gateway) buildMux(version string) (*http.ServeMux, string, error) {
+func (g *Gateway) buildMux(readyHandler http.Handler, version string) (*http.ServeMux, string, error) {
 	policy, err := configureWebSocketOrigins(g.Router, envOr("CORS_ORIGIN", "*"))
 	if err != nil {
 		return nil, "", fmt.Errorf("CORS_ORIGIN: %w", err)
@@ -313,6 +317,7 @@ func (g *Gateway) buildMux(version string) (*http.ServeMux, string, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handleHealth)
+	mux.Handle("GET /ready", readyHandler)
 
 	// i18n — load translations (non-fatal if missing)
 	translator := i18n.New(envOr("APP_LOCALE", "en"))

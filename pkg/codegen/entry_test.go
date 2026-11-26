@@ -553,6 +553,43 @@ func TestGenerateEntryFileWithEvents(t *testing.T) {
 	}
 }
 
+func TestGeneratedModuleSelectsManagedJetStreamReadiness(t *testing.T) {
+	result := analyzePermissionFixture(t, "event Changed(value: Int)\napi value(): Int { return 42 }")
+	for _, sample := range []struct {
+		name  string
+		queue string
+	}{
+		{name: "event-only"},
+		{name: "jetstream", queue: "nats"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			entries, err := GenerateModuleEntryFilesChecked(result, "example.com/app", EntryBackends{
+				Events: "nats",
+				Queue:  sample.queue,
+			})
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("expected one entry, got %d: %v", len(entries), err)
+			}
+			for _, source := range entries {
+				code := string(source)
+				if !strings.Contains(code, "gw.AddReadinessCheck(eventBus.CheckReady)") {
+					t.Fatal("event bus lost its readiness check")
+				}
+				const selector = `if queueURL == "nats://nats:4222" && os.Getenv("LUXO_INTERNAL_COMPOSE_JETSTREAM") == "1" {`
+				usesQueue := sample.queue == "nats"
+				for _, part := range []string{
+					selector, "gw.AddReadinessCheck(taskQueue.CheckDirectJetStreamReady)",
+					"gw.AddReadinessCheck(taskQueue.CheckReady)",
+				} {
+					if strings.Contains(code, part) != usesQueue {
+						t.Errorf("generated entry has %q = %v, want %v", part, !usesQueue, usesQueue)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestGenerateEntryFileWithServiceFns(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{

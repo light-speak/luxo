@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"sync"
 	"syscall"
@@ -19,10 +20,11 @@ func TestWaitForShutdownWaitsForSignal(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		quit := make(chan os.Signal, 1)
 		serveErr := make(chan error, 1)
-		gw := &Gateway{server: &http.Server{}}
-		gw.server.RegisterOnShutdown(func() { serveErr <- http.ErrServerClosed })
+		server := &http.Server{}
+		gw := &Gateway{server: server}
+		server.RegisterOnShutdown(func() { serveErr <- http.ErrServerClosed })
 		done := make(chan error, 1)
-		go func() { done <- gw.waitForShutdown(quit, serveErr, time.Second) }()
+		go func() { done <- gw.waitForShutdown(quit, serveErr, time.Second, func() {}) }()
 		synctest.Wait()
 		assertShutdownPending(t, done)
 		quit <- syscall.SIGTERM
@@ -32,13 +34,71 @@ func TestWaitForShutdownWaitsForSignal(t *testing.T) {
 	})
 }
 
+func TestWaitForShutdownCancelsReadinessBeforeDrain(t *testing.T) {
+	readiness, stopReadiness := context.WithCancel(t.Context())
+	t.Cleanup(stopReadiness)
+	quit := make(chan os.Signal, 1)
+	quit <- syscall.SIGTERM
+	serveErr := make(chan error, 1)
+	drain := observedGatewayDrain(func(ctx context.Context) error {
+		if !errors.Is(readiness.Err(), context.Canceled) {
+			return errors.New("readiness was active when drain began")
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("business drain context was already cancelled: %w", ctx.Err())
+		}
+		serveErr <- http.ErrServerClosed
+		return nil
+	})
+	gw := &Gateway{server: drain}
+	if err := gw.waitForShutdown(quit, serveErr, time.Second, stopReadiness); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStatelessReadinessStopsBeforeDrain(t *testing.T) {
+	t.Setenv("CORS_ORIGIN", "*")
+	gw := New()
+	ready := gw.startReadiness()
+	t.Cleanup(ready.stop)
+	mux, _, err := gw.buildMux(ready, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := func(method, path string) int {
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), method, path, nil))
+		return response.Code
+	}
+	if get, head, post := status(http.MethodGet, "/ready"), status(http.MethodHead, "/ready"), status(http.MethodPost, "/ready"); get != http.StatusOK || head != http.StatusOK || post != http.StatusMethodNotAllowed {
+		t.Fatalf("readiness before shutdown: GET=%d HEAD=%d POST=%d", get, head, post)
+	}
+	quit := make(chan os.Signal, 1)
+	quit <- syscall.SIGTERM
+	serveErr := make(chan error, 1)
+	gw.server = observedGatewayDrain(func(context.Context) error {
+		if ready, health := status(http.MethodGet, "/ready"), status(http.MethodGet, "/health"); ready != http.StatusServiceUnavailable || health != http.StatusOK {
+			return fmt.Errorf("during drain: readiness=%d health=%d", ready, health)
+		}
+		serveErr <- http.ErrServerClosed
+		return nil
+	})
+	if err := gw.waitForShutdown(quit, serveErr, time.Second, ready.stop); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type observedGatewayDrain func(context.Context) error
+
+func (d observedGatewayDrain) Shutdown(ctx context.Context) error { return d(ctx) }
+
 func TestWaitForShutdownServerExit(t *testing.T) {
 	want := errors.New("listener failed")
 	for _, result := range []error{http.ErrServerClosed, want} {
 		t.Run(result.Error(), func(t *testing.T) {
 			serveErr := make(chan error, 1)
 			serveErr <- result
-			err := New().waitForShutdown(nil, serveErr, time.Second)
+			err := New().waitForShutdown(nil, serveErr, time.Second, func() {})
 			if result == http.ErrServerClosed {
 				if err != nil {
 					t.Fatal(err)
@@ -56,9 +116,10 @@ func TestWaitForShutdownServerFailureAfterSignal(t *testing.T) {
 		quit := make(chan os.Signal, 1)
 		quit <- syscall.SIGINT
 		serveErr := make(chan error, 1)
-		gw := &Gateway{server: &http.Server{}}
-		gw.server.RegisterOnShutdown(func() { serveErr <- want })
-		if err := gw.waitForShutdown(quit, serveErr, time.Second); !errors.Is(err, want) {
+		server := &http.Server{}
+		gw := &Gateway{server: server}
+		server.RegisterOnShutdown(func() { serveErr <- want })
+		if err := gw.waitForShutdown(quit, serveErr, time.Second, func() {}); !errors.Is(err, want) {
 			t.Fatalf("waitForShutdown = %v, want %v", err, want)
 		}
 	})
@@ -69,7 +130,7 @@ func TestWaitForShutdownDrainsActiveRequest(t *testing.T) {
 		gw, serveErr, release, response := blockedRequestGateway(t)
 		quit := make(chan os.Signal, 1)
 		done := make(chan error, 1)
-		go func() { done <- gw.waitForShutdown(quit, serveErr, time.Minute) }()
+		go func() { done <- gw.waitForShutdown(quit, serveErr, time.Minute, func() {}) }()
 		quit <- syscall.SIGTERM
 		synctest.Wait()
 		assertShutdownPending(t, done)
@@ -89,7 +150,7 @@ func TestWaitForShutdownHonorsTimeout(t *testing.T) {
 		quit := make(chan os.Signal, 1)
 		quit <- syscall.SIGINT
 		start := time.Now()
-		err := gw.waitForShutdown(quit, serveErr, 7*time.Second)
+		err := gw.waitForShutdown(quit, serveErr, 7*time.Second, func() {})
 		if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) != 7*time.Second {
 			t.Fatalf("shutdown error = %v, elapsed = %s", err, time.Since(start))
 		}

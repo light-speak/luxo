@@ -635,6 +635,11 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 - [ ] luxo-ai（自然语言 → .luxo → 运行中的 API）
 - [x] `luxo deploy helm` — Helm Chart 生成
 
+请一起重新生成 Helm Chart 和服务二进制。`/health` 检测进程存活，`/ready`
+检测就绪。所需的 PostgreSQL 连接、已配置的 NATS 连接或 LRPC 监听不可用时，
+`/ready` 返回 HTTP 503。集群网关与每个模块做 LRPC 握手，各模块只检查本地依赖，
+避免互相等待。响应缓存仍按原有规则回源。探针只返回状态，服务最多复用一秒的探测结果。
+
 ## 贡献
 
 Luxo 处于早期开发阶段，欢迎贡献代码、提出想法和反馈。

@@ -670,6 +670,14 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 - [ ] luxo-ai (natural language → .luxo → running API)
 - [x] `luxo deploy helm` — Helm Chart generation
 
+Regenerate the Helm chart and service binaries together to use `/health` for
+liveness and `/ready` for readiness. The latter returns HTTP 503 when a required
+PostgreSQL connection, configured NATS broker connection, or LRPC listener is
+unavailable. The cluster gateway checks the LRPC handshake with each module.
+Modules check local dependencies so their readiness cannot depend on each other.
+Response caches still fall back to the origin. Readiness responses contain only
+a status and the service shares a probe result for up to one second.
+
 ## Contributing
 
 Luxo is in early development. Contributions, ideas, and feedback are welcome.

@@ -83,6 +83,7 @@ func writeSelectedEventBus(b *strings.Builder, selection string) {
 	writeRequiredNATSURL(b, "eventURL")
 	writeBackendInitialization(b, "eventBus", "event.NewNATSBus(eventURL)")
 	writeBackendCleanup(b, "eventBus", "event bus")
+	b.WriteString("\tgw.AddReadinessCheck(eventBus.CheckReady)\n")
 }
 
 func writeSelectedQueue(b *strings.Builder, selection string) {
@@ -95,6 +96,10 @@ func writeSelectedQueue(b *strings.Builder, selection string) {
 	} else {
 		writeRequiredNATSURL(b, "queueURL")
 		writeBackendInitialization(b, "taskQueue", "natsqueue.NewNATSQueue(queueURL, queue.DefaultConfig())")
+		// The Compose marker distinguishes its managed broker from external NATS routing.
+		fmt.Fprintf(b, "\tif queueURL == %q && os.Getenv(%q) == \"1\" {\n", composeNATSURL, composeJetStreamReadinessEnv)
+		b.WriteString("\t\tgw.AddReadinessCheck(taskQueue.CheckDirectJetStreamReady)\n")
+		b.WriteString("\t} else {\n\t\tgw.AddReadinessCheck(taskQueue.CheckReady)\n\t}\n")
 	}
 	writeBackendCleanup(b, "taskQueue", "task queue")
 }
