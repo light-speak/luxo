@@ -1,0 +1,61 @@
+name: Recheck #157 JSON list metadata on EPYC 9V45
+
+on:
+  push:
+    branches: [diagnostics/pr157-json-list-9v45]
+
+permissions:
+  contents: read
+
+jobs:
+  witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+
+      - id: route
+        name: Require the original EPYC 9V45 processor
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/pr157-json-list
+          cpu=$(awk -F ': *' '/^model name[[:space:]]*:/ {sub(/[[:space:]]+$/, "", $2); print $2; exit}' /proc/cpuinfo)
+          printf '%s\n' "$cpu" > .tmp/pr157-json-list/cpu.txt
+          if [[ "$cpu" == "AMD EPYC 9V45 96-Core Processor" ]]; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+            echo "CPU did not match; no benchmark binaries or samples were produced." > .tmp/pr157-json-list/status.txt
+          fi
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: 59a4167f129f0bff0e8425125fa02eae87fd347b
+          path: .tmp/base
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - if: steps.route.outputs.matched == 'true'
+        name: Verify exact ELF and replay four original leaves
+        shell: bash
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: bash scripts/diagnose-pr157-json-list/run.sh
+
+      - if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr157-json-list-9v45-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr157-json-list
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
