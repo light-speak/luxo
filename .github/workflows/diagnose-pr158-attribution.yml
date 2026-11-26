@@ -1,4 +1,4 @@
-name: Attribute #158 timing on the original CPU families
+name: Attribute #158 HTTP/2 allocations on EPYC 7763
 
 on:
   push:
@@ -16,16 +16,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 4
+          fetch-depth: 5
           persist-credentials: false
 
-      - name: Select the original profile for this runner CPU
+      - name: Require the original EPYC 7763 runner CPU
         id: route
         env:
           RUNNER_KIND: ${{ runner.environment }}
         run: |
           set -euo pipefail
-          route=$(python3 -I -B scripts/diagnose-pr158/run.py --probe auto)
+          route=$(python3 -I -B scripts/diagnose-pr158/run.py --probe epyc)
           printf 'route=%s\n' "$route" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v7
@@ -38,7 +38,7 @@ jobs:
           path: .tmp/pr158-base
           persist-credentials: false
 
-      - name: Validate the route and reproduce the pinned samples
+      - name: Run the pinned EPYC timing matrix and then profile HTTP/2
         env:
           RUNNER_KIND: ${{ runner.environment }}
           NATIVE_ROUTE: ${{ steps.route.outputs.route }}

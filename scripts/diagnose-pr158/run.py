@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -19,12 +20,14 @@ INPUT = Path(__file__).resolve().parent
 ROOT = INPUT.parents[1]
 OUT = ROOT / '.tmp/pr158-attribution'
 RUN_CONFIG_SHA = 'bf3be34db7cca43489c678e725e5baa66ca03e323c4a282df9e8650db93cdc81'
-DIAGNOSTIC_PARENT = '5d63fd896bcc88aa35968e986985bb387e7de661'
+DIAGNOSTIC_PARENT = 'd586d4283c290501fb9f4e911996be13aa6945d7'
+ORIGINAL_WITNESS = '5d63fd896bcc88aa35968e986985bb387e7de661'
 DIAGNOSTIC_REF = 'refs/heads/diagnostics/pr158-attribution'
 CONFIG = json.loads((INPUT / 'routes.json').read_bytes())
 PATHS = ('.github/workflows/diagnose-pr158-attribution.yml',
-         *('scripts/diagnose-pr158/' + name for name in ('arm-b.patch.b64', 'go-capture.py', 'routes.json', 'run.py')))
-FOLLOWUP_PATHS = ('M\t.github/workflows/diagnose-pr158-attribution.yml', 'M\tscripts/diagnose-pr158/run.py')
+         *('scripts/diagnose-pr158/' + name for name in ('arm-b.patch.b64', 'go-capture.py', 'h2_profile.py', 'routes.json', 'run.py')))
+FOLLOWUP_PATHS = ('M\t.github/workflows/diagnose-pr158-attribution.yml',
+                  'A\tscripts/diagnose-pr158/h2_profile.py', 'M\tscripts/diagnose-pr158/run.py')
 PAIRS = ('AA', 'BB', 'CC', 'AB', 'BC', 'AC')
 METRICS = '.unit:(sec/op OR B/op OR allocs/op)'
 HOT = {
@@ -96,7 +99,8 @@ def verify_provenance():
     active = git('rev-parse', 'HEAD')
     need(active == os.environ.get('GITHUB_SHA') and git('show', '-s', '--format=%P', active) == DIAGNOSTIC_PARENT,
          'the diagnostic must append one commit to the published witness')
-    need(git('show', '-s', '--format=%P', DIAGNOSTIC_PARENT) == CONFIG['candidateCommit'],
+    need(git('show', '-s', '--format=%P', DIAGNOSTIC_PARENT) == ORIGINAL_WITNESS and
+         git('show', '-s', '--format=%P', ORIGINAL_WITNESS) == CONFIG['candidateCommit'],
          'the published witness must descend directly from the historical candidate')
     need(git('show', '-s', '--format=%P', CONFIG['candidateCommit']) == CONFIG['baseCommit'], 'target ancestry changed')
     need(git('diff', '--name-status', DIAGNOSTIC_PARENT, active).splitlines() == list(FOLLOWUP_PATHS),
@@ -254,7 +258,7 @@ def main():
     probe = args[:1] == ['--probe']
     if probe:
         args = args[1:]
-    need(len(args) == 1 and (args[0] == 'auto' or args[0] in CONFIG['routes']), 'expected auto, intel, or epyc')
+    need(args == ['epyc'], 'this witness requires the original EPYC route')
     selected, cpu = route_guard(args[0])
     if probe:
         print(selected)
@@ -292,8 +296,11 @@ def main():
         binaries = {role: build_profile(go, tools, role, source, work, grouped) for role, source in arms.items()}
         processes = measure(arms, binaries, grouped)
         outcomes = gate(tools, expected)
+        json_file(OUT / 'timing-status.json', {'processes': processes, 'gates': outcomes})
+        profile_h2 = runpy.run_path(str(INPUT / 'h2_profile.py'))['capture']
+        profiles = profile_h2(go, call, json_file, need, OUT, arms, binaries, CONFIG['trees'])
     json_file(OUT / 'status.json', {'matched': True, 'route': selected, 'cpu': cpu,
-                                   'processes': processes, 'gates': outcomes})
+                                   'processes': processes, 'gates': outcomes, 'profileProcesses': profiles})
     sys.exit(int(any(outcomes.values())))
 
 
