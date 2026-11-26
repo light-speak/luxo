@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare compact migration catalog SQL on the pinned PostgreSQL protocols."""
+"""Compare migration receipt writes on the pinned PostgreSQL recovery protocol."""
 import argparse
 import base64
 import gzip
@@ -22,7 +22,7 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-PARENT = '996c4c2ad099e26df089fbef8bb8d47385c05a1e'
+PARENT = '73a650835bde85d517246a70b9ef9582c0db28f6'
 BASE = '15765dee6705d39de0b5a505d3039d59ebf43584'
 BASE_TREE = '75aebe5bd2fa6b45a1c614ace1a816ebc63e4c0a'
 PROJECTION = {
@@ -38,37 +38,38 @@ PROJECTION = {
     "priorNativeSHA256": "d68266e78585d107a2371a52f94b5736f35ce73fbaa6ba3132a7341412f24dc8",
 }
 HISTORICAL = {
-    "recovery": {"run": 45897800508, "attempt": 1, "head": PARENT, "artifact": 15153569053,
-                 "artifactSHA256": "93ea3e84d2506b8d4073f21ed41dfd460841eb49b5d72df929de82858399201e"},
-    "lifecycle": {"run": 45889914630, "attempt": 1, "head": "fe6a15dbb3c43242cd6299eb96ec7471d21aa207",
-                  "artifact": 15150204945,
-                  "artifactSHA256": "95b70ca56ac762d72454aadcc4d20c657ab6a8b940a01de32b9d6a6004585866"},
+    "recovery": {"run": 45900142426, "attempt": 1, "head": PARENT, "artifact": 15155876118,
+                 "artifactSHA256": "42777579dc8434af5d3b90c8eab76310e2404c979ea8be355eab0f2131a934aa"},
+    "lifecycle": {"run": 45900142426, "attempt": 1, "head": PARENT, "artifact": 15155024207,
+                  "artifactSHA256": "418639e91a44be97e5c51285e084ed2b8b7628fbafa68277a5e876613321101d"},
 }
 PATCH_TREES = {
     "Q": "13a0159134235571a8a1a431d02d6afd362b4718",
     "S": "e77173b111fa67969131eb23b5eb8d7a8f148207",
     "T": "87b1608db30bcd6028a07b7ecbfe1886949d8ab8",
     "U": "d6abb02b268e93546c75ffc179d134f53f7e41d6",
+    "V": "79efa3b5dfefe0e3c1f1c5440e9a4e95c61158a1",
 }
-ARMS = {"P": BASE_TREE, "T": PATCH_TREES["T"], "U": PATCH_TREES["U"]}
+ARMS = {"P": BASE_TREE, "U": PATCH_TREES["U"], "V": PATCH_TREES["V"]}
 PATCHES = {
     "Q": (PROJECTION["mergeTree"], "a2c84ab8db37a7965c63f0a87befc0c5ab3875da2fb49235cc448b8975d8dccd"),
     "S": (PATCH_TREES["Q"], "42169934c30dd834f78222031bd50a7092bf2449615368d1fdea905cddef3ae2"),
     "T": (PATCH_TREES["S"], "4e5c6f5897a65b66ae85fbed7140ef57307173e6ce9f311f24c52f6b96a5dc16"),
     "U": (PATCH_TREES["T"], "dc9b089bb6c4933868e86ab88a4392a905dda333f5e83f2c39d753b0757898ff"),
+    "V": (PATCH_TREES["U"], "98a42aa26e85a613014d0bb5f7f3b02a7e67237c4d3eb0509540c9880a373dd2"),
 }
 DIAGNOSTIC_PATHS = (
     "M\t.github/workflows/diagnose-pg-durable.yml",
-    "A\tscripts/diagnostics/pg-durable-hosted/.payload/arm-U.patch.gz.b64",
+    "A\tscripts/diagnostics/pg-durable-hosted/.payload/arm-V.patch.gz.b64",
     "M\tscripts/diagnostics/pg-durable-hosted/.payload/inputs.sha256",
     "M\tscripts/diagnostics/pg-durable-hosted/hosted.py",
-    "M\tscripts/diagnostics/pg-durable-hosted/server.py",
 )
 MODULE_PINS = ("github.com/jackc/pgx/v5 v5.10.0", "golang.org/x/net v0.58.0")
 CHANGE_PATHS = {
     "S": ("migrate.go", "migration_attempt.go", "migration_execution_test.go"),
     "T": ("migrate.go", "migration_attempt.go", "migration_execution.go", "migration_execution_test.go"),
     "U": ("migration_execution.go",),
+    "V": ("migration_attempt.go", "migration_execution_test.go"),
 }
 RETRY_LEAF = "retry-after-invalid-index-repair"
 JOURNAL_LEAF = "first-journal-and-create-index"
@@ -79,9 +80,9 @@ BENCHMARKS = {"recovery": "BenchmarkDurableRecovery", "journal": "BenchmarkDurab
               "standalone": "BenchmarkMigrationPair"}
 PACKAGES = {"recovery": "recoverypair", "journal": "recoverypair", "standalone": "migratepair"}
 RECOVERY_FIXTURES = ("advisory_pair_test.go", "recovery_test.go")
-JOB_LANES = {"retry": ("recovery",), "lifecycle": ("journal", "standalone")}
+JOB_LANES = {"retry": ("recovery",)}
 PROCESS_PROTOCOLS = {
-    "recovery": "Identical retry-only 3x and journal+retry 1x to run 45897800508.",
+    "recovery": "Identical retry-only 3x and journal+retry 1x to run 45900142426.",
     "journal": "One journal leaf per process; run 45889914630 also selected retry in that process.",
     "standalone": "Only the two concurrent leaves share a process; run 45889914630 also selected two ordinary leaves.",
 }
@@ -103,7 +104,7 @@ def put(path, value):
 def payload():
     names = {"shared.py", "advisory_pair_test.go", "first_query_test.go", "migration_pair_test.go",
              "durable_reset_test.go", "used_holder_reuse_test.go", "capacity_public_test.go", "recovery_test.go",
-             "arm-Q.patch.gz.b64", "arm-R.patch.gz.b64", "arm-S.patch.gz.b64", "arm-T.patch.gz.b64", "arm-U.patch.gz.b64"}
+             "arm-Q.patch.gz.b64", "arm-R.patch.gz.b64", "arm-S.patch.gz.b64", "arm-T.patch.gz.b64", "arm-U.patch.gz.b64", "arm-V.patch.gz.b64"}
     entries = {}
     for line in (PAYLOAD / "inputs.sha256").read_text().splitlines():
         digest, name = line.split("  ", 1)
@@ -309,7 +310,7 @@ def sample(root, lane, name, arm, slots, slot, identities, iterations, evidence,
 
 
 def schedule(lane):
-    comparisons, controls = ("TU", "PU"), ("PP", "TT", "UU")
+    comparisons, controls = ("UV", "PV"), ("PP", "UU", "VV")
     control_count = {"recovery": 10, "journal": 10, "standalone": 5}[lane]
     for group, slots in enumerate(("ab", "ba"), 1):
         for pair in range(1, 11):
@@ -415,7 +416,7 @@ def replay(repo, root, evidence, entries):
                                   "projection": PROJECTION, "historical": HISTORICAL, "modulePins": MODULE_PINS,
                                   "patchTrees": PATCH_TREES, "migrationFilesByPatch": CHANGE_PATHS,
                                   "job": job, "processProtocols": {lane: PROCESS_PROTOCOLS[lane] for lane in lanes},
-                                  "comparisons": {"TU": "SQL indentation only", "PU": "remaining product costs"}})
+                                  "comparisons": {"UV": "retry receipt update execution mode", "PV": "remaining product costs"}})
     git = trees(repo, root)
     identities = {arm: prepare_arm(git, root, arm, env, evidence, lanes) for arm in ARMS}
     shared = runpy.run_path(str(PAYLOAD / "shared.py"))
