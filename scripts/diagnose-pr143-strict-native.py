@@ -329,6 +329,12 @@ def verify_alignment(evidence):
     def read(file):
         return json.loads(file.read_bytes())
 
+    flags = "-ldflags=-funcalign=64"
+    expected_policy = [
+        f"{arm}\tcompile-performance{'-baseline' if arm.startswith('base') else ''}\t{flags if arm.endswith('64') else ''}"
+        for arm in ARM_NAMES
+    ]
+    assert (evidence / "link-policy.tsv").read_text().splitlines() == expected_policy, "unexpected link policy"
     reference = evidence / "default-reference"
     layout = {}
     for arm in ARM_NAMES:
@@ -350,9 +356,8 @@ def verify_alignment(evidence):
         assert symbols == read(reference / f"{arm}.symbols.json"), (arm, "stock symbol drift")
         original_build = compiler_metadata(reference / f"{arm}.build.txt")
         assert compiler_metadata(evidence / f"{arm}.build.txt") == original_build, arm
-        aligned_build = compiler_metadata(evidence / f"{arm}64.build.txt")
-        flag = "\tbuild\t-ldflags=-funcalign=64"
-        assert aligned_build.count(flag) == 1 and [row for row in aligned_build if row != flag] == original_build, arm
+        # Go 1.27.1 omits linker flags from BuildInfo under -trimpath.
+        assert compiler_metadata(evidence / f"{arm}64.build.txt") == original_build, arm
 
         aligned, _, aligned_code = layout[arm + "64"]
         assert current["text"]["sha256"] != aligned["text"]["sha256"], (arm, "alignment absent")
