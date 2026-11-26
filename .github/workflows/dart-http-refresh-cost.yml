@@ -1,0 +1,50 @@
+name: Dart HTTP refresh performance
+
+on:
+  push:
+    branches: [diag/dart-http-refresh-cost]
+    paths:
+      - '.github/workflows/dart-http-refresh-cost.yml'
+      - '.github/diagnostics/dart-http-refresh/**'
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: Dart HTTP refresh / Linux x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.13.4'
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Bind the locked Dart arms and take paired samples
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/dart-http-refresh-evidence
+          python3 -I -B .github/diagnostics/dart-http-refresh/qualify.py collect \
+            --repo "$GITHUB_WORKSPACE" --scratch "$GITHUB_WORKSPACE/.tmp" \
+            --evidence "$GITHUB_WORKSPACE/.tmp/dart-http-refresh-evidence" \
+            | tee .tmp/dart-http-refresh-evidence/setup.jsonl
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: dart-http-refresh-linux-x64-${{ github.run_attempt }}
+          path: .tmp/dart-http-refresh-evidence/
+          if-no-files-found: error
+          retention-days: 14
