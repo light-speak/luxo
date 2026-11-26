@@ -15,6 +15,119 @@ type controlScope struct {
 	prefix string
 }
 
+// A Go expression closure that contains an outward return must remain in the
+// enclosing function. Only its generated value completion uses this target.
+type inlineValueScope struct {
+	controlScope
+	outer  *inlineValueScope
+	result string
+	when   *ast.WhenExpr
+	branch bool
+	page   string
+	yield  bool
+}
+
+func (c *compiler) expressionCompiler(expr ast.Expr) *compiler {
+	if !containsAwaitReturn(expr) {
+		return c.valueCompiler()
+	}
+	sub := c.statementCompiler()
+	sub.resultTmp++
+	sub.inlineValue = &inlineValueScope{
+		controlScope: controlScope{prefix: "_inlineExit", indent: c.indent},
+		outer:        c.inlineValue,
+		result:       "_inlineValue" + strconv.Itoa(sub.resultTmp),
+	}
+	return &sub
+}
+
+func containsAwaitReturn(expr ast.Expr) bool {
+	found := false
+	ast.WalkExpr(expr, func(value ast.Expr) {
+		if await, ok := value.(*ast.AwaitExpr); ok && !found {
+			ast.Walk(await.Body, ast.Visitor{Stmt: func(stmt ast.Stmt) {
+				if _, returned := stmt.(*ast.ReturnStmt); returned {
+					found = true
+				}
+			}})
+		}
+	})
+	return found
+}
+
+func (c *compiler) writeValueCompletion(indent, value string) {
+	if c.inlineValue == nil {
+		c.b.WriteString(c.indent)
+		c.b.WriteString(indent)
+		c.b.WriteString("return ")
+		c.b.WriteString(value)
+		c.b.WriteByte('\n')
+		return
+	}
+	c.writeInlineValue(c.inlineValue, indent, value)
+}
+
+func (c *compiler) writeConditionalValue(condition, value string) {
+	if c.inlineValue == nil {
+		c.write("if %s { return %s }", condition, value)
+		return
+	}
+	c.write("if %s {", condition)
+	c.writeValueCompletion("\t", value)
+	c.write("}")
+}
+
+func (c *compiler) writeInlineValue(scope *inlineValueScope, indent, value string) {
+	c.write("%s%s = %s", indent, scope.result, value)
+	c.write("%sbreak %s", indent, c.controlLabel(&scope.controlScope))
+}
+
+func (c *compiler) writeYieldResult(value string) {
+	for scope := c.inlineValue; scope != nil; scope = scope.outer {
+		if scope.yield {
+			c.writeInlineValue(scope, "", value)
+			return
+		}
+	}
+	c.write("return %s", value)
+}
+
+func (c *compiler) inlineWhenReturn() *inlineValueScope {
+	for scope := c.inlineValue; scope != nil; scope = scope.outer {
+		if scope.branch {
+			return scope
+		}
+	}
+	return nil
+}
+
+func (c *compiler) writeInlineWhenValue(scope *inlineValueScope, expr ast.Expr) {
+	value := "nil"
+	if expr != nil {
+		when := scope.when
+		var expected *ast.TypeRef
+		if when.IsNullable() {
+			expected = &ast.TypeRef{Name: when.GetTypeTag(), IsList: when.IsListType(), Nullable: true}
+		}
+		value = c.compileValueResult(expr, expected, scope.page, expected == nil && c.models[when.GetTypeTag()] != nil)
+	}
+	c.writeInlineValue(scope, "", value)
+}
+
+func (c *compiler) writeInlineValueScope(sub *compiler, goType, body string) string {
+	scope := sub.inlineValue
+	c.closureError = sub.closureError
+	c.write("var %s %s", scope.result, goType)
+	if scope.label != "" {
+		c.write("%s:", scope.label)
+	}
+	c.write("switch {")
+	c.write("default:")
+	c.b.WriteString(body)
+	c.write("}")
+	return scope.result
+}
+
 func (c *compiler) controlLabel(scope *controlScope) string {
 	if scope.label == "" {
 		c.resultTmp++
@@ -95,8 +208,9 @@ func (c *compiler) statementCompiler() compiler {
 
 func (c *compiler) compileWhenStatement(expr *ast.WhenExpr) {
 	sub := c.statementCompiler()
+	sub.inlineWhen = false
+	sub.statementWhen = nil
 	scope := &controlScope{prefix: "_when", indent: c.indent}
-	sub.whenScope = scope
 	subject := ""
 	if expr.Subject != nil {
 		subject = sub.compileBooleanValue(expr.Subject)
@@ -107,6 +221,7 @@ func (c *compiler) compileWhenStatement(expr *ast.WhenExpr) {
 			subject = name
 		}
 	}
+	sub.statementWhen = scope
 	scope.header = sub.b.Len()
 	sub.write("switch {")
 	sub.write("default:")

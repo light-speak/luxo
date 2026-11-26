@@ -29,17 +29,18 @@ type pageValue struct {
 }
 
 type paginationAnalysis struct {
-	models    map[string]*ast.ModelDecl
-	functions map[string]*ast.FnDecl
-	scopes    []map[string]pageValue
-	values    map[ast.Expr]pageValue
-	branches  map[ast.Expr]bool
-	queries   []ast.Expr
-	returns   []pageValue
-	used      map[ast.Expr]bool
-	invalid   map[ast.Expr]token.Position
-	active    map[string]bool
-	depth     int
+	models       map[string]*ast.ModelDecl
+	functions    map[string]*ast.FnDecl
+	scopes       []map[string]pageValue
+	values       map[ast.Expr]pageValue
+	branches     map[ast.Expr]bool
+	queries      []ast.Expr
+	returns      []pageValue
+	used         map[ast.Expr]bool
+	invalid      map[ast.Expr]token.Position
+	active       map[string]bool
+	depth        int
+	publicReturn bool
 }
 
 // PlanPagination rejects database transforms whose final window cannot be
@@ -111,8 +112,13 @@ func (p *paginationAnalysis) block(body *ast.Block, bindings map[string]pageValu
 	if body == nil {
 		return pageValue{}
 	}
+	parentReturn := p.publicReturn
+	p.publicReturn = public
 	p.scopes = append(p.scopes, bindings)
-	defer func() { p.scopes = p.scopes[:len(p.scopes)-1] }()
+	defer func() {
+		p.scopes = p.scopes[:len(p.scopes)-1]
+		p.publicReturn = parentReturn
+	}()
 	var result pageValue
 	for index, statement := range body.Stmts {
 		if expr, ok := statement.(*ast.ExprStmt); ok && last && index == len(body.Stmts)-1 {

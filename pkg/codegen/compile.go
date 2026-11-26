@@ -530,21 +530,24 @@ type compiler struct {
 	pageSlots          map[ast.Expr]string
 	pageResult         string
 	pagingQuery        bool
-	ptrTmpCount        int                              // counter for hoisted pointer temp vars (nullable create args)
-	resultTmp          int                              // counter for Result<T> values lowered from Go's (T, error)
-	aggregateTmp       int                              // counter for fused await aggregate result slices
-	nativeFunctions    map[string]bool                  // @native fn names available through app.Resolver
-	functions          map[string]*ast.FnDecl           // function declarations available for static call lowering
-	staticFunctions    map[string]string                // standalone generated call targets
-	selectionFunctions map[string]bool                  // local functions that consume client field selection
-	clientSelection    string                           // generated expression for the current request selection
-	functionResult     *ast.TypeRef                     // non-nil while compiling a local fn body
-	valueResult        *ast.TypeRef                     // declared nullable list ABI of a value closure
-	inFunction         bool                             // true while compiling a local fn rather than a transport handler
-	valueClosure       bool                             // Go value boundary; never writes a transport response
-	loopScope          *controlScope                    // Nearest explicit loop in the current Go function.
-	whenScope          *controlScope                    // Statement-when branch return boundary in this Go function.
-	valueModel         bool                             // value closure returns a model pointer, not a local model value
+	ptrTmpCount        int                    // counter for hoisted pointer temp vars (nullable create args)
+	resultTmp          int                    // counter for Result<T> values lowered from Go's (T, error)
+	aggregateTmp       int                    // counter for fused await aggregate result slices
+	nativeFunctions    map[string]bool        // @native fn names available through app.Resolver
+	functions          map[string]*ast.FnDecl // function declarations available for static call lowering
+	staticFunctions    map[string]string      // standalone generated call targets
+	selectionFunctions map[string]bool        // local functions that consume client field selection
+	clientSelection    string                 // generated expression for the current request selection
+	functionResult     *ast.TypeRef           // non-nil while compiling a local fn body
+	valueResult        *ast.TypeRef           // declared nullable list ABI of a value closure
+	inFunction         bool                   // true while compiling a local fn rather than a transport handler
+	valueClosure       bool                   // Go value boundary; never writes a transport response
+	inlineWhen         bool
+	valueModel         bool          // value closure returns a model pointer, not a local model value
+	loopScope          *controlScope // Nearest explicit loop in the current Go function.
+	whenScope          *controlScope // Lexical return target inside a discarded when block arm.
+	statementWhen      *controlScope // Branch emission target for the current discarded when.
+	inlineValue        *inlineValueScope
 	closureError       string                           // local failure slot for an immediately invoked value closure
 	loadSelections     map[*ast.NamedArg]loadProjection // exact load expression → compiled demand
 	querySelections    map[ast.Expr]loadProjection
@@ -770,15 +773,15 @@ func (c *compiler) compileReturn(s *ast.ReturnStmt) {
 		c.write("break %s", c.controlLabel(c.whenScope))
 		return
 	}
+	if branch := c.inlineWhenReturn(); branch != nil {
+		c.writeInlineWhenValue(branch, s.Value)
+		return
+	}
 	if c.valueClosure {
 		if s.Value == nil {
 			c.write("return nil")
 		} else {
-			expression := c.compileAssignedValue(s.Value, c.valueResult)
-			expression = c.pageBranchValue(c.pageResult, s.Value, expression)
-			if c.valueModel {
-				expression = c.modelReference(s.Value, expression)
-			}
+			expression := c.compileValueResult(s.Value, c.valueResult, c.pageResult, c.valueModel)
 			c.write("return %s", expression)
 		}
 		return
@@ -1396,9 +1399,9 @@ func (c *compiler) compileBlockExpr(expr ast.Expr) string {
 				} else {
 					c.write("%s := %s", name, val)
 				}
-				c.write("return &%s", name)
+				c.writeYieldResult("&" + name)
 			} else {
-				c.write("return %s", val)
+				c.writeYieldResult(val)
 			}
 		} else {
 			c.write("_yieldResult = %s", val)
@@ -3249,7 +3252,7 @@ func (c *compiler) compileTemplate(e *ast.TemplateString) string {
 			return fmt.Sprintf("%q", lit.Value)
 		}
 	}
-	sub := c.valueCompiler()
+	sub := c.expressionCompiler(e)
 	sub.indent = c.indent + "\t"
 	parts := make([]compiledTemplatePart, len(e.Parts))
 	sizes := make([]string, len(e.Parts))
@@ -3266,7 +3269,7 @@ func (c *compiler) compileTemplate(e *ast.TemplateString) string {
 		}
 		sub.write("_sb.%s(%s)", method, part.value)
 	}
-	sub.write("return _sb.String()")
+	sub.writeValueCompletion("", "_sb.String()")
 	return c.finishValueClosure(sub, "string", sub.b.String())
 }
 

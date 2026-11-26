@@ -28,6 +28,15 @@ func TestPaginationPlanFinalListLineage(t *testing.T) {
 		{"builder_alias", "", `val query = Node.where(id > 1) return query.all()`, 1, false},
 		{"find", "", `return Node.findMany(id: 1)`, 1, false},
 		{"identity_loop", "", `val rows = Node.all() return for row in rows { row }`, 1, false},
+		{"yielded_lookup_argument", "", `val selected = for id in [1] { if choose { yield id } }
+return Node.findMany(id: selected ?: 1)`, 1, false},
+		{"yielded_loop_return_keeps_query_owner", "", `val rows = Node.all()
+val selected = for id in [1] {
+if choose { yield id }
+return rows
+rows.size()
+}
+return Node.findMany(id: selected ?: 1)`, 2, false},
 		{"identity_map", "", `return Node.all().map { row -> row }`, 1, false},
 		{"when_queries", "", `return when { choose -> Node.where(id == 1).all() else -> Node.all() }`, 2, false},
 		{"discarded_query", "", `Node.where(id == 2).all() return Node.all()`, 1, false},
