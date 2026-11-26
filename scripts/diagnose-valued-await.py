@@ -188,7 +188,13 @@ def main():
         os.environ.update(GOCACHE=str(cache), TMPDIR=tmp, GOTMPDIR=tmp)
         env = {**os.environ, "GOWORK": "off"}
         run("sh", "scripts/setup-modules.sh", str(root), cwd=root, env=env)
-        run("go", "list", "-deps", "-test", "./pkg/codegen", cwd=root, env={**env, "GOWORK": str(root/"go.work")})
+        workspace = {**env, "GOWORK": str(root / "go.work")}
+        run("go", "list", "-deps", "-test", "./pkg/codegen", cwd=root, env=workspace)
+        # Generated handlers can use runtime packages the compiler never imports.
+        runtime_packages = ("./pkg/lux/api", "./pkg/lux/pg")
+        run("go", "list", "-deps", *runtime_packages, cwd=root, env=workspace)
+        offline = {**workspace, "GOPROXY": "off", "GOSUMDB": "off"}
+        run("go", "list", "-deps", *runtime_packages, cwd=root, env=offline)
         bin_path = work / "bin"
         bin_path.mkdir()
         run("go", "build", "-o", str(bin_path) + "/", "./scripts/benchplan", "./scripts/benchgate", cwd=root, env=env)

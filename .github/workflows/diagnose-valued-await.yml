@@ -32,9 +32,9 @@ jobs:
         run: |
           set -euo pipefail
           test "$RUNNER_KIND" = github-hosted
-          test "$(git -C .tmp/await-driver show -s --format=%P HEAD)" = eaf2aac9e920135babd24b58f2a2e800ebdc44e8
-          diff -u <(printf '%s\n' .github/workflows/diagnose-valued-await.yml scripts/diagnose-valued-await-inputs.zip scripts/diagnose-valued-await.py) \
-            <(git -C .tmp/await-driver diff-tree --no-commit-id --name-only -r HEAD)
+          test "$(git -C .tmp/await-driver show -s --format=%P HEAD)" = d8e5e2ec98011ea25f0d99653e089dda60471184
+          diff -u <(printf 'M\t%s\n' .github/workflows/diagnose-valued-await.yml scripts/diagnose-valued-await.py) \
+            <(git -C .tmp/await-driver diff-tree --no-commit-id --name-status -r HEAD)
           export LC_ALL=C
           python3 -I -B .tmp/await-driver/scripts/diagnose-valued-await.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.tmp/await-native-evidence"
       - uses: actions/upload-artifact@v7.0.2
