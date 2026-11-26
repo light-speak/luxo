@@ -1,0 +1,48 @@
+name: Check PostgreSQL journal statement construction on native ARM64
+on:
+  push:
+    branches: [diagnostics/pg-intent-latency]
+    paths:
+      - '.github/workflows/diagnose-pg-intent-latency.yml'
+      - 'scripts/diagnostics/pg-intent-latency/**'
+permissions:
+  contents: read
+jobs:
+  construction:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pg-intent-latency'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Fetch the exact product source for the inherited patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=15765dee6705d39de0b5a505d3039d59ebf43584
+          git fetch --depth=1 --no-tags origin "$base"
+          test "$(git rev-parse FETCH_HEAD)" = "$base"
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+          cache: false
+      - name: Check the original processor and sample paired statements
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          export LC_ALL=C
+          python3 -I -B scripts/diagnostics/pg-intent-latency/hosted.py run "$GITHUB_WORKSPACE"
+      - name: Preserve all raw processes and control comparisons
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pg-intent-latency-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pg-intent-latency-evidence/
+          if-no-files-found: error
+          retention-days: 14
