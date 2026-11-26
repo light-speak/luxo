@@ -90,7 +90,7 @@ collect_host > "$evidence/environment.txt"
 mkdir "$scratch/bin" "$scratch/source"
 for role in base head; do
   src="$scratch/source/$role"
-  mkdir -p "$src/.tmp" "$scratch/bin/$role"
+  mkdir -p "$src/.tmp"
   tree="$base_tree"
   if [[ "$role" == head ]]; then tree="$head_tree"; fi
   "${graft[@]}" archive "$tree" | tar -xf - -C "$src"
@@ -138,7 +138,7 @@ for role in base head; do
     binary_name=${package//\//-}
     if [[ "$profile" != default ]]; then binary_name+="-$profile"; fi
     binary="$bin/$binary_name.test"
-    go tool nm -size "$binary" | awk -v rx="$symbols" '$4 ~ rx' > "$evidence/symbols-$role-$case_id.nm"
+    go tool nm -size "$binary" | grep -E -- "$symbols" > "$evidence/symbols-$role-$case_id.nm"
     go tool objdump -s "$symbols" "$binary" > "$evidence/symbols-$role-$case_id.objdump"
     [[ -s "$evidence/symbols-$role-$case_id.nm" ]]
     [[ -s "$evidence/symbols-$role-$case_id.objdump" ]]
