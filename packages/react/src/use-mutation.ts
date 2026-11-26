@@ -63,7 +63,11 @@ export function useLuxoMutation<T, V = void>(
       const invalidations = typeof currentOptions.invalidateQueries === 'function'
         ? currentOptions.invalidateQueries(result, variables)
         : currentOptions.invalidateQueries
-      for (const queryKey of invalidations ?? []) queryClient.invalidateQueries({ queryKey })
+      if (invalidations?.length === 1) {
+        queryClient.invalidateQueries({ queryKey: invalidations[0] })
+      } else if (invalidations?.length) {
+        queryClient.invalidateQueries(invalidations.map(queryKey => ({ queryKey })))
+      }
       if (mountedRef.current && generation === generationRef.current) setData(result)
       return result
     } catch (e) {
