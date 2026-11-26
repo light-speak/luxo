@@ -189,6 +189,8 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
 			return errors.New("Luvia convenience keys profile requires the twenty verified benchmark leaves")
 		}
+	default:
+		return verifyAPIWholeFixtureLeaves(profile, isolated)
 	}
 	return nil
 }
@@ -241,13 +243,39 @@ func verifyResolvedFieldsInventory(isolated inventory) error {
 	return nil
 }
 
+func verifyAPIWholeFixtureLeaves(profile string, isolated inventory) error {
+	switch profile {
+	case benchlayout.APIIdentityConditionProfile:
+		const root = benchlayout.APIIdentityConditionBenchmark
+		leaves := benchmarkCaseProduct([]string{"empty", "member", "missing", "wrong-kind"},
+			[]string{"EnumChecked", "EnumReference", "OwnChecked", "OwnReference", "TextChecked", "TextReference"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("API identity condition profile requires the 24 verified benchmark leaves")
+		}
+	case benchlayout.APIHandlerPanicProfile:
+		const root = benchlayout.APIHandlerPanicBenchmark
+		leaves := benchmarkCaseProduct([]string{"BusinessError", "OpaquePanic", "StringPanic", "Success"}, []string{"Before", "After"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("API handler panic profile requires the eight verified benchmark leaves")
+		}
+	case benchlayout.APIWebSocketRegistrationsProfile:
+		const root = benchlayout.APIWebSocketRegistrationsBenchmark
+		leaves := benchmarkCaseProduct([]string{"size=1", "size=8", "size=64"}, []string{"checked", "former"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("API WebSocket registration profile requires the six verified benchmark leaves")
+		}
+	}
+	return nil
+}
+
 func verifyAPINonIdentityCompanions(ordinary, isolated inventory) error {
 	// Discovery still checks the broad binary before assigning these roots
 	// exclusively to their corresponding sampling binaries.
 	for root, leaves := range ordinary {
 		switch benchlayout.ProfileForBenchmark(benchlayout.APIPackage, root) {
 		case benchlayout.APILocalRouteExportProfile, benchlayout.APICanonicalJSONProfile,
-			benchlayout.APIBinaryParamLookupProfile, benchlayout.APIRequestLogProfile:
+			benchlayout.APIBinaryParamLookupProfile, benchlayout.APIRequestLogProfile,
+			benchlayout.APIHandlerPanicProfile, benchlayout.APIWebSocketRegistrationsProfile:
 			if !maps.Equal(leaves, isolated[root]) {
 				return fmt.Errorf("API non-identity profile must retain the ordinary %s inventory", root)
 			}

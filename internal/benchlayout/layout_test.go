@@ -166,7 +166,14 @@ func TestLuviaAuthProfileRequiresPackageAndExactRoot(t *testing.T) {
 
 func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 	for _, tc := range []struct{ pkg, name, want string }{
-		{APIPackage, "BenchmarkIdentityConditionValidity/member/EnumChecked-2", DefaultProfile},
+		{APIPackage, "BenchmarkIdentityConditionValidity/member/EnumChecked-2", "api-identity-condition"},
+		{APIPackage, "BenchmarkHandlerPanicFormatting/OpaquePanic/After-2", "api-handler-panic"},
+		{APIPackage, "BenchmarkWSConnectionRegistrations/size=64/checked-2", "api-websocket-registrations"},
+		{APIPackage, "BenchmarkHandlerDetachedResponseBuffer-2", APINonIdentityProfile},
+		{APIPackage, "BenchmarkHandlerResponseBuffer/Int-2", APINonIdentityProfile},
+		{APIPackage, "BenchmarkWSConnectionRegistrationCold/false-2", APINonIdentityProfile},
+		{APIPackage, "BenchmarkWSConnectionRegistrationsSibling-2", APINonIdentityProfile},
+		{RPCPackage, "BenchmarkHandlerPanicFormatting", DefaultProfile},
 		{APIPackage, "BenchmarkIdentityEnumArray", DefaultProfile},
 		{APIPackage, "BenchmarkIdentitySubjectVisibility", DefaultProfile},
 		{APIPackage, "BenchmarkIdentitySurface", APINonIdentityProfile},
@@ -236,6 +243,9 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{APICanonicalJSONProfile, "^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$"},
 		{APIBinaryParamLookupProfile, "^BenchmarkBinaryParamLookup$"},
 		{APIRequestLogProfile, "^BenchmarkRequestLogBoundary$|^BenchmarkRequestLogDelivered$"},
+		{"api-identity-condition", "^BenchmarkIdentityConditionValidity$"},
+		{"api-handler-panic", "^BenchmarkHandlerPanicFormatting$"},
+		{"api-websocket-registrations", "^BenchmarkWSConnectionRegistrations$"},
 	}
 	if !reflect.DeepEqual(apiProfiles, wantAPI) || ValidPerformanceProfile(RPCPackage, APIBinaryParamLookupProfile) ||
 		ValidPerformanceProfile(RPCPackage, APIRequestLogProfile) {
