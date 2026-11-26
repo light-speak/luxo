@@ -31,14 +31,22 @@ const (
 
 	APILocalRouteExportProfile   = "api-local-route-export"
 	APILocalRouteExportBenchmark = "BenchmarkLocalRouteExport"
+	APICanonicalJSONProfile      = "api-canonical-json"
 
 	LuviaMergeDestinationProfile   = "luvia-merge-destination"
 	LuviaMergeDestinationBenchmark = "BenchmarkMergeDestination"
+
+	LuviaResolvedFieldsProfile   = "luvia-resolved-fields"
+	LuviaResolvedFieldsBenchmark = "BenchmarkValidateResolvedFields"
 )
 
 var apiIdentityRoots = []string{
 	"BenchmarkIdentityConditionValidity", "BenchmarkIdentityEnumArray", "BenchmarkIdentitySubjectVisibility",
 }
+
+const apiCanonicalJSONPrefix = "BenchmarkCanonicalJSON"
+
+var apiCanonicalJSONFamilies = []string{"Structured", "Typed", "Bytes", "Float", "Value", "Integer"}
 
 var luviaIsolatedRoots = []string{"BenchmarkPrimaryKeys", "BenchmarkTraceEncodingComparison"}
 
@@ -58,6 +66,9 @@ func ProfileForBenchmark(pkg, name string) string {
 		if root == APILocalRouteExportBenchmark {
 			return APILocalRouteExportProfile
 		}
+		if family, ok := strings.CutPrefix(root, apiCanonicalJSONPrefix); ok && slices.Contains(apiCanonicalJSONFamilies, family) {
+			return APICanonicalJSONProfile
+		}
 		if !slices.Contains(apiIdentityRoots, root) {
 			return APINonIdentityProfile
 		}
@@ -67,6 +78,8 @@ func ProfileForBenchmark(pkg, name string) string {
 			return LuviaGatewayIdentityProfile
 		case LuviaMergeDestinationBenchmark:
 			return LuviaMergeDestinationProfile
+		case LuviaResolvedFieldsBenchmark:
+			return LuviaResolvedFieldsProfile
 		}
 		if slices.Contains(luviaIsolatedRoots, root) {
 			return LuviaPrimaryTraceProfile
@@ -100,12 +113,14 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 		return []IsolationSpec{
 			{APINonIdentityProfile, "."},
 			{APILocalRouteExportProfile, "^" + APILocalRouteExportBenchmark + "$"},
+			{APICanonicalJSONProfile, "^" + apiCanonicalJSONPrefix + "(" + strings.Join(apiCanonicalJSONFamilies, "|") + ")$"},
 		}
 	case LuviaPackage:
 		return []IsolationSpec{
 			{LuviaPrimaryTraceProfile, "^" + strings.Join(luviaIsolatedRoots, "$|^") + "$"},
 			{LuviaGatewayIdentityProfile, "^" + LuviaGatewayIdentityBenchmark + "$"},
 			{LuviaMergeDestinationProfile, "^" + LuviaMergeDestinationBenchmark + "$"},
+			{LuviaResolvedFieldsProfile, "^" + LuviaResolvedFieldsBenchmark + "$"},
 		}
 	case CodegenPackage:
 		return []IsolationSpec{

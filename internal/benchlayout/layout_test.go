@@ -97,7 +97,10 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{APIPackage, "BenchmarkLocalRouteExport/routes=128/previous-2", "api-local-route-export"},
 		{APIPackage, "BenchmarkLocalRouteLookup", APINonIdentityProfile},
 		{APIPackage, "BenchmarkLocalRouteExportSibling", APINonIdentityProfile},
-		{APIPackage, "BenchmarkCanonicalJSONBytes", APINonIdentityProfile},
+		{APIPackage, "BenchmarkCanonicalJSONBytes", "api-canonical-json"},
+		{APIPackage, "BenchmarkCanonicalJSONTyped/boolean/1-2", "api-canonical-json"},
+		{APIPackage, "BenchmarkCanonicalJSONValue/object/after-2", "api-canonical-json"},
+		{APIPackage, "BenchmarkCanonicalJSONSibling", APINonIdentityProfile},
 		{LuviaPackage, "BenchmarkPrimaryKeys/row-small/keyLast=false/baseline=true-2", LuviaPrimaryTraceProfile},
 		{LuviaPackage, "BenchmarkTraceEncodingComparison", LuviaPrimaryTraceProfile},
 		{LuviaPackage, "BenchmarkGatewayIdentity", LuviaGatewayIdentityProfile},
@@ -106,6 +109,11 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{LuviaPackage, "BenchmarkMergeDestination", "luvia-merge-destination"},
 		{LuviaPackage, "BenchmarkMergeDestination/columnar=true/rows=1/direct=true-2", "luvia-merge-destination"},
 		{LuviaPackage, "BenchmarkMergeDestinationSibling", DefaultProfile},
+		{LuviaPackage, "BenchmarkValidateResolvedFields", "luvia-resolved-fields"},
+		{LuviaPackage, "BenchmarkValidateResolvedFields/list-small-128x16/per-value-2", "luvia-resolved-fields"},
+		{LuviaPackage, "BenchmarkValidateResolvedFieldsSibling", DefaultProfile},
+		{LuviaPackage, "BenchmarkGroupedResponse", DefaultProfile},
+		{CodegenPackage, "BenchmarkValidateResolvedFields", DefaultProfile},
 		{LuviaPackage, "BenchmarkGatewayStandardStartStop", DefaultProfile},
 		{CodegenPackage, "BenchmarkMergeDestination", DefaultProfile},
 		{CodegenPackage, "BenchmarkGatewayIdentity", DefaultProfile},
@@ -132,14 +140,17 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		}
 	}
 	apiProfiles := IsolationProfiles(APIPackage)
-	if len(apiProfiles) != 2 || apiProfiles[0] != (IsolationSpec{APINonIdentityProfile, "."}) ||
-		apiProfiles[1] != (IsolationSpec{"api-local-route-export", "^BenchmarkLocalRouteExport$"}) {
+	if len(apiProfiles) != 3 || apiProfiles[0] != (IsolationSpec{APINonIdentityProfile, "."}) ||
+		apiProfiles[1] != (IsolationSpec{"api-local-route-export", "^BenchmarkLocalRouteExport$"}) ||
+		apiProfiles[2] != (IsolationSpec{"api-canonical-json", "^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$"}) {
 		t.Fatalf("unexpected API profiles: %v", apiProfiles)
 	}
 	profiles := IsolationProfiles(LuviaPackage)
-	if len(profiles) != 3 || profiles[0] != (IsolationSpec{LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"}) ||
+	if len(profiles) != 4 || profiles[0] != (IsolationSpec{LuviaPrimaryTraceProfile, "^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$"}) ||
 		profiles[1] != (IsolationSpec{LuviaGatewayIdentityProfile, "^BenchmarkGatewayIdentity$"}) ||
 		profiles[2] != (IsolationSpec{"luvia-merge-destination", "^BenchmarkMergeDestination$"}) ||
+		profiles[3] != (IsolationSpec{"luvia-resolved-fields", "^BenchmarkValidateResolvedFields$"}) ||
+		ValidPerformanceProfile(CodegenPackage, "luvia-resolved-fields") ||
 		ValidPerformanceProfile(CodegenPackage, LuviaGatewayIdentityProfile) ||
 		ValidPerformanceProfile(CodegenPackage, "luvia-merge-destination") {
 		t.Fatalf("unexpected Luvia isolation: %v", profiles)

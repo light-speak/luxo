@@ -108,13 +108,9 @@ func verifyProfileInventory(args []string) error {
 		return err
 	}
 	if profile == benchlayout.APINonIdentityProfile {
-		// Keep the broad binary's layout and verify discovery before its export
-		// leaves are assigned exclusively to the dedicated sampling binary.
-		const route = benchlayout.APILocalRouteExportBenchmark
-		if !maps.Equal(ordinary[route], isolated[route]) {
-			return errors.New("API non-identity profile must retain the ordinary local route export inventory")
+		if err := verifyAPINonIdentityCompanions(ordinary, isolated); err != nil {
+			return err
 		}
-		delete(isolated, route)
 	}
 	for root := range ordinary {
 		receiverCompanion := profile == benchlayout.CodegenMigrationStateProfile && root == benchlayout.CodegenReceiverBenchmark
@@ -125,6 +121,10 @@ func verifyProfileInventory(args []string) error {
 	if len(ordinary) == 0 || !maps.EqualFunc(ordinary, isolated, maps.Equal[map[string]struct{}]) {
 		return fmt.Errorf("benchmark profile %q must reproduce its exact ordinary benchmark inventory", profile)
 	}
+	return verifyProfileLeaves(profile, isolated)
+}
+
+func verifyProfileLeaves(profile string, isolated inventory) error {
 	switch profile {
 	case benchlayout.LuxShortPathProfile:
 		return verifyLuxShortPathInventory(isolated)
@@ -143,6 +143,8 @@ func verifyProfileInventory(args []string) error {
 			"routes=16/current", "routes=128/previous", "routes=128/current") {
 			return errors.New("API local route export profile requires the six verified export leaves")
 		}
+	case benchlayout.APICanonicalJSONProfile:
+		return verifyAPICanonicalJSONInventory(isolated)
 	case benchlayout.LuviaGatewayIdentityProfile:
 		const root = benchlayout.LuviaGatewayIdentityBenchmark
 		if !verifiedBenchmarkLeaves(isolated[root], root, "anonymous/before", "anonymous/after", "authenticated/before",
@@ -157,8 +159,74 @@ func verifyProfileInventory(args []string) error {
 			"columnar=true/rows=128/direct=false", "columnar=true/rows=128/direct=true") {
 			return errors.New("Luvia merge destination profile requires the six verified merge leaves")
 		}
+	case benchlayout.LuviaResolvedFieldsProfile:
+		return verifyResolvedFieldsInventory(isolated)
 	}
 	return nil
+}
+
+func verifyResolvedFieldsInventory(isolated inventory) error {
+	const root = benchlayout.LuviaResolvedFieldsBenchmark
+	if !verifiedBenchmarkLeaves(isolated[root], root,
+		"object-2/per-value", "object-2/column-check",
+		"list-small-128x16/per-value", "list-small-128x16/column-check",
+		"list-wide-128x16/per-value", "list-wide-128x16/column-check") {
+		return errors.New("Luvia resolved fields profile requires the six verified validation leaves")
+	}
+	return nil
+}
+
+func verifyAPINonIdentityCompanions(ordinary, isolated inventory) error {
+	// Discovery still checks the broad binary before assigning these roots
+	// exclusively to their corresponding sampling binaries.
+	for root, leaves := range ordinary {
+		switch benchlayout.ProfileForBenchmark(benchlayout.APIPackage, root) {
+		case benchlayout.APILocalRouteExportProfile, benchlayout.APICanonicalJSONProfile:
+			if !maps.Equal(leaves, isolated[root]) {
+				return fmt.Errorf("API non-identity profile must retain the ordinary %s inventory", root)
+			}
+			delete(isolated, root)
+		}
+	}
+	return nil
+}
+
+func verifyAPICanonicalJSONInventory(isolated inventory) error {
+	for family, cases := range canonicalJSONCases() {
+		root := "BenchmarkCanonicalJSON" + family
+		if !verifiedBenchmarkLeaves(isolated[root], root, cases...) {
+			return fmt.Errorf("API CanonicalJSON profile requires the exact %s leaf inventory", family)
+		}
+	}
+	return nil
+}
+
+func canonicalJSONCases() map[string][]string {
+	counts := []string{"-1", "0", "1", "128"}
+	sizes := []string{"0", "1", "16", "128"}
+	versions := []string{"before", "after"}
+	return map[string][]string{
+		"Structured": counts,
+		"Typed": append(benchmarkCaseProduct(
+			[]string{"string", "escaped", "boolean", "date", "uuid", "decimal", "enum", "unique", "long1KB"}, counts), "chinese72KB/-1"),
+		"Bytes": benchmarkCaseProduct(
+			[]string{"empty", "small", "escaped", "long72KB", "escaped4096", "list0", "list1", "list128", "escapedList128"},
+			[]string{"decode", "canonical"}),
+		"Float": benchmarkCaseProduct(sizes, versions),
+		"Value": benchmarkCaseProduct(
+			[]string{"integer", "object", "list0", "integerList1", "stringList1", "list1", "list16", "list128"}, versions),
+		"Integer": benchmarkCaseProduct(sizes, versions),
+	}
+}
+
+func benchmarkCaseProduct(values, variants []string) []string {
+	cases := make([]string, 0, len(values)*len(variants))
+	for _, value := range values {
+		for _, variant := range variants {
+			cases = append(cases, value+"/"+variant)
+		}
+	}
+	return cases
 }
 
 func verifyCodegenReceiverInventory(isolated inventory) error {
