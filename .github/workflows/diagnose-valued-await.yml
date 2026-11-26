@@ -1,0 +1,46 @@
+name: Qualify the valued await compiler
+on:
+  push:
+    branches: [diagnostics/valued-await-eaf2]
+    paths: ['.github/workflows/diagnose-valued-await.yml', 'scripts/diagnose-valued-await*']
+permissions:
+  contents: read
+jobs:
+  compiler:
+    if: github.repository == 'light-speak/luxo'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: eaf2aac9e920135babd24b58f2a2e800ebdc44e8
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: .tmp/await-driver
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Run direct A/C with two independent groups
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          test "$(git -C .tmp/await-driver show -s --format=%P HEAD)" = eaf2aac9e920135babd24b58f2a2e800ebdc44e8
+          diff -u <(printf '%s\n' .github/workflows/diagnose-valued-await.yml scripts/diagnose-valued-await-inputs.zip scripts/diagnose-valued-await.py) \
+            <(git -C .tmp/await-driver diff-tree --no-commit-id --name-only -r HEAD)
+          export LC_ALL=C
+          python3 -I -B .tmp/await-driver/scripts/diagnose-valued-await.py "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/.tmp/await-native-evidence"
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: valued-await-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/await-native-evidence/
+          if-no-files-found: error
+          retention-days: 14
