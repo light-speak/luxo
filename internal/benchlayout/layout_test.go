@@ -307,3 +307,24 @@ func TestLuxShortPathProfileRequiresPackageAndExactRoots(t *testing.T) {
 		t.Fatalf("unexpected Lux isolation: %v", profiles)
 	}
 }
+
+func TestReadinessBenchmarkProfileIsolation(t *testing.T) {
+	cases := []struct {
+		pkg, leaf, profile string
+	}{
+		{"pkg/lux/rpc", "BenchmarkLRPCPreparedFrame/0/before-2", "rpc-prepared-frame"},
+		{"pkg/lux/queue", "BenchmarkQueueStreamName/tasks/after-2", "queue-stream-name"},
+		{"pkg/lux/rpc", "BenchmarkLRPCFrame/0-2", DefaultProfile},
+		{"pkg/lux/queue", "BenchmarkMemoryQueue/1-2", DefaultProfile},
+	}
+	for _, tc := range cases {
+		t.Run(tc.leaf, func(t *testing.T) {
+			if got := ProfileForBenchmark(tc.pkg, tc.leaf); got != tc.profile {
+				t.Fatalf("profile = %q, want %q", got, tc.profile)
+			}
+			if !ValidPerformanceProfile(tc.pkg, tc.profile) {
+				t.Fatalf("discovery does not accept %q for %q", tc.profile, tc.pkg)
+			}
+		})
+	}
+}

@@ -173,20 +173,15 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 	case benchlayout.LuviaResolvedFieldsProfile:
 		return verifyResolvedFieldsInventory(isolated)
 	case benchlayout.RPCOwnedRequestProfile:
-		const root = benchlayout.RPCOwnedRequestBenchmark
-		leaves := benchmarkCaseProduct([]string{"0", "128", "4096", "65536"}, []string{"before", "owned"})
-		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
-			return errors.New("RPC owned-request profile requires the eight verified benchmark leaves")
-		}
+		return verifyRPCOwnedRequestInventory(isolated)
 	case benchlayout.RPCDeadlineProfile:
-		const root = benchlayout.RPCDeadlineBenchmark
-		leaves := benchmarkCaseProduct([]string{"NoDeadline", "Cancelled", "ExpiredEOF", "FutureTimeout", "ExpiredTimeout", "WrappedTimeout"},
-			[]string{"Before", "After"})
-		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
-			return errors.New("RPC deadline classification profile requires the twelve verified benchmark leaves")
-		}
+		return verifyRPCDeadlineInventory(isolated)
 	case benchlayout.RPCNilContextGuardProfile:
 		return verifyRPCNilContextGuardInventory(isolated)
+	case benchlayout.RPCPreparedFrameProfile:
+		return verifyPairedBenchmarkInventory(isolated, benchlayout.RPCPreparedFrameBenchmark, "0", "128", "4096", "65536")
+	case benchlayout.QueueStreamNameProfile:
+		return verifyPairedBenchmarkInventory(isolated, benchlayout.QueueStreamNameBenchmark, "tasks", "email.send", "email_send")
 	case benchlayout.LuviaConvenienceKeysProfile:
 		const root = benchlayout.LuviaConvenienceKeysBenchmark
 		leaves := benchmarkCaseProduct([]string{"row-small", "row-wide", "column-small", "column-batch", "column-many"},
@@ -194,6 +189,33 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
 			return errors.New("Luvia convenience keys profile requires the twenty verified benchmark leaves")
 		}
+	}
+	return nil
+}
+
+func verifyRPCOwnedRequestInventory(isolated inventory) error {
+	const root = benchlayout.RPCOwnedRequestBenchmark
+	leaves := benchmarkCaseProduct([]string{"0", "128", "4096", "65536"}, []string{"before", "owned"})
+	if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+		return errors.New("RPC owned-request profile requires the eight verified benchmark leaves")
+	}
+	return nil
+}
+
+func verifyRPCDeadlineInventory(isolated inventory) error {
+	const root = benchlayout.RPCDeadlineBenchmark
+	leaves := benchmarkCaseProduct([]string{"NoDeadline", "Cancelled", "ExpiredEOF", "FutureTimeout", "ExpiredTimeout", "WrappedTimeout"},
+		[]string{"Before", "After"})
+	if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+		return errors.New("RPC deadline classification profile requires the twelve verified benchmark leaves")
+	}
+	return nil
+}
+
+func verifyPairedBenchmarkInventory(isolated inventory, root string, inputs ...string) error {
+	leaves := benchmarkCaseProduct(inputs, []string{"before", "after"})
+	if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+		return fmt.Errorf("%s profile requires the %d verified benchmark leaves", root, len(leaves))
 	}
 	return nil
 }

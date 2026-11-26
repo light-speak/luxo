@@ -54,6 +54,83 @@ func TestCodecReaderInventoryRequiresExactPartition(t *testing.T) {
 	}
 }
 
+func TestPairedBenchmarkProfilesRequireTheirExactInventories(t *testing.T) {
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	for _, tc := range []struct {
+		pkg, profile, root, defaultRoot string
+		inputs                          []string
+	}{
+		{"pkg/lux/rpc", "rpc-prepared-frame", "BenchmarkLRPCPreparedFrame", "BenchmarkLRPCConnectionFrameReuseCandidate", []string{"0", "128", "4096", "65536"}},
+		{"pkg/lux/queue", "queue-stream-name", "BenchmarkQueueStreamName", "BenchmarkMemoryRepeatedClose", []string{"tasks", "email.send", "email_send"}},
+	} {
+		t.Run(tc.profile, func(t *testing.T) {
+			var body strings.Builder
+			for _, input := range tc.inputs {
+				body.WriteString(tc.root + "/" + input + "/before" + measurement)
+				body.WriteString(tc.root + "/" + input + "/after" + measurement)
+			}
+			full := body.String()
+			first := tc.root + "/" + tc.inputs[0] + "/before" + measurement
+			missing := strings.TrimPrefix(full, first)
+			rename := tc.root + "/" + tc.inputs[0] + "/other" + measurement + missing
+			extra := full + tc.root + "/unverified/after" + measurement
+			sibling := tc.defaultRoot + measurement
+			root := benchmarkTempDir(t)
+			ordinary, isolated := root+"/ordinary.log", root+"/isolated.log"
+			args := []string{"--verify-profile-inventory", tc.pkg, tc.profile, ordinary, isolated}
+			for _, sample := range []struct {
+				name, ordinary, isolated string
+				valid                    bool
+			}{
+				{"full", full, full, true}, {"missing-isolated", full, missing, false},
+				{"missing-both", missing, missing, false}, {"renamed-both", rename, rename, false},
+				{"extra-both", extra, extra, false}, {"unrelated", full, full + sibling, false},
+			} {
+				t.Run(sample.name, func(t *testing.T) {
+					writeFixture(t, ordinary, sample.ordinary+sibling+"PASS\n")
+					writeFixture(t, isolated, sample.isolated+"PASS\n")
+					if err := run(args, io.Discard); (err == nil) != sample.valid {
+						t.Fatalf("inventory valid=%v, got %v", sample.valid, err)
+					}
+				})
+			}
+			leaf := tc.root + "/" + tc.inputs[1] + "/before-2"
+			verifyPairedProfileBatches(t, root, tc.pkg, tc.profile, tc.root, tc.defaultRoot, leaf)
+		})
+	}
+}
+
+func verifyPairedProfileBatches(t *testing.T, dir, pkg, profile, root, defaultRoot, leaf string) {
+	t.Helper()
+	groups := []benchGroup{{Package: pkg, Name: root}, {Package: pkg, Name: defaultRoot}}
+	leaves := []sampleKey{{pkg, leaf}, {pkg, defaultRoot + "-2"}}
+	expected, batch := dir+"/expected.json", dir+"/shard.tsv"
+	data, err := json.Marshal(expectedSamples{Base: leaves, Head: leaves})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, expected, string(data))
+	for _, test := range []struct{ phase, rows string }{
+		{"primary", formatShard(benchShard{Groups: groups})},
+		{"confirmation", formatConfirmationBatch(leaves)},
+	} {
+		if !strings.Contains(test.rows, pkg+"\t"+profile+"\t") ||
+			!strings.Contains(test.rows, pkg+"\tdefault\t") || !strings.Contains(test.rows, defaultRoot) {
+			t.Fatalf("incorrect %s routing:\n%s", test.phase, test.rows)
+		}
+		args := []string{"--verify-profile-batch", test.phase, expected, batch}
+		writeFixture(t, batch, test.rows)
+		if err := run(args, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		incorrect := strings.Replace(test.rows, "\t"+profile+"\t", "\tdefault\t", 1)
+		writeFixture(t, batch, incorrect)
+		if err := run(args, io.Discard); err == nil {
+			t.Fatalf("accepted %s routing with the protected benchmark sent to the default binary", test.phase)
+		}
+	}
+}
+
 func TestProfileBatchRejectsMisroutedShard(t *testing.T) {
 	root := benchmarkTempDir(t)
 	expected, batch := root+"/expected.json", root+"/batch.tsv"

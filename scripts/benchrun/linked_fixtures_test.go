@@ -34,7 +34,9 @@ func TestIsolationProfileCommand(t *testing.T) {
 		{"pkg/lux", "lux-short-path\t^BenchmarkStrictFilterContract$|^BenchmarkDecimalAlignment$\n"},
 		{"pkg/lux/rpc", "rpc-owned-request\t^BenchmarkLRPCOwnedRequest$\n" +
 			"rpc-deadline-classification\t^BenchmarkRPCDeadlineClassification$\n" +
-			"rpc-nil-context-guard\t^BenchmarkRPCNilContextGuard$\n"},
+			"rpc-nil-context-guard\t^BenchmarkRPCNilContextGuard$\n" +
+			"rpc-prepared-frame\t^BenchmarkLRPCPreparedFrame$\n"},
+		{"pkg/lux/queue", "queue-stream-name\t^BenchmarkQueueStreamName$\n"},
 	} {
 		var output bytes.Buffer
 		if err := run([]string{"isolation-profile", tc.pkg}, nil, &output, io.Discard); err != nil || output.String() != tc.want {
@@ -83,6 +85,12 @@ func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 		{"pkg/lux/rpc", "rpc-owned-request", verifyRPCOwnedRequestOverlay},
 		{"pkg/lux/rpc", "rpc-deadline-classification", verifyRPCDeadlineOverlay},
 		{"pkg/lux/rpc", "rpc-nil-context-guard", verifyRPCNilContextGuardOverlay},
+		{"pkg/lux/rpc", "rpc-prepared-frame", func(t *testing.T, replace map[string]string, dir string) {
+			verifyNativePairedFixture(t, replace, dir, "frame_prepared_bench_test.go", "8f4ca28038d34633c5ef5b4379d2621a51272237aaf249b9e4d769538db2053e")
+		}},
+		{"pkg/lux/nats/queue", "queue-stream-name", func(t *testing.T, replace map[string]string, dir string) {
+			verifyNativePairedFixture(t, replace, dir, "nats_retry_bench_test.go", "0f0a5195bb203151b16c1ec768d139153e822c29c7143da8193de9369ac8d8e6")
+		}},
 		{benchlayout.APIPackage, benchlayout.APINonIdentityProfile, verifyAPIOverlay},
 		{benchlayout.APIPackage, "api-request-log", verifyAPIRequestLogOverlay},
 		{benchlayout.LuxPackage, benchlayout.LuxShortPathProfile, verifyLuxShortPathOverlay},
@@ -118,6 +126,87 @@ func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 				t.Fatal(err)
 			}
 			tc.assert(t, overlay.Replace, filepath.Join(root, tc.pkg))
+		})
+	}
+}
+
+func verifyNativePairedFixture(t *testing.T, replace map[string]string, dir, fixture, witness string) {
+	t.Helper()
+	path := filepath.Join(dir, fixture)
+	projected, err := os.ReadFile(replace[path])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(projected)); got != witness {
+		t.Fatalf("projection hash = %s, want native witness %s", got, witness)
+	}
+	delete(replace, path)
+	verifyOnlyListedTestFiles(t, replace, dir, fixture)
+}
+
+func TestQueueStreamNameRequiresItsPhysicalAdapter(t *testing.T) {
+	root := newBenchmarkRunTree(t)
+	writeBenchmarkRunFixture(t, root, "pkg/lux/queue/ordinary_test.go", "package queue")
+	for _, command := range []string{"compile-performance", "compile-performance-baseline", "run-performance"} {
+		err := run([]string{command, root, filepath.Join(root, "bin"), "pkg/lux/queue", "queue-stream-name"}, nil, io.Discard, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "missing benchmark package pkg/lux/nats/queue") {
+			t.Fatalf("%s fell back to the memory queue: %v", command, err)
+		}
+	}
+}
+
+func TestPairedFixtureOverlaysRejectInvalidInputs(t *testing.T) {
+	for _, fixture := range []struct{ pkg, name, profile string }{
+		{"pkg/lux/rpc", "frame_prepared_bench_test.go", "rpc-prepared-frame"},
+		{"pkg/lux/nats/queue", "nats_retry_bench_test.go", "queue-stream-name"},
+	} {
+		t.Run(fixture.profile, func(t *testing.T) {
+			body, err := os.ReadFile(filepath.Join("../..", fixture.pkg, fixture.name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := newBenchmarkRunTree(t)
+			other := filepath.Join(fixture.pkg, "ordinary_test.go")
+			path := filepath.Join(fixture.pkg, fixture.name)
+			writeBenchmarkRunFixture(t, root, other, "package sample\n")
+			checkFailure := func(message string) {
+				t.Helper()
+				_, cleanup, err := compileOverlay(root, fixture.pkg, true, fixture.profile)
+				if cleanup != nil || err == nil || !strings.Contains(err.Error(), message) {
+					t.Fatalf("wanted %q and no surviving workspace, got %v", message, err)
+				}
+			}
+			checkFailure("missing")
+			writeBenchmarkRunFixture(t, root, path, "// edited fixture\n"+string(body))
+			checkFailure("does not match the verified source")
+			writeBenchmarkRunFixture(t, root, path, string(body))
+			writeBenchmarkRunFixture(t, root, other, "package sample\nfunc TestMain() {}\n")
+			checkFailure("cannot isolate test package setup")
+			writeBenchmarkRunFixture(t, root, other, "package sample\n")
+			nonregular := filepath.Join(root, fixture.pkg, "nonregular_test.go")
+			if err := os.Mkdir(nonregular, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			checkFailure("fixture must be a regular file")
+		})
+	}
+}
+
+func TestPairedFixtureRejectsInvalidWitness(t *testing.T) {
+	root := newBenchmarkRunTree(t)
+	const name = "bench_test.go"
+	identity := pairedBenchmarkFixture{name: name}
+	for _, tc := range []struct{ body, want string }{
+		{"package", "expected 'IDENT'"},
+		{"package sample\nfunc BenchmarkFixture() {}\n", "does not match the verified projection"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			writeBenchmarkRunFixture(t, root, name, tc.body)
+			identity.sourceSHA = fmt.Sprintf("%x", sha256.Sum256([]byte(tc.body)))
+			path, err := identity.projectFile(filepath.Join(root, name), root)
+			if path != "" || err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("invalid signed fixture returned %q, %v", path, err)
+			}
 		})
 	}
 }

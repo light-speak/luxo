@@ -48,7 +48,11 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 	if err != nil {
 		return err
 	}
-	packages, err := benchlayout.Packages(root, args[3])
+	pkg := args[3]
+	if profile == benchlayout.QueueStreamNameProfile {
+		pkg = benchlayout.NATSQueuePackage
+	}
+	packages, err := benchlayout.Packages(root, pkg)
 	if err != nil {
 		return err
 	}
@@ -114,6 +118,10 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-rpc-deadline-*", writeRPCDeadlineOverlay)
 	case benchlayout.RPCNilContextGuardProfile:
 		return packageTestOverlay(root, packagePath, "bench-rpc-nil-context-guard-*", writeRPCNilContextGuardOverlay)
+	case benchlayout.RPCPreparedFrameProfile:
+		return pairedBenchmarkOverlay(root, packagePath, profile, rpcPreparedFrameFixture)
+	case benchlayout.QueueStreamNameProfile:
+		return pairedBenchmarkOverlay(root, packagePath, profile, queueStreamNameFixture)
 	case benchlayout.APINonIdentityProfile:
 		return packageTestOverlay(root, packagePath, "bench-api-non-identity-*", writeAPIBenchmarkOverlay)
 	case benchlayout.APILocalRouteExportProfile:
