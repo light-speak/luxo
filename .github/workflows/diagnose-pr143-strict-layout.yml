@@ -51,7 +51,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: .tmp/control
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
 
       - uses: actions/checkout@v7

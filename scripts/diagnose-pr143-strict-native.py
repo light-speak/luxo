@@ -150,16 +150,22 @@ def symbol_fingerprints(binary, selected, elf):
     data = binary.read_bytes()
     segments = json.loads(elf.read_bytes())["executableLoadSegments"]
     result = {}
+    seen = set()
     for line in selected.read_text().splitlines():
-        address, size, _, name = line.split(maxsplit=3)
+        address, size, binding, name = line.split(maxsplit=3)
         address, size = int(address, 16), int(size)
+        identity = (name, address, binding)
         segments_for_symbol = [segment for segment in segments if
             segment["address"] <= address and address + size <= segment["address"] + segment["filesz"]]
-        assert len(segments_for_symbol) == 1 and size > 0 and name not in result, line
+        assert len(segments_for_symbol) == 1 and size > 0 and binding in {"t", "T"} and identity not in seen, line
+        seen.add(identity)
         segment = segments_for_symbol[0]
         offset = address - segment["address"] + segment["offset"]
-        result[name] = {"address": address, "offset": offset, "size": size, "mod32": address % 32,
-                        "mod64": address % 64, "sha256": executable_bytes(data, offset, size)}
+        # Inlined closures can have several text bodies with the same name.
+        result.setdefault(name, []).append({
+            "address": address, "binding": binding, "offset": offset, "size": size, "mod32": address % 32,
+            "mod64": address % 64, "sha256": executable_bytes(data, offset, size),
+        })
     assert result
     return result
 

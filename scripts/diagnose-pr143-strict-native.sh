@@ -4,7 +4,8 @@ export LC_ALL=C GOTOOLCHAIN=local
 
 base=36681c63627f4a3a4805bc6d19e908325614d3e9
 head=27fddbeee9a994e1ea1330df9b53b36d501c8652
-driver_parent=99926f9dac1ebcca449ada8f6c9d33e231bd6a70
+driver_parent=04720f2facd9c42754726ab46fb6ea4d257d1bd2
+routing_parent=99926f9dac1ebcca449ada8f6c9d33e231bd6a70
 root=$(cd "$GITHUB_WORKSPACE" && pwd -P)
 work="$root/.tmp"
 control="$work/control"
@@ -28,8 +29,10 @@ test "$actual" = "$cpu"
 test "$(go env GOVERSION GOHOSTOS GOHOSTARCH GOOS GOARCH GOAMD64 CGO_ENABLED)" = $'go1.27.1\nlinux\namd64\nlinux\namd64\nv1\n1'
 test -z "$(go env GOFLAGS)"
 test "$(g "$control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $driver_parent"
-test "$(g "$control" rev-list --parents -n 1 "$driver_parent")" = "$driver_parent $base"
-diff -u <(printf 'M\t%s\n' .github/workflows/diagnose-pr143-strict-layout.yml scripts/diagnose-pr143-strict-native.sh) \
+test "$(g "$control" rev-list --parents -n 1 "$driver_parent")" = "$driver_parent $routing_parent"
+test "$(g "$control" rev-list --parents -n 1 "$routing_parent")" = "$routing_parent $base"
+diff -u <(printf 'M\t%s\n' .github/workflows/diagnose-pr143-strict-layout.yml \
+    scripts/diagnose-pr143-strict-native.py scripts/diagnose-pr143-strict-native.sh) \
     <(g "$control" diff --name-status "$driver_parent" HEAD)
 diff -u <(printf 'A\t%s\n' .github/workflows/diagnose-pr143-strict-layout.yml \
     scripts/diagnose-pr143-strict-native.py scripts/diagnose-pr143-strict-native.sh) \
