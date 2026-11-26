@@ -16,9 +16,10 @@ PACKAGE = "pkg/lux/rpc"
 GROUPS = ("primary", "confirmation")
 FALSE = {f"BenchmarkRPCTraceLocal/false/{version}-2" for version in ("before", "current")}
 TRACE = FALSE | {f"BenchmarkRPCTraceLocal/true/{version}-2" for version in ("before", "current")}
-LEAVES = TRACE | {"BenchmarkRPC_Echo-2"}
-ROLES = {"aa": ("base", "base"), "bh": ("base", "head"),
-         "hc": ("head", "candidate"), "bc": ("base", "candidate")}
+LEAVES = TRACE | {"BenchmarkRPC_Ping-2", "BenchmarkRPC_Echo-2",
+                  "BenchmarkRPCStructuredErrorRoundTrip/without_data-2",
+                  "BenchmarkRPCStructuredErrorRoundTrip/with_data-2"}
+ROLES = {"aa": ("base", "base"), "bb": ("head", "head"), "ab": ("base", "head")}
 UNITS = ("ns/op", "B/op", "allocs/op")
 FORMAL_SHA = "27da0dfaea6eb5addef98a0198d93d420908345c8d322a3f0ef89a5a3818267d"
 ECHO_SHA = "dda115389a6140b1ec5f3d2098145d17eb73d66ab08df27266b4ca481ad2bef4"
@@ -112,6 +113,21 @@ def expected_schedule():
                            f"raw/{group}.{pair}.{comparison}.01.{side}.txt")
 
 
+def measurements(path, one_iteration=False):
+    lines = path.read_text(encoding="utf-8").splitlines()
+    context(lines)
+    require(lines.count("PASS") == 1, f"expected one successful process: {path}")
+    require({line[4:].strip() for line in lines if line.startswith("pkg:")} ==
+            {"github.com/light-speak/luxo/" + PACKAGE}, f"unexpected package: {path}")
+    rows = [line for line in lines if line.startswith("Benchmark")]
+    if one_iteration:
+        require(all(line.split()[1] == "1" for line in rows), f"expected 1x inventory: {path}")
+    parsed = [sample(line) for line in rows]
+    require(len(parsed) == len(LEAVES) and {leaf for leaf, _ in parsed} == LEAVES,
+            f"incorrect benchmark set: {path}")
+    return dict(parsed)
+
+
 def fresh(output):
     with (output / "order.tsv").open(encoding="utf-8", newline="") as stream:
         rows = list(csv.reader(stream, delimiter="\t"))
@@ -120,14 +136,7 @@ def fresh(output):
     recorded = {}
     require(len(list((output / "raw").glob("*.txt"))) == len(rows) - 1, "unexpected raw sample files")
     for group, pair, comparison, _, side, role, _, path in rows[1:]:
-        lines = (output / path).read_text(encoding="utf-8").splitlines()
-        context(lines)
-        require({line[4:].strip() for line in lines if line.startswith("pkg:")} ==
-                {"github.com/light-speak/luxo/" + PACKAGE}, f"unexpected package: {path}")
-        measurements = [sample(line) for line in lines if line.startswith("Benchmark")]
-        require(len(measurements) == len(LEAVES) and {leaf for leaf, _ in measurements} == LEAVES,
-                f"incorrect benchmark set: {path}")
-        recorded[(group, pair, comparison, side)] = dict(measurements)
+        recorded[(group, pair, comparison, side)] = measurements(output / path)
     comparisons = {}
     for group, comparison in itertools.product(GROUPS, ROLES):
         details = {}
@@ -147,15 +156,17 @@ def fresh(output):
     dump(output / "paired-deltas.json", {"cpu": CPU, "legs": len(rows) - 1, "comparisons": comparisons})
 
 
-def echo(path):
-    declarations = re.findall(
-        rb"^func BenchmarkRPC_Echo\(b \*testing\.B\) \{\n[\s\S]+?^\}\n",
-        path.read_bytes(), re.MULTILINE,
-    )
-    require(len(declarations) == 1, "expected a single real TCP Echo benchmark")
-    digest = hashlib.sha256(declarations[0]).hexdigest()
-    require(digest == ECHO_SHA, "timed TCP Echo workload changed")
-    print(f"{digest}  BenchmarkRPC_Echo")
+def tcp(path):
+    for name in ("BenchmarkRPC_Ping", "BenchmarkRPC_Echo"):
+        declarations = re.findall(
+            rb"^func " + name.encode() + rb"\(b \*testing\.B\) \{\n[\s\S]+?^\}\n",
+            path.read_bytes(), re.MULTILINE,
+        )
+        require(len(declarations) == 1, f"expected a single real TCP {name} benchmark")
+        digest = hashlib.sha256(declarations[0]).hexdigest()
+        if name == "BenchmarkRPC_Echo":
+            require(digest == ECHO_SHA, "timed TCP Echo workload changed")
+        print(f"{digest}  {name}")
 
 
 if __name__ == "__main__":
@@ -164,7 +175,9 @@ if __name__ == "__main__":
         historical(*map(Path, args))
     elif command == "samples":
         fresh(*map(Path, args))
-    elif command == "echo":
-        echo(*map(Path, args))
+    elif command == "tcp":
+        tcp(*map(Path, args))
+    elif command == "inventory":
+        measurements(Path(args[0]), one_iteration=True)
     else:
         raise SystemExit("unknown verifier command")
