@@ -34,6 +34,11 @@ SHARDS = {"7763": ("06", "07"), "9v45": ("02",), "6975": ("04",)}
 GROUPS = ("primary", "confirmation")
 ROLES = {"aa": ("base", "base"), "bb": ("head", "head"), "ab": ("base", "head")}
 METRICS = ("ns/op", "B/op", "allocs/op")
+HISTORICAL_RUN = {"event": "pull_request", "head_sha": "397af9c8c6fc6dc807e1dbcbe2e05d8913f58944",
+                  "id": 45227864247, "run_attempt": 1, "pull_requests": [{
+                      "number": 78, "base": "65f1892e175487503aa36caa86d1eb8a0805f073",
+                      "head": "397af9c8c6fc6dc807e1dbcbe2e05d8913f58944"}]}
+SHARD_MODEL = {}
 CASES = {
     "7763": (
         (H2, "default",
@@ -102,11 +107,7 @@ def row(line):
 
 def historical(lane, directory, output):
     run = json.loads((directory / "run.json").read_text())
-    require(run == {"event": "pull_request", "head_sha": "397af9c8c6fc6dc807e1dbcbe2e05d8913f58944",
-                    "id": 45227864247, "run_attempt": 1, "pull_requests": [
-                        {"number": 78, "base": "65f1892e175487503aa36caa86d1eb8a0805f073",
-                         "head": "397af9c8c6fc6dc807e1dbcbe2e05d8913f58944"}]},
-            "historical pull request run binding")
+    require(run == HISTORICAL_RUN, "historical pull request run binding")
     write_json(output / "historical-run.json", run)
     results = {}
     for shard in SHARDS[lane]:
@@ -114,17 +115,18 @@ def historical(lane, directory, output):
         meta = json.loads((directory / f"{shard}.json").read_text())
         require(meta["id"] == identifier and meta["name"] == f"performance-evidence-{shard}-1"
                 and not meta["expired"] and meta["digest"] == "sha256:" + digest
-                and meta["workflow_run"]["id"] == 45227864247
-                and meta["workflow_run"]["head_sha"] == "397af9c8c6fc6dc807e1dbcbe2e05d8913f58944",
+                and meta["workflow_run"]["id"] == run["id"]
+                and meta["workflow_run"]["head_sha"] == run["head_sha"],
                 f"artifact metadata mismatch: {shard}")
         archive = directory / f"{shard}.zip"
         require(hashlib.sha256(archive.read_bytes()).hexdigest() == digest, f"archive binding: {shard}")
         records = {}
+        origin = SHARD_MODEL.get(shard, lane)
         with zipfile.ZipFile(archive) as bundle:
             require(bundle.testzip() is None, f"invalid ZIP: {shard}")
             for group, side in itertools.product(GROUPS, ("base", "head")):
                 lines = bundle.read(f"benchmark-raw-{group}-{side}.txt").decode().splitlines()
-                check_platform(lines, lane)
+                check_platform(lines, origin)
                 observed = {(package, name): [] for package, names in checks.items() for name in names}
                 package = ""
                 for line in lines:
@@ -135,7 +137,7 @@ def historical(lane, directory, output):
                         observed[(package, name)].append(metrics)
                 require(all(len(values) == 10 for values in observed.values()), f"missing legacy leaf: {shard}")
                 records[f"{group}/{side}"] = {f"{package}/{name}": data for (package, name), data in observed.items()}
-        results[shard] = {"id": identifier, "sha256": digest, "cpu": MODELS[lane], "samples": records}
+        results[shard] = {"id": identifier, "sha256": digest, "cpu": MODELS[origin], "samples": records}
     write_json(output / "historical-samples.json", results)
 
 

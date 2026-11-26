@@ -1,0 +1,83 @@
+name: Recheck PR 83 request logging on AMD EPYC 9V45
+
+on:
+  push:
+    branches: [diagnostics/pr83-f9-native]
+    paths:
+      - .github/workflows/diagnose-pr83-f9.yml
+      - scripts/diagnose-pr83-f9/**
+      - scripts/diagnose-pr78-shutdown/run.sh
+      - scripts/diagnose-pr78-shutdown/verify.py
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  native:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr83-f9-native'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Identify the native runner
+        id: cpu
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=$(python3 -B scripts/diagnose-pr83-f9/verify.py model 9v45)
+          actual=$(LC_ALL=C lscpu | awk -F: '$1 == "Model name" {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2}')
+          match=false
+          if [[ "$(uname -sm)" == 'Linux x86_64' && "$actual" == "$expected" ]]; then match=true; fi
+          mkdir -p .tmp/pr83-f9-evidence-9v45
+          printf 'actual=%s\nexpected=%s\nmatch=%s\n' "$actual" "$expected" "$match" |
+            tee .tmp/pr83-f9-evidence-9v45/routing.txt
+          printf 'match=%s\n' "$match" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v7
+        if: steps.cpu.outputs.match == 'true'
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Recheck the exact product and original failing workloads
+        if: steps.cpu.outputs.match == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LUXO_NATIVE_DIAGNOSTIC: pr83-f9
+        run: |
+          set -euo pipefail
+          source scripts/diagnose-pr83-f9/settings.sh
+          sampler=cbf4cfb383d944ceb38f700e19cf79c4c54d3c58
+          for revision in "$product_base" "$sampler"; do
+            git cat-file -e "$revision^{commit}" 2>/dev/null || git fetch --no-tags origin "$revision"
+          done
+          inputs=$(mktemp -d "$GITHUB_WORKSPACE/.tmp/pr83-f9-input.XXXXXXXX")
+          trap 'rm -rf -- "$inputs"' EXIT
+          run_metadata() {
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$1" --jq \
+              '{id,event,run_attempt,head_sha,pull_requests:[.pull_requests[]|{number,head:.head.sha,base:.base.sha}]}'
+          }
+          run_metadata 45219367507 > "$inputs/run.json"
+          run_metadata 45242193591 > "$inputs/diag-run.json"
+          python3 -B scripts/diagnose-pr83-f9/verify.py artifacts 9v45 > "$inputs/refs.tsv"
+          while IFS=$'\t' read -r shard artifact digest; do
+            resource="repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact"
+            gh api "$resource" > "$inputs/$shard.json"
+            jq -e --arg sha "sha256:$digest" '.digest == $sha and (.expired | not)' "$inputs/$shard.json" > /dev/null
+            gh api "$resource/zip" > "$inputs/$shard.zip"
+          done < "$inputs/refs.tsv"
+          bash scripts/diagnose-pr78-shutdown/run.sh 9v45 "$inputs"
+      - name: Preserve evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: pr83-f9-9v45-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr83-f9-evidence-9v45/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Report an unmatched runner
+        if: ${{ always() && steps.cpu.outputs.match == 'false' }}
+        run: exit 3

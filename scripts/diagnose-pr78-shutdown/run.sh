@@ -7,13 +7,29 @@ historical="$(cd "$2" && pwd -P)"
 plan="${3:-}"
 repo=$(git rev-parse --show-toplevel)
 driver=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+diagnostic=${LUXO_NATIVE_DIAGNOSTIC:-pr78-shutdown}
 historical_base=65f1892e175487503aa36caa86d1eb8a0805f073
 historical_head=397af9c8c6fc6dc807e1dbcbe2e05d8913f58944
 sampler=cbf4cfb383d944ceb38f700e19cf79c4c54d3c58
 sampler_sum=9e0a5f421f2e76674b819f81074a3d416a51174e0f93b858a63d20c27d64e072
 patch_sum=65c0194f9d5354e2934eb1cf79015393652a6f98a72036f2f38c81fe354d219e
+patch_file=shutdown.patch.b64
+product_base=55f982e4237a9e196cc0cb1ef84b1f97570c0d04
+base_tree=85e9600484d2531099ef28b2e5284b3ea4aed67c
+head_tree=32ef8e8c41a5c21a22180759b5ac0d6ce6253dbd
+product_paths=(pkg/lux/h2transport/{limits_test,serve_conn_test,server,server_test,shutdown_test}.go)
+symbols='\.(Benchmark(AuthMiddlewareIsolation|GatewayIdentity|MergeDestination|TraceEncodingComparison|RPCPoolCloseSafetyReverse|ShutdownNoConnections|ShutdownOneOpeningConnection|PriorKnowledgeConnectionLifecycle)|benchmark(PoolSerialAfter|MergeDestination)|extractBearerToken|appendTraceRecord|\(\*(Pool|Server)\)\.(Put|GetContext|Shutdown|beginShutdown|retireConnection))'
+case "$diagnostic" in
+  pr78-shutdown) ;;
+  pr83-f9)
+    [[ "$lane" == 9v45 ]]
+    driver="$repo/scripts/diagnose-pr83-f9"
+    source "$driver/settings.sh"
+    ;;
+  *) printf 'Unknown native diagnostic: %s\n' "$diagnostic" >&2; exit 2 ;;
+esac
+export LC_ALL=C GOWORK=off GOTOOLCHAIN=local PYTHONDONTWRITEBYTECODE=1
 cpu=$(python3 "$driver/verify.py" model "$lane")
-export LC_ALL=C GOWORK=off GOTOOLCHAIN=local
 
 if [[ -z "$plan" ]]; then
   [[ "$(uname -sm)" == 'Linux x86_64' ]]
@@ -26,11 +42,11 @@ fi
 
 [[ ! -L "$repo/.tmp" ]]
 mkdir -p "$repo/.tmp"
-evidence="$repo/.tmp/pr78-shutdown-evidence-$lane"
-if [[ -n "$plan" ]]; then evidence="$repo/.tmp/pr78-shutdown-plan-$lane"; fi
+evidence="$repo/.tmp/$diagnostic-evidence-$lane"
+if [[ -n "$plan" ]]; then evidence="$repo/.tmp/$diagnostic-plan-$lane"; fi
 [[ ! -L "$evidence" ]]
 mkdir -p "$evidence"
-scratch=$(mktemp -d "$repo/.tmp/pr78-shutdown-stage.XXXXXXXX")
+scratch=$(mktemp -d "$repo/.tmp/$diagnostic-stage.XXXXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -42,48 +58,40 @@ printf '%s  %s\n' "$sampler_sum" "$scratch/sampler.sh" | shasum -a 256 -c -
 # The pinned helper supplies environment, binary receipts and CSV normalization.
 source "$scratch/sampler.sh"
 # The historical sampler declares its own defaults. Restore this run's binding.
-base=55f982e4237a9e196cc0cb1ef84b1f97570c0d04
-base_tree=85e9600484d2531099ef28b2e5284b3ea4aed67c
-head_tree=32ef8e8c41a5c21a22180759b5ac0d6ce6253dbd
+base="$product_base"
 [[ "$benchtime" == 200ms ]]
 git -C "$repo" init --quiet --bare "$scratch/objects.git"
 git -C "$repo" rev-parse --path-format=absolute --git-path objects > "$scratch/objects.git/objects/info/alternates"
 graft=(git "--git-dir=$scratch/objects.git")
-python3 - "$driver/shutdown.patch.b64" "$scratch/shutdown.patch" <<'PY'
+python3 - "$driver/$patch_file" "$scratch/product.patch" <<'PY'
 from base64 import b64decode
 from pathlib import Path
 import sys
 source, target = map(Path, sys.argv[1:])
 target.write_bytes(b64decode(b"".join(source.read_bytes().splitlines()), validate=True))
 PY
-printf '%s  %s\n' "$patch_sum" "$scratch/shutdown.patch" | shasum -a 256 -c -
-(
+printf '%s  %s\n' "$patch_sum" "$scratch/product.patch" | shasum -a 256 -c -
+if [[ "$diagnostic" == pr78-shutdown ]]; then (
   cd "$driver"
   shasum -a 256 -c <<'SHA'
 f1af98d2511b5ce90a3c521c577c8aea58809c09377ccffe71716bf8328ecff3  empty.fixture.go.txt
 ea6127592cb1c6ae965007266ffead6e01eed7026e128e9346e722af64b397bb  opening.fixture.go.txt
 SHA
-)
+); fi
 [[ "$("${graft[@]}" rev-parse "$base^{tree}")" == "$base_tree" ]]
 "${graft[@]}" read-tree "$base"
-"${graft[@]}" apply --cached --check --whitespace=error-all "$scratch/shutdown.patch"
-"${graft[@]}" apply --cached --whitespace=error-all "$scratch/shutdown.patch"
+"${graft[@]}" apply --cached --check --whitespace=error-all "$scratch/product.patch"
+"${graft[@]}" apply --cached --whitespace=error-all "$scratch/product.patch"
 [[ "$("${graft[@]}" write-tree)" == "$head_tree" ]]
 "${graft[@]}" diff --check "$base_tree" "$head_tree"
 "${graft[@]}" diff --name-only "$base_tree" "$head_tree" > "$evidence/product-paths.txt"
-diff -u - "$evidence/product-paths.txt" <<'FILES'
-pkg/lux/h2transport/limits_test.go
-pkg/lux/h2transport/serve_conn_test.go
-pkg/lux/h2transport/server.go
-pkg/lux/h2transport/server_test.go
-pkg/lux/h2transport/shutdown_test.go
-FILES
-"${graft[@]}" apply --cached --reverse --whitespace=error-all "$scratch/shutdown.patch"
+printf '%s\n' "${product_paths[@]}" | diff -u - "$evidence/product-paths.txt"
+"${graft[@]}" apply --cached --reverse --whitespace=error-all "$scratch/product.patch"
 [[ "$("${graft[@]}" write-tree)" == "$base_tree" ]]
 printf 'base=%s\nbase_tree=%s\nhead_tree=%s\nhistorical_base=%s\nhistorical_head=%s\nsampler=%s\npatch_sha256=%s\n' \
   "$base" "$base_tree" "$head_tree" "$historical_base" "$historical_head" "$sampler" "$patch_sum" > "$evidence/revisions.txt"
-"${graft[@]}" ls-tree "$base_tree" -- go.mod go.sum scripts pkg/lux/{luvia,rpc,h2transport} > "$evidence/base-blobs.txt"
-"${graft[@]}" ls-tree "$head_tree" -- go.mod go.sum scripts pkg/lux/{luvia,rpc,h2transport} > "$evidence/head-blobs.txt"
+"${graft[@]}" ls-tree "$base_tree" -- go.mod go.sum scripts pkg/lux/{api,luvia,rpc,h2transport} > "$evidence/base-blobs.txt"
+"${graft[@]}" ls-tree "$head_tree" -- go.mod go.sum scripts pkg/lux/{api,luvia,rpc,h2transport} > "$evidence/head-blobs.txt"
 if [[ -n "$plan" ]]; then exit 0; fi
 
 collect_host > "$evidence/environment.txt"
@@ -133,8 +141,7 @@ for role in base head; do
       -test.run='^$' -test.bench="$filter" -test.benchmem -test.benchtime=1x -test.count=1 \
       -test.cpu=2 -test.timeout=90s > "$evidence/inventory-$role-$case_id.txt" 2>&1
     python3 "$driver/verify.py" inventory "$lane" "$case_id" "$evidence/inventory-$role-$case_id.txt"
-    # Save the named timed functions and changed server states for linked-layout diagnosis.
-    symbols='\.(Benchmark(AuthMiddlewareIsolation|GatewayIdentity|MergeDestination|TraceEncodingComparison|RPCPoolCloseSafetyReverse|ShutdownNoConnections|ShutdownOneOpeningConnection|PriorKnowledgeConnectionLifecycle)|benchmark(PoolSerialAfter|MergeDestination)|extractBearerToken|appendTraceRecord|\(\*(Pool|Server)\)\.(Put|GetContext|Shutdown|beginShutdown|retireConnection))'
+    # Preserve timed and changed functions for linked-layout diagnosis.
     binary_name=${package//\//-}
     if [[ "$profile" != default ]]; then binary_name+="-$profile"; fi
     binary="$bin/$binary_name.test"

@@ -1,0 +1,8 @@
+historical_head=f841a4770b83b368730db8c559df4a4da226b736
+product_base=f9ce659fd7f17bf57cfe0aee7de7ecb8d9b8f2e4
+base_tree=68591bb02805a9c5a95e47864c3be1abb6e256cb
+head_tree=7e1f45697b287e545ff13b156d346b4222c85fef
+patch_file=product.patch.b64
+patch_sum=844a5a6246f0a017e15b6441d293a9eea4d416ffc93d0054860b2a2ccd80f089
+product_paths=(pkg/lux/api/request_log_async{,_test}.go)
+symbols='\.(Benchmark(RequestLogDelivered|RequestLogBoundary|BinaryJSONRawRequest|IdentityConditionValidity|ValidatedHTTPBridge|TaskDeadlineReplacement|RPCPoolClosedBorrow|RPCDeadlineClassification|RPCNilContextGuard)|\(\*asyncRequestLogs\)\.(run|finishWorker|stopAdmission|submit|close)|\(\*Router\)\.logParseFailure)'
