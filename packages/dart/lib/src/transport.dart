@@ -477,8 +477,17 @@ final class _HTTPTokenRefresh {
   bool discarded = false;
 
   void start(Future<String?> Function() callback) {
+    Future<String?> work;
+    try {
+      work = Zone.current.fork(zoneValues: {this: true}).run(callback);
+    } catch (error, stack) {
+      // Preserve Future.sync's handling of synchronous callback errors.
+      work = Future<String?>.sync(
+        () => Error.throwWithStackTrace(error, stack),
+      );
+    }
     unawaited(
-      Future<String?>.sync(callback).then<void>(
+      work.then<void>(
         // Settle at the end of the callback event. Success needs only its token.
         (token) {
           if (!discarded) result.complete(token);
@@ -758,7 +767,14 @@ class HttpTransport implements Transport {
     if (!_canRetry(credential, clock)) return null;
     final callback = onTokenExpired;
     if (callback == null) return null;
-    final refresh = credential.refresh ??= _HTTPTokenRefresh();
+    var refresh = credential.refresh;
+    if (refresh != null &&
+        !refresh.result.isCompleted &&
+        Zone.current[refresh] == true) {
+      // A request issued by the hook cannot wait for that hook to return.
+      return null;
+    }
+    refresh ??= credential.refresh = _HTTPTokenRefresh();
     return _joinRefresh(refresh, callback, credential, clock);
   }
 

@@ -260,6 +260,89 @@ void main() {
       });
     }
 
+    test(
+      '$mode refresh request returns its own 401 when it reenters the transport',
+      () async {
+        var refreshing = false;
+        var requests = 0;
+        late final HttpTransport transport;
+        transport =
+            HttpTransport(
+              'http://localhost/api',
+              timeout: const Duration(milliseconds: 300),
+              client: MockClient((_) async {
+                final message = ++requests == 1 ? 'expired' : 'refresh denied';
+                return _errorResponse(mode, message: message);
+              }),
+              options: TransportOptions(mode: mode, token: 'expired'),
+              onTokenExpired: () async {
+                if (refreshing) return null;
+                refreshing = true;
+                try {
+                  return await transport.call<String?>('refresh');
+                } finally {
+                  refreshing = false;
+                }
+              },
+            )..setSchema({
+              'echo': const APISchemaEntry(7),
+              'refresh': const APISchemaEntry(8),
+            });
+        addTearDown(transport.close);
+
+        await expectLater(
+          transport.call<Object?>('echo'),
+          throwsA(
+            isA<LuxoError>()
+                .having((error) => error.error, 'name', 'Unauthorized')
+                .having((error) => error.code, 'code', 401)
+                .having((error) => error.message, 'message', 'refresh denied'),
+          ),
+        );
+        expect(requests, 2);
+      },
+    );
+
+    test(
+      '$mode a completed refresh does not block a later callback task',
+      () async {
+        final startLaterRequest = Completer<void>();
+        final sent = <String?>[];
+        var refreshes = 0;
+        late final Future<Object?> laterRequest;
+        late final HttpTransport transport;
+        transport = HttpTransport(
+          'http://localhost/api',
+          client: MockClient((request) async {
+            sent.add(request.headers['authorization']);
+            return sent.length.isOdd ? _errorResponse(mode) : _success(mode);
+          }),
+          options: TransportOptions(mode: mode, token: 'expired'),
+          onTokenExpired: () async {
+            if (++refreshes == 1) {
+              laterRequest = startLaterRequest.future.then(
+                (_) => transport.call<Object?>('echo'),
+              );
+            }
+            return 'fresh-$refreshes';
+          },
+        )..setSchema({'echo': const APISchemaEntry(7)});
+        addTearDown(transport.close);
+
+        await transport.call<Object?>('echo');
+        final later = expectLater(laterRequest, completes);
+        startLaterRequest.complete();
+        await later;
+        expect(refreshes, 2);
+        expect(sent, [
+          'Bearer expired',
+          'Bearer fresh-1',
+          'Bearer fresh-1',
+          'Bearer fresh-2',
+        ]);
+      },
+    );
+
     test('$mode close settles all waiters on one stalled refresh', () async {
       final initial = List.generate(2, (_) => Completer<http.Response>());
       final sent = Completer<void>();
