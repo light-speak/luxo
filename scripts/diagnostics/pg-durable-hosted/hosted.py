@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure the one-shot migration intent on the original PostgreSQL protocol."""
+"""Compare retry settings on the original PostgreSQL recovery protocol."""
 import argparse
 import base64
 import gzip
@@ -22,7 +22,7 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-PARENT = '545261164d4a7c7819f420ffa9533400754662fb'
+PARENT = 'fe6a15dbb3c43242cd6299eb96ec7471d21aa207'
 BASE = '15765dee6705d39de0b5a505d3039d59ebf43584'
 BASE_TREE = '75aebe5bd2fa6b45a1c614ace1a816ebc63e4c0a'
 PROJECTION = {
@@ -37,34 +37,30 @@ PROJECTION = {
     "priorNativeArtifact": 15136741248,
     "priorNativeSHA256": "d68266e78585d107a2371a52f94b5736f35ce73fbaa6ba3132a7341412f24dc8",
 }
-HISTORICAL = {"run": 45879856292, "attempt": 1, "head": PARENT, "artifact": 15146123973,
-              "artifactSHA256": "49f7b4b2a0f28ea4b06d89655982f1375f4b9fbd71c19007293f50358bb8590d"}
+HISTORICAL = {"run": 45889914630, "attempt": 1, "head": PARENT, "artifact": 15150204945,
+              "artifactSHA256": "95b70ca56ac762d72454aadcc4d20c657ab6a8b940a01de32b9d6a6004585866"}
 ARMS = {'P': BASE_TREE, 'Q': '13a0159134235571a8a1a431d02d6afd362b4718',
-        'R': '40e9e4c4aefe41bb6c9fd2d02d5d49f6c7b0909f'}
+        'S': 'e77173b111fa67969131eb23b5eb8d7a8f148207'}
 PATCHES = {
     'Q': (PROJECTION["mergeTree"], 'a2c84ab8db37a7965c63f0a87befc0c5ab3875da2fb49235cc448b8975d8dccd'),
-    'R': (ARMS['Q'], 'd46682d848a5640e894f55a6a9ac402f4fc5f356aadd6a0939998b07a07c9355'),
+    'S': (ARMS['Q'], '42169934c30dd834f78222031bd50a7092bf2449615368d1fdea905cddef3ae2'),
 }
 DIAGNOSTIC_PATHS = (
     "M\t.github/workflows/diagnose-pg-durable.yml",
-    "A\tscripts/diagnostics/pg-durable-hosted/.payload/arm-R.patch.gz.b64",
+    "A\tscripts/diagnostics/pg-durable-hosted/.payload/arm-S.patch.gz.b64",
     "M\tscripts/diagnostics/pg-durable-hosted/.payload/inputs.sha256",
     "M\tscripts/diagnostics/pg-durable-hosted/hosted.py",
 )
 MODULE_PINS = ("github.com/jackc/pgx/v5 v5.10.0", "golang.org/x/net v0.58.0")
-LEAVES = {
-    "standalone": {"ordinary/up", "ordinary/up-existing", "concurrent/up", "concurrent/down"},
-    "recovery": {"first-journal-and-create-index", "retry-after-invalid-index-repair"},
-}
+CANDIDATE_PATHS = tuple("pkg/lux/pg/migrate/" + name for name in (
+    "migrate.go", "migration_attempt.go", "migration_execution_test.go"))
+RETRY_LEAF = "retry-after-invalid-index-repair"
+JOURNAL_LEAF = "first-journal-and-create-index"
+LEAVES = {"recovery": {RETRY_LEAF}}
 METRICS = ("ns/op", "B/op", "allocs/op")
-BENCHMARKS = {"standalone": "BenchmarkMigrationPair", "recovery": "BenchmarkDurableRecovery"}
-SMOKE_TESTS = {"standalone": ("TestMigrationPairEmptyPreview",), "recovery": ()}
-SELECTORS = {
-    "standalone": "^BenchmarkMigrationPair$/^ordinary$/^(up|up-existing)$|^BenchmarkMigrationPair$/^concurrent$/^(up|down)$",
-    "recovery": "^BenchmarkDurableRecovery$/^(first-journal-and-create-index|retry-after-invalid-index-repair)$",
-}
+BENCHMARKS = {"recovery": "BenchmarkDurableRecovery"}
+RECOVERY_FIXTURES = ("advisory_pair_test.go", "recovery_test.go")
 CPU = "Neoverse-N2"
-
 
 
 def run(*args, **kwargs):
@@ -82,7 +78,7 @@ def put(path, value):
 def payload():
     names = {"shared.py", "advisory_pair_test.go", "first_query_test.go", "migration_pair_test.go",
              "durable_reset_test.go", "used_holder_reuse_test.go", "capacity_public_test.go", "recovery_test.go",
-             "arm-Q.patch.gz.b64", "arm-R.patch.gz.b64"}
+             "arm-Q.patch.gz.b64", "arm-R.patch.gz.b64", "arm-S.patch.gz.b64"}
     entries = {}
     for line in (PAYLOAD / "inputs.sha256").read_text().splitlines():
         digest, name = line.split("  ", 1)
@@ -120,34 +116,11 @@ def trees(repo, root):
         run(*git, "apply", "--cached", "--whitespace=error", "-", input=patch)
         if run(*git, "write-tree", text=True).strip() != ARMS[arm]:
             raise RuntimeError(f"{arm} patch did not produce the expected tree")
+        if arm == "S":
+            changed = run(*git, "diff", "--name-only", preimage, ARMS[arm], text=True).splitlines()
+            if tuple(changed) != CANDIDATE_PATHS:
+                raise RuntimeError("the settings optimization changed files outside its scope")
     return git
-
-
-def standalone_fixture():
-    source = (PAYLOAD / "migration_pair_test.go").read_text()
-    for before, after, count in (
-        ("func runPairCase(", "var completeStandalone = func(fixture, scenario) {}\n\nfunc runPairCase(", 1),
-        ("\n\tf.verify(sample, before, wantNames, wantSQL, names, sql, err)\n",
-         "\n\tf.verify(sample, before, wantNames, wantSQL, names, sql, err)\n\tcompleteStandalone(f, sample)\n", 1),
-        ("\n\t\tf.verify(sample, before, wantNames, wantSQL, names, sql, err)\n",
-         "\n\t\tf.verify(sample, before, wantNames, wantSQL, names, sql, err)\n\t\tcompleteStandalone(f, sample)\n", 1),
-        ("DROP TABLE IF EXISTS public._migrations, public.audit_target",
-         "DROP TABLE IF EXISTS public._luxo_migration_attempt, public._migrations, public.audit_target", 1),
-        ('\n\t"testing"\n', '\n\t"testing"\n\t"time"\n', 1),
-        ("\n\tgot := f.inspect()\n\tif got.lockHeld || got.historyOID", """
-	got := f.inspect()
-	// Local connection close does not confirm that PostgreSQL processed Terminate.
-	deadline := time.Now().Add(5 * time.Second)
-	for got.lockHeld && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-		got = f.inspect()
-	}
-	if got.lockHeld || got.historyOID""", 1),
-    ):
-        if source.count(before) != count:
-            raise RuntimeError("original standalone fixture preimage changed")
-        source = source.replace(before, after)
-    return source
 
 
 def archive_source(git, target, tree):
@@ -171,33 +144,25 @@ def prepare_arm(git, root, arm, env, evidence):
                       cwd=src, env=workspace, text=True).splitlines()
         if tuple(modules) != MODULE_PINS:
             raise RuntimeError(f"unexpected effective modules for {arm}: {modules}")
-        lanes = {"standalone": "migratepair", "recovery": "recoverypair"}
-        for lane, folder in lanes.items():
-            target = src / "pkg/lux/pg" / folder
-            target.mkdir()
-            if lane == "standalone":
-                (target / "migration_pair_test.go").write_text(standalone_fixture())
-                shutil.copyfile(PAYLOAD / "durable_reset_test.go", target / "durable_reset_test.go")
-            else:
-                for name in ("advisory_pair_test.go", "recovery_test.go"):
-                    shutil.copyfile(PAYLOAD / name, target / name)
-        packages = ["./pkg/lux/pg/" + folder for folder in lanes.values()]
-        graph = run("go", "list", "-mod=readonly", "-p=1", "-deps", "-test", *packages, cwd=src, env=workspace)
+        target = src / "pkg/lux/pg/recoverypair"
+        target.mkdir()
+        for name in RECOVERY_FIXTURES:
+            shutil.copyfile(PAYLOAD / name, target / name)
+        package = "./pkg/lux/pg/recoverypair"
+        graph = run("go", "list", "-mod=readonly", "-p=1", "-deps", "-test", package, cwd=src, env=workspace)
         verified = run("go", "mod", "verify", cwd=src, env=workspace, text=True).strip()
         if verified != "all modules verified":
             raise RuntimeError("Go module verification failed")
         offline = workspace | {"GOPROXY": "off", "GOSUMDB": "off"}
-        if run("go", "list", "-mod=readonly", "-p=1", "-deps", "-test", *packages, cwd=src, env=offline) != graph:
+        if run("go", "list", "-mod=readonly", "-p=1", "-deps", "-test", package, cwd=src, env=offline) != graph:
             raise RuntimeError("offline fixture graph differs")
-        result = {}
-        for lane, folder in lanes.items():
-            path = root / lane / f"runner-{arm}.test"
-            path.parent.mkdir(exist_ok=True)
-            run("go", "test", "-c", "-trimpath", "-o", str(path), "./pkg/lux/pg/" + folder, cwd=src, env=offline)
-            result[lane] = {"tree": ARMS[arm], "binary": path.name, "sha256": sha(path.read_bytes())}
+        path = root / "recovery" / f"runner-{arm}.test"
+        path.parent.mkdir(exist_ok=True)
+        run("go", "test", "-c", "-trimpath", "-o", str(path), package, cwd=src, env=offline)
+        result = {"recovery": {"tree": ARMS[arm], "binary": path.name, "sha256": sha(path.read_bytes())}}
+        fixture_hashes = {name: sha((target / name).read_bytes()) for name in RECOVERY_FIXTURES}
     put(evidence / f"source-{arm}.json", {"tree": ARMS[arm], "graphSHA256": sha(graph), "modules": verified,
-                                        "arms": result, "modulePins": modules,
-                                        "standaloneFixtureSHA256": sha(standalone_fixture().encode())})
+                                        "arms": result, "modulePins": modules, "recoveryFixtureSHA256": fixture_hashes})
     return result
 
 
@@ -231,33 +196,26 @@ def admit(path):
 
 
 def sample_arguments(lane, iterations, smoke):
-    tests = SMOKE_TESTS[lane] if smoke else ()
-    selected = "^(" + "|".join(tests) + ")$" if tests else "^$"
-    args = [f"-test.run={selected}", f"-test.bench={SELECTORS[lane]}", "-test.cpu=1", "-test.benchmem", "-test.count=1",
+    group = f"({JOURNAL_LEAF}|{RETRY_LEAF})" if smoke else RETRY_LEAF
+    selector = f"^{BENCHMARKS[lane]}$/^{group}$"
+    return ["-test.run=^$", f"-test.bench={selector}", "-test.cpu=1", "-test.benchmem", "-test.count=1",
             "-test.timeout=3m", f"-test.benchtime={iterations}x"]
-    if tests:
-        args.append("-test.v")
-    return args, tests
 
 
-def sample_metrics(raw, lane, iterations, tests):
+def sample_metrics(raw, lane, iterations, smoke):
+    expected = LEAVES[lane] | ({JOURNAL_LEAF} if smoke else set())
     rows = re.findall(rf"^{BENCHMARKS[lane]}/(\S+?)(?:-\d+)?\s+(\d+)\s+([\d.]+) ns/op\s+(\d+) B/op\s+(\d+) allocs/op$", raw, re.M)
-    if len(rows) != len(LEAVES[lane]) or {row[0] for row in rows} != LEAVES[lane] or any(int(row[1]) != iterations for row in rows):
+    if len(rows) != len(expected) or {row[0] for row in rows} != expected or any(int(row[1]) != iterations for row in rows):
         raise RuntimeError(f"invalid {lane} sample inventory")
-    if len(re.findall(r"^PASS$", raw, re.M)) != 1:
-        raise RuntimeError("missing benchmark PASS")
-    passed = re.findall(r"^--- PASS: (Test\w+) ", raw, re.M)
-    if sorted(passed) != sorted(tests) or re.search(r"^\s*--- SKIP:", raw, re.M):
-        raise RuntimeError(f"incomplete {lane} smoke tests")
-    if tests and lane == "standalone" and re.findall(r"history created=(true|false)", raw) != ["false"]:
-        raise RuntimeError("empty preview changed migration history")
+    if len(re.findall(r"^PASS$", raw, re.M)) != 1 or re.search(r"^\s*--- SKIP:", raw, re.M):
+        raise RuntimeError("missing benchmark PASS or unexpected skip")
     return {leaf: dict(zip(METRICS, values)) for leaf, _, *values in rows}
 
 
 def sample(root, lane, name, arm, slots, slot, identities, iterations, evidence, smoke=False):
     database, password = slots[slot]
     binary = root / lane / identities[arm][lane]["binary"]
-    arguments, tests = sample_arguments(lane, iterations, smoke)
+    arguments = sample_arguments(lane, iterations, smoke)
     env = {**os.environ, "GOMAXPROCS": "1", "GOGC": "100", "GOMEMLIMIT": "off", "GODEBUG": "",
            "TMPDIR": str(root), "LUXO_ADVISORY_MODEL": "holder",
            "LUXO_DURABLE_ARM": arm, "LUXO_MIGPAIR_EMPTY_HISTORY_CREATE": "no",
@@ -268,19 +226,19 @@ def sample(root, lane, name, arm, slots, slot, identities, iterations, evidence,
     (evidence / f"{name}.log").write_text(raw)
     if proc.returncode:
         raise RuntimeError(f"failed to measure {name}; see raw transcript")
-    return {"arm": arm, "slot": slot, "name": name, "metrics": sample_metrics(raw, lane, iterations, tests),
+    return {"arm": arm, "slot": slot, "name": name, "metrics": sample_metrics(raw, lane, iterations, smoke),
             "logSHA256": sha(raw.encode())}
 
 
 def schedule(lane):
-    comparisons, controls = ("QR", "PR"), ("PP", "QQ", "RR")
-    control_count = {"standalone": 5, "recovery": 10}[lane]
+    if lane not in LEAVES:
+        raise RuntimeError(f"unknown recovery lane: {lane}")
+    comparisons = ("QS", "PS", "PP", "QQ", "SS")
     for group, slots in enumerate(("ab", "ba"), 1):
         for pair in range(1, 11):
-            active = comparisons + (controls if pair <= control_count else ())
-            rotate = (pair + group - 1) % len(active)
+            rotate = (pair + group - 1) % len(comparisons)
             indices = (0, 1) if (pair + group) % 2 == 0 else (1, 0)
-            for arms in active[rotate:] + active[:rotate]:
+            for arms in comparisons[rotate:] + comparisons[:rotate]:
                 yield f"{arms.lower()}{group}", arms, pair, slots, indices
 
 
@@ -375,7 +333,8 @@ def replay(repo, root, evidence, entries):
     put(evidence / "inputs.json", {"base": BASE, "baseTree": BASE_TREE, "products": ARMS,
                                   "patches": PATCHES, "payload": entries, "go": "go1.27.1 linux/arm64",
                                   "projection": PROJECTION, "historical": HISTORICAL, "modulePins": MODULE_PINS,
-                                  "comparisons": {"QR": "one-shot intent only", "PR": "remaining product costs"}})
+                                  "candidatePaths": CANDIDATE_PATHS,
+                                  "comparisons": {"QS": "retry settings only", "PS": "remaining product costs"}})
     git = trees(repo, root)
     identities = {arm: prepare_arm(git, root, arm, env, evidence) for arm in ARMS}
     shared = runpy.run_path(str(PAYLOAD / "shared.py"))
