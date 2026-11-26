@@ -379,6 +379,14 @@ Returning `null` preserves the original error; a thrown refresh error propagates
 unchanged. The retry retains the request's original JSON/Binary mode even if the
 callback changes the mode for future calls.
 
+A refresh callback can call its refresh endpoint through the same Fetch or
+Node HTTP/2 client with `{ refreshOnUnauthorized: false }` in the call options.
+For example, a generated endpoint with parameters can be called as
+`client.refresh({ refreshToken }, { refreshOnUnauthorized: false })`. The call
+uses its usual credentials and deadline, and a validated 401 is returned to
+the callback without joining the pending refresh. Other HTTP calls continue
+to share the refresh and can retry once.
+
 ```ts
 const transport = new FetchTransport(endpoint, {
   onTokenExpired: async () => {
