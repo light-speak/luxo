@@ -38,6 +38,7 @@ func (generator *GeneratorContext) generateErrorFile(result *semantic.Result, pa
 
 	var b strings.Builder
 	g := newErrorDataGenerator(result, generator)
+	g.publicErrorData = true
 	for _, e := range errs {
 		generator.generateErrorConstructor(&b, e, g.models)
 		g.writeData(&b, e)
@@ -52,6 +53,7 @@ func (generator *GeneratorContext) generateErrorFile(result *semantic.Result, pa
 	if generatedPackages(body).has("lux") {
 		out.WriteString("\t\"github.com/light-speak/luxo/pkg/lux\"\n")
 	}
+	writeRuntimeUtilityImports(&out, g.imports)
 	out.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/errors\"\n")
 	out.WriteString(")\n\n")
 	out.WriteString(body)

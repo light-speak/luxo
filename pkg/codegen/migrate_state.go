@@ -88,7 +88,11 @@ func validateSchemaState(s *SchemaState) error {
 	if s == nil {
 		return fmt.Errorf("migration state must be an object")
 	}
-	for name, model := range s.Models {
+	models := s.Models
+	if len(models) == 0 {
+		return nil
+	}
+	for name, model := range models {
 		if model == nil {
 			return fmt.Errorf("migration state model %q must be an object", name)
 		}

@@ -269,12 +269,12 @@ it.each(['json', 'binary'] as const)('isolates cancelled %s refresh and removes 
   class ObservableTransport extends NodeHTTP2Transport {
     get refreshSignal() { return this.refreshAbortSignal! }
   }
-  const entered = [Promise.withResolvers<void>(), Promise.withResolvers<void>()]
-  const refreshes = [Promise.withResolvers<string | null>(), Promise.withResolvers<string | null>()]
-  let index = 0
+  const entered = Promise.withResolvers<void>()
+  const renewal = Promise.withResolvers<string | null>()
+  const refresh = vi.fn(() => { entered.resolve(); return renewal.promise })
   const transport = new ObservableTransport(endpoint, {
     mode, token: 'old', tls: { ca: cert },
-    onTokenExpired: () => { const current = index++; entered[current].resolve(); return refreshes[current].promise },
+    onTokenExpired: refresh,
   })
   transport.setSchema({ echo: { id: 1, params: [] } })
   clients.push(transport)
@@ -291,17 +291,16 @@ it.each(['json', 'binary'] as const)('isolates cancelled %s refresh and removes 
   }
   const controller = new AbortController()
   const first = expect(transport.call('echo', undefined, { signal: controller.signal })).rejects.toMatchObject({ error: 'CancelledError' })
-  await entered[0].promise
+  await entered.promise
   const second = transport.call('echo')
-  await entered[1].promise
-  expect(getEventListeners(transport.refreshSignal, 'abort')).toHaveLength(2)
+  await vi.waitFor(() => expect(getEventListeners(transport.refreshSignal, 'abort')).toHaveLength(2))
   controller.abort()
   await first
   expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0)
   expect(getEventListeners(transport.refreshSignal, 'abort')).toHaveLength(1)
-  refreshes[0].reject(new Error('cancelled refresh failed late'))
-  refreshes[1].resolve('new')
+  renewal.resolve('new')
   expect(await second).toEqual(mode === 'json' ? 42 : Uint8Array.of(42))
+  expect(refresh).toHaveBeenCalledOnce()
   expect(getEventListeners(transport.refreshSignal, 'abort')).toHaveLength(0)
   expect(sessions.size).toBe(1)
 })

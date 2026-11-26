@@ -159,12 +159,20 @@ func TestStaticAuthNilBoundaries(t *testing.T) {
 }
 
 func TestStaticJWTEnvelope(t *testing.T) {
-	for _, raw := range []string{"[]", `{"data":{},`, `{"data":{},"exp":`, `{"data":{},"exp":123} false`} {
+	for _, raw := range []string{"[]", `{"data":{},`, `{"data":{},"exp":`, `{"data":{},"exp":123,"token_use":"access"} false`} {
 		if claims, _, err := readTokenClaims([]byte(raw), accessPurpose); err == nil || claims.Raw() != "" {
 			t.Errorf("accepted %q", raw)
 		}
 	}
-	for _, raw := range []string{`{}`, `{"data":{},"exp":null}`, `{"data":{},"exp":1.5}`, `{"data":null,"exp":1}`, `{"data":{},"exp":1,"exp":2}`, `{"data":{},"exp":1,"iat":false}`, `{"data":{},"exp":1,"iat":1,"iat":2}`} {
+	for _, raw := range []string{
+		`{}`,
+		`{"data":{},"exp":null,"token_use":"access"}`,
+		`{"data":{},"exp":1.5,"token_use":"access"}`,
+		`{"data":null,"exp":1,"token_use":"access"}`,
+		`{"data":{},"exp":1,"exp":2,"token_use":"access"}`,
+		`{"data":{},"exp":1,"iat":false,"token_use":"access"}`,
+		`{"data":{},"exp":1,"iat":1,"iat":2,"token_use":"access"}`,
+	} {
 		if claims, _, err := readTokenClaims([]byte(raw), accessPurpose); err == nil || claims.Raw() != "" {
 			t.Errorf("accepted %s", raw)
 		}
@@ -188,7 +196,7 @@ func TestStaticJWTEnvelope(t *testing.T) {
 }
 
 func FuzzStaticClaims(f *testing.F) {
-	for _, raw := range []string{`{}`, `{"id":9223372036854775807}`, `{"role":"\uD800"}`, `{"a":1,"a":2}`} {
+	for _, raw := range []string{`{}`, `{"id":9223372036854775807}`, `{"role":"\uD800"}`, `{"a":1,"a":2}`, " \n{\"id\":1} \r\n"} {
 		f.Add(raw)
 	}
 	f.Fuzz(func(t *testing.T, raw string) {
@@ -196,11 +204,12 @@ func FuzzStaticClaims(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if claims.Raw() != raw || !strings.HasPrefix(strings.TrimSpace(raw), "{") {
+		object := strings.Trim(raw, " \t\r\n")
+		if claims.Raw() != object || !strings.HasPrefix(object, "{") {
 			t.Fatal("claims changed")
 		}
 		out, err := claims.AppendJSON(nil)
-		if err != nil || string(out) != raw {
+		if err != nil || string(out) != object {
 			t.Fatal("re-emission changed claims")
 		}
 	})

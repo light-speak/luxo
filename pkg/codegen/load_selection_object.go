@@ -102,7 +102,7 @@ func (a *loadDemandAnalysis) objectFields(fields []*ast.NamedArg) []loadOrigin {
 }
 
 func (a *loadDemandAnalysis) bindObject(origins []loadOrigin, expression ast.Expr, expected *ast.TypeRef) []loadOrigin {
-	if len(origins) == 0 || origins[0].demand.object == nil || expression.IsNullable() || a.models[expression.GetTypeTag()] != nil || expected != nil && a.models[expected.Name] != nil {
+	if !a.loadObjectValue(origins, expression, expected) {
 		return origins
 	}
 	// A literal has just created unique slots; only existing values need a copy.
@@ -112,16 +112,98 @@ func (a *loadDemandAnalysis) bindObject(origins []loadOrigin, expression ast.Exp
 	if call, ok := expression.(*ast.CallExpr); ok && isLoadObjectConstructor(call) {
 		return origins
 	}
+	return copyLoadObjectSlots(origins, false)
+}
+
+func (a *loadDemandAnalysis) loadObjectValue(origins []loadOrigin, expression ast.Expr, expected *ast.TypeRef) bool {
+	return len(origins) != 0 && origins[0].demand.object != nil && !expression.IsNullable() &&
+		a.models[expression.GetTypeTag()] == nil && (expected == nil || a.models[expected.Name] == nil)
+}
+
+func (a *loadDemandAnalysis) bindLoadAliases(scope map[string][]loadOrigin, names []string, origins []loadOrigin, expression ast.Expr, expected *ast.TypeRef) {
+	bound := a.bindObject(origins, expression, expected)
+	copySlots := len(names) > 1 && !expression.IsListType() && a.loadObjectValue(bound, expression, expected) &&
+		(expected == nil || !expected.Nullable && !expected.IsList)
+	if copySlots && len(bound) == 1 && bound[0].demand.object.initial == nil {
+		bindFreshLoadAliases(scope, names, bound)
+		return
+	}
+	used := false
+	for _, name := range names {
+		if name == "_" {
+			continue
+		}
+		// Scalar fan-out evaluates the initializer once. Each value alias has
+		// its own top-level slots and shares the same reference fields.
+		if used && copySlots {
+			bound = copyLoadObjectSlots(bound, true)
+		}
+		scope[name] = bound
+		used = true
+	}
+}
+
+type loadAliasSlot struct {
+	object  loadObject
+	origins [1]loadOrigin
+}
+
+func bindFreshLoadAliases(scope map[string][]loadOrigin, names []string, bound []loadOrigin) {
+	count := 0
+	for _, name := range names {
+		if name != "_" {
+			count++
+		}
+	}
+	object := bound[0].demand.object
+	var slots []loadAliasSlot
+	if count > 1 {
+		object.shareInitialSlots()
+		slots = make([]loadAliasSlot, count-1)
+	}
+	first := true
+	for _, name := range names {
+		if name == "_" {
+			continue
+		}
+		if first {
+			scope[name] = bound
+			first = false
+			continue
+		}
+		slot := &slots[0]
+		slots = slots[1:]
+		slot.object = *object
+		slot.object.origin.object = &slot.object
+		slot.origins[0] = bound[0]
+		slot.origins[0].demand = &slot.object.origin
+		scope[name] = slot.origins[:]
+	}
+}
+
+func (object *loadObject) shareInitialSlots() {
+	// Each owner can override the shared initialization in its private slots.
+	object.initial = &loadObjectFields{fields: object.fields, keys: object.keys}
+	object.loadObjectFields = loadObjectFields{}
+}
+
+func copyLoadObjectSlots(origins []loadOrigin, shareFresh bool) []loadOrigin {
 	bound := slices.Clone(origins)
 	for index, origin := range bound {
-		if origin.demand.object != nil {
-			origin.demand.object.initialFields()
-			copy := *origin.demand.object
-			copy.fields = maps.Clone(copy.fields)
-			copy.keys = slices.Clone(copy.keys)
-			copy.origin.object = &copy
-			bound[index].demand = &copy.origin
+		object := origin.demand.object
+		if object == nil {
+			continue
 		}
+		if shareFresh && object.initial == nil {
+			object.shareInitialSlots()
+		} else {
+			object.initialFields()
+		}
+		copy := *object
+		copy.fields = maps.Clone(copy.fields)
+		copy.keys = slices.Clone(copy.keys)
+		copy.origin.object = &copy
+		bound[index].demand = &copy.origin
 	}
 	return bound
 }

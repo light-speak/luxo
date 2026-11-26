@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -532,6 +533,32 @@ func TestServe_H2C(t *testing.T) {
 	serveWithPendingShutdown(t, gw, "test-v1")
 }
 
+func TestServeRegistersTheBoundPort(t *testing.T) {
+	studio := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer studio.Close()
+	t.Setenv("APP_PORT", "0")
+	t.Setenv("LUXO_STUDIO_URL", studio.URL)
+	t.Setenv("LUXO_API_KEY", "test-key")
+	t.Setenv("LUXO_PROJECT_ID", testStudioProjectID)
+	t.Setenv("LUXO_INSTANCE_ID", "localhost")
+	t.Setenv("LUXO_GATEWAY_ENDPOINT", "")
+	gw := New()
+	serveWithPendingShutdown(t, gw, "test-v1")
+	server, ok := gw.server.(*gatewayHTTPServer)
+	if !ok {
+		t.Fatalf("gateway started unexpected runtime %T", gw.server)
+	}
+	_, port, err := net.SplitHostPort(server.Addr)
+	if err != nil || port == "0" {
+		t.Fatalf("bound address %q: %v", server.Addr, err)
+	}
+	if gw.registrar == nil || gw.registrar.endpoint != "http://localhost:"+port {
+		t.Fatalf("Studio registration did not use bound port %s", port)
+	}
+}
+
 func TestServe_CustomShutdownTimeout(t *testing.T) {
 	t.Setenv("GRACEFUL_TIMEOUT", "1s")
 	t.Setenv("APP_PORT", "0")
@@ -636,6 +663,26 @@ func TestServeRejectsInvalidJWTConfiguration(t *testing.T) {
 	err := New().Serve("test-v1")
 	if err == nil || !strings.Contains(err.Error(), "invalid JWT configuration") {
 		t.Fatalf("invalid JWT configuration = %v", err)
+	}
+}
+
+func TestServeRejectsScaffoldJWTSecret(t *testing.T) {
+	auth.ResetConfig()
+	t.Cleanup(auth.ResetConfig)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("DEPLOY_MODE", "embedded")
+	t.Setenv("GRACEFUL_TIMEOUT", "30s")
+	t.Setenv("JWT_SECRET", "change-me")
+	t.Setenv("JWT_EXPIRES", "1h")
+	t.Setenv("JWT_REFRESH", "false")
+	t.Setenv("JWT_REFRESH_EXPIRES", "24h")
+	t.Setenv("LUXO_STUDIO_URL", "")
+	// Keep the test from opening a listener if JWT validation regresses.
+	t.Setenv("CORS_ORIGIN", "https://app.example/path")
+	gateway := New()
+	err := gateway.Serve("test-v1")
+	if err == nil || !strings.Contains(err.Error(), "invalid JWT configuration: JWT_SECRET uses the default scaffold placeholder") || gateway.server != nil {
+		t.Fatalf("expected startup to reject the scaffold JWT secret, got %v", err)
 	}
 }
 

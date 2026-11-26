@@ -19,7 +19,6 @@ func parseClaims(raw []byte) (Claims, error) {
 	if err := finishClaimsObject(reader, raw); err != nil {
 		return Claims{}, err
 	}
-	claims.data.raw = string(raw)
 	return claims, nil
 }
 
@@ -54,6 +53,21 @@ func TestClaimsPreserveExactNumbers(t *testing.T) {
 		if _, ok := claims.Get("decimal").Int64(); ok {
 			t.Fatal("fraction accepted as integer")
 		}
+	}
+}
+
+func TestClaimsRawPreservesObjectBytes(t *testing.T) {
+	const object = "{\n  \"id\" : 9007199254740993\n}"
+	claims, err := parseClaims([]byte(" \t" + object + "\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claims.Raw() != object {
+		t.Fatalf("Raw() = %q, want %q", claims.Raw(), object)
+	}
+	emitted, err := claims.AppendJSON([]byte("prefix"))
+	if err != nil || string(emitted) != "prefix"+object {
+		t.Fatalf("AppendJSON = %q, %v", emitted, err)
 	}
 }
 

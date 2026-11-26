@@ -100,6 +100,9 @@ func (c *candidateConnection) execute(task *requestTask) (result *response, err 
 		}
 	}
 	result = &response{header: make(http.Header), limit: c.limits.MaxResponseBodyBytes, budget: c.budget}
+	if request.Method == http.MethodHead {
+		result.headBytes = -1
+	}
 	// Goexit leaves this failure marker in place while running cleanup defers.
 	err = errResponse
 	c.handler.ServeHTTP(result, request)

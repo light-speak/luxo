@@ -67,49 +67,85 @@ func checkedSelectionChildren(fields []byte, children []SelectionMaskChild) ([]S
 // SplitSelectionMask returns the current node's bitmap and encoded child area.
 // An empty mask means select all. Malformed or over-depth nodes return ok=false.
 func SplitSelectionMask(mask []byte) (fields, children []byte, ok bool) {
-	return splitSelectionMask(mask, 0)
-}
-
-func splitSelectionMask(mask []byte, depth int) (fields, children []byte, ok bool) {
 	if len(mask) == 0 {
 		return nil, nil, true
 	}
-	fieldLen, n := ReadVarint(mask, 0)
-	if n <= 0 || fieldLen == 0 || fieldLen > MaxSelectionMaskBytes || fieldLen > uint64(len(mask)-n) {
+	fields, children, ok = splitSelectionMask(mask, 0)
+	return
+}
+
+func splitSelectionMask(mask []byte, depth int) (fields, children []byte, ok bool) {
+	fields, children, ok = selectionMaskParts(mask)
+	if len(children) > 0 && !validSelectionChildren(fields, children, depth) {
+		return nil, nil, false
+	}
+	return
+}
+
+// selectionMaskParts decodes a nonempty node. Callers handle an empty root
+// or verify a positive child length first. Malformed nodes expose no slices.
+func selectionMaskParts(mask []byte) (fields, children []byte, ok bool) {
+	fieldLen, n := uint64(mask[0]), 1
+	if fieldLen >= 0x80 {
+		fieldLen, n = ReadVarint(mask, 0)
+	}
+	if n <= 0 || fieldLen > uint64(len(mask)-n) {
 		return nil, nil, false
 	}
 	end := n + int(fieldLen)
 	fields = mask[n:end]
-	if !validSelectionBitmap(fields) || !validSelectionChildren(mask[end:], depth) {
+	if !validSelectionBitmap(fields) {
 		return nil, nil, false
 	}
 	return fields, mask[end:], true
 }
 
-func validSelectionChildren(children []byte, depth int) bool {
-	previousID := uint64(0)
-	for off := 0; off < len(children); {
+func validSelectionChildren(fields, children []byte, depth int) bool {
+descend:
+	for {
 		if depth >= MaxSelectionDepth-1 {
 			return false
 		}
-		fieldID, n := ReadVarint(children, off)
-		if n <= 0 || fieldID == 0 || fieldID > MaxSelectionFieldID || fieldID <= previousID {
-			return false
+		depth++
+		previousID := uint64(0)
+		for off := 0; off < len(children); {
+			fieldID, n := ReadVarint(children, off)
+			if n <= 0 || fieldID <= previousID {
+				return false
+			}
+			// The validated parent bitmap excludes the reserved high bit.
+			// Membership also bounds the unsigned ID before narrowing.
+			bit := fieldID - 1
+			index := bit >> 3
+			if index >= uint64(len(fields)) || fields[index]&(1<<(bit&7)) == 0 {
+				return false
+			}
+			off += n
+			length, n := ReadVarint(children, off)
+			if n <= 0 || length == 0 || length > uint64(len(children)-off-n) {
+				return false
+			}
+			off += n
+			end := off + int(length)
+			childFields, nested, ok := selectionMaskParts(children[off:end])
+			if !ok {
+				return false
+			}
+			if len(nested) > 0 {
+				// Descend into the last child without keeping a recursion frame.
+				if end == len(children) {
+					fields, children = childFields, nested
+					continue descend
+				}
+				if !validSelectionChildren(childFields, nested, depth) {
+					return false
+				}
+			}
+			off = end
+			previousID = fieldID
 		}
-		off += n
-		length, n := ReadVarint(children, off)
-		if n <= 0 || length == 0 || length > uint64(len(children)-off-n) {
-			return false
-		}
-		off += n
-		end := off + int(length)
-		if _, _, ok := splitSelectionMask(children[off:end], depth+1); !ok {
-			return false
-		}
-		off = end
-		previousID = fieldID
+		return true
 	}
-	return true
 }
 
 // SelectionMaskFields returns the current node's bitmap. An empty or malformed

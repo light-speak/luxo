@@ -42,7 +42,7 @@ func NewPoolWithOptions(addr string, options PoolOptions) (*Pool, error) {
 
 func newPool(addr string, options PoolOptions) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Pool{addr: addr, maxIdle: options.MaxIdle, timeout: options.DialTimeout,
+	return &Pool{addr: addr,
 		conns: make(chan net.Conn, options.MaxIdle), options: options,
 		wake: make(chan struct{}, 1), lifetime: ctx, cancel: cancel}
 }
@@ -132,7 +132,7 @@ func (p *Pool) wait(ctx context.Context) (net.Conn, error) {
 // The reservation precedes dialing and is held through handshake. Closing the
 // pool cancels in-flight setup without interrupting already borrowed calls.
 func (p *Pool) dialReserved(ctx context.Context) (net.Conn, error) {
-	dialCtx, cancel := context.WithTimeout(ctx, p.timeout)
+	dialCtx, cancel := context.WithTimeout(ctx, p.options.DialTimeout)
 	stop := context.AfterFunc(p.lifetime, cancel)
 	defer cancel()
 	defer stop()

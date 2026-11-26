@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"go/token"
 	"strconv"
 
 	"github.com/light-speak/luxo/internal/inferred"
@@ -108,8 +109,8 @@ func (c *compiler) captureQueryTotal(expr ast.Expr, total string) string {
 	return total
 }
 
-func (c *compiler) pageBranchValue(expr ast.Expr, value string) string {
-	if c.pageResult == "" {
+func (c *compiler) pageBranchValue(result string, expr ast.Expr, value string) string {
+	if result == "" {
 		return value
 	}
 	total := c.pageTotal(expr)
@@ -122,7 +123,10 @@ func (c *compiler) pageBranchValue(expr ast.Expr, value string) string {
 		}
 		value = name
 		total = c.writeInMemoryPagination(name)
+	} else if !token.IsIdentifier(value) {
+		// An inline value closure can set its pagination total when it runs.
+		value = c.captureExpressionValue(expr, value, "")
 	}
-	c.write("%s = %s", c.pageResult, total)
+	c.write("%s = %s", result, total)
 	return value
 }

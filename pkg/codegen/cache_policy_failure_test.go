@@ -9,6 +9,7 @@ type policyRedisProxy struct {
  mu sync.Mutex
  failed bool
  stalled <-chan struct{}
+ stalledConnections int
  connections map[net.Conn]struct{}
  workers sync.WaitGroup
  done chan struct{}
@@ -60,6 +61,7 @@ func (proxy *policyRedisProxy) forward(client net.Conn){
  proxy.connections[client]=struct{}{}
  proxy.connections[upstream]=struct{}{}
  stalled:=proxy.stalled
+ if stalled!=nil{proxy.stalledConnections++}
  proxy.mu.Unlock()
  defer func(){
   proxy.mu.Lock()
@@ -93,6 +95,7 @@ func TestGeneratedRedisFailureBoundsConcurrentOrigin(t *testing.T){
 
 type policyFailureCache struct {
  cache.Cache
+ proxy *policyRedisProxy
  mu sync.Mutex
  getError,setError error
  writes int
@@ -102,7 +105,21 @@ type policyFailureCache struct {
  lastGetBytes int
 }
 
+const policyRedisFaultTimeout=100*time.Millisecond
+
+// Healthy setup and recovery use the real adapter’s default finite timeout.
+// Only explicit proxy faults use the shorter per-operation deadline.
+func(backend *policyFailureCache)operationContext(ctx context.Context)(context.Context,context.CancelFunc){
+ backend.proxy.mu.Lock()
+ fault:=backend.proxy.failed||backend.proxy.stalled!=nil
+ backend.proxy.mu.Unlock()
+ if !fault{return ctx,func(){}}
+ return context.WithTimeout(ctx,policyRedisFaultTimeout)
+}
+
 func(backend *policyFailureCache)Get(ctx context.Context,key string)([]byte,error){
+ ctx,cancel:=backend.operationContext(ctx)
+ defer cancel()
  value,err:=backend.Cache.Get(ctx,key)
  backend.mu.Lock()
  backend.getError=err
@@ -113,6 +130,8 @@ func(backend *policyFailureCache)Get(ctx context.Context,key string)([]byte,erro
 }
 
 func(backend *policyFailureCache)Set(ctx context.Context,key string,value []byte,ttl time.Duration)error{
+ ctx,cancel:=backend.operationContext(ctx)
+ defer cancel()
  err:=backend.Cache.Set(ctx,key,value,ttl)
  backend.mu.Lock()
  backend.writes++
@@ -130,8 +149,8 @@ func(backend *policyFailureCache)assertInitialFill(t *testing.T){
  t.Helper()
  backend.mu.Lock()
  defer backend.mu.Unlock()
- if backend.writes!=1||backend.setError!=nil||backend.getError!=nil{
-  t.Fatalf("Redis fixture was not healthy before fault: writes=%d get=%v set=%v",backend.writes,backend.getError,backend.setError)
+ if backend.writes!=1||backend.setError!=nil||backend.getError!=nil||backend.initialTTL!=time.Minute{
+  t.Fatalf("Redis fixture was not healthy before fault: writes=%d get=%v set=%v ttl=%v",backend.writes,backend.getError,backend.setError,backend.initialTTL)
  }
 }
 
@@ -146,11 +165,11 @@ func(backend *policyFailureCache)diagnostics()string{
 
 func failurePolicyRouter(t *testing.T,proxy *policyRedisProxy)(*api.Router,*policyResolver,*policyFailureCache){
  t.Helper()
- backend,err:=rediscache.NewRedis(proxy.listener.Addr().String(),rediscache.WithPrefix(t.Name()),rediscache.WithTimeout(100*time.Millisecond))
+ backend,err:=rediscache.NewRedis(proxy.listener.Addr().String(),rediscache.WithPrefix(t.Name()))
  if err!=nil{t.Fatal(err)}
  t.Cleanup(func(){if err:=backend.Close();err!=nil{t.Error(err)}})
- if err:=backend.Ping(t.Context());err!=nil{t.Fatal(err)}
- observed:=&policyFailureCache{Cache:backend}
+ if err:=backend.Ping(t.Context());err!=nil{t.Fatalf("Redis proxy readiness ping: %v",err)}
+ observed:=&policyFailureCache{Cache:backend,proxy:proxy}
  router,resolver:=policyRouterWithBackend(t,observed,"redis-failure",time.Minute,api.ResponseOriginOptions{MaxConcurrent:2})
  return router,resolver,observed
 }
@@ -245,6 +264,7 @@ func stallPolicyRedis(proxy *policyRedisProxy)func(){
  ready:=make(chan struct{})
  proxy.mu.Lock()
  proxy.stalled=ready
+ proxy.stalledConnections=0
  for conn:=range proxy.connections{_=conn.Close()}
  proxy.mu.Unlock()
  var once sync.Once
@@ -256,7 +276,7 @@ func stallPolicyRedis(proxy *policyRedisProxy)func(){
  })}
 }
 
-func storedPolicyValue(t *testing.T,backend *policyFailureCache)[]byte{
+func storedPolicySnapshot(t *testing.T,backend *policyFailureCache)([]byte,time.Time){
  t.Helper()
  backend.mu.Lock()
  key:=t.Name()+":"+backend.initialKey
@@ -265,9 +285,10 @@ func storedPolicyValue(t *testing.T,backend *policyFailureCache)[]byte{
  defer probe.Close()
  value,err:=probe.Get(t.Context(),key).Bytes()
  if err!=nil{t.Fatalf("direct Redis read: %v",err)}
- ttl,err:=probe.PTTL(t.Context(),key).Result()
- if err!=nil||ttl<=0||ttl>time.Minute{t.Fatalf("direct Redis ttl=%v error=%v",ttl,err)}
- return value
+ // Compare Redis's stored deadline, which does not move with its wall clock.
+ expiry,err:=probe.PExpireTime(t.Context(),key).Result()
+ if err!=nil||expiry<=0{t.Fatalf("direct Redis expiry=%v error=%v",expiry,err)}
+ return value,time.UnixMilli(int64(expiry/time.Millisecond))
 }
 
 func TestGeneratedRedisReadTimeoutDoesNotMeanEntryLoss(t *testing.T){
@@ -289,7 +310,7 @@ func verifyPolicyRedisReadTimeout(t *testing.T,http2,binary bool){
  token:=policyHTTPToken(t,cfg,9007199254740993)
  callPolicyHTTP(t,endpoint,router,token,42,binary,http2)
  backend.assertInitialFill(t)
- original:=storedPolicyValue(t,backend)
+ original,originalExpiry:=storedPolicySnapshot(t,backend)
  resume:=stallPolicyRedis(proxy)
  defer resume()
  callPolicyHTTP(t,endpoint,router,token,42,binary,http2)
@@ -297,15 +318,69 @@ func verifyPolicyRedisReadTimeout(t *testing.T,http2,binary bool){
  getErr,setErr:=backend.getError,backend.setError
  sameKey:=backend.lastGetKey==backend.initialKey
  backend.mu.Unlock()
+ proxy.mu.Lock()
+ stalledConnections:=proxy.stalledConnections
+ proxy.mu.Unlock()
+ if stalledConnections==0{t.Fatal("Redis fault did not withhold an upstream connection")}
  var timeout net.Error
  if !errors.As(getErr,&timeout)||!timeout.Timeout()||setErr==nil||!sameKey{
   t.Fatalf("stalled Redis was not a timed-out read/refill: %s",backend.diagnostics())
  }
  if got:=resolver.calls.Load();got!=2{t.Fatalf("timed-out cache did not execute origin once: %d",got)}
- if !bytes.Equal(storedPolicyValue(t,backend),original){t.Fatal("timed-out read/refill changed the stored entry")}
+ stored,expiry:=storedPolicySnapshot(t,backend)
+ if !bytes.Equal(stored,original){t.Fatal("timed-out read/refill changed the stored entry")}
+ if !expiry.Equal(originalExpiry){t.Fatalf("timed-out read/refill changed the stored expiry: %v to %v",originalExpiry,expiry)}
  t.Logf("entry preserved despite origin fallback: %s",backend.diagnostics())
  resume()
  callPolicyHTTP(t,endpoint,router,token,42,binary,http2)
  if got:=resolver.calls.Load();got!=2{t.Fatalf("resumed Redis did not hit preserved entry: %d %s",got,backend.diagnostics())}
+}
+
+type policyDeadlineProbe struct {
+ cache.Cache
+ read,write context.Context
+}
+
+func(probe *policyDeadlineProbe)Get(ctx context.Context,_ string)([]byte,error){
+ probe.read=ctx
+ return nil,nil
+}
+
+func(probe *policyDeadlineProbe)Set(ctx context.Context,_ string,_ []byte,_ time.Duration)error{
+ probe.write=ctx
+ return nil
+}
+
+func TestGeneratedRedisFaultDeadlineIsolation(t *testing.T){
+ probe:=&policyDeadlineProbe{}
+ proxy:=&policyRedisProxy{}
+ backend:=&policyFailureCache{Cache:probe,proxy:proxy}
+ resume:=func(){}
+ t.Cleanup(func(){resume()})
+ for _,phase:=range []struct{name string; start func(); fault bool}{
+  {"readiness",func(){},false},
+  {"closed",func(){proxy.setFailed(true)},true},
+  {"recovered",func(){proxy.setFailed(false)},false},
+  {"withholding",func(){resume=stallPolicyRedis(proxy)},true},
+  {"resumed",func(){resume()},false},
+ } {
+  t.Run(phase.name,func(t *testing.T){
+   phase.start()
+   parent:=t.Context()
+   before:=time.Now().Add(policyRedisFaultTimeout)
+   _,_=backend.Get(parent,"key")
+   _=backend.Set(parent,"key",nil,time.Minute)
+   after:=time.Now().Add(policyRedisFaultTimeout)
+   for _,ctx:=range []context.Context{probe.read,probe.write}{
+    if !phase.fault{
+     if ctx!=parent{t.Fatal("healthy Redis did not receive the original operation context")}
+     continue
+    }
+    if deadline,ok:=ctx.Deadline();!ok||deadline.Before(before)||deadline.After(after){
+     t.Fatalf("injected Redis fault deadline=%v, present=%t, want [%v,%v]",deadline,ok,before,after)
+    }
+   }
+  })
+ }
 }
 `

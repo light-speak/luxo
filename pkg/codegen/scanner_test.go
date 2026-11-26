@@ -1,6 +1,7 @@
 package codegen
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -844,6 +845,10 @@ func TestNullableJSON(t *testing.T){
 }
 
 func TestGeneratedExtendEnumScanner(t *testing.T) {
+	if os.Getenv("LUXO_TEST_DATABASE_URL") != "" {
+		// Verify the configured database path with Docker unavailable to the generated test.
+		t.Setenv("DOCKER_HOST", "unix:///dev/null")
+	}
 	extend := &ast.ExtendDecl{Name: "User", Fields: []*ast.FieldDecl{
 		{Name: "role", Type: &ast.TypeRef{Name: "Role"}},
 		{Name: "optionalRole", Type: &ast.TypeRef{Name: "Role", Nullable: true}},
@@ -892,11 +897,14 @@ func TestEnumScanner(t *testing.T) {
 }
 func TestEnumScannerPostgres(t *testing.T) {
  ctx := t.Context()
- image:=os.Getenv("LUXO_TEST_POSTGRES_IMAGE");if image==""{image="postgres:17-alpine"}
- container, err := postgres.Run(ctx,image,postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
- testcontainers.CleanupContainer(t, container)
- if err != nil { t.Fatal(err) }
- connection, err := container.ConnectionString(ctx,"sslmode=disable"); if err != nil { t.Fatal(err) }
+ connection := os.Getenv("LUXO_TEST_DATABASE_URL")
+ if connection == "" {
+  image:=os.Getenv("LUXO_TEST_POSTGRES_IMAGE");if image==""{image="postgres:17-alpine"}
+  container, err := postgres.Run(ctx,image,postgres.WithDatabase("luxo_test"),postgres.WithUsername("test"),postgres.WithPassword("test"),postgres.BasicWaitStrategies())
+  testcontainers.CleanupContainer(t, container)
+  if err != nil { t.Fatal(err) }
+  connection, err = container.ConnectionString(ctx,"sslmode=disable"); if err != nil { t.Fatal(err) }
+ }
  db, err := pg.NewDB(ctx,connection); if err != nil { t.Fatal(err) }; defer db.Close()
  value := "USER"
  for _, optional := range []*string{nil, &value} {

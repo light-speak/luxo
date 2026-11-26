@@ -3,7 +3,6 @@ package codegen
 import (
 	"encoding/json"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -218,14 +217,6 @@ func assertStatelessEntryStarts(t *testing.T, dir, target string, backends Entry
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("entry binary: %v\n%s", err, out)
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
 	logPath := filepath.Join(dir, "entry-"+target+".log")
 	log, err := os.Create(logPath)
 	if err != nil {
@@ -234,7 +225,7 @@ func assertStatelessEntryStarts(t *testing.T, dir, target string, backends Entry
 	t.Cleanup(func() { _ = log.Close() })
 	command := exec.Command(binary)
 	command.Dir, command.Stdout, command.Stderr = dir, log, log
-	command.Env = statelessEntryEnvironment(port, backends)
+	command.Env = statelessEntryEnvironment(backends)
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -242,10 +233,11 @@ func assertStatelessEntryStarts(t *testing.T, dir, target string, backends Entry
 	go func() { done <- command.Wait() }()
 	finished := false
 	t.Cleanup(func() { stopStatelessEntry(t, command, done, finished, logPath) })
-	probeStatelessEntry(t, port, api, value, done, &finished, logPath)
+	port := waitStatelessEntryPort(t, done, &finished, logPath)
+	probeStatelessEntry(t, port, api, value)
 }
 
-func statelessEntryEnvironment(port int, backends EntryBackends) []string {
+func statelessEntryEnvironment(backends EntryBackends) []string {
 	var result []string
 	for _, item := range os.Environ() {
 		name, _, _ := strings.Cut(item, "=")
@@ -256,7 +248,7 @@ func statelessEntryEnvironment(port int, backends EntryBackends) []string {
 		}
 		result = append(result, item)
 	}
-	return append(result, "APP_PORT="+strconv.Itoa(port), "DEPLOY_MODE=embedded", "AUTO_MIGRATE=true",
+	return append(result, "APP_PORT=0", "DEPLOY_MODE=embedded", "AUTO_MIGRATE=true",
 		"DATABASE_HOST=127.0.0.1", "DATABASE_PORT=1", "LUXO_EVENT_BACKEND="+backends.Events,
 		"GRACEFUL_TIMEOUT=1s", "LOG_REQUESTS=false")
 }
@@ -280,12 +272,8 @@ func stopStatelessEntry(t *testing.T, command *exec.Cmd, done <-chan error, fini
 	}
 }
 
-func probeStatelessEntry(t *testing.T, port int, api string, value int, done <-chan error, finished *bool, logPath string) {
+func waitStatelessEntryPort(t *testing.T, done <-chan error, finished *bool, logPath string) int {
 	t.Helper()
-	client := &http.Client{Timeout: time.Second}
-	defer client.CloseIdleConnections()
-	endpoint := "http://127.0.0.1:" + strconv.Itoa(port) + "/luvia"
-	body := `{"$api":"` + api + `","value":` + strconv.Itoa(value) + `}`
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
@@ -295,20 +283,43 @@ func probeStatelessEntry(t *testing.T, port int, api string, value int, done <-c
 			t.Fatalf("entry stopped before request: %v\n%s", err, out)
 		default:
 		}
-		response, err := client.Post(endpoint, "application/json", strings.NewReader(body))
-		if err == nil {
-			data, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
-			_ = response.Body.Close()
-			var envelope struct{ Data int64 }
-			decodeErr := json.Unmarshal(data, &envelope)
-			if readErr != nil || decodeErr != nil || response.StatusCode != 200 || envelope.Data != 42 {
-				t.Fatalf("entry response: %d %s %v %v", response.StatusCode, data, readErr, decodeErr)
+		out, err := os.ReadFile(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, reported, found := strings.Cut(string(out), "\n  Listening on http://localhost:"); found {
+			if digits, _, complete := strings.Cut(reported, " "); complete {
+				port, err := strconv.ParseUint(digits, 10, 16)
+				if err != nil || port == 0 {
+					t.Fatalf("entry reported invalid listening port %q", digits)
+				}
+				return int(port)
 			}
-			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("entry never accepted its request")
+	out, _ := os.ReadFile(logPath)
+	t.Fatalf("entry never reported its listening port:\n%s", out)
+	return 0
+}
+
+func probeStatelessEntry(t *testing.T, port int, api string, value int) {
+	t.Helper()
+	client := &http.Client{Timeout: time.Second}
+	defer client.CloseIdleConnections()
+	endpoint := "http://127.0.0.1:" + strconv.Itoa(port) + "/luvia"
+	body := `{"$api":"` + api + `","value":` + strconv.Itoa(value) + `}`
+	response, err := client.Post(endpoint, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	data, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+	var envelope struct{ Data int64 }
+	decodeErr := json.Unmarshal(data, &envelope)
+	if readErr != nil || decodeErr != nil || response.StatusCode != 200 || envelope.Data != 42 {
+		t.Fatalf("entry response: %d %s %v %v", response.StatusCode, data, readErr, decodeErr)
+	}
 }
 
 func writeStatelessFixtureFile(t *testing.T, root, name string, data []byte) {

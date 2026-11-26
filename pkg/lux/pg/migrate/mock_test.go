@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // mockDB implements DB for unit testing error paths without a real database.
@@ -31,7 +33,12 @@ func (m *mockDB) Query(ctx context.Context, sql string, args ...any) (Rows, erro
 	}
 	return m.queryResult, nil
 }
-func (m *mockDB) QueryRow(ctx context.Context, sql string, args ...any) Row { return m.queryRowVal }
+func (m *mockDB) QueryRow(ctx context.Context, sql string, args ...any) Row {
+	if m.queryRowVal != nil {
+		return m.queryRowVal
+	}
+	return &mockRow{history: true}
+}
 func (m *mockDB) Begin(ctx context.Context) (Tx, error) {
 	if m.beginErr != nil {
 		return nil, m.beginErr
@@ -47,6 +54,7 @@ type mockRows struct {
 	data    [][]any
 	pos     int
 	scanErr error
+	closed  bool
 }
 
 func (r *mockRows) Next() bool {
@@ -69,6 +77,10 @@ func (r *mockRows) Scan(dest ...any) error {
 				*v = row[i].(string)
 			case *int64:
 				*v = row[i].(int64)
+			case **string:
+				if checksum, ok := row[i].(string); ok {
+					*v = &checksum
+				}
 			case *time.Time:
 				if t, ok := row[i].(time.Time); ok {
 					*v = t
@@ -79,7 +91,7 @@ func (r *mockRows) Scan(dest ...any) error {
 	return nil
 }
 
-func (r *mockRows) Close() {}
+func (r *mockRows) Close() { r.closed = true }
 
 // mockTx simulates a transaction.
 type mockTx struct {
@@ -93,10 +105,24 @@ func (t *mockTx) Rollback(ctx context.Context) error                      { retu
 
 // mockRow simulates a single row result.
 type mockRow struct {
-	scanErr error
+	scanErr       error
+	history       bool
+	legacyStrings bool
 }
 
-func (r *mockRow) Scan(dest ...any) error { return r.scanErr }
+func (r *mockRow) Scan(dest ...any) error {
+	if len(dest) == 3 {
+		*dest[0].(*string) = "public"
+		*dest[1].(*bool) = r.history
+		*dest[2].(*bool) = !r.legacyStrings
+	}
+	if len(dest) == 1 {
+		if exists, ok := dest[0].(*bool); ok {
+			*exists = r.history
+		}
+	}
+	return r.scanErr
+}
 
 // --- Tests ---
 
@@ -127,6 +153,65 @@ func TestUpAcquireLockError(t *testing.T) {
 	}
 }
 
+func TestUpHistoryErrors(t *testing.T) {
+	failed := errors.New("migration history unavailable")
+	cases := []struct {
+		name string
+		db   *mockDB
+	}{
+		{name: "read", db: &mockDB{queryRowVal: &mockRow{scanErr: failed}}},
+		{name: "create", db: &mockDB{queryRowVal: &mockRow{}, execErr: failed}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := NewFromDB(tc.db, t.TempDir())
+			names, err := runner.Up(t.Context())
+			if len(names) != 0 || !errors.Is(err, failed) {
+				t.Fatalf("history failure: names=%v err=%v", names, err)
+			}
+		})
+	}
+}
+
+func TestAutocommitHistoryDiagnosticsUnwrapOriginalCause(t *testing.T) {
+	cause := context.Canceled
+	for _, sample := range []struct {
+		name string
+		db   *mockDB
+		want string
+	}{
+		{"statement", &mockDB{execErr: cause}, "autocommit statement success is unconfirmed"},
+		{"begin", &mockDB{beginErr: cause}, "migration history remains uncommitted"},
+		{"record", &mockDB{beginTx: &mockTx{execErr: cause}}, "migration history remains uncommitted"},
+		{"commit", &mockDB{beginTx: &mockTx{commitErr: cause}}, "migration history commit is unconfirmed"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			runner := NewFromDB(sample.db, t.TempDir())
+			err := runner.execMigration(t.Context(), plannedMigration{
+				name: "001_idx.sql", sql: "CREATE INDEX CONCURRENTLY idx ON t (col);",
+				mode: migrationMode{autocommit: true},
+			})
+			if !errors.Is(err, cause) || !strings.Contains(err.Error(), sample.want) {
+				t.Fatalf("migration diagnosis lost its original cause: %v", err)
+			}
+		})
+	}
+}
+
+func TestGuardedConcurrentIndexPropagatesCatalogError(t *testing.T) {
+	unavailable := errors.New("catalog read failed")
+	runner := NewFromDB(&mockDB{queryRowVal: &mockRow{scanErr: unavailable}}, t.TempDir())
+	migration := plannedMigration{
+		name: "001_idx.sql",
+		sql:  "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx ON t (col);",
+		mode: migrationMode{autocommit: true, index: "idx", table: "t"},
+	}
+	err := runner.execMigration(t.Context(), migration)
+	if !errors.Is(err, unavailable) || !strings.Contains(err.Error(), "verify index idx on t") {
+		t.Fatalf("guarded index catalog error: %v", err)
+	}
+}
+
 func TestUpVerifyChecksumQueryError(t *testing.T) {
 	// Init succeeds, lock succeeds, verifyChecksums query fails
 	db := &mockDB{queryErr: fmt.Errorf("query fail")}
@@ -146,12 +231,46 @@ func TestDownAcquireLockError(t *testing.T) {
 	}
 }
 
-func TestDownInitError(t *testing.T) {
-	db := &mockDB{execErr: fmt.Errorf("init fail")}
-	r := NewFromDB(db, t.TempDir())
-	_, err := r.Down(context.Background(), 1)
-	if err == nil {
-		t.Fatal("expected init error")
+func TestInitPropagatesHistoryMetadataError(t *testing.T) {
+	probe := errors.New("history metadata unavailable")
+	runner := NewFromDB(&mockDB{queryRowVal: &mockRow{scanErr: probe}}, t.TempDir())
+	if err := runner.Init(t.Context()); !errors.Is(err, probe) {
+		t.Fatalf("initialize history: %v", err)
+	}
+}
+
+func TestDownReadsOnlyBoundHistory(t *testing.T) {
+	missing := &pgconn.PgError{Code: "42P01", Message: "undefined table"}
+	probeFailed := errors.New("history read failed")
+	for _, tc := range []struct {
+		name      string
+		queryErr  error
+		catalog   mockRow
+		wantQuery error
+	}{
+		{name: "normal query", catalog: mockRow{history: true}},
+		{name: "missing history", queryErr: missing},
+		{name: "existing history", queryErr: missing, catalog: mockRow{history: true}, wantQuery: missing},
+		{name: "failed metadata read", queryErr: missing, catalog: mockRow{scanErr: probeFailed}, wantQuery: probeFailed},
+		{name: "disabled standard string mode", catalog: mockRow{legacyStrings: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := &mockDB{queryResult: &mockRows{}, queryErr: tc.queryErr, queryRowVal: &tc.catalog}
+			runner := NewFromDB(db, t.TempDir())
+			rolled, err := runner.Down(t.Context(), 1)
+			if len(rolled) != 0 {
+				t.Fatalf("unexpected rollbacks: %v", rolled)
+			}
+			if tc.catalog.legacyStrings {
+				if !errors.Is(err, errMigrationStringMode) {
+					t.Fatalf("legacy string mode: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantQuery) {
+				t.Fatalf("Down returned %v, want %v", err, tc.wantQuery)
+			}
+		})
 	}
 }
 
@@ -192,12 +311,12 @@ func TestStatusQueryError(t *testing.T) {
 	}
 }
 
-func TestDryRunInitError(t *testing.T) {
-	db := &mockDB{execErr: fmt.Errorf("init fail")}
+func TestDryRunHistoryReadError(t *testing.T) {
+	db := &mockDB{queryRowVal: &mockRow{scanErr: fmt.Errorf("history read failed")}}
 	r := NewFromDB(db, t.TempDir())
 	_, _, err := r.DryRun(context.Background())
-	if err == nil {
-		t.Fatal("expected init error")
+	if err == nil || !strings.Contains(err.Error(), "history read failed") {
+		t.Fatalf("expected history read error, got %v", err)
 	}
 }
 
@@ -235,7 +354,7 @@ func TestVerifyInitError(t *testing.T) {
 func TestExecMigrationBeginError(t *testing.T) {
 	db := &mockDB{beginErr: fmt.Errorf("begin fail")}
 	r := NewFromDB(db, t.TempDir())
-	err := r.execMigration(context.Background(), "test", "SELECT 1;", "abc")
+	err := r.execMigration(context.Background(), plannedMigration{name: "test", sql: "SELECT 1;", checksum: "abc"})
 	if err == nil {
 		t.Fatal("expected begin error")
 	}
@@ -245,7 +364,7 @@ func TestExecMigrationNonTxError(t *testing.T) {
 	db := &mockDB{execErr: fmt.Errorf("exec fail")}
 	r := NewFromDB(db, t.TempDir())
 	// SQL with CONCURRENTLY triggers non-tx path
-	err := r.execMigration(context.Background(), "test", "CREATE INDEX CONCURRENTLY idx ON t (c);", "abc")
+	err := r.execMigration(context.Background(), plannedMigration{name: "test", sql: "CREATE INDEX CONCURRENTLY idx ON t (c);", checksum: "abc", mode: migrationMode{autocommit: true}})
 	if err == nil {
 		t.Fatal("expected non-tx exec error")
 	}
@@ -255,7 +374,7 @@ func TestExecMigrationCommitError(t *testing.T) {
 	tx := &mockTx{commitErr: fmt.Errorf("commit fail")}
 	db := &mockDB{beginTx: tx}
 	r := NewFromDB(db, t.TempDir())
-	err := r.execMigration(context.Background(), "test", "SELECT 1;", "abc")
+	err := r.execMigration(context.Background(), plannedMigration{name: "test", sql: "SELECT 1;", checksum: "abc"})
 	if err == nil {
 		t.Fatal("expected commit error")
 	}
@@ -265,7 +384,7 @@ func TestExecMigrationTxExecError(t *testing.T) {
 	tx := &mockTx{execErr: fmt.Errorf("tx exec fail")}
 	db := &mockDB{beginTx: tx}
 	r := NewFromDB(db, t.TempDir())
-	err := r.execMigration(context.Background(), "test", "SELECT 1;", "abc")
+	err := r.execMigration(context.Background(), plannedMigration{name: "test", sql: "SELECT 1;", checksum: "abc"})
 	if err == nil {
 		t.Fatal("expected tx exec error")
 	}
@@ -274,7 +393,7 @@ func TestExecMigrationTxExecError(t *testing.T) {
 func TestExecRollbackBeginError(t *testing.T) {
 	db := &mockDB{beginErr: fmt.Errorf("begin fail")}
 	r := NewFromDB(db, t.TempDir())
-	err := r.execRollback(context.Background(), "test", "SELECT 1;")
+	err := r.execRollback(context.Background(), plannedMigration{name: "test", sql: "SELECT 1;"})
 	if err == nil {
 		t.Fatal("expected begin error")
 	}
@@ -283,7 +402,7 @@ func TestExecRollbackBeginError(t *testing.T) {
 func TestExecRollbackNonTxError(t *testing.T) {
 	db := &mockDB{execErr: fmt.Errorf("exec fail")}
 	r := NewFromDB(db, t.TempDir())
-	err := r.execRollback(context.Background(), "test", "DROP INDEX CONCURRENTLY idx;")
+	err := r.execRollback(context.Background(), plannedMigration{name: "test", sql: "DROP INDEX CONCURRENTLY idx;", mode: migrationMode{autocommit: true}})
 	if err == nil {
 		t.Fatal("expected non-tx exec error")
 	}
@@ -293,7 +412,7 @@ func TestExecRollbackTxExecError(t *testing.T) {
 	tx := &mockTx{execErr: fmt.Errorf("tx exec fail")}
 	db := &mockDB{beginTx: tx}
 	r := NewFromDB(db, t.TempDir())
-	err := r.execRollback(context.Background(), "test", "SELECT 1;")
+	err := r.execRollback(context.Background(), plannedMigration{name: "test", sql: "SELECT 1;"})
 	if err == nil {
 		t.Fatal("expected tx exec error")
 	}
@@ -303,19 +422,9 @@ func TestExecRollbackCommitError(t *testing.T) {
 	tx := &mockTx{commitErr: fmt.Errorf("commit fail")}
 	db := &mockDB{beginTx: tx}
 	r := NewFromDB(db, t.TempDir())
-	err := r.execRollback(context.Background(), "test", "SELECT 1;")
+	err := r.execRollback(context.Background(), plannedMigration{name: "test", sql: "SELECT 1;"})
 	if err == nil {
 		t.Fatal("expected commit error")
-	}
-}
-
-func TestSplitConcurrentlyAllConcurrent(t *testing.T) {
-	txSQL, nonTx := splitConcurrently("CREATE INDEX CONCURRENTLY a ON t(c); CREATE INDEX CONCURRENTLY b ON t(d);")
-	if txSQL != "" {
-		t.Errorf("txSQL should be empty, got: %q", txSQL)
-	}
-	if len(nonTx) != 2 {
-		t.Errorf("expected 2 non-tx, got %d", len(nonTx))
 	}
 }
 
@@ -336,6 +445,99 @@ func TestAppliedMapScanError(t *testing.T) {
 	_, err := r.appliedMap(context.Background())
 	if err == nil {
 		t.Fatal("expected scan error")
+	}
+}
+
+type interruptedMigrationRows struct {
+	*mockRows
+	cause error
+}
+
+func (r interruptedMigrationRows) Err() error { return r.cause }
+
+func TestMigrationAbortsWhenRowStreamEndsWithError(t *testing.T) {
+	broken := errors.New("row stream interrupted after one result")
+	for _, operation := range []string{"up-checksum", "up-applied", "down", "status", "verify", "dry-run"} {
+		t.Run(operation, func(t *testing.T) {
+			dir := t.TempDir()
+			const firstFile = "001_existing.sql"
+			writeMigration(t, dir, firstFile, "CREATE TABLE existing (id bigint)", "DROP TABLE existing")
+			writeMigration(t, dir, "002_pending.sql", "CREATE TABLE pending (id bigint)", "DROP TABLE pending")
+			rows := interruptedMigrationRows{mockRows: &mockRows{data: [][]any{{firstFile, time.Time{}}}}, cause: broken}
+			if operation == "up-checksum" {
+				rows.data[0][1] = fileChecksum(filepath.Join(dir, firstFile))
+			}
+			db := &queryFuncDB{queryFunc: func(_ context.Context, statement string, _ ...any) (Rows, error) {
+				if operation == "up-applied" && strings.Contains(statement, "SELECT name, checksum") {
+					return &mockRows{}, nil
+				}
+				if rows.pos == 0 {
+					return rows, nil
+				}
+				return &mockRows{}, nil
+			}}
+			r := NewFromDB(db, dir)
+			var err error
+			var changed []string
+			switch operation {
+			case "up-checksum", "up-applied":
+				changed, err = r.Up(t.Context())
+			case "down":
+				changed, err = r.Down(t.Context(), 2)
+			case "status":
+				_, err = r.Status(t.Context())
+			case "verify":
+				_, err = r.Verify(t.Context())
+			case "dry-run":
+				changed, _, err = r.DryRun(t.Context())
+			}
+			if !errors.Is(err, broken) || len(changed) != 0 || !rows.closed {
+				t.Fatalf("migration returned changes %v, error %v, rows closed=%t", changed, err, rows.closed)
+			}
+		})
+	}
+}
+
+func TestRollbackLegacyMissingChecksumQueryFallback(t *testing.T) {
+	missing := &pgconn.PgError{Code: "42703", Message: "checksum column unavailable"}
+	cases := []struct {
+		name       string
+		initial    Rows
+		queryErr   error
+		scanLegacy bool
+	}{
+		{name: "before query", queryErr: missing, scanLegacy: true},
+		{name: "before first row", initial: interruptedMigrationRows{mockRows: &mockRows{}, cause: missing}, scanLegacy: true},
+		{name: "after first row", initial: interruptedMigrationRows{mockRows: &mockRows{data: [][]any{{"001.sql", "sum"}}}, cause: missing}},
+		{name: "other server error", queryErr: &pgconn.PgError{Code: "42501"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			queryCount := 0
+			db := &queryFuncDB{queryFunc: func(_ context.Context, query string, _ ...any) (Rows, error) {
+				queryCount++
+				if queryCount == 1 {
+					if !strings.Contains(query, "name, checksum") {
+						t.Fatalf("missing checksum projection: %s", query)
+					}
+					return tc.initial, tc.queryErr
+				}
+				if strings.Contains(query, "checksum") {
+					t.Fatalf("legacy projection unexpectedly includes checksum: %s", query)
+				}
+				return &mockRows{data: [][]any{{"001.sql"}}}, nil
+			}}
+			dir := t.TempDir()
+			runner := NewFromDB(db, dir)
+			files, err := runner.rollbackFiles(t.Context(), 2)
+			if tc.scanLegacy {
+				if err != nil || queryCount != 2 || len(files) != 1 || files[0].path != filepath.Join(dir, "001.sql") || files[0].checksum != nil {
+					t.Fatalf("legacy rollback selection: %v %v, queries=%d", files, err, queryCount)
+				}
+			} else if err == nil || queryCount != 1 || len(files) != 0 {
+				t.Fatalf("unexpected legacy retry: %v %v, queries=%d", files, err, queryCount)
+			}
+		})
 	}
 }
 
@@ -448,7 +650,7 @@ func TestExecMigrationEmptyTxSQL(t *testing.T) {
 	tx := &mockTx{}
 	db := &mockDB{beginTx: tx}
 	r := NewFromDB(db, t.TempDir())
-	err := r.execMigration(context.Background(), "test", "CREATE INDEX CONCURRENTLY idx ON t(c);", "abc")
+	err := r.execMigration(context.Background(), plannedMigration{name: "test", sql: "CREATE INDEX CONCURRENTLY idx ON t(c);", checksum: "abc", mode: migrationMode{autocommit: true}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -458,7 +660,7 @@ func TestExecRollbackEmptyTxSQL(t *testing.T) {
 	tx := &mockTx{}
 	db := &mockDB{beginTx: tx}
 	r := NewFromDB(db, t.TempDir())
-	err := r.execRollback(context.Background(), "test", "DROP INDEX CONCURRENTLY idx;")
+	err := r.execRollback(context.Background(), plannedMigration{name: "test", sql: "DROP INDEX CONCURRENTLY idx;", mode: migrationMode{autocommit: true}})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -475,7 +677,7 @@ func TestExecMigrationInsertError(t *testing.T) {
 	db := &mockDB{beginTx: failOnSecond}
 	r := NewFromDB(db, t.TempDir())
 	_ = callCount
-	err := r.execMigration(context.Background(), "test", "SELECT 1;", "abc")
+	err := r.execMigration(context.Background(), plannedMigration{name: "test", sql: "SELECT 1;", checksum: "abc"})
 	if err == nil {
 		t.Fatal("expected INSERT error")
 	}
@@ -485,7 +687,7 @@ func TestExecRollbackDeleteError(t *testing.T) {
 	failOnSecond := &countingTx{failAt: 2}
 	db := &mockDB{beginTx: failOnSecond}
 	r := NewFromDB(db, t.TempDir())
-	err := r.execRollback(context.Background(), "test", "SELECT 1;")
+	err := r.execRollback(context.Background(), plannedMigration{name: "test", sql: "SELECT 1;"})
 	if err == nil {
 		t.Fatal("expected DELETE error")
 	}
@@ -563,7 +765,7 @@ func (m *multiQueryDB) Query(ctx context.Context, sql string, args ...any) (Rows
 	return r, nil
 }
 func (m *multiQueryDB) QueryRow(ctx context.Context, sql string, args ...any) Row {
-	return &mockRow{}
+	return &mockRow{history: true}
 }
 func (m *multiQueryDB) Begin(ctx context.Context) (Tx, error) {
 	if m.beginErr != nil {
@@ -1087,7 +1289,7 @@ func (m *queryFuncDB) Query(ctx context.Context, sql string, args ...any) (Rows,
 	return m.queryFunc(ctx, sql, args...)
 }
 func (m *queryFuncDB) QueryRow(ctx context.Context, sql string, args ...any) Row {
-	return &mockRow{}
+	return &mockRow{history: true}
 }
 func (m *queryFuncDB) Begin(ctx context.Context) (Tx, error) { return &mockTx{}, nil }
 func (m *queryFuncDB) AcquireLock(ctx context.Context) error { return nil }

@@ -97,11 +97,21 @@ func (g *GeneratorContext) validateFieldIdentifiers(result *semantic.Result, enu
 	return nil
 }
 
-// Conditional members only reserve names when they are actually emitted.
-func (g *GeneratorContext) conflictsWithAppMember(name string, result *semantic.Result, enums map[string]bool) bool {
-	switch name {
+func unconditionalAppMemberName[Name ~string | ~[]byte](name Name) bool {
+	switch string(name) {
 	case "DB", "Queue", "Close", "Tx":
 		return true
+	default:
+		return false
+	}
+}
+
+// Conditional members only reserve names when they are actually emitted.
+func (g *GeneratorContext) conflictsWithAppMember(name string, result *semantic.Result, enums map[string]bool) bool {
+	if unconditionalAppMemberName(name) {
+		return true
+	}
+	switch name {
 	case "EventBus":
 		return appNeedsEvents(result)
 	case "EventHandlers":

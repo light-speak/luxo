@@ -1,10 +1,98 @@
 package codegen
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/light-speak/luxo/pkg/lux/str"
+	"github.com/light-speak/luxo/pkg/semantic"
 )
+
+func TestCapitalizedASCIISnakeCaseLenMatchesRenderedName(t *testing.T) {
+	for _, name := range []string{
+		"", "a", "user", "userID", "uSR", "uSr", "uRLParser", "HTTP", "HTMLParser", "api1HTTPClient",
+		"_user_v2", strings.Repeat("a", 59) + "Ba", strings.Repeat("a", 62),
+	} {
+		length, ok := capitalizedASCIISnakeCaseLen(name)
+		want := len(str.ToSnakeCase(str.Capitalize(name)))
+		if !ok || length != want {
+			t.Errorf("%q: got %d/%v, want %d/true", name, length, ok, want)
+		}
+	}
+	for _, name := range []string{"\x00before", "a\x00b", "éstart", "aé", "a\xff", "\xff"} {
+		if _, ok := capitalizedASCIISnakeCaseLen(name); ok {
+			t.Errorf("%q should use the general conversion", name)
+		}
+	}
+}
+
+func TestValidateModuleScaffoldModelNameDoesNotAllocate(t *testing.T) {
+	for _, name := range []string{
+		"user", "user_" + strings.Repeat("a", 24), strings.Repeat("a", 62),
+		"userID", "uSR", "userHTTPServer", "_user", "User",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateModuleScaffoldModelName(name); err != nil {
+				t.Fatal(err)
+			}
+			if allocations := testing.AllocsPerRun(50, func() {
+				if err := ValidateModuleScaffoldModelName(name); err != nil {
+					t.Fatal(err)
+				}
+			}); allocations != 0 {
+				t.Fatalf("validating %q allocated %.0f times, want zero", name, allocations)
+			}
+		})
+	}
+}
+
+func TestValidateModuleScaffoldModelNameMatchesGeneratedNames(t *testing.T) {
+	names := []string{
+		"", "_", "user", "person2", "User", "_user", "uSR", "uSr", "uRLParser",
+		"HTMLParser", "apiHTTPClient", "apiHTTP", "api1HTTPClient", "userID", "User_Id",
+		"résumé", "éHTTPParser", "mañana", "δHTTP", "aK", "a\x00b", "\xff",
+		"resolver", "EventBus", "EventHandlers", "SetLoaders", "loaders",
+	}
+	for _, base := range []string{"App", "New", "NewFromDB", "RegisterSchema", "DB", "Queue", "Close", "Tx"} {
+		names = append(names, base, str.LowerFirst(base), strings.ToLower(base))
+	}
+	for builtin := range semantic.BuiltinTypes() {
+		names = append(names, builtin, str.LowerFirst(builtin), strings.ToLower(builtin))
+	}
+	for _, length := range []int{28, 32, 33, 61, 62, 63, 64} {
+		names = append(names, strings.Repeat("a", length), strings.Repeat("a", length-2)+"Ba",
+			"uS"+strings.Repeat("A", length-2), strings.Repeat("aB", length/2))
+	}
+
+	for _, name := range names {
+		want := referenceModuleScaffoldNameError(name)
+		got := fmt.Sprint(ValidateModuleScaffoldModelName(name))
+		if got != want {
+			t.Errorf("%q: got %q, want %q", name, got, want)
+		}
+	}
+}
+
+func referenceModuleScaffoldNameError(moduleName string) string {
+	modelName := str.Capitalize(moduleName)
+	if semantic.IsBuiltinTypeName(modelName) {
+		return fmt.Sprintf("generated model name %q is a built-in type / 生成的模型名 %q 是内置类型", modelName, modelName)
+	}
+	switch modelName {
+	case generatedAppTypeName, generatedAppNewName, generatedAppNewFromDBName, generatedSchemaRegisterName:
+		return fmt.Sprintf("generated model name %q conflicts with a Go declaration / 生成的模型名 %q 与 Go 声明冲突", modelName, modelName)
+	}
+	g := defaultGenerator()
+	if g.conflictsWithAppMember(modelName, &semantic.Result{}, nil) {
+		return fmt.Sprintf("generated model name %q conflicts with an App member / 生成的模型名 %q 与 App 成员冲突", modelName, modelName)
+	}
+	if err := g.sqlDialect.ValidateIdentifier(modelTableName(modelName)); err != nil {
+		return fmt.Sprintf("generated model name %q has an invalid database table name / 生成的模型名 %q 对应的数据库表名无效: %v", modelName, modelName, err)
+	}
+	return "<nil>"
+}
 
 func TestInitProject(t *testing.T) {
 	sr := InitProject("github.com/example/myapp")
@@ -70,7 +158,7 @@ func TestInitProjectEnvExample(t *testing.T) {
 		"DATABASE_DRIVER=pg",
 		"DATABASE_USER=postgres",
 		"DATABASE_PASSWORD=postgres",
-		"JWT_SECRET=change-me",
+		"# JWT_SECRET=",
 		"DEPLOY_MODE=embedded",
 		"LUXO_EVENT_BACKEND=none",
 		"LUXO_QUEUE_BACKEND=none",
@@ -84,6 +172,12 @@ func TestInitProjectEnvExample(t *testing.T) {
 	for _, check := range checks {
 		if !strings.Contains(src, check) {
 			t.Errorf("missing %q in .env.example:\n%s", check, src)
+		}
+	}
+	for _, line := range strings.Split(src, "\n") {
+		key, _, _ := strings.Cut(line, "=")
+		if strings.TrimSpace(key) == "JWT_SECRET" {
+			t.Error(".env.example must leave JWT_SECRET unset")
 		}
 	}
 

@@ -89,6 +89,37 @@ func TestPlanRejectsUnsupportedPrimaryKey(t *testing.T) {
 	}
 }
 
+func TestPlanRejectsMalformedSelection(t *testing.T) {
+	model := userModelWithExtend()
+	if plan, err := Plan(model, []byte{1}, "user"); plan != nil || err != codec.ErrInvalidSelectionMask {
+		t.Fatalf("malformed mask produced a plan: %v / %v", plan, err)
+	}
+}
+
+func BenchmarkPlanSelection(b *testing.B) {
+	model := userModelWithExtend()
+	fields := testutil.Bytes(b)(codec.FieldMaskSet([]byte{3}, 10))
+	child := selectionNode(b, []byte{1})
+	selected := selectionNode(b, fields, codec.SelectionMaskChild{FieldID: 10, Mask: child})
+	for _, sample := range []struct {
+		name string
+		mask []byte
+	}{
+		{"all", nil},
+		{"nested", selected},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				plan, err := Plan(model, sample.mask, "user")
+				if err != nil || plan == nil {
+					b.Fatalf("valid plan failed: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestPlanPropagatesDuplicateChildError(t *testing.T) {
 	model := &schema.Model{Name: "Broken", Fields: []schema.Field{
 		{ID: 1, Name: "id", Type: schema.FieldInt},

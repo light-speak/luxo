@@ -4,8 +4,14 @@ import java.io.IOException
 import java.net.InetSocketAddress
 import java.util.concurrent.Executors
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
@@ -15,6 +21,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.MediaType.Companion.toMediaType
@@ -28,6 +36,7 @@ import okio.Buffer
 import okio.BufferedSource
 import okio.ForwardingSource
 import okio.buffer
+import kotlin.coroutines.CoroutineContext
 import kotlin.test.*
 
 class HttpProtocolTest {
@@ -885,6 +894,302 @@ class HttpProtocolTest {
     }
 
     @Test
+    fun `three concurrent and late unauthorized responses share one refresh`() = runBlocking {
+        val evidence = mutableListOf<String>()
+        for (mode in TransportMode.entries) for (lateUnauthorized in listOf(false, true)) {
+            val initial = AtomicInteger()
+            val firstTwoSent = CompletableDeferred<Unit>()
+            val allSent = CompletableDeferred<Unit>()
+            val refreshes = AtomicInteger()
+            val refreshStarted = CompletableDeferred<Unit>()
+            val refresh = CompletableDeferred<String>()
+            val releaseInitial = CountDownLatch(1)
+            val releaseLate = CountDownLatch(if (lateUnauthorized) 1 else 0)
+            val success = if (mode == TransportMode.JSON) """{"data":true}""".toByteArray() else byteArrayOf(1)
+            withClient({ request, _ ->
+                if (request.header("Authorization") == "Bearer expired") {
+                    val index = initial.incrementAndGet()
+                    if (index == 2) firstTwoSent.complete(Unit)
+                    if (index == 3) allSent.complete(Unit)
+                    check(releaseInitial.await(3, TimeUnit.SECONDS))
+                    if (index == 3) check(releaseLate.await(3, TimeUnit.SECONDS))
+                    response(request, 401, errorBody(mode, 401))
+                } else {
+                    response(request, 200, success)
+                }
+            }) { client, sent ->
+                val transport = transport(client, mode) {
+                    if (refreshes.incrementAndGet() == 1) refreshStarted.complete(Unit)
+                    refresh.await()
+                }
+                transport.setToken("expired")
+                withTimeout(5000) {
+                    val boundaries = List(3) { HTTPResponseBoundary() }
+                    fun start(boundary: HTTPResponseBoundary) =
+                        async(boundary, start = CoroutineStart.UNDISPATCHED) {
+                            runCatching { transport.call("echo") }
+                        }
+                    val firstTwo = boundaries.take(2).map(::start)
+                    firstTwoSent.await()
+                    val requests = firstTwo + start(boundaries.last())
+                    try {
+                        allSent.await()
+                        releaseInitial.countDown()
+                        val delivered = if (lateUnauthorized) boundaries.take(2) else boundaries
+                        delivered.forEach { it.handled.await() }
+                        refreshStarted.await()
+                        refresh.complete("renewed")
+                        if (lateUnauthorized) requests.first().await()
+                    } finally {
+                        releaseLate.countDown()
+                    }
+                    val outcomes = requests.awaitAll()
+                    val successful = outcomes.count { it.isSuccess }
+                    val unauthorized = outcomes.count { (it.exceptionOrNull() as? LuxoError)?.code == 401 }
+                    evidence += "$mode late=$lateUnauthorized: callbacks=${refreshes.get()}, successful=$successful, unauthorized=$unauthorized, HTTP=${sent.size}"
+                }
+            }
+        }
+        assertEquals(
+            TransportMode.entries.flatMap { mode ->
+                listOf(false, true).map { "$mode late=$it: callbacks=1, successful=3, unauthorized=0, HTTP=6" }
+            },
+            evidence,
+        )
+    }
+
+    @Test
+    fun `canceling one request leaves its peer's refresh active`() = runBlocking {
+        for (mode in TransportMode.entries) {
+            val releaseInitial = CountDownLatch(1)
+            val refreshStarted = CompletableDeferred<Unit>()
+            val refreshFinished = CompletableDeferred<Unit>()
+            val refresh = CompletableDeferred<String>()
+            val refreshes = AtomicInteger()
+            val success = if (mode == TransportMode.JSON) """{"data":true}""".toByteArray() else byteArrayOf(1)
+            withClient({ request, _ ->
+                if (request.header("Authorization") == "Bearer expired") {
+                    check(releaseInitial.await(3, TimeUnit.SECONDS))
+                    response(request, 401, errorBody(mode, 401))
+                } else {
+                    response(request, 200, success)
+                }
+            }) { client, sent ->
+                val transport = transport(client, mode) {
+                    refreshes.incrementAndGet()
+                    refreshStarted.complete(Unit)
+                    try { refresh.await() } finally { refreshFinished.complete(Unit) }
+                }
+                transport.setToken("expired")
+                withTimeout(5000) {
+                    val boundaries = List(2) { HTTPResponseBoundary() }
+                    val calls = boundaries.map { boundary ->
+                        async(boundary, start = CoroutineStart.UNDISPATCHED) { transport.call("echo") }
+                    }
+                    releaseInitial.countDown()
+                    boundaries.forEach { it.handled.await() }
+                    refreshStarted.await()
+                    calls.first().cancelAndJoin()
+                    assertFalse(refreshFinished.isCompleted)
+                    refresh.complete("renewed")
+                    calls.last().await()
+                    assertEquals(1, refreshes.get())
+                    assertEquals(listOf("Bearer expired", "Bearer expired", "Bearer renewed"),
+                        sent.map { it.header("Authorization") })
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `late unauthorized response can refresh after its sole peer cancelled`() = runBlocking {
+        for (mode in TransportMode.entries) {
+            val received = AtomicInteger()
+            val lateSent = CompletableDeferred<Unit>()
+            val releaseLate = CountDownLatch(1)
+            val refreshStarted = CompletableDeferred<Unit>()
+            val refreshStopped = CompletableDeferred<Unit>()
+            val refreshes = AtomicInteger()
+            val success = if (mode == TransportMode.JSON) """{"data":true}""".toByteArray() else byteArrayOf(1)
+            withClient({ request, _ ->
+                when (received.incrementAndGet()) {
+                    1 -> {
+                        lateSent.complete(Unit)
+                        check(releaseLate.await(3, TimeUnit.SECONDS))
+                        response(request, 401, errorBody(mode, 401))
+                    }
+                    2 -> response(request, 401, errorBody(mode, 401))
+                    else -> response(request, 200, success)
+                }
+            }) { client, sent ->
+                val transport = transport(client, mode) {
+                    if (refreshes.incrementAndGet() > 1) "renewed" else {
+                        refreshStarted.complete(Unit)
+                        try { awaitCancellation() } finally { refreshStopped.complete(Unit) }
+                    }
+                }
+                transport.setToken("expired")
+                withTimeout(5000) {
+                    val late = async { transport.call("echo") }
+                    try {
+                        lateSent.await()
+                        val cancelled = async { transport.call("echo") }
+                        refreshStarted.await()
+                        cancelled.cancelAndJoin()
+                        assertTrue(refreshStopped.isCompleted)
+                    } finally {
+                        releaseLate.countDown()
+                    }
+                    late.await()
+                    assertEquals(2, refreshes.get())
+                    assertEquals(
+                        listOf("Bearer expired", "Bearer expired", "Bearer renewed"),
+                        sent.map { it.header("Authorization") },
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `explicit token replacement invalidates all shared refresh waiters`() = runBlocking {
+        for (mode in TransportMode.entries) for (replacement in listOf("different", "expired")) {
+            val releaseInitial = CountDownLatch(1)
+            val refreshStarted = CompletableDeferred<Unit>()
+            val cleanupEntered = CompletableDeferred<Unit>()
+            val allowCleanup = CompletableDeferred<Unit>()
+            val refreshStopped = CompletableDeferred<Unit>()
+            val refreshes = AtomicInteger()
+            val success = if (mode == TransportMode.JSON) """{"data":true}""".toByteArray() else byteArrayOf(1)
+            withClient({ request, _ ->
+                if (request.header("Authorization") == "Bearer renewed") {
+                    response(request, 200, success)
+                } else {
+                    check(releaseInitial.await(3, TimeUnit.SECONDS))
+                    response(request, 401, errorBody(mode, 401))
+                }
+            }) { client, sent ->
+                val transport = transport(client, mode) {
+                    if (refreshes.incrementAndGet() == 1) {
+                        refreshStarted.complete(Unit)
+                        try {
+                            awaitCancellation()
+                        } finally {
+                            withContext(NonCancellable) {
+                                cleanupEntered.complete(Unit)
+                                allowCleanup.await()
+                                refreshStopped.complete(Unit)
+                            }
+                        }
+                    }
+                    "renewed"
+                }
+                transport.setToken("expired")
+                withTimeout(5000) {
+                    val boundaries = List(2) { HTTPResponseBoundary() }
+                    val stale = boundaries.map { boundary ->
+                        async(boundary, start = CoroutineStart.UNDISPATCHED) {
+                            runCatching { transport.call("echo") }
+                        }
+                    }
+                    releaseInitial.countDown()
+                    boundaries.forEach { it.handled.await() }
+                    refreshStarted.await()
+                    transport.setToken(replacement)
+                    try {
+                        cleanupEntered.await()
+                        for (result in stale.awaitAll()) {
+                            assertEquals(401, assertIs<LuxoError>(result.exceptionOrNull()).code)
+                        }
+                        assertFalse(refreshStopped.isCompleted)
+                    } finally {
+                        allowCleanup.complete(Unit)
+                    }
+                    refreshStopped.await()
+                    transport.call("echo")
+                    assertEquals(2, refreshes.get())
+                    assertEquals(
+                        listOf("Bearer expired", "Bearer expired", "Bearer $replacement", "Bearer renewed"),
+                        sent.map { it.header("Authorization") },
+                    )
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `late unauthorized responses share a completed refresh failure`() = runBlocking {
+        for (mode in TransportMode.entries) for (throws in listOf(false, true)) {
+            val initial = AtomicInteger()
+            val firstSent = CompletableDeferred<Unit>()
+            val bothSent = CompletableDeferred<Unit>()
+            val releaseResponses = CountDownLatch(1)
+            val releaseLate = CountDownLatch(1)
+            val refreshStarted = CompletableDeferred<Unit>()
+            val completeRefresh = CompletableDeferred<Result<String?>>()
+            val failure = IllegalStateException("refresh failed")
+            val refreshes = AtomicInteger()
+            val success = if (mode == TransportMode.JSON) """{"data":true}""".toByteArray() else byteArrayOf(1)
+            withClient({ request, _ ->
+                if (request.header("Authorization") == "Bearer renewed") {
+                    response(request, 200, success)
+                } else {
+                    val index = initial.incrementAndGet()
+                    if (index == 1) firstSent.complete(Unit)
+                    if (index == 2) bothSent.complete(Unit)
+                    check(releaseResponses.await(3, TimeUnit.SECONDS))
+                    if (index == 2) check(releaseLate.await(3, TimeUnit.SECONDS))
+                    response(request, 401, errorBody(mode, 401))
+                }
+            }) { client, _ ->
+                val transport = transport(client, mode) {
+                    if (refreshes.incrementAndGet() == 1) {
+                        refreshStarted.complete(Unit)
+                        completeRefresh.await().getOrThrow()
+                    } else "renewed"
+                }
+                transport.setToken("expired")
+                withTimeout(5000) {
+                    val first = async { runCatching { transport.call("echo") } }
+                    firstSent.await()
+                    val late = async { runCatching { transport.call("echo") } }
+                    try {
+                        // The second request must capture the original cohort before the failure.
+                        bothSent.await()
+                        releaseResponses.countDown()
+                        refreshStarted.await()
+                        completeRefresh.complete(if (throws) Result.failure(failure) else Result.success(null))
+                        first.await()
+                    } finally {
+                        releaseLate.countDown()
+                    }
+                    for (result in awaitAll(first, late)) {
+                        val error = result.exceptionOrNull()
+                        if (throws) assertSame(failure, error)
+                        else assertEquals(401, assertIs<LuxoError>(error).code)
+                    }
+                    assertEquals(1, refreshes.get())
+                    transport.call("echo")
+                    assertEquals(2, refreshes.get())
+                }
+            }
+        }
+    }
+
+    // Initial calls start undispatched. The first dispatch processes the held HTTP response.
+    private class HTTPResponseBoundary : CoroutineDispatcher() {
+        private val firstDispatch = AtomicBoolean(true)
+        val handled = CompletableDeferred<Unit>()
+
+        override fun dispatch(context: CoroutineContext, block: Runnable) {
+            val capture = firstDispatch.getAndSet(false)
+            Dispatchers.Default.dispatch(context, Runnable {
+                try { block.run() } finally { if (capture) handled.complete(Unit) }
+            })
+        }
+    }
+
+    @Test
     fun `cancelled refresh cannot replace credentials for later calls`() = runBlocking {
         for (mode in TransportMode.entries) {
             val success = if (mode == TransportMode.JSON) """{"data":true}""".toByteArray() else byteArrayOf(1)
@@ -901,6 +1206,66 @@ class HttpProtocolTest {
                 transport.call("echo")
                 assertEquals("Bearer original-token", sent.last().header("Authorization"))
             }
+        }
+    }
+
+    @Test
+    fun `reentrant JSON refresh delivers the inner unauthorized response`() = runBlocking {
+        expectReentrantUnauthorized(TransportMode.JSON)
+    }
+
+    @Test
+    fun `reentrant Binary refresh delivers the inner unauthorized response`() = runBlocking {
+        expectReentrantUnauthorized(TransportMode.BINARY)
+    }
+
+    @Test
+    fun `nested transports retain the ancestor refresh flight`() = runBlocking {
+        expectReentrantUnauthorized(TransportMode.BINARY, throughPeer = true)
+    }
+
+    private suspend fun expectReentrantUnauthorized(mode: TransportMode, throughPeer: Boolean = false) {
+        val requests = if (throughPeer) 3 else 2
+        val refreshes = AtomicInteger()
+        val peerRefreshes = AtomicInteger()
+        val refreshFinished = CompletableDeferred<Unit>()
+        val peerFinished = CompletableDeferred<Unit>()
+        val requestSchema = mapOf("echo" to APISchemaEntry(1), "refresh" to APISchemaEntry(2))
+        withClient({ request, count ->
+            val message = if (count == requests) "refresh denied" else "expired"
+            response(request, 401, errorBody(mode, 401, message = message))
+        }) { client, sent ->
+            lateinit var transport: OkHttpTransport
+            val peer = if (throughPeer) {
+                OkHttpTransport(endpoint, client = client, mode = mode, schema = requestSchema, timeoutSeconds = 0,
+                    onTokenExpired = {
+                        peerRefreshes.incrementAndGet()
+                        try { transport.call("refresh"); null } finally { peerFinished.complete(Unit) }
+                    })
+            } else null
+            transport = OkHttpTransport(endpoint, client = client, mode = mode, schema = requestSchema, timeoutSeconds = 0,
+                onTokenExpired = {
+                    if (refreshes.incrementAndGet() != 1) null else try {
+                        (peer ?: transport).call("refresh")
+                        null
+                    } finally { refreshFinished.complete(Unit) }
+                })
+            val error = try {
+                assertFailsWith<LuxoError> { withTimeout(3000) { transport.call("echo") } }
+            } finally {
+                transport.setToken("cleanup")
+                peer?.setToken("cleanup")
+                withTimeout(3000) {
+                    if (refreshes.get() != 0) refreshFinished.await()
+                    if (peerRefreshes.get() != 0) peerFinished.await()
+                }
+            }
+            assertEquals("Unauthorized", error.error)
+            assertEquals(401, error.code)
+            assertEquals("refresh denied", error.message)
+            assertEquals(requests, sent.size)
+            assertEquals(1, refreshes.get())
+            assertEquals(if (throughPeer) 1 else 0, peerRefreshes.get())
         }
     }
 

@@ -2,8 +2,9 @@
 
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
-import { QueryClient } from './query-client'
+import { QueryClient, type QueryFunctionContext } from './query-client'
 import { useLuxoMutation } from './use-mutation'
+import { useLuxoQuery } from './use-query'
 
 describe('useLuxoMutation', () => {
   it('preserves int64 mutation inputs, results and invalidation keys', async () => {
@@ -63,6 +64,46 @@ describe('useLuxoMutation', () => {
 
     await act(async () => { await result.current.mutate(9) })
     expect(events).toEqual(['success', 'invalidated'])
+  })
+
+  it.each([
+    { overlapping: false, disabled: false },
+    { overlapping: true, disabled: false },
+    { overlapping: false, disabled: true },
+  ])('shares a new read after mutation success ($overlapping, $disabled)', async ({ overlapping, disabled }) => {
+    const queryKey = ['tickets', 'list']
+    const queryClient = new QueryClient({ staleTime: Infinity, gcTime: Infinity })
+    queryClient.setQueryData(queryKey, 'open')
+    const reads: { signal: AbortSignal; resolve: (status: string) => void }[] = []
+    const queryFn = vi.fn(({ signal }: QueryFunctionContext) => new Promise<string>(resolve => {
+      reads.push({ signal, resolve })
+    }))
+    const first = renderHook(() => useLuxoQuery(queryFn, [], { queryClient, queryKey, enabled: !disabled }))
+    const second = renderHook(() => useLuxoQuery(queryFn, [], { queryClient, queryKey }))
+    const mutation = renderHook(() => useLuxoMutation(async () => 'closed', {
+      queryClient,
+      invalidateQueries: overlapping ? [queryKey, ['tickets'], queryKey] : [['tickets']],
+    }))
+    expect(first.result.current.data).toBe('open')
+    expect(second.result.current.data).toBe('open')
+    expect(queryFn).not.toHaveBeenCalled()
+
+    let oldRead!: Promise<void>
+    act(() => { oldRead = first.result.current.refetch() })
+    expect(queryFn).toHaveBeenCalledTimes(1)
+
+    await act(async () => { await mutation.result.current.mutate(undefined) })
+    await act(async () => { reads[1]?.resolve('closed') })
+    await act(async () => {
+      reads[0].resolve('open')
+      await oldRead
+    })
+    expect({
+      signals: reads.map(read => read.signal.aborted),
+      cached: queryClient.getQueryData(queryKey),
+      first: first.result.current.data,
+      second: second.result.current.data,
+    }).toEqual({ signals: [true, false], cached: 'closed', first: 'closed', second: 'closed' })
   })
 
   it('stays loading until every concurrent mutation settles', async () => {

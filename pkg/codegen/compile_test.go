@@ -3649,7 +3649,7 @@ func TestCompileAwaitParallelQueries(t *testing.T) {
 	}
 	c := newCompiler(models)
 	// await { val user = User.find(id); val posts = Post.where(...).all() }
-	c.compileExpr(&ast.AwaitExpr{
+	c.compileStmt(&ast.ExprStmt{Expr: &ast.AwaitExpr{
 		Body: &ast.Block{Stmts: []ast.Stmt{
 			&ast.ValStmt{
 				Name: "user",
@@ -3672,7 +3672,7 @@ func TestCompileAwaitParallelQueries(t *testing.T) {
 				},
 			},
 		}},
-	})
+	}})
 	out := compilerOut(c)
 	// Standalone await keeps typed task slots inside its own lexical scope.
 	if !strings.Contains(out, " *User") {
@@ -4124,11 +4124,11 @@ func modelAggregateCall(model, function, column string, conditions ...ast.Expr) 
 // TestCompileAwaitNoVals — await with no val statements → sequential
 func TestCompileAwaitNoVals(t *testing.T) {
 	c := newCompiler(nil)
-	c.compileExpr(&ast.AwaitExpr{
+	c.compileStmt(&ast.ExprStmt{Expr: &ast.AwaitExpr{
 		Body: &ast.Block{Stmts: []ast.Stmt{
 			&ast.ExprStmt{Expr: &ast.Ident{Name: "doSomething"}},
 		}},
-	})
+	}})
 	out := compilerOut(c)
 	if strings.Contains(out, "api.NewTaskGroup") {
 		t.Fatalf("should not use errgroup for non-val stmts, got:\n%s", out)
@@ -4143,14 +4143,14 @@ func TestCompileAwaitNonQueryVal(t *testing.T) {
 	c := newCompiler(nil)
 	value := &ast.Literal{Kind: token.Int, Value: "42"}
 	value.SetTypeTag("Int")
-	c.compileExpr(&ast.AwaitExpr{
+	c.compileStmt(&ast.ExprStmt{Expr: &ast.AwaitExpr{
 		Body: &ast.Block{Stmts: []ast.Stmt{
 			&ast.ValStmt{
 				Name:  "x",
 				Value: value,
 			},
 		}},
-	})
+	}})
 	out := compilerOut(c)
 	if !strings.Contains(out, " int64") {
 		t.Fatalf("missing var declaration, got:\n%s", out)
@@ -5512,7 +5512,7 @@ func TestCompileAwaitWithThreeQueries(t *testing.T) {
 		"Order": {Name: "Order"},
 	}
 	c := newCompiler(models)
-	c.compileExpr(&ast.AwaitExpr{
+	c.compileStmt(&ast.ExprStmt{Expr: &ast.AwaitExpr{
 		Body: &ast.Block{Stmts: []ast.Stmt{
 			&ast.ValStmt{
 				Name: "user",
@@ -5546,7 +5546,7 @@ func TestCompileAwaitWithThreeQueries(t *testing.T) {
 				},
 			},
 		}},
-	})
+	}})
 	out := compilerOut(c)
 	if !strings.Contains(out, " *User") {
 		t.Fatalf("missing var user, got:\n%s", out)
@@ -5932,9 +5932,9 @@ func TestCompileEmptyAsync(t *testing.T) {
 // TestCompileEmptyAwait — await { } (empty body)
 func TestCompileEmptyAwait(t *testing.T) {
 	c := newCompiler(nil)
-	c.compileExpr(&ast.AwaitExpr{
+	c.compileStmt(&ast.ExprStmt{Expr: &ast.AwaitExpr{
 		Body: &ast.Block{Stmts: nil},
-	})
+	}})
 	out := compilerOut(c)
 	// Empty await with no val stmts → no errgroup, just empty
 	if strings.Contains(out, "api.NewTaskGroup") {

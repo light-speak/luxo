@@ -475,6 +475,7 @@ func TestIntegrationDownNoPending(t *testing.T) {
 	if len(rolledBack) != 0 {
 		t.Errorf("expected 0, got %d", len(rolledBack))
 	}
+	assertMigrationRelations(t, runner, false, false)
 }
 
 func TestIntegrationStatusEmpty(t *testing.T) {
@@ -572,6 +573,257 @@ func TestIntegrationDryRun(t *testing.T) {
 		"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='test_users')").Scan(&exists)
 	if exists {
 		t.Error("DryRun should not create the table")
+	}
+}
+
+func TestIntegrationMigrationSectionMarkersInsideSQL(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := t.Context()
+	const up = `CREATE TABLE test_users (label text);
+		INSERT INTO test_users VALUES ($value$
+-- ====== DOWN ======
+first; second
+$value$);
+		SELECT 1; -- ====== DOWN ======`
+	const down = "DROP TABLE test_users;"
+	writeMigration(t, dir, "001_markers.sql", up, down)
+
+	names, preview, err := runner.DryRun(ctx)
+	if err != nil || len(names) != 1 || len(preview) != 1 || preview[0] != up {
+		t.Errorf("preview changed SQL boundaries: %v %q %v", names, preview, err)
+	}
+	if _, err := runner.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var stored string
+	if err := runner.db.QueryRow(ctx, "SELECT label FROM test_users").Scan(&stored); err != nil ||
+		stored != "\n-- ====== DOWN ======\nfirst; second\n" {
+		t.Fatalf("stored value: %q %v", stored, err)
+	}
+	if _, err := runner.Down(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	assertMigrationRelations(t, runner, true, false)
+}
+
+func TestIntegrationRollbackChecksumPreflightsEntireBatch(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := t.Context()
+	const firstFile = "001_users.sql"
+	const firstUp = "CREATE TABLE test_users (id int);"
+	writeMigration(t, dir, firstFile, firstUp, "DROP TABLE test_users;")
+	writeMigration(t, dir, "002_posts.sql", "CREATE TABLE test_posts (id int);", "DROP TABLE test_posts;")
+	if applied, err := runner.Up(ctx); err != nil || len(applied) != 2 {
+		t.Fatalf("setup: %v %v", applied, err)
+	}
+
+	writeMigration(t, dir, firstFile, firstUp, "DELETE FROM test_users;")
+	rolled, err := runner.Down(ctx, 2)
+	if len(rolled) != 0 || err == nil || !strings.Contains(err.Error(), firstFile) ||
+		!strings.Contains(err.Error(), "DOWN") || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Errorf("rollback modified a checked batch: %v %v", rolled, err)
+	}
+	var history int
+	var posts bool
+	err = runner.db.QueryRow(ctx, "SELECT (SELECT count(*) FROM _migrations), to_regclass('test_posts') IS NOT NULL").Scan(&history, &posts)
+	if err != nil || history != 2 || !posts {
+		t.Fatalf("earlier rollback changed database: history=%d, posts=%t, err=%v", history, posts, err)
+	}
+}
+
+func TestIntegrationRollbackLegacyChecksumHistory(t *testing.T) {
+	for _, legacy := range []struct{ name, history string }{
+		{"null checksum", "ALTER TABLE _migrations ADD COLUMN checksum text"},
+		{"no checksum column", "SELECT 1"},
+	} {
+		t.Run(legacy.name, func(t *testing.T) {
+			runner, dir := setupTestRunner(t)
+			ctx := t.Context()
+			const name = "001_legacy.sql"
+			if err := runner.db.Exec(ctx, `CREATE TABLE _migrations (id serial PRIMARY KEY, name text);
+				CREATE TABLE test_users (id int);
+				INSERT INTO _migrations (name) VALUES ('001_legacy.sql');`+legacy.history); err != nil {
+				t.Fatal(err)
+			}
+			writeMigration(t, dir, name, "CREATE TABLE test_users (id int);", "DROP TABLE test_users;")
+			rolled, err := runner.Down(ctx, 1)
+			if err != nil || len(rolled) != 1 || rolled[0] != name {
+				t.Fatalf("legacy rollback: %v %v", rolled, err)
+			}
+			assertMigrationRelations(t, runner, true, false)
+		})
+	}
+}
+
+func TestIntegrationAppliedHistoryTimestampMustRemainReadable(t *testing.T) {
+	for _, sample := range []struct{ name, column, data string }{
+		{"missing", "", ""},
+		{"null", ", applied_at TIMESTAMPTZ", ", NULL"},
+		{"malformed", ", applied_at TEXT", ", 'invalid-time'"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			runner, dir := setupTestRunner(t)
+			ctx := t.Context()
+			const schema = "CREATE TABLE _migrations (id SERIAL PRIMARY KEY, name TEXT NOT NULL, checksum TEXT"
+			if err := runner.db.Exec(ctx, schema+sample.column+")"); err != nil {
+				t.Fatal(err)
+			}
+			const insert = "INSERT INTO _migrations VALUES (DEFAULT, '001_existing.sql', NULL"
+			if err := runner.db.Exec(ctx, insert+sample.data+")"); err != nil {
+				t.Fatal(err)
+			}
+			writeMigration(t, dir, "002_pending.sql", "SELECT 42;", "SELECT 0;")
+			names, sqls, err := runner.DryRun(ctx)
+			assertUnreadableHistoryTimestamp(t, sample.name, err)
+			if len(names) != 0 || len(sqls) != 0 {
+				t.Fatalf("preview exposed a plan despite unreadable history: %v %v", names, sqls)
+			}
+			changed, err := runner.Up(ctx)
+			assertUnreadableHistoryTimestamp(t, sample.name, err)
+			if len(changed) != 0 {
+				t.Fatalf("migration ran despite unreadable history: %v", changed)
+			}
+			statuses, err := runner.Status(ctx)
+			assertUnreadableHistoryTimestamp(t, sample.name, err)
+			if len(statuses) != 0 {
+				t.Fatalf("status exposed a partial result: %v", statuses)
+			}
+			var count int
+			if err := runner.db.QueryRow(ctx, "SELECT COUNT(*) FROM _migrations").Scan(&count); err != nil || count != 1 {
+				t.Fatalf("expected one unchanged historical row: %d: %v", count, err)
+			}
+		})
+	}
+}
+
+func assertUnreadableHistoryTimestamp(t *testing.T, sample string, err error) {
+	t.Helper()
+	if err == nil || !strings.Contains(err.Error(), "applied_at") {
+		t.Fatalf("expected a specific historical timestamp failure: %v", err)
+	}
+	if sample == "missing" && !migrationHasSQLState(err, "42703") {
+		t.Fatalf("expected PostgreSQL undefined column: %v", err)
+	}
+}
+
+func TestIntegrationDryRunDoesNotCreateHistory(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	writeMigration(t, dir, "001_init.sql", "CREATE TABLE test_users (id int);", "DROP TABLE test_users;")
+
+	if names, sqls, err := runner.DryRun(t.Context()); err != nil || len(names) != 1 || len(sqls) != 1 {
+		t.Fatalf("empty database preview: %v %v %v", names, sqls, err)
+	}
+	assertMigrationRelations(t, runner, false, false)
+}
+
+func TestIntegrationRejectsMixedMigrationBeforeWriting(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	writeMigration(t, dir, "001_init.sql", "CREATE TABLE test_users (id int);", "DROP TABLE test_users;")
+	writeMigration(t, dir, "002_mixed.sql", `ALTER TABLE test_users ADD COLUMN label text;
+		CREATE INDEX CONCURRENTLY test_users_label_idx ON test_users (label);`, "SELECT 1;")
+
+	executed, err := runner.Up(t.Context())
+	if len(executed) != 0 || err == nil || !strings.Contains(err.Error(), "002_mixed.sql") ||
+		!strings.Contains(err.Error(), "UP") || !strings.Contains(err.Error(), "split") {
+		t.Errorf("mixed migration preflight: %v %v", executed, err)
+	}
+	assertMigrationRelations(t, runner, false, false)
+}
+
+func TestIntegrationRejectsMixedRollbackBeforeWriting(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	writeMigration(t, dir, "001_init.sql", "CREATE TABLE test_users (id int);", `
+		DROP INDEX CONCURRENTLY IF EXISTS test_users_unused_idx;
+		DROP TABLE test_users;`)
+	writeMigration(t, dir, "002_add.sql", "ALTER TABLE test_users ADD COLUMN label text;", "ALTER TABLE test_users DROP COLUMN label;")
+	if applied, err := runner.Up(t.Context()); err != nil || len(applied) != 2 {
+		t.Fatalf("setup: %v %v", applied, err)
+	}
+	rolledBack, err := runner.Down(t.Context(), 2)
+	if len(rolledBack) != 0 || err == nil || !strings.Contains(err.Error(), "001_init.sql") ||
+		!strings.Contains(err.Error(), "DOWN") || !strings.Contains(err.Error(), "split") {
+		t.Errorf("mixed rollback preflight: %v %v", rolledBack, err)
+	}
+	assertMigrationRelations(t, runner, true, true)
+	var count int
+	if err := runner.db.QueryRow(t.Context(), "SELECT count(*) FROM _migrations").Scan(&count); err != nil || count != 2 {
+		t.Fatalf("migration history: %d %v", count, err)
+	}
+}
+
+func TestIntegrationConcurrentIndexRetryDoesNotRecordInvalidIndex(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	ctx := t.Context()
+	writeMigration(t, dir, "001_init.sql", `
+		CREATE TABLE test_users (id int PRIMARY KEY, label text);
+		INSERT INTO test_users VALUES (1, 'duplicate'), (2, 'duplicate');`, "DROP TABLE test_users;")
+	writeMigration(t, dir, "002_idx.sql", `
+		CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "retry;index"
+			ON "public"."test_users" (label);`, `DROP INDEX CONCURRENTLY IF EXISTS "retry;index";`)
+
+	var pgErr *pgconn.PgError
+	applied, err := runner.Up(ctx)
+	if len(applied) != 1 || !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		t.Fatalf("expected initial unique violation: %v %v", applied, err)
+	}
+	assertConcurrentIndexState(t, runner, false, 1)
+
+	applied, err = runner.Up(ctx)
+	if len(applied) != 0 || err == nil || !strings.Contains(err.Error(), "index") || !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("invalid existing index was recorded: %v %v", applied, err)
+	}
+	assertConcurrentIndexState(t, runner, false, 1)
+
+	if err := runner.db.Exec(ctx, `DROP INDEX "retry;index"; DELETE FROM test_users WHERE id = 2;`); err != nil {
+		t.Fatal(err)
+	}
+	// A deliberately preexisting valid index on the target table remains compatible
+	// with PostgreSQL's IF NOT EXISTS contract.
+	if err := runner.db.Exec(ctx, `CREATE UNIQUE INDEX "retry;index" ON test_users (label);`); err != nil {
+		t.Fatal(err)
+	}
+	applied, err = runner.Up(ctx)
+	if len(applied) != 1 || applied[0] != "002_idx.sql" || err != nil {
+		t.Fatalf("valid existing index: %v %v", applied, err)
+	}
+	assertConcurrentIndexState(t, runner, true, 2)
+}
+
+func assertConcurrentIndexState(t *testing.T, runner *Runner, expectedValid bool, expectedHistory int) {
+	t.Helper()
+	var valid bool
+	var history int
+	err := runner.db.QueryRow(t.Context(), `SELECT
+		(SELECT indisvalid FROM pg_index WHERE indexrelid = 'public."retry;index"'::regclass),
+		(SELECT count(*) FROM _migrations)`).Scan(&valid, &history)
+	if err != nil || valid != expectedValid || history != expectedHistory {
+		t.Fatalf("index valid=%t, history=%d, err=%v", valid, history, err)
+	}
+}
+
+func TestIntegrationConcurrentIndexRejectsSameNameOnDifferentTable(t *testing.T) {
+	runner, dir := setupTestRunner(t)
+	writeMigration(t, dir, "001_init.sql", `
+		CREATE TABLE test_users (id int);
+		CREATE TABLE test_posts (id int);
+		CREATE INDEX same_name ON test_posts (id);`, "DROP TABLE test_users, test_posts;")
+	writeMigration(t, dir, "002_idx.sql", "CREATE INDEX CONCURRENTLY IF NOT EXISTS same_name ON test_users (id);", "DROP INDEX CONCURRENTLY same_name;")
+	applied, err := runner.Up(t.Context())
+	if len(applied) != 1 || applied[0] != "001_init.sql" || err == nil || !strings.Contains(err.Error(), "belongs to another table") {
+		t.Fatalf("another table's index was accepted: %v %v", applied, err)
+	}
+	var history int
+	if err := runner.db.QueryRow(t.Context(), "SELECT count(*) FROM _migrations").Scan(&history); err != nil || history != 1 {
+		t.Fatalf("migration history: %d %v", history, err)
+	}
+}
+
+func assertMigrationRelations(t *testing.T, runner *Runner, wantHistory, wantUsers bool) {
+	t.Helper()
+	var history, users bool
+	err := runner.db.QueryRow(t.Context(), "SELECT to_regclass('_migrations') IS NOT NULL, to_regclass('test_users') IS NOT NULL").Scan(&history, &users)
+	if err != nil || history != wantHistory || users != wantUsers {
+		t.Fatalf("relations: history=%t, users=%t, err=%v", history, users, err)
 	}
 }
 
