@@ -1,0 +1,2 @@
+pkg/codegen	default	^BenchmarkRelationLoaderGeneration$/^1$/^metadata$
+pkg/semantic	default	^BenchmarkCollectEventEmits$/^direct_1$/^recursive=true$|^BenchmarkCollectEventEmits$/^direct_128$/^recursive=true$

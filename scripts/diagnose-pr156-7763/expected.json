@@ -1,0 +1,30 @@
+{
+  "Base": [
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkRelationLoaderGeneration/1/metadata-2"
+    },
+    {
+      "Package": "pkg/semantic",
+      "Name": "BenchmarkCollectEventEmits/direct_1/recursive=true-2"
+    },
+    {
+      "Package": "pkg/semantic",
+      "Name": "BenchmarkCollectEventEmits/direct_128/recursive=true-2"
+    }
+  ],
+  "Head": [
+    {
+      "Package": "pkg/codegen",
+      "Name": "BenchmarkRelationLoaderGeneration/1/metadata-2"
+    },
+    {
+      "Package": "pkg/semantic",
+      "Name": "BenchmarkCollectEventEmits/direct_1/recursive=true-2"
+    },
+    {
+      "Package": "pkg/semantic",
+      "Name": "BenchmarkCollectEventEmits/direct_128/recursive=true-2"
+    }
+  ]
+}

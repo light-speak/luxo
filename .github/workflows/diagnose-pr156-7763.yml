@@ -1,0 +1,52 @@
+name: Recheck #156 codegen and semantic timing on EPYC 7763
+
+on:
+  push:
+    branches: [diagnostics/pr156-codegen-semantic-7763]
+
+permissions:
+  contents: read
+
+jobs:
+  witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 4
+          persist-credentials: false
+
+      - name: Record the runner CPU model
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/pr156-7763
+          cpu=$(awk -F ': *' '/^model name[[:space:]]*:/ {sub(/[[:space:]]+$/, "", $2); print $2; exit}' /proc/cpuinfo)
+          test -n "$cpu"
+          printf '%s\n' "$cpu" > .tmp/pr156-7763/cpu.txt
+
+      - uses: actions/checkout@v7
+        with:
+          ref: 59a4167f129f0bff0e8425125fa02eae87fd347b
+          path: .tmp/base
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Capture exact ELF and time the original CPU
+        shell: bash
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: bash scripts/diagnose-pr156-7763/run.sh
+
+      - if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr156-codegen-semantic-7763-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr156-7763
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
