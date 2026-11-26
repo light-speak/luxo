@@ -1297,6 +1297,9 @@ func TestGeneratedEntriesRegisterStreams(t *testing.T) {
 		t.Fatalf("gateway entry does not register streams:\n%s", gateway)
 	}
 	for name, source := range map[string]string{"embedded": embedded, "module": module, "gateway": gateway} {
+		if strings.Contains(source, "alert_luxo.RegisterHandlers(") {
+			t.Errorf("%s references unary handlers in a stream-only module", name)
+		}
 		if !strings.Contains(source, "if err := alert_luxo.RegisterStreams(gw.Router, eventBus, nil); err != nil {") || !strings.Contains(source, "fatal: register streams:") {
 			t.Errorf("%s ignores stream listener registration failure", name)
 		}
@@ -1330,6 +1333,11 @@ func TestGeneratedEntriesBridgeNativeStreamsThroughRPC(t *testing.T) {
 	}
 	if !strings.Contains(module, "score_luxo.RegisterSchema(gw.Router.Schema)") {
 		t.Fatalf("standalone module did not register its runtime schema:\n%s", module)
+	}
+	for name, source := range map[string]string{"embedded": embedded, "module": module} {
+		if strings.Contains(source, "score_luxo.RegisterHandlers(") {
+			t.Errorf("%s references unary handlers in a native stream-only module", name)
+		}
 	}
 	gateway := string(generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}))
 	for _, want := range []string{

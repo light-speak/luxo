@@ -700,8 +700,27 @@ func TestMigrationStateRenameFailureRemovesSQL(t *testing.T) {
 	}
 }
 
-func TestMigrationCLIApplyAndReport(t *testing.T) {
-	db := isolatedMigrationCountDatabase(t)
+func TestMigrationCLIWithPostgreSQL(t *testing.T) {
+	fixture := newMigrationCLIFixture(t)
+
+	for _, sample := range []struct {
+		name string
+		run  func(*testing.T, *pg.DB)
+	}{
+		{"apply_and_report", testMigrationCLIApplyAndReport},
+		{"verify_table_drift", testMigrationCLIVerifyTableDrift},
+		{"sql_failure", testMigrationCLISQLFailurePreservesCommittedSteps},
+		{"invalid_rollback_count", testMigrationDownInvalidCountPreservesAppliedSchema},
+		{"valid_rollback_count", testMigrationDownValidCountUsesRequestedLimit},
+	} {
+		t.Run(sample.name, func(t *testing.T) { sample.run(t, fixture.open(t)) })
+	}
+	t.Run("metadata_schema_errors", func(t *testing.T) { testMigrationCommandsPropagateMetadataSchemaErrors(t, fixture) })
+	t.Run("autocommit_history_diagnostics", func(t *testing.T) { testMigrationCLIHistoryDiagnostics(t, fixture) })
+	t.Run("database_and_schema_isolation", func(t *testing.T) { testMigrationCLIDatabaseIsolation(t, fixture) })
+}
+
+func testMigrationCLIApplyAndReport(t *testing.T, db *pg.DB) {
 	command := newMigrationCLICommand(t)
 	assertMigrationCLICommand(t, db, command, runMigrateStatus, nil, 0, "No migrations found")
 	writeMigrationCountFixture(t)
@@ -736,6 +755,87 @@ func TestMigrationCLIApplyAndReport(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func testMigrationCLIHistoryDiagnostics(t *testing.T, fixture *migrationCLIFixture) {
+	const build = "CREATE INDEX CONCURRENTLY cli_migration_diag ON cli_rollback_probe (payload);"
+	for _, sample := range []struct {
+		name, up, trigger string
+		down              bool
+		code, diagnostic  string
+		exists, valid     bool
+	}{
+		{"statement", "CREATE UNIQUE INDEX CONCURRENTLY cli_migration_diag ON cli_rollback_probe (payload);", "", false, "23505", "autocommit statement success is unconfirmed", true, false},
+		{"record", build, "BEFORE DELETE", true, "P0001", "migration history remains uncommitted", false, false},
+		{"commit", build, "AFTER INSERT", false, "P0001", "migration history commit is unconfirmed", true, true},
+		{"ordinary", "CREATE TABLE cli_migration_diag (id bigint);", "BEFORE INSERT", false, "P0001", "fixture rejected migration history", false, false},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			db := fixture.open(t)
+			writeMigrationCountFixture(t)
+			cmd := newMigrationCLICommand(t)
+			assertMigrationCLICommand(t, db, cmd, runMigrateUp, nil, 2, "2 migration(s) applied")
+			script := "-- ====== UP ======\n" + sample.up + "\n-- ====== DOWN ======\nDROP INDEX CONCURRENTLY IF EXISTS cli_migration_diag;\n"
+			if err := os.WriteFile(filepath.Join("migrations", "003_diagnostic.sql"), []byte(script), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if sample.name == "statement" {
+				if _, err := pg.Exec(t.Context(), db, "INSERT INTO cli_rollback_probe VALUES (2, 'keep')"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			run, command, applied := runMigrateUp, "migrate up:", int64(2)
+			if sample.down {
+				assertMigrationCLICommand(t, db, cmd, runMigrateUp, nil, 3, "1 migration(s) applied")
+				run, command, applied = runMigrateDown, "migrate down:", 3
+			}
+			if sample.trigger != "" {
+				installMigrationDiagnosticTrigger(t, db, sample.trigger)
+			}
+			output, err := captureCLIResponse(t, func() error { return run(cmd, nil) })
+			assertMigrationDiagnosticError(t, err, output, command, sample.name, sample.code, sample.diagnostic)
+			assertMigrationDiagnosticState(t, db, applied, sample.exists, sample.valid)
+		})
+	}
+}
+
+func installMigrationDiagnosticTrigger(t *testing.T, db *pg.DB, operation string) {
+	t.Helper()
+	const reject = "CREATE FUNCTION cli_reject_history() RETURNS trigger LANGUAGE plpgsql AS " +
+		"$$ BEGIN RAISE EXCEPTION 'fixture rejected migration history'; END; $$; "
+	create := "CREATE TRIGGER cli_reject_history " + operation + " ON _migrations "
+	if operation == "AFTER INSERT" {
+		create = "CREATE CONSTRAINT TRIGGER cli_reject_history AFTER INSERT ON _migrations DEFERRABLE INITIALLY DEFERRED "
+	}
+	if _, err := pg.Exec(t.Context(), db, reject+create+"FOR EACH ROW EXECUTE FUNCTION cli_reject_history()"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertMigrationDiagnosticError(t *testing.T, err error, output, command, phase, code, want string) {
+	t.Helper()
+	var state interface{ SQLState() string }
+	if !errors.As(err, &state) || state.SQLState() != code || output != "" ||
+		!strings.HasPrefix(err.Error(), command) || !strings.Contains(err.Error(), "003_diagnostic.sql") || !strings.Contains(err.Error(), want) {
+		t.Errorf("migration reported the wrong failure phase: output=%q error=%v", output, err)
+	}
+	if err != nil && phase == "ordinary" && strings.Contains(err.Error(), "autocommit statement") {
+		t.Errorf("ordinary transaction reported a standalone statement failure: %v", err)
+	}
+}
+
+func assertMigrationDiagnosticState(t *testing.T, db *pg.DB, applied int64, wantIndex, wantValid bool) {
+	t.Helper()
+	assertMigrationCLIHistory(t, db, applied)
+	const relation = "pg_catalog.to_regclass('public.cli_migration_diag')"
+	index, err := pg.QueryScalar[bool](t.Context(), db, "SELECT "+relation+" IS NOT NULL")
+	if err != nil || index != wantIndex {
+		t.Fatalf("index exists=%t want=%t error=%v", index, wantIndex, err)
+	}
+	valid, err := pg.QueryScalar[bool](t.Context(), db, "SELECT COALESCE((SELECT indisvalid FROM pg_index WHERE indexrelid="+relation+"), false)")
+	if err != nil || valid != wantValid {
+		t.Fatalf("index valid=%t want=%t error=%v", valid, wantValid, err)
 	}
 }
 
@@ -778,8 +878,7 @@ func assertMigrationCLIHistory(t *testing.T, db *pg.DB, want int64) {
 	}
 }
 
-func TestMigrationCLIVerifyTableDrift(t *testing.T) {
-	db := isolatedMigrationCountDatabase(t)
+func testMigrationCLIVerifyTableDrift(t *testing.T, db *pg.DB) {
 	writeMigrationCountFixture(t)
 	state := `{"models":{"Probe":{"table":"cli_rollback_probe"},"Marker":{"table":"cli_rollback_marker"}}}`
 	if err := os.WriteFile(filepath.Join("migrations", ".state.json"), []byte(state), 0600); err != nil {
@@ -802,8 +901,7 @@ func TestMigrationCLIVerifyTableDrift(t *testing.T) {
 	assertMigrationCLICommand(t, db, command, runMigrateVerify, nil, 2, "Database matches expected origin")
 }
 
-func TestMigrationCLISQLFailurePreservesCommittedSteps(t *testing.T) {
-	db := isolatedMigrationCountDatabase(t)
+func testMigrationCLISQLFailurePreservesCommittedSteps(t *testing.T, db *pg.DB) {
 	writeMigrationCountFixture(t)
 	path := filepath.Join("migrations", "002_marker.sql")
 	valid, err := os.ReadFile(path)
@@ -909,8 +1007,7 @@ func TestMigrationDownRejectsInvalidCountBeforeEnvironment(t *testing.T) {
 	}
 }
 
-func TestMigrationDownInvalidCountPreservesAppliedSchema(t *testing.T) {
-	db := isolatedMigrationCountDatabase(t)
+func testMigrationDownInvalidCountPreservesAppliedSchema(t *testing.T, db *pg.DB) {
 	writeMigrationCountFixture(t)
 	runner, err := migrate.New(t.Context(), "migrations")
 	if err != nil {
@@ -940,8 +1037,7 @@ func TestMigrationDownInvalidCountPreservesAppliedSchema(t *testing.T) {
 	}
 }
 
-func TestMigrationDownValidCountUsesRequestedLimit(t *testing.T) {
-	db := isolatedMigrationCountDatabase(t)
+func testMigrationDownValidCountUsesRequestedLimit(t *testing.T, db *pg.DB) {
 	writeMigrationCountFixture(t)
 	runner, err := migrate.New(t.Context(), "migrations")
 	if err != nil {
@@ -994,13 +1090,18 @@ func writeMigrationCountFixture(t *testing.T) {
 	}
 }
 
-func isolatedMigrationCountDatabase(t *testing.T) *pg.DB {
+type migrationCLIFixture struct {
+	connection *url.URL
+	name       string
+	opened     bool
+}
+
+func newMigrationCLIFixture(t *testing.T) *migrationCLIFixture {
 	t.Helper()
 	connection := os.Getenv("LUXO_TEST_DATABASE_URL")
 	if connection == "" {
 		t.Skip("requires isolated LUXO_TEST_DATABASE_URL")
 	}
-	enterCacheGenerationScratch(t)
 	u, err := url.Parse(connection)
 	if err != nil || u.User == nil {
 		t.Fatal("invalid test database URL")
@@ -1009,9 +1110,9 @@ func isolatedMigrationCountDatabase(t *testing.T) *pg.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(admin.Close)
 	name := "luxo_cli_count_" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	if _, err := pg.Exec(t.Context(), admin, "CREATE DATABASE "+name); err != nil {
-		admin.Close()
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -1020,10 +1121,18 @@ func isolatedMigrationCountDatabase(t *testing.T) *pg.DB {
 		if _, err := pg.Exec(ctx, admin, "DROP DATABASE "+name+" WITH (FORCE)"); err != nil {
 			t.Error(err)
 		}
-		admin.Close()
 	})
+	return &migrationCLIFixture{connection: u, name: name}
+}
+
+func (fixture *migrationCLIFixture) open(t *testing.T) *pg.DB {
+	t.Helper()
+	// Both helpers require serial subtests. A case closes its pools before the
+	// next case opens a connection and resets the exclusively owned database.
+	enterCacheGenerationScratch(t)
+	u := fixture.connection
 	password, _ := u.User.Password()
-	for key, value := range map[string]string{"DATABASE_HOST": u.Hostname(), "DATABASE_PORT": u.Port(), "DATABASE_USER": u.User.Username(), "DATABASE_PASSWORD": password, "DATABASE_PREFIX": name, "DATABASE_SSL": u.Query().Get("sslmode")} {
+	for key, value := range map[string]string{"DATABASE_HOST": u.Hostname(), "DATABASE_PORT": u.Port(), "DATABASE_USER": u.User.Username(), "DATABASE_PASSWORD": password, "DATABASE_PREFIX": fixture.name, "DATABASE_SSL": u.Query().Get("sslmode")} {
 		t.Setenv(key, value)
 	}
 	db, err := pg.NewDB(t.Context(), migrate.BuildDatabaseURL())
@@ -1031,7 +1140,48 @@ func isolatedMigrationCountDatabase(t *testing.T) *pg.DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(db.Close)
+	owned, err := pg.QueryScalar[bool](t.Context(), db, `SELECT EXISTS (
+		SELECT 1 FROM pg_catalog.pg_database
+		WHERE datname = $1 AND datname = current_database()
+		AND datdba = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user)
+	)`, fixture.name)
+	if err != nil || !owned {
+		t.Fatalf("migration fixture must connect to its owned database: %v", err)
+	}
+	if fixture.opened {
+		if _, err := pg.Exec(t.Context(), db, "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public"); err != nil {
+			t.Fatalf("reset migration fixture schema: %v", err)
+		}
+	}
+	fixture.opened = true
 	return db
+}
+
+func testMigrationCLIDatabaseIsolation(t *testing.T, fixture *migrationCLIFixture) {
+	const oidQuery = "SELECT oid::bigint FROM pg_catalog.pg_database WHERE datname = current_database()"
+	var firstOID int64
+	t.Run("leave_table", func(t *testing.T) {
+		db := fixture.open(t)
+		var err error
+		firstOID, err = pg.QueryScalar[int64](t.Context(), db, oidQuery)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pg.Exec(t.Context(), db, "CREATE TABLE public.cli_migration_fixture_marker (id int)"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("reopen_clean_schema", func(t *testing.T) {
+		db := fixture.open(t)
+		oid, err := pg.QueryScalar[int64](t.Context(), db, oidQuery)
+		if err != nil || oid != firstOID || oid == 0 {
+			t.Fatalf("migration cases did not reuse their database: first=%d current=%d err=%v", firstOID, oid, err)
+		}
+		empty, err := pg.QueryScalar[bool](t.Context(), db, "SELECT pg_catalog.to_regclass('public.cli_migration_fixture_marker') IS NULL")
+		if err != nil || !empty {
+			t.Fatalf("migration fixture leaked a table from the preceding case: %v", err)
+		}
+	})
 }
 
 func TestMigrationSQLErrorsDoNotCreateOutput(t *testing.T) {
@@ -1137,7 +1287,7 @@ func TestMigrationDefaultErrorsPreserveExistingFiles(t *testing.T) {
 	}
 }
 
-func TestMigrationCommandsPropagateMetadataSchemaErrors(t *testing.T) {
+func testMigrationCommandsPropagateMetadataSchemaErrors(t *testing.T, fixture *migrationCLIFixture) {
 	for _, sample := range []struct {
 		name, prefix string
 		run          func(*cobra.Command, []string) error
@@ -1149,7 +1299,7 @@ func TestMigrationCommandsPropagateMetadataSchemaErrors(t *testing.T) {
 		{"verify", "verify:", runMigrateVerify, false},
 	} {
 		t.Run(sample.name, func(t *testing.T) {
-			db := isolatedMigrationCountDatabase(t)
+			db := fixture.open(t)
 			if _, err := pg.Exec(t.Context(), db, "CREATE TABLE _migrations (unexpected bigint); INSERT INTO _migrations VALUES (7)"); err != nil {
 				t.Fatal(err)
 			}

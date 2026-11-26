@@ -205,7 +205,7 @@ func BenchmarkCanonicalJSONFloat(b *testing.B) {
 			raw = []byte("[" + strings.Repeat("1.25,", count-1) + "1.25]")
 		}
 		req := &Request{Params: map[string]json.RawMessage{"value": raw}}
-		var expected []byte
+		expected := canonicalJSONBenchmarkGolden(b, req, meta, encodeBinaryParam)
 		for _, version := range []struct {
 			name   string
 			decode func(*Request, ParamMeta) (any, bool, error)
@@ -223,9 +223,7 @@ func BenchmarkCanonicalJSONFloat(b *testing.B) {
 					}
 				}
 				write()
-				if version.name == "before" {
-					expected = bytes.Clone(enc.Bytes())
-				} else if !bytes.Equal(enc.Bytes(), expected) {
+				if !bytes.Equal(enc.Bytes(), expected) {
 					b.Fatal("different output")
 				}
 				b.ReportAllocs()
@@ -262,7 +260,7 @@ func BenchmarkCanonicalJSONValue(b *testing.B) {
 func benchmarkCanonicalJSONValue(b *testing.B, tc opaqueJSONBenchmarkCase) {
 	meta := ParamMeta{Name: "value", Type: "JSON", FieldID: 1, IsList: tc.list}
 	req := &Request{Params: map[string]json.RawMessage{"value": json.RawMessage(tc.raw)}}
-	var expected []byte
+	expected := canonicalJSONBenchmarkGolden(b, req, meta, encodeOpaqueJSONReference)
 	for _, version := range []struct {
 		name   string
 		decode func(*Request, ParamMeta) (any, bool, error)
@@ -281,9 +279,7 @@ func benchmarkCanonicalJSONValue(b *testing.B, tc opaqueJSONBenchmarkCase) {
 				}
 			}
 			write()
-			if version.name == "before" {
-				expected = bytes.Clone(enc.Bytes())
-			} else if !bytes.Equal(enc.Bytes(), expected) {
+			if !bytes.Equal(enc.Bytes(), expected) {
 				b.Fatal("comparison requires identical valid output")
 			}
 			b.ReportAllocs()
@@ -292,6 +288,20 @@ func benchmarkCanonicalJSONValue(b *testing.B, tc opaqueJSONBenchmarkCase) {
 			}
 		})
 	}
+}
+
+// Build the historical golden before benchmark selection can skip a sibling.
+func canonicalJSONBenchmarkGolden(b *testing.B, req *Request, meta ParamMeta, encode func(*codec.Encoder, ParamMeta, any) error) []byte {
+	b.Helper()
+	value, present, err := beforeOpaqueJSONValue(req, meta)
+	if err != nil || !present {
+		b.Fatalf("golden decode: present %v, error %v", present, err)
+	}
+	var enc codec.Encoder
+	if err := encode(&enc, meta, value); err != nil {
+		b.Fatal(err)
+	}
+	return enc.Bytes()
 }
 
 // Preserve the former reflective encoder only for the non-null JSON benchmark.

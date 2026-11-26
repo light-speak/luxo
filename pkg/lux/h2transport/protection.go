@@ -74,23 +74,17 @@ func (c *candidateConnection) refreshDeadline() {
 // Called under c.mu for a registered task. Only changing the current minimum
 // can invalidate the cached deadline; later tasks do not require a map scan.
 func (c *candidateConnection) replaceTaskDeadline(task *requestTask, next time.Time) {
-	if len(c.tasks) == 1 {
-		task.deadline = next
-		c.deadline = next
-		return
-	}
-	c.replaceSharedTaskDeadline(task, next)
-}
-
-// The nonzero cached minimum is an exact copy of a registered task deadline.
-func (c *candidateConnection) replaceSharedTaskDeadline(task *requestTask, next time.Time) {
-	previous, minimum := task.deadline, c.deadline
+	previous := task.deadline
 	task.deadline = next
-	if !next.IsZero() && (minimum.IsZero() || next.Before(minimum)) {
+	if len(c.tasks) == 1 {
 		c.deadline = next
 		return
 	}
-	if previous == minimum && !minimum.IsZero() {
+	if !next.IsZero() && (c.deadline.IsZero() || next.Before(c.deadline)) {
+		c.deadline = next
+		return
+	}
+	if !previous.IsZero() && previous.Equal(c.deadline) {
 		c.refreshDeadline()
 	}
 }

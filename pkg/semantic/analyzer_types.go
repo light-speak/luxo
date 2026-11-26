@@ -590,13 +590,18 @@ func (a *Analyzer) validateCallableParametersInContext(kind, name string, params
 }
 
 func (a *Analyzer) resolveParameterTypes(kind, name string, params []*ast.ParamDecl, context typeContext, assign func(int, *ResolvedType)) {
-	seen := make(map[string]bool, len(params))
+	var seen map[string]bool
+	if len(params) > 1 {
+		seen = make(map[string]bool, len(params))
+	}
 	for index, param := range params {
 		expected := a.resolveTypeRefInContext(param.Type, param.Pos, context)
-		if seen[param.Name] {
-			a.addError(param.Pos, "duplicate parameter '%s' in %s '%s' / %s '%s' 中参数 '%s' 重复", param.Name, kind, name, kind, name, param.Name)
-		} else {
-			seen[param.Name] = true
+		if seen != nil {
+			if seen[param.Name] {
+				a.addError(param.Pos, "duplicate parameter '%s' in %s '%s' / %s '%s' 中参数 '%s' 重复", param.Name, kind, name, kind, name, param.Name)
+			} else {
+				seen[param.Name] = true
+			}
 		}
 		a.validateParameterDefault(param, expected)
 		if assign != nil {

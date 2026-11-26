@@ -32,6 +32,11 @@ func testConnectionReader(t *testing.T, router *api.Router) (*connectionReader, 
 }
 
 func TestConnectionReaderKeepsInFlightPayloadOwned(t *testing.T) {
+	synctest.Test(t, testConnectionReaderKeepsInFlightPayloadOwned)
+}
+
+func testConnectionReaderKeepsInFlightPayloadOwned(t *testing.T) {
+	t.Helper()
 	router := api.NewRouter()
 	if err := router.Registry.Register("echo", 1); err != nil {
 		t.Fatal(err)
@@ -59,7 +64,7 @@ func TestConnectionReaderKeepsInFlightPayloadOwned(t *testing.T) {
 		req.Buf.B = append(req.Buf.B, req.BinaryRequest()...)
 		return nil
 	})
-	_, peer := testConnectionReader(t, router)
+	reader, peer := testConnectionReader(t, router)
 	bodies := make([][]byte, 2)
 	for i := range 2 {
 		bodies[i] = encodeCallRequest(1, nil, mustEncodeParams(t, ParamField{FieldID: 1, Value: int64(i + 1)}))
@@ -75,12 +80,53 @@ func TestConnectionReaderKeepsInFlightPayloadOwned(t *testing.T) {
 	if err := WriteFrame(peer, encodeRequestEnvelope(requestKindCall, "", bodies[1])); err != nil {
 		t.Fatal(err)
 	}
+	// A pipe write acknowledges the bytes before the reader queues the frame.
+	synctest.Wait()
+	reader.mu.Lock()
+	queued := reader.queued
+	reader.mu.Unlock()
+	if !queued {
+		t.Fatal("second request was not queued while the first handler was blocked")
+	}
 	close(release)
 	for _, body := range bodies {
 		got, err := ReadFrame(peer, nil)
 		if err != nil || !bytes.Equal(got, append([]byte{statusOK}, body...)) {
 			t.Fatal("ordered response", got, err)
 		}
+	}
+}
+
+func TestConnectionReaderSkipsDispatchAfterClose(t *testing.T) {
+	router := api.NewRouter()
+	if err := router.Registry.Register("echo", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := router.Registry.RegisterParams("echo", nil); err != nil {
+		t.Fatal(err)
+	}
+	router.Handle("echo", func(context.Context, *api.Request) error {
+		t.Error("handler ran after the connection closed")
+		return nil
+	})
+	server := NewServer(router)
+	t.Cleanup(server.Close)
+	socket, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	reader := newConnectionReader(server, socket)
+	t.Cleanup(reader.close)
+	payload := encodeRequestEnvelope(requestKindCall, "", encodeCallRequest(1, nil, nil))
+	envelope, err := decodeRequestEnvelope(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := incomingRequest{payload: payload, envelope: envelope}
+	if dispatch, ok := reader.claim(request, false); !dispatch || !ok {
+		t.Fatal("live connection failed to claim the request")
+	}
+	reader.close()
+	if reader.dispatch(request) {
+		t.Fatal("dispatcher continued after the connection closed")
 	}
 }
 

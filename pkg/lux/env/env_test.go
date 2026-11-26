@@ -27,6 +27,25 @@ func TestLoadReportsSetenvFailure(t *testing.T) {
 	}
 }
 
+func TestLoadReportsMalformedLinesWithoutTheirValues(t *testing.T) {
+	const value = "test-secret-value"
+	for _, sample := range []struct{ line, diagnostic string }{
+		{"JWT_SECRET " + value, "missing '='"},
+		{"=" + value, "empty key"},
+	} {
+		t.Run(sample.diagnostic, func(t *testing.T) {
+			path := writeEnvFile(t, "# header\n"+sample.line+"\n")
+			err := Load(path)
+			if err == nil || !strings.Contains(err.Error(), path+":2:") || !strings.Contains(err.Error(), sample.diagnostic) {
+				t.Fatalf("expected file, line and syntax diagnostic: %v", err)
+			}
+			if strings.Contains(err.Error(), value) {
+				t.Fatal("environment error exposed input from an invalid line")
+			}
+		})
+	}
+}
+
 func writeEnvFile(t *testing.T, content string) string {
 	t.Helper()
 	dir := t.TempDir()

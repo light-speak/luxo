@@ -101,6 +101,32 @@ func TestRequestHeaders(t *testing.T) {
 	}
 }
 
+func TestRequestHeadPseudoFieldValues(t *testing.T) {
+	frame := &http2.MetaHeadersFrame{
+		HeadersFrame: &http2.HeadersFrame{FrameHeader: http2.FrameHeader{StreamID: 3}},
+		Fields: []hpack.HeaderField{
+			{Name: ":path", Value: "/custom?debug=1"},
+			{Name: ":authority", Value: "localhost"},
+			{Name: ":scheme", Value: "https"},
+			{Name: ":method", Value: "GET"},
+		},
+	}
+	head, err := decodeHead(t, frame.Fields, true)
+	if err != nil || head.method != "GET" || head.authority != "localhost" ||
+		head.path != "/custom?debug=1" || head.target == nil || head.target.Scheme != "https" || head.fields != nil {
+		t.Fatalf("unexpected request head: %+v, %v", head, err)
+	}
+	// Framer rejects mixed request and response pseudo headers before this point.
+	frame.Fields = append(frame.Fields, hpack.HeaderField{Name: ":status", Value: "200"})
+	if _, err := parseRequestHead(frame); err != (http2.StreamError{StreamID: 3, Code: http2.ErrCodeProtocol}) {
+		t.Fatalf("unexpected status error: %v", err)
+	}
+	frame.Fields[len(frame.Fields)-1].Value = ""
+	if head, err := parseRequestHead(frame); err != nil || head.fields != nil {
+		t.Fatalf("empty status changed request head: %+v, %v", head, err)
+	}
+}
+
 func TestMalformedRequestHeaders(t *testing.T) {
 	for _, field := range []hpack.HeaderField{
 		{Name: "connection", Value: "keep-alive"}, {Name: "upgrade", Value: "websocket"},
