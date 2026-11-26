@@ -8,6 +8,7 @@ from pathlib import Path
 import json
 import os
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -19,11 +20,21 @@ ROOT = INPUT.parents[1]
 OUT = ROOT / '.tmp/pr83-pr84-intel-evidence'
 CHECKOUTS = ROOT / '.tmp/pr83-pr84-intel-checkouts'
 REF = 'refs/heads/diagnostics/pr83-pr84-intel'
-DIAGNOSTIC_PARENT = 'e1ee754133cda6a7b36b5b4c63cc596afec8c559'
+DIAGNOSTIC_PARENT = 'f4e265a6c1f280ed89fcb325cb81cc2b3758f2a3'
 MANIFEST_SHA = '3471b2d29d862dcce9bbdc0e27ec05440fe455c1f2b217a88e909daac1c27366'
 MANIFEST = json.loads((INPUT / 'manifest.json').read_bytes())
 PACKAGE = 'pkg/lux/api'
 PROFILES = MANIFEST['profiles']
+PROJECT = runpy.run_path(str(INPUT / 'projection.py'))
+PROJECTED = PROJECT['selected_profiles'](PROFILES)
+REFERENCE_SHA = '41361042b9a6e59e79b8f4e9bf7ebf415cf837185611e141f7e577b6c103bbf6'
+REFERENCE = json.loads((INPUT / 'projection-reference.json').read_bytes())
+CHANGED = [
+    'M\t.github/workflows/diagnose-pr83-pr84-intel.yml',
+    'A\tscripts/diagnose-pr83-pr84-intel/projection-reference.json',
+    'A\tscripts/diagnose-pr83-pr84-intel/projection.py',
+    'M\tscripts/diagnose-pr83-pr84-intel/run.py',
+]
 PAIRS = ('AA', 'HH', 'AH')
 ROLES = ('A', 'H')
 BLOCKS = (1, 2)
@@ -32,6 +43,9 @@ HOT = {
     'api-non-identity': (r'BenchmarkHandlerPanicFormatting', r'BenchmarkWSConnectionRegistrations',
                          r'benchmarkConnectionRegistrations|connectionSliceBaseline|callHandler'),
 }
+HOT['identity'] = HOT['default']
+HOT['handler'] = (r'BenchmarkHandlerPanicFormatting', r'callHandler|beforeHandlerPanicFormatting')
+HOT['websocket'] = (r'BenchmarkWSConnectionRegistrations', r'benchmarkConnectionRegistrations|connectionSliceBaseline')
 BENCH_RE = re.compile(rb'^(Benchmark\S+)\s+(\d+)\s+', re.M)
 
 
@@ -78,6 +92,10 @@ def schedule():
 
 def manifest_check():
     need(digest(INPUT / 'manifest.json') == MANIFEST_SHA, 'qualification manifest changed')
+    need(digest(INPUT / 'projection-reference.json') == REFERENCE_SHA, 'prior machine-code or inventory binding changed')
+    for profile, all_leaves in REFERENCE['fullInventory'].items():
+        need(set(PROJECTED[profile]) <= set(all_leaves) and len(all_leaves) == len(set(all_leaves)),
+             f'projected full inventory incomplete for {profile}')
     need(set(MANIFEST['revisions']) == {'83', '84'}, 'expected both independent release revisions')
     need({key: len(items) for key, items in PROFILES.items()} == {'default': 12, 'api-non-identity': 2},
          'expected 14 original matched leaves')
@@ -102,8 +120,8 @@ def runner():
     active = git(ROOT, 'rev-parse', 'HEAD')
     need(active == os.environ.get('GITHUB_SHA') and
          git(ROOT, 'show', '-s', '--format=%P', active) == DIAGNOSTIC_PARENT and
-         git(ROOT, 'diff', '--name-status', DIAGNOSTIC_PARENT, active) == 'M\tscripts/diagnose-pr83-pr84-intel/run.py',
-         'expected the one-file selector correction on the published diagnostic parent')
+         git(ROOT, 'diff', '--name-status', DIAGNOSTIC_PARENT, active).splitlines() == CHANGED,
+         'expected only the diagnostic overlay changes on the published parent')
     cpu = {line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines()
            if line.startswith('model name')}
     spec = MANIFEST['runner']
@@ -165,10 +183,12 @@ def inspect_binary(go, binary, profile, evidence, work):
         path.unlink()
 
 
-def sample(benchrun, arm, profile, budget):
+def sample(benchrun, arm, profile, budget, leaves=None, projected=False):
     source, binaries = arm
-    args = (benchrun, 'run-performance', source, binaries, PACKAGE, profile,
-            '-test.run=^$', '-test.bench=' + selector(PROFILES[profile]), '-test.benchmem',
+    mode = ('run', source, binaries / profile, PACKAGE) if projected else (
+        'run-performance', source, binaries, PACKAGE, profile)
+    regex = '.' if leaves is None else selector(leaves)
+    args = (benchrun, *mode, '-test.run=^$', '-test.bench=' + regex, '-test.benchmem',
             '-test.benchtime=' + budget, '-test.count=1', '-test.cpu=2')
     try:
         return call(*args)
@@ -187,6 +207,27 @@ def verify_rows(raw, leaves, count, one_iteration=False):
     need({line[5:].strip() for line in raw.splitlines() if line.startswith(b'cpu: ')} == {expected_cpu}, 'sample CPU mismatch')
 
 
+def build_projected(go, benchrun, source, building, evidence, work, env):
+    for profile in PROJECTED:
+        compile_log = evidence / profile
+        compile_log.mkdir()
+        output = building / profile
+        output.mkdir(parents=True)
+        overlay = work / ('projection-' + evidence.name + '-' + profile + '.json')
+        fixture = PROJECT['write_overlay'](source / PACKAGE, overlay, profile)
+        (compile_log / 'fixture.txt').write_text(f'{fixture.name} {digest(fixture)}\n')
+        binary = output / 'pkg-lux-api.test'
+        call('go', 'test', '-trimpath', '-c', '-overlay=' + str(overlay), './' + PACKAGE, '-o', binary,
+             cwd=source, env=dict(env, LUXO_WITNESS_PROFILE_LOG=str(compile_log)))
+        inspect_binary(go, binary, profile, compile_log / 'elf', work)
+        complete = sample(benchrun, (source, building), profile, '1x', projected=True)
+        verify_rows(complete, REFERENCE['fullInventory'][profile], 1, one_iteration=True)
+        (compile_log / 'all-inventory.txt').write_bytes(complete)
+        selected = sample(benchrun, (source, building), profile, '1x', PROJECTED[profile], projected=True)
+        verify_rows(selected, PROJECTED[profile], 1, one_iteration=True)
+        (compile_log / 'selected-inventory.txt').write_bytes(selected)
+
+
 def build_pr(go, pr, work, evidence, wrapper, env):
     work.mkdir()
     evidence.mkdir()
@@ -201,7 +242,7 @@ def build_pr(go, pr, work, evidence, wrapper, env):
     batch = evidence / 'benchmark-batch.tsv'
     batch.write_text(''.join(f'{PACKAGE}\t{profile}\t{selector(items)}\n' for profile, items in PROFILES.items()))
     call(benchplan, '--verify-profile-batch', 'confirmation', OUT / 'expected.json', batch)
-    arms = {}
+    arms, projected = {}, {}
     for role, src, command in (('A', left, 'compile-performance-baseline'), ('H', right, 'compile-performance')):
         binaries = work / (role + '-bin')
         build_log = evidence / (role + '-build')
@@ -213,36 +254,42 @@ def build_pr(go, pr, work, evidence, wrapper, env):
             suffix = '-' + profile if profile != 'default' else ''
             binary = binaries / ('pkg-lux-api' + suffix + '.test')
             inspect_binary(go, binary, profile, build_log / profile, work)
-            capture = sample(benchrun, (src, binaries), profile, '1x')
+            sections = json.loads((build_log / profile / 'segments.json').read_bytes())
+            need(sections == REFERENCE['stock'][pr][role][profile], f'{pr} {role} {profile}: original stock segments changed')
+            capture = sample(benchrun, (src, binaries), profile, '1x', PROFILES[profile])
             verify_rows(capture, PROFILES[profile], 1, one_iteration=True)
             (build_log / (profile + '-inventory.txt')).write_bytes(capture)
         arms[role] = src, binaries
-    return arms, benchrun, benchgate, benchplan, control
+        projected[role] = src, work / (role + '-projected')
+        project_log = evidence / (role + '-projected')
+        project_log.mkdir()
+        build_projected(go, benchrun, *projected[role], project_log, work, compile_env)
+    return {'stock': arms, 'projected': projected}, benchrun, benchgate, benchplan, control
 
 
-def measure(built):
+def measure(built, mode, profiles, destination):
     index = 0
-    with (OUT / 'order.tsv').open('x') as order:
+    with (destination / 'order.tsv').open('x') as order:
         order.write('record\tblock\tpair\tpr\tcomparison\tside\trole\tprofile\n')
         for block, pair, pr, comparison, side in schedule():
             arms, benchrun, *_ = built[pr]
             role = comparison[side]
             side_name = ('left', 'right')[side]
-            output = OUT / pr / f'{comparison}-{block}.{side_name}.raw'
+            output = destination / pr / f'{comparison}-{block}.{side_name}.raw'
             with output.open('ab') as stream:
-                for profile in PROFILES:
+                for profile, leaves in profiles.items():
                     index += 1
                     order.write(f'{index}\t{block}\t{pair}\t{pr}\t{comparison}\t{side_name}\t{role}\t{profile}\n')
-                    stream.write(sample(benchrun, arms[role], profile, '200ms'))
-    need(index == 480, 'expected 480 benchmark process invocations')
+                    stream.write(sample(benchrun, arms[mode][role], profile, '200ms', leaves, projected=(mode == 'projected')))
+    need(index == 240 * len(profiles), 'unexpected benchmark process count')
     return index
 
 
-def gate(built, benchstat, leaves):
+def gate(built, benchstat, leaves, destination):
     expected = OUT / 'expected.json'
     statuses = {}
     for pr, (_, _, benchgate, benchplan, control) in built.items():
-        dest = OUT / pr
+        dest = destination / pr
         for comparison in PAIRS:
             csvs = []
             directions = ('forward', 'reverse') if comparison != 'AH' else ('forward',)
@@ -278,7 +325,7 @@ def main():
     args = sys.argv[1:]
     leaves = manifest_check()
     if args == ['--check']:
-        print('14 leaves, 2 independent revisions, 480 scheduled processes, 2 profiles')
+        print('14 leaves, 2 independent revisions, 480 stock and 720 projected processes, 5 profiles')
         return
     if args == ['--probe']:
         runner()
@@ -294,6 +341,7 @@ def main():
     spec = MANIFEST['runner']
     wanted = f'go{spec["go"]}\nlinux\namd64\nlinux\namd64\n{spec["goamd64"]}\n{spec["cgo"]}\n\nlocal\n'.encode()
     need(version == wanted, 'Go build settings differ from the original')
+    need(digest(Path(go)) == REFERENCE['goSHA256'], 'Go binary differs from the original attribution run')
     save_json(OUT / 'binding.json', {'manifest': MANIFEST, 'goEnvironment': version.decode().splitlines(),
                                     'goSHA256': digest(Path(go)), 'kernel': call('uname', '-a').decode().strip()})
     rows = [{'Package': PACKAGE, 'Name': leaf} for leaf in sorted(leaves)]
@@ -307,10 +355,28 @@ def main():
         environment = dict(env, TMPDIR=str(work), GOBIN=str(work))
         call(go, 'install', 'golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70', env=environment)
         built = {pr: build_pr(go, pr, work / pr, OUT / pr, wrapper, environment) for pr in ('83', '84')}
-        count = measure(built)
-        statuses = gate(built, work / 'benchstat', leaves)
-    save_json(OUT / 'status.json', {'processes': count, 'gates': statuses})
-    sys.exit(int(any(statuses.values())))
+        outcomes = {}
+        for mode, profiles in (('stock', PROFILES), ('projected', PROJECTED)):
+            destination = OUT / mode
+            destination.mkdir()
+            for pr in built:
+                (destination / pr).mkdir()
+            count = measure(built, mode, profiles, destination)
+            statuses = gate(built, work / 'benchstat', leaves, destination)
+            outcomes[mode] = {'processes': count, 'gates': statuses}
+    stock = outcomes['stock']['gates']
+    stock_gates = {'83/AH-1.forward', '84/AH-1.forward'}
+    baseline_failed = {name for name, status in stock.items() if status}
+    reproduced = baseline_failed == stock_gates and all(stock[name] == 1 for name in stock_gates)
+    expected_pairs = len(leaves)
+    for pr in built:
+        report = OUT / 'stock' / pr / 'AH-1.forward.gate.txt'
+        rows = [line for line in report.read_text().splitlines() if line.startswith('confirmed performance regression:')]
+        reproduced &= len(rows) == expected_pairs and all(' sec/op ' in line for line in rows)
+    projected_passed = not any(outcomes['projected']['gates'].values())
+    save_json(OUT / 'status.json', {'stockReproduced': reproduced, 'projectedPassed': projected_passed,
+                                   'modes': outcomes})
+    sys.exit(int(not (reproduced and projected_passed)))
 
 
 if __name__ == '__main__':

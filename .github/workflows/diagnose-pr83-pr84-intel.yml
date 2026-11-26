@@ -14,7 +14,7 @@ jobs:
   intel:
     if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr83-pr84-intel'
     runs-on: ubuntu-24.04
-    timeout-minutes: 38
+    timeout-minutes: 42
     env:
       GOTOOLCHAIN: local
     steps:
@@ -59,13 +59,13 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
-      - name: Record exact binaries and run the interleaved control and candidate groups
+      - name: Compare stock and single-file benchmark builds with the original gate
         run: python3 -I -B scripts/diagnose-pr83-pr84-intel/run.py
 
       - if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: pr83-pr84-intel-attribution-${{ github.run_id }}-${{ github.run_attempt }}
+          name: pr83-pr84-intel-projected-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/pr83-pr84-intel-evidence/
           if-no-files-found: error
           retention-days: 14

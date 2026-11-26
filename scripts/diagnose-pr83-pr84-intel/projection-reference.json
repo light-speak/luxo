@@ -1,0 +1,115 @@
+{
+  "fullInventory": {
+    "handler": [
+      "BenchmarkHandlerDetachedResponseBuffer-2",
+      "BenchmarkHandlerPanicFormatting/BusinessError/After-2",
+      "BenchmarkHandlerPanicFormatting/BusinessError/Before-2",
+      "BenchmarkHandlerPanicFormatting/OpaquePanic/After-2",
+      "BenchmarkHandlerPanicFormatting/OpaquePanic/Before-2",
+      "BenchmarkHandlerPanicFormatting/StringPanic/After-2",
+      "BenchmarkHandlerPanicFormatting/StringPanic/Before-2",
+      "BenchmarkHandlerPanicFormatting/Success/After-2",
+      "BenchmarkHandlerPanicFormatting/Success/Before-2",
+      "BenchmarkHandlerResponseBuffer/BusinessError-2",
+      "BenchmarkHandlerResponseBuffer/Bytes4KiB-2",
+      "BenchmarkHandlerResponseBuffer/Empty-2",
+      "BenchmarkHandlerResponseBuffer/Int-2"
+    ],
+    "identity": [
+      "BenchmarkIdentityConditionValidity/empty/EnumChecked-2",
+      "BenchmarkIdentityConditionValidity/empty/EnumReference-2",
+      "BenchmarkIdentityConditionValidity/empty/OwnChecked-2",
+      "BenchmarkIdentityConditionValidity/empty/OwnReference-2",
+      "BenchmarkIdentityConditionValidity/empty/TextChecked-2",
+      "BenchmarkIdentityConditionValidity/empty/TextReference-2",
+      "BenchmarkIdentityConditionValidity/member/EnumChecked-2",
+      "BenchmarkIdentityConditionValidity/member/EnumReference-2",
+      "BenchmarkIdentityConditionValidity/member/OwnChecked-2",
+      "BenchmarkIdentityConditionValidity/member/OwnReference-2",
+      "BenchmarkIdentityConditionValidity/member/TextChecked-2",
+      "BenchmarkIdentityConditionValidity/member/TextReference-2",
+      "BenchmarkIdentityConditionValidity/missing/EnumChecked-2",
+      "BenchmarkIdentityConditionValidity/missing/EnumReference-2",
+      "BenchmarkIdentityConditionValidity/missing/OwnChecked-2",
+      "BenchmarkIdentityConditionValidity/missing/OwnReference-2",
+      "BenchmarkIdentityConditionValidity/missing/TextChecked-2",
+      "BenchmarkIdentityConditionValidity/missing/TextReference-2",
+      "BenchmarkIdentityConditionValidity/wrong-kind/EnumChecked-2",
+      "BenchmarkIdentityConditionValidity/wrong-kind/EnumReference-2",
+      "BenchmarkIdentityConditionValidity/wrong-kind/OwnChecked-2",
+      "BenchmarkIdentityConditionValidity/wrong-kind/OwnReference-2",
+      "BenchmarkIdentityConditionValidity/wrong-kind/TextChecked-2",
+      "BenchmarkIdentityConditionValidity/wrong-kind/TextReference-2",
+      "BenchmarkIdentityEnumArray/128-2",
+      "BenchmarkIdentityEnumArray/empty-2",
+      "BenchmarkIdentityEnumArray/one-2",
+      "BenchmarkIdentitySubjectVisibility/pointer/reference-2",
+      "BenchmarkIdentitySubjectVisibility/pointer/subject-2",
+      "BenchmarkIdentitySubjectVisibility/value/reference-2",
+      "BenchmarkIdentitySubjectVisibility/value/subject-2"
+    ],
+    "websocket": [
+      "BenchmarkWSConnectionRegistrationCold/false-2",
+      "BenchmarkWSConnectionRegistrationCold/true-2",
+      "BenchmarkWSConnectionRegistrations/size=1/checked-2",
+      "BenchmarkWSConnectionRegistrations/size=1/former-2",
+      "BenchmarkWSConnectionRegistrations/size=64/checked-2",
+      "BenchmarkWSConnectionRegistrations/size=64/former-2",
+      "BenchmarkWSConnectionRegistrations/size=8/checked-2",
+      "BenchmarkWSConnectionRegistrations/size=8/former-2"
+    ]
+  },
+  "goSHA256": "30969f97169d7f43fe6a085873d75613adc21e30818a8c61d95bd27275df4624",
+  "original": {
+    "attempt": 2,
+    "diagnostic": "f4e265a6c1f280ed89fcb325cb81cc2b3758f2a3",
+    "run": 45887382933,
+    "sha256": "42e9876c0f55f3c42d4b45c83b3d249cec9852768c64b9b0a48cb0ab86551ac1"
+  },
+  "stock": {
+    "83": {
+      "A": {
+        "api-non-identity": {
+          "rodata": "132d7f0b05a3d56b8e69f457a300f8faf9d4e6f6413750453823f493a97201a5",
+          "text": "d1321b73b78a0f0388f66e5553263012d83c990e001132afa2b5a48c9d61b39b"
+        },
+        "default": {
+          "rodata": "692c0fd6d10f0c6372a1c9f7c9730b3039a1d35ff46f67745950261d4acd309c",
+          "text": "ab90bf633670e85f23e83f15ffbb6675e3993a130bc6b33627562a79d3269370"
+        }
+      },
+      "H": {
+        "api-non-identity": {
+          "rodata": "89937581c51ebb55cb2d3751616a23ccbe71646577b231d400b0825d2c012b16",
+          "text": "b934466cf6fb15ee5886750e96506ab2d1812daf55aca75ba869a9b0b1fe280c"
+        },
+        "default": {
+          "rodata": "5b9e2284401493ce4d4e15702ded9fce82ee547869bdd3e5d455317d7db93952",
+          "text": "d24a5395d0155416ddb07cc26e60be3a1c7a9797716304da9d3908e749e4506a"
+        }
+      }
+    },
+    "84": {
+      "A": {
+        "api-non-identity": {
+          "rodata": "132d7f0b05a3d56b8e69f457a300f8faf9d4e6f6413750453823f493a97201a5",
+          "text": "d1321b73b78a0f0388f66e5553263012d83c990e001132afa2b5a48c9d61b39b"
+        },
+        "default": {
+          "rodata": "692c0fd6d10f0c6372a1c9f7c9730b3039a1d35ff46f67745950261d4acd309c",
+          "text": "ab90bf633670e85f23e83f15ffbb6675e3993a130bc6b33627562a79d3269370"
+        }
+      },
+      "H": {
+        "api-non-identity": {
+          "rodata": "0040721a14157ad4ceb6fe30ec68bc363e8d6fa6d3de51341d4b75ddd3aab92d",
+          "text": "5035e139e9e4057e5949539c21ab4f4c0d359de0ae8ea5054f48e770da39b025"
+        },
+        "default": {
+          "rodata": "35709e52b6d191b8120564790ea1f49a5e739ee217066c3a576070dea180dfa2",
+          "text": "d70cd2db15b3dda9e34450321d58e415bcc2b51009c038279201832f03320ae3"
+        }
+      }
+    }
+  }
+}
