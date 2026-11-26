@@ -1,0 +1,163 @@
+name: Qualify Dart HTTP refresh on Windows
+
+on:
+  push:
+    branches: [diagnostics/dart-http-refresh-windows]
+    paths:
+      - '.github/workflows/qualify-dart-http-refresh-windows.yml'
+      - '.github/diagnostics/dart-http-refresh-windows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  http-refresh:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/dart-http-refresh-windows'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      CORE_BASE: c9bf5b75b8bfec4d9a65e90c135376f130fb6307
+      CORE_TREE: 23cb6e837c454388a1c36c5de4d8e7ab43c15a0e
+      PRODUCT_TREE: 56a9d668cc6ef1b4d933e928b0a6082de625430b
+      DART_TREE: d9e83c36b755f3ffbff1935ef3f3461c19a20b4f
+      PATCH_SHA256: 66dd189d5703dd7f6d8f5248be14c572e540abe8dfb0dcb81e9834aa1d29db02
+      LOCK_SHA256: 0d107eca2444e58cd48cb37abc48bf7115ed04f5101e6ba753ab13dea7e3f8bc
+      DART_SUPPRESS_ANALYTICS: 'true'
+      PYTHONUTF8: '1'
+    steps:
+      - name: Record the native Windows x64 host
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          cd "$(cygpath -u "$GITHUB_WORKSPACE")"
+          evidence=.tmp/dart-http-refresh-windows-evidence
+          mkdir -p "$evidence"
+          test "$RUNNER_KIND" = github-hosted
+          test "$RUNNER_OS" = Windows
+          test "$RUNNER_ARCH" = X64
+          pwsh -NoLogo -NoProfile -NonInteractive -Command '
+            $ErrorActionPreference = "Stop"
+            $os = Get-CimInstance Win32_OperatingSystem
+            $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+            if ($os.Caption -notlike "*Windows Server 2025*" -or $arch -ne "X64") {
+              throw "Unexpected Windows release host: $($os.Caption) $arch"
+            }
+            @{name=$os.Caption; version=$os.Version; build=$os.BuildNumber; arch=$arch} | ConvertTo-Json -Compress
+          ' > "$evidence/windows.json"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        with:
+          ref: c9bf5b75b8bfec4d9a65e90c135376f130fb6307
+          path: product
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: '3.13.4'
+
+      - name: Bind the exact candidate and verify the HTTP suite
+        run: |
+          set -euo pipefail
+          cd "$(cygpath -u "$GITHUB_WORKSPACE")"
+          evidence="$PWD/.tmp/dart-http-refresh-windows-evidence"
+          package="$PWD/product/packages/dart"
+          payload=.github/diagnostics/dart-http-refresh-windows
+          test "$(git -C control rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C control rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $CORE_BASE"
+          diff -u <(printf 'A\t%s\n' "$payload/product.patch.b64" "$payload/pubspec.lock" .github/workflows/qualify-dart-http-refresh-windows.yml) \
+            <(git -C control diff --name-status "$CORE_BASE" HEAD)
+          test "$(git -C product rev-parse HEAD)" = "$CORE_BASE"
+          test "$(git -C product rev-parse 'HEAD^{tree}')" = "$CORE_TREE"
+          git -C product config core.autocrlf false
+          git -C product config core.eol lf
+          git -C product checkout-index --all --force --index
+          git -C product diff --quiet
+          git -C product diff --cached --quiet
+          test ! -e "$package/pubspec.lock"
+          test ! -L "$package/pubspec.lock"
+          test ! -e "$package/.dart_tool"
+          test ! -L "$package/.dart_tool"
+          scratch=$(mktemp -d "$PWD/.tmp/dart-http-refresh-windows-run.XXXXXXXX")
+          cleanup() {
+            local status=$?
+            trap - EXIT
+            rm -f -- "$package/pubspec.lock" || status=1
+            rm -rf -- "$package/.dart_tool" "$scratch" || status=1
+            printf 'exit=%s\n' "$status" > "$evidence/cleanup.txt"
+            exit "$status"
+          }
+          trap cleanup EXIT
+          git -C control show "HEAD:$payload/product.patch.b64" | base64 -d > "$scratch/product.patch"
+          git -C control show "HEAD:$payload/pubspec.lock" > "$scratch/pubspec.lock"
+          printf '%s  %s\n' "$PATCH_SHA256" "$scratch/product.patch" "$LOCK_SHA256" "$scratch/pubspec.lock" |
+            sha256sum -c -
+          git -C product apply --check --index --whitespace=error-all "$scratch/product.patch"
+          git -C product apply --index --whitespace=error-all "$scratch/product.patch"
+          test "$(git -C product write-tree)" = "$PRODUCT_TREE"
+          test "$(git -C product rev-parse "$PRODUCT_TREE:packages/dart")" = "$DART_TREE"
+          git -C product diff --quiet
+          printf 'workflow_sha=%s\nbase=%s\nbase_tree=%s\nproduct_tree=%s\ndart_tree=%s\npatch_sha256=%s\nlock_sha256=%s\n' \
+            "$GITHUB_SHA" "$CORE_BASE" "$CORE_TREE" "$PRODUCT_TREE" "$DART_TREE" "$PATCH_SHA256" "$LOCK_SHA256" > "$evidence/binding.txt"
+          git -C product diff --cached --raw >> "$evidence/binding.txt"
+
+          dart --version > "$evidence/dart-version.txt" 2>&1
+          case "$(tr -d '\r' < "$evidence/dart-version.txt")" in
+            'Dart SDK version: 3.13.4 (stable) '*'"windows_x64"') ;;
+            *) cat "$evidence/dart-version.txt"; exit 1 ;;
+          esac
+          mkdir "$scratch/pub-cache"
+          export PUB_CACHE="$(cygpath -m "$scratch/pub-cache")"
+          cp -- "$scratch/pubspec.lock" "$package/pubspec.lock"
+          cd "$package"
+          dart pub get --enforce-lockfile > "$evidence/pub-get.log" 2>&1
+          printf '%s  %s\n' "$LOCK_SHA256" pubspec.lock | sha256sum -c -
+          status=0
+          dart test --concurrency=1 --reporter json test/http_protocol_test.dart \
+            > "$evidence/test.jsonl" 2> "$evidence/test.stderr" || status=$?
+          printf '%s\n' "$status" > "$evidence/test.exit"
+          test "$status" -eq 0
+          python -I -B - "$(cygpath -m "$evidence/test.jsonl")" "$(cygpath -m "$evidence/test-summary.json")" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          events = [json.loads(line) for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()]
+          suites = [event["suite"] for event in events if event["type"] == "suite"]
+          assert len(suites) == 1 and suites[0]["platform"] == "vm", suites
+          suite = suites[0]["path"].replace("\\", "/")
+          expected = "test/http_protocol_test.dart"
+          assert suite == expected or suite.endswith("/" + expected), suite
+          tests = [event for event in events if event["type"] == "testDone" and not event["hidden"]]
+          assert len(tests) == len({test["testID"] for test in tests}) == 61, len(tests)
+          assert all(test["result"] == "success" and not test["skipped"] for test in tests)
+          assert all(not event["skipped"] for event in events if event["type"] == "testDone")
+          completions = [event for event in events if event["type"] == "done"]
+          assert len(completions) == 1 and completions[0]["success"] is True, completions
+          result = {"suite": expected, "platform": "vm", "passed": 61, "skipped": 0}
+          Path(sys.argv[2]).write_text(json.dumps(result) + "\n", encoding="utf-8")
+          print(json.dumps(result))
+          PY
+          printf '%s  %s\n' "$LOCK_SHA256" pubspec.lock | sha256sum -c -
+          test "$(git write-tree)" = "$PRODUCT_TREE"
+          git diff --quiet
+
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: dart-http-refresh-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/dart-http-refresh-windows-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
