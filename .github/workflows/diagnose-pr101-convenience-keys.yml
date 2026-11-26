@@ -1,0 +1,65 @@
+name: Recheck PR 101 convenience keys on native Linux
+
+on:
+  push:
+    branches: [diagnostics/pr101-convenience-keys]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      LC_ALL: C
+      GOTOOLCHAIN: local
+      CGO_ENABLED: '1'
+      GOAMD64: v1
+    steps:
+      - name: Require the original hosted CPU
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          evidence=.tmp/pr101-convenience-keys-evidence
+          mkdir -p "$evidence"
+          lscpu > "$evidence/lscpu.txt"
+          cpu=$(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/lscpu.txt")
+          printf 'actual=%s\nexpected=INTEL(R) XEON(R) PLATINUM 8573C\n' "$cpu" | tee "$evidence/routing.txt"
+          [[ "$RUNNER_KIND" == github-hosted && "$(uname -sm)" == 'Linux x86_64' ]]
+          if [[ "${cpu^^}" != 'INTEL(R) XEON(R) PLATINUM 8573C' ]]; then exit 3; fi
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Bind exact product and qualification input
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          evidence=.tmp/pr101-convenience-keys-evidence
+          git fetch --no-tags --depth=1 origin f9ce659fd7f17bf57cfe0aee7de7ecb8d9b8f2e4 39d329d07d7729b4b4ddb5915e08bf9d5d07ea9d
+          artifact="repos/$GITHUB_REPOSITORY/actions/artifacts/15083004141"
+          gh api "$artifact" > "$evidence/original-metadata.json"
+          jq -e '
+            .id == 15083004141 and .name == "performance-evidence-02-1" and (.expired | not)
+            and .digest == "sha256:5709c8ca778e8661d9331afe083092972eed88162501999488c8a41cfefec94d"
+            and .workflow_run.id == 45745353238
+            and .workflow_run.head_sha == "39d329d07d7729b4b4ddb5915e08bf9d5d07ea9d"
+          ' "$evidence/original-metadata.json"
+          gh api "$artifact/zip" > "$evidence/original.zip"
+      - name: Measure default and test-isolated layouts
+        run: bash scripts/diagnose-pr101-convenience-keys.sh .tmp/pr101-convenience-keys-evidence --also-isolate
+      - name: Preserve raw samples and linker receipts
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr101-convenience-keys-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr101-convenience-keys-evidence/
+          if-no-files-found: error
+          retention-days: 14
