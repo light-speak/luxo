@@ -704,6 +704,12 @@ func stmtsContainEmit(stmts []ast.Stmt) bool {
 	return false
 }
 
+const (
+	generatedAppTypeName      = "App"
+	generatedAppNewName       = "New"
+	generatedAppNewFromDBName = "NewFromDB"
+)
+
 func generateAppFile(result *semantic.Result, packageName string, enums map[string]bool, driver DBDriver) []byte {
 	models, _, needed := appNeedsGeneration(result)
 	if !needed {
@@ -735,7 +741,7 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 
 	// App struct
 	b.WriteString("// App is the entry point for all database operations.\n")
-	b.WriteString("type App struct {\n")
+	b.WriteString("type " + generatedAppTypeName + " struct {\n")
 	b.WriteString("\tDB *pg.DB\n")
 	if hasEvents {
 		b.WriteString("\tEventBus event.Bus\n")
@@ -759,7 +765,7 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 	// New function — uses lux.DBConfigFromEnv() for all DATABASE_* config
 	b.WriteString("// New creates an App by reading DATABASE_* config from the environment.\n")
 	b.WriteString("// Call env.Load(\".env\") before New() if using a .env file.\n")
-	b.WriteString("func New(ctx context.Context) (*App, error) {\n")
+	b.WriteString("func " + generatedAppNewName + "(ctx context.Context) (*App, error) {\n")
 	b.WriteString("\tcfg := lux.DBConfigFromEnv()\n")
 	b.WriteString("\tdb, err := pg.NewDBWithConfig(ctx, cfg.ConnectionString(), cfg)\n")
 	b.WriteString("\tif err != nil {\n")
@@ -770,7 +776,7 @@ func generateAppFile(result *semantic.Result, packageName string, enums map[stri
 
 	// NewFromDB function
 	b.WriteString("// NewFromDB creates an App from an existing *pg.DB.\n")
-	b.WriteString("func NewFromDB(db *pg.DB) *App {\n")
+	b.WriteString("func " + generatedAppNewFromDBName + "(db *pg.DB) *App {\n")
 	b.WriteString("\treturn &App{\n")
 	b.WriteString("\t\tDB: db,\n")
 	for _, name := range models {
