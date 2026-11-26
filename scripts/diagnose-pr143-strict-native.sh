@@ -4,7 +4,7 @@ export LC_ALL=C GOTOOLCHAIN=local
 
 base=36681c63627f4a3a4805bc6d19e908325614d3e9
 head=27fddbeee9a994e1ea1330df9b53b36d501c8652
-parent=99926f9dac1ebcca449ada8f6c9d33e231bd6a70
+parent=4d5bf15394591c182b2edc77156dcc20ed723652
 root=$(cd "$GITHUB_WORKSPACE" && pwd -P)
 work="$root/.tmp"
 control="$work/control"
@@ -23,8 +23,7 @@ test "$actual" = "$cpu"
 test "$(go env GOVERSION GOHOSTOS GOHOSTARCH GOOS GOARCH GOAMD64 CGO_ENABLED)" = $'go1.27.1\nlinux\namd64\nlinux\namd64\nv1\n1'
 test -z "$(go env GOFLAGS)"
 test "$(g "$control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $parent"
-diff -u <(printf 'M\t%s\n' .github/workflows/diagnose-pr143-strict-layout.yml \
-    scripts/diagnose-pr143-strict-native.py scripts/diagnose-pr143-strict-native.sh) \
+diff -u <(printf 'M\tscripts/diagnose-pr143-strict-native.sh\n') \
     <(g "$control" diff --name-status "$parent" HEAD)
 test "$(g "$base_checkout" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$base" d94bb8bc8d797a4cd2c0def3ff30fe59188dc772)"
 test "$(g "$head_git" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$head" 648af87da509ec22c879161c27799c857ceadbdf)"
@@ -197,10 +196,11 @@ for side in aa bb aa64 bb64; do
         done
     done
 done
+# Both sample groups contain the complete comparison inventory.
 strict_compare() {
     local label=$1
     gate "$label-combined" --approved-costs "$head_git/scripts/benchgate/approved-costs.json" --base-sha "$base" \
-        --targeted-confirmation "$evidence/$label.1.csv" "$evidence/$label.2.csv"
+        "$evidence/$label.1.csv" "$evidence/$label.2.csv"
 }
 strict_status=0
 strict_compare ab || strict_status=$?
@@ -211,7 +211,7 @@ is_performance_rejection() {
 }
 for label in a-align b-align; do
     cross_status=0
-    gate "$label-combined" --targeted-confirmation "$evidence/$label.1.csv" "$evidence/$label.2.csv" || cross_status=$?
+    gate "$label-combined" "$evidence/$label.1.csv" "$evidence/$label.2.csv" || cross_status=$?
     if (( cross_status != 0 )) && ! is_performance_rejection "$label-combined"; then
         printf 'invalid-cross-comparison\n' > "$evidence/outcome.txt"
         exit 4
