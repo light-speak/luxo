@@ -1,0 +1,75 @@
+name: Qualify PR 156 codegen on EPYC 9V74
+on:
+  push:
+    branches: [diagnostics/valued-await-eaf2]
+    paths: ['.github/workflows/diagnose-pr156-native.yml', 'scripts/qualify-pr156-native.py', 'scripts/qualify-pr156-native-inputs.zip']
+permissions:
+  contents: read
+jobs:
+  native:
+    if: github.repository == 'light-speak/luxo'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2]
+    env:
+      GOTOOLCHAIN: local
+      GOAMD64: v1
+      CGO_ENABLED: '1'
+      LC_ALL: C
+    steps:
+      - name: Check original CPU before build
+        shell: bash
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/pr156-route
+          lscpu > .tmp/pr156-route/lscpu.txt
+          uname -a > .tmp/pr156-route/uname.txt
+          test "$RUNNER_KIND" = github-hosted
+          test "$(awk -F ': *' '$1 == "Model name" { print $2 }' .tmp/pr156-route/lscpu.txt)" = 'AMD EPYC 9V74 80-Core Processor'
+          test "$(awk -F ': *' '$1 == "CPU(s)" { print $2 }' .tmp/pr156-route/lscpu.txt)" = 4
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: .tmp/pr156-driver
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: 59a4167f129f0bff0e8425125fa02eae87fd347b
+          path: .tmp/pr156-base
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: f5f0aaf83bc2637e91e1dd61dfe134399adaf2c0
+          path: .tmp/pr156-old
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Replay three original batches with controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          driver=.tmp/pr156-driver
+          test "$(git -C "$driver" show -s --format=%P HEAD)" = c1989a97936e4115a0f9de7efe49347b057a9141
+          printf 'A\t%s\n' .github/workflows/diagnose-pr156-native.yml scripts/qualify-pr156-native-inputs.zip scripts/qualify-pr156-native.py > .tmp/pr156-route/expected-diff.tsv
+          git -C "$driver" diff-tree --no-commit-id --name-status -r HEAD > .tmp/pr156-route/actual-diff.tsv
+          cmp .tmp/pr156-route/expected-diff.tsv .tmp/pr156-route/actual-diff.tsv
+          python3 -I -B "$driver/scripts/qualify-pr156-native.py" run \
+            "$driver/scripts/qualify-pr156-native-inputs.zip" .tmp/pr156-base .tmp/pr156-old .tmp/pr156-evidence
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: pr156-9v74-${{ github.run_id }}-${{ github.run_attempt }}-slot-${{ matrix.slot }}
+          path: |
+            .tmp/pr156-route/
+            .tmp/pr156-evidence/
+          if-no-files-found: error
+          retention-days: 14
