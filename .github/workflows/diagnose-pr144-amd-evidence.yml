@@ -1,0 +1,51 @@
+name: Replay PR 144 benchmark evidence on native Linux
+
+on:
+  push:
+    branches: [diagnostics/pr144-amd-evidence]
+    paths:
+      - '.github/workflows/diagnose-pr144-amd-evidence.yml'
+      - 'scripts/diagnose-pr144-native.*'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  replay:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr144-amd-evidence'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 79ca343d68b265be411d07166702497eba1cd008
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: e9159f125064eccd6499ff5f9426f9c020f05dcc
+          path: .tmp/base
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: .tmp/control
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Rebuild and compare the original benchmark arms
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNNER_KIND: ${{ runner.environment }}
+        run: bash .tmp/control/scripts/diagnose-pr144-native.sh
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: pr144-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/pr144-native-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
