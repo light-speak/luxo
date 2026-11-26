@@ -44,6 +44,13 @@ const (
 	CodegenMigrationStateProfile   = "codegen-migration-state"
 	CodegenMigrationStateBenchmark = "BenchmarkMigrationStateValidation"
 
+	CodegenRelationLoaderProfile   = "codegen-relation-loader"
+	CodegenRelationLoaderBenchmark = "BenchmarkRelationLoaderGeneration"
+
+	SemanticPackage             = "pkg/semantic"
+	SemanticEventEmitsProfile   = "semantic-event-emits"
+	SemanticEventEmitsBenchmark = "BenchmarkCollectEventEmits"
+
 	APILocalRouteExportProfile      = "api-local-route-export"
 	APILocalRouteExportBenchmark    = "BenchmarkLocalRouteExport"
 	APICanonicalJSONProfile         = "api-canonical-json"
@@ -119,16 +126,28 @@ func ProfileForBenchmark(pkg, name string) string {
 			return LuviaPrimaryTraceProfile
 		}
 	case CodegenPackage:
-		switch root {
-		case CodegenLiteralBenchmark:
-			return CodegenLiteralProfile
-		case CodegenReceiverBenchmark:
-			return CodegenReceiverProfile
-		case CodegenMigrationStateBenchmark:
-			return CodegenMigrationStateProfile
+		return codegenBenchmarkProfile(root)
+	case SemanticPackage:
+		if root == SemanticEventEmitsBenchmark {
+			return SemanticEventEmitsProfile
 		}
 	}
 	return DefaultProfile
+}
+
+func codegenBenchmarkProfile(root string) string {
+	switch root {
+	case CodegenLiteralBenchmark:
+		return CodegenLiteralProfile
+	case CodegenReceiverBenchmark:
+		return CodegenReceiverProfile
+	case CodegenMigrationStateBenchmark:
+		return CodegenMigrationStateProfile
+	case CodegenRelationLoaderBenchmark:
+		return CodegenRelationLoaderProfile
+	default:
+		return DefaultProfile
+	}
 }
 
 func apiBenchmarkProfile(root string) string {
@@ -193,7 +212,10 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"},
 			{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"},
 			{CodegenMigrationStateProfile, "^" + CodegenReceiverBenchmark + "$|^" + CodegenMigrationStateBenchmark + "$"},
+			{CodegenRelationLoaderProfile, "^" + CodegenRelationLoaderBenchmark + "$"},
 		}
+	case SemanticPackage:
+		return []IsolationSpec{{SemanticEventEmitsProfile, "^" + SemanticEventEmitsBenchmark + "$"}}
 	default:
 		return nil
 	}

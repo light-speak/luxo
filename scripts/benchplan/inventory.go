@@ -128,15 +128,15 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 	switch profile {
 	case benchlayout.LuxShortPathProfile:
 		return verifyLuxShortPathInventory(isolated)
-	case benchlayout.CodegenLiteralProfile:
-		const root = benchlayout.CodegenLiteralBenchmark
-		if !verifiedBenchmarkLeaves(isolated[root], root, "duration_leading_zero", "duration_plain", "int_leading_zero", "int_plain") {
-			return errors.New("codegen integer literal profile requires the four verified integer and duration leaves")
+	case benchlayout.CodegenLiteralProfile, benchlayout.CodegenReceiverProfile,
+		benchlayout.CodegenMigrationStateProfile, benchlayout.CodegenRelationLoaderProfile:
+		return verifyCodegenProfileLeaves(profile, isolated)
+	case benchlayout.SemanticEventEmitsProfile:
+		const root = benchlayout.SemanticEventEmitsBenchmark
+		leaves := benchmarkCaseProduct([]string{"direct_0", "direct_1", "direct_128"}, []string{"recursive=false", "recursive=true"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("semantic event collection profile requires the six verified benchmark leaves")
 		}
-	case benchlayout.CodegenReceiverProfile:
-		return verifyCodegenReceiverInventory(isolated)
-	case benchlayout.CodegenMigrationStateProfile:
-		return verifyCodegenMigrationStateInventory(isolated)
 	case benchlayout.APILocalRouteExportProfile:
 		const root = benchlayout.APILocalRouteExportBenchmark
 		if !verifiedBenchmarkLeaves(isolated[root], root, "routes=1/previous", "routes=1/current", "routes=16/previous",
@@ -315,6 +315,26 @@ func benchmarkCaseProduct(values, variants []string) []string {
 		}
 	}
 	return cases
+}
+
+func verifyCodegenProfileLeaves(profile string, isolated inventory) error {
+	switch profile {
+	case benchlayout.CodegenLiteralProfile:
+		const root = benchlayout.CodegenLiteralBenchmark
+		if !verifiedBenchmarkLeaves(isolated[root], root, "duration_leading_zero", "duration_plain", "int_leading_zero", "int_plain") {
+			return errors.New("codegen integer literal profile requires the four verified integer and duration leaves")
+		}
+	case benchlayout.CodegenReceiverProfile:
+		return verifyCodegenReceiverInventory(isolated)
+	case benchlayout.CodegenMigrationStateProfile:
+		return verifyCodegenMigrationStateInventory(isolated)
+	case benchlayout.CodegenRelationLoaderProfile:
+		const root = benchlayout.CodegenRelationLoaderBenchmark
+		if !verifiedBenchmarkLeaves(isolated[root], root, "1/metadata", "1/source", "128/metadata", "128/source") {
+			return errors.New("codegen relation loader profile requires the four verified benchmark leaves")
+		}
+	}
+	return nil
 }
 
 func verifyCodegenReceiverInventory(isolated inventory) error {

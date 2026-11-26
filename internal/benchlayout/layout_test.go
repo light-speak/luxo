@@ -280,12 +280,41 @@ func TestCodegenProfilesRequirePackageAndExactRoots(t *testing.T) {
 		}
 	}
 	profiles := IsolationProfiles(CodegenPackage)
-	if len(profiles) != 3 || profiles[0] != (IsolationSpec{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"}) ||
+	if len(profiles) != 4 || profiles[0] != (IsolationSpec{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"}) ||
 		profiles[1] != (IsolationSpec{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"}) ||
 		profiles[2] != (IsolationSpec{migrationProfile, "^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$"}) ||
+		profiles[3] != (IsolationSpec{"codegen-relation-loader", "^BenchmarkRelationLoaderGeneration$"}) ||
 		ValidPerformanceProfile(CodecPackage, CodegenLiteralProfile) ||
 		ValidPerformanceProfile(CodecPackage, CodegenReceiverProfile) || ValidPerformanceProfile(CodecPackage, migrationProfile) {
 		t.Fatalf("unexpected codegen isolation: %v", profiles)
+	}
+}
+
+func TestRelationAndEventBenchmarkProfilesRequireExactRoots(t *testing.T) {
+	for _, tc := range []struct{ pkg, root, sibling, profile string }{
+		{"pkg/codegen", "BenchmarkRelationLoaderGeneration", "BenchmarkRelationResolverEmission", "codegen-relation-loader"},
+		{"pkg/semantic", "BenchmarkCollectEventEmits", "BenchmarkReachableEventEmits", "semantic-event-emits"},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.root+"/nested-2"); got != tc.profile ||
+			!ValidPerformanceProfile(tc.pkg, tc.profile) || ValidPerformanceProfile("pkg/lux", tc.profile) {
+			t.Fatalf("%s/%s profile = %q, want %q", tc.pkg, tc.root, got, tc.profile)
+		}
+		if ProfileForBenchmark(tc.pkg, tc.sibling) != DefaultProfile ||
+			ProfileForBenchmark(tc.pkg, tc.root+"Sibling-2") != DefaultProfile ||
+			ProfileForBenchmark("pkg/lux", tc.root) != DefaultProfile {
+			t.Fatalf("profile %s accepted a different root or package", tc.profile)
+		}
+	}
+	for pkg, sibling := range map[string]string{
+		"pkg/semantic": "BenchmarkEventSnapshotContract/small-2",
+		"pkg/codegen":  "BenchmarkFindRead",
+	} {
+		if ProfileForBenchmark(pkg, sibling) != DefaultProfile {
+			t.Fatalf("unexpected isolated routing of %s/%s", pkg, sibling)
+		}
+	}
+	if ProfileForBenchmark("pkg/codegen", "BenchmarkNumericRangeValidation") != DefaultProfile {
+		t.Fatal("numeric range validation must still use the ordinary benchmark binary")
 	}
 }
 

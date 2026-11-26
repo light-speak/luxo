@@ -30,7 +30,9 @@ func TestIsolationProfileCommand(t *testing.T) {
 			"luvia-convenience-keys\t^BenchmarkConvenienceKeyParentValidation$\n"},
 		{"pkg/codegen", "codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n" +
 			"codegen-global-receiver\t^BenchmarkGlobalReceiverName$\n" +
-			"codegen-migration-state\t^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$\n"},
+			"codegen-migration-state\t^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$\n" +
+			"codegen-relation-loader\t^BenchmarkRelationLoaderGeneration$\n"},
+		{"pkg/semantic", "semantic-event-emits\t^BenchmarkCollectEventEmits$\n"},
 		{"pkg/lux", "lux-short-path\t^BenchmarkStrictFilterContract$|^BenchmarkDecimalAlignment$\n"},
 		{"pkg/lux/rpc", "rpc-owned-request\t^BenchmarkLRPCOwnedRequest$\n" +
 			"rpc-deadline-classification\t^BenchmarkRPCDeadlineClassification$\n" +
@@ -155,10 +157,52 @@ func TestQueueStreamNameRequiresItsPhysicalAdapter(t *testing.T) {
 	}
 }
 
+func TestCompilerBenchmarkProfilesMatchNativeFixtures(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ pkg, profile, name, sourceHash, projectionHash string }{
+		{"pkg/codegen", "codegen-relation-loader", "dataloader_nullable_bench_test.go",
+			"4f58c514dc0f2ac9c310a3142e961c15cbaffa47b2dc745192ea3b30be95729e", "9e1e181a3e49000a4543842e444ac9387b0a30503a524eb218cd7f651276957d"},
+		{"pkg/semantic", "semantic-event-emits", "analyzer_bench_test.go",
+			"ee8320cdca18a8700a37b504b8ee2f3ff05624c8e25a6ef35fe9ea8d4bad2a51", "94ef2558fb21f50051ac83b9fe1ca7baa7ec52456bfb16735879344b71d5d4ca"},
+	} {
+		t.Run(tc.profile, func(t *testing.T) {
+			binding := "\n" + tc.profile + "-overlay-v1 " + tc.name + "=" + tc.projectionHash + " " + tc.sourceHash + "\n"
+			if !strings.Contains(performanceProfile+"\n", binding) {
+				t.Error("performance compilation does not bind the verified source and projection")
+			}
+			for _, baseline := range []bool{true, false} {
+				path, cleanup, err := compileOverlay(root, tc.pkg, baseline, tc.profile)
+				if err != nil || path == "" {
+					t.Fatalf("overlay for baseline=%v: %q, %v", baseline, path, err)
+				}
+				t.Cleanup(func() {
+					if err := cleanup(); err != nil {
+						t.Error(err)
+					}
+				})
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var overlay struct{ Replace map[string]string }
+				if err := json.Unmarshal(data, &overlay); err != nil {
+					t.Fatal(err)
+				}
+				verifyNativePairedFixture(t, overlay.Replace, filepath.Join(root, tc.pkg), tc.name, tc.projectionHash)
+			}
+		})
+	}
+}
+
 func TestPairedFixtureOverlaysRejectInvalidInputs(t *testing.T) {
 	for _, fixture := range []struct{ pkg, name, profile string }{
 		{"pkg/lux/rpc", "frame_prepared_bench_test.go", "rpc-prepared-frame"},
 		{"pkg/lux/nats/queue", "nats_retry_bench_test.go", "queue-stream-name"},
+		{"pkg/codegen", "dataloader_nullable_bench_test.go", "codegen-relation-loader"},
+		{"pkg/semantic", "analyzer_bench_test.go", "semantic-event-emits"},
 	} {
 		t.Run(fixture.profile, func(t *testing.T) {
 			body, err := os.ReadFile(filepath.Join("../..", fixture.pkg, fixture.name))

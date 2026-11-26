@@ -538,6 +538,22 @@ func verifyExactProfileRouting(t *testing.T, pkg, control, profile, root, target
 	}
 }
 
+func TestRelationLoaderProfileKeepsExactlyFourLeaves(t *testing.T) {
+	verifyExactProfileInventory(t, "pkg/codegen", "BenchmarkRelationResolverEmission", "codegen-relation-loader",
+		"BenchmarkRelationLoaderGeneration", []string{"1/metadata", "1/source", "128/metadata", "128/source"}, "128/custom")
+	verifyExactProfileRouting(t, "pkg/codegen", "BenchmarkRelationResolverEmission", "codegen-relation-loader",
+		"BenchmarkRelationLoaderGeneration", "128/source", "^128$/^source$")
+}
+
+func TestCollectEventEmitsProfileKeepsExactlySixLeaves(t *testing.T) {
+	verifyExactProfileInventory(t, "pkg/semantic", "BenchmarkEventSnapshotContract", "semantic-event-emits",
+		"BenchmarkCollectEventEmits", []string{"direct_0/recursive=false", "direct_0/recursive=true",
+			"direct_1/recursive=false", "direct_1/recursive=true", "direct_128/recursive=false", "direct_128/recursive=true"},
+		"direct_256/recursive=true")
+	verifyExactProfileRouting(t, "pkg/semantic", "BenchmarkEventSnapshotContract", "semantic-event-emits",
+		"BenchmarkCollectEventEmits", "direct_128/recursive=true", "^direct_128$/^recursive=true$")
+}
+
 func TestCodegenLiteralProfileKeepsExactlyFourLeaves(t *testing.T) {
 	const pkg = "pkg/codegen"
 	const profile = "codegen-integer-literals"
