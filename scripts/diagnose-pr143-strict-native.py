@@ -12,16 +12,20 @@ from zipfile import ZipFile
 BASE = "36681c63627f4a3a4805bc6d19e908325614d3e9"
 HEAD = "27fddbeee9a994e1ea1330df9b53b36d501c8652"
 RUN = 45783705322
-REPLAY = 45791729810
-REPLAY_HEAD = "99926f9dac1ebcca449ada8f6c9d33e231bd6a70"
-REPLAY_ARTIFACT = 15103451534
-REPLAY_DIGEST = "2d10b219bdc8299676ea13fb30e213efa31d7a9b9ff45b3295fd7f6786eb5d71"
-PACKAGE_PREFIX = "github.com/light-speak/luxo/pkg/lux/luvia."
-HOT_SYMBOLS = {"context.(*valueCtx).Value"} | {PACKAGE_PREFIX + name for name in (
-    "newGateway.func1", "BenchmarkGatewayIdentity", "BenchmarkGatewayIdentity.func1",
-    "BenchmarkGatewayIdentity.func1.1", "BenchmarkGatewayIdentity.func1.2",
+REPLAY = 45803210780
+REPLAY_HEAD = "04720f2facd9c42754726ab46fb6ea4d257d1bd2"
+REPLAY_ARTIFACT = 15108143280
+REPLAY_DIGEST = "4332cbf9da59b1943c2cc4d939628c746e1b6237ea16c60407eb3129f979182e"
+PACKAGE_PREFIX = "github.com/light-speak/luxo/pkg/lux/rpc."
+HOT_SYMBOLS = {PACKAGE_PREFIX + name for name in (
+    "contextErrorAfterIO", "contextErrorBeforeDeadlineFix", "BenchmarkRPCDeadlineClassification.func1.1",
+    "pendingDeadlineContext.Deadline", "pendingDeadlineContext.Err",
 )}
-ARM_NAMES = ("base", "head", "base64", "head64")
+OPTIONAL_SYMBOLS = {
+    "errors.AsType[go.shape.interface { Error() string; Temporary() bool; Timeout() bool }]",
+    "context.backgroundCtx.Err",
+}
+ARM_NAMES = ("base", "head", "baseiso", "headiso")
 SCOPES = {
     "01": {
         "artifact": 15100912340,
@@ -160,16 +164,21 @@ def symbol_fingerprints(binary, selected, elf):
     data = binary.read_bytes()
     segments = json.loads(elf.read_bytes())["executableLoadSegments"]
     result = {}
+    seen = set()
     for line in selected.read_text().splitlines():
-        address, size, _, name = line.split(maxsplit=3)
+        address, size, binding, name = line.split(maxsplit=3)
         address, size = int(address, 16), int(size)
+        identity = (name, address, binding)
         segments_for_symbol = [segment for segment in segments if
             segment["address"] <= address and address + size <= segment["address"] + segment["filesz"]]
-        assert len(segments_for_symbol) == 1 and size > 0 and name not in result, line
+        assert len(segments_for_symbol) == 1 and size > 0 and binding in {"t", "T"} and identity not in seen, line
+        seen.add(identity)
         segment = segments_for_symbol[0]
         offset = address - segment["address"] + segment["offset"]
-        result[name] = {"address": address, "offset": offset, "size": size, "mod32": address % 32,
-                        "mod64": address % 64, "sha256": executable_bytes(data, offset, size)}
+        result.setdefault(name, []).append({
+            "address": address, "binding": binding, "offset": offset, "size": size, "mod32": address % 32,
+            "mod64": address % 64, "sha256": executable_bytes(data, offset, size),
+        })
     assert result
     return result
 
@@ -177,7 +186,7 @@ def symbol_fingerprints(binary, selected, elf):
 def read_default_reference(scratch, evidence):
     metadata = json.loads((scratch / "replay-metadata.json").read_bytes())
     assert (metadata["id"], metadata["name"], metadata["size_in_bytes"], metadata["digest"]) == (
-        REPLAY_ARTIFACT, f"pr143-strict-01-{REPLAY}-1", 57543, "sha256:" + REPLAY_DIGEST), metadata
+        REPLAY_ARTIFACT, f"pr143-strict-07-{REPLAY}-1-slot6", 55317, "sha256:" + REPLAY_DIGEST), metadata
     assert (metadata["workflow_run"]["id"], metadata["workflow_run"]["head_sha"]) == (REPLAY, REPLAY_HEAD)
     run = json.loads((scratch / "replay-run.json").read_bytes())
     assert (run["id"], run["run_attempt"], run["head_sha"], run["event"], run["conclusion"]) == (
@@ -189,8 +198,8 @@ def read_default_reference(scratch, evidence):
     with ZipFile(raw) as archive:
         assert archive.testzip() is None
         route = dict(line.split("=", 1) for line in archive.read("runner-route.txt").decode().splitlines())
-        assert route == {"workflow": REPLAY_HEAD, "shard": "01", "expected": SCOPES["01"]["cpu"],
-                         "actual": SCOPES["01"]["cpu"], "match": "true"}, route
+        assert route == {"workflow": REPLAY_HEAD, "slot": "6", "shard": "07",
+                         "actual": SCOPES["07"]["cpu"], "match": "true"}, route
         assert archive.read("source-mode.txt") == (
             f"A checkout={BASE}\nB archive={HEAD}\nattributes files=none in either tree\n").encode()
         for previous, current in (("batch.tsv", "batch.tsv"), ("expected.json", "expected.json"),
@@ -208,15 +217,19 @@ def read_default_reference(scratch, evidence):
             (ref / filename).write_bytes(archive.read(filename))
 
 
+def rip_relative_memory(raw):
+    return raw[0] >> 4 == 4 and raw[1] in (0x89, 0x8b, 0x8d) and raw[2] & 0xc7 == 5
+
+
 def instruction_without_relocation(encoding, instruction):
     raw = bytes.fromhex(encoding)
     if raw[:1] in (b"\xe8", b"\xe9") and len(raw) == 5 and instruction.endswith("(SB)"):
         return [raw[:1].hex(), instruction]
     if raw[:2] == b"\x83\x3d" and instruction.startswith("CMPL runtime.writeBarrier(SB),"):
         return [(raw[:2] + raw[-1:]).hex(), instruction]
-    if instruction.startswith("LEAQ ") and "(IP), " in instruction and len(raw) == 7:
+    if len(raw) == 7 and rip_relative_memory(raw) and "(IP), " in instruction:
         return [raw[:-4].hex(), instruction.split("(IP), ", 1)[1]]
-    if instruction.startswith("LEAQ ") and "(SB), " in instruction and len(raw) == 7:
+    if len(raw) == 7 and rip_relative_memory(raw) and "(SB)" in instruction:
         return [raw[:-4].hex(), instruction]
     return [raw.hex()]
 
@@ -225,8 +238,9 @@ def normalized_disassembly(path):
     output = {}
     for section in path.read_text().split("TEXT ")[1:]:
         lines = section.splitlines()
-        name = lines[0].split()[0].removesuffix("(SB)")
-        if name not in HOT_SYMBOLS | {PACKAGE_PREFIX + "New"}:
+        name, separator, _ = lines[0].partition("(SB) ")
+        assert separator, lines[0]
+        if name not in HOT_SYMBOLS:
             continue
         instructions = []
         for line in filter(str.strip, lines[1:]):
@@ -235,15 +249,15 @@ def normalized_disassembly(path):
         assert name not in output and instructions, name
         first = instructions[0][0]
         output[name] = {"address": first, "shape": [[address - first, *op] for address, op in instructions]}
-    assert HOT_SYMBOLS | {PACKAGE_PREFIX + "New"} <= output.keys(), path
+    assert HOT_SYMBOLS <= output.keys(), path
     return output
 
 
 def nearby_text_map(source, output):
     rows = source.read_text().splitlines()
     names = [row.split(maxsplit=3)[-1] for row in rows]
-    indexes = [index for index, name in enumerate(names) if name in HOT_SYMBOLS | {PACKAGE_PREFIX + "New"}]
-    assert {names[index] for index in indexes} == HOT_SYMBOLS | {PACKAGE_PREFIX + "New"}, names[:2]
+    indexes = [index for index, name in enumerate(names) if name in HOT_SYMBOLS | OPTIONAL_SYMBOLS]
+    assert HOT_SYMBOLS <= {names[index] for index in indexes}, names[:2]
     keep = {neighbor for index in indexes for neighbor in range(max(0, index - 2), min(len(rows), index + 3))}
     output.write_text("\n".join(rows[index] for index in sorted(keep)) + "\n")
 
@@ -260,7 +274,7 @@ def compiler_metadata(file):
     return rows
 
 
-def verify_alignment(evidence):
+def verify_isolation(evidence):
     def read(file):
         return json.loads(file.read_bytes())
 
@@ -271,7 +285,8 @@ def verify_alignment(evidence):
         symbols = read(evidence / f"{arm}.symbols.json")
         assert HOT_SYMBOLS <= symbols.keys(), (arm, symbols.keys())
         assembly = normalized_disassembly(evidence / f"{arm}.objdump.txt")
-        assert all(code["address"] == symbols[name]["address"] for name, code in assembly.items()), arm
+        assert all(len(symbols[name]) == 1 and code["address"] == symbols[name][0]["address"]
+                   for name, code in assembly.items()), arm
         layout[arm] = (elf, symbols, assembly)
         (evidence / f"{arm}.normalized.json").write_text(json.dumps(assembly, indent=2, sort_keys=True) + "\n")
 
@@ -281,32 +296,82 @@ def verify_alignment(evidence):
         previous = read(reference / f"{arm}.elf.json")
         assert executable_shape(current) == executable_shape(previous), (arm, "default executable code drift")
         for name, identity in read(reference / f"{arm}.symbols.json").items():
-            assert symbols[name] == identity, (arm, name, "default symbol drift")
+            actual = [{key: value for key, value in symbol.items() if key != "binding"} for symbol in symbols[name]]
+            assert actual == [identity], (arm, name, "default symbol drift")
         original_build = compiler_metadata(reference / f"{arm}.build.txt")
         assert compiler_metadata(evidence / f"{arm}.build.txt") == original_build, arm
-        aligned_build = compiler_metadata(evidence / f"{arm}64.build.txt")
-        assert [row for row in aligned_build if row != "\tbuild\t-ldflags=-funcalign=64"] == original_build, arm
-        aligned, aligned_symbols, aligned_assembly = layout[arm + "64"]
-        for name, code in assembly.items():
-            assert aligned_symbols[name]["mod64"] == 0, (arm, name, "unaligned symbol")
-            assert code["shape"] == aligned_assembly[name]["shape"], (arm, name, "link changed instructions")
-        production = PACKAGE_PREFIX + "newGateway.func1"
-        assert symbols[production]["mod64"] == (0 if arm == "base" else 32), (arm, "original layout absent")
-        assert current["text"]["sha256"] != aligned["text"]["sha256"], (arm, "link intervention absent")
+        isolated, isolated_symbols, isolated_assembly = layout[arm + "iso"]
+        assert current["text"]["sha256"] != isolated["text"]["sha256"], (arm, "test isolation absent")
+        for name in HOT_SYMBOLS:
+            assert assembly[name]["shape"] == isolated_assembly[name]["shape"], (arm, name, "hot instruction shape drift")
         report[arm] = {"sameDefaultELF": current["sha256"] == previous["sha256"],
                        "sameDefaultExecutableSegments": current["executableLoadSegments"] == previous["executableLoadSegments"],
                        "sameDefaultTextAndSymbolMap": True,
-                       "identityEntryMod64": [symbols[production]["mod64"], aligned_symbols[production]["mod64"]]}
-    (evidence / "alignment-verification.json").write_text(json.dumps(report, indent=2) + "\n")
+                       "layout": {name: [symbols[name], isolated_symbols[name]] for name in sorted(HOT_SYMBOLS)}}
+    for kind in (("base", "head"), ("baseiso", "headiso")):
+        for name in HOT_SYMBOLS:
+            assert layout[kind[0]][2][name]["shape"] == layout[kind[1]][2][name]["shape"], (kind, name)
+    left = read(evidence / "baseiso.projection.json")
+    right = read(evidence / "headiso.projection.json")
+    assert left["retained"] == right["retained"]
+    report["projection"] = left["retained"]
+    (evidence / "isolation-verification.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
 def confirmed_targets(text):
-    prefix = "confirmed performance regression: github.com/light-speak/luxo/pkg/lux/luvia/"
     rows = [line for line in text.splitlines() if line.startswith("confirmed performance regression:")]
-    if len(rows) != 2 or not all(line.startswith(prefix) and " sec/op " in line for line in rows):
-        return False
-    confirmed = {line.removeprefix(prefix).split(" sec/op ", 1)[0] for line in rows}
-    return confirmed == set(SCOPES["01"]["confirmed"])
+    wanted = "confirmed performance regression: " + PACKAGE_PREFIX[:-1] + "/" + SCOPES["07"]["confirmed"][0] + " sec/op "
+    return len(rows) == 1 and rows[0].startswith(wanted)
+
+
+FIXTURES = {
+    "stream_termination_bench_test.go": (
+        "c485436553f4bff4483a89f1af0472b4519c46993d33fa262c4201d22aa8d50d",
+        b'package rpc\n\nimport (\n\t"context"\n\t"fmt"\n\t"io"\n\t"os"\n\t"testing"\n\t"time"\n)\n\n',
+        b"var deadlineClassificationSink error\n", None,
+    ),
+    "stream_termination_test.go": (
+        "faf5346ee627379f334f508c4b577cf70741a291a22d0d2fd9cefe4afaa5f19b",
+        b'package rpc\n\nimport (\n\t"context"\n\t"time"\n)\n\n',
+        b"// Models the interval after a socket deadline fires", b"type deadlineReadConn ",
+    ),
+}
+FAMILY = {f"BenchmarkRPCDeadlineClassification/{sample}/{side}-2"
+          for sample in ("NoDeadline", "Cancelled", "ExpiredEOF", "FutureTimeout", "ExpiredTimeout", "WrappedTimeout")
+          for side in ("Before", "After")}
+
+
+def project(source, destination):
+    package = source.resolve(strict=True) / "pkg/lux/rpc"
+    destination = destination.resolve(strict=True)
+    mapping, retained = {}, {}
+    for path in sorted(package.glob("*_test.go")):
+        assert path.is_file() and not path.is_symlink(), path
+        mapping[str(path)] = ""
+        if path.name not in FIXTURES:
+            continue
+        want_hash, prefix, start, end = FIXTURES[path.name]
+        content = path.read_bytes()
+        assert sha256(content).hexdigest() == want_hash and content.count(start) == 1, path
+        declaration = start + content.split(start, 1)[1]
+        if end is not None:
+            assert declaration.count(end) == 1
+            declaration = declaration.split(end, 1)[0]
+        projected = prefix + declaration
+        output = destination / path.name
+        output.write_bytes(projected)
+        mapping[str(path)] = str(output)
+        retained[path.name] = sha256(projected).hexdigest()
+    assert retained.keys() == FIXTURES.keys(), retained
+    (destination / "overlay.json").write_text(json.dumps({"Replace": mapping}) + "\n")
+    print(json.dumps({"retained": retained, "omittedTestFiles": len(mapping) - len(retained)}, indent=2))
+
+
+def verify_inventory(path):
+    rows = [line.split() for line in path.read_text().splitlines() if line.startswith("Benchmark")]
+    assert Counter(row[0] for row in rows) == {name: 1 for name in FAMILY}, rows
+    for row in rows:
+        assert row[1] == "1" and set(row[3::2]) == {"ns/op", "B/op", "allocs/op"}, row
 
 
 if __name__ == "__main__":
@@ -322,8 +387,12 @@ if __name__ == "__main__":
         read_default_reference(*map(Path, args))
     elif action == "map":
         nearby_text_map(*map(Path, args))
-    elif action == "verify-alignment":
-        verify_alignment(Path(args[0]))
+    elif action == "verify-isolation":
+        verify_isolation(Path(args[0]))
+    elif action == "project":
+        project(*map(Path, args))
+    elif action == "inventory":
+        verify_inventory(Path(args[0]))
     elif action == "confirmed-targets":
         raise SystemExit(0 if confirmed_targets(Path(args[0]).read_text()) else 1)
     else:

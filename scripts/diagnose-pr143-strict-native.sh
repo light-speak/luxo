@@ -4,7 +4,7 @@ export LC_ALL=C GOTOOLCHAIN=local
 
 base=36681c63627f4a3a4805bc6d19e908325614d3e9
 head=27fddbeee9a994e1ea1330df9b53b36d501c8652
-parent=4d5bf15394591c182b2edc77156dcc20ed723652
+parent=771090c884127fd85ee10e2863b7ba7c11ec25c7
 root=$(cd "$GITHUB_WORKSPACE" && pwd -P)
 work="$root/.tmp"
 control="$work/control"
@@ -14,8 +14,8 @@ evidence="$work/pr143-strict-evidence"
 helper="$control/scripts/diagnose-pr143-strict-native.py"
 g() { git --no-replace-objects -C "$@"; }
 
-cpu='Intel(R) Xeon(R) 6975P-C'
-symbols='BenchmarkGatewayIdentity|luvia\.(New|newGateway|Identity)|context\.\(\*valueCtx\)\.Value'
+cpu='INTEL(R) XEON(R) PLATINUM 8573C'
+symbols='BenchmarkRPCDeadlineClassification|contextErrorAfterIO|contextErrorBeforeDeadlineFix|pendingDeadlineContext|^errors\.AsType\[go\.shape\.interface|^context\.backgroundCtx\.Err'
 test "$RUNNER_KIND" = github-hosted
 test "$(uname -sm)" = 'Linux x86_64'
 actual=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | sed 's/[[:space:]]*$//')
@@ -23,7 +23,8 @@ test "$actual" = "$cpu"
 test "$(go env GOVERSION GOHOSTOS GOHOSTARCH GOOS GOARCH GOAMD64 CGO_ENABLED)" = $'go1.27.1\nlinux\namd64\nlinux\namd64\nv1\n1'
 test -z "$(go env GOFLAGS)"
 test "$(g "$control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $parent"
-diff -u <(printf 'M\tscripts/diagnose-pr143-strict-native.sh\n') \
+diff -u <(printf 'M\t%s\n' .github/workflows/diagnose-pr143-strict-layout.yml \
+    scripts/diagnose-pr143-strict-native.py scripts/diagnose-pr143-strict-native.sh) \
     <(g "$control" diff --name-status "$parent" HEAD)
 test "$(g "$base_checkout" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$base" d94bb8bc8d797a4cd2c0def3ff30fe59188dc772)"
 test "$(g "$head_git" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$head" 648af87da509ec22c879161c27799c857ceadbdf)"
@@ -59,16 +60,16 @@ trap 'exit 143' TERM
 input="$scratch/input"
 head_archive="$scratch/head"
 tools="$scratch/bin"
-mkdir -p "$input" "$head_archive/.tmp" "$tools"/{base,head,base64,head64} "$scratch/tmp" "$base_checkout/.tmp"
+mkdir -p "$input" "$head_archive/.tmp" "$tools"/{base,head,baseiso,headiso} "$scratch/tmp" "$base_checkout/.tmp"
 export TMPDIR="$scratch/tmp" GOTMPDIR="$scratch/tmp"
 gh api repos/light-speak/luxo/actions/runs/45783705322/attempts/1 > "$input/original-run.json"
-gh api "repos/light-speak/luxo/actions/artifacts/15100912340" > "$input/original-metadata.json"
-gh api "repos/light-speak/luxo/actions/artifacts/15100912340/zip" > "$input/original.zip"
-python3 -I -B "$helper" prepare 01 "$input" "$cpu"
+gh api "repos/light-speak/luxo/actions/artifacts/15101276107" > "$input/original-metadata.json"
+gh api "repos/light-speak/luxo/actions/artifacts/15101276107/zip" > "$input/original.zip"
+python3 -I -B "$helper" prepare 07 "$input" "$cpu"
 cp "$input"/{original-run.json,original-metadata.json,original-gate.txt,reference-profile.txt,batch.tsv,expected.json,routing.json} "$evidence/"
-gh api repos/light-speak/luxo/actions/runs/45791729810/attempts/1 > "$input/replay-run.json"
-gh api repos/light-speak/luxo/actions/artifacts/15103451534 > "$input/replay-metadata.json"
-gh api repos/light-speak/luxo/actions/artifacts/15103451534/zip > "$input/replay.zip"
+gh api repos/light-speak/luxo/actions/runs/45803210780/attempts/1 > "$input/replay-run.json"
+gh api repos/light-speak/luxo/actions/artifacts/15108143280 > "$input/replay-metadata.json"
+gh api repos/light-speak/luxo/actions/artifacts/15108143280/zip > "$input/replay.zip"
 cp "$input"/{replay-run.json,replay-metadata.json} "$evidence/"
 python3 -I -B "$helper" reference "$input" "$evidence"
 g "$head_git" archive "$head" | tar -xf - -C "$head_archive"
@@ -88,18 +89,28 @@ IFS=$'\t' read -r package profile filter < "$evidence/batch.tsv"
 "$tools/benchplan" --verify-profile-batch confirmation "$evidence/expected.json" "$evidence/batch.tsv"
 source_for() {
     case "$1" in
-        base|base64) printf '%s\n' "$base_checkout" ;;
-        head|head64) printf '%s\n' "$head_archive" ;;
+        base|baseiso) printf '%s\n' "$base_checkout" ;;
+        head|headiso) printf '%s\n' "$head_archive" ;;
         *) return 2 ;;
     esac
 }
 compile_arm() {
-    local arm=$1 flags= command=compile-performance
+    local arm=$1 source command=compile-performance
+    source=$(source_for "$arm")
     if [[ "$arm" == base* ]]; then command=compile-performance-baseline; fi
-    if [[ "$arm" == *64 ]]; then flags=-ldflags=-funcalign=64; fi
-    printf '%s\t%s\t%s\n' "$arm" "$command" "$flags" >> "$evidence/link-policy.tsv"
-    GOFLAGS="$flags" "$tools/benchrun" "$command" "$(source_for "$arm")" "$tools/$arm" "$package" "$profile" \
-        > "$evidence/$arm.compile.log" 2>&1
+    if [[ "$arm" == *iso ]]; then
+        mkdir "$scratch/$arm-overlay"
+        python3 -I -B "$helper" project "$source" "$scratch/$arm-overlay" > "$evidence/$arm.projection.json"
+        printf '%s\tprojected tests\n' "$arm" >> "$evidence/link-policy.tsv"
+        (
+            cd "$source"
+            GOWORK="$source/go.work" go test -trimpath -c -overlay="$scratch/$arm-overlay/overlay.json" \
+                "./$package" -o "$tools/$arm/$binary"
+        ) > "$evidence/$arm.compile.log" 2>&1
+    else
+        printf '%s\t%s\n' "$arm" "$command" >> "$evidence/link-policy.tsv"
+        "$tools/benchrun" "$command" "$source" "$tools/$arm" "$package" "$profile" > "$evidence/$arm.compile.log" 2>&1
+    fi
 }
 binary="${package//\//-}"
 if [[ "$profile" != default ]]; then binary="$binary-$profile"; fi
@@ -112,16 +123,21 @@ record_binary() {
     go tool buildid "$path" > "$output.buildid.txt"
     readelf -WhlS "$path" > "$output.readelf.txt"
     go tool nm -size -sort address "$path" | awk '$3 ~ /^[Tt]$/' > "$scratch/text-addresses.txt"
-    grep -E "$symbols" "$scratch/text-addresses.txt" > "$output.symbols.txt"
+    grep -E "BenchmarkRPCDeadlineClassification|contextErrorAfterIO|contextErrorBeforeDeadlineFix|pendingDeadlineContext|errors\.AsType\[go\.shape\.interface|context\.backgroundCtx\.Err" \
+        "$scratch/text-addresses.txt" > "$output.symbols.txt"
     python3 -I -B "$helper" map "$scratch/text-addresses.txt" "$output.address-map.txt"
     go tool objdump -s "$symbols" "$path" > "$output.objdump.txt"
     python3 -I -B "$helper" symbols "$path" "$output.symbols.txt" "$output.elf.json" > "$output.symbols.json"
 }
-for arm in base head base64 head64; do
+for arm in base head baseiso headiso; do
     compile_arm "$arm"
     record_binary "$tools/$arm/$binary" "$evidence/$arm"
+    "$tools/benchrun" run-performance "$(source_for "$arm")" "$tools/$arm" "$package" "$profile" \
+        -test.run='^$' -test.bench='^BenchmarkRPCDeadlineClassification$' -test.benchmem \
+        -test.benchtime=1x -test.count=1 -test.cpu=2 > "$evidence/$arm.inventory.raw"
+    python3 -I -B "$helper" inventory "$evidence/$arm.inventory.raw"
 done
-python3 -I -B "$helper" verify-alignment "$evidence"
+python3 -I -B "$helper" verify-isolation "$evidence"
 jq -s '{sameELF: (.[0].sha256 == .[1].sha256), sameTextBytes: (.[0].text.sha256 == .[1].text.sha256),
     sameTextRecord: (.[0].text == .[1].text),
     sameExecutableLoadSegments: (.[0].executableLoadSegments == .[1].executableLoadSegments)}' \
@@ -151,8 +167,8 @@ sample_pair() {
     fi
 }
 
-comparisons=(aa:base:base ab:base:head bb:head:head aa64:base64:base64 ab64:base64:head64 bb64:head64:head64
-    a-align:base:base64 b-align:head:head64)
+comparisons=(aa:base:base ab:base:head bb:head:head aaiso:baseiso:baseiso abiso:baseiso:headiso bbiso:headiso:headiso
+    a-isolate:base:baseiso b-isolate:head:headiso)
 printf 'comparison\tgroup\tpair\torder\tleft\tright\n' > "$evidence/order.tsv"
 for group in 1 2; do
     for round in {1..10}; do
@@ -188,7 +204,7 @@ gate() {
     return "$status"
 }
 unstable=0
-for side in aa bb aa64 bb64; do
+for side in aa bb aaiso bbiso; do
     for group in 1 2; do
         for direction in '' .reverse; do
             name="$side.$group$direction"
@@ -204,12 +220,12 @@ strict_compare() {
 }
 strict_status=0
 strict_compare ab || strict_status=$?
-aligned_status=0
-strict_compare ab64 || aligned_status=$?
+isolated_status=0
+strict_compare abiso || isolated_status=$?
 is_performance_rejection() {
     grep -Eq '^performance gate rejected [1-9][0-9]* regression\(s\)$' "$evidence/$1.gate.txt"
 }
-for label in a-align b-align; do
+for label in a-isolate b-isolate; do
     cross_status=0
     gate "$label-combined" "$evidence/$label.1.csv" "$evidence/$label.2.csv" || cross_status=$?
     if (( cross_status != 0 )) && ! is_performance_rejection "$label-combined"; then
@@ -217,18 +233,26 @@ for label in a-align b-align; do
         exit 4
     fi
 done
-sha256sum -c "$evidence/"{base,head,base64,head64}.sha256
+sha256sum -c "$evidence/"{base,head,baseiso,headiso}.sha256
 if (( unstable )); then printf 'unstable-control\n' > "$evidence/outcome.txt"; exit 4; fi
-if (( strict_status != 1 )) || ! python3 -I -B "$helper" confirmed-targets "$evidence/ab-combined.gate.txt"; then
+if (( strict_status == 0 )); then
     printf 'default-targets-not-reproduced\n' > "$evidence/outcome.txt"
     exit 4
 fi
-if (( aligned_status )); then
-    if is_performance_rejection ab64-combined; then
-        printf 'default-strict-failed-aligned-comparison-failed\n' > "$evidence/outcome.txt"
-    else
-        printf 'invalid-aligned-comparison\n' > "$evidence/outcome.txt"
-    fi
-    exit "$aligned_status"
+if ! is_performance_rejection ab-combined; then
+    printf 'invalid-default-comparison\n' > "$evidence/outcome.txt"
+    exit "$strict_status"
 fi
-printf 'default-strict-failed-alignment-cleared-targets\n' > "$evidence/outcome.txt"
+if ! python3 -I -B "$helper" confirmed-targets "$evidence/ab-combined.gate.txt"; then
+    printf 'default-confirmed-targets-changed\n' > "$evidence/outcome.txt"
+    exit "$strict_status"
+fi
+if (( isolated_status )); then
+    if is_performance_rejection abiso-combined; then
+        printf 'default-strict-failed-isolated-comparison-failed\n' > "$evidence/outcome.txt"
+    else
+        printf 'invalid-isolated-comparison\n' > "$evidence/outcome.txt"
+    fi
+    exit "$isolated_status"
+fi
+printf 'default-strict-failed-isolation-cleared-targets\n' > "$evidence/outcome.txt"
