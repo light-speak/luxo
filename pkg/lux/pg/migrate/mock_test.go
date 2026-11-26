@@ -105,11 +105,17 @@ func (t *mockTx) Rollback(ctx context.Context) error                      { retu
 
 // mockRow simulates a single row result.
 type mockRow struct {
-	scanErr error
-	history bool
+	scanErr       error
+	history       bool
+	legacyStrings bool
 }
 
 func (r *mockRow) Scan(dest ...any) error {
+	if len(dest) == 3 {
+		*dest[0].(*string) = "public"
+		*dest[1].(*bool) = r.history
+		*dest[2].(*bool) = !r.legacyStrings
+	}
 	if len(dest) == 1 {
 		if exists, ok := dest[0].(*bool); ok {
 			*exists = r.history
@@ -225,7 +231,15 @@ func TestDownAcquireLockError(t *testing.T) {
 	}
 }
 
-func TestDownReadsCatalogOnlyAfterUndefinedTable(t *testing.T) {
+func TestInitPropagatesHistoryMetadataError(t *testing.T) {
+	probe := errors.New("history metadata unavailable")
+	runner := NewFromDB(&mockDB{queryRowVal: &mockRow{scanErr: probe}}, t.TempDir())
+	if err := runner.Init(t.Context()); !errors.Is(err, probe) {
+		t.Fatalf("initialize history: %v", err)
+	}
+}
+
+func TestDownReadsOnlyBoundHistory(t *testing.T) {
 	missing := &pgconn.PgError{Code: "42P01", Message: "undefined table"}
 	probeFailed := errors.New("history read failed")
 	for _, tc := range []struct {
@@ -233,12 +247,12 @@ func TestDownReadsCatalogOnlyAfterUndefinedTable(t *testing.T) {
 		queryErr  error
 		catalog   mockRow
 		wantQuery error
-		wantProbe error
 	}{
-		{name: "normal query", catalog: mockRow{scanErr: probeFailed}},
+		{name: "normal query", catalog: mockRow{history: true}},
 		{name: "missing history", queryErr: missing},
 		{name: "existing history", queryErr: missing, catalog: mockRow{history: true}, wantQuery: missing},
-		{name: "failed confirmation", queryErr: missing, catalog: mockRow{scanErr: probeFailed}, wantQuery: missing, wantProbe: probeFailed},
+		{name: "failed metadata read", queryErr: missing, catalog: mockRow{scanErr: probeFailed}, wantQuery: probeFailed},
+		{name: "disabled standard string mode", catalog: mockRow{legacyStrings: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := &mockDB{queryResult: &mockRows{}, queryErr: tc.queryErr, queryRowVal: &tc.catalog}
@@ -247,8 +261,14 @@ func TestDownReadsCatalogOnlyAfterUndefinedTable(t *testing.T) {
 			if len(rolled) != 0 {
 				t.Fatalf("unexpected rollbacks: %v", rolled)
 			}
-			if !errors.Is(err, tc.wantQuery) || tc.wantProbe != nil && !errors.Is(err, tc.wantProbe) {
-				t.Fatalf("Down returned %v, want %v and %v", err, tc.wantQuery, tc.wantProbe)
+			if tc.catalog.legacyStrings {
+				if !errors.Is(err, errMigrationStringMode) {
+					t.Fatalf("legacy string mode: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantQuery) {
+				t.Fatalf("Down returned %v, want %v", err, tc.wantQuery)
 			}
 		})
 	}

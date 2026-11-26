@@ -19,8 +19,9 @@ import (
 
 // Runner executes migrations against a database.
 type Runner struct {
-	db  DB
-	dir string // migrations directory
+	db      DB
+	dir     string // migrations directory
+	history string // qualified history relation for the current operation
 }
 
 // New creates a Runner from DATABASE_* env vars.
@@ -45,14 +46,18 @@ func (r *Runner) Close() {
 
 // Init creates the _migrations table if it doesn't exist.
 func (r *Runner) Init(ctx context.Context) error {
-	return r.db.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS _migrations (
-			id         SERIAL PRIMARY KEY,
-			name       TEXT NOT NULL UNIQUE,
-			checksum   TEXT,
-			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)
-	`)
+	bound, _, err := r.bindMigrationHistory(ctx, false)
+	if err != nil {
+		return err
+	}
+	return bound.initHistory(ctx)
+}
+
+func (r *Runner) initHistory(ctx context.Context) error {
+	if r.history == "" {
+		return errors.New("PostgreSQL search_path has no schema for migration history")
+	}
+	return r.db.Exec(ctx, createHistory.sql(r.history))
 }
 
 // Up executes all pending migrations with advisory lock and checksum verification.
@@ -62,28 +67,28 @@ func (r *Runner) Up(ctx context.Context) ([]string, error) {
 	}
 	defer r.db.ReleaseLock(ctx)
 
-	exists, err := r.historyExists(ctx)
+	bound, exists, err := r.bindMigrationHistory(ctx, true)
 	if err != nil {
 		return nil, err
 	}
 	if exists {
-		if err := r.verifyChecksums(ctx); err != nil {
+		if err := bound.verifyChecksums(ctx); err != nil {
 			return nil, err
 		}
 	}
-	plan, err := r.pendingPlan(ctx, exists, true)
+	plan, err := bound.pendingPlan(ctx, exists, true)
 	if err != nil {
 		return nil, err
 	}
 	if !exists {
-		if err := r.Init(ctx); err != nil {
+		if err := bound.initHistory(ctx); err != nil {
 			return nil, err
 		}
 	}
 
 	var executed []string
 	for _, migration := range plan {
-		if err := r.execMigration(ctx, migration); err != nil {
+		if err := bound.execMigration(ctx, migration); err != nil {
 			return executed, fmt.Errorf("%s: UP: %w", migration.name, err)
 		}
 		executed = append(executed, migration.name)
@@ -93,11 +98,11 @@ func (r *Runner) Up(ctx context.Context) ([]string, error) {
 
 // DryRun returns the pending SQL in execution order without changing the database.
 func (r *Runner) DryRun(ctx context.Context) ([]string, []string, error) {
-	exists, err := r.historyExists(ctx)
+	bound, exists, err := r.bindMigrationHistory(ctx, true)
 	if err != nil {
 		return nil, nil, err
 	}
-	plan, err := r.pendingPlan(ctx, exists, false)
+	plan, err := bound.pendingPlan(ctx, exists, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -110,13 +115,70 @@ func (r *Runner) DryRun(ctx context.Context) ([]string, []string, error) {
 	return names, sqls, nil
 }
 
-func (r *Runner) historyExists(ctx context.Context) (bool, error) {
-	var exists bool
-	err := r.db.QueryRow(ctx, "SELECT pg_catalog.to_regclass('_migrations') IS NOT NULL").Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("read migration history: %w", err)
+const migrationHistoryMetadata = `
+	SELECT COALESCE(selected.schema::text, ''),
+	       pg_catalog.to_regclass(pg_catalog.quote_ident(selected.schema) || '._migrations') IS NOT NULL,
+	       pg_catalog.current_setting('standard_conforming_strings') = 'on'
+	FROM (SELECT pg_catalog.current_schema() AS schema) AS selected
+`
+
+const publicMigrationHistory = "public._migrations"
+
+var errMigrationStringMode = errors.New("PostgreSQL migrations require standard_conforming_strings=on")
+
+type migrationHistoryStatement string
+
+func (s migrationHistoryStatement) sql(history string) string {
+	if history == publicMigrationHistory {
+		return string(s)
 	}
-	return exists, nil
+	return strings.Replace(string(s), publicMigrationHistory, history, 1)
+}
+
+const (
+	createHistory migrationHistoryStatement = `
+		CREATE TABLE IF NOT EXISTS ` + publicMigrationHistory + ` (
+			id         SERIAL PRIMARY KEY,
+			name       TEXT NOT NULL UNIQUE,
+			checksum   TEXT,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`
+	appliedHistory              migrationHistoryStatement = `SELECT name, applied_at FROM ` + publicMigrationHistory + ` ORDER BY id`
+	checksumHistory             migrationHistoryStatement = `SELECT name, checksum FROM ` + publicMigrationHistory + ` WHERE checksum IS NOT NULL ORDER BY id`
+	insertHistory               migrationHistoryStatement = `INSERT INTO ` + publicMigrationHistory + ` (name, checksum) VALUES ($1, $2)`
+	deleteHistory               migrationHistoryStatement = `DELETE FROM ` + publicMigrationHistory + ` WHERE name = $1`
+	rollbackHistoryWithChecksum migrationHistoryStatement = `SELECT name, checksum FROM ` + publicMigrationHistory + ` ORDER BY id DESC LIMIT $1`
+	rollbackHistoryLegacy       migrationHistoryStatement = `SELECT name FROM ` + publicMigrationHistory + ` ORDER BY id DESC LIMIT $1`
+)
+
+// Select the normal creation schema before user SQL can change the search path.
+func (r Runner) bindMigrationHistory(ctx context.Context, checkStringMode bool) (Runner, bool, error) {
+	var schema string
+	var exists, standardStrings bool
+	err := r.db.QueryRow(ctx, migrationHistoryMetadata).Scan(&schema, &exists, &standardStrings)
+	if err != nil {
+		return r, false, fmt.Errorf("read migration history: %w", err)
+	}
+	if checkStringMode && !standardStrings {
+		return r, false, errMigrationStringMode
+	}
+	switch schema {
+	case "public":
+		r.history = publicMigrationHistory
+	case "":
+		r.history = ""
+	default:
+		r.history = pgx.Identifier{schema}.Sanitize() + "._migrations"
+	}
+	return r, exists, nil
+}
+
+func (r *Runner) historyRelation() string {
+	if r.history == "" {
+		return "_migrations"
+	}
+	return r.history
 }
 
 func (r *Runner) pendingPlan(ctx context.Context, hasHistory, withChecksum bool) ([]plannedMigration, error) {
@@ -145,7 +207,11 @@ func (r *Runner) Down(ctx context.Context, n int) ([]string, error) {
 		n = 1
 	}
 
-	files, err := r.rollbackFiles(ctx, n)
+	bound, exists, err := r.bindMigrationHistory(ctx, true)
+	if err != nil || !exists {
+		return nil, err
+	}
+	files, err := bound.rollbackFiles(ctx, n)
 	if err != nil {
 		return nil, err
 	}
@@ -156,7 +222,7 @@ func (r *Runner) Down(ctx context.Context, n int) ([]string, error) {
 
 	var rolledBack []string
 	for _, migration := range plan {
-		if err := r.execRollback(ctx, migration); err != nil {
+		if err := bound.execRollback(ctx, migration); err != nil {
 			return rolledBack, fmt.Errorf("%s: DOWN: %w", migration.name, err)
 		}
 		rolledBack = append(rolledBack, migration.name)
@@ -169,29 +235,15 @@ func (r *Runner) rollbackFiles(ctx context.Context, n int) ([]rollbackFile, erro
 	if missingChecksum {
 		files, _, err = r.queryRollbackFiles(ctx, n, false)
 	}
-	if !migrationHasSQLState(err, "42P01") {
-		return files, err
-	}
-	// An empty database needs no rollback. Confirm the missing relation before
-	// treating an undefined-table error as success.
-	exists, checkErr := r.historyExists(ctx)
-	if checkErr != nil {
-		return nil, errors.Join(err, checkErr)
-	}
-	if exists {
-		return nil, err
-	}
-	return nil, nil
+	return files, err
 }
 
 func (r *Runner) queryRollbackFiles(ctx context.Context, n int, withChecksum bool) ([]rollbackFile, bool, error) {
-	const legacyQuery = `SELECT name FROM _migrations ORDER BY id DESC LIMIT $1`
-	const checksumQuery = `SELECT name, checksum FROM _migrations ORDER BY id DESC LIMIT $1`
-	query := legacyQuery
+	statement := rollbackHistoryLegacy
 	if withChecksum {
-		query = checksumQuery
+		statement = rollbackHistoryWithChecksum
 	}
-	rows, err := r.db.Query(ctx, query, n)
+	rows, err := r.db.Query(ctx, statement.sql(r.historyRelation()), n)
 	if err != nil {
 		return nil, withChecksum && migrationHasSQLState(err, "42703"), err
 	}
@@ -225,11 +277,15 @@ func migrationHasSQLState(err error, state string) bool {
 
 // Status returns all migrations with their applied status.
 func (r *Runner) Status(ctx context.Context) ([]MigrationStatus, error) {
-	if err := r.Init(ctx); err != nil {
+	bound, _, err := r.bindMigrationHistory(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := bound.initHistory(ctx); err != nil {
 		return nil, err
 	}
 
-	applied, err := r.appliedMap(ctx)
+	applied, err := bound.appliedMap(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -263,19 +319,22 @@ type MigrationStatus struct {
 
 // execMigration runs SQL and records it in _migrations.
 func (r *Runner) execMigration(ctx context.Context, migration plannedMigration) error {
-	return r.execSection(ctx, migration, `INSERT INTO _migrations (name, checksum) VALUES ($1, $2)`, migration.name, migration.checksum)
+	return r.execSection(ctx, migration, insertHistory.sql(r.historyRelation()), migration.name, migration.checksum)
 }
 
 // execRollback runs the DOWN section and removes it from _migrations.
 func (r *Runner) execRollback(ctx context.Context, migration plannedMigration) error {
-	return r.execSection(ctx, migration, `DELETE FROM _migrations WHERE name = $1`, migration.name)
+	return r.execSection(ctx, migration, deleteHistory.sql(r.historyRelation()), migration.name)
 }
 
 const migrationRetryAdvice = "Check PostgreSQL state and migration history before retrying"
 
 func (r *Runner) execSection(ctx context.Context, migration plannedMigration, record string, args ...any) error {
 	if migration.mode.autocommit {
-		if err := r.db.Exec(ctx, migration.sql); err != nil {
+		if err := execMigrationStatement(ctx, r.db, migration.sql); err != nil {
+			if errors.Is(err, errMigrationStringMode) {
+				return err
+			}
 			return fmt.Errorf("autocommit statement success is unconfirmed. %s: %w", migrationRetryAdvice, err)
 		}
 		if migration.mode.index != "" {
@@ -291,7 +350,7 @@ func (r *Runner) execSection(ctx context.Context, migration plannedMigration, re
 	defer tx.Rollback(ctx)
 
 	if !migration.mode.autocommit && migration.sql != "" {
-		if err := tx.Exec(ctx, migration.sql); err != nil {
+		if err := execMigrationStatement(ctx, tx, migration.sql); err != nil {
 			return err
 		}
 	}
@@ -303,6 +362,19 @@ func (r *Runner) execSection(ctx context.Context, migration plannedMigration, re
 		return fmt.Errorf("autocommit statement returned success. The migration history commit is unconfirmed. %s: %w", migrationRetryAdvice, err)
 	}
 	return err
+}
+
+type migrationExec interface {
+	Exec(context.Context, string, ...any) error
+}
+
+func execMigrationStatement(ctx context.Context, db migrationExec, sql string) error {
+	if executor, ok := db.(interface {
+		execMigrationStatement(context.Context, string) error
+	}); ok {
+		return executor.execMigrationStatement(ctx, sql)
+	}
+	return db.Exec(ctx, sql)
 }
 
 func migrationHistoryUncommitted(autocommit bool, err error) error {
@@ -358,7 +430,7 @@ func migrationChecksum(data []byte) string {
 
 // verifyChecksums checks that applied migrations haven't been modified.
 func (r *Runner) verifyChecksums(ctx context.Context) error {
-	rows, err := r.db.Query(ctx, `SELECT name, checksum FROM _migrations WHERE checksum IS NOT NULL ORDER BY id`)
+	rows, err := r.db.Query(ctx, checksumHistory.sql(r.historyRelation()))
 	if err != nil {
 		return err
 	}
@@ -378,11 +450,9 @@ func (r *Runner) verifyChecksums(ctx context.Context) error {
 	return migrationRowsError(rows)
 }
 
-const appliedHistoryQuery = `SELECT name, applied_at FROM _migrations ORDER BY id`
-
 // appliedSet validates the history rows while retaining only the applied names.
 func (r *Runner) appliedSet(ctx context.Context) (map[string]bool, error) {
-	rows, err := r.db.Query(ctx, appliedHistoryQuery)
+	rows, err := r.db.Query(ctx, appliedHistory.sql(r.historyRelation()))
 	if err != nil {
 		return nil, err
 	}
@@ -405,7 +475,7 @@ func (r *Runner) appliedSet(ctx context.Context) (map[string]bool, error) {
 
 // appliedMap returns applied migrations with their timestamps.
 func (r *Runner) appliedMap(ctx context.Context) (map[string]time.Time, error) {
-	rows, err := r.db.Query(ctx, appliedHistoryQuery)
+	rows, err := r.db.Query(ctx, appliedHistory.sql(r.historyRelation()))
 	if err != nil {
 		return nil, err
 	}
@@ -504,7 +574,11 @@ func parseSection(path, section string) (string, error) {
 
 // Verify checks that the database matches the expected schema state.
 func (r *Runner) Verify(ctx context.Context) ([]string, error) {
-	if err := r.Init(ctx); err != nil {
+	bound, _, err := r.bindMigrationHistory(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := bound.initHistory(ctx); err != nil {
 		return nil, err
 	}
 
@@ -513,7 +587,7 @@ func (r *Runner) Verify(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 
-	drifts, err := r.checkPending(ctx)
+	drifts, err := bound.checkPending(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("check pending migrations: %w", err)
 	}

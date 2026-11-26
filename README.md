@@ -639,6 +639,8 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 
 In PostgreSQL migrations, run each supported statement that requires execution outside a transaction, such as `CREATE INDEX CONCURRENTLY`, in its own numbered SQL file. For example, add the column in `002_add_column.sql` and create its index in `003_create_index.sql`. Write each `UP` or `DOWN` section as either ordinary transactional SQL or one standalone statement. Luxo validates the selected sections before applying or rolling back any migration. Rollback also checks each selected file against its recorded checksum when one exists. `luxo migrate up --dry-run` reads the pending plan without creating the history table or running migration SQL.
 
+Luxo selects `_migrations` in PostgreSQL's `current_schema()` at the start of each operation. Configure the same `search_path` for preview, apply, and rollback. Migration SQL requires `standard_conforming_strings=on`, the PostgreSQL default. Use explicit `E'...'` literals for backslash escapes.
+
 If a previously applied file has a mixed `DOWN` section, leave its recorded file intact and create new compensating migrations in dependency order. When a concurrent index build fails, PostgreSQL can leave an invalid index. Inspect and resolve that index before retrying. A concurrent `CREATE INDEX IF NOT EXISTS` only counts as successful if the index is valid and belongs to the intended table.
 
 Standalone PostgreSQL statements and migration-history changes commit separately. An error can mean the statement returned without a confirmed success, PostgreSQL returned success but the history change remained uncommitted, or the history commit could not be confirmed. Check the affected database objects and the migration history before retrying.

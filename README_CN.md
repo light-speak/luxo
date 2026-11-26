@@ -604,6 +604,8 @@ Luxo 不只是代码更短 — 它是 **AI 写后端最可靠的语言**。
 
 PostgreSQL 迁移中，`CREATE INDEX CONCURRENTLY` 等受支持的事务外语句须放在独立的编号 SQL 文件中。例如先在 `002_add_column.sql` 添加列，再在 `003_create_index.sql` 创建索引。每个 `UP` 或 `DOWN` 段可以包含多条普通事务 SQL，或单条事务外语句。Luxo 在执行任何迁移或回滚前检查本次涉及的段。回滚还会核对所选文件已记录的校验和。`luxo migrate up --dry-run` 只读预览待执行计划，不会创建历史表或执行迁移 SQL。
 
+每次操作开始时，Luxo 使用 PostgreSQL 的 `current_schema()` 选定 `_migrations` 所在的 schema。预览、执行和回滚请配置同一 `search_path`。迁移 SQL 要求 PostgreSQL 默认设置 `standard_conforming_strings=on`。需要反斜杠转义时使用显式的 `E'...'` 字符串。
+
 如果已应用文件的 `DOWN` 段混用了两类语句，保留已记录文件，按依赖顺序新建补偿迁移。并发索引构建失败时，PostgreSQL 可能留下无效索引。重试前先检查并处理该索引。并发的 `CREATE INDEX IF NOT EXISTS` 只有在索引有效且属于目标表时才记为成功。
 
 PostgreSQL 的独立事务外语句和迁移历史分开提交。失败可能发生在语句成功尚未确认、语句已返回成功但历史未提交，或历史提交尚未确认三个阶段。重试前先核对受影响的数据库对象和迁移历史。保留已应用的迁移文件原样。

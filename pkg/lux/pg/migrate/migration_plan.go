@@ -256,7 +256,7 @@ func (c *migrationTokens) firstStatementKind() migrationSQLKind {
 			return migrationSQLAutocommit
 		}
 	case strings.EqualFold(token, "REINDEX"):
-		if c.concurrentReindex() {
+		if c.reindexAutocommit() {
 			return migrationSQLAutocommit
 		}
 	case strings.EqualFold(token, "ALTER"):
@@ -265,29 +265,6 @@ func (c *migrationTokens) firstStatementKind() migrationSQLKind {
 		}
 	}
 	return migrationSQLTransaction
-}
-
-func (c *migrationTokens) concurrentReindex() bool {
-	var option bool
-	if c.accept("(") {
-		for {
-			if c.accept("CONCURRENTLY") {
-				option = !(c.accept("FALSE") || c.accept("OFF") || c.accept("0") || c.accept("'false'") || c.accept("'off'") || c.accept("'0'"))
-			} else if c.next() == "" {
-				return false
-			}
-			for next := c.next(); next != "," && next != ")"; next = c.next() {
-				if next == "" {
-					return false
-				}
-			}
-			if c.sql[c.pos-1] == ')' {
-				break
-			}
-		}
-	}
-	c.next() // INDEX, TABLE, SCHEMA, DATABASE or SYSTEM
-	return option || c.accept("CONCURRENTLY") && !c.accept(".")
 }
 
 func (c *migrationTokens) concurrentDetach() bool {
