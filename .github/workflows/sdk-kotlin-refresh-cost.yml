@@ -1,0 +1,76 @@
+name: Kotlin HTTP refresh performance
+
+"on":
+  push:
+    branches: [diag/sdk-kotlin-http-refresh-cost]
+    paths:
+      - .github/workflows/sdk-kotlin-refresh-cost.yml
+      - .github/diagnostics/sdk-kotlin-refresh/**
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diag/sdk-kotlin-http-refresh-cost'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '26.0.1+8'
+          architecture: x64
+          check-latest: false
+
+      - name: Build exact arms and measure on the same runner
+        timeout-minutes: 47
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+          LC_ALL: C.UTF-8
+          TZ: UTC
+        run: |
+          set -euo pipefail
+          test "$RUNNER_KIND" = github-hosted
+          test "$RUNNER_ARCH" = X64
+          test "$(uname -sm)" = 'Linux x86_64'
+          grep -Fx 'VERSION_ID="24.04"' /etc/os-release
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS
+          export QUALIFICATION_REPO="$GITHUB_WORKSPACE"
+          evidence="$GITHUB_WORKSPACE/.tmp/kotlin-refresh-evidence"
+          mkdir -p "$evidence"
+          cp .github/diagnostics/sdk-kotlin-refresh/* "$evidence/"
+          build=$(mktemp -d "$evidence/run.XXXXXXXX")
+          cleanup() {
+            [[ -d "$build" && ! -L "$build" && "$build" == "$evidence"/run.* ]] || return 99
+            rm -rf -- "$build"
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          cpus=$(python3 -B -c 'import os; cpus = sorted(os.sched_getaffinity(0)); assert len(cpus) >= 2; print(",".join(map(str, cpus[:2])))')
+          { uname -a; cat /etc/os-release; lscpu; printf 'sample_cpuset=%s\n' "$cpus"; } > "$evidence/runner.txt"
+          bash "$evidence/prepare.sh" "$build"
+          cp "$build/build-metadata.txt" "$evidence/build-metadata.txt"
+          taskset -c "$cpus" python3 -B "$evidence/qualify.py" smoke --build-dir "$build" --out "$evidence/smoke.json"
+          taskset -c "$cpus" python3 -B "$evidence/qualify.py" measure --build-dir "$build" --out "$evidence/formal"
+
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: kotlin-http-refresh-linux-x64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .tmp/kotlin-refresh-evidence/runner.txt
+            .tmp/kotlin-refresh-evidence/build-metadata.txt
+            .tmp/kotlin-refresh-evidence/*.gradle.log
+            .tmp/kotlin-refresh-evidence/smoke.json
+            .tmp/kotlin-refresh-evidence/formal/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14

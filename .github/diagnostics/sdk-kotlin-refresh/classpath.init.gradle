@@ -1,0 +1,11 @@
+gradle.projectsEvaluated {
+    def sdk = gradle.rootProject
+    sdk.tasks.register('writeHttpSingleFlightClasspath') {
+        dependsOn(sdk.tasks.named('testClasses'))
+        doLast {
+            def sources = sdk.extensions.getByName('sourceSets')
+            def output = new File(System.getProperty('luxo.auditClasspath'))
+            output.text = sources.getByName('test').runtimeClasspath.asPath + '\n'
+        }
+    }
+}
