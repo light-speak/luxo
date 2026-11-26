@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,9 +19,11 @@ import (
 func TestIsolationProfileCommand(t *testing.T) {
 	for _, tc := range []struct{ pkg, want string }{
 		{"pkg/lux/api", "api-non-identity\t.\napi-local-route-export\t^BenchmarkLocalRouteExport$\n" +
-			"api-canonical-json\t^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$\n"},
+			"api-canonical-json\t^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$\n" +
+			"api-binary-param-lookup\t^BenchmarkBinaryParamLookup$\n"},
 		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n" +
 			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n" +
+			"luvia-auth-middleware\t^BenchmarkAuthMiddlewareIsolation$\n" +
 			"luvia-merge-destination\t^BenchmarkMergeDestination$\n" +
 			"luvia-resolved-fields\t^BenchmarkValidateResolvedFields$\n" +
 			"luvia-convenience-keys\t^BenchmarkConvenienceKeyParentValidation$\n"},
@@ -27,7 +31,9 @@ func TestIsolationProfileCommand(t *testing.T) {
 			"codegen-global-receiver\t^BenchmarkGlobalReceiverName$\n" +
 			"codegen-migration-state\t^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$\n"},
 		{"pkg/lux", "lux-short-path\t^BenchmarkStrictFilterContract$|^BenchmarkDecimalAlignment$\n"},
-		{"pkg/lux/rpc", "rpc-owned-request\t^BenchmarkLRPCOwnedRequest$\n"},
+		{"pkg/lux/rpc", "rpc-owned-request\t^BenchmarkLRPCOwnedRequest$\n" +
+			"rpc-deadline-classification\t^BenchmarkRPCDeadlineClassification$\n" +
+			"rpc-nil-context-guard\t^BenchmarkRPCNilContextGuard$\n"},
 	} {
 		var output bytes.Buffer
 		if err := run([]string{"isolation-profile", tc.pkg}, nil, &output, io.Discard); err != nil || output.String() != tc.want {
@@ -70,11 +76,17 @@ func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 			verifyOnlyListedTestFiles(t, replace, dir, "local_input_bench_test.go")
 		}},
 		{benchlayout.APIPackage, "api-canonical-json", verifyAPICanonicalJSONOverlay},
+		{benchlayout.APIPackage, "api-binary-param-lookup", func(t *testing.T, replace map[string]string, dir string) {
+			verifyOnlyListedTestFiles(t, replace, dir, "binary_param_lookup_test.go")
+		}},
 		{"pkg/lux/rpc", "rpc-owned-request", verifyRPCOwnedRequestOverlay},
+		{"pkg/lux/rpc", "rpc-deadline-classification", verifyRPCDeadlineOverlay},
+		{"pkg/lux/rpc", "rpc-nil-context-guard", verifyRPCNilContextGuardOverlay},
 		{benchlayout.APIPackage, benchlayout.APINonIdentityProfile, verifyAPIOverlay},
 		{benchlayout.LuxPackage, benchlayout.LuxShortPathProfile, verifyLuxShortPathOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaPrimaryTraceProfile, verifyLuviaOverlay},
 		{benchlayout.LuviaPackage, benchlayout.LuviaGatewayIdentityProfile, verifyLuviaGatewayIdentityOverlay},
+		{benchlayout.LuviaPackage, "luvia-auth-middleware", verifyLuviaAuthMiddlewareOverlay},
 		{benchlayout.LuviaPackage, "luvia-merge-destination", verifyLuviaMergeDestinationOverlay},
 		{benchlayout.LuviaPackage, "luvia-convenience-keys", func(t *testing.T, replace map[string]string, dir string) {
 			verifyOnlyListedTestFiles(t, replace, dir, "convenience_keys_bench_test.go",
@@ -105,6 +117,289 @@ func TestLinkedOverlaysPreserveFixtureBoundaries(t *testing.T) {
 			}
 			tc.assert(t, overlay.Replace, filepath.Join(root, tc.pkg))
 		})
+	}
+}
+
+func verifyLuviaAuthMiddlewareOverlay(t *testing.T, replace map[string]string, dir string) {
+	t.Helper()
+	const fixture = "middleware_bench_test.go"
+	const helper = "middleware_test.go"
+	for _, tc := range []struct{ path, want string }{
+		{filepath.Join(dir, fixture), "a5a5cd5191827423e07bf382d572614207c3e7fb5b7df27452963c3136bb2d8e"},
+		{replace[filepath.Join(dir, helper)], "c70f9f8da6377c484739423793d637304f974bb0e1f1ebfd10fa75eb8d6eb3f3"},
+	} {
+		body, err := os.ReadFile(tc.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := fmt.Sprintf("%x", sha256.Sum256(body)); got != tc.want {
+			t.Fatalf("%s hash = %s, want native witness %s", tc.path, got, tc.want)
+		}
+	}
+	delete(replace, filepath.Join(dir, helper))
+	verifyOnlyListedTestFiles(t, replace, dir, fixture, helper)
+}
+
+func TestLuviaAuthMiddlewareDefaultKeepsOrdinaryTestInputs(t *testing.T) {
+	root := newBenchmarkRunTree(t)
+	dir := filepath.Join(benchlayout.LuviaPackage, "ordinary_test.go")
+	writeBenchmarkRunFixture(t, root, dir, "package luvia")
+	for _, baseline := range []bool{false, true} {
+		overlay, cleanup, err := compileOverlay(root, benchlayout.LuviaPackage, baseline, benchlayout.DefaultProfile)
+		if err != nil || overlay != "" {
+			t.Fatalf("ordinary Luvia overlay = %q, %v", overlay, err)
+		}
+		if err := cleanup(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestLuviaAuthMiddlewareOverlayRejectsNonregularFixture(t *testing.T) {
+	root := newBenchmarkRunTree(t)
+	dir := filepath.Join(root, benchlayout.LuviaPackage)
+	if _, err := writeLuviaAuthMiddlewareOverlay(dir, root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing package returned %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "nonregular_test.go"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeLuviaAuthMiddlewareOverlay(dir, root); err == nil || !strings.Contains(err.Error(), "must be a regular file") {
+		t.Fatalf("nonregular fixture returned %v", err)
+	}
+}
+
+func TestLuviaAuthMiddlewareOverlayReportsUnreadableFixtures(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read fixtures without permission bits")
+	}
+	for _, fixture := range []string{luviaAuthBenchmarkFixture, luviaAuthHelperFixture} {
+		t.Run(fixture, func(t *testing.T) {
+			root := newBenchmarkRunTree(t)
+			relative := filepath.Join(benchlayout.LuviaPackage, fixture)
+			writeBenchmarkRunFixture(t, root, relative, "package luvia")
+			filename := filepath.Join(root, relative)
+			if err := os.Chmod(filename, 0); err != nil {
+				t.Fatal(err)
+			}
+			_, cleanup, err := compileOverlay(root, benchlayout.LuviaPackage, false, benchlayout.LuviaAuthMiddlewareProfile)
+			if cleanup != nil {
+				defer func() {
+					if err := cleanup(); err != nil {
+						t.Error(err)
+					}
+				}()
+			}
+			if !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("unreadable fixture returned %v, want permission error", err)
+			}
+		})
+	}
+}
+
+func TestLuviaAuthMiddlewareOverlayRejectsChangedWorkload(t *testing.T) {
+	const pkg = "pkg/lux/luvia"
+	const profile = "luvia-auth-middleware"
+	const benchmark = "middleware_bench_test.go"
+	const helper = "middleware_test.go"
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(performanceProfile+"\n", "\nluvia-auth-middleware-overlay-v1 "+benchmark+"=") {
+		t.Fatal("performance compile profile lacks the Luvia auth fixture binding")
+	}
+	for _, tc := range []struct{ name, filename, before, after, message string }{
+		{"missing benchmark", benchmark, "", "", "missing Luvia auth middleware test fixture"},
+		{"changed benchmark", benchmark, "middlewareTokenSink", "changedSink", "does not match the verified benchmark"},
+		{"missing helper", helper, "", "", "missing Luvia auth middleware test fixture"},
+		{"changed helper", helper, "time.Hour", "time.Minute", "does not match the verified projection"},
+		{"missing helper boundary", helper, "func testIdentity(", "func alternateIdentity(", "missing or repeated helper declarations"},
+		{"repeated helper", helper, "func testCfg()", "func testCfg() {}\nfunc testCfg()", "missing or repeated helper declarations"},
+		{"unrelated test changes", helper, "func TestJWTHeaderBoundaryHTTPWebSocketAndInternal", "func TestRenamedHeaderBoundary", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scratch := newBenchmarkRunTree(t)
+			for _, name := range []string{benchmark, helper} {
+				body, err := os.ReadFile(filepath.Join(root, pkg, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				source := string(body)
+				if name == tc.filename {
+					if tc.before == "" {
+						continue
+					}
+					source = strings.Replace(source, tc.before, tc.after, 1)
+				}
+				writeBenchmarkRunFixture(t, scratch, filepath.Join(pkg, name), source)
+			}
+			_, cleanup, err := compileOverlay(scratch, pkg, false, profile)
+			if err == nil {
+				defer func() {
+					if err := cleanup(); err != nil {
+						t.Error(err)
+					}
+				}()
+			}
+			if tc.message == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("auth middleware fixture error = %v, want %s", err, tc.message)
+			}
+		})
+	}
+}
+
+func verifyRPCDeadlineOverlay(t *testing.T, replace map[string]string, dir string) {
+	t.Helper()
+	for name, expected := range map[string]string{
+		"stream_termination_bench_test.go": "d73d6805aa1aa0c5a0212d3cb246adc17ce92a116c4f31f83cf10b32ce531efb",
+		"stream_termination_test.go":       "237955931ab9e5c7791eed9965a0262c8e0902d0e0db328d5c0ec31b84ed446a",
+	} {
+		input := filepath.Join(dir, name)
+		projected, err := os.ReadFile(replace[input])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := fmt.Sprintf("%x", sha256.Sum256(projected)); got != expected {
+			t.Fatalf("%s projected hash = %s, want native witness %s", name, got, expected)
+		}
+		delete(replace, input)
+	}
+	verifyOnlyListedTestFiles(t, replace, dir, "stream_termination_bench_test.go", "stream_termination_test.go")
+}
+
+func TestRPCDeadlineOverlayRejectsChangedProjection(t *testing.T) {
+	const pkg = "pkg/lux/rpc"
+	const profile = "rpc-deadline-classification"
+	const benchmark = "stream_termination_bench_test.go"
+	const context = "stream_termination_test.go"
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(performanceProfile+"\n", "\nrpc-deadline-classification-overlay-v1 "+benchmark+"=") {
+		t.Fatal("performance compile profile lacks the RPC deadline projection binding")
+	}
+	for _, tc := range []struct{ name, filename, before, after, message string }{
+		{"missing benchmark", benchmark, "var deadlineClassificationSink error", "var alternateSink error", "missing or repeated fixture start"},
+		{"duplicate benchmark", benchmark, "func BenchmarkRPCDeadlineClassification(b *testing.B)", "func BenchmarkRPCDeadlineClassification(b *testing.B) {}\nfunc BenchmarkRPCDeadlineClassification(b *testing.B)", "missing or repeated fixture end"},
+		{"workload changed", benchmark, "time.Hour", "time.Minute", "does not match the verified projection"},
+		{"missing context boundary", context, "pendingDeadlineContext) Deadline()", "pendingDeadlineContext) OtherDeadline()", "missing or repeated fixture end"},
+		{"missing context receiver", context, "func (c pendingDeadlineContext) Deadline()", "func Deadline()", "missing or repeated fixture end"},
+		{"context changed", context, "return c.deadline, true", "return c.deadline, false", "does not match the verified projection"},
+		{"different package", context, "package rpc", "package rpc_test", "requires package rpc"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scratch := newBenchmarkRunTree(t)
+			for _, name := range []string{benchmark, context} {
+				body, err := os.ReadFile(filepath.Join(root, pkg, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				source := string(body)
+				if name == tc.filename {
+					source = strings.Replace(source, tc.before, tc.after, 1)
+				}
+				writeBenchmarkRunFixture(t, scratch, filepath.Join(pkg, name), source)
+			}
+			_, _, err := compileOverlay(scratch, pkg, false, profile)
+			if err == nil || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("deadline fixture error = %v, want %s", err, tc.message)
+			}
+		})
+	}
+}
+
+func verifyRPCNilContextGuardOverlay(t *testing.T, replace map[string]string, dir string) {
+	t.Helper()
+	const fixture = "auth_context_bench_test.go"
+	const witness = "cd1b4a5dd0d0622ce19cfc144057482a1059cd61245cf38cf9205f46aaece2c3"
+	path := filepath.Join(dir, fixture)
+	projected, err := os.ReadFile(replace[path])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprintf("%x", sha256.Sum256(projected)); got != witness {
+		t.Fatalf("nil-context projection hash = %s, want native witness %s", got, witness)
+	}
+	delete(replace, path)
+	verifyOnlyListedTestFiles(t, replace, dir, fixture)
+}
+
+func TestRPCNilContextGuardOverlayGuardsProjectionBoundaries(t *testing.T) {
+	const pkg, profile = "pkg/lux/rpc", "rpc-nil-context-guard"
+	const fixture, rootFn = "auth_context_bench_test.go", "func BenchmarkRPCNilContextGuard(b *testing.B)"
+	data, err := os.ReadFile(filepath.Join("../..", pkg, fixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(performanceProfile+"\n", "\nrpc-nil-context-guard-overlay-v1 "+fixture+"=") {
+		t.Fatal("performance compile profile lacks the RPC nil-context projection binding")
+	}
+	for _, tc := range []struct{ name, before, after, message string }{
+		{"missing", "", "", "missing RPC nil-context guard fixture"},
+		{"different package", "package rpc", "package rpc_test", "requires package rpc"},
+		{"missing root", rootFn, "func BenchmarkOther(b *testing.B)", "missing or repeated fixture end"},
+		{"duplicate root", rootFn, rootFn + " {}\n" + rootFn, "missing or repeated fixture end"},
+		{"changed workload", "invalid token", "invalid credentials", "does not match the verified projection"},
+		{"independent benchmark renamed", "BenchmarkRPCAuthenticationErrorRecovery", "BenchmarkRPCAuthErrorRecovery", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := newBenchmarkRunTree(t)
+			writeBenchmarkRunFixture(t, root, filepath.Join(pkg, "other_test.go"), "package rpc")
+			if tc.before != "" {
+				writeBenchmarkRunFixture(t, root, filepath.Join(pkg, fixture), strings.Replace(string(data), tc.before, tc.after, 1))
+			}
+			_, cleanup, err := compileOverlay(root, pkg, tc.message == "", profile)
+			if tc.message != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.message) {
+					t.Fatalf("nil-context fixture error = %v, want %s", err, tc.message)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cleanup(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRPCNilContextGuardOverlayRejectsNonregularFixture(t *testing.T) {
+	const pkg = "pkg/lux/rpc"
+	root := newBenchmarkRunTree(t)
+	writeBenchmarkRunFixture(t, root, filepath.Join(pkg, "other_test.go"), "package rpc")
+	if err := os.Symlink("missing.go", filepath.Join(root, pkg, "auth_context_bench_test.go")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := compileOverlay(root, pkg, false, "rpc-nil-context-guard")
+	if err == nil || !strings.Contains(err.Error(), "fixture must be a regular file") {
+		t.Fatalf("nonregular nil-context fixture returned %v", err)
+	}
+}
+
+func TestRPCDeadlineOverlayRequiresBothRegularFixtures(t *testing.T) {
+	const pkg = "pkg/lux/rpc"
+	root := newBenchmarkRunTree(t)
+	dir := filepath.Join(root, pkg)
+	if _, err := writeRPCDeadlineOverlay(dir, root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing RPC directory returned %v", err)
+	}
+	writeBenchmarkRunFixture(t, root, filepath.Join(pkg, "unrelated_test.go"), "package rpc")
+	if _, err := writeRPCDeadlineOverlay(dir, root); err == nil || !strings.Contains(err.Error(), "missing RPC deadline fixture") {
+		t.Fatalf("missing deadline projection returned %v", err)
+	}
+	if err := os.Symlink("missing.go", filepath.Join(dir, "stream_termination_test.go")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeRPCDeadlineOverlay(dir, root); err == nil || !strings.Contains(err.Error(), "fixture must be a regular file") {
+		t.Fatalf("nonregular deadline fixture returned %v", err)
 	}
 }
 
