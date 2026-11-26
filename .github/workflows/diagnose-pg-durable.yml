@@ -2,7 +2,7 @@ name: Measure PostgreSQL durable migration costs
 
 on:
   push:
-    branches: [diagnostics/hosted-pg-durable-fedd]
+    branches: [diagnostics/hosted-pg-durable-0a6b]
     paths:
       - .github/workflows/diagnose-pg-durable.yml
       - scripts/diagnostics/pg-durable-hosted/**
@@ -12,26 +12,32 @@ permissions:
   contents: read
 
 concurrency:
-  group: hosted-pg-durable-fedd
+  group: hosted-pg-durable-0a6b
   cancel-in-progress: false
 
 jobs:
   pg-durable:
-    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-pg-durable-fedd'
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/hosted-pg-durable-0a6b'
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 40
+    timeout-minutes: 48
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
+          fetch-depth: 2
           persist-credentials: false
+      - name: Fetch the exact common product source
+        run: |
+          set -euo pipefail
+          base=0a6b143ad667c84f0e517b9ef0a9e9d5bd6ec367
+          git fetch --depth=1 --no-tags origin "$base"
+          test "$(git rev-parse FETCH_HEAD)" = "$base"
       - uses: actions/setup-go@v7
         with:
           go-version: '1.27.1'
           check-latest: false
           cache: false
-      - name: Measure the original and reconciliation boundaries
-        timeout-minutes: 33
+      - name: Measure cold, warm, standalone and reconciliation boundaries
+        timeout-minutes: 40
         run: python3 -I -B scripts/diagnostics/pg-durable-hosted/hosted.py run
       - name: Confirm task-owned PostgreSQL resources returned to zero
         if: always()

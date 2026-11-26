@@ -28,7 +28,7 @@ def docker(*args, **kwargs):
 def scope():
     required = {
         "GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "light-speak/luxo",
-        "GITHUB_REF": "refs/heads/diagnostics/hosted-pg-durable-fedd",
+        "GITHUB_REF": "refs/heads/diagnostics/hosted-pg-durable-0a6b",
         "RUNNER_ENVIRONMENT": "github-hosted", "RUNNER_OS": "Linux", "RUNNER_ARCH": "ARM64",
     }
     if platform.system() != "Linux" or platform.machine() != "aarch64":

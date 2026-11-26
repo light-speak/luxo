@@ -22,24 +22,29 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-BASE = "feddadefe3ee05611c075cfa0319a851865584b5"
-BASE_TREE = "f30e4c89335c8b14d4269e0df1a5d51e7d471506"
-ARMS = {"A": "06d749abc50cd631ca556586a58a07acb9869eda", "B": "631b05aa62508ae122f9a69ad83a80a7eae8bd08"}
+PARENT = "608326ec5d5336fc565514165aeaae7347b8029f"
+BASE = "0a6b143ad667c84f0e517b9ef0a9e9d5bd6ec367"
+BASE_TREE = "c12a0bf33f9bd39da85ba6a199ac9d76e16fa00b"
+ARMS = {"A": BASE_TREE, "H": "fb62f62b62599a623f6b7887bf0c007a9d1aff6a", "P": "ff67b201dc39ce5d6df033283ad3a2a8bde0da9f"}
 PATCHES = {
-    "order": ("fbb3bc40bb1cfb8b5e8961f9a17c22ff5931cfffc31bca55184f3aeadd397439", ARMS["A"]),
-    "durable": ("5746c8a785473fd05aee2a96eee75f7edfbeccbe342f0423e5d3cfd2d69de2b5", ARMS["B"]),
+    "H": "b61a7b2ee1b08960193ad66c47733f3eb1c7b48c38cea7b27ab1b9584b9d9db7",
+    "P": "61d5b5c63674710ed674613e457340b505507e11ba12fdd134778e11e08bc797",
 }
 LEAVES = {
-    "holder": {"open-close", "first-lock", "warm-lock", "ordinary-up", "up-no-pending"},
+    "first-query": {"cold-open-ping-up", "already-used-pool-up", "warm-read-only-holder-up"},
     "standalone": {"ordinary/up", "ordinary/down", "ordinary/up-existing",
                    "concurrent/up", "concurrent/down", "concurrent/up-existing-index"},
     "recovery": {"first-journal-and-create-index", "acknowledge-committed-down",
                  "record-applied-after-restart", "retry-after-invalid-index-repair"},
 }
 METRICS = ("ns/op", "B/op", "allocs/op")
-HOLD_ORDER = (("aa", "AA", 4, "ab"), ("h1", "AB", 10, "ab"), ("h2", "AB", 10, "ba"))
-RECONCILE = "^BenchmarkDurableRecovery$"
-STANDALONE = "^BenchmarkMigrationPair$/^(ordinary|concurrent)$/^(up|down|up-existing|up-existing-index)$"
+BENCHMARKS = {"first-query": "BenchmarkDurableFirstQuery", "standalone": "BenchmarkMigrationPair",
+              "recovery": "BenchmarkDurableRecovery"}
+SMOKE_TESTS = {"first-query": ("TestDurableFirstQuerySessions", "TestAdvisoryPairStandaloneWriterHoldsLock"),
+               "standalone": ("TestMigrationPairEmptyPreview",), "recovery": ()}
+STANDALONE_SUFFIX = "/^(ordinary|concurrent)$/^(up|down|up-existing|up-existing-index)$"
+CPU = "Neoverse-N2"
+
 
 
 def run(*args, **kwargs):
@@ -55,8 +60,8 @@ def put(path, value):
 
 
 def payload():
-    names = {"holder-driver.py", "shared.py", "advisory_pair_test.go", "migration_pair_test.go",
-             "durable_reset_test.go", "recovery_test.go", "order.patch.gz.b64", "durable.patch.gz.b64"}
+    names = {"shared.py", "advisory_pair_test.go", "first_query_test.go", "migration_pair_test.go",
+             "durable_reset_test.go", "recovery_test.go", "arm-H.patch.gz.b64", "arm-P.patch.gz.b64"}
     entries = {}
     for line in (PAYLOAD / "inputs.sha256").read_text().splitlines():
         digest, name = line.split("  ", 1)
@@ -72,21 +77,20 @@ def trees(repo, root):
     checkout = ("git", "-C", str(repo))
     if run(*checkout, "rev-parse", BASE + "^{tree}", text=True).strip() != BASE_TREE:
         raise RuntimeError("unexpected source commit or base tree")
-    subprocess.run([*checkout, "merge-base", "--is-ancestor", BASE, "HEAD"], check=True)
     objects = run(*checkout, "rev-parse", "--path-format=absolute", "--git-path", "objects", text=True).strip()
     bare = root / "objects.git"
     run("git", "init", "--bare", "--quiet", str(bare))
     (bare / "objects/info/alternates").write_text(objects + "\n")
     git = ("git", f"--git-dir={bare}")
-    run(*git, "read-tree", BASE_TREE)
-    for name, (digest, expected) in PATCHES.items():
-        encoded = (PAYLOAD / (name + ".patch.gz.b64")).read_bytes()
+    for arm, digest in PATCHES.items():
+        run(*git, "read-tree", BASE_TREE)
+        encoded = (PAYLOAD / f"arm-{arm}.patch.gz.b64").read_bytes()
         patch = gzip.decompress(base64.b64decode(b"".join(encoded.split()), validate=True))
         if sha(patch) != digest:
-            raise RuntimeError(f"{name} patch hash changed")
+            raise RuntimeError(f"{arm} patch hash changed")
         run(*git, "apply", "--cached", "--whitespace=error", "-", input=patch)
-        if run(*git, "write-tree", text=True).strip() != expected:
-            raise RuntimeError(f"{name} patch did not produce the expected tree")
+        if run(*git, "write-tree", text=True).strip() != ARMS[arm]:
+            raise RuntimeError(f"{arm} patch did not produce the expected tree")
     return git
 
 
@@ -100,6 +104,16 @@ def standalone_fixture():
          "\n\t\tf.verify(sample, before, wantNames, wantSQL, names, sql, err)\n\t\tcompleteStandalone(f, sample)\n", 1),
         ("DROP TABLE IF EXISTS public._migrations, public.audit_target",
          "DROP TABLE IF EXISTS public._luxo_migration_attempt, public._migrations, public.audit_target", 1),
+        ('\n\t"testing"\n', '\n\t"testing"\n\t"time"\n', 1),
+        ("\n\tgot := f.inspect()\n\tif got.lockHeld || got.historyOID", """
+	got := f.inspect()
+	// Local connection close does not confirm that PostgreSQL processed Terminate.
+	deadline := time.Now().Add(5 * time.Second)
+	for got.lockHeld && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		got = f.inspect()
+	}
+	if got.lockHeld || got.historyOID""", 1),
     ):
         if source.count(before) != count:
             raise RuntimeError("original standalone fixture preimage changed")
@@ -122,20 +136,20 @@ def prepare_arm(git, root, arm, env, evidence):
         archive_source(git, src, ARMS[arm])
         run("sh", "scripts/setup-modules.sh", str(src), cwd=src, env=env)
         workspace = env | {"GOWORK": str(src / "go.work")}
-        lanes = {"holder": "advispair", "standalone": "migratepair"}
-        if arm == "B":
+        lanes = {"first-query": "advispair", "standalone": "migratepair"}
+        if arm != "A":
             lanes["recovery"] = "recoverypair"
         for lane, folder in lanes.items():
             target = src / "pkg/lux/pg" / folder
             target.mkdir()
             if lane == "standalone":
                 (target / "migration_pair_test.go").write_text(standalone_fixture())
-                if arm == "B":
+                if arm != "A":
                     shutil.copyfile(PAYLOAD / "durable_reset_test.go", target / "durable_reset_test.go")
             else:
-                for name in ("advisory_pair_test.go", "recovery_test.go"):
-                    if lane == "recovery" or name == "advisory_pair_test.go":
-                        shutil.copyfile(PAYLOAD / name, target / name)
+                supplement = "recovery_test.go" if lane == "recovery" else "first_query_test.go"
+                for name in ("advisory_pair_test.go", supplement):
+                    shutil.copyfile(PAYLOAD / name, target / name)
         packages = ["./pkg/lux/pg/" + folder for folder in lanes.values()]
         graph = run("go", "list", "-mod=readonly", "-p=1", "-deps", "-test", *packages, cwd=src, env=workspace)
         verified = run("go", "mod", "verify", cwd=src, env=workspace, text=True).strip()
@@ -155,11 +169,15 @@ def prepare_arm(git, root, arm, env, evidence):
     return result
 
 
+def require_cpu(data):
+    lscpu = {i["field"].rstrip(":"): i.get("data") for i in data["lscpu"]}
+    if lscpu.get("Model name") != CPU or lscpu.get("Architecture") != "aarch64":
+        raise RuntimeError(f"unexpected hosted model or architecture: {lscpu.get('Model name')}")
+
+
 def observation():
     server = SERVER["verify_server"]()
-    lscpu = {i["field"].rstrip(":"): i.get("data") for i in server["cpu"]["lscpu"]}
-    if lscpu.get("Model name") != "Neoverse-N2":
-        raise RuntimeError(f"unexpected hosted model: {lscpu.get('Model name')}")
+    require_cpu(server["cpu"])
     scope, _ = SERVER["scope"]()
     checkpoint = SERVER["admin"](scope, "SELECT checkpoints_timed, checkpoints_req, checkpoint_write_time, "
                                  "checkpoint_sync_time, stats_reset FROM pg_stat_bgwriter;").split("|")
@@ -180,102 +198,150 @@ def admit(path):
     raise RuntimeError("no quiet hosted PG window")
 
 
-def extra_sample(root, lane, name, arm, slots, slot, identities, iterations, evidence):
+def sample_arguments(lane, iterations, smoke):
+    selector = f"^{BENCHMARKS[lane]}$"
+    if lane == "standalone":
+        selector += STANDALONE_SUFFIX
+    tests = SMOKE_TESTS[lane] if smoke else ()
+    selected = "^(" + "|".join(tests) + ")$" if tests else "^$"
+    args = [f"-test.run={selected}", f"-test.bench={selector}", "-test.cpu=1", "-test.benchmem", "-test.count=1",
+            "-test.timeout=3m", f"-test.benchtime={iterations}x"]
+    if tests:
+        args.append("-test.v")
+    return args, tests
+
+
+def sample_metrics(raw, lane, iterations, tests):
+    rows = re.findall(rf"^{BENCHMARKS[lane]}/(\S+?)(?:-\d+)?\s+(\d+)\s+([\d.]+) ns/op\s+(\d+) B/op\s+(\d+) allocs/op$", raw, re.M)
+    if len(rows) != len(LEAVES[lane]) or {row[0] for row in rows} != LEAVES[lane] or any(int(row[1]) != iterations for row in rows):
+        raise RuntimeError(f"invalid {lane} sample inventory")
+    if len(re.findall(r"^PASS$", raw, re.M)) != 1:
+        raise RuntimeError("missing benchmark PASS")
+    passed = re.findall(r"^--- PASS: (Test\w+) ", raw, re.M)
+    if sorted(passed) != sorted(tests) or re.search(r"^\s*--- SKIP:", raw, re.M):
+        raise RuntimeError(f"incomplete {lane} smoke tests")
+    if tests and lane == "first-query":
+        cases = re.findall(r"^ +--- PASS: TestDurableFirstQuerySessions/(\S+) ", raw, re.M)
+        if sorted(cases) != ["clean-ping", "used-pool"]:
+            raise RuntimeError("missing first-query session smoke case")
+    if tests and lane == "standalone" and re.findall(r"history created=(true|false)", raw) != ["false"]:
+        raise RuntimeError("empty preview changed migration history")
+    return {leaf: dict(zip(METRICS, values)) for leaf, _, *values in rows}
+
+
+def sample(root, lane, name, arm, slots, slot, identities, iterations, evidence, smoke=False):
     database, password = slots[slot]
     binary = root / lane / identities[arm][lane]["binary"]
-    selector = STANDALONE if lane == "standalone" else RECONCILE
+    arguments, tests = sample_arguments(lane, iterations, smoke)
     env = {**os.environ, "GOMAXPROCS": "1", "GOGC": "100", "GOMEMLIMIT": "off", "GODEBUG": "",
-           "TMPDIR": str(root), "LUXO_ADVISORY_MODEL": "holder" if arm == "B" else "pooled",
+           "TMPDIR": str(root), "LUXO_ADVISORY_MODEL": "pooled" if arm == "A" else "holder",
+           "LUXO_DURABLE_ARM": arm, "LUXO_MIGPAIR_EMPTY_HISTORY_CREATE": "no",
            "LUXO_MIGPAIR_DATABASE_URL": f"postgres://{database}:{password}@127.0.0.1:5432/{database}?sslmode=disable"}
-    proc = subprocess.run([str(binary), "-test.run=^$", f"-test.bench={selector}", "-test.cpu=1",
-                           "-test.benchmem", "-test.count=1", "-test.timeout=3m", f"-test.benchtime={iterations}x"],
-                          cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.run([str(binary), *arguments], cwd=root, env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True)
     raw = proc.stdout.replace(password, "[redacted]")
     (evidence / f"{name}.log").write_text(raw)
     if proc.returncode:
         raise RuntimeError(f"failed to measure {name}; see raw transcript")
-    prefix = "BenchmarkMigrationPair" if lane == "standalone" else "BenchmarkDurableRecovery"
-    rows = re.findall(rf"^{prefix}/(\S+?)(?:-\d+)?\s+(\d+)\s+([\d.]+) ns/op\s+(\d+) B/op\s+(\d+) allocs/op$", raw, re.M)
-    if len(rows) != len(LEAVES[lane]) or {row[0] for row in rows} != LEAVES[lane] or any(int(r[1]) != iterations for r in rows):
-        raise RuntimeError(f"invalid {lane} sample inventory")
-    if not re.search(r"^PASS$", raw, re.M):
-        raise RuntimeError("missing benchmark PASS")
-    return {"arm": arm, "slot": slot, "name": name, "metrics": {leaf: dict(zip(METRICS, values))
-             for leaf, _, *values in rows}, "logSHA256": sha(raw.encode())}
+    return {"arm": arm, "slot": slot, "name": name, "metrics": sample_metrics(raw, lane, iterations, tests),
+            "logSHA256": sha(raw.encode())}
 
 
-def run_lane(root, evidence, helper, holder, lane, identities):
-    out = evidence / lane
+def schedule(lane):
+    if lane == "recovery":
+        comparisons, controls, control_count = ("HP",), ("HH", "PP"), 10
+    else:
+        comparisons, controls = ("AH", "HP", "AP"), ("AA", "HH", "PP")
+        control_count = 2 if lane == "first-query" else 5
+    for group, slots in enumerate(("ab", "ba"), 1):
+        for pair in range(1, 11):
+            active = comparisons + (controls if pair <= control_count else ())
+            rotate = (pair + group - 1) % len(active)
+            indices = (0, 1) if (pair + group) % 2 == 0 else (1, 0)
+            for arms in active[rotate:] + active[:rotate]:
+                yield f"{arms.lower()}{group}", arms, pair, slots, indices
+
+
+def check_observation(before, after):
+    first, last = before["checkpoints"], after["checkpoints"]
+    if before["cpus"] != after["cpus"] or first[:2] != last[:2] or first[-1] != last[-1]:
+        raise RuntimeError("CPU scope, checkpoint counts or checkpoint epoch changed")
+
+
+def summarize(runs, lane):
+    groups = sorted({row["group"] for row in runs})
+    result = {}
+    for group in groups:
+        result[group] = {}
+        group_rows = [row for row in runs if row["group"] == group]
+        for leaf in sorted(LEAVES[lane]):
+            result[group][leaf] = {}
+            for metric in METRICS:
+                values = [Decimal(row["delta"][leaf][metric]) for row in group_rows]
+                result[group][leaf][metric] = {"minimum": str(min(values)), "median": str(statistics.median(values)),
+                    "maximum": str(max(values)), "maximumPositive": str(max(0, max(values)))}
+    return result
+
+
+def run_lane(root, evidence, helper, lane, identities, smoke):
+    out = evidence / (lane + "-smoke" if smoke else lane)
     out.mkdir()
-    order = HOLD_ORDER
-    if lane == "standalone":
-        order = (("aa", "AA", 10, "ab"), *HOLD_ORDER[1:])
-    elif lane == "recovery":
-        order = (("bb1", "BB", 10, "ab"), ("bb2", "BB", 10, "ba"))
     slots, runs = {}, []
     state = {"status": "failed", "initial": {}, "clean": {}, "measurements": runs, "iterations": 3}
     token = secrets.token_hex(8)
+    arms_for_lane = tuple(arm for arm, identity in identities.items() if lane in identity)
 
     def verify_binaries():
-        for arm in ("B",) if lane == "recovery" else ("A", "B"):
+        for arm in arms_for_lane:
             expected = identities[arm][lane]
             if sha((root / lane / expected["binary"]).read_bytes()) != expected["sha256"]:
                 raise RuntimeError("prepared benchmark binary changed")
-
-    def sample(name, arm, slot, iterations, smoke=False):
-        expected = identities[arm][lane]
-        if lane == "holder":
-            namespace = holder["measure"].__globals__
-            namespace["HERE"] = root / lane
-            return holder["measure"](helper, out, name, arm, slot, slots, {"arms": {arm: expected}},
-                                     iterations, smoke, root)
-        return extra_sample(root, lane, name, arm, slots, slot, identities, iterations, out)
 
     try:
         verify_binaries()
         for key in ("a", "b"):
             helper.create_slot(key, slots, token)
             state["initial"][key] = "0|0"
-        before_smoke = admit(out / "before-smoke.json")
-        state["smoke"] = [sample(f"smoke-{arm}", arm, slot, 1, True) for arm, slot in
-                          ((("B", "b"),) if lane == "recovery" else (("A", "a"), ("B", "b")))]
-        verify_binaries()
+        if smoke:
+            state["iterations"] = 1
+            before = admit(out / "before-smoke.json")
+            state["smoke"] = [sample(root, lane, f"smoke-{arm}", arm, slots, "ab"[index % 2], identities, 1, out, True)
+                              for index, arm in enumerate(arms_for_lane)]
+            after = observation()
+            put(out / "after-smoke.json", after)
+            if before["cpus"] != after["cpus"]:
+                raise RuntimeError("runner CPU scope changed during smoke checks")
+            verify_binaries()
+            state["status"] = "pass"
+            return
         before = admit(out / "before-formal.json")
-        if before_smoke["cpus"] != before["cpus"]:
-            raise RuntimeError("runner CPU scope changed before sampling")
-        for group, arms, count, db in order:
-            for pair in range(1, count + 1):
-                indices = (0, 1) if pair % 2 else (1, 0)
-                values = {i: sample(f"{group}-{pair:02d}-{i}", arms[i], db[i], 3) for i in indices}
-                difference = {leaf: {metric: str(Decimal(values[1]["metrics"][leaf][metric]) -
-                    Decimal(values[0]["metrics"][leaf][metric])) for metric in METRICS} for leaf in LEAVES[lane]}
-                runs.append({"group": group, "pair": pair, "order": indices, "arms": list(values.values()), "delta": difference})
+        for group, arms, pair, db, indices in schedule(lane):
+            values = {i: sample(root, lane, f"{group}-{pair:02d}-{i}", arms[i], slots, db[i], identities, 3, out)
+                      for i in indices}
+            difference = {leaf: {metric: str(Decimal(values[1]["metrics"][leaf][metric]) -
+                Decimal(values[0]["metrics"][leaf][metric])) for metric in METRICS} for leaf in LEAVES[lane]}
+            runs.append({"group": group, "pair": pair, "order": indices, "arms": [values[0], values[1]], "delta": difference})
         after = observation()
         put(out / "after-formal.json", after)
-        if before["cpus"] != after["cpus"] or before["checkpoints"][-1] != after["checkpoints"][-1]:
-            raise RuntimeError("CPU scope or checkpoint epoch changed")
+        check_observation(before, after)
         verify_binaries()
-        summary = {}
-        for group, _, _, _ in order:
-            summary[group] = {}
-            for leaf in sorted(LEAVES[lane]):
-                summary[group][leaf] = {}
-                for metric in METRICS:
-                    values = [Decimal(row["delta"][leaf][metric]) for row in runs if row["group"] == group]
-                    summary[group][leaf][metric] = {"minimum": str(min(values)),
-                        "median": str(statistics.median(values)), "maximum": str(max(values)),
-                        "maximumPositive": str(max(0, max(values)))}
-        put(out / "summary.json", summary)
+        put(out / "summary.json", summarize(runs, lane))
         state["status"] = "pass"
     finally:
         state["clean"] = helper.clean_slots(slots)
         put(out / "run.json", state)
-        if state["clean"] != {"a":"0|0","b":"0|0"}:
+        if state["clean"] != {"a": "0|0", "b": "0|0"}:
             raise RuntimeError(f"incomplete cleanup in {lane}")
 
 
 def replay(repo, root, evidence, entries):
-    env = {key: value for key, value in os.environ.items() if not key.startswith(("LUXO_MIGPAIR_", "LUXO_ADVISORY_"))}
+    current = run("git", "-C", str(repo), "rev-list", "--parents", "-n", "1", "HEAD", text=True).strip().split()
+    if current != [os.environ["GITHUB_SHA"], PARENT]:
+        raise RuntimeError("unexpected diagnostic commit or parent")
+    cpu = json.loads(run("lscpu", "-J"))
+    put(evidence / "host-cpu.json", cpu)
+    require_cpu(cpu)
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("LUXO_MIGPAIR_", "LUXO_ADVISORY_", "LUXO_DURABLE_"))}
     env |= {"GOTOOLCHAIN": "local", "GOWORK": "off", "GOFLAGS": "-p=1", "GOMAXPROCS": "2", "CGO_ENABLED": "0",
             "GOENV": "off", "GOARM64": "v8.0", "GOCACHE": str(root / "cache"), "GOMODCACHE": str(root / "modules"),
             "TMPDIR": str(root), "GOTMPDIR": str(root), "GOPROXY": "https://proxy.golang.org", "GOSUMDB": "sum.golang.org"}
@@ -285,22 +351,21 @@ def replay(repo, root, evidence, entries):
                                   "patches": PATCHES, "payload": entries, "go": "go1.27.1 linux/arm64"})
     git = trees(repo, root)
     identities = {arm: prepare_arm(git, root, arm, env, evidence) for arm in ARMS}
-    # Only the real PostgreSQL fixture and holder measurement entry points are reused here.
     shared = runpy.run_path(str(PAYLOAD / "shared.py"))
-    holder = runpy.run_path(str(PAYLOAD / "holder-driver.py"))
     scope, _ = SERVER["scope"]()
     shared["admin"].__globals__["admin"] = lambda sql: SERVER["admin"](scope, sql)
     helper = SimpleNamespace(**shared)
     put(evidence / "server.json", SERVER["start_owned"]())
-    failures = {}
-    for lane in LEAVES:
-        try:
-            run_lane(root, evidence, helper, holder, lane, identities)
-        except (RuntimeError, subprocess.SubprocessError) as err:
-            failures[lane] = str(err)
-    put(evidence / "outcome.json", {"passed": not failures, "failures": failures})
-    if failures:
-        raise RuntimeError(f"durable PostgreSQL diagnostic failed in {sorted(failures)}")
+    for phase in ("smoke", "formal"):
+        failures = {}
+        for lane in LEAVES:
+            try:
+                run_lane(root, evidence, helper, lane, identities, phase == "smoke")
+            except (RuntimeError, subprocess.SubprocessError) as err:
+                failures[lane] = str(err)
+        put(evidence / "outcome.json", {"passed": not failures and phase == "formal", "phase": phase, "failures": failures})
+        if failures:
+            raise RuntimeError(f"durable PostgreSQL {phase} failed in {sorted(failures)}")
 
 
 def interrupted(_signal, _frame):
