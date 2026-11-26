@@ -60,27 +60,35 @@ func TestIntegrationMigrationHistoryUsesCreationSchema(t *testing.T) {
 	if err != nil || !slices.Equal(names, []string{migration}) {
 		t.Errorf("pending tenant migration: %v, %v", names, err)
 	}
-	assertSessionHistory(t, runner, schema, false, 1)
+	assertSessionHistory(t, runner, schema, nil, 1)
 	if done, err := runner.Down(ctx, 1); err != nil || len(done) != 0 {
 		t.Errorf("empty tenant rollback: %v, %v", done, err)
 	}
-	assertSessionHistory(t, runner, schema, false, 1)
+	assertSessionHistory(t, runner, schema, nil, 1)
 	if done, err := runner.Up(ctx); err != nil || !slices.Equal(done, []string{migration}) {
 		t.Fatalf("tenant apply: %v, %v", done, err)
 	}
-	assertSessionHistory(t, runner, schema, true, 1)
+	assertSessionHistory(t, runner, schema, []string{migration}, 1)
 	if done, err := runner.Down(ctx, 1); err != nil || !slices.Equal(done, []string{migration}) {
 		t.Fatalf("tenant rollback: %v, %v", done, err)
 	}
-	assertSessionHistory(t, runner, schema, true, 1)
+	assertSessionHistory(t, runner, schema, []string{}, 1)
 }
 
-func assertSessionHistory(t *testing.T, runner *Runner, schema string, tenant bool, fallbackCount int) {
+func assertSessionHistory(t *testing.T, runner *Runner, schema string, tenantMigrations []string, fallbackCount int) {
 	t.Helper()
 	ctx := t.Context()
 	var exists bool
-	if err := runner.db.QueryRow(ctx, "SELECT pg_catalog.to_regclass($1) IS NOT NULL", schema+"._migrations").Scan(&exists); err != nil || exists != tenant {
-		t.Errorf("tenant history exists: %t, want %t, err %v", exists, tenant, err)
+	wantHistory := tenantMigrations != nil
+	if err := runner.db.QueryRow(ctx, "SELECT pg_catalog.to_regclass($1) IS NOT NULL", schema+"._migrations").Scan(&exists); err != nil || exists != wantHistory {
+		t.Errorf("tenant history exists: %t, want %t, err %v", exists, wantHistory, err)
+	}
+	if exists {
+		var names []string
+		query := "SELECT COALESCE(array_agg(name ORDER BY id), ARRAY[]::text[]) FROM " + schema + "._migrations"
+		if err := runner.db.QueryRow(ctx, query).Scan(&names); err != nil || !slices.Equal(names, tenantMigrations) {
+			t.Errorf("tenant history migrations: %v, want %v, err %v", names, tenantMigrations, err)
+		}
 	}
 	var count int
 	if err := runner.db.QueryRow(ctx, "SELECT count(*) FROM public._migrations").Scan(&count); err != nil || count != fallbackCount {

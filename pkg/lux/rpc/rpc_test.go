@@ -1171,8 +1171,9 @@ func TestPoolDialError(t *testing.T) {
 
 func TestPoolDefaultMaxIdle(t *testing.T) {
 	pool := NewPool("127.0.0.1:1234", 0)
-	if pool.maxIdle != 32 {
-		t.Errorf("default maxIdle = %d, want 32", pool.maxIdle)
+	defer pool.Close()
+	if maxIdle := cap(pool.conns); maxIdle != 32 {
+		t.Errorf("default maxIdle = %d, want 32", maxIdle)
 	}
 }
 

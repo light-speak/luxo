@@ -31,6 +31,7 @@ func TestPlanReindexTransactionMode(t *testing.T) {
 		{"escaped uppercase hex", `REINDEX (CONCURRENTLY E'\x6FN') INDEX notes_idx`, true},
 		{"escaped plain character", `REINDEX (CONCURRENTLY E'trU\e') INDEX notes_idx`, true},
 		{"unicode true", `REINDEX (CONCURRENTLY U&'t@0072ue' UESCAPE '@') INDEX notes_idx`, true},
+		{"escape letter as unicode escape", `REINDEX (CONCURRENTLY U&'tx0072ue' UESCAPE E'\x') INDEX notes_idx`, true},
 		{"unicode escape true", `REINDEX (CONCURRENTLY E't\u0072ue') INDEX notes_idx`, true},
 		{"long unicode escape true", `REINDEX (CONCURRENTLY E't\U00000072ue') INDEX notes_idx`, true},
 		{"hex one", `REINDEX (CONCURRENTLY 0x1) INDEX notes_idx`, true},
@@ -64,7 +65,8 @@ func TestPlanReindexTransactionMode(t *testing.T) {
 		{"schema false", `REINDEX (CONCURRENTLY FALSE) SCHEMA public`, true},
 		{"database", `REINDEX DATABASE`, true},
 		{"system", `REINDEX SYSTEM`, true},
-		{"qualified keyword relation", `REINDEX INDEX concurrently.notes_idx`, false},
+		{"qualified keyword relation", `REINDEX INDEX "concurrently".notes_idx`, false},
+		{"invalid unquoted keyword relation", `REINDEX INDEX concurrently.notes_idx`, false},
 		{"plain table", `REINDEX TABLE public.notes`, false},
 		{"unknown target", `REINDEX MATERIALIZED VIEW notes`, false},
 		{"dangling sign", `REINDEX (CONCURRENTLY +) INDEX notes_idx`, false},
@@ -89,6 +91,26 @@ func TestPlanReindexTransactionMode(t *testing.T) {
 			_, err = planMigrationSQL(tc.statement + "; SELECT 1;")
 			if errors.Is(err, errSplitMigration) != tc.autocommit || (err != nil && !errors.Is(err, errSplitMigration)) {
 				t.Fatalf("mixed plan error = %v, want split=%v", err, tc.autocommit)
+			}
+		})
+	}
+}
+
+func TestDecodeReindexBackslashHex(t *testing.T) {
+	for _, tc := range []struct {
+		name, input, want string
+		ok                bool
+	}{
+		{"literal x", `\x`, "x", true},
+		{"literal x with trailing text", `\xzz`, "xzz", true},
+		{"one hex digit", `\x7z`, "\x07z", true},
+		{"two hex digits", `\x78`, "x", true},
+		{"hex zero rejected", `\x0z`, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := decodeReindexEscapes(tc.input, '\\', false)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("decode %q = %q, %t; want %q, %t", tc.input, got, ok, tc.want, tc.ok)
 			}
 		})
 	}
@@ -131,10 +153,11 @@ func TestIntegrationReindexMigrationTransactionMode(t *testing.T) {
 	if err := db.Exec(ctx, "CREATE TABLE items(id int); CREATE INDEX items_idx ON items(id);"); err != nil {
 		t.Fatal(err)
 	}
+	const escaped = `REINDEX (CONCURRENTLY U&'tx0072ue' UESCAPE E'\x') INDEX items_idx;`
 	const quoted = `REINDEX ("concurrently" TRUE) INDEX items_idx;`
 	const transactional = "REINDEX (CONCURRENTLY $$false$$) INDEX items_idx;"
 	schemaReindex := "REINDEX (CONCURRENTLY FALSE) SCHEMA " + scope + ";"
-	writeMigration(t, dir, "001_index.sql", quoted, quoted)
+	writeMigration(t, dir, "001_index.sql", escaped, quoted)
 	writeMigration(t, dir, "002_false.sql", transactional+" INSERT INTO items VALUES (1);", "DELETE FROM items; "+transactional)
 	writeMigration(t, dir, "003_schema.sql", schemaReindex, schemaReindex)
 	const mixed = "004_mixed.sql"

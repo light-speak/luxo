@@ -235,7 +235,12 @@ func reindexBackslashEscape(value string) (byte, int, bool) {
 	case 'U':
 		return reindexEscapeNumber(value, 1, 8, 8, 16)
 	case 'x':
-		return reindexEscapeNumber(value, 1, 1, 2, 16)
+		decoded, width, ok := reindexEscapeNumber(value, 1, 1, 2, 16)
+		if width == 1 {
+			// PostgreSQL treats \x without a hex digit like any escaped letter.
+			return 'x', 1, true
+		}
+		return decoded, width, ok
 	case '0', '1', '2', '3', '4', '5', '6', '7':
 		return reindexEscapeNumber(value, 0, 1, 3, 8)
 	case 'b', 'f', 'n', 'r', 't':
