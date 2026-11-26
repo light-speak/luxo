@@ -1,52 +1,45 @@
 #!/usr/bin/env python3
-"""Attribute a shared exact Intel performance signal without changing release gates."""
+"""Replay the remaining signed #84 leaves without changing the release gate."""
 
-from collections import Counter
+from collections import Counter, defaultdict
 from hashlib import sha256
 from itertools import product
-from pathlib import Path
+from math import isfinite
 import json
 import os
+from pathlib import Path
 import re
-import runpy
 import shutil
 import subprocess
 import sys
-import tempfile
-
+from tempfile import TemporaryDirectory
 
 INPUT = Path(__file__).resolve().parent
 ROOT = INPUT.parents[1]
-OUT = ROOT / '.tmp/pr83-pr84-intel-evidence'
-CHECKOUTS = ROOT / '.tmp/pr83-pr84-intel-checkouts'
-REF = 'refs/heads/diagnostics/pr83-pr84-intel'
-DIAGNOSTIC_PARENT = 'f4e265a6c1f280ed89fcb325cb81cc2b3758f2a3'
-MANIFEST_SHA = '3471b2d29d862dcce9bbdc0e27ec05440fe455c1f2b217a88e909daac1c27366'
-MANIFEST = json.loads((INPUT / 'manifest.json').read_bytes())
+OUT = ROOT / '.tmp/pr84-native-evidence'
+CHECKOUTS = ROOT / '.tmp/pr84-native-inputs'
+MANIFEST = INPUT / 'remaining.json'
+CONFIG = json.loads(MANIFEST.read_bytes())
+MANIFEST_SHA = '590cd78408d600323a61e7df8d186c970c022a5d78cb8ac13acdb8c3903e6bd4'
+PROJECTOR_SHA = '05d4710fbb50682462275be5597f9ab533779aa335df7e8187684233b7b3446a'
+PARENT = '5d4dd6725ae111debcd5d768266ae46cdfc320fb'
+REF = 'refs/heads/diagnostics/pr84-original-layout'
 PACKAGE = 'pkg/lux/api'
-PROFILES = MANIFEST['profiles']
-PROJECT = runpy.run_path(str(INPUT / 'projection.py'))
-PROJECTED = PROJECT['selected_profiles'](PROFILES)
-REFERENCE_SHA = '41361042b9a6e59e79b8f4e9bf7ebf415cf837185611e141f7e577b6c103bbf6'
-REFERENCE = json.loads((INPUT / 'projection-reference.json').read_bytes())
-CHANGED = [
-    'M\t.github/workflows/diagnose-pr83-pr84-intel.yml',
-    'A\tscripts/diagnose-pr83-pr84-intel/projection-reference.json',
-    'A\tscripts/diagnose-pr83-pr84-intel/projection.py',
-    'M\tscripts/diagnose-pr83-pr84-intel/run.py',
-]
-PAIRS = ('AA', 'HH', 'AH')
 ROLES = ('A', 'H')
-BLOCKS = (1, 2)
+PAIRS = ('AA', 'HH', 'AH')
+CONTROLS = {f'{pair}-{block}.{direction}' for pair, block, direction in
+            product(('AA', 'HH'), (1, 2), ('forward', 'reverse'))}
+BENCH_ROW = re.compile(rb'^(Benchmark\S+-2)[ \t]+(\d+)[ \t]+([^\r\n]+)$', re.M)
 HOT = {
-    'default': (r'BenchmarkIdentityConditionValidity', r'IdentityString|IdentityReader|Claims\.(Get|ID)|jwt\.'),
-    'api-non-identity': (r'BenchmarkHandlerPanicFormatting', r'BenchmarkWSConnectionRegistrations',
-                         r'benchmarkConnectionRegistrations|connectionSliceBaseline|callHandler'),
+    'handler-buffer': r'BenchmarkHandlerResponseBuffer|ResponseBuffer',
+    'identity-subject': r'BenchmarkIdentitySubjectVisibility|identitySubject',
+    'origin-run': r'BenchmarkResponseOriginRun|responseOrigin.*run',
+    'http-completion': r'BenchmarkHTTPHandlerCompletion|benchmarkHTTPHandlerCompletion|executeHTTPHandler',
+    'ws-auth-expired': r'BenchmarkWSAuthenticationExpiredParent|benchmarkWSExpiredParent|wsConn.*write',
+    'request-values': r'BenchmarkStaticParamSlot|BenchmarkStaticValueParams|benchmarkStaticValue|LegacyParamJSON|findParam|SetParamSlot',
+    'body-read': r'BenchmarkBodyRead|benchmarkBodyRead|[Rr]eadBody',
+    'json-quote': r'BenchmarkJSONQuoteCandidate|appendStrict|[Aa]ppendJSONString',
 }
-HOT['identity'] = HOT['default']
-HOT['handler'] = (r'BenchmarkHandlerPanicFormatting', r'callHandler|beforeHandlerPanicFormatting')
-HOT['websocket'] = (r'BenchmarkWSConnectionRegistrations', r'benchmarkConnectionRegistrations|connectionSliceBaseline')
-BENCH_RE = re.compile(rb'^(Benchmark\S+)\s+(\d+)\s+', re.M)
 
 
 def need(ok, problem):
@@ -66,317 +59,348 @@ def git(directory, *args):
     return call('git', '--no-replace-objects', '-C', directory, *args).decode().strip()
 
 
-def save_json(path, data):
+def save(path, value):
     with path.open('x') as stream:
-        json.dump(data, stream, indent=2, sort_keys=True)
+        json.dump(value, stream, indent=2, sort_keys=True)
         stream.write('\n')
 
 
-def selector(leaves):
-    def anchor(piece):
-        # Match Go's regexp.QuoteMeta byte for byte in the signed benchplan TSV.
-        return '^' + re.sub(r'([\\.+*?()|\[\]{}^$])', r'\\\1', piece) + '$'
+def requested_shards(ref):
+    known = {route['shard'] for route in CONFIG['routes']}
+    if ref == REF:
+        return known
+    shard = ref.removeprefix(REF+'-')
+    need(shard in known and ref == REF+'-'+shard, 'unexpected diagnostic route ref')
+    return {shard}
 
-    return '|'.join('/'.join(anchor(piece) for piece in name.removesuffix('-2').split('/'))
-                    for name in leaves)
+
+def select_route(cpu, requested):
+    found = [route for route in CONFIG['routes'] if route['cpu'] == cpu and route['shard'] in requested]
+    need(len(found) <= 1, 'ambiguous CPU route')
+    return found[0] if found else None
+
+
+def check_runner():
+    OUT.mkdir(parents=True, exist_ok=True)
+    need(digest(MANIFEST) == MANIFEST_SHA and digest(INPUT/'project.go') == PROJECTOR_SHA, 'witness inputs changed')
+    active = git(ROOT, 'rev-parse', 'HEAD')
+    need(os.environ.get('RUNNER_KIND') == 'github-hosted' and os.environ.get('GITHUB_REPOSITORY') == 'light-speak/luxo'
+         and os.environ.get('GITHUB_EVENT_NAME') == 'push'
+         and os.environ.get('GITHUB_SHA') == active, 'unexpected diagnostic event')
+    requested = requested_shards(os.environ['GITHUB_REF'])
+    need(git(ROOT, 'show', '-s', '--format=%P', active) == PARENT, 'unexpected diagnostic parent')
+    need(git(ROOT, 'diff', '--name-status', PARENT, active).splitlines() == [
+        'M\t.github/workflows/diagnose-pr83-pr84-intel.yml',
+        'A\tscripts/diagnose-pr83-pr84-intel/project.go',
+        'A\tscripts/diagnose-pr83-pr84-intel/remaining.json',
+        'M\tscripts/diagnose-pr83-pr84-intel/run.py',
+    ], 'unexpected diagnostic diff')
+    cpus = {line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines()
+            if line.startswith('model name')}
+    need(len(cpus) == 1, 'CPU descriptions missing or inconsistent')
+    cpu = cpus.pop()
+    route = select_route(cpu, requested)
+    if route is not None:
+        need(call('uname', '-sm').decode().strip() == 'Linux x86_64' and
+             'VERSION_ID="24.04"' in Path('/etc/os-release').read_text().splitlines() and
+             call('getconf', '_NPROCESSORS_ONLN').strip() == b'4', 'unexpected native runner image')
+    receipt = {'matched': route is not None, 'cpu': cpu, 'shard': route['shard'] if route else None, 'diagnostic': active}
+    if not (OUT/'route.json').is_file():
+        save(OUT/'route.json', receipt)
+    else:
+        need(json.loads((OUT/'route.json').read_bytes()) == receipt, 'runner scope changed after probe')
+    return route
+
+
+def bind_sources(go):
+    arms = {role: CHECKOUTS/role for role in ROLES}
+    for role, source in arms.items():
+        commit = CONFIG['base' if role == 'A' else 'head']
+        need(git(source, 'rev-parse', 'HEAD') == commit and git(source, 'rev-parse', 'HEAD^{tree}') == CONFIG[role]
+             and git(source, 'rev-parse', '--show-toplevel') == str(source)
+             and not git(source, 'status', '--porcelain'), f'wrong {role} source checkout')
+    head = arms['H']
+    need(git(head, 'show', '-s', '--format=%P', 'HEAD').split()[-1] == CONFIG['base'], 'historic merge base changed')
+    need(git(head, 'diff', '--name-only', CONFIG['base'], 'HEAD').splitlines() ==
+         [PACKAGE+'/trace.go', PACKAGE+'/trace_encoding_test.go'], 'wrong original product diff')
+    fields = ('GOVERSION','GOHOSTOS','GOHOSTARCH','GOOS','GOARCH','GOAMD64','CGO_ENABLED','GOFLAGS','GOTOOLCHAIN')
+    environment = call(go, 'env', *fields)
+    need(environment == b'go1.27.1\nlinux\namd64\nlinux\namd64\nv1\n1\n\nlocal\n', 'wrong original Go environment')
+    save(OUT/'binding.json', {'original': CONFIG, 'goEnvironment': environment.decode().splitlines(),
+                              'goSHA256': digest(Path(go)), 'runner': json.loads((OUT/'route.json').read_bytes())})
+    for arm in arms.values():
+        (arm/'.tmp').mkdir()
+        call('sh', head/'scripts/setup-modules.sh', arm, cwd=head)
+    need((arms['A']/'go.work').read_bytes() == (head/'go.work').read_bytes(), 'workspace differs between arms')
+    return arms
+
+
+def build_tools(go, head, work):
+    tools, wrapper, temp = work/'bin', work/'wrapper', work/'go-tmp'
+    for path in (tools, wrapper, temp):
+        path.mkdir()
+    os.environ.update(TMPDIR=str(temp), GOTMPDIR=str(temp))
+    env = dict(os.environ, GOWORK='off')
+    for name in ('benchrun','benchplan','benchgate'):
+        call(go, 'build', '-p', '1', '-o', tools/name, './scripts/'+name, cwd=head, env=env)
+    call(go, 'build', '-p', '1', '-o', tools/'project', INPUT/'project.go', cwd=head, env=env)
+    call(go, 'install', 'golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70',
+         cwd=head, env=dict(env, GOBIN=str(tools)))
+    original = call(tools/'benchrun', 'performance-profile')
+    need(sha256(original).hexdigest() == CONFIG['compileProfileSHA256'], 'official compile profile changed')
+    (OUT/'compile-profile.txt').write_bytes(original)
+    shutil.copyfile(INPUT/'go-capture.py', wrapper/'go')
+    (wrapper/'go').chmod(0o700)
+    return tools
+
+
+def plan_subset(benchplan, expected, names, destination):
+    destination.mkdir()
+    targets, batch, paired = (destination/name for name in ('targets.tsv','batch.tsv','expected.json'))
+    targets.write_text(''.join(f'{PACKAGE}\t{name}\n' for name in sorted(names)))
+    call(benchplan, '--confirmation-plan', expected, targets, batch, paired)
+    call(benchplan, '--verify-profile-batch', 'confirmation', paired, batch)
+    rows = [line.split('\t') for line in batch.read_text().splitlines()]
+    need(all(package == PACKAGE for package, _, _ in rows), 'original batch was not only API')
+    return {profile: selector for _, profile, selector in rows}
+
+
+def plan_route(tools, route):
+    names = [item['name'] for item in route['confirmed']]
+    entries = [{'Package': PACKAGE,'Name': name} for name in sorted(names)]
+    expected = OUT/'expected.json'
+    save(expected, {'Base': entries,'Head': entries})
+    plan = OUT/'plan'
+    plan.mkdir()
+    by_group, by_profile = defaultdict(list), defaultdict(list)
+    for item in route['confirmed']:
+        group = item['projection']
+        profile = CONFIG['projections'][group]['stock'][item['root']]
+        by_group[group].append(item['name'])
+        by_profile[profile].append(item['name'])
+    stock = plan_subset(tools/'benchplan', expected, names, plan/'stock')
+    need(set(stock) == set(by_profile), 'original stock family profile differs')
+    for profile, selector in stock.items():
+        selected = plan_subset(tools/'benchplan', expected, by_profile[profile], plan/('stock-'+profile))
+        need(selected == {profile: selector}, 'original stock selector differs')
+    projected = {}
+    for group, group_names in by_group.items():
+        selected = plan_subset(tools/'benchplan', expected, group_names, plan/group)
+        need(len(selected) == 1, 'fixture mixes distinct stock roles')
+        projected[group] = next(iter(selected.values()))
+    return expected, stock, projected
+
+
+def verify_metrics(name, sample):
+    fields = sample.split()
+    need(len(fields) % 2 == 0, 'incomplete benchmark metric')
+    data = {unit: float(value) for value,unit in zip(fields[::2],fields[1::2])}
+    needed = {b'ns/op',b'B/op',b'allocs/op'}
+    need(needed <= data.keys() and len(data)*2==len(fields) and all(isfinite(v) and v>=0 for v in data.values()),
+         'missing or invalid benchmark metrics')
+    if name.startswith(b'BenchmarkWSAuthenticationExpiredParent/'):
+        need(data.get(b'attempts/op') == 64 and data.get(b'writes/op') == 0,
+             'expired parent benchmark ran a different number of attempted or accepted writes')
+
+
+def inventory(raw, names, cpu, repeats=1, one_iteration=False):
+    rows = BENCH_ROW.findall(raw)
+    lines = raw.splitlines()
+    need(len(rows)==sum(line.startswith(b'Benchmark') for line in lines) and
+         Counter(name.decode() for name, _, _ in rows) == Counter({name: repeats for name in names}),
+         'missing, repeated or invalid original benchmark leaves')
+    need(all(int(iterations) == 1 if one_iteration else int(iterations) > 0 for _, iterations, _ in rows),
+         'wrong use of 1x discovery or timed sampling')
+    need(b'PASS' in lines and b'FAIL' not in lines, 'benchmark did not finish')
+    need({line[5:].strip() for line in lines if line.startswith(b'cpu: ')} == {cpu.encode()}, 'sample CPU mismatch')
+    for name, _, metrics in rows:
+        verify_metrics(name,metrics)
+
+
+def sample(binary, source, selector, time):
+    return call(binary, '-test.run=^$', '-test.bench='+selector, '-test.benchmem', '-test.benchtime='+time,
+                '-test.count=1', '-test.cpu=2', '-test.timeout=180s', cwd=source/PACKAGE)
+
+
+def inspect_binary(go, binary, scope, pattern, work):
+    data = {'fileSHA256': digest(binary)}
+    commands = {'buildinfo':(go,'version','-m'), 'buildid':(go,'tool','buildid'),
+                'sections':('readelf','-WlS'), 'hot':(go,'tool','objdump','-s',pattern)}
+    for name, command in commands.items():
+        (scope/(name+'.txt')).write_bytes(call(*command, binary))
+    need((scope/'hot.txt').stat().st_size > 0, 'no hot instructions captured')
+    symbols = call(go, 'tool','nm','-size',binary).decode().splitlines()
+    (scope/'symbols.txt').write_text('\n'.join(row for row in symbols if re.search(pattern,row))+'\n')
+    paths = [work/name for name in ('text','rodata')]
+    copied = work/'discard.elf'
+    call('objcopy', *(f'--dump-section=.{path.name}={path}' for path in paths), binary, copied)
+    for path in paths:
+        data[path.name] = digest(path)
+        path.unlink()
+    copied.unlink()
+    save(scope/'elf.json', data)
+
+
+def build_binary(go, tools, mode, role, key, source, work, evidence):
+    wrapper = work/'wrapper/go'
+    env = dict(os.environ, PATH=str(wrapper.parent)+os.pathsep+os.environ['PATH'], LUXO_WITNESS_REAL_GO=go,
+               LUXO_WITNESS_PROFILE_LOG=str(evidence), GOWORK=str(source/'go.work'))
+    built = work/(mode+'-'+role+'-'+key)
+    built.mkdir()
+    if mode == 'stock':
+        command = 'compile-performance-baseline' if role == 'A' else 'compile-performance'
+        call(tools/'benchrun', command, source, built, PACKAGE, key, env=env)
+        suffix = '' if key == 'default' else '-'+key
+        return built/('pkg-lux-api'+suffix+'.test')
+    outcome = json.loads(call(tools/'project', source, MANIFEST, key, built/'overlay'))
+    save(evidence/'projection.json', outcome)
+    binary = built/'pkg-lux-api.test'
+    call(wrapper, 'test','-trimpath','-c','-overlay='+outcome['Overlay'],'./'+PACKAGE,'-o',binary,cwd=source,env=env)
+    return binary
+
+
+def build_group(go, tools, work, mode, role, source, key, route, output):
+    scope = output/(role+'-'+key)
+    scope.mkdir()
+    binary = build_binary(go, tools, mode, role, key, source, work, scope)
+    projections = CONFIG['projections']
+    if mode == 'stock':
+        groups = sorted({item['projection'] for item in route['confirmed']
+                         if projections[item['projection']]['stock'][item['root']] == key})
+    else:
+        groups = [key]
+    inspect_binary(go, binary, scope, '|'.join(HOT[group] for group in groups), work)
+    for group in groups:
+        spec = projections[group]
+        roots = [root for root in spec['roots'] if mode != 'stock' or spec['stock'][root] == key]
+        names = [name for name in spec['names'] if name.split('/')[0].removesuffix('-2') in roots]
+        raw = sample(binary,source,'^('+'|'.join(roots)+')$','1x')
+        inventory(raw,names,route['cpu'],one_iteration=True)
+        (scope/(group+'.inventory.raw')).write_bytes(raw)
+    return binary
 
 
 def schedule():
-    for block, index in product(BLOCKS, range(1, 11)):
-        order = (0, 1) if index % 2 else (1, 0)
-        revisions = ('83', '84') if index % 2 else ('84', '83')
-        for pair, pr in product(PAIRS, revisions):
-            for side in order:
-                yield block, index, pr, pair, side
-
-
-def manifest_check():
-    need(digest(INPUT / 'manifest.json') == MANIFEST_SHA, 'qualification manifest changed')
-    need(digest(INPUT / 'projection-reference.json') == REFERENCE_SHA, 'prior machine-code or inventory binding changed')
-    for profile, all_leaves in REFERENCE['fullInventory'].items():
-        need(set(PROJECTED[profile]) <= set(all_leaves) and len(all_leaves) == len(set(all_leaves)),
-             f'projected full inventory incomplete for {profile}')
-    need(set(MANIFEST['revisions']) == {'83', '84'}, 'expected both independent release revisions')
-    need({key: len(items) for key, items in PROFILES.items()} == {'default': 12, 'api-non-identity': 2},
-         'expected 14 original matched leaves')
-    leaves = sum(PROFILES.values(), [])
-    need(len(set(leaves)) == 14 and set(leaves) == set(MANIFEST['originalShards']), 'leaf inventory mismatch')
-    visits = list(schedule())
-    counts = Counter((block, pr, pair, side) for block, _, pr, pair, side in visits)
-    need(len(visits) == 240 and len(counts) == 24 and set(counts.values()) == {10}, 'incomplete paired schedule')
-    for start in range(0, len(visits), 2):
-        block, sample, pr, pair, side = visits[start]
-        need(visits[start + 1] == (block, sample, pr, pair, 1 - side) and side == int(sample % 2 == 0),
-             'arms must alternate and stay adjacent')
-    return leaves
-
-
-def runner():
-    OUT.mkdir(parents=True, exist_ok=True)
-    need(os.environ.get('RUNNER_KIND') == 'github-hosted' and
-         os.environ.get('GITHUB_REPOSITORY') == 'light-speak/luxo' and
-         os.environ.get('GITHUB_EVENT_NAME') == 'push' and os.environ.get('GITHUB_REF') == REF,
-         'expected a hosted push of the diagnostic branch')
-    active = git(ROOT, 'rev-parse', 'HEAD')
-    need(active == os.environ.get('GITHUB_SHA') and
-         git(ROOT, 'show', '-s', '--format=%P', active) == DIAGNOSTIC_PARENT and
-         git(ROOT, 'diff', '--name-status', DIAGNOSTIC_PARENT, active).splitlines() == CHANGED,
-         'expected only the diagnostic overlay changes on the published parent')
-    cpu = {line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines()
-           if line.startswith('model name')}
-    spec = MANIFEST['runner']
-    machine = call('uname', '-sm').decode().strip()
-    ubuntu = f'VERSION_ID="{spec["ubuntu"]}"' in Path('/etc/os-release').read_text().splitlines()
-    cores = int(call('getconf', '_NPROCESSORS_ONLN'))
-    matched = cpu == {spec['model']} and machine == 'Linux x86_64' and ubuntu and cores == spec['cores']
-    save_json(OUT / 'runner.json', {'matched': matched, 'cpu': sorted(cpu), 'cores': cores, 'platform': machine,
-                                   'ubuntuMatched': ubuntu, 'diagnostic': active, 'scheduledSamples': 0})
-    need(matched, 'CPU or Linux image differs from the original runner, no samples taken')
-
-
-def bound_source(directory, commit, tree):
-    need(directory.exists() and git(directory, 'rev-parse', '--show-toplevel') == str(directory) and
-         git(directory, 'rev-parse', 'HEAD') == commit and git(directory, 'rev-parse', 'HEAD^{tree}') == tree and
-         not git(directory, 'status', '--porcelain'), f'unexpected source checkout: {directory}')
-
-
-def source_pair(pr, work, evidence):
-    spec = MANIFEST['revisions'][pr]
-    left, control = (CHECKOUTS / (pr + role) for role in ROLES)
-    bound_source(left, spec['base'], spec['baseTree'])
-    bound_source(control, spec['head'], spec['headTree'])
-    need(git(control, 'show', '-s', '--format=%P', spec['head']).split()[-1] == spec['base'], 'original PR ancestry changed')
-    need(git(control, 'diff', '--name-only', spec['base'], spec['head']).splitlines() == spec['productPaths'],
-         'original product path list changed')
-    right = work / 'head'
-    right.mkdir()
-    process = subprocess.Popen(['git', '--no-replace-objects', 'archive', spec['head']], cwd=control, stdout=subprocess.PIPE)
-    with process.stdout:
-        subprocess.run(['tar', '-xf', '-', '-C', right], stdin=process.stdout, check=True)
-    need(process.wait() == 0, 'original head archive failed')
-    for role, path, commit in (('A', left, spec['base']), ('H', right, spec['head'])):
-        (path / '.tmp').mkdir()
-        call('sh', control / 'scripts/setup-modules.sh', path, cwd=control)
-        source_repo = left if role == 'A' else control
-        tree = git(source_repo, 'ls-tree', '-r', commit, PACKAGE, 'go.mod', 'go.sum', 'VERSION')
-        (evidence / (role + '-source-tree.txt')).write_text(tree + '\n')
-    return left, right, control
-
-
-def inspect_binary(go, binary, profile, evidence, work):
-    evidence.mkdir()
-    (evidence / 'elf.sha256').write_text(digest(binary) + '\n')
-    pattern = '|'.join(HOT[profile])
-    specs = {'buildinfo': (go, 'version', '-m', binary), 'buildid': (go, 'tool', 'buildid', binary),
-             'sections': ('readelf', '-WlS', binary), 'hot': (go, 'tool', 'objdump', '-s', pattern, binary)}
-    for name, args in specs.items():
-        (evidence / (name + '.txt')).write_bytes(call(*args))
-    hot = (evidence / 'hot.txt').read_text()
-    need(all(marker in hot for marker in HOT[profile] if '|' not in marker), f'missing hot benchmark symbol: {profile}')
-    symbols = call(go, 'tool', 'nm', '-size', binary).decode().splitlines()
-    (evidence / 'symbols.txt').write_text('\n'.join(line for line in symbols if re.search(pattern, line)) + '\n')
-    paths = [work / name for name in ('text', 'rodata')]
-    copy = work / 'copy.elf'
-    call('objcopy', *(f'--dump-section=.{path.name}={path}' for path in paths), binary, copy)
-    save_json(evidence / 'segments.json', {path.name: digest(path) for path in paths})
-    for path in (*paths, copy):
-        path.unlink()
-
-
-def sample(benchrun, arm, profile, budget, leaves=None, projected=False):
-    source, binaries = arm
-    mode = ('run', source, binaries / profile, PACKAGE) if projected else (
-        'run-performance', source, binaries, PACKAGE, profile)
-    regex = '.' if leaves is None else selector(leaves)
-    args = (benchrun, *mode, '-test.run=^$', '-test.bench=' + regex, '-test.benchmem',
-            '-test.benchtime=' + budget, '-test.count=1', '-test.cpu=2')
-    try:
-        return call(*args)
-    except subprocess.CalledProcessError as error:
-        (OUT / 'sample-failure.txt').write_bytes(error.output)
-        raise
-
-
-def verify_rows(raw, leaves, count, one_iteration=False):
-    parsed = BENCH_RE.findall(raw)
-    expected = Counter({name.encode(): count for name in leaves})
-    need(Counter(name for name, _ in parsed) == expected, 'missing, duplicated, or unplanned benchmark leaf')
-    need(all(int(iters) == 1 if one_iteration else int(iters) > 0 for _, iters in parsed), 'invalid iteration count')
-    need(b'FAIL' not in raw.splitlines() and b'PASS' in raw.splitlines(), 'missing successful benchmark completion')
-    expected_cpu = MANIFEST['runner']['model'].encode()
-    need({line[5:].strip() for line in raw.splitlines() if line.startswith(b'cpu: ')} == {expected_cpu}, 'sample CPU mismatch')
-
-
-def build_projected(go, benchrun, source, building, evidence, work, env):
-    for profile in PROJECTED:
-        compile_log = evidence / profile
-        compile_log.mkdir()
-        output = building / profile
-        output.mkdir(parents=True)
-        overlay = work / ('projection-' + evidence.name + '-' + profile + '.json')
-        fixture = PROJECT['write_overlay'](source / PACKAGE, overlay, profile)
-        (compile_log / 'fixture.txt').write_text(f'{fixture.name} {digest(fixture)}\n')
-        binary = output / 'pkg-lux-api.test'
-        call('go', 'test', '-trimpath', '-c', '-overlay=' + str(overlay), './' + PACKAGE, '-o', binary,
-             cwd=source, env=dict(env, LUXO_WITNESS_PROFILE_LOG=str(compile_log)))
-        inspect_binary(go, binary, profile, compile_log / 'elf', work)
-        complete = sample(benchrun, (source, building), profile, '1x', projected=True)
-        verify_rows(complete, REFERENCE['fullInventory'][profile], 1, one_iteration=True)
-        (compile_log / 'all-inventory.txt').write_bytes(complete)
-        selected = sample(benchrun, (source, building), profile, '1x', PROJECTED[profile], projected=True)
-        verify_rows(selected, PROJECTED[profile], 1, one_iteration=True)
-        (compile_log / 'selected-inventory.txt').write_bytes(selected)
-
-
-def build_pr(go, pr, work, evidence, wrapper, env):
-    work.mkdir()
-    evidence.mkdir()
-    left, right, control = source_pair(pr, work, evidence)
-    benchrun, benchgate, benchplan = (work / n for n in ('benchrun', 'benchgate', 'benchplan'))
-    for tool in (benchrun, benchgate, benchplan):
-        call(go, 'build', '-p', '1', '-o', tool, './scripts/' + tool.name, cwd=control, env=env)
-    compile_profile = call(benchrun, 'performance-profile')
-    need(sha256(compile_profile).hexdigest() == MANIFEST['revisions'][pr]['compileProfileSHA256'],
-         'original compiler profile differs for PR ' + pr)
-    (evidence / 'compile-profile.txt').write_bytes(compile_profile)
-    batch = evidence / 'benchmark-batch.tsv'
-    batch.write_text(''.join(f'{PACKAGE}\t{profile}\t{selector(items)}\n' for profile, items in PROFILES.items()))
-    call(benchplan, '--verify-profile-batch', 'confirmation', OUT / 'expected.json', batch)
-    arms, projected = {}, {}
-    for role, src, command in (('A', left, 'compile-performance-baseline'), ('H', right, 'compile-performance')):
-        binaries = work / (role + '-bin')
-        build_log = evidence / (role + '-build')
-        build_log.mkdir()
-        compile_env = dict(env, PATH=str(wrapper) + os.pathsep + env['PATH'], LUXO_WITNESS_REAL_GO=go,
-                           LUXO_WITNESS_PROFILE_LOG=str(build_log), GOWORK=str(src / 'go.work'))
-        for profile in PROFILES:
-            call(benchrun, command, src, binaries, PACKAGE, profile, env=compile_env)
-            suffix = '-' + profile if profile != 'default' else ''
-            binary = binaries / ('pkg-lux-api' + suffix + '.test')
-            inspect_binary(go, binary, profile, build_log / profile, work)
-            sections = json.loads((build_log / profile / 'segments.json').read_bytes())
-            need(sections == REFERENCE['stock'][pr][role][profile], f'{pr} {role} {profile}: original stock segments changed')
-            capture = sample(benchrun, (src, binaries), profile, '1x', PROFILES[profile])
-            verify_rows(capture, PROFILES[profile], 1, one_iteration=True)
-            (build_log / (profile + '-inventory.txt')).write_bytes(capture)
-        arms[role] = src, binaries
-        projected[role] = src, work / (role + '-projected')
-        project_log = evidence / (role + '-projected')
-        project_log.mkdir()
-        build_projected(go, benchrun, *projected[role], project_log, work, compile_env)
-    return {'stock': arms, 'projected': projected}, benchrun, benchgate, benchplan, control
-
-
-def measure(built, mode, profiles, destination):
-    index = 0
-    with (destination / 'order.tsv').open('x') as order:
-        order.write('record\tblock\tpair\tpr\tcomparison\tside\trole\tprofile\n')
-        for block, pair, pr, comparison, side in schedule():
-            arms, benchrun, *_ = built[pr]
-            role = comparison[side]
-            side_name = ('left', 'right')[side]
-            output = destination / pr / f'{comparison}-{block}.{side_name}.raw'
-            with output.open('ab') as stream:
-                for profile, leaves in profiles.items():
-                    index += 1
-                    order.write(f'{index}\t{block}\t{pair}\t{pr}\t{comparison}\t{side_name}\t{role}\t{profile}\n')
-                    stream.write(sample(benchrun, arms[mode][role], profile, '200ms', leaves, projected=(mode == 'projected')))
-    need(index == 240 * len(profiles), 'unexpected benchmark process count')
-    return index
-
-
-def gate(built, benchstat, leaves, destination):
-    expected = OUT / 'expected.json'
-    statuses = {}
-    for pr, (_, _, benchgate, benchplan, control) in built.items():
-        dest = destination / pr
+    for block, index in product((1,2),range(1,11)):
+        order = (0,1) if (block+index)%2 == 0 else (1,0)
         for comparison in PAIRS:
-            csvs = []
-            directions = ('forward', 'reverse') if comparison != 'AH' else ('forward',)
-            for block in BLOCKS:
-                prefix = dest / f'{comparison}-{block}'
-                halves = [Path(str(prefix) + '.' + side) for side in ('left', 'right')]
-                output = [path.with_suffix(path.suffix + '.txt') for path in halves]
-                for raw, normalized in zip(halves, output):
-                    raw = raw.with_suffix(raw.suffix + '.raw')
-                    verify_rows(raw.read_bytes(), leaves, 10)
-                    call(benchplan, '--normalize', raw, normalized)
-                call(benchplan, '--verify', expected, *output)
-                for direction in directions:
-                    csv = Path(f'{prefix}.{direction}.csv')
-                    warnings = Path(f'{prefix}.{direction}.warnings.txt')
-                    arms = output if direction == 'forward' else output[::-1]
-                    with csv.open('xb') as stream, warnings.open('xb') as errors:
-                        subprocess.run([benchstat, '-alpha', '0.01', '-filter', '.unit:(sec/op OR B/op OR allocs/op)',
-                                        '-format', 'csv', f'base={arms[0]}', f'head={arms[1]}'],
-                                       stdout=stream, stderr=errors, check=True)
-                    csvs.append(csv)
-            groups = [csvs] if comparison == 'AH' else [[item] for item in csvs]
-            opts = ['--approved-costs', control / 'scripts/benchgate/approved-costs.json',
-                    '--base-sha', MANIFEST['revisions'][pr]['base']] if comparison == 'AH' else []
-            for files in groups:
-                with files[0].with_suffix('.gate.txt').open('xb') as log:
-                    result = subprocess.run([benchgate, *opts, *files], stdout=log, stderr=subprocess.STDOUT)
-                statuses[pr + '/' + files[0].stem] = result.returncode
+            yield block,index,comparison,order
+
+
+def measure(arms, binaries, selectors, output):
+    measured = 0
+    with (output/'order.tsv').open('x') as order:
+        for block, index, comparison, matching in schedule():
+            for side in matching:
+                label, role = ('left','right')[side], comparison[side]
+                with (output/f'{comparison}-{block}.{label}.raw').open('ab') as sink:
+                    for key, selector in selectors.items():
+                        measured += 1
+                        order.write(f'{measured}\t{block}\t{index}\t{comparison}\t{label}\t{role}\t{key}\n')
+                        sink.write(sample(binaries[role,key],arms[role],selector,'200ms'))
+    need(measured==120*len(selectors),'incorrect native process count')
+    return measured
+
+
+def gate(tools, expected, head, route, output):
+    names = [item['name'] for item in route['confirmed']]
+    statuses = {}
+    for comparison in PAIRS:
+        files = []
+        for block in (1,2):
+            prefix = output/f'{comparison}-{block}'
+            halves = [Path(str(prefix)+'.'+side+'.txt') for side in ('left','right')]
+            for arm in halves:
+                raw = arm.with_suffix('.raw')
+                inventory(raw.read_bytes(), names, route['cpu'], repeats=10)
+                call(tools/'benchplan','--normalize',raw,arm)
+            call(tools/'benchplan','--verify',expected,*halves)
+            for direction in (('forward','reverse') if comparison != 'AH' else ('forward',)):
+                csv = Path(f'{prefix}.{direction}.csv')
+                order = halves if direction=='forward' else halves[::-1]
+                with csv.open('xb') as stats, csv.with_suffix('.warnings').open('xb') as warnings:
+                    subprocess.run([tools/'benchstat','-alpha','0.01','-filter','.unit:(sec/op OR B/op OR allocs/op)',
+                                    '-format','csv','base='+str(order[0]),'head='+str(order[1])],
+                                   stdout=stats,stderr=warnings,check=True)
+                files.append(csv)
+        groups = [files] if comparison=='AH' else [[part] for part in files]
+        flags = ['--approved-costs',head/'scripts/benchgate/approved-costs.json','--base-sha',CONFIG['base']] if comparison=='AH' else []
+        for parts in groups:
+            with parts[0].with_suffix('.gate.txt').open('xb') as raw:
+                result = subprocess.run([tools/'benchgate',*flags,*parts],stdout=raw,stderr=subprocess.STDOUT)
+            statuses[parts[0].stem] = result.returncode
     return statuses
+
+
+def compare(mode, go, tools, arms, route, selectors, expected, work):
+    output = OUT/mode
+    output.mkdir()
+    binaries = {(role,key): build_group(go,tools,work,mode,role,arms[role],key,route,output)
+                for role,key in product(ROLES,selectors)}
+    if mode=='projected':
+        for key in selectors:
+            sources = [json.loads((output/(role+'-'+key)/'projection.json').read_bytes())['Fixtures'] for role in ROLES]
+            need(sources[0]==sources[1],'different retained fixture bytes between arms')
+    return {'processes': measure(arms,binaries,selectors,output), 'binaries': len(selectors),
+            'gates': gate(tools,expected,arms['H'],route,output)}
+
+
+def summarize(folder):
+    status_paths = list(folder.glob('*/status.json'))
+    need(len(status_paths)==6,'missing slot receipt')
+    observed, failed = set(), []
+    requested = requested_shards(os.environ.get('GITHUB_REF', REF))
+    for path in sorted(status_paths):
+        result = json.loads(path.read_bytes())
+        route = select_route(result['cpu'], requested)
+        if not result['matched']:
+            need(route is None and result['processes']==0,'misrouted benchmark receipt')
+            continue
+        need(route and route['shard']==result['shard'], 'wrong CPU for original shard')
+        observed.add(route['shard'])
+        needed = {'stock', 'projected'}
+        available = set(result['modes'])
+        if available != needed:
+            failed.append((route['shard'],'missing comparison'))
+        for mode, comparison in result['modes'].items():
+            count = len({(item['projection'] if mode=='projected' else
+                         CONFIG['projections'][item['projection']]['stock'][item['root']]) for item in route['confirmed']})
+            need(comparison['binaries']==count and comparison['processes']==120*count
+                 and set(comparison['gates']) == CONTROLS|{'AH-1.forward'}, 'invalid slot schedule or gate receipt')
+            if any(comparison['gates'].values()):
+                failed.append((route['shard'],mode))
+    missing = sorted(requested-observed)
+    print(json.dumps({'matchedShards':sorted(observed),'missingShards':missing,'strictFailures':failed},sort_keys=True))
+    need(not missing and not failed,'at least one original model remains unqualified')
 
 
 def main():
     args = sys.argv[1:]
-    leaves = manifest_check()
-    if args == ['--check']:
-        print('14 leaves, 2 independent revisions, 480 stock and 720 projected processes, 5 profiles')
+    if len(args)==2 and args[0]=='--summarize':
+        summarize(Path(args[1]))
         return
-    if args == ['--probe']:
-        runner()
+    route = check_runner()
+    if args==['--probe']:
+        if route:
+            with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
+                output.write(f"shard={route['shard']}\n")
+        else:
+            recorded = json.loads((OUT/'route.json').read_bytes())
+            save(OUT/'status.json', {'matched':False,'cpu':recorded['cpu'],'processes':0})
         return
-    need(not args, 'use --check, --probe, or no arguments')
-    receipt = json.loads((OUT / 'runner.json').read_bytes())
-    need(receipt['matched'] and receipt['diagnostic'] == git(ROOT, 'rev-parse', 'HEAD'), 'missing matching runner receipt')
+    need(route and args==[route['shard']],'requested shard differs from this native model')
     go = shutil.which('go')
-    need(go, 'missing Go compiler')
-    env = dict(os.environ, GOWORK='off')
-    fields = ('GOVERSION', 'GOHOSTOS', 'GOHOSTARCH', 'GOOS', 'GOARCH', 'GOAMD64', 'CGO_ENABLED', 'GOFLAGS', 'GOTOOLCHAIN')
-    version = call(go, 'env', *fields, env=env)
-    spec = MANIFEST['runner']
-    wanted = f'go{spec["go"]}\nlinux\namd64\nlinux\namd64\n{spec["goamd64"]}\n{spec["cgo"]}\n\nlocal\n'.encode()
-    need(version == wanted, 'Go build settings differ from the original')
-    need(digest(Path(go)) == REFERENCE['goSHA256'], 'Go binary differs from the original attribution run')
-    save_json(OUT / 'binding.json', {'manifest': MANIFEST, 'goEnvironment': version.decode().splitlines(),
-                                    'goSHA256': digest(Path(go)), 'kernel': call('uname', '-a').decode().strip()})
-    rows = [{'Package': PACKAGE, 'Name': leaf} for leaf in sorted(leaves)]
-    save_json(OUT / 'expected.json', {'Base': rows, 'Head': rows})
-    with tempfile.TemporaryDirectory(prefix='intel-work.', dir=OUT.parent) as scratch:
-        work = Path(scratch)
-        wrapper = work / 'wrapper'
-        wrapper.mkdir()
-        shutil.copyfile(INPUT / 'go-capture.py', wrapper / 'go')
-        (wrapper / 'go').chmod(0o700)
-        environment = dict(env, TMPDIR=str(work), GOBIN=str(work))
-        call(go, 'install', 'golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70', env=environment)
-        built = {pr: build_pr(go, pr, work / pr, OUT / pr, wrapper, environment) for pr in ('83', '84')}
-        outcomes = {}
-        for mode, profiles in (('stock', PROFILES), ('projected', PROJECTED)):
-            destination = OUT / mode
-            destination.mkdir()
-            for pr in built:
-                (destination / pr).mkdir()
-            count = measure(built, mode, profiles, destination)
-            statuses = gate(built, work / 'benchstat', leaves, destination)
-            outcomes[mode] = {'processes': count, 'gates': statuses}
-    stock = outcomes['stock']['gates']
-    stock_gates = {'83/AH-1.forward', '84/AH-1.forward'}
-    baseline_failed = {name for name, status in stock.items() if status}
-    reproduced = baseline_failed == stock_gates and all(stock[name] == 1 for name in stock_gates)
-    expected_pairs = len(leaves)
-    for pr in built:
-        report = OUT / 'stock' / pr / 'AH-1.forward.gate.txt'
-        rows = [line for line in report.read_text().splitlines() if line.startswith('confirmed performance regression:')]
-        reproduced &= len(rows) == expected_pairs and all(' sec/op ' in line for line in rows)
-    projected_passed = not any(outcomes['projected']['gates'].values())
-    save_json(OUT / 'status.json', {'stockReproduced': reproduced, 'projectedPassed': projected_passed,
-                                   'modes': outcomes})
-    sys.exit(int(not (reproduced and projected_passed)))
+    need(go,'Go compiler not found')
+    arms = bind_sources(go)
+    with TemporaryDirectory(prefix='pr84-native.', dir=OUT.parent) as parent:
+        work = Path(parent)
+        tools = build_tools(go,arms['H'],work)
+        expected, stock, projected = plan_route(tools,route)
+        modes = {'stock': compare('stock',go,tools,arms,route,stock,expected,work)}
+        if all(modes['stock']['gates'][name]==0 for name in CONTROLS):
+            modes['projected'] = compare('projected',go,tools,arms,route,projected,expected,work)
+    save(OUT/'status.json', {'matched':True,'cpu':route['cpu'],'shard':route['shard'],'modes':modes})
+    sys.exit(int(any(value for mode in modes.values() for value in mode['gates'].values())))
 
 
 if __name__ == '__main__':

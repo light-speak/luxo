@@ -1,0 +1,474 @@
+{
+  "A": "a6e89a783c0f8202b1233078c1c3fbc204aba1f5",
+  "H": "c0575f87e37db75bfc26701fa305ab17a84cb94b",
+  "attempt": 1,
+  "base": "43dd9d4e5eb8fb59573fd3bdfd7de7b5b6814879",
+  "compileProfileSHA256": "66f667fe32c2e5cb6d4379d7efb160494d221d5fe0e39ca2a39ebcbc70f3a857",
+  "head": "9c174866c68a8cbd241720cbf2c13c1ea8d4c9f4",
+  "planArtifact": 15152092277,
+  "planSHA256": "57dd27e761b2499af46f161f4570d4f9194e22c15c63531276e261fc0cac2bf8",
+  "projections": {
+    "body-read": {
+      "fixtures": [
+        {
+          "functions": [],
+          "imports": [],
+          "name": "request_body_test.go",
+          "sha256": "05511ef9477759d0ca01ed76634fc3a38537626ccf4db79c5dfcce0e2ac13336"
+        }
+      ],
+      "names": [
+        "BenchmarkBodyRead/0/direct-2",
+        "BenchmarkBodyRead/0/previous-2",
+        "BenchmarkBodyRead/128/direct-2",
+        "BenchmarkBodyRead/128/previous-2",
+        "BenchmarkBodyRead/4096/direct-2",
+        "BenchmarkBodyRead/4096/previous-2",
+        "BenchmarkBodyRead/4097/direct-2",
+        "BenchmarkBodyRead/4097/previous-2",
+        "BenchmarkBodyRead/65536/direct-2",
+        "BenchmarkBodyRead/65536/previous-2"
+      ],
+      "roots": [
+        "BenchmarkBodyRead"
+      ],
+      "stock": {
+        "BenchmarkBodyRead": "api-non-identity"
+      }
+    },
+    "handler-buffer": {
+      "fixtures": [
+        {
+          "functions": [],
+          "imports": [],
+          "name": "handler_panic_bench_test.go",
+          "sha256": "01122e4a09e5c6d6a20018f47566fb801ad4888db504fd9d2c932be56146e302"
+        }
+      ],
+      "names": [
+        "BenchmarkHandlerResponseBuffer/BusinessError-2",
+        "BenchmarkHandlerResponseBuffer/Bytes4KiB-2",
+        "BenchmarkHandlerResponseBuffer/Empty-2",
+        "BenchmarkHandlerResponseBuffer/Int-2"
+      ],
+      "roots": [
+        "BenchmarkHandlerResponseBuffer"
+      ],
+      "stock": {
+        "BenchmarkHandlerResponseBuffer": "api-non-identity"
+      }
+    },
+    "http-completion": {
+      "fixtures": [
+        {
+          "functions": [],
+          "imports": [],
+          "name": "http_abnormal_bench_test.go",
+          "sha256": "55f72f7781f78a96161e58d41d6dffcd07f2a1b3bb74ca535e158c687ef13236"
+        },
+        {
+          "functions": [
+            "httpAbnormalMode",
+            "httpAbnormalRequest"
+          ],
+          "imports": [
+            "bytes",
+            "net/http",
+            "net/http/httptest"
+          ],
+          "name": "http_abnormal_test.go",
+          "sha256": "16c2bc650532fea783e1eabf01d82d09f955075ebb91cf31d272bb543b377f5a"
+        }
+      ],
+      "names": [
+        "BenchmarkHTTPHandlerCompletion/binary/metrics/error-2",
+        "BenchmarkHTTPHandlerCompletion/binary/metrics/success-2",
+        "BenchmarkHTTPHandlerCompletion/binary/unobserved/error-2",
+        "BenchmarkHTTPHandlerCompletion/binary/unobserved/success-2",
+        "BenchmarkHTTPHandlerCompletion/json/metrics/error-2",
+        "BenchmarkHTTPHandlerCompletion/json/metrics/success-2",
+        "BenchmarkHTTPHandlerCompletion/json/unobserved/error-2",
+        "BenchmarkHTTPHandlerCompletion/json/unobserved/success-2"
+      ],
+      "roots": [
+        "BenchmarkHTTPHandlerCompletion"
+      ],
+      "stock": {
+        "BenchmarkHTTPHandlerCompletion": "api-non-identity"
+      }
+    },
+    "identity-subject": {
+      "fixtures": [
+        {
+          "functions": [],
+          "imports": [],
+          "name": "identity_reader_bench_test.go",
+          "sha256": "20d45a1c2a71419d6c2c44e33b49e691cf15f3522f6e1041541dbce5097a3c5f"
+        }
+      ],
+      "names": [
+        "BenchmarkIdentitySubjectVisibility/pointer/reference-2",
+        "BenchmarkIdentitySubjectVisibility/pointer/subject-2",
+        "BenchmarkIdentitySubjectVisibility/value/reference-2",
+        "BenchmarkIdentitySubjectVisibility/value/subject-2"
+      ],
+      "roots": [
+        "BenchmarkIdentitySubjectVisibility"
+      ],
+      "stock": {
+        "BenchmarkIdentitySubjectVisibility": "default"
+      }
+    },
+    "json-quote": {
+      "fixtures": [
+        {
+          "functions": [],
+          "imports": [],
+          "name": "buf_quote_test.go",
+          "sha256": "f6f5f6869a72a6fd35c54b9ddff66dd341e9962d209a451cd3cc219193e274b9"
+        },
+        {
+          "functions": [],
+          "imports": [],
+          "name": "buf_quote_reference_test.go",
+          "sha256": "1c12228639bcf3cf6506c93f24772dc12bc93512ee3fb300079ef93b045a439d"
+        }
+      ],
+      "names": [
+        "BenchmarkJSONQuoteCandidate/ascii1024/current-2",
+        "BenchmarkJSONQuoteCandidate/ascii1024/manual-strict-2",
+        "BenchmarkJSONQuoteCandidate/ascii1024/stdlib-2",
+        "BenchmarkJSONQuoteCandidate/ascii16/current-2",
+        "BenchmarkJSONQuoteCandidate/ascii16/manual-strict-2",
+        "BenchmarkJSONQuoteCandidate/ascii16/stdlib-2",
+        "BenchmarkJSONQuoteCandidate/empty/current-2",
+        "BenchmarkJSONQuoteCandidate/empty/manual-strict-2",
+        "BenchmarkJSONQuoteCandidate/empty/stdlib-2",
+        "BenchmarkJSONQuoteCandidate/escapes24/current-2",
+        "BenchmarkJSONQuoteCandidate/escapes24/manual-strict-2",
+        "BenchmarkJSONQuoteCandidate/escapes24/stdlib-2",
+        "BenchmarkJSONQuoteCandidate/html/current-2",
+        "BenchmarkJSONQuoteCandidate/html/manual-strict-2",
+        "BenchmarkJSONQuoteCandidate/html/stdlib-2",
+        "BenchmarkJSONQuoteCandidate/unicode1026/current-2",
+        "BenchmarkJSONQuoteCandidate/unicode1026/manual-strict-2",
+        "BenchmarkJSONQuoteCandidate/unicode1026/stdlib-2",
+        "BenchmarkJSONQuoteCandidate/unicode24/current-2",
+        "BenchmarkJSONQuoteCandidate/unicode24/manual-strict-2",
+        "BenchmarkJSONQuoteCandidate/unicode24/stdlib-2"
+      ],
+      "roots": [
+        "BenchmarkJSONQuoteCandidate"
+      ],
+      "stock": {
+        "BenchmarkJSONQuoteCandidate": "api-non-identity"
+      }
+    },
+    "origin-run": {
+      "fixtures": [
+        {
+          "functions": [],
+          "imports": [],
+          "name": "response_origin_bench_test.go",
+          "sha256": "73022ebed1b57a2f54344199b406cbc20028063819f634c74eab84a867feb1e0"
+        },
+        {
+          "functions": [
+            "testResponseOrigin"
+          ],
+          "imports": [
+            "testing",
+            "time"
+          ],
+          "name": "response_origin_test.go",
+          "sha256": "42fb8c4bf2d07d23138b27c10302a54e42ab5de674b0ff890c55894e06cc5973"
+        }
+      ],
+      "names": [
+        "BenchmarkResponseOriginRun/bounded-2",
+        "BenchmarkResponseOriginRun/unbounded-2"
+      ],
+      "roots": [
+        "BenchmarkResponseOriginRun"
+      ],
+      "stock": {
+        "BenchmarkResponseOriginRun": "api-non-identity"
+      }
+    },
+    "request-values": {
+      "fixtures": [
+        {
+          "functions": [],
+          "imports": [],
+          "name": "request_value_bench_test.go",
+          "sha256": "2ea96ad21f5f589de2c05897c969c1e6c7d21a854654f84b3d27b5a9b337406b"
+        },
+        {
+          "functions": [],
+          "imports": [],
+          "name": "request_legacy_reference_test.go",
+          "sha256": "7b9c4f7403501466b38d166e0c52b986c214a0c6e1ee3b26c6efe7a49d6251e5"
+        },
+        {
+          "functions": [],
+          "imports": [],
+          "name": "request_value_reference_test.go",
+          "sha256": "4ef82704e6ff1bc55e7ceae464a6ba91ab7af2c238dcb6ca9e670fac1475a027"
+        },
+        {
+          "functions": [
+            "staticValueRequest"
+          ],
+          "imports": [
+            "encoding/json"
+          ],
+          "name": "request_value_test.go",
+          "sha256": "f083ebc56e1533c19409b3e8794b2c4318012cc586174f932b69680dad2b4ae5"
+        }
+      ],
+      "names": [
+        "BenchmarkStaticParamSlot/previous-2",
+        "BenchmarkStaticParamSlot/static-2",
+        "BenchmarkStaticValueParams/BoolArray/0/Binary/previous-2",
+        "BenchmarkStaticValueParams/BoolArray/0/Binary/static-2",
+        "BenchmarkStaticValueParams/BoolArray/0/JSON/previous-2",
+        "BenchmarkStaticValueParams/BoolArray/0/JSON/static-2",
+        "BenchmarkStaticValueParams/BoolArray/1/Binary/previous-2",
+        "BenchmarkStaticValueParams/BoolArray/1/Binary/static-2",
+        "BenchmarkStaticValueParams/BoolArray/1/JSON/previous-2",
+        "BenchmarkStaticValueParams/BoolArray/1/JSON/static-2",
+        "BenchmarkStaticValueParams/BoolArray/128/Binary/previous-2",
+        "BenchmarkStaticValueParams/BoolArray/128/Binary/static-2",
+        "BenchmarkStaticValueParams/BoolArray/128/JSON/previous-2",
+        "BenchmarkStaticValueParams/BoolArray/128/JSON/static-2",
+        "BenchmarkStaticValueParams/Bytes/Binary/previous-2",
+        "BenchmarkStaticValueParams/Bytes/Binary/static-2",
+        "BenchmarkStaticValueParams/Bytes/JSON/previous-2",
+        "BenchmarkStaticValueParams/Bytes/JSON/static-2",
+        "BenchmarkStaticValueParams/BytesArray/0/Binary/previous-2",
+        "BenchmarkStaticValueParams/BytesArray/0/Binary/static-2",
+        "BenchmarkStaticValueParams/BytesArray/0/JSON/previous-2",
+        "BenchmarkStaticValueParams/BytesArray/0/JSON/static-2",
+        "BenchmarkStaticValueParams/BytesArray/1/Binary/previous-2",
+        "BenchmarkStaticValueParams/BytesArray/1/Binary/static-2",
+        "BenchmarkStaticValueParams/BytesArray/1/JSON/previous-2",
+        "BenchmarkStaticValueParams/BytesArray/1/JSON/static-2",
+        "BenchmarkStaticValueParams/BytesArray/128/Binary/previous-2",
+        "BenchmarkStaticValueParams/BytesArray/128/Binary/static-2",
+        "BenchmarkStaticValueParams/BytesArray/128/JSON/previous-2",
+        "BenchmarkStaticValueParams/BytesArray/128/JSON/static-2",
+        "BenchmarkStaticValueParams/DateTimeArray/0/Binary/previous-2",
+        "BenchmarkStaticValueParams/DateTimeArray/0/Binary/static-2",
+        "BenchmarkStaticValueParams/DateTimeArray/0/JSON/previous-2",
+        "BenchmarkStaticValueParams/DateTimeArray/0/JSON/static-2",
+        "BenchmarkStaticValueParams/DateTimeArray/1/Binary/previous-2",
+        "BenchmarkStaticValueParams/DateTimeArray/1/Binary/static-2",
+        "BenchmarkStaticValueParams/DateTimeArray/1/JSON/previous-2",
+        "BenchmarkStaticValueParams/DateTimeArray/1/JSON/static-2",
+        "BenchmarkStaticValueParams/DateTimeArray/128/Binary/previous-2",
+        "BenchmarkStaticValueParams/DateTimeArray/128/Binary/static-2",
+        "BenchmarkStaticValueParams/DateTimeArray/128/JSON/previous-2",
+        "BenchmarkStaticValueParams/DateTimeArray/128/JSON/static-2",
+        "BenchmarkStaticValueParams/Decimal/Binary/previous-2",
+        "BenchmarkStaticValueParams/Decimal/Binary/static-2",
+        "BenchmarkStaticValueParams/Decimal/JSON/previous-2",
+        "BenchmarkStaticValueParams/Decimal/JSON/static-2",
+        "BenchmarkStaticValueParams/DecimalArray/0/Binary/previous-2",
+        "BenchmarkStaticValueParams/DecimalArray/0/Binary/static-2",
+        "BenchmarkStaticValueParams/DecimalArray/0/JSON/previous-2",
+        "BenchmarkStaticValueParams/DecimalArray/0/JSON/static-2",
+        "BenchmarkStaticValueParams/DecimalArray/1/Binary/previous-2",
+        "BenchmarkStaticValueParams/DecimalArray/1/Binary/static-2",
+        "BenchmarkStaticValueParams/DecimalArray/1/JSON/previous-2",
+        "BenchmarkStaticValueParams/DecimalArray/1/JSON/static-2",
+        "BenchmarkStaticValueParams/DecimalArray/128/Binary/previous-2",
+        "BenchmarkStaticValueParams/DecimalArray/128/Binary/static-2",
+        "BenchmarkStaticValueParams/DecimalArray/128/JSON/previous-2",
+        "BenchmarkStaticValueParams/DecimalArray/128/JSON/static-2",
+        "BenchmarkStaticValueParams/Duration/Binary/previous-2",
+        "BenchmarkStaticValueParams/Duration/Binary/static-2",
+        "BenchmarkStaticValueParams/Duration/JSON/previous-2",
+        "BenchmarkStaticValueParams/Duration/JSON/static-2",
+        "BenchmarkStaticValueParams/DurationArray/0/Binary/previous-2",
+        "BenchmarkStaticValueParams/DurationArray/0/Binary/static-2",
+        "BenchmarkStaticValueParams/DurationArray/0/JSON/previous-2",
+        "BenchmarkStaticValueParams/DurationArray/0/JSON/static-2",
+        "BenchmarkStaticValueParams/DurationArray/1/Binary/previous-2",
+        "BenchmarkStaticValueParams/DurationArray/1/Binary/static-2",
+        "BenchmarkStaticValueParams/DurationArray/1/JSON/previous-2",
+        "BenchmarkStaticValueParams/DurationArray/1/JSON/static-2",
+        "BenchmarkStaticValueParams/DurationArray/128/Binary/previous-2",
+        "BenchmarkStaticValueParams/DurationArray/128/Binary/static-2",
+        "BenchmarkStaticValueParams/DurationArray/128/JSON/previous-2",
+        "BenchmarkStaticValueParams/DurationArray/128/JSON/static-2",
+        "BenchmarkStaticValueParams/FloatArray/0/Binary/previous-2",
+        "BenchmarkStaticValueParams/FloatArray/0/Binary/static-2",
+        "BenchmarkStaticValueParams/FloatArray/0/JSON/previous-2",
+        "BenchmarkStaticValueParams/FloatArray/0/JSON/static-2",
+        "BenchmarkStaticValueParams/FloatArray/1/Binary/previous-2",
+        "BenchmarkStaticValueParams/FloatArray/1/Binary/static-2",
+        "BenchmarkStaticValueParams/FloatArray/1/JSON/previous-2",
+        "BenchmarkStaticValueParams/FloatArray/1/JSON/static-2",
+        "BenchmarkStaticValueParams/FloatArray/128/Binary/previous-2",
+        "BenchmarkStaticValueParams/FloatArray/128/Binary/static-2",
+        "BenchmarkStaticValueParams/FloatArray/128/JSON/previous-2",
+        "BenchmarkStaticValueParams/FloatArray/128/JSON/static-2",
+        "BenchmarkStaticValueParams/RawJSON/72KB/Binary/previous-2",
+        "BenchmarkStaticValueParams/RawJSON/72KB/Binary/static-2",
+        "BenchmarkStaticValueParams/RawJSON/72KB/JSON/previous-2",
+        "BenchmarkStaticValueParams/RawJSON/72KB/JSON/static-2",
+        "BenchmarkStaticValueParams/RawJSON/short/Binary/previous-2",
+        "BenchmarkStaticValueParams/RawJSON/short/Binary/static-2",
+        "BenchmarkStaticValueParams/RawJSON/short/JSON/previous-2",
+        "BenchmarkStaticValueParams/RawJSON/short/JSON/static-2",
+        "BenchmarkStaticValueParams/RawJSONArray/0/Binary/previous-2",
+        "BenchmarkStaticValueParams/RawJSONArray/0/Binary/static-2",
+        "BenchmarkStaticValueParams/RawJSONArray/0/JSON/previous-2",
+        "BenchmarkStaticValueParams/RawJSONArray/0/JSON/static-2",
+        "BenchmarkStaticValueParams/RawJSONArray/1/Binary/previous-2",
+        "BenchmarkStaticValueParams/RawJSONArray/1/Binary/static-2",
+        "BenchmarkStaticValueParams/RawJSONArray/1/JSON/previous-2",
+        "BenchmarkStaticValueParams/RawJSONArray/1/JSON/static-2",
+        "BenchmarkStaticValueParams/RawJSONArray/128/Binary/previous-2",
+        "BenchmarkStaticValueParams/RawJSONArray/128/Binary/static-2",
+        "BenchmarkStaticValueParams/RawJSONArray/128/JSON/previous-2",
+        "BenchmarkStaticValueParams/RawJSONArray/128/JSON/static-2",
+        "BenchmarkStaticValueParams/UUID/Binary/previous-2",
+        "BenchmarkStaticValueParams/UUID/Binary/static-2",
+        "BenchmarkStaticValueParams/UUID/JSON/previous-2",
+        "BenchmarkStaticValueParams/UUID/JSON/static-2"
+      ],
+      "roots": [
+        "BenchmarkStaticValueParams",
+        "BenchmarkStaticParamSlot"
+      ],
+      "stock": {
+        "BenchmarkStaticParamSlot": "api-non-identity",
+        "BenchmarkStaticValueParams": "api-non-identity"
+      }
+    },
+    "ws-auth-expired": {
+      "fixtures": [
+        {
+          "functions": [],
+          "imports": [],
+          "name": "websocket_write_bench_test.go",
+          "sha256": "0507874cdbaece00383797313043634ca448479cdb7fccf8e7bab067095806b5"
+        }
+      ],
+      "names": [
+        "BenchmarkWSAuthenticationExpiredParent/MessageBinary-2",
+        "BenchmarkWSAuthenticationExpiredParent/MessageText-2"
+      ],
+      "roots": [
+        "BenchmarkWSAuthenticationExpiredParent"
+      ],
+      "stock": {
+        "BenchmarkWSAuthenticationExpiredParent": "api-non-identity"
+      }
+    }
+  },
+  "routes": [
+    {
+      "artifact": 15154280432,
+      "confirmed": [
+        {
+          "name": "BenchmarkHandlerResponseBuffer/Int-2",
+          "projection": "handler-buffer",
+          "root": "BenchmarkHandlerResponseBuffer"
+        },
+        {
+          "name": "BenchmarkStaticValueParams/Bytes/JSON/previous-2",
+          "projection": "request-values",
+          "root": "BenchmarkStaticValueParams"
+        },
+        {
+          "name": "BenchmarkStaticValueParams/BytesArray/1/JSON/previous-2",
+          "projection": "request-values",
+          "root": "BenchmarkStaticValueParams"
+        }
+      ],
+      "cpu": "AMD EPYC 9V45 96-Core Processor",
+      "job": 140159205243,
+      "sha256": "4eb90d4e148fa88a69b2820d0751542c557a3febea31d88204fb5cfd45be707b",
+      "shard": "01"
+    },
+    {
+      "artifact": 15153537124,
+      "confirmed": [
+        {
+          "name": "BenchmarkIdentitySubjectVisibility/value/reference-2",
+          "projection": "identity-subject",
+          "root": "BenchmarkIdentitySubjectVisibility"
+        }
+      ],
+      "cpu": "AMD EPYC 9V74 80-Core Processor",
+      "job": 140159205311,
+      "sha256": "f10aa62e35da464c374880dfc15db8e878ee075368d864859776f0c0c1ae3625",
+      "shard": "02"
+    },
+    {
+      "artifact": 15153262390,
+      "confirmed": [
+        {
+          "name": "BenchmarkHTTPHandlerCompletion/json/unobserved/error-2",
+          "projection": "http-completion",
+          "root": "BenchmarkHTTPHandlerCompletion"
+        },
+        {
+          "name": "BenchmarkWSAuthenticationExpiredParent/MessageBinary-2",
+          "projection": "ws-auth-expired",
+          "root": "BenchmarkWSAuthenticationExpiredParent"
+        },
+        {
+          "name": "BenchmarkWSAuthenticationExpiredParent/MessageText-2",
+          "projection": "ws-auth-expired",
+          "root": "BenchmarkWSAuthenticationExpiredParent"
+        }
+      ],
+      "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+      "job": 140159205224,
+      "sha256": "25d6ee1225f7491ec9a5740f31ca48369d5315840ce2a648436d96c4e4fc5cca",
+      "shard": "03"
+    },
+    {
+      "artifact": 15153257255,
+      "confirmed": [
+        {
+          "name": "BenchmarkResponseOriginRun/unbounded-2",
+          "projection": "origin-run",
+          "root": "BenchmarkResponseOriginRun"
+        }
+      ],
+      "cpu": "Intel(R) Xeon(R) 6975P-C",
+      "job": 140159205182,
+      "sha256": "b523444ce96c650d25669be55d7d969be5bc23b83c228316cd575f0493e3ad8a",
+      "shard": "06"
+    },
+    {
+      "artifact": 15152858824,
+      "confirmed": [
+        {
+          "name": "BenchmarkBodyRead/0/direct-2",
+          "projection": "body-read",
+          "root": "BenchmarkBodyRead"
+        },
+        {
+          "name": "BenchmarkJSONQuoteCandidate/empty/current-2",
+          "projection": "json-quote",
+          "root": "BenchmarkJSONQuoteCandidate"
+        },
+        {
+          "name": "BenchmarkStaticParamSlot/static-2",
+          "projection": "request-values",
+          "root": "BenchmarkStaticParamSlot"
+        }
+      ],
+      "cpu": "AMD EPYC 7763 64-Core Processor",
+      "job": 140159205370,
+      "sha256": "44a8759b5dc06bef87bc7dd9e009780b1be1e12e09cdfecf7c79127fa93b25f9",
+      "shard": "08"
+    }
+  ],
+  "run": 45892462352
+}

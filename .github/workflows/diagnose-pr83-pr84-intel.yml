@@ -1,20 +1,20 @@
-name: Attribute the shared PR 83 and 84 Intel performance signal
+name: Recheck #84 unqualified API benchmarks on their original runner models
 
 on:
   push:
-    branches: [diagnostics/pr83-pr84-intel]
-    paths:
-      - '.github/workflows/diagnose-pr83-pr84-intel.yml'
-      - 'scripts/diagnose-pr83-pr84-intel/**'
+    branches: [diagnostics/pr84-original-layout, 'diagnostics/pr84-original-layout-*']
 
 permissions:
   contents: read
 
 jobs:
-  intel:
-    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr83-pr84-intel'
+  witness:
     runs-on: ubuntu-24.04
-    timeout-minutes: 42
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6]
     env:
       GOTOOLCHAIN: local
     steps:
@@ -23,49 +23,74 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
-      - name: Require the original hosted processor before setup
+      - name: Match an original runner CPU before setup or build
+        id: route
+        shell: bash
         env:
           RUNNER_KIND: ${{ runner.environment }}
-        run: python3 -I -B scripts/diagnose-pr83-pr84-intel/run.py --probe
+        run: |
+          set -euo pipefail
+          python3 -I -B scripts/diagnose-pr83-pr84-intel/run.py --probe
 
-      - uses: actions/setup-go@v7
+      - if: steps.route.outputs.shard != ''
+        uses: actions/setup-go@v7
         with:
           go-version: '1.27.1'
           cache: false
 
-      - uses: actions/checkout@v7
+      - if: steps.route.outputs.shard != ''
+        uses: actions/checkout@v7
         with:
-          ref: 5017b587f4cf71d30ebba8b542267aed597bb573
-          path: .tmp/pr83-pr84-intel-checkouts/83A
+          ref: 43dd9d4e5eb8fb59573fd3bdfd7de7b5b6814879
+          path: .tmp/pr84-native-inputs/A
           persist-credentials: false
 
-      - uses: actions/checkout@v7
+      - if: steps.route.outputs.shard != ''
+        uses: actions/checkout@v7
         with:
-          ref: a6cca9106891c4207a90358642242b47590a5703
-          path: .tmp/pr83-pr84-intel-checkouts/83H
+          ref: 9c174866c68a8cbd241720cbf2c13c1ea8d4c9f4
+          path: .tmp/pr84-native-inputs/H
           fetch-depth: 2
           persist-credentials: false
 
-      - uses: actions/checkout@v7
-        with:
-          ref: 59a4167f129f0bff0e8425125fa02eae87fd347b
-          path: .tmp/pr83-pr84-intel-checkouts/84A
-          persist-credentials: false
-
-      - uses: actions/checkout@v7
-        with:
-          ref: 79ad754c69deb94196d8d9dc4accefee4ebd58c2
-          path: .tmp/pr83-pr84-intel-checkouts/84H
-          fetch-depth: 2
-          persist-credentials: false
-
-      - name: Compare stock and single-file benchmark builds with the original gate
-        run: python3 -I -B scripts/diagnose-pr83-pr84-intel/run.py
+      - if: steps.route.outputs.shard != ''
+        name: Run the original comparison followed by the matched fixture projection
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+          ORIGINAL_SHARD: ${{ steps.route.outputs.shard }}
+        run: python3 -I -B scripts/diagnose-pr83-pr84-intel/run.py "$ORIGINAL_SHARD"
 
       - if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: pr83-pr84-intel-projected-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .tmp/pr83-pr84-intel-evidence/
+          name: pr84-original-layout-${{ github.run_id }}-${{ github.run_attempt }}-slot-${{ matrix.slot }}
+          path: .tmp/pr84-native-evidence
           if-no-files-found: error
           retention-days: 14
+
+  qualification:
+    needs: [witness]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/diagnose-pr83-pr84-intel
+          persist-credentials: false
+
+      - name: Report strict results and any original CPU models still missing
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          results=$(mktemp -d .tmp/pr84-native-receipts.XXXXXXXX)
+          trap 'rm -rf -- "$results"' EXIT
+          gh run download "$GITHUB_RUN_ID" --pattern "pr84-original-layout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-slot-*" --dir "$results"
+          python3 -I -B scripts/diagnose-pr83-pr84-intel/run.py --summarize "$results"
