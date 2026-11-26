@@ -61,9 +61,12 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           read -r head parent extra <<< "$(git rev-list --parents -n 1 HEAD)"
           test "$head" = "$GITHUB_SHA"
-          test "$parent" = 14d6c0b37aff33bd052dcb990ab70b126ead093b
+          test "$parent" = 29265b55f1107ccdef607a4ab99f203efc3e3151
           test -z "$extra"
-          test "$(git diff --no-renames --name-only "$parent" HEAD)" = .github/workflows/diagnose-pr81-error-validation.yml
+          test "$(git diff --no-renames --name-only "$parent" HEAD)" = "$(printf '%s\n' \
+            .github/workflows/diagnose-pr81-error-validation.yml \
+            scripts/diagnose-pr81-error-validation/product.patch.b64 \
+            scripts/diagnose-pr81-error-validation/run.sh)"
       - uses: actions/setup-go@v7
         with:
           go-version: '1.27.1'
