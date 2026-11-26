@@ -611,6 +611,53 @@ func TestCompileYieldExprInForExpr(t *testing.T) {
 	}
 }
 
+func TestAddressedYieldPreservesReturnTargets(t *testing.T) {
+	for _, sample := range []struct {
+		name, result string
+		inline       *inlineValueScope
+	}{
+		{"closure", "return &_yield0\n", nil},
+		{"inline", "result = &_yield0\nbreak done\n", &inlineValueScope{
+			controlScope: controlScope{label: "done"}, result: "result", yield: true,
+		}},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			c := newCompiler(nil)
+			c.indent, c.inForExpr, c.yieldAddr, c.inlineValue = "", true, true, sample.inline
+			item := &ast.Ident{Name: "item", TypeTagged: ast.TypeTagged{TypeTag: "Int"}}
+			c.compileExpr(&ast.YieldExpr{Value: item})
+			if got, want := compilerOut(c), "var _yield0 int64 = item\n"+sample.result; got != want {
+				t.Fatalf("yield generated %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestConditionalValueReturnWritesWithoutTemporaryAllocation(t *testing.T) {
+	const want = "\tif item > 0 { return true }\n"
+	c := newCompiler(nil)
+	c.indent = "\t"
+	condition, value := strings.Clone("item > 0"), strings.Clone("true")
+	reset := func() {
+		c.b.Reset()
+		c.b.Grow(len(want))
+	}
+	baseline := testing.AllocsPerRun(20, func() {
+		reset()
+		c.b.WriteString(want)
+	})
+	got := testing.AllocsPerRun(20, func() {
+		reset()
+		c.writeConditionalValue(condition, value)
+	})
+	if out := compilerOut(c); out != want {
+		t.Fatalf("conditional return generated %q, want %q", out, want)
+	}
+	if got != baseline {
+		t.Fatalf("conditional return allocated %g beyond its output buffer", got-baseline)
+	}
+}
+
 // ─── compileExpr — CallExpr (generic) ───────────────────────────────────────
 
 func TestCompileCallGeneric(t *testing.T) {

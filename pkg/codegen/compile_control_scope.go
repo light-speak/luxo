@@ -57,19 +57,29 @@ func containsAwaitReturn(expr ast.Expr) bool {
 
 func (c *compiler) writeValueCompletion(indent, value string) {
 	if c.inlineValue == nil {
-		c.b.WriteString(c.indent)
-		c.b.WriteString(indent)
-		c.b.WriteString("return ")
-		c.b.WriteString(value)
-		c.b.WriteByte('\n')
+		c.writeValueReturn(indent, "", value)
 		return
 	}
 	c.writeInlineValue(c.inlineValue, indent, value)
 }
 
+func (c *compiler) writeValueReturn(indent, prefix, value string) {
+	c.b.WriteString(c.indent)
+	c.b.WriteString(indent)
+	c.b.WriteString("return ")
+	c.b.WriteString(prefix)
+	c.b.WriteString(value)
+	c.b.WriteByte('\n')
+}
+
 func (c *compiler) writeConditionalValue(condition, value string) {
 	if c.inlineValue == nil {
-		c.write("if %s { return %s }", condition, value)
+		c.b.WriteString(c.indent)
+		c.b.WriteString("if ")
+		c.b.WriteString(condition)
+		c.b.WriteString(" { return ")
+		c.b.WriteString(value)
+		c.b.WriteString(" }\n")
 		return
 	}
 	c.write("if %s {", condition)
@@ -82,14 +92,14 @@ func (c *compiler) writeInlineValue(scope *inlineValueScope, indent, value strin
 	c.write("%sbreak %s", indent, c.controlLabel(&scope.controlScope))
 }
 
-func (c *compiler) writeYieldResult(value string) {
+func (c *compiler) writeYieldResult(prefix, value string) {
 	for scope := c.inlineValue; scope != nil; scope = scope.outer {
 		if scope.yield {
-			c.writeInlineValue(scope, "", value)
+			c.writeInlineValue(scope, "", prefix+value)
 			return
 		}
 	}
-	c.write("return %s", value)
+	c.writeValueReturn("", prefix, value)
 }
 
 func (c *compiler) inlineWhenReturn() *inlineValueScope {

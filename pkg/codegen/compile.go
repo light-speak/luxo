@@ -1399,9 +1399,9 @@ func (c *compiler) compileBlockExpr(expr ast.Expr) string {
 				} else {
 					c.write("%s := %s", name, val)
 				}
-				c.writeYieldResult("&" + name)
+				c.writeYieldResult("&", name)
 			} else {
-				c.writeYieldResult(val)
+				c.writeYieldResult("", val)
 			}
 		} else {
 			c.write("_yieldResult = %s", val)
