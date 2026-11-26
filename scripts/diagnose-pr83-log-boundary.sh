@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export LC_ALL=C GOTOOLCHAIN=local
+mode=stock
+candidate=head
+comparison_forward=ab
+comparison_control=bb
+if [[ "${1:-}" == --project-test ]]; then
+    mode=projected
+    candidate=projected
+    comparison_forward=ap
+    comparison_control=pp
+    shift
+fi
 
 schedule() {
     local group round order offset index name left right
-    local comparisons=(aa:base:base ab:base:head bb:head:head)
+    local comparisons=(aa:base:base "$comparison_forward:base:$candidate" "$comparison_control:$candidate:$candidate")
     printf 'comparison\tgroup\tpair\torder\tleft\tright\n'
     for group in 1 2; do
         for round in {1..10}; do
@@ -36,6 +47,11 @@ control="$work/pr83-control"
 base_checkout="$work/pr83-base"
 head_git="$work/pr83-head"
 evidence="$work/pr83-log-boundary-evidence"
+control_parent=$head
+if [[ "$mode" == projected ]]; then
+    evidence="$work/pr83-log-projected-evidence"
+    control_parent=3a82a85f4c3a35512fcec0e6a220772ea515a80a
+fi
 verify="$control/scripts/diagnose-pr83-log-boundary.py"
 g() { git --no-replace-objects -C "$@"; }
 
@@ -44,9 +60,17 @@ test "$(sed -n 's/^actual=//p' "$evidence/runner-route.txt")" = "$cpu"
 test "$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | sed 's/[[:space:]]*$//')" = "$cpu"
 test "$(go env GOVERSION GOOS GOARCH GOAMD64 CGO_ENABLED)" = $'go1.27.1\nlinux\namd64\nv1\n1'
 test -z "$(go env GOFLAGS)"
-test "$(g "$control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $head"
-diff -u <(printf 'A\t%s\n' .github/workflows/diagnose-pr83-log-boundary.yml scripts/diagnose-pr83-log-boundary.py scripts/diagnose-pr83-log-boundary.sh) \
-    <(g "$control" diff --name-status "$head" HEAD)
+test "$(g "$control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $control_parent"
+if [[ "$mode" == projected ]]; then
+    test "$(g "$control" rev-parse "$control_parent^{tree}")" = 698e4cacc33b095f7217d66a85070012bdadef3f
+    test "$(g "$control" show -s --format=%P "$control_parent")" = "$head"
+    diff -u <(printf 'A\t%s\nM\t%s\nM\t%s\n' .github/workflows/diagnose-pr83-log-boundary-project-test.yml \
+        scripts/diagnose-pr83-log-boundary.py scripts/diagnose-pr83-log-boundary.sh) \
+        <(g "$control" diff --name-status "$control_parent" HEAD)
+else
+    diff -u <(printf 'A\t%s\n' .github/workflows/diagnose-pr83-log-boundary.yml scripts/diagnose-pr83-log-boundary.py scripts/diagnose-pr83-log-boundary.sh) \
+        <(g "$control" diff --name-status "$head" HEAD)
+fi
 test "$(g "$base_checkout" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$base" 91dffe0aa1df765fa6c06da63dee7aff3b29aa79)"
 test "$(g "$head_git" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$head" 094eba692d89593c05fb066302a3b7415aebd6ef)"
 test "$(g "$head_git" cat-file commit "$head" | sed -n 's/^parent //p')" = \
@@ -88,8 +112,20 @@ export TMPDIR="$scratch/tmp" GOTMPDIR="$scratch/tmp" GOCACHE="$scratch/go-cache"
 gh api repos/light-speak/luxo/actions/runs/45821350412/attempts/1 > "$evidence/original-run.json"
 gh api repos/light-speak/luxo/actions/artifacts/15120416499 > "$evidence/original-metadata.json"
 gh api repos/light-speak/luxo/actions/artifacts/15120416499/zip > "$scratch/original.zip"
-unset GH_TOKEN
 python3 -I -B "$verify" plan "$scratch/original.zip" "$evidence/original-metadata.json" "$evidence/original-run.json" "$evidence"
+if [[ "$mode" == projected ]]; then
+    prior="$scratch/stock"
+    mkdir "$prior"
+    gh api repos/light-speak/luxo/actions/runs/45829013113/attempts/1 > "$prior/run.json"
+    for slot in 1 2; do
+        artifact=15121816705
+        if [[ "$slot" == 2 ]]; then artifact=15122226439; fi
+        gh api "repos/light-speak/luxo/actions/artifacts/$artifact" > "$prior/$slot.json"
+        gh api "repos/light-speak/luxo/actions/artifacts/$artifact/zip" > "$prior/$slot.zip"
+    done
+    python3 -I -B "$verify" verify-stock "$prior" "$evidence"
+fi
+unset GH_TOKEN
 g "$head_git" archive "$head" | tar -xf - -C "$head_archive"
 sh "$head_archive/scripts/setup-modules.sh" "$base_checkout"
 sh "$head_archive/scripts/setup-modules.sh" "$head_archive"
@@ -107,7 +143,7 @@ test "$pkg" = "$package" && test "$profile" = api-non-identity
 source_for() {
     case "$1" in
         base) printf '%s\n' "$base_checkout" ;;
-        head) printf '%s\n' "$head_archive" ;;
+        head|projected) printf '%s\n' "$head_archive" ;;
         *) return 2 ;;
     esac
 }
@@ -120,6 +156,9 @@ record_binary() {
     readelf -WhlS "$binary" > "$evidence/$arm.readelf.txt"
     go tool nm -size -sort address "$binary" > "$scratch/$arm.nm"
     grep -E "$symbols" "$scratch/$arm.nm" > "$evidence/$arm.symbols.txt"
+    if [[ "$mode" == projected ]]; then
+        verify_projected_symbols "$arm"
+    fi
     go tool objdump -s "$symbols" "$binary" > "$evidence/$arm.objdump.txt"
     grep -q 'BenchmarkRequestLogBoundary' "$evidence/$arm.objdump.txt"
     grep -q 'BenchmarkRequestLogDelivered' "$evidence/$arm.objdump.txt"
@@ -128,17 +167,59 @@ record_binary() {
     rm -- "$scratch/$arm.text" "$scratch/$arm.objcopy" "$scratch/$arm.nm"
 }
 
+verify_projected_symbols() {
+    local arm=$1 symbol expected
+    local prefix=github.com/light-speak/luxo/pkg/lux/api.
+    awk '{print $4}' "$scratch/$arm.nm" > "$scratch/$arm.names"
+    for symbol in BenchmarkRequestLogBoundary BenchmarkRequestLogBoundary.func1 BenchmarkRequestLogDelivered BenchmarkRequestLogDelivered.func1 \
+        '(*Router).logRequestTiming' '(*asyncRequestLogs).run' '(*asyncRequestLogs).close'; do
+        test "$(grep -Fxc "$prefix$symbol" "$scratch/$arm.names" || true)" = 1
+    done
+    expected=0
+    if [[ "$arm" == projected ]]; then expected=1; fi
+    test "$(grep -Fxc "$prefix(*asyncRequestLogs).finishWorker" "$scratch/$arm.names" || true)" = "$expected"
+    if grep -E 'TestAsyncRequestLogsAbnormalWriter(DrainsAndStops|PreservesFirstError)' "$scratch/$arm.names"; then
+        return 1
+    fi
+}
+
+project_test_fixture() {
+    local fixture="$package/request_log_async_test.go"
+    local product="$package/request_log_async.go"
+    cmp "$head_archive/$fixture" "$head_git/$fixture"
+    cmp "$head_archive/$product" "$head_git/$product"
+    printf '%s  %s\n' ce47aebb7d132885536fe9eb2fb4a12b1f08d7b0d68ecc3b5f24b10b4dd720dc "$base_checkout/$fixture" \
+        18953d4af73fe0cdc9d8cbced337215e73f2eade18d892a31322534ca3a9c022 "$head_archive/$fixture" \
+        6dc7ca72cbfcf29fd5e6f30b6010b7b44bbaea9f65ecff6d96f7ba46915a1c48 "$head_archive/$product" \
+        > "$evidence/projection-inputs.sha256"
+    sha256sum -c "$evidence/projection-inputs.sha256"
+    cp "$base_checkout/$fixture" "$head_archive/$fixture"
+    cmp "$head_archive/$fixture" "$base_checkout/$fixture"
+    sha256sum "$head_archive/$fixture" "$head_archive/$product" > "$evidence/projection-compile.sha256"
+}
+
 sample() {
     "$tools/benchrun" run-performance "$(source_for "$1")" "$tools/$1" "$package" "$profile" \
         -test.run='^$' -test.bench="$filter" -test.benchmem -test.benchtime="$2" -test.count=1 -test.cpu=2 >> "$3"
 }
 
-for arm in base head; do
+for arm in base "$candidate"; do
     mkdir "$tools/$arm"
     compile=compile-performance
     if [[ "$arm" == base ]]; then compile=compile-performance-baseline; fi
+    if [[ "$arm" == projected ]]; then project_test_fixture; fi
     "$tools/benchrun" "$compile" "$(source_for "$arm")" "$tools/$arm" "$package" "$profile" > "$evidence/$arm.compile.log" 2>&1
+    if [[ "$arm" == projected ]]; then
+        fixture="$package/request_log_async_test.go"
+        cp "$head_git/$fixture" "$head_archive/$fixture"
+        sha256sum -c "$evidence/projection-inputs.sha256"
+    fi
     record_binary "$arm"
+    if [[ "$mode" == projected && "$arm" == base ]]; then
+        cut -d ' ' -f 1 "$evidence/base.sha256" | cmp - "$evidence/stock-base.sha256"
+        cut -d ' ' -f 1 "$evidence/base.text.sha256" | cmp - "$evidence/stock-base.text.sha256"
+        cmp "$evidence/base.symbols.txt" "$evidence/stock-base.symbols.txt"
+    fi
     sample "$arm" 1x "$evidence/$arm.inventory.raw"
     python3 -I -B "$verify" verify-samples 1 "$evidence/$arm.inventory.raw"
 done
@@ -170,7 +251,7 @@ done < <(tail -n +2 "$evidence/order.tsv")
 
 unstable=0
 for group in 1 2; do
-    for comparison in aa ab bb; do
+    for comparison in aa "$comparison_forward" "$comparison_control"; do
         prefix="$evidence/$comparison.$group"
         for side in left right; do
             python3 -I -B "$verify" verify-samples 10 "$prefix.$side.raw"
@@ -178,16 +259,16 @@ for group in 1 2; do
         done
         "$tools/benchplan" --verify "$evidence/expected.json" "$prefix.left.txt" "$prefix.right.txt"
         compare "$prefix.left.txt" "$prefix.right.txt" "$prefix"
-        if [[ "$comparison" == ab ]]; then continue; fi
+        if [[ "$comparison" == "$comparison_forward" ]]; then continue; fi
         compare "$prefix.right.txt" "$prefix.left.txt" "$prefix.reverse"
         gate "$comparison.$group" "$prefix.csv" || unstable=1
         gate "$comparison.$group.reverse" "$prefix.reverse.csv" || unstable=1
     done
 done
-sha256sum -c "$evidence"/{base,head}.sha256
+sha256sum -c "$evidence/base.sha256" "$evidence/$candidate.sha256"
 result=0
-gate ab-combined --approved-costs "$head_git/scripts/benchgate/approved-costs.json" --base-sha "$base" \
-    "$evidence/ab.1.csv" "$evidence/ab.2.csv" || result=$?
+gate "$comparison_forward-combined" --approved-costs "$head_git/scripts/benchgate/approved-costs.json" --base-sha "$base" \
+    "$evidence/$comparison_forward.1.csv" "$evidence/$comparison_forward.2.csv" || result=$?
 
 if (( unstable )); then
     printf 'unstable-control\n' > "$evidence/outcome.txt"
@@ -195,7 +276,7 @@ if (( unstable )); then
 fi
 if (( result == 0 )); then
     printf 'no-confirmed-regression\n' > "$evidence/outcome.txt"
-elif grep -Eq '^performance gate rejected [1-9][0-9]* regression\(s\)$' "$evidence/ab-combined.gate.txt"; then
+elif grep -Eq '^performance gate rejected [1-9][0-9]* regression\(s\)$' "$evidence/$comparison_forward-combined.gate.txt"; then
     printf 'strict-performance-rejection\n' > "$evidence/outcome.txt"
 else
     printf 'diagnostic-gate-failure\n' > "$evidence/outcome.txt"
