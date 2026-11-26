@@ -11,6 +11,7 @@ import (
 
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 )
 
 var errEmptyStreamPayload = errors.New("rpc: empty stream data payload")
@@ -181,7 +182,6 @@ func (c *Client) SubscribeContext(ctx context.Context, bearerToken string, apiID
 	if err != nil {
 		return nil, fmt.Errorf("rpc: dial %s: %w", c.pool.addr, err)
 	}
-	conn = streamResponseConn(conn)
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
 			conn.Close()
@@ -295,8 +295,10 @@ func (s *Subscription) finish(err error) {
 }
 
 func (c *Client) callRequest(ctx context.Context, request callRequest) ([]byte, error) {
-	resp, err := c.exchangeRequest(ctx, nil, &request)
-	return decodeCallResponse(resp, err)
+	reply, err := c.exchangeRequest(ctx, nil, &request)
+	body, err := decodeCallResponse(reply.frame, err)
+	c.releaseReply(reply.conn, err)
+	return body, err
 }
 
 func decodeCallResponse(resp []byte, err error) ([]byte, error) {
@@ -320,27 +322,30 @@ func decodeCallResponse(resp []byte, err error) ([]byte, error) {
 	return body, nil
 }
 
-func (c *Client) exchange(ctx context.Context, payload []byte) ([]byte, error) {
-	return c.exchangeRequest(ctx, payload, nil)
+// A complete frame is still leased until its caller validates the response.
+// conn is nil if I/O, deadline cleanup, or cancellation closed the lease.
+type exchangeReply struct {
+	frame []byte
+	conn  net.Conn
 }
 
-func (c *Client) exchangeRequest(ctx context.Context, payload []byte, request *callRequest) ([]byte, error) {
+func (c *Client) exchangeRequest(ctx context.Context, payload []byte, request *callRequest) (exchangeReply, error) {
 	// Get pooled connection
 	conn, err := c.pool.GetContext(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("rpc: dial %s: %w", c.pool.addr, err)
+		return exchangeReply{}, fmt.Errorf("rpc: dial %s: %w", c.pool.addr, err)
 	}
 	if request != nil {
 		payload, err = request.prepare(conn)
 		if err != nil {
 			c.pool.Put(conn)
-			return nil, err
+			return exchangeReply{}, err
 		}
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetDeadline(deadline); err != nil {
 			conn.Close()
-			return nil, fmt.Errorf("rpc: deadline: %w", err)
+			return exchangeReply{}, fmt.Errorf("rpc: deadline: %w", err)
 		}
 	}
 	var stopCancel func() bool
@@ -358,9 +363,9 @@ func (c *Client) exchangeRequest(ctx context.Context, payload []byte, request *c
 	if err := writePreparedFrame(conn, payload); err != nil {
 		closeConnection()
 		if contextErr := contextErrorAfterIO(ctx, err); contextErr != nil {
-			return nil, contextErr
+			return exchangeReply{}, contextErr
 		}
-		return nil, fmt.Errorf("rpc: write: %w", err)
+		return exchangeReply{}, fmt.Errorf("rpc: write: %w", err)
 	}
 
 	scratch := payload[:4]
@@ -372,9 +377,9 @@ func (c *Client) exchangeRequest(ctx context.Context, payload []byte, request *c
 	if err != nil {
 		closeConnection()
 		if contextErr := contextErrorAfterIO(ctx, err); contextErr != nil {
-			return nil, contextErr
+			return exchangeReply{}, contextErr
 		}
-		return nil, fmt.Errorf("rpc: read: %w", err)
+		return exchangeReply{}, fmt.Errorf("rpc: read: %w", err)
 	}
 
 	reusable := true
@@ -384,22 +389,50 @@ func (c *Client) exchangeRequest(ctx context.Context, payload []byte, request *c
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		reusable = false
 	}
-	if reusable {
-		c.pool.Put(conn)
-	} else {
+	if !reusable {
 		conn.Close()
+		return exchangeReply{frame: resp}, nil
 	}
+	return exchangeReply{frame: resp, conn: conn}, nil
+}
 
-	return resp, nil
+func (c *Client) releaseReply(conn net.Conn, err error) {
+	if conn == nil {
+		return
+	}
+	if err != nil {
+		switch err.(type) {
+		case *luxerrors.AppError, tracePayloadError:
+			// A valid application error or a bounded trace payload still
+			// belongs to this exchange and consumes the complete response.
+		default:
+			conn.Close()
+			return
+		}
+	}
+	c.pool.Put(conn)
 }
 
 func (c *Client) callTracedPayload(ctx context.Context, payload []byte) ([]byte, api.DebugTraceSnapshot, error) {
-	resp, err := c.exchange(ctx, payload)
+	reply, err := c.exchangeRequest(ctx, payload, nil)
 	if err != nil {
 		return nil, api.DebugTraceSnapshot{}, err
 	}
-	return decodeTracedResponse(resp)
+	body, trace, err := decodeTracedResponse(reply.frame)
+	c.releaseReply(reply.conn, err)
+	return body, trace, err
 }
+
+type tracePayloadError struct{ error }
+
+func (e tracePayloadError) Error() string {
+	return fmt.Sprintf("rpc: decode traced response: %v", e.error)
+}
+
+func (e tracePayloadError) Unwrap() error { return e.error }
+
+// An invalid business error body retires the lease and preserves the trace failure.
+type invalidTracedErrorBody struct{ tracePayloadError }
 
 func decodeTracedResponse(resp []byte) ([]byte, api.DebugTraceSnapshot, error) {
 	if len(resp) == 0 {
@@ -421,11 +454,18 @@ func decodeTracedResponse(resp []byte) ([]byte, api.DebugTraceSnapshot, error) {
 		return nil, api.DebugTraceSnapshot{}, fmt.Errorf("rpc: traced response length exceeds frame")
 	}
 	end := start + int(traceLength)
+	body := resp[end:]
 	trace, err := api.DecodeDebugTrace(resp[start:end])
 	if err != nil {
-		return nil, api.DebugTraceSnapshot{}, fmt.Errorf("rpc: decode traced response: %w", err)
+		traceErr := tracePayloadError{err}
+		if status == statusTraceError {
+			fields, bodyErr := readRPCErrorFields(body)
+			if bodyErr != nil || fields.validate() != nil {
+				return nil, api.DebugTraceSnapshot{}, invalidTracedErrorBody{traceErr}
+			}
+		}
+		return nil, api.DebugTraceSnapshot{}, traceErr
 	}
-	body := resp[end:]
 	if status == statusTraceError {
 		return nil, trace, decodeError(body)
 	}

@@ -21,6 +21,13 @@ type poolLifecycleConn struct {
 	onClose func()
 }
 
+// Test the raw I/O lifecycle independently of response decoding.
+func (c *Client) exchange(ctx context.Context, payload []byte) ([]byte, error) {
+	reply, err := c.exchangeRequest(ctx, payload, nil)
+	c.releaseReply(reply.conn, nil)
+	return reply.frame, err
+}
+
 func TestClientExchangeDeadlineFailuresDoNotRecycleConnections(t *testing.T) {
 	for _, sample := range []struct {
 		name      string

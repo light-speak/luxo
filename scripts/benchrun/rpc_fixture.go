@@ -45,9 +45,12 @@ const (
 		"\nrpc-deadline-classification-overlay-v1 " + rpcDeadlineBenchmarkFixture + "=" + rpcDeadlineBenchmarkSHA +
 		" " + rpcDeadlineContextFixture + "=" + rpcDeadlineContextSHA +
 		"\nrpc-nil-context-guard-overlay-v1 " + rpcNilContextGuardFixture + "=" + rpcNilContextGuardSHA +
+		"\nrpc-prepared-frame-overlay-v1 " + rpcPreparedFrameFilename + "=" + rpcPreparedFrameProjectionSHA + " " + rpcPreparedFrameSourceSHA +
+		"\nqueue-stream-name-overlay-v1 " + queueStreamNameFilename + "=" + queueStreamNameProjectionSHA + " " + queueStreamNameSourceSHA +
 		"\nluvia-auth-middleware-overlay-v1 " + luviaAuthBenchmarkFixture + "=" + luviaAuthBenchmarkSHA +
 		" " + luviaAuthHelperFixture + "=" + luviaAuthHelperSHA +
-		"\napi-binary-param-lookup-overlay-v1 " + apiBinaryParamLookupFixture
+		"\napi-binary-param-lookup-overlay-v1 " + apiBinaryParamLookupFixture +
+		"\napi-request-log-overlay-v1 " + apiRequestLogFixture + "=" + apiRequestLogProjectionSHA + " " + apiRequestLogSourceSHA
 )
 
 func writeRPCOwnedRequestOverlay(pkg, workspace string) (string, error) {
@@ -136,15 +139,15 @@ var rpcDeadlineSources = map[string]rpcDeadlineSource{
 }
 
 func writeRPCDeadlineOverlay(pkg, workspace string) (string, error) {
-	return writeProjectedRPCTestOverlay(pkg, workspace, "RPC deadline", projectRPCDeadlineFixture,
+	return writeProjectedBenchmarkOverlay(pkg, workspace, "RPC deadline", projectRPCDeadlineFixture,
 		rpcDeadlineBenchmarkFixture, rpcDeadlineContextFixture)
 }
 
 func writeRPCNilContextGuardOverlay(pkg, workspace string) (string, error) {
-	return writeProjectedRPCTestOverlay(pkg, workspace, "RPC nil-context guard", projectRPCNilContextGuardFixture, rpcNilContextGuardFixture)
+	return writeProjectedBenchmarkOverlay(pkg, workspace, "RPC nil-context guard", projectRPCNilContextGuardFixture, rpcNilContextGuardFixture)
 }
 
-func writeProjectedRPCTestOverlay(pkg, workspace, description string, project func(string, string) (string, error), fixtures ...string) (string, error) {
+func writeProjectedBenchmarkOverlay(pkg, workspace, description string, project func(string, string) (string, error), fixtures ...string) (string, error) {
 	entries, err := os.ReadDir(pkg)
 	if err != nil {
 		return "", err

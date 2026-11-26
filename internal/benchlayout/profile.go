@@ -26,6 +26,12 @@ const (
 	RPCDeadlineBenchmark          = "BenchmarkRPCDeadlineClassification"
 	RPCNilContextGuardProfile     = "rpc-nil-context-guard"
 	RPCNilContextGuardBenchmark   = "BenchmarkRPCNilContextGuard"
+	RPCPreparedFrameProfile       = "rpc-prepared-frame"
+	RPCPreparedFrameBenchmark     = "BenchmarkLRPCPreparedFrame"
+	QueuePackage                  = "pkg/lux/queue"
+	NATSQueuePackage              = "pkg/lux/nats/queue"
+	QueueStreamNameProfile        = "queue-stream-name"
+	QueueStreamNameBenchmark      = "BenchmarkQueueStreamName"
 	CodecReaderBenchmark          = "BenchmarkElementPayload"
 	APIPackage                    = "pkg/lux/api"
 	LuviaPackage                  = "pkg/lux/luvia"
@@ -38,11 +44,14 @@ const (
 	CodegenMigrationStateProfile   = "codegen-migration-state"
 	CodegenMigrationStateBenchmark = "BenchmarkMigrationStateValidation"
 
-	APILocalRouteExportProfile    = "api-local-route-export"
-	APILocalRouteExportBenchmark  = "BenchmarkLocalRouteExport"
-	APICanonicalJSONProfile       = "api-canonical-json"
-	APIBinaryParamLookupProfile   = "api-binary-param-lookup"
-	APIBinaryParamLookupBenchmark = "BenchmarkBinaryParamLookup"
+	APILocalRouteExportProfile      = "api-local-route-export"
+	APILocalRouteExportBenchmark    = "BenchmarkLocalRouteExport"
+	APICanonicalJSONProfile         = "api-canonical-json"
+	APIBinaryParamLookupProfile     = "api-binary-param-lookup"
+	APIBinaryParamLookupBenchmark   = "BenchmarkBinaryParamLookup"
+	APIRequestLogProfile            = "api-request-log"
+	APIRequestLogBoundaryBenchmark  = "BenchmarkRequestLogBoundary"
+	APIRequestLogDeliveredBenchmark = "BenchmarkRequestLogDelivered"
 
 	LuviaMergeDestinationProfile   = "luvia-merge-destination"
 	LuviaMergeDestinationBenchmark = "BenchmarkMergeDestination"
@@ -84,6 +93,12 @@ func ProfileForBenchmark(pkg, name string) string {
 			return RPCDeadlineProfile
 		case RPCNilContextGuardBenchmark:
 			return RPCNilContextGuardProfile
+		case RPCPreparedFrameBenchmark:
+			return RPCPreparedFrameProfile
+		}
+	case QueuePackage:
+		if root == QueueStreamNameBenchmark {
+			return QueueStreamNameProfile
 		}
 	case APIPackage:
 		return apiBenchmarkProfile(root)
@@ -117,6 +132,9 @@ func ProfileForBenchmark(pkg, name string) string {
 }
 
 func apiBenchmarkProfile(root string) string {
+	if root == APIRequestLogBoundaryBenchmark || root == APIRequestLogDeliveredBenchmark {
+		return APIRequestLogProfile
+	}
 	if root == APIBinaryParamLookupBenchmark {
 		return APIBinaryParamLookupProfile
 	}
@@ -149,13 +167,17 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{RPCOwnedRequestProfile, "^" + RPCOwnedRequestBenchmark + "$"},
 			{RPCDeadlineProfile, "^" + RPCDeadlineBenchmark + "$"},
 			{RPCNilContextGuardProfile, "^" + RPCNilContextGuardBenchmark + "$"},
+			{RPCPreparedFrameProfile, "^" + RPCPreparedFrameBenchmark + "$"},
 		}
+	case QueuePackage:
+		return []IsolationSpec{{QueueStreamNameProfile, "^" + QueueStreamNameBenchmark + "$"}}
 	case APIPackage:
 		return []IsolationSpec{
 			{APINonIdentityProfile, "."},
 			{APILocalRouteExportProfile, "^" + APILocalRouteExportBenchmark + "$"},
 			{APICanonicalJSONProfile, "^" + apiCanonicalJSONPrefix + "(" + strings.Join(apiCanonicalJSONFamilies, "|") + ")$"},
 			{APIBinaryParamLookupProfile, "^" + APIBinaryParamLookupBenchmark + "$"},
+			{APIRequestLogProfile, "^" + APIRequestLogBoundaryBenchmark + "$|^" + APIRequestLogDeliveredBenchmark + "$"},
 		}
 	case LuviaPackage:
 		return []IsolationSpec{

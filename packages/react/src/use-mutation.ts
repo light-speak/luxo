@@ -73,6 +73,7 @@ export function useLuxoMutation<T, V = void>(
   }, [])
 
   const mutate = useCallback(async (variables: V): Promise<T> => {
+    const mutationOptions = optionsRef.current
     const generation = generationRef.current
     pendingRef.current++
     if (mountedRef.current) {
@@ -90,15 +91,14 @@ export function useLuxoMutation<T, V = void>(
         throw err
       }
 
-      const currentOptions = optionsRef.current
       let followupError: Error | undefined
       try {
-        if (currentOptions.onSuccess) await currentOptions.onSuccess(result, variables)
+        if (mutationOptions.onSuccess) await mutationOptions.onSuccess(result, variables)
       } catch (failure) {
         followupError = normalizeMutationError(failure)
       }
       try {
-        invalidateMutationQueries(queryClient, currentOptions, result, variables)
+        invalidateMutationQueries(queryClient, mutationOptions, result, variables)
       } catch (failure) {
         const err = normalizeMutationError(failure)
         followupError = followupError
