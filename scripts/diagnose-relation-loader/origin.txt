@@ -1,0 +1,4 @@
+C original: 45862942193/1, plan 15138943421 SHA256 b45544f062bea4a026c0b86664368dd224ac1d15929deb8a590f2aa601d367d1, shard02 artifact 15140548521 SHA256 e5ff2b58fad22e60c7494965edacaf6b07ccbf21c300a4b0f247ebde46fb1b75, AMD EPYC 7763 64-Core Processor.
+D original: 45872054757/1, shard02 artifact 15143663716, SHA256 840e0d332c75d7800c31c6d9dacefed37ed479f6a09340be54c968932917fe0c, AMD EPYC 9V74 80-Core Processor.
+Both original confirmations target pkg/codegen:default BenchmarkRelationLoaderGeneration/1/metadata-2. Keep every original family leaf in both default and projected binaries.
+Go 1.27.1, Ubuntu 24.04, linux/amd64/v1, CGO=1, two benchmark threads, 200ms, two groups of 10 interleaved pairs with same-arm comparisons in both directions.

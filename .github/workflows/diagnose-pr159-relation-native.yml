@@ -1,0 +1,53 @@
+name: Attribute relation loader timing on the original EPYC models
+
+on:
+  push:
+    branches: [diagnostics/pr159-relation-native]
+
+permissions:
+  contents: read
+
+jobs:
+  witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+
+      - name: Check the real runner CPU
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: bash scripts/diagnose-relation-loader/run.sh --probe
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+
+      - uses: actions/checkout@v7
+        with:
+          ref: 59a4167f129f0bff0e8425125fa02eae87fd347b
+          path: .tmp/relation-A
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        with:
+          ref: 0f3e233220962fbdc96a6ecc4f55750074f03861
+          path: .tmp/relation-C
+          fetch-depth: 3
+          persist-credentials: false
+
+      - name: Record verified ELF and matched native measurements
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: bash scripts/diagnose-relation-loader/run.sh
+
+      - if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr159-relation-native-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/relation-native
+          if-no-files-found: error
+          retention-days: 14
