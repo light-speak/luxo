@@ -1,8 +1,8 @@
-name: Attribute #158 timing on the original CPU families
+name: Compare #158 stock and isolated benchmark layouts on Intel 6975P-C
 
 on:
   push:
-    branches: [diagnostics/pr158-attribution]
+    branches: [diagnostics/pr158-intel-layout]
 
 permissions:
   contents: read
@@ -11,43 +11,82 @@ jobs:
   witness:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4]
     env:
       GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 4
+          fetch-depth: 5
           persist-credentials: false
 
-      - name: Select the original profile for this runner CPU
+      - name: Match Intel 6975P-C before toolchain or source setup
         id: route
+        shell: bash
         env:
           RUNNER_KIND: ${{ runner.environment }}
         run: |
           set -euo pipefail
-          route=$(python3 -I -B scripts/diagnose-pr158/run.py --probe auto)
-          printf 'route=%s\n' "$route" >> "$GITHUB_OUTPUT"
+          if route=$(python3 -I -B scripts/diagnose-pr158/run.py --probe intel); then
+            printf 'route=%s\n' "$route" >> "$GITHUB_OUTPUT"
+          else
+            code=$?
+            test "$code" = 3
+          fi
 
-      - uses: actions/setup-go@v7
+      - if: steps.route.outputs.route == 'intel'
+        uses: actions/setup-go@v7
         with:
           go-version: '1.27.4'
+          cache: false
 
-      - uses: actions/checkout@v7
+      - if: steps.route.outputs.route == 'intel'
+        uses: actions/checkout@v7
         with:
           ref: 59a4167f129f0bff0e8425125fa02eae87fd347b
           path: .tmp/pr158-base
           persist-credentials: false
 
-      - name: Validate the route and reproduce the pinned samples
+      - if: steps.route.outputs.route == 'intel'
+        name: Recheck the three original leaves with unchanged gates and linked-code evidence
         env:
           RUNNER_KIND: ${{ runner.environment }}
-          NATIVE_ROUTE: ${{ steps.route.outputs.route }}
-        run: python3 -I -B scripts/diagnose-pr158/run.py "$NATIVE_ROUTE"
+        run: python3 -I -B scripts/diagnose-pr158/run.py intel
 
       - if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: pr158-attribution-native-${{ github.run_id }}-${{ github.run_attempt }}
+          name: pr158-intel-layout-${{ github.run_id }}-${{ github.run_attempt }}-slot-${{ matrix.slot }}
           path: .tmp/pr158-attribution
           if-no-files-found: error
           retention-days: 14
+
+  qualification:
+    needs: [witness]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/diagnose-pr158
+          persist-credentials: false
+
+      - name: Validate all receipts and preserve stock and isolated gate results
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          results=$(mktemp -d .tmp/pr158-intel-receipts.XXXXXXXX)
+          trap 'rm -rf -- "$results"' EXIT
+          gh run download "$GITHUB_RUN_ID" --pattern "pr158-intel-layout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-slot-*" --dir "$results"
+          python3 -I -B scripts/diagnose-pr158/run.py --summarize "$results"

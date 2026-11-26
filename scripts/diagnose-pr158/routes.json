@@ -2,47 +2,17 @@
   "baseCommit": "59a4167f129f0bff0e8425125fa02eae87fd347b",
   "candidateCommit": "5e41250a61e7fa2615ffb78804830bbc2db67334",
   "failureManifestSHA256": "add7df4261e332e016daae91ef1ac8cd1847484aa34b0a0f9bde3b85f82a08f0",
+  "familyManifestSHA256": "a500159153e732fa7936fa965256b1398ea30dd747f6bb47d682036fa545884d",
+  "historicalNative": [
+    45876655016,
+    "c3e1dd8631ece1380de7700ac5085595722d643df3d3cae81351fba3671cfc1d"
+  ],
   "nativeCompileProfileSHA256": "ca6d61fffd64abebbfceb442bb80e0e4247d7ddbbd51a33ee2b35fe2c0ce8126",
   "originalRun": "45866988415",
   "pinOnlyPatchSHA256": "2198a072d22ef9d647010d39769b30173c61433aad7411b85b4054ac0bc7f3b4",
   "planArtifactSHA256": "0bc40a2ebe82529096ed6eb8364ba0ad7dbfd334b4a8590154cd319e76a28fe9",
+  "projectorSHA256": "5dd5dc9ecbaa64d46fb32a50085f369612b8fb389d6200c7be90165153b7431d",
   "routes": {
-    "epyc": {
-      "cases": [
-        {
-          "artifact": "15142383329",
-          "artifactSHA256": "bc2fdefba010769b2a66328730c3bde6f87744e75c14dc888fee9b0d1ec45d2c",
-          "kind": "signed-original",
-          "name": "BenchmarkAuthUpgradeHeaders/anonymous-get/before-2",
-          "package": "pkg/lux/luvia",
-          "profile": "default"
-        },
-        {
-          "artifact": "15142383329",
-          "artifactSHA256": "bc2fdefba010769b2a66328730c3bde6f87744e75c14dc888fee9b0d1ec45d2c",
-          "kind": "signed-original",
-          "name": "BenchmarkAuthUpgradeHeaders/anonymous-get/current-2",
-          "package": "pkg/lux/luvia",
-          "profile": "default"
-        },
-        {
-          "artifact": "15141884348",
-          "artifactSHA256": "e1e4258a59dc20fa2ccfb48a3a0e008d7fdf83d175a3ef281a8d66449fc0f069",
-          "kind": "signed-original",
-          "name": "BenchmarkCollectionLengthCompiler/list-empty-method-2",
-          "package": "pkg/codegen",
-          "profile": "default"
-        },
-        {
-          "artifact": "15140638442",
-          "kind": "dependency-control",
-          "name": "BenchmarkPriorKnowledgeConnectionLifecycle-2",
-          "package": "pkg/lux/h2transport",
-          "profile": "default"
-        }
-      ],
-      "cpu": "AMD EPYC 7763 64-Core Processor"
-    },
     "intel": {
       "cases": [
         {
@@ -67,13 +37,6 @@
           "kind": "signed-original",
           "name": "BenchmarkDurationWriteReject/List128Last-2",
           "package": "pkg/lux/pg",
-          "profile": "default"
-        },
-        {
-          "artifact": "15140638442",
-          "kind": "dependency-control",
-          "name": "BenchmarkPriorKnowledgeConnectionLifecycle-2",
-          "package": "pkg/lux/h2transport",
           "profile": "default"
         }
       ],

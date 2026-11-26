@@ -2,7 +2,7 @@
 """Run a matched native attribution subset without changing the release gate."""
 
 from base64 import b64decode
-from collections import defaultdict
+from collections import Counter, defaultdict
 from hashlib import sha256
 from itertools import product
 import json
@@ -18,22 +18,26 @@ import tempfile
 INPUT = Path(__file__).resolve().parent
 ROOT = INPUT.parents[1]
 OUT = ROOT / '.tmp/pr158-attribution'
-RUN_CONFIG_SHA = 'bf3be34db7cca43489c678e725e5baa66ca03e323c4a282df9e8650db93cdc81'
-DIAGNOSTIC_PARENT = '5d63fd896bcc88aa35968e986985bb387e7de661'
-DIAGNOSTIC_REF = 'refs/heads/diagnostics/pr158-attribution'
+RUN_CONFIG_SHA = '3a08f280cfacaa0698f0347e392dc21b9a197377a321ed5f5c7c13b64c69bfdc'
+DIAGNOSTIC_PARENT = 'd586d4283c290501fb9f4e911996be13aa6945d7'
+ORIGINAL_WITNESS = '5d63fd896bcc88aa35968e986985bb387e7de661'
+DIAGNOSTIC_REF = 'refs/heads/diagnostics/pr158-intel-layout'
 CONFIG = json.loads((INPUT / 'routes.json').read_bytes())
-PATHS = ('.github/workflows/diagnose-pr158-attribution.yml',
-         *('scripts/diagnose-pr158/' + name for name in ('arm-b.patch.b64', 'go-capture.py', 'routes.json', 'run.py')))
-FOLLOWUP_PATHS = ('M\t.github/workflows/diagnose-pr158-attribution.yml', 'M\tscripts/diagnose-pr158/run.py')
+FAMILY_MANIFEST = INPUT / 'families.json'
+FAMILIES = json.loads(FAMILY_MANIFEST.read_bytes())['packages']
+FOLLOWUP_PATHS = (
+    'M	.github/workflows/diagnose-pr158-attribution.yml',
+    'A	scripts/diagnose-pr158/families.json',
+    'A	scripts/diagnose-pr158/project.go',
+    'M	scripts/diagnose-pr158/routes.json',
+    'M	scripts/diagnose-pr158/run.py',
+)
 PAIRS = ('AA', 'BB', 'CC', 'AB', 'BC', 'AC')
 METRICS = '.unit:(sec/op OR B/op OR allocs/op)'
 HOT = {
-    'pkg/lux/api': r'BenchmarkStaticValueParams|BinaryArray|ReadDateTime',
-    'pkg/lux/rpc': r'BenchmarkLRPCConnectionFrameReuseCandidate|prepareReusedFrameCandidate|writePreparedFrame',
-    'pkg/lux/pg': r'BenchmarkDurationWriteReject|[Dd]uration',
-    'pkg/lux/luvia': r'BenchmarkAuthUpgradeHeaders|AuthMiddleware|isWebSocketUpgrade',
-    'pkg/codegen': r'BenchmarkCollectionLengthCompiler|compileCollectionLength|compileString',
-    'pkg/lux/h2transport': r'BenchmarkPriorKnowledgeConnectionLifecycle|runPriorKnowledgeConnection|ClientConn.*RoundTrip|\.newClientConn|\.ReadFrame|\.processWindowUpdate',
+    'pkg/lux/api': r'BenchmarkStaticValueParams|benchmarkStaticValue|ParamDateTimeArray|readParam(Value|Array)|findParam',
+    'pkg/lux/rpc': r'BenchmarkLRPCConnectionFrameReuseCandidate|prepareReusedFrameCandidate|writePreparedFrame|retainReadFrame|appendCallBody|appendEnvelopePrefix',
+    'pkg/lux/pg': r'BenchmarkDurationWriteReject|bindArguments?|validateDuration(List|Argument)|ValidateDuration',
 }
 
 
@@ -96,12 +100,14 @@ def verify_provenance():
     active = git('rev-parse', 'HEAD')
     need(active == os.environ.get('GITHUB_SHA') and git('show', '-s', '--format=%P', active) == DIAGNOSTIC_PARENT,
          'the diagnostic must append one commit to the published witness')
-    need(git('show', '-s', '--format=%P', DIAGNOSTIC_PARENT) == CONFIG['candidateCommit'],
-         'the published witness must descend directly from the historical candidate')
+    need(git('show', '-s', '--format=%P', DIAGNOSTIC_PARENT) == ORIGINAL_WITNESS and
+         git('show', '-s', '--format=%P', ORIGINAL_WITNESS) == CONFIG['candidateCommit'],
+         'the published witness must descend from the historical candidate')
     need(git('show', '-s', '--format=%P', CONFIG['candidateCommit']) == CONFIG['baseCommit'], 'target ancestry changed')
     need(git('diff', '--name-status', DIAGNOSTIC_PARENT, active).splitlines() == list(FOLLOWUP_PATHS),
-         'unexpected routing revision paths')
-    need(git('diff', '--name-only', CONFIG['candidateCommit'], active).splitlines() == list(PATHS), 'unexpected diagnostic paths')
+         'unexpected layout diagnostic revision paths')
+    need(digest(FAMILY_MANIFEST) == CONFIG['familyManifestSHA256'], 'signed family inventory changed')
+    need(digest(INPUT / 'project.go') == CONFIG['projectorSHA256'], 'verified fixture projector changed')
     for role, commit in (('A', CONFIG['baseCommit']), ('C', CONFIG['candidateCommit'])):
         need(git('rev-parse', f'{commit}^{{tree}}') == CONFIG['trees'][role], f'{role} source identity changed')
 
@@ -167,26 +173,53 @@ def elf(go, binary, target, package, work):
         path.unlink()
 
 
-def build_profile(go, tools, role, source, work, grouped):
-    built = work / (role + '-binaries')
-    evidence = OUT / (role + '-build')
+def compiler_env(go, source, work, evidence):
+    return dict(os.environ, PATH=str(work / 'wrapper') + os.pathsep + os.environ['PATH'],
+                LUXO_WITNESS_REAL_GO=go, LUXO_WITNESS_PROFILE_LOG=str(evidence), GOWORK=str(source / 'go.work'))
+
+
+def compile_projected(tools, source, work, package, binary, name, stock, env):
+    capture = json.loads((stock / (name + '.overlay.json')).read_bytes())
+    need(all(not replacement for replacement in capture.values()), f'unexpected stock replacement for {package}')
+    overlay = work / (binary.parent.name + '-' + name + '.json')
+    json_file(overlay, {'Replace': {str(source / path): '' for path in capture}})
+    projection = work / (binary.parent.name + '-' + name + '-overlay')
+    projected = call(tools / 'project', source, package.rsplit('/', 1)[-1], overlay, projection).decode().strip()
+    need(projected == str(projection / 'overlay.json'), 'unexpected projection path')
+    call(work / 'wrapper' / 'go', 'test', '-trimpath', '-c', '-overlay=' + projected, './' + package, '-o', binary,
+         cwd=source, env=env)
+    roots = call(binary, '-test.list=.*', cwd=source / package).decode().splitlines()
+    need(roots == [FAMILIES[package]['root']], f'{package} projection retained an unrelated benchmark or test')
+
+
+def check_inventory(smoke, package):
+    family = FAMILIES[package]
+    output = smoke.decode()
+    all_rows = [line for line in output.splitlines() if line.startswith('Benchmark')]
+    rows = re.findall(r'^(Benchmark\S+-2)\s+1\s+\S+\s+ns/op\s+\S+\s+B/op\s+\S+\s+allocs/op$', output, re.M)
+    need(output.rstrip().endswith('\nPASS') and len(all_rows) == len(rows) and Counter(rows) == Counter(family['names']),
+         f"{package} fixture does not reproduce every signed {family['root']} leaf exactly once")
+
+
+def build_profile(go, tools, mode, role, source, work, grouped):
+    built = work / (mode + '-' + role + '-binaries')
+    built.mkdir()
+    evidence = OUT / mode / (role + '-build')
     evidence.mkdir()
-    wrapper = work / 'wrapper'
-    env = dict(os.environ, PATH=str(wrapper) + os.pathsep + os.environ['PATH'], LUXO_WITNESS_REAL_GO=go,
-               LUXO_WITNESS_PROFILE_LOG=str(evidence), GOWORK=str(source / 'go.work'))
+    env = compiler_env(go, source, work, evidence)
     built_profiles = {}
-    mode = 'compile-performance' if role == 'C' else 'compile-performance-baseline'
+    command = 'compile-performance' if role == 'C' else 'compile-performance-baseline'
     (evidence / 'modules.txt').write_bytes(call(go, 'list', '-m', 'all', cwd=source, env=env))
-    for (package, profile), cases in grouped.items():
-        call(tools / 'benchrun', mode, source, built, package, profile, env=env)
+    for package, profile in grouped:
         name = package.replace('/', '-') + (f'-{profile}' if profile != 'default' else '')
         binary = built / (name + '.test')
+        if mode == 'stock':
+            call(tools / 'benchrun', command, source, built, package, profile, env=env)
+        else:
+            compile_projected(tools, source, work, package, binary, name, OUT / 'stock' / (role + '-build'), env)
         elf(go, binary, evidence / name, package, work)
-        selector = filter_for(cases)
-        smoke = sample(binary, source / package, selector, '1x')
-        expected = [case['name'] for case in cases]
-        observed = re.findall(r'^(Benchmark\S+-2)\s+1\s+', smoke.decode(), re.M)
-        need(sorted(observed) == sorted(expected) and b'\nPASS\n' in smoke, f'{role} fixture differs for {name}')
+        smoke = sample(binary, source / package, '^' + FAMILIES[package]['root'] + '$', '1x')
+        check_inventory(smoke, package)
         (evidence / (name + '.inventory.txt')).write_bytes(smoke)
         built_profiles[package, profile] = binary
     return built_profiles
@@ -204,13 +237,13 @@ def schedule():
             yield block, pair, code, visit
 
 
-def measure(arms, bins, grouped):
+def measure(directory, arms, bins, grouped):
     process = 0
-    with (OUT / 'order.tsv').open('x') as order:
+    with (directory / 'order.tsv').open('x') as order:
         for block, pair, code, visit in schedule():
             for slot in visit:
                 role, direction = code[slot], ('left', 'right')[slot]
-                output = OUT / f'{code}-{block}.{direction}.raw'
+                output = directory / f'{code}-{block}.{direction}.raw'
                 with output.open('ab') as stream:
                     for (package, profile), cases in grouped.items():
                         binary = bins[role][package, profile]
@@ -221,14 +254,14 @@ def measure(arms, bins, grouped):
     return process
 
 
-def gate(tools, expected):
+def gate(directory, tools, expected):
     approvals = ROOT / 'scripts/benchgate/approved-costs.json'
     statuses = {}
-    with (OUT / 'warnings.txt').open('x') as warnings:
+    with (directory / 'warnings.txt').open('x') as warnings:
         for code in PAIRS:
             csvs = []
             for block in (1, 2):
-                prefix = OUT / f'{code}-{block}'
+                prefix = directory / f'{code}-{block}'
                 files = [Path(str(prefix) + '.' + label + '.txt') for label in ('left', 'right')]
                 for file in files:
                     call(tools / 'benchplan', '--normalize', file.with_suffix('.raw'), file)
@@ -249,12 +282,49 @@ def gate(tools, expected):
     return statuses
 
 
+def compare(go, tools, mode, work, arms, grouped, expected):
+    folder = OUT / mode
+    folder.mkdir()
+    binaries = {role: build_profile(go, tools, mode, role, source, work, grouped) for role, source in arms.items()}
+    processes = measure(folder, arms, binaries, grouped)
+    return {'processes': processes, 'gates': gate(folder, tools, expected)}
+
+
+def summarize(folder):
+    statuses = sorted(folder.glob('*/status.json'))
+    need(len(statuses) == 4, 'expected receipts from four independent runner slots')
+    matched, failures = 0, []
+    gate_names = {f'{pair}-1' for pair in PAIRS if pair[0] != pair[1]}
+    gate_names.update(f'{pair}-{group}{suffix}' for pair in PAIRS if pair[0] == pair[1]
+                      for group, suffix in product((1, 2), ('', '.reverse')))
+    for status in statuses:
+        result = json.loads(status.read_bytes())
+        if not result['matched']:
+            need(result['processes'] == 0 and result['cpu'] != CONFIG['routes']['intel']['cpu'],
+                 'an unverified runner produced samples')
+            continue
+        matched += 1
+        need(result['cpu'] == CONFIG['routes']['intel']['cpu'] and result['route'] == 'intel', 'wrong runner receipt')
+        need(set(result['comparisons']) == {'stock', 'projected'}, 'both comparison receipts are required')
+        for mode, comparison in result['comparisons'].items():
+            need(comparison['processes'] == 720 and set(comparison['gates']) == gate_names,
+                 f'incomplete {mode} receipt')
+            if any(comparison['gates'].values()):
+                failures.append((status.parent.name, mode))
+    print(json.dumps({'matchedSlots': matched, 'failedComparisons': failures}, sort_keys=True))
+    need(matched > 0, 'no original Intel 6975P-C measurement')
+    need(not failures, 'a matched runner reported a strict gate failure')
+
+
 def main():
     args = sys.argv[1:]
+    if len(args) == 2 and args[0] == '--summarize':
+        summarize(Path(args[1]))
+        return
     probe = args[:1] == ['--probe']
     if probe:
         args = args[1:]
-    need(len(args) == 1 and (args[0] == 'auto' or args[0] in CONFIG['routes']), 'expected auto, intel, or epyc')
+    need(args == ['intel'], 'expected --probe intel, intel, or --summarize PATH')
     selected, cpu = route_guard(args[0])
     if probe:
         print(selected)
@@ -276,25 +346,28 @@ def main():
     json_file(expected, {'Base': rows, 'Head': rows})
     with tempfile.TemporaryDirectory(prefix='pr158-witness.', dir=OUT.parent) as temp:
         work = Path(temp)
-        tools, wrapper = work / 'bin', work / 'wrapper'
-        tools.mkdir()
-        wrapper.mkdir()
+        tools, wrapper, gotmp = work / 'bin', work / 'wrapper', work / 'go-tmp'
+        for path in (tools, wrapper, gotmp):
+            path.mkdir()
+        os.environ.update(TMPDIR=str(gotmp), GOTMPDIR=str(gotmp))
         shutil.copyfile(INPUT / 'go-capture.py', wrapper / 'go')
         (wrapper / 'go').chmod(0o700)
         env = dict(os.environ, GOWORK='off')
         for name in ('benchrun', 'benchplan', 'benchgate'):
             call(go, 'build', '-p', '1', '-o', tools / name, './scripts/' + name, env=env)
+        call(go, 'build', '-p', '1', '-o', tools / 'project', INPUT / 'project.go', env=env)
         call(go, 'install', 'golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70', env=dict(env, GOBIN=str(tools)))
         profile = call(tools / 'benchrun', 'performance-profile')
         need(sha256(profile).hexdigest() == CONFIG['nativeCompileProfileSHA256'], 'original benchmark compile profile changed')
         (OUT / 'compile-profile.txt').write_bytes(profile)
         arms = materialize(work)
-        binaries = {role: build_profile(go, tools, role, source, work, grouped) for role, source in arms.items()}
-        processes = measure(arms, binaries, grouped)
-        outcomes = gate(tools, expected)
-    json_file(OUT / 'status.json', {'matched': True, 'route': selected, 'cpu': cpu,
-                                   'processes': processes, 'gates': outcomes})
-    sys.exit(int(any(outcomes.values())))
+        comparisons = {'stock': compare(go, tools, 'stock', work, arms, grouped, expected)}
+        controls = [code for name, code in comparisons['stock']['gates'].items() if name[:2] in ('AA', 'BB', 'CC')]
+        if not any(controls):
+            comparisons['projected'] = compare(go, tools, 'projected', work, arms, grouped, expected)
+    json_file(OUT / 'status.json', {'matched': True, 'route': selected, 'cpu': cpu, 'comparisons': comparisons})
+    # A successful projection does not change a stock gate's result.
+    sys.exit(int(any(code for phase in comparisons.values() for code in phase['gates'].values())))
 
 
 if __name__ == '__main__':
