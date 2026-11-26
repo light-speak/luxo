@@ -457,6 +457,48 @@ Future<T> _decodeHTTPCall<T>(
       : decoder(result);
 }
 
+final class _HTTPCredential {
+  final Object? session;
+  _HTTPTokenRefresh? refresh;
+
+  _HTTPCredential([this.session]);
+}
+
+final class _HTTPRefreshFailure {
+  final Object error;
+  final StackTrace stack;
+
+  const _HTTPRefreshFailure(this.error, this.stack);
+}
+
+final class _HTTPTokenRefresh {
+  final result = Completer<Object?>.sync();
+  int waiters = 0;
+  bool discarded = false;
+
+  void start(Future<String?> Function() callback) {
+    unawaited(
+      Future<String?>.sync(callback).then<void>(
+        // Settle at the end of the callback event. Success needs only its token.
+        (token) {
+          if (!discarded) result.complete(token);
+        },
+        onError: (Object error, StackTrace stack) {
+          if (!discarded) result.complete(_HTTPRefreshFailure(error, stack));
+        },
+      ),
+    );
+  }
+
+  void discard() {
+    discarded = true;
+    if (!result.isCompleted) {
+      // Reserve completion now, but let close/setToken finish before notifying.
+      result.complete(Future<Object?>.microtask(() => null));
+    }
+  }
+}
+
 /// HTTP-based transport for Flutter / Dart server.
 /// The default native client uses HTTP/1.1; web negotiation is browser-managed.
 /// Inject a compatible client to use a different HTTP backend.
@@ -475,7 +517,7 @@ class HttpTransport implements Transport {
   final http.Client _client;
   final _pendingHTTP = <Completer<void>>{};
   bool _closedHTTP = false;
-  Object? _credentialRevision;
+  var _credential = _HTTPCredential();
   final Duration timeout;
   final Future<String?> Function()? onTokenExpired;
   TransportMode _mode;
@@ -522,7 +564,9 @@ class HttpTransport implements Transport {
   void setMode(TransportMode mode) => _mode = mode;
   @override
   void setToken(String token) {
-    _credentialRevision = Object();
+    final previous = _credential;
+    _credential = _HTTPCredential(Object());
+    previous.refresh?.discard();
     _setHeader('authorization', 'Bearer $token');
   }
 
@@ -530,6 +574,7 @@ class HttpTransport implements Transport {
   void close() {
     if (_closedHTTP) return;
     _closedHTTP = true;
+    _credential.refresh?.discard();
     for (final abort in _pendingHTTP) {
       if (!abort.isCompleted) abort.complete();
     }
@@ -651,7 +696,7 @@ class HttpTransport implements Transport {
     bool isRetry = false,
     JSONResponseSchema? response,
   }) async {
-    final credentialRevision = _credentialRevision;
+    final credential = _credential;
     final resp = await _post(_headers, body, clock);
 
     final json = _jsonEnvelope(resp, response);
@@ -667,24 +712,15 @@ class HttpTransport implements Transport {
       return payload;
     }
     final error = decodeJSONError(json, resp.statusCode);
-    if (!identical(credentialRevision, _credentialRevision)) throw error;
     final refresh = _refreshAfterUnauthorized(
       error,
       resp.statusCode,
       isRetry,
       clock,
+      credential,
     );
-    if (refresh != null) {
-      final newToken = await refresh;
-      _checkDeadline(clock);
-      if (newToken != null) {
-        if (_closedHTTP) {
-          throw const LuxoError('CancelledError', 0, 'request cancelled');
-        }
-        if (!identical(credentialRevision, _credentialRevision)) throw error;
-        setToken(newToken);
-        return _jsonCall(body, clock, isRetry: true, response: response);
-      }
+    if (refresh != null && await refresh && _canRetry(credential, clock)) {
+      return _jsonCall(body, clock, isRetry: true, response: response);
     }
 
     throw error;
@@ -705,41 +741,49 @@ class HttpTransport implements Transport {
     }
   }
 
-  Future<String?>? _refreshAfterUnauthorized(
+  Future<bool>? _refreshAfterUnauthorized(
     LuxoError error,
     int status,
     bool isRetry,
     Stopwatch clock,
+    _HTTPCredential credential,
   ) {
     if (isRetry ||
         status != 401 ||
         error.code != 401 ||
-        error.error == 'ParseError') {
+        error.error == 'ParseError' ||
+        !identical(credential.session, _credential.session)) {
       return null;
     }
+    if (!_canRetry(credential, clock)) return null;
+    final callback = onTokenExpired;
+    if (callback == null) return null;
+    final refresh = credential.refresh ??= _HTTPTokenRefresh();
+    return _joinRefresh(refresh, callback, credential, clock);
+  }
+
+  bool _canRetry(_HTTPCredential credential, Stopwatch clock) {
     if (_closedHTTP) {
       throw const LuxoError('CancelledError', 0, 'request cancelled');
     }
     _checkDeadline(clock);
-    final refresh = onTokenExpired?.call();
-    return refresh == null ? null : _waitForRefresh(refresh, clock);
+    return identical(credential.session, _credential.session);
   }
 
-  Future<String?> _waitForRefresh(
-    Future<String?> refresh,
+  Future<bool> _joinRefresh(
+    _HTTPTokenRefresh refresh,
+    Future<String?> Function() callback,
+    _HTTPCredential credential,
     Stopwatch clock,
   ) async {
-    final abort = Completer<void>();
-    _pendingHTTP.add(abort);
-    if (_closedHTTP) abort.complete();
+    if (++refresh.waiters == 1 && !refresh.result.isCompleted) {
+      refresh.start(callback);
+    }
     try {
-      final token = await withDeadline(
-        Future.any<String?>([
-          refresh,
-          abort.future.then<String?>((_) {
-            throw const LuxoError('CancelledError', 0, 'request cancelled');
-          }),
-        ]),
+      // Closing the transport or replacing credentials settles this flight.
+      // The HTTP send/read phase keeps its own request abort trigger.
+      final outcome = await withDeadline(
+        refresh.result.future,
         timeout,
         clock: clock,
         onTimeout: () {
@@ -750,12 +794,24 @@ class HttpTransport implements Transport {
           );
         },
       );
-      if (_closedHTTP) {
-        throw const LuxoError('CancelledError', 0, 'request cancelled');
+      if (!_canRetry(credential, clock) || refresh.discarded) return false;
+      final token = outcome is String ? outcome : null;
+      if (identical(credential, _credential)) {
+        // Already-sent requests retain this result. New requests use a fresh
+        // generation so that a declined or failed refresh can be attempted again.
+        if (token != null) _setHeader('authorization', 'Bearer $token');
+        _credential = _HTTPCredential(credential.session);
       }
-      return token;
+      if (outcome is _HTTPRefreshFailure) {
+        Error.throwWithStackTrace(outcome.error, outcome.stack);
+      }
+      return token != null;
     } finally {
-      _pendingHTTP.remove(abort);
+      if (--refresh.waiters == 0 && identical(_credential, credential)) {
+        // A response still in flight can start the replacement refresh.
+        credential.refresh = null;
+        refresh.discard();
+      }
     }
   }
 
@@ -783,7 +839,7 @@ class HttpTransport implements Transport {
     Stopwatch clock, {
     bool isRetry = false,
   }) async {
-    final credentialRevision = _credentialRevision;
+    final credential = _credential;
     final resp = await _post(_binaryHeaders, body, clock);
 
     // The HTTP response owns its collected body; no second copy is needed.
@@ -792,24 +848,15 @@ class HttpTransport implements Transport {
       return resp.bodyBytes;
     }
     final error = decodeBinaryError(resp.bodyBytes, resp.statusCode);
-    if (!identical(credentialRevision, _credentialRevision)) throw error;
     final refresh = _refreshAfterUnauthorized(
       error,
       resp.statusCode,
       isRetry,
       clock,
+      credential,
     );
-    if (refresh != null) {
-      final newToken = await refresh;
-      _checkDeadline(clock);
-      if (newToken != null) {
-        if (_closedHTTP) {
-          throw const LuxoError('CancelledError', 0, 'request cancelled');
-        }
-        if (!identical(credentialRevision, _credentialRevision)) throw error;
-        setToken(newToken);
-        return _binaryCall(body, clock, isRetry: true);
-      }
+    if (refresh != null && await refresh && _canRetry(credential, clock)) {
+      return _binaryCall(body, clock, isRetry: true);
     }
 
     throw error;
