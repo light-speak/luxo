@@ -4,6 +4,7 @@ export LC_ALL=C
 
 base=e9159f125064eccd6499ff5f9426f9c020f05dcc
 head=79ca343d68b265be411d07166702497eba1cd008
+diagnostic_parent=94cef84121cd4d6692235721a9e6153aed8a7837
 root=$(pwd -P)
 work="$root/.tmp"
 evidence="$work/pr144-native-evidence"
@@ -19,13 +20,17 @@ test "$(git rev-parse HEAD)" = "$head"
 test "$(git rev-parse 'HEAD^{tree}')" = 358f53b09104da9eb88a5ae67860c949ae449c7f
 test "$(git -C "$work/base" rev-parse HEAD)" = "$base"
 test "$(git -C "$work/base" rev-parse 'HEAD^{tree}')" = a721621c0c30b6c57f4b404fb358295ec065293b
-test "$(git -C "$work/control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $head"
+test "$(git -C "$work/control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $diagnostic_parent"
 diff -u <(printf 'A\t%s\n' .github/workflows/diagnose-pr144-amd-evidence.yml \
     scripts/diagnose-pr144-native.py scripts/diagnose-pr144-native.sh) \
-    <(git -C "$work/control" diff --name-status HEAD^ HEAD)
+    <(git -C "$work/control" diff --name-status "$head" HEAD)
 { uname -a; lscpu; go env -json GOVERSION GOOS GOARCH GOAMD64 CGO_ENABLED GOFLAGS; } > "$evidence/environment.txt"
 cpu=$(sed -n 's/^Model name:[[:space:]]*//p' "$evidence/environment.txt")
-test -n "$cpu"
+case "${TARGET_SHARD}:$cpu" in
+    '09:AMD EPYC 9V74 80-Core Processor') original_artifact=15095340498 ;;
+    '10:AMD EPYC 9V45 96-Core Processor') original_artifact=15094702482 ;;
+    *) exit 1 ;;
+esac
 git ls-tree HEAD -- pkg cmd go.mod go.sum > "$evidence/head-product.txt"
 git -C "$work/base" ls-tree HEAD -- pkg cmd go.mod go.sum > "$evidence/base-product.txt"
 cmp "$evidence/base-product.txt" "$evidence/head-product.txt"
@@ -40,8 +45,7 @@ fetch_original() {
     gh api "repos/light-speak/luxo/actions/artifacts/$artifact/zip" > "$path/original.zip"
     python3 -I -B "$helper" prepare "$shard" "$path" "$cpu"
 }
-fetch_original 09 15095340498
-fetch_original 10 15094702482
+fetch_original "$TARGET_SHARD" "$original_artifact"
 
 for directory in "$work/head" "$tools" "$work/test-tmp"; do
     test ! -e "$directory" && test ! -L "$directory"
@@ -62,8 +66,7 @@ sh scripts/setup-modules.sh .tmp/head
 GOWORK=off GOBIN="$tools" go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
 GOWORK=off go build -o "$tools/" ./scripts/benchrun ./scripts/benchplan ./scripts/benchgate
 "$tools/benchrun" performance-profile > "$evidence/rebuilt-profile.txt"
-cmp "$evidence/09/reference-profile.txt" "$evidence/rebuilt-profile.txt"
-cmp "$evidence/10/reference-profile.txt" "$evidence/rebuilt-profile.txt"
+cmp "$evidence/$TARGET_SHARD/reference-profile.txt" "$evidence/rebuilt-profile.txt"
 sha256sum "$tools/benchrun" "$tools/benchplan" "$tools/benchgate" "$tools/benchstat" > "$evidence/tools.sha256"
 go version -m "$tools/benchstat" > "$evidence/benchstat-build.txt"
 
@@ -108,47 +111,46 @@ run_group() {
 }
 
 overall=0
-for shard in 09 10; do
-    path="$evidence/$shard"
-    IFS=$'\t' read -r package profile filter < "$path/batch.tsv"
-    "$tools/benchplan" --verify-profile-batch confirmation "$path/expected.json" "$path/batch.tsv"
-    "$tools/benchrun" compile-performance-baseline .tmp/base .tmp/bin/base "$package" "$profile" > "$path/base.compile.log" 2>&1
-    "$tools/benchrun" compile-performance .tmp/head .tmp/bin/head "$package" "$profile" > "$path/head.compile.log" 2>&1
-    binary="${package//\//-}"
-    if [[ "$profile" != default ]]; then binary="$binary-$profile"; fi
-    for arm in base head; do record_binary "$tools/$arm/$binary.test" "$path/$arm"; done
-    jq -s '{sameELF: (.[0].sha256 == .[1].sha256), sameTextBytes: (.[0].text.sha256 == .[1].text.sha256),
-        sameTextRecord: (.[0].text == .[1].text),
-        sameExecutableLoadSegments: (.[0].executableLoadSegments == .[1].executableLoadSegments)}' \
-        "$path/base.elf.json" "$path/head.elf.json" > "$path/elf-comparison.json"
-    if ! cmp -s "$path/base.elf.json" "$path/head.elf.json"; then
-        symbols='BenchmarkInternalRouteExport|ExportHandlers'
-        if [[ "$shard" == 10 ]]; then symbols='BenchmarkSoftDeleteIdentifiers|validateFieldIdentifiers'; fi
-        for arm in base head; do
-            go tool nm -size -sort address "$tools/$arm/$binary.test" |
-                awk -v pattern="$symbols" '$0 ~ pattern' > "$path/$arm.symbols.txt"
-            go tool objdump -s "$symbols" "$tools/$arm/$binary.test" > "$path/$arm.objdump.txt"
-        done
-        diff -u "$path/base.readelf.txt" "$path/head.readelf.txt" > "$path/elf-layout.diff" || test "$?" = 1
-    fi
-
-    printf 'group\tpair\torder\tleft_subject\tright_subject\n' > "$path/order.tsv"
-    run_group primary
-    run_group confirmation
-    run_group control
-    "$tools/benchstat" -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv \
-        "base=$path/control.head.txt" "head=$path/control.base.txt" > "$path/control-reversed.csv" 2> "$path/control-reversed.warnings.txt"
-    for label in control control-reversed; do
-        status=0
-        "$tools/benchgate" "$path/$label.csv" > "$path/$label.gate.txt" 2>&1 || status=$?
-        printf '%s\t%d\n' "$label" "$status" >> "$path/gates.tsv"
-        if (( status != 0 )); then overall=1; fi
+shard="$TARGET_SHARD"
+path="$evidence/$shard"
+IFS=$'\t' read -r package profile filter < "$path/batch.tsv"
+"$tools/benchplan" --verify-profile-batch confirmation "$path/expected.json" "$path/batch.tsv"
+"$tools/benchrun" compile-performance-baseline .tmp/base .tmp/bin/base "$package" "$profile" > "$path/base.compile.log" 2>&1
+"$tools/benchrun" compile-performance .tmp/head .tmp/bin/head "$package" "$profile" > "$path/head.compile.log" 2>&1
+binary="${package//\//-}"
+if [[ "$profile" != default ]]; then binary="$binary-$profile"; fi
+for arm in base head; do record_binary "$tools/$arm/$binary.test" "$path/$arm"; done
+jq -s '{sameELF: (.[0].sha256 == .[1].sha256), sameTextBytes: (.[0].text.sha256 == .[1].text.sha256),
+    sameTextRecord: (.[0].text == .[1].text),
+    sameExecutableLoadSegments: (.[0].executableLoadSegments == .[1].executableLoadSegments)}' \
+    "$path/base.elf.json" "$path/head.elf.json" > "$path/elf-comparison.json"
+if ! cmp -s "$path/base.elf.json" "$path/head.elf.json"; then
+    symbols='BenchmarkInternalRouteExport|ExportHandlers'
+    if [[ "$shard" == 10 ]]; then symbols='BenchmarkSoftDeleteIdentifiers|validateFieldIdentifiers'; fi
+    for arm in base head; do
+        go tool nm -size -sort address "$tools/$arm/$binary.test" |
+            awk -v pattern="$symbols" '$0 ~ pattern' > "$path/$arm.symbols.txt"
+        go tool objdump -s "$symbols" "$tools/$arm/$binary.test" > "$path/$arm.objdump.txt"
     done
+    diff -u "$path/base.readelf.txt" "$path/head.readelf.txt" > "$path/elf-layout.diff" || test "$?" = 1
+fi
+
+printf 'group\tpair\torder\tleft_subject\tright_subject\n' > "$path/order.tsv"
+run_group primary
+run_group confirmation
+run_group control
+"$tools/benchstat" -alpha 0.01 -filter '.unit:(sec/op OR B/op OR allocs/op)' -format csv \
+    "base=$path/control.head.txt" "head=$path/control.base.txt" > "$path/control-reversed.csv" 2> "$path/control-reversed.warnings.txt"
+for label in control control-reversed; do
     status=0
-    "$tools/benchgate" --approved-costs scripts/benchgate/approved-costs.json --base-sha "$base" \
-        "$path/primary.csv" "$path/confirmation.csv" > "$path/ab.gate.txt" 2>&1 || status=$?
-    printf 'ab\t%d\n' "$status" >> "$path/gates.tsv"
+    "$tools/benchgate" "$path/$label.csv" > "$path/$label.gate.txt" 2>&1 || status=$?
+    printf '%s\t%d\n' "$label" "$status" >> "$path/gates.tsv"
     if (( status != 0 )); then overall=1; fi
-    sha256sum -c "$path/base.sha256" "$path/head.sha256"
 done
+status=0
+"$tools/benchgate" --approved-costs scripts/benchgate/approved-costs.json --base-sha "$base" \
+    "$path/primary.csv" "$path/confirmation.csv" > "$path/ab.gate.txt" 2>&1 || status=$?
+printf 'ab\t%d\n' "$status" >> "$path/gates.tsv"
+if (( status != 0 )); then overall=1; fi
+sha256sum -c "$path/base.sha256" "$path/head.sha256"
 exit "$overall"
