@@ -26,6 +26,12 @@ const (
 	RPCDeadlineBenchmark          = "BenchmarkRPCDeadlineClassification"
 	RPCNilContextGuardProfile     = "rpc-nil-context-guard"
 	RPCNilContextGuardBenchmark   = "BenchmarkRPCNilContextGuard"
+	RPCPreparedFrameProfile       = "rpc-prepared-frame"
+	RPCPreparedFrameBenchmark     = "BenchmarkLRPCPreparedFrame"
+	QueuePackage                  = "pkg/lux/queue"
+	NATSQueuePackage              = "pkg/lux/nats/queue"
+	QueueStreamNameProfile        = "queue-stream-name"
+	QueueStreamNameBenchmark      = "BenchmarkQueueStreamName"
 	CodecReaderBenchmark          = "BenchmarkElementPayload"
 	APIPackage                    = "pkg/lux/api"
 	LuviaPackage                  = "pkg/lux/luvia"
@@ -87,6 +93,12 @@ func ProfileForBenchmark(pkg, name string) string {
 			return RPCDeadlineProfile
 		case RPCNilContextGuardBenchmark:
 			return RPCNilContextGuardProfile
+		case RPCPreparedFrameBenchmark:
+			return RPCPreparedFrameProfile
+		}
+	case QueuePackage:
+		if root == QueueStreamNameBenchmark {
+			return QueueStreamNameProfile
 		}
 	case APIPackage:
 		return apiBenchmarkProfile(root)
@@ -155,7 +167,10 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{RPCOwnedRequestProfile, "^" + RPCOwnedRequestBenchmark + "$"},
 			{RPCDeadlineProfile, "^" + RPCDeadlineBenchmark + "$"},
 			{RPCNilContextGuardProfile, "^" + RPCNilContextGuardBenchmark + "$"},
+			{RPCPreparedFrameProfile, "^" + RPCPreparedFrameBenchmark + "$"},
 		}
+	case QueuePackage:
+		return []IsolationSpec{{QueueStreamNameProfile, "^" + QueueStreamNameBenchmark + "$"}}
 	case APIPackage:
 		return []IsolationSpec{
 			{APINonIdentityProfile, "."},

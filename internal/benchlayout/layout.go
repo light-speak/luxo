@@ -10,7 +10,7 @@ import (
 
 var moves = []struct{ current, original string }{
 	{"pkg/lux/cache/redis", "pkg/lux/cache"},
-	{"pkg/lux/nats/queue", "pkg/lux/queue"},
+	{NATSQueuePackage, QueuePackage},
 	{"pkg/lux/nats/event", "pkg/lux/event"},
 	{"pkg/lux/storage/s3", "pkg/lux/storage"},
 	{"pkg/lux/dialect/pg", "pkg/lux/pg"},
