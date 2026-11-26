@@ -2,14 +2,17 @@
 set -euo pipefail
 export LC_ALL=C GOTOOLCHAIN=local
 
-base=36681c63627f4a3a4805bc6d19e908325614d3e9
-head=27fddbeee9a994e1ea1330df9b53b36d501c8652
-parent=4d5bf15394591c182b2edc77156dcc20ed723652
+base=43dd9d4e5eb8fb59573fd3bdfd7de7b5b6814879
+head=5e4d2b5c0c1a2ba867160d8fe666af0ca90466d8
+merge_base=59a4167f129f0bff0e8425125fa02eae87fd347b
+merge_tree=11094664f5b716661d5fcfbf10c7610b35b54bcc
+parent=771090c884127fd85ee10e2863b7ba7c11ec25c7
 root=$(cd "$GITHUB_WORKSPACE" && pwd -P)
 work="$root/.tmp"
 control="$work/control"
 base_checkout="$work/base"
 head_git="$work/head-git"
+merge_base_git="$work/merge-base"
 evidence="$work/pr143-strict-evidence"
 helper="$control/scripts/diagnose-pr143-strict-native.py"
 g() { git --no-replace-objects -C "$@"; }
@@ -17,28 +20,26 @@ g() { git --no-replace-objects -C "$@"; }
 cpu='Intel(R) Xeon(R) 6975P-C'
 symbols='BenchmarkGatewayIdentity|luvia\.(New|newGateway|Identity)|context\.\(\*valueCtx\)\.Value'
 test "$RUNNER_KIND" = github-hosted
+test "$GITHUB_REPOSITORY" = light-speak/luxo
+test "$GITHUB_EVENT_NAME" = push
+test "$GITHUB_REF" = refs/heads/diagnostics/pr143-gateway-current
 test "$(uname -sm)" = 'Linux x86_64'
 actual=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | sed 's/[[:space:]]*$//')
 test "$actual" = "$cpu"
 test "$(go env GOVERSION GOHOSTOS GOHOSTARCH GOOS GOARCH GOAMD64 CGO_ENABLED)" = $'go1.27.1\nlinux\namd64\nlinux\namd64\nv1\n1'
 test -z "$(go env GOFLAGS)"
 test "$(g "$control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $parent"
-diff -u <(printf 'M\tscripts/diagnose-pr143-strict-native.sh\n') \
+diff -u <(printf 'M\t.github/workflows/diagnose-pr143-strict-layout.yml\nM\tscripts/diagnose-pr143-strict-native.py\nM\tscripts/diagnose-pr143-strict-native.sh\n') \
     <(g "$control" diff --name-status "$parent" HEAD)
-test "$(g "$base_checkout" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$base" d94bb8bc8d797a4cd2c0def3ff30fe59188dc772)"
-test "$(g "$head_git" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$head" 648af87da509ec22c879161c27799c857ceadbdf)"
-test "$(g "$head_git" cat-file commit "$head" | sed -n 's/^parent //p')" = \
-    "$(printf '%s\n%s' 1b6c73bd67a781beb9e8b783cc7f8f631bf1276e "$base")"
+test "$(g "$base_checkout" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$base" a6e89a783c0f8202b1233078c1c3fbc204aba1f5)"
+test "$(g "$head_git" rev-parse HEAD)" = "$head"
+test "$(g "$merge_base_git" rev-parse HEAD 'HEAD^{tree}')" = "$(printf '%s\n%s' "$merge_base" c96b8db43227f6ed447d10b0b32deb39284c7f28)"
 g "$base_checkout" diff --quiet
 g "$head_git" diff --quiet
 for checkout in "$base_checkout" "$head_git"; do
     test -z "$(g "$checkout" ls-tree -r --name-only HEAD | awk '/(^|\/)\.gitattributes$/')"
 done
-printf 'A checkout=%s\nB archive=%s\nattributes files=none in either tree\n' "$base" "$head" > "$evidence/source-mode.txt"
-build_inputs=(go.mod go.sum scripts/setup-modules.sh scripts/benchrun scripts/benchplan scripts/benchgate internal/benchlayout)
-g "$base_checkout" ls-tree HEAD -- "${build_inputs[@]}" > "$evidence/base-tool-inputs.txt"
-g "$head_git" ls-tree HEAD -- "${build_inputs[@]}" > "$evidence/head-tool-inputs.txt"
-cmp "$evidence/base-tool-inputs.txt" "$evidence/head-tool-inputs.txt"
+printf 'A checkout=%s\nB product head=%s\nB archive tree=%s\nmerge base=%s\n' "$base" "$head" "$merge_tree" "$merge_base" > "$evidence/source-mode.txt"
 { uname -a; lscpu; go env -json GOVERSION GOOS GOARCH GOAMD64 CGO_ENABLED GOFLAGS; } > "$evidence/environment.txt"
 
 for path in go.work go.work.sum .tmp; do
@@ -56,31 +57,32 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-input="$scratch/input"
 head_archive="$scratch/head"
 tools="$scratch/bin"
-mkdir -p "$input" "$head_archive/.tmp" "$tools"/{base,head,base64,head64} "$scratch/tmp" "$base_checkout/.tmp"
+mkdir -p "$head_archive/.tmp" "$tools"/{base,head,base64,head64} "$scratch/tmp" "$base_checkout/.tmp"
 export TMPDIR="$scratch/tmp" GOTMPDIR="$scratch/tmp"
-gh api repos/light-speak/luxo/actions/runs/45783705322/attempts/1 > "$input/original-run.json"
-gh api "repos/light-speak/luxo/actions/artifacts/15100912340" > "$input/original-metadata.json"
-gh api "repos/light-speak/luxo/actions/artifacts/15100912340/zip" > "$input/original.zip"
-python3 -I -B "$helper" prepare 01 "$input" "$cpu"
-cp "$input"/{original-run.json,original-metadata.json,original-gate.txt,reference-profile.txt,batch.tsv,expected.json,routing.json} "$evidence/"
-gh api repos/light-speak/luxo/actions/runs/45791729810/attempts/1 > "$input/replay-run.json"
-gh api repos/light-speak/luxo/actions/artifacts/15103451534 > "$input/replay-metadata.json"
-gh api repos/light-speak/luxo/actions/artifacts/15103451534/zip > "$input/replay.zip"
-cp "$input"/{replay-run.json,replay-metadata.json} "$evidence/"
-python3 -I -B "$helper" reference "$input" "$evidence"
-g "$head_git" archive "$head" | tar -xf - -C "$head_archive"
+objects="$scratch/product.git"
+git init --quiet --bare "$objects"
+for checkout in "$base_checkout" "$head_git" "$merge_base_git"; do
+    g "$checkout" rev-parse --path-format=absolute --git-path objects
+done > "$objects/objects/info/alternates"
+test "$(g "$objects" merge-tree --write-tree --merge-base="$merge_base" "$base" "$head")" = "$merge_tree"
+build_inputs=(go.mod go.sum scripts/setup-modules.sh scripts/benchrun scripts/benchplan scripts/benchgate internal/benchlayout)
+g "$objects" ls-tree "$base" -- "${build_inputs[@]}" > "$evidence/base-tool-inputs.txt"
+g "$objects" ls-tree "$merge_tree" -- "${build_inputs[@]}" > "$evidence/head-tool-inputs.txt"
+cmp "$evidence/base-tool-inputs.txt" "$evidence/head-tool-inputs.txt"
+g "$objects" archive "$merge_tree" | tar -xf - -C "$head_archive"
+python3 -I -B "$helper" current-plan "$evidence"
 sh "$head_archive/scripts/setup-modules.sh" "$base_checkout"
 sh "$head_archive/scripts/setup-modules.sh" "$head_archive"
 (
-    cd "$head_git"
+    cd "$head_archive"
     GOWORK=off go build -o "$tools/" ./scripts/benchrun ./scripts/benchplan ./scripts/benchgate
 )
 GOWORK=off GOBIN="$tools" go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260825160852-19be9d8e6c70
 "$tools/benchrun" performance-profile > "$evidence/rebuilt-profile.txt"
-cmp "$evidence/reference-profile.txt" "$evidence/rebuilt-profile.txt"
+"$tools/benchrun" isolation-profile pkg/lux/luvia > "$evidence/identity-selectors.txt"
+grep -Fxq $'luvia-gateway-identity\t^BenchmarkGatewayIdentity$' "$evidence/identity-selectors.txt"
 sha256sum "$tools/benchrun" "$tools/benchplan" "$tools/benchgate" "$tools/benchstat" > "$evidence/tools.sha256"
 go version -m "$tools/benchstat" > "$evidence/benchstat-build.txt"
 
@@ -120,8 +122,12 @@ record_binary() {
 for arm in base head base64 head64; do
     compile_arm "$arm"
     record_binary "$tools/$arm/$binary" "$evidence/$arm"
+    "$tools/benchrun" run-performance "$(source_for "$arm")" "$tools/$arm" "$package" "$profile" \
+        -test.run='^$' -test.bench='^BenchmarkGatewayIdentity$' -test.benchmem -test.benchtime=1x \
+        -test.count=1 -test.cpu=2 > "$evidence/$arm.inventory.txt"
+    python3 -I -B "$helper" current-inventory "$evidence/expected.json" "$evidence/$arm.inventory.txt" "$cpu"
 done
-python3 -I -B "$helper" verify-alignment "$evidence"
+python3 -I -B "$helper" verify-current-alignment "$evidence"
 jq -s '{sameELF: (.[0].sha256 == .[1].sha256), sameTextBytes: (.[0].text.sha256 == .[1].text.sha256),
     sameTextRecord: (.[0].text == .[1].text),
     sameExecutableLoadSegments: (.[0].executableLoadSegments == .[1].executableLoadSegments)}' \
@@ -199,7 +205,7 @@ done
 # Both sample groups contain the complete comparison inventory.
 strict_compare() {
     local label=$1
-    gate "$label-combined" --approved-costs "$head_git/scripts/benchgate/approved-costs.json" --base-sha "$base" \
+    gate "$label-combined" --approved-costs "$head_archive/scripts/benchgate/approved-costs.json" --base-sha "$base" \
         "$evidence/$label.1.csv" "$evidence/$label.2.csv"
 }
 strict_status=0
@@ -219,7 +225,8 @@ for label in a-align b-align; do
 done
 sha256sum -c "$evidence/"{base,head,base64,head64}.sha256
 if (( unstable )); then printf 'unstable-control\n' > "$evidence/outcome.txt"; exit 4; fi
-if (( strict_status != 1 )) || ! python3 -I -B "$helper" confirmed-targets "$evidence/ab-combined.gate.txt"; then
+if (( strict_status == 0 )); then printf 'current-stock-strict-passed\n' > "$evidence/outcome.txt"; exit 0; fi
+if (( strict_status != 1 )) || ! python3 -I -B "$helper" current-targets "$evidence/ab-combined.gate.txt"; then
     printf 'default-targets-not-reproduced\n' > "$evidence/outcome.txt"
     exit 4
 fi

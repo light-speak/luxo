@@ -4,6 +4,7 @@
 from collections import Counter
 from hashlib import sha256
 import json
+import re
 from pathlib import Path
 from struct import Struct
 import sys
@@ -260,7 +261,7 @@ def compiler_metadata(file):
     return rows
 
 
-def verify_alignment(evidence):
+def verify_alignment(evidence, current_source=False):
     def read(file):
         return json.loads(file.read_bytes())
 
@@ -278,12 +279,13 @@ def verify_alignment(evidence):
     report = {}
     for arm in ARM_NAMES[:2]:
         current, symbols, assembly = layout[arm]
-        previous = read(reference / f"{arm}.elf.json")
-        assert executable_shape(current) == executable_shape(previous), (arm, "default executable code drift")
-        for name, identity in read(reference / f"{arm}.symbols.json").items():
-            assert symbols[name] == identity, (arm, name, "default symbol drift")
-        original_build = compiler_metadata(reference / f"{arm}.build.txt")
-        assert compiler_metadata(evidence / f"{arm}.build.txt") == original_build, arm
+        original_build = compiler_metadata(evidence / f"{arm}.build.txt")
+        if not current_source:
+            previous = read(reference / f"{arm}.elf.json")
+            assert executable_shape(current) == executable_shape(previous), (arm, "default executable code drift")
+            for name, identity in read(reference / f"{arm}.symbols.json").items():
+                assert symbols[name] == identity, (arm, name, "default symbol drift")
+            assert original_build == compiler_metadata(reference / f"{arm}.build.txt"), arm
         aligned_build = compiler_metadata(evidence / f"{arm}64.build.txt")
         assert [row for row in aligned_build if row != "\tbuild\t-ldflags=-funcalign=64"] == original_build, arm
         aligned, aligned_symbols, aligned_assembly = layout[arm + "64"]
@@ -291,12 +293,18 @@ def verify_alignment(evidence):
             assert aligned_symbols[name]["mod64"] == 0, (arm, name, "unaligned symbol")
             assert code["shape"] == aligned_assembly[name]["shape"], (arm, name, "link changed instructions")
         production = PACKAGE_PREFIX + "newGateway.func1"
-        assert symbols[production]["mod64"] == (0 if arm == "base" else 32), (arm, "original layout absent")
         assert current["text"]["sha256"] != aligned["text"]["sha256"], (arm, "link intervention absent")
-        report[arm] = {"sameDefaultELF": current["sha256"] == previous["sha256"],
-                       "sameDefaultExecutableSegments": current["executableLoadSegments"] == previous["executableLoadSegments"],
-                       "sameDefaultTextAndSymbolMap": True,
-                       "identityEntryMod64": [symbols[production]["mod64"], aligned_symbols[production]["mod64"]]}
+        report[arm] = {"identityEntryMod64": [symbols[production]["mod64"], aligned_symbols[production]["mod64"]]}
+        if not current_source:
+            assert symbols[production]["mod64"] == (0 if arm == "base" else 32), (arm, "original layout absent")
+            report[arm].update(sameDefaultELF=current["sha256"] == previous["sha256"],
+                               sameDefaultExecutableSegments=current["executableLoadSegments"] == previous["executableLoadSegments"],
+                               sameDefaultTextAndSymbolMap=True)
+    if current_source:
+        def identity(arm):
+            return layout[arm][2][PACKAGE_PREFIX + "newGateway.func1"]["shape"]
+
+        report["stockIdentityInstructionsMatch"] = identity("base") == identity("head")
     (evidence / "alignment-verification.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
@@ -307,6 +315,35 @@ def confirmed_targets(text):
         return False
     confirmed = {line.removeprefix(prefix).split(" sec/op ", 1)[0] for line in rows}
     return confirmed == set(SCOPES["01"]["confirmed"])
+
+
+def current_plan(evidence):
+    root = "BenchmarkGatewayIdentity"
+    supported = ("anonymous", "authenticated", "typed-nil")
+    leaves = [f"{root}/{subject}/{side}" for subject in supported for side in ("after", "before")]
+    package = "pkg/lux/luvia"
+    rows = [{"Package": package, "Name": leaf + "-2"} for leaf in leaves]
+    (evidence / "expected.json").write_text(json.dumps({"Base": rows, "Head": rows}) + "\n")
+    selector = "|".join("/".join(f"^{fragment}$" for fragment in leaf.split("/")) for leaf in leaves)
+    (evidence / "batch.tsv").write_text(f"{package}\tluvia-gateway-identity\t{selector}\n")
+
+
+def current_inventory(expected_path, inventory_path, cpu):
+    expected = sorted(item["Name"] for item in json.loads(expected_path.read_bytes())["Base"])
+    result = inventory_path.read_text()
+    actual = re.findall(r"^(Benchmark\S+)\s+(\d+)\s+", result, re.M)
+    assert sorted(name for name, size in actual if size == "1") == expected, "wrong one-iteration fixture inventory"
+    assert len(actual) == len(expected) and result.splitlines().count("PASS") == 1, "invalid inventory result"
+    assert re.findall(r"^cpu: (.+)$", result, re.M) == [cpu], "inventory CPU differs"
+
+
+def current_targets(result):
+    prefix = "confirmed performance regression: github.com/light-speak/luxo/pkg/lux/luvia/"
+    rows = [line for line in result.splitlines() if line.startswith("confirmed performance regression:")]
+    if not rows or not all(line.startswith(prefix) and " sec/op " in line for line in rows):
+        return False
+    names = {line.removeprefix(prefix).split(" sec/op ", 1)[0] for line in rows}
+    return "GatewayIdentity/authenticated/after-2" in names and names <= set(SCOPES["01"]["confirmed"])
 
 
 if __name__ == "__main__":
@@ -324,6 +361,14 @@ if __name__ == "__main__":
         nearby_text_map(*map(Path, args))
     elif action == "verify-alignment":
         verify_alignment(Path(args[0]))
+    elif action == "verify-current-alignment":
+        verify_alignment(Path(args[0]), current_source=True)
+    elif action == "current-plan":
+        current_plan(Path(args[0]))
+    elif action == "current-inventory":
+        current_inventory(Path(args[0]), Path(args[1]), args[2])
+    elif action == "current-targets":
+        raise SystemExit(0 if current_targets(Path(args[0]).read_text()) else 1)
     elif action == "confirmed-targets":
         raise SystemExit(0 if confirmed_targets(Path(args[0]).read_text()) else 1)
     else:

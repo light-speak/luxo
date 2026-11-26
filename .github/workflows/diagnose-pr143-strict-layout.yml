@@ -1,19 +1,18 @@
-name: Attribute PR 143 gateway identity link layout
+name: Attribute PR 143 gateway identity on the current main
 
 on:
   push:
-    branches: [diagnostics/pr143-identity-alignment]
+    branches: [diagnostics/pr143-gateway-current]
     paths:
       - '.github/workflows/diagnose-pr143-strict-layout.yml'
       - 'scripts/diagnose-pr143-strict-native.*'
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
   replay:
-    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr143-identity-alignment'
+    if: github.repository == 'light-speak/luxo' && github.ref == 'refs/heads/diagnostics/pr143-gateway-current'
     name: Gateway identity alignment (${{ matrix.slot }})
     runs-on: ubuntu-24.04
     timeout-minutes: 35
@@ -52,15 +51,22 @@ jobs:
       - uses: actions/checkout@v7
         if: steps.route.outputs.match == 'true'
         with:
-          ref: 36681c63627f4a3a4805bc6d19e908325614d3e9
+          ref: 43dd9d4e5eb8fb59573fd3bdfd7de7b5b6814879
           path: .tmp/base
           persist-credentials: false
 
       - uses: actions/checkout@v7
         if: steps.route.outputs.match == 'true'
         with:
-          ref: 27fddbeee9a994e1ea1330df9b53b36d501c8652
+          ref: 5e4d2b5c0c1a2ba867160d8fe666af0ca90466d8
           path: .tmp/head-git
+          persist-credentials: false
+
+      - uses: actions/checkout@v7
+        if: steps.route.outputs.match == 'true'
+        with:
+          ref: 59a4167f129f0bff0e8425125fa02eae87fd347b
+          path: .tmp/merge-base
           persist-credentials: false
 
       - uses: actions/setup-go@v7
@@ -69,17 +75,16 @@ jobs:
           go-version: '1.27.1'
           cache: false
 
-      - name: Verify the original executable code and run four-arm link comparisons
+      - name: Verify the current product trees and run four-arm link comparisons
         if: steps.route.outputs.match == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
           RUNNER_KIND: ${{ runner.environment }}
         run: bash .tmp/control/scripts/diagnose-pr143-strict-native.sh
 
       - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
-          name: pr143-identity-alignment-${{ matrix.slot }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: pr143-gateway-current-${{ matrix.slot }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/pr143-strict-evidence/
           include-hidden-files: true
           if-no-files-found: error
