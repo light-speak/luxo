@@ -19,9 +19,12 @@ INPUT = Path(__file__).resolve().parent
 ROOT = INPUT.parents[1]
 OUT = ROOT / '.tmp/pr158-attribution'
 RUN_CONFIG_SHA = 'bf3be34db7cca43489c678e725e5baa66ca03e323c4a282df9e8650db93cdc81'
+DIAGNOSTIC_PARENT = '5d63fd896bcc88aa35968e986985bb387e7de661'
+DIAGNOSTIC_REF = 'refs/heads/diagnostics/pr158-attribution'
 CONFIG = json.loads((INPUT / 'routes.json').read_bytes())
 PATHS = ('.github/workflows/diagnose-pr158-attribution.yml',
          *('scripts/diagnose-pr158/' + name for name in ('arm-b.patch.b64', 'go-capture.py', 'routes.json', 'run.py')))
+FOLLOWUP_PATHS = ('M\t.github/workflows/diagnose-pr158-attribution.yml', 'M\tscripts/diagnose-pr158/run.py')
 PAIRS = ('AA', 'BB', 'CC', 'AB', 'BC', 'AC')
 METRICS = '.unit:(sec/op OR B/op OR allocs/op)'
 HOT = {
@@ -57,22 +60,47 @@ def json_file(file, value):
         stream.write('\n')
 
 
-def route_guard(route):
-    OUT.mkdir(parents=True)
-    cpu = next(line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines()
-               if line.startswith('model name'))
+def select_route(requested, cpu):
+    routes = CONFIG['routes']
+    if requested != 'auto':
+        return requested if routes[requested]['cpu'] == cpu else None
+    matches = [name for name, route in routes.items() if route['cpu'] == cpu]
+    need(len(matches) <= 1, 'the CPU identifies more than one original route')
+    return matches[0] if matches else None
+
+
+def route_guard(requested):
+    OUT.mkdir(parents=True, exist_ok=True)
+    models = {line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines()
+              if line.startswith('model name')}
+    need(len(models) == 1, 'expected one native CPU model')
+    cpu = models.pop()
     (OUT / 'cpu.txt').write_text(cpu + '\n')
     need(os.environ.get('RUNNER_KIND') == 'github-hosted', 'expected a hosted runner')
+    need(os.environ.get('GITHUB_EVENT_NAME') == 'push' and os.environ.get('GITHUB_REF') == DIAGNOSTIC_REF and
+         os.environ.get('GITHUB_REPOSITORY') == 'light-speak/luxo', 'expected the diagnostic branch push')
     need(digest(INPUT / 'routes.json') == RUN_CONFIG_SHA, 'witness route manifest changed')
-    if cpu != route['cpu']:
-        json_file(OUT / 'status.json', {'matched': False, 'expectedCPU': route['cpu'], 'cpu': cpu, 'processes': 0})
+    selected = select_route(requested, cpu)
+    if selected is None:
+        expected = [route['cpu'] for route in CONFIG['routes'].values()] if requested == 'auto' else [CONFIG['routes'][requested]['cpu']]
+        json_file(OUT / 'status.json', {'matched': False, 'requestedRoute': requested, 'expectedCPUs': expected,
+                                       'cpu': cpu, 'processes': 0})
         raise SystemExit(3)
     need('VERSION_ID="24.04"' in Path('/etc/os-release').read_text() and call('getconf', '_NPROCESSORS_ONLN').strip() == b'4',
          'expected Ubuntu 24.04 on four CPU cores')
+    verify_provenance()
+    return selected, cpu
+
+
+def verify_provenance():
     active = git('rev-parse', 'HEAD')
-    need(active == os.environ['GITHUB_SHA'] and git('show', '-s', '--format=%P', active) == CONFIG['candidateCommit'],
-         'the diagnostic must be one commit on the published historical candidate')
+    need(active == os.environ.get('GITHUB_SHA') and git('show', '-s', '--format=%P', active) == DIAGNOSTIC_PARENT,
+         'the diagnostic must append one commit to the published witness')
+    need(git('show', '-s', '--format=%P', DIAGNOSTIC_PARENT) == CONFIG['candidateCommit'],
+         'the published witness must descend directly from the historical candidate')
     need(git('show', '-s', '--format=%P', CONFIG['candidateCommit']) == CONFIG['baseCommit'], 'target ancestry changed')
+    need(git('diff', '--name-status', DIAGNOSTIC_PARENT, active).splitlines() == list(FOLLOWUP_PATHS),
+         'unexpected routing revision paths')
     need(git('diff', '--name-only', CONFIG['candidateCommit'], active).splitlines() == list(PATHS), 'unexpected diagnostic paths')
     for role, commit in (('A', CONFIG['baseCommit']), ('C', CONFIG['candidateCommit'])):
         need(git('rev-parse', f'{commit}^{{tree}}') == CONFIG['trees'][role], f'{role} source identity changed')
@@ -222,16 +250,25 @@ def gate(tools, expected):
 
 
 def main():
-    need(len(sys.argv) == 2 and sys.argv[1] in CONFIG['routes'], 'expected the Intel or EPYC route')
-    route = CONFIG['routes'][sys.argv[1]]
-    route_guard(route)
+    args = sys.argv[1:]
+    probe = args[:1] == ['--probe']
+    if probe:
+        args = args[1:]
+    need(len(args) == 1 and (args[0] == 'auto' or args[0] in CONFIG['routes']), 'expected auto, intel, or epyc')
+    selected, cpu = route_guard(args[0])
+    if probe:
+        print(selected)
+        return
+    route = CONFIG['routes'][selected]
     go = shutil.which('go')
     need(go, 'missing Go compiler')
     fields = ('GOVERSION', 'GOHOSTOS', 'GOHOSTARCH', 'GOOS', 'GOARCH', 'GOAMD64', 'CGO_ENABLED', 'GOFLAGS', 'GOTOOLCHAIN')
     version = call(go, 'env', *fields)
     need(version == b'go1.27.4\nlinux\namd64\nlinux\namd64\nv1\n1\n\nlocal\n', 'wrong native toolchain or flags')
-    json_file(OUT / 'binding.json', {'inputs': CONFIG, 'route': sys.argv[1], 'goEnvironment': version.decode().splitlines(),
-                                    'goSHA256': digest(Path(go)), 'runner': call('uname', '-a').decode().strip()})
+    json_file(OUT / 'binding.json', {'inputs': CONFIG, 'route': selected, 'cpu': cpu,
+                                    'diagnosticCommit': os.environ['GITHUB_SHA'], 'diagnosticParent': DIAGNOSTIC_PARENT,
+                                    'goEnvironment': version.decode().splitlines(), 'goSHA256': digest(Path(go)),
+                                    'runner': call('uname', '-a').decode().strip()})
     grouped = group_cases(route['cases'])
     rows = sorted(({'Package': item['package'], 'Name': item['name']} for item in route['cases']),
                   key=lambda item: (item['Package'], item['Name']))
@@ -255,7 +292,8 @@ def main():
         binaries = {role: build_profile(go, tools, role, source, work, grouped) for role, source in arms.items()}
         processes = measure(arms, binaries, grouped)
         outcomes = gate(tools, expected)
-    json_file(OUT / 'status.json', {'matched': True, 'processes': processes, 'gates': outcomes})
+    json_file(OUT / 'status.json', {'matched': True, 'route': selected, 'cpu': cpu,
+                                   'processes': processes, 'gates': outcomes})
     sys.exit(int(any(outcomes.values())))
 
 
