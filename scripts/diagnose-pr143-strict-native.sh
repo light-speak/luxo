@@ -4,6 +4,7 @@ export LC_ALL=C GOTOOLCHAIN=local
 
 base=36681c63627f4a3a4805bc6d19e908325614d3e9
 head=27fddbeee9a994e1ea1330df9b53b36d501c8652
+driver_parent=99926f9dac1ebcca449ada8f6c9d33e231bd6a70
 root=$(cd "$GITHUB_WORKSPACE" && pwd -P)
 work="$root/.tmp"
 control="$work/control"
@@ -14,8 +15,6 @@ helper="$control/scripts/diagnose-pr143-strict-native.py"
 g() { git --no-replace-objects -C "$@"; }
 
 case "$TARGET_SHARD" in
-    01) original=15100912340; cpu='Intel(R) Xeon(R) 6975P-C';
-        symbols='BenchmarkGatewayIdentity|luvia\.(New|newGateway|Identity)|context\.\(\*valueCtx\)\.Value' ;;
     06) original=15101670856; cpu='AMD EPYC 9V45 96-Core Processor';
         symbols='BenchmarkAuthMiddlewareIsolation|authMiddlewareBeforeIsolation|AuthMiddleware|extractBearerToken|auth\.VerifyCachedWithExpiry|luvia\.Identity' ;;
     07) original=15101276107; cpu='INTEL(R) XEON(R) PLATINUM 8573C';
@@ -28,7 +27,10 @@ actual=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | sed 's/[[:space:]]*$//
 test "$actual" = "$cpu"
 test "$(go env GOVERSION GOHOSTOS GOHOSTARCH GOOS GOARCH GOAMD64 CGO_ENABLED)" = $'go1.27.1\nlinux\namd64\nlinux\namd64\nv1\n1'
 test -z "$(go env GOFLAGS)"
-test "$(g "$control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $base"
+test "$(g "$control" rev-list --parents -n 1 HEAD)" = "$GITHUB_SHA $driver_parent"
+test "$(g "$control" rev-list --parents -n 1 "$driver_parent")" = "$driver_parent $base"
+diff -u <(printf 'M\t%s\n' .github/workflows/diagnose-pr143-strict-layout.yml scripts/diagnose-pr143-strict-native.sh) \
+    <(g "$control" diff --name-status "$driver_parent" HEAD)
 diff -u <(printf 'A\t%s\n' .github/workflows/diagnose-pr143-strict-layout.yml \
     scripts/diagnose-pr143-strict-native.py scripts/diagnose-pr143-strict-native.sh) \
     <(g "$control" diff --name-status "$base" HEAD)
@@ -181,7 +183,7 @@ for side in aa bb; do
 done
 status=0
 gate ab-combined --approved-costs "$head_git/scripts/benchgate/approved-costs.json" --base-sha "$base" \
-    --targeted-confirmation "$evidence/ab.1.csv" "$evidence/ab.2.csv" || status=$?
+    "$evidence/ab.1.csv" "$evidence/ab.2.csv" || status=$?
 sha256sum -c "$evidence/base.sha256" "$evidence/head.sha256"
 if (( unstable )); then printf 'unstable-control\n' > "$evidence/outcome.txt"; exit 4; fi
 if (( status )); then printf 'strict-comparison-failed\n' > "$evidence/outcome.txt"; exit "$status"; fi
