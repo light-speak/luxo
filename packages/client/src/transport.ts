@@ -401,7 +401,8 @@ export interface TransportOptions {
   /** Request timeout in milliseconds (default: 30000) */
   // WebSocket bounds connection setup, response/ACK and renewal separately.
   timeout?: number
-  /** HTTP 401 retries once; WS close 4001 refreshes before reconnecting, without replaying old work. */
+  /** HTTP requests in one session share refresh and retry a validated 401 once.
+   * WS close 4001 refreshes before reconnecting, without replaying old work. */
   onTokenExpired?: () => Promise<string | null>
   /** Optional safe request observer. Parameter values and wire payloads are never exposed. */
   observer?: TransportObserver
@@ -435,6 +436,32 @@ interface ResponseScope {
   abortError: (error: unknown) => LuxoError | undefined
 }
 
+type HTTPRefreshResult = { token: string | null } | { error: unknown }
+type HTTPRefreshWaiter = (result: HTTPRefreshResult) => void
+
+interface HTTPRefreshFlight {
+  waiters: HTTPRefreshWaiter | Set<HTTPRefreshWaiter> | undefined
+  result?: HTTPRefreshResult
+  participants: number
+  abandoned: boolean
+  installedResult: boolean
+}
+
+interface HTTPCredentials {
+  readonly revision: number
+  session: number
+  flight?: HTTPRefreshFlight
+  installingFlight?: HTTPRefreshFlight
+}
+
+function finishHTTPRefresh(flight: HTTPRefreshFlight, result: HTTPRefreshResult): void {
+  if (flight.abandoned || flight.result) return
+  flight.result = result
+  const waiters = flight.waiters
+  if (typeof waiters === 'function') waiters(result)
+  else if (waiters) for (const settle of waiters) settle(result)
+}
+
 function notifyObserver(observer: TransportObserver, event: TransportEvent): void {
   try {
     observer(event)
@@ -456,6 +483,7 @@ export class FetchTransport implements Transport {
   private schema: Record<string, APISchema> = {}
   private timeout: number
   private onTokenExpired?: () => Promise<string | null>
+  private httpCredentials?: HTTPCredentials
   private readonly observer?: TransportObserver
 
   constructor(private endpoint: string, options?: TransportOptions) {
@@ -463,6 +491,7 @@ export class FetchTransport implements Transport {
     this.mode = options?.mode ?? 'json'
     this.timeout = options?.timeout ?? 30000
     this.onTokenExpired = options?.onTokenExpired
+    if (this.onTokenExpired) this.httpCredentials = { revision: 0, session: 0 }
     this.observer = options?.observer
     this.headers = new HTTPHeaders(options?.headers, options?.token)
   }
@@ -475,6 +504,16 @@ export class FetchTransport implements Transport {
   setMode(mode: TransportMode): void { this.mode = mode }
   setToken(token: string | null): void {
     this.headers.setToken(token)
+    const previous = this.httpCredentials
+    if (previous) {
+      const { flight, installingFlight } = previous
+      const revision = previous.revision + 1
+      this.httpCredentials = { revision, session: revision }
+      const witness = installingFlight ?? flight
+      const result = witness?.result
+      if (witness && result) witness.installedResult = 'token' in result && result.token === token
+      if (flight && !flight.result) finishHTTPRefresh(flight, { token: null })
+    }
   }
 
   call(api: string, params?: RequestParameters, options?: CallOptions): Promise<unknown> {
@@ -606,10 +645,10 @@ export class FetchTransport implements Transport {
     body: string,
     responsePlan: JSONResourcePlan,
     options?: CallOptions,
-    allowRefresh = true,
     parent?: ResponseScope,
   ): Promise<unknown> {
     const requestHeaders = this.headers.json
+    const credentials = this.httpCredentials
     const scope = await this.openRequest({
       method: 'POST',
       headers: requestHeaders,
@@ -635,17 +674,9 @@ export class FetchTransport implements Transport {
         return json.data
       }
       const error = jsonResponseError(json, resp.status)
-      if (this.headers.json !== requestHeaders) throw error
-      const refresh = this.refreshAfterUnauthorized(error, scope, allowRefresh, options?.signal)
-      if (refresh) {
-        const token = await refresh
-        if (scope.signal.aborted) throw scope.abortError(new DOMException('request aborted', 'AbortError'))
-        if (token) {
-          if (options?.signal?.aborted || this.refreshAbortSignal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
-          if (this.headers.json !== requestHeaders) throw error
-          this.setToken(token)
-          return await this.jsonRequest(body, responsePlan, options, false, scope)
-        }
+      const refresh = !parent && this.refreshAfterUnauthorized(error, scope, credentials, options?.signal)
+      if (refresh && await refresh && this.mayRetry(scope, credentials!, options?.signal)) {
+        return await this.jsonRequest(body, responsePlan, options, scope)
       }
       throw error
     } finally {
@@ -661,8 +692,9 @@ export class FetchTransport implements Transport {
   ): Promise<unknown> {
     try {
       const requestHeaders = this.headers.binary
+      const credentials = this.httpCredentials
       const body = preparedBody ?? this.encodeBinaryRequest(api, params)
-      return this.binaryRequest(body, options, true, undefined, requestHeaders)
+      return this.binaryRequest(body, options, undefined, requestHeaders, credentials)
     } catch (error) {
       return Promise.reject(error)
     }
@@ -671,9 +703,9 @@ export class FetchTransport implements Transport {
   private async binaryRequest(
     body: ArrayBuffer | Uint8Array<ArrayBuffer>,
     options?: CallOptions,
-    allowRefresh = true,
     parent?: ResponseScope,
     requestHeaders = this.headers.binary,
+    credentials = this.httpCredentials,
   ): Promise<unknown> {
     const scope = await this.openRequest({
       method: 'POST',
@@ -694,17 +726,9 @@ export class FetchTransport implements Transport {
         return data
       }
       const error = decodeBinaryError(data, scope.response.status)
-      if (this.headers.binary !== requestHeaders) throw error
-      const refresh = this.refreshAfterUnauthorized(error, scope, allowRefresh, options?.signal)
-      if (refresh) {
-        const token = await refresh
-        if (scope.signal.aborted) throw scope.abortError(new DOMException('request aborted', 'AbortError'))
-        if (token) {
-          if (options?.signal?.aborted || this.refreshAbortSignal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
-          if (this.headers.binary !== requestHeaders) throw error
-          this.setToken(token)
-          return await this.binaryRequest(body, options, false, scope)
-        }
+      const refresh = !parent && this.refreshAfterUnauthorized(error, scope, credentials, options?.signal)
+      if (refresh && await refresh && this.mayRetry(scope, credentials!, options?.signal)) {
+        return await this.binaryRequest(body, options, scope)
       }
       throw error
     } finally {
@@ -713,39 +737,122 @@ export class FetchTransport implements Transport {
   }
 
   private refreshAfterUnauthorized(
-    error: LuxoError, scope: ResponseScope, allowRefresh: boolean, signal?: AbortSignal,
-  ): Promise<string | null> | undefined {
+    error: LuxoError, scope: ResponseScope, credentials: HTTPCredentials | undefined, signal?: AbortSignal,
+  ): Promise<boolean> | undefined {
     // Only a validated 401 envelope may refresh; body failures never reach here.
-    if (!allowRefresh || scope.response.status !== 401 ||
-      error.code !== 401 || error.error === 'ParseError' || !this.onTokenExpired) return undefined
-    if (scope.signal.aborted) return Promise.reject(scope.abortError(new DOMException('request aborted', 'AbortError')))
-    if (signal?.aborted || this.refreshAbortSignal?.aborted) return Promise.reject(new LuxoError('CancelledError', 0, 'request cancelled'))
-    const refresh = this.onTokenExpired()
-    return this.waitForRefresh(refresh, scope, this.refreshAbortSignal)
+    const current = this.httpCredentials
+    if (scope.response.status !== 401 || error.code !== 401 || error.error === 'ParseError' ||
+      !credentials || !current || current.session !== credentials.session) return undefined
+    this.checkRefreshCancellation(scope, signal)
+    const flight = credentials.flight ?? this.startHTTPRefresh(credentials)
+    return this.joinHTTPRefresh(credentials, flight, scope, signal)
   }
 
-  private waitForRefresh(refresh: Promise<string | null>, scope: ResponseScope, lifecycle?: AbortSignal): Promise<string | null> {
+  private startHTTPRefresh(credentials: HTTPCredentials): HTTPRefreshFlight {
+    const flight: HTTPRefreshFlight = { waiters: undefined, participants: 0, abandoned: false, installedResult: false }
+    credentials.flight = flight
+    try {
+      void Promise.resolve(this.onTokenExpired!()).then(
+        token => finishHTTPRefresh(flight, { token }), error => finishHTTPRefresh(flight, { error }),
+      )
+    } catch (error) {
+      finishHTTPRefresh(flight, { error })
+    }
+    return flight
+  }
+
+  private async joinHTTPRefresh(
+    credentials: HTTPCredentials, flight: HTTPRefreshFlight, scope: ResponseScope, signal?: AbortSignal,
+  ): Promise<boolean> {
+    flight.participants++
+    try {
+      const token = await this.waitForRefresh(flight, scope, this.refreshAbortSignal)
+      this.checkRefreshCancellation(scope, signal)
+      const current = this.httpCredentials
+      if (!token || current?.session !== credentials.session) return false
+      if (current.revision === credentials.revision) {
+        flight.installedResult = false
+        if (current.flight === flight) this.setToken(token)
+        else this.installLateRefreshToken(current, flight, token)
+        const updated = this.httpCredentials
+        // Preserve the session only if the setter installed the refresh result.
+        if (updated?.revision === current.revision + 1 && flight.installedResult) {
+          updated.session = current.session
+        }
+      }
+      return this.httpCredentials?.revision !== credentials.revision
+    } finally {
+      if (--flight.participants === 0 && this.httpCredentials === credentials) {
+        if (!flight.result) {
+          // A request whose 401 has not arrived can still start a replacement refresh.
+          flight.abandoned = true
+          credentials.flight = undefined
+        } else {
+          // Already-sent requests retain the settled result. Later requests can refresh again.
+          this.httpCredentials = { revision: credentials.revision, session: credentials.session }
+        }
+      }
+    }
+  }
+
+  private installLateRefreshToken(current: HTTPCredentials, flight: HTTPRefreshFlight, token: string): void {
+    // A late response can preserve an older settled result while the active flight is pending.
+    const previous = current.installingFlight
+    current.installingFlight = flight
+    try {
+      this.setToken(token)
+    } finally {
+      current.installingFlight = previous
+    }
+  }
+
+  private mayRetry(scope: ResponseScope, credentials: HTTPCredentials, signal?: AbortSignal): boolean {
+    this.checkRefreshCancellation(scope, signal)
+    return this.httpCredentials?.session === credentials.session
+  }
+
+  private checkRefreshCancellation(scope: ResponseScope, signal?: AbortSignal): void {
+    if (scope.signal.aborted) throw scope.abortError(new DOMException('request aborted', 'AbortError'))
+    if (signal?.aborted || this.refreshAbortSignal?.aborted) throw new LuxoError('CancelledError', 0, 'request cancelled')
+  }
+
+  private waitForRefresh(flight: HTTPRefreshFlight, scope: ResponseScope, lifecycle?: AbortSignal): Promise<string | null> {
     const signal = scope.signal
     return new Promise((resolve, reject) => {
       const cleanup = () => {
-        signal?.removeEventListener('abort', cancel)
+        signal.removeEventListener('abort', cancel)
         lifecycle?.removeEventListener('abort', cancel)
+        const waiters = flight.waiters
+        if (waiters === settle) flight.waiters = undefined
+        else if (typeof waiters === 'object') waiters.delete(settle)
       }
       const cancel = () => {
         cleanup()
         reject(scope.abortError(new DOMException('request aborted', 'AbortError')))
       }
-      signal?.addEventListener('abort', cancel, { once: true })
+      const settle = (result: HTTPRefreshResult) => {
+        cleanup()
+        if ('error' in result) reject(result.error)
+        else resolve(result.token)
+      }
+      signal.addEventListener('abort', cancel, { once: true })
       lifecycle?.addEventListener('abort', cancel, { once: true })
-      if (signal?.aborted || lifecycle?.aborted) cancel()
-      // Observe late settlement without changing credentials or retrying a cancelled call.
-      void refresh.then(token => {
-        cleanup()
-        resolve(token)
-      }, error => {
-        cleanup()
-        reject(error)
-      })
+      if (signal.aborted || lifecycle?.aborted) cancel()
+      else if (flight.result) settle(flight.result)
+      else {
+        let waiters = flight.waiters
+        if (!waiters) {
+          flight.waiters = settle
+        } else {
+          if (typeof waiters === 'function') {
+            const first = waiters
+            waiters = new Set<HTTPRefreshWaiter>()
+            waiters.add(first)
+            flight.waiters = waiters
+          }
+          waiters.add(settle)
+        }
+      }
     })
   }
 
