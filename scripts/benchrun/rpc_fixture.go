@@ -50,7 +50,9 @@ const (
 		"\nluvia-auth-middleware-overlay-v1 " + luviaAuthBenchmarkFixture + "=" + luviaAuthBenchmarkSHA +
 		" " + luviaAuthHelperFixture + "=" + luviaAuthHelperSHA +
 		"\napi-binary-param-lookup-overlay-v1 " + apiBinaryParamLookupFixture +
-		"\napi-request-log-overlay-v1 " + apiRequestLogFixture + "=" + apiRequestLogProjectionSHA + " " + apiRequestLogSourceSHA
+		"\napi-request-log-overlay-v1 " + apiRequestLogFixture + "=" + apiRequestLogProjectionSHA + " " + apiRequestLogSourceSHA +
+		"\ncodegen-relation-loader-overlay-v1 " + codegenRelationLoaderFilename + "=" + codegenRelationLoaderProjectionSHA + " " + codegenRelationLoaderSourceSHA +
+		"\nsemantic-event-emits-overlay-v1 " + semanticEventEmitsFilename + "=" + semanticEventEmitsProjectionSHA + " " + semanticEventEmitsSourceSHA
 )
 
 func writeRPCOwnedRequestOverlay(pkg, workspace string) (string, error) {
