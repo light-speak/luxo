@@ -11,7 +11,7 @@ module=packages/kotlin
 kotlin_tree=9f47b2309da48711302cc48d8bc937bd41137e57
 transport=src/main/kotlin/com/luxo/client/Transport.kt
 base_hash=33d5d22886da79b5bca2267da4eda63423be78aeab542272b38e514d2f36a556
-head_hash=66b256499e97e4b6efd50cd1c877c1364cb3cb8bdb2449d20668761a9356a46d
+head_hash=2e6958e481632aa9e5ecba5b63baa29704f1dfa5d5918c8d6358b182169194ee
 
 test "$(uname -sm)" = 'Linux x86_64'
 java_version=$("$jdk/bin/java" -version 2>&1)
@@ -26,12 +26,13 @@ test "$(git -C "$repo" rev-parse "$base:VERSION")" = ffbc993986414defe0d22671869
     uname -sm
     printf '%s\n' "$java_version"
     printf 'base_tree=%s\nkotlin_tree=%s\n' "$base_tree" "$kotlin_tree"
+    printf 'candidate_tree=%s\n' 5b692e993d08e4d85739f70cd8bb8bf57301f228
     sha256sum "$scope"/{HttpSingleFlightBenchmark.kt,classpath.init.gradle,qualify.py,runtime-sha256.tsv,transport.patch.b64} \
         "$jdk/bin/java" "$jdk/lib/server/libjvm.so"
 } > "$build/build-metadata.txt"
 
 base64 -d "$scope/transport.patch.b64" > "$build/transport.diff"
-printf '%s  %s\n' b9e212dac7267840694b18d949e0d0ff84d1b6554373d340a1bd19345d29634a "$build/transport.diff" | sha256sum -c -
+printf '%s  %s\n' 86be2412b0f3801d8378f369e7f5fad172dd75438e27e9c50aee6404639bf49d "$build/transport.diff" | sha256sum -c -
 mkdir "$build/gradle-home"
 for role in base candidate; do
     arm="$build/$role"

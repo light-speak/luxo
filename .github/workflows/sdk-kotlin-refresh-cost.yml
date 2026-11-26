@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
 
       - uses: actions/setup-java@v6
@@ -41,6 +41,8 @@ jobs:
           test "$(uname -sm)" = 'Linux x86_64'
           grep -Fx 'VERSION_ID="24.04"' /etc/os-release
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git show -s --format=%P HEAD)" = 0f6bd9e4ffa650b6b6df4c6eab72b24f0f97c142
+          test "$(git rev-parse HEAD~2)" = 77b6cdf20d424213f4c1dc90534f924ac6b176d0
           unset JAVA_TOOL_OPTIONS JDK_JAVA_OPTIONS _JAVA_OPTIONS
           export QUALIFICATION_REPO="$GITHUB_WORKSPACE"
           evidence="$GITHUB_WORKSPACE/.tmp/kotlin-refresh-evidence"
