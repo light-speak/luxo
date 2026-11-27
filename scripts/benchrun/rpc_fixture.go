@@ -48,6 +48,7 @@ const (
 		"\n" + benchlayout.APIBodyReadProfile + "-overlay-v1 " + apiBodyReadFixture + "=" + apiBodyReadSHA +
 		"\n" + benchlayout.APIJSONQuoteCandidateProfile + "-overlay-v1 " + apiJSONQuoteFixture + "=" + apiJSONQuoteSHA +
 		" " + apiJSONQuoteReferenceFixture + "=" + apiJSONQuoteReferenceSHA +
+		"\n" + benchlayout.APIJSONListMetadataProfile + "-overlay-v1 " + apiJSONListMetadataFilename + "=" + apiJSONListMetadataProjectionSHA + " " + apiJSONListMetadataSourceSHA +
 		"\n" + benchlayout.APIResponseOriginRunProfile + "-overlay-v1 " + apiResponseOriginBenchmarkFixture + "=" + apiResponseOriginBenchmarkSHA +
 		" " + apiResponseOriginHelperFixture + "=" + apiResponseOriginHelperSHA + ":" + apiResponseOriginProjectionSHA +
 		"\nrpc-owned-request-overlay-v1 " + rpcOwnedRequestFixture +
