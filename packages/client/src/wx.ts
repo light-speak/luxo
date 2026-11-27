@@ -1,6 +1,6 @@
 import { encodeBinaryBody, encodeStaticRequestBody } from './transport'
 import { decodeBinaryError, jsonResponseError, missingBinaryResponse } from './error-codec'
-import type { Transport, TransportMode, APISchema } from './transport'
+import type { APISchema, CallOptions, Transport, TransportMode } from './transport'
 import { LuxoError } from './error'
 import { decodeJSONEnvelope, encodeLuxoJSON } from './json'
 import { JSONParamValidator } from './json-params'
@@ -10,17 +10,77 @@ import { snapshotAPISchema } from './schema-runtime'
 import { requestJSON, staticJSONParameters, generatedJSONParameters } from './request'
 import type { RequestParameters, RequestEncoder, RequestValues } from './request'
 
+interface WxRequestOptions {
+  url: string
+  method: string
+  header: Record<string, string>
+  data: string | ArrayBuffer
+  dataType?: string
+  responseType?: 'text' | 'arraybuffer'
+  success: (res: { statusCode: number; data: unknown }) => void
+  fail: (err: { errMsg: string }) => void
+}
+
+interface WxRequestTask {
+  abort(): void
+}
+
 declare const wx: {
-  request(options: {
-    url: string
-    method: string
-    header: Record<string, string>
-    data: string | ArrayBuffer
-    dataType?: string
-    responseType?: 'text' | 'arraybuffer'
-    success: (res: { statusCode: number; data: unknown }) => void
-    fail: (err: { errMsg: string }) => void
-  }): void
+  request(options: WxRequestOptions): WxRequestTask | undefined
+}
+
+function cancelledRequest(): LuxoError {
+  return new LuxoError('CancelledError', 0, 'request cancelled')
+}
+
+function abortWxTask(task: WxRequestTask | undefined): void {
+  try { task?.abort() } catch { /* The request has already settled as cancelled. */ }
+}
+
+function sendWxRequest(options: WxRequestOptions, signal: AbortSignal | undefined, reject: (error: unknown) => void): void {
+  if (signal) sendCancellableWxRequest(options, signal, reject)
+  else wx.request(options)
+}
+
+function sendCancellableWxRequest(options: WxRequestOptions, signal: AbortSignal, reject: (error: unknown) => void): void {
+  // A parameter encoder can abort after the public entry's initial check.
+  if (signal.aborted) {
+    reject(cancelledRequest())
+    return
+  }
+
+  const { success, fail } = options
+  let settled = false
+  let cancelled = false
+  let task: WxRequestTask | undefined
+  const finish = (): boolean => {
+    if (settled) return false
+    settled = true
+    task = undefined
+    signal.removeEventListener('abort', cancel)
+    return true
+  }
+  const cancel = (): void => {
+    const started = task
+    if (!finish()) return
+    cancelled = true
+    reject(cancelledRequest())
+    abortWxTask(started)
+  }
+  options.success = response => { if (finish()) success(response) }
+  options.fail = error => { if (finish()) fail(error) }
+
+  try {
+    signal.addEventListener('abort', cancel, { once: true })
+    if (signal.aborted) cancel()
+    if (settled) return
+    const started = wx.request(options)
+    // The host can settle the request synchronously before returning a task.
+    if (cancelled) abortWxTask(started)
+    else if (!settled) task = started
+  } catch (error) {
+    if (finish()) reject(error)
+  }
 }
 
 function decodeWxJSON(data: unknown, status: number, responsePlan: JSONResourcePlan): unknown {
@@ -67,23 +127,27 @@ export class WxTransport implements Transport {
     }
   }
 
-  async call<T = unknown>(api: string, params?: RequestParameters): Promise<T> {
+  async call<T = unknown>(api: string, params?: RequestParameters, options?: CallOptions): Promise<T> {
+    const signal = options?.signal
+    if (signal?.aborted) throw cancelledRequest()
     if (this.mode === 'binary') {
-      return this.callBinary<T>(api, params)
+      return this.callBinary<T>(api, params, signal)
     }
-    return this.callJSON<T>(api, params)
+    return this.callJSON<T>(api, params, signal)
   }
 
-  async callGenerated<P extends RequestValues>(api: string, codec: RequestEncoder<P>, params?: P): Promise<unknown> {
+  async callGenerated<P extends RequestValues>(api: string, codec: RequestEncoder<P>, params?: P, options?: CallOptions): Promise<unknown> {
+    const signal = options?.signal
+    if (signal?.aborted) throw cancelledRequest()
     const meta = this.schema[api]
     if (!meta || meta.id !== codec.apiID) throw new LuxoError('ConfigError', 0, 'generated request API ID differs from registered schema')
     const jsonParams = this.jsonParams
     return this.mode === 'binary'
-      ? this.callBinary(api, undefined, encodeStaticRequestBody(meta, codec, params))
-      : this.callJSON(api, params, staticJSONParameters(codec, params), jsonParams)
+      ? this.callBinary(api, undefined, signal, encodeStaticRequestBody(meta, codec, params))
+      : this.callJSON(api, params, signal, staticJSONParameters(codec, params), jsonParams)
   }
 
-  private callJSON<T>(api: string, params?: RequestParameters, prepared?: string, jsonParams = this.jsonParams): Promise<T> {
+  private callJSON<T>(api: string, params: RequestParameters | undefined, signal: AbortSignal | undefined, prepared?: string, jsonParams = this.jsonParams): Promise<T> {
     const responsePlan = jsonParams.response(api)
     const fragment = prepared ?? generatedJSONParameters(params)
     let body: string
@@ -94,7 +158,7 @@ export class WxTransport implements Transport {
     } else body = jsonParams.validateEncoded(api, '{"$api":' + encodeLuxoJSON(api) + fragment + '}')
 
     return new Promise((resolve, reject) => {
-      wx.request({
+      sendWxRequest({
         url: this.endpoint,
         method: 'POST',
         header: { 'Content-Type': 'application/json', ...this.headers },
@@ -107,11 +171,11 @@ export class WxTransport implements Transport {
         fail(err) {
           reject(new LuxoError('NetworkError', 0, err.errMsg))
         },
-      })
+      }, signal, reject)
     })
   }
 
-  private callBinary<T>(api: string, params?: RequestParameters, preparedBody?: Uint8Array<ArrayBuffer>): Promise<T> {
+  private callBinary<T>(api: string, params: RequestParameters | undefined, signal: AbortSignal | undefined, preparedBody?: Uint8Array<ArrayBuffer>): Promise<T> {
     let body = preparedBody
     if (!body) {
       const apiMeta = this.schema[api]
@@ -122,7 +186,7 @@ export class WxTransport implements Transport {
     }
 
     return new Promise((resolve, reject) => {
-      wx.request({
+      sendWxRequest({
         url: this.endpoint,
         method: 'POST',
         header: { 'Content-Type': 'application/x-luxo', 'X-Luxo-Mode': 'binary', ...this.headers },
@@ -134,7 +198,7 @@ export class WxTransport implements Transport {
         fail(err) {
           reject(new LuxoError('NetworkError', 0, err.errMsg))
         },
-      })
+      }, signal, reject)
     })
   }
 

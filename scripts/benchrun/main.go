@@ -142,7 +142,8 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-api-request-log-*", func(pkg, workspace string) (string, error) {
 			return writeAPIRequestLogOverlay(pkg, workspace, apiRequestLogProjectionSHA, apiRequestLogSourceSHA)
 		})
-	case benchlayout.APIIdentityConditionProfile, benchlayout.APIHandlerPanicProfile, benchlayout.APIWebSocketRegistrationsProfile:
+	case benchlayout.APIIdentityConditionProfile, benchlayout.APIHandlerPanicProfile, benchlayout.APIWebSocketRegistrationsProfile,
+		benchlayout.APIBodyReadProfile, benchlayout.APIJSONQuoteCandidateProfile:
 		return packageTestOverlay(root, packagePath, "bench-"+profile+"-*", func(pkg, workspace string) (string, error) {
 			return writeAPIBenchmarkFileOverlay(pkg, workspace, profile)
 		})
@@ -166,12 +167,9 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-codegen-global-receiver-*", writeCodegenReceiverOverlay)
 	case benchlayout.CodegenMigrationStateProfile:
 		return packageTestOverlay(root, packagePath, "bench-codegen-migration-state-*", writeCodegenMigrationStateOverlay)
-	case benchlayout.CodegenRelationLoaderProfile:
-		return pairedBenchmarkOverlay(root, packagePath, profile, codegenRelationLoaderFixture)
-	case benchlayout.SemanticEventEmitsProfile:
-		return pairedBenchmarkOverlay(root, packagePath, profile, semanticEventEmitsFixture)
+
 	default:
-		return compileCompactBenchmarkOverlay(root, packagePath, baseline, profile)
+		return compilerProfileOverlay(root, packagePath, baseline, profile)
 	}
 }
 

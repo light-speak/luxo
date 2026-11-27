@@ -175,6 +175,10 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{APIPackage, "BenchmarkResponseOriginRun/bounded-2", "api-response-origin-run"},
 		{APIPackage, "BenchmarkResponseOriginRun/unbounded-2", "api-response-origin-run"},
 		{APIPackage, "BenchmarkResponseOriginContended", APINonIdentityProfile},
+		{APIPackage, "BenchmarkBodyRead/0/direct-2", "api-body-read"},
+		{APIPackage, "BenchmarkBodyReadReverse/4096/direct-2", APINonIdentityProfile},
+		{APIPackage, "BenchmarkJSONQuoteCandidate/empty/current-2", "api-json-quote-candidate"},
+		{APIPackage, "BenchmarkJSONQuoteInvalidCandidate", APINonIdentityProfile},
 		{RPCPackage, "BenchmarkResponseOriginRun", DefaultProfile},
 		{APIPackage, "BenchmarkWSConnectionRegistrationsSibling-2", APINonIdentityProfile},
 		{RPCPackage, "BenchmarkHandlerPanicFormatting", RPCHandlerPanicProfile},
@@ -252,6 +256,8 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{"api-handler-panic", "^BenchmarkHandlerPanicFormatting$|^BenchmarkHandlerResponseBuffer$"},
 		{"api-websocket-registrations", "^BenchmarkWSConnectionRegistrations$"},
 		{"api-response-origin-run", "^BenchmarkResponseOriginRun$"},
+		{"api-body-read", "^BenchmarkBodyRead$"},
+		{"api-json-quote-candidate", "^BenchmarkJSONQuoteCandidate$"},
 	}
 	if !reflect.DeepEqual(apiProfiles, wantAPI) || ValidPerformanceProfile(RPCPackage, APIBinaryParamLookupProfile) ||
 		ValidPerformanceProfile(RPCPackage, APIRequestLogProfile) {
@@ -296,7 +302,7 @@ func TestCodegenProfilesRequirePackageAndExactRoots(t *testing.T) {
 		}
 	}
 	profiles := IsolationProfiles(CodegenPackage)
-	if len(profiles) != 4 || profiles[0] != (IsolationSpec{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"}) ||
+	if len(profiles) != 6 || profiles[0] != (IsolationSpec{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"}) ||
 		profiles[1] != (IsolationSpec{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"}) ||
 		profiles[2] != (IsolationSpec{migrationProfile, "^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$"}) ||
 		profiles[3] != (IsolationSpec{"codegen-relation-loader", "^BenchmarkRelationLoaderGeneration$"}) ||
@@ -321,17 +327,7 @@ func TestRelationAndEventBenchmarkProfilesRequireExactRoots(t *testing.T) {
 			t.Fatalf("profile %s accepted a different root or package", tc.profile)
 		}
 	}
-	for pkg, sibling := range map[string]string{
-		"pkg/semantic": "BenchmarkEventSnapshotContract/small-2",
-		"pkg/codegen":  "BenchmarkFindRead",
-	} {
-		if ProfileForBenchmark(pkg, sibling) != DefaultProfile {
-			t.Fatalf("unexpected isolated routing of %s/%s", pkg, sibling)
-		}
-	}
-	if ProfileForBenchmark("pkg/codegen", "BenchmarkNumericRangeValidation") != DefaultProfile {
-		t.Fatal("numeric range validation must still use the ordinary benchmark binary")
-	}
+
 }
 
 func TestLuxShortPathProfileRequiresPackageAndExactRoots(t *testing.T) {
@@ -427,5 +423,22 @@ func TestTransportRejectionAndReplacementProfiles(t *testing.T) {
 				t.Fatalf("incorrect root or package binding for %s", tc.profile)
 			}
 		})
+	}
+}
+
+func TestSealedCompilerProfilesRequireExactRoots(t *testing.T) {
+	for _, tc := range []struct{ pkg, root, profile string }{
+		{"pkg/codegen", "BenchmarkFindRead", "codegen-find-read"},
+		{"pkg/codegen", "BenchmarkNumericRangeValidation", "codegen-numeric-range"},
+		{"pkg/semantic", "BenchmarkEventSnapshotContract", "semantic-event-snapshot"},
+	} {
+		for _, name := range []string{tc.root, tc.root + "/leaf-2"} {
+			if got := ProfileForBenchmark(tc.pkg, name); got != tc.profile || !ValidPerformanceProfile(tc.pkg, got) {
+				t.Fatalf("%s/%s = %s", tc.pkg, name, got)
+			}
+		}
+		if ProfileForBenchmark(tc.pkg, tc.root+"Sibling-2") != DefaultProfile || ProfileForBenchmark("pkg/lux", tc.root) != DefaultProfile || ValidPerformanceProfile("pkg/lux", tc.profile) {
+			t.Fatal("profile escaped exact root/package")
+		}
 	}
 }
