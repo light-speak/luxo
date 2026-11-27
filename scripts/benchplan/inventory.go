@@ -132,14 +132,11 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 	case benchlayout.LuxShortPathProfile:
 		return verifyLuxShortPathInventory(isolated)
 	case benchlayout.CodegenLiteralProfile, benchlayout.CodegenReceiverProfile,
-		benchlayout.CodegenMigrationStateProfile, benchlayout.CodegenRelationLoaderProfile:
+		benchlayout.CodegenMigrationStateProfile, benchlayout.CodegenRelationLoaderProfile,
+		benchlayout.CodegenFindReadProfile, benchlayout.CodegenNumericRangeProfile:
 		return verifyCodegenProfileLeaves(profile, isolated)
-	case benchlayout.SemanticEventEmitsProfile:
-		const root = benchlayout.SemanticEventEmitsBenchmark
-		leaves := benchmarkCaseProduct([]string{"direct_0", "direct_1", "direct_128"}, []string{"recursive=false", "recursive=true"})
-		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
-			return errors.New("semantic event collection profile requires the six verified benchmark leaves")
-		}
+	case benchlayout.SemanticEventSnapshotProfile, benchlayout.SemanticEventEmitsProfile:
+		return verifySemanticProfileLeaves(profile, isolated)
 	case benchlayout.APILocalRouteExportProfile:
 		const root = benchlayout.APILocalRouteExportBenchmark
 		if !verifiedBenchmarkLeaves(isolated[root], root, "routes=1/previous", "routes=1/current", "routes=16/previous",
@@ -386,6 +383,19 @@ func verifyCodegenProfileLeaves(profile string, isolated inventory) error {
 		if !verifiedBenchmarkLeaves(isolated[root], root, "duration_leading_zero", "duration_plain", "int_leading_zero", "int_plain") {
 			return errors.New("codegen integer literal profile requires the four verified integer and duration leaves")
 		}
+	case benchlayout.CodegenFindReadProfile:
+		const root = benchlayout.CodegenFindReadBenchmark
+		if leaves := isolated[root]; len(leaves) != 1 {
+			return errors.New("codegen find read profile requires the verified root benchmark")
+		} else if _, ok := leaves[root+"-2"]; !ok {
+			return errors.New("codegen find read profile requires the verified root benchmark")
+		}
+	case benchlayout.CodegenNumericRangeProfile:
+		const root = benchlayout.CodegenNumericRangeBenchmark
+		if !verifiedBenchmarkLeaves(isolated[root], root, "none", "positive", "signed_int", "signed_float") {
+			return errors.New("codegen numeric range profile requires all four verified benchmark leaves")
+		}
+
 	case benchlayout.CodegenReceiverProfile:
 		return verifyCodegenReceiverInventory(isolated)
 	case benchlayout.CodegenMigrationStateProfile:
@@ -580,6 +590,24 @@ func verifyRPCProfileLeaves(profile string, isolated inventory) error {
 		return verifyPairedBenchmarkInventory(isolated, benchlayout.RPCPoolReturnRejectionBenchmark, "closed", "full")
 	default:
 		return errors.New("unsupported RPC benchmark inventory profile")
+	}
+	return nil
+}
+
+func verifySemanticProfileLeaves(profile string, isolated inventory) error {
+	switch profile {
+	case benchlayout.SemanticEventSnapshotProfile:
+		const root = benchlayout.SemanticEventSnapshotBenchmark
+		if !verifiedBenchmarkLeaves(isolated[root], root, "nested_types_0", "nested_types_1", "nested_types_16", "nested_types_128") {
+			return errors.New("semantic event snapshot profile requires all four verified benchmark leaves")
+		}
+
+	case benchlayout.SemanticEventEmitsProfile:
+		const root = benchlayout.SemanticEventEmitsBenchmark
+		leaves := benchmarkCaseProduct([]string{"direct_0", "direct_1", "direct_128"}, []string{"recursive=false", "recursive=true"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("semantic event collection profile requires the six verified benchmark leaves")
+		}
 	}
 	return nil
 }
