@@ -412,7 +412,7 @@ Registration, heartbeats, deregistration, metrics, and trace exports never follo
 
 ### Release and Stability Policy
 
-The cross-repository Swift CI checks out commit `d6578969bcef258141c7c99cb6cface30a22a0e2` and verifies that its `VERSION` matches the core. The conformance lane checks direct and gateway calls, WebSocket token renewal, and rolling enum upgrades over JSON and Binary. Release validation also requires the remote checkout and complete release gates. Record the tested revisions and compatibility matrix for each candidate update.
+The cross-repository Swift CI checks out commit `476e861a3b8a76e4bf7a4ece676f4be75fa10013` and verifies that its `VERSION` matches the core. The conformance lane checks direct and gateway calls, WebSocket token renewal, and rolling enum upgrades over JSON and Binary. Release validation also requires the remote checkout and complete release gates. Record the tested revisions and compatibility matrix for each candidate update.
 
 The next release target is **`v1.0.0-beta.1`**, not an already published stable release. Luxo follows [Semantic Versioning](https://semver.org/): Git tags use the `v` prefix; package versions use the format required by their ecosystem.
 
