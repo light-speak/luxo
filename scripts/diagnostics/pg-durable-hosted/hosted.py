@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare combined migration journal and recovery costs on the pinned PostgreSQL protocols."""
+"""Compare readable migration binding SQL on the pinned PostgreSQL protocols."""
 import argparse
 import base64
 import gzip
@@ -22,7 +22,7 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-PARENT = 'b5f89c3462e5e189b81524e583f3ae4a697c8a6c'
+PARENT = '8d8127faa8badd4403e2e0db266f882cccc6b326'
 BASE = '15765dee6705d39de0b5a505d3039d59ebf43584'
 BASE_TREE = '75aebe5bd2fa6b45a1c614ace1a816ebc63e4c0a'
 PROJECTION = {
@@ -52,8 +52,9 @@ PATCH_TREES = {
     "V": "79efa3b5dfefe0e3c1f1c5440e9a4e95c61158a1",
     "W": "d5f47f034f5cad2c40ed7b05ae699bcc45948b21",
     "C": "3a0f6cbdc7e3ce4bc3804babf40874ed5c43728c",
+    "D": "20a1aaff93bf6ced052baaa1d26db2fc163b954c",
 }
-ARMS = {"P": BASE_TREE, "W": PATCH_TREES["W"], "C": PATCH_TREES["C"]}
+ARMS = {"P": BASE_TREE, "C": PATCH_TREES["C"], "D": PATCH_TREES["D"]}
 PATCHES = {
     "Q": (PROJECTION["mergeTree"], "a2c84ab8db37a7965c63f0a87befc0c5ab3875da2fb49235cc448b8975d8dccd"),
     "S": (PATCH_TREES["Q"], "42169934c30dd834f78222031bd50a7092bf2449615368d1fdea905cddef3ae2"),
@@ -62,10 +63,11 @@ PATCHES = {
     "V": (PATCH_TREES["U"], "98a42aa26e85a613014d0bb5f7f3b02a7e67237c4d3eb0509540c9880a373dd2"),
     "W": (PATCH_TREES["V"], "688c1cca1c13e4d746b9e651c8df3a4839f61fffe2c0aad38ec16143fd96e637"),
     "C": (PATCH_TREES["W"], "65eb5a91b85c96ca850708fef0c47115fc2da35fc81e7b0a1fe0c7308fb00dc3"),
+    "D": (PATCH_TREES["C"], "3e21589d3d342833b679a7cf2722b627d384395452d0bc957ebddea2ee040ade"),
 }
 DIAGNOSTIC_PATHS = (
     "M\t.github/workflows/diagnose-pg-durable.yml",
-    "A\tscripts/diagnostics/pg-durable-hosted/.payload/arm-C.patch.gz.b64",
+    "A\tscripts/diagnostics/pg-durable-hosted/.payload/arm-D.patch.gz.b64",
     "M\tscripts/diagnostics/pg-durable-hosted/.payload/inputs.sha256",
     "M\tscripts/diagnostics/pg-durable-hosted/hosted.py",
 )
@@ -77,6 +79,7 @@ CHANGE_PATHS = {
     "V": ("migration_attempt.go", "migration_execution_test.go"),
     "W": ("migrate.go", "migration_attempt.go", "migration_execution_test.go"),
     "C": ("migrate.go", "migration_attempt.go", "migration_execution.go", "pgdb.go"),
+    "D": ("migration_execution.go",),
 }
 RETRY_LEAF = "retry-after-invalid-index-repair"
 JOURNAL_LEAF = "first-journal-and-create-index"
@@ -89,11 +92,43 @@ PACKAGES = {"recovery": "recoverypair", "journal": "recoverypair", "standalone":
 RECOVERY_FIXTURES = ("advisory_pair_test.go", "recovery_test.go")
 JOB_LANES = {"retry": ("recovery",), "lifecycle": ("journal", "standalone")}
 PROCESS_PROTOCOLS = {
-    "recovery": "Identical retry-only 3x and journal+retry 1x to run 45904903688.",
-    "journal": "Identical journal-only 3x and 1x selections to run 45900142426.",
-    "standalone": "Identical concurrent up/down 3x and 1x selections to run 45900142426.",
+    "recovery": "Identical retry-only 3x and journal+retry 1x to run 45919964077.",
+    "journal": "Identical journal-only 3x and 1x selections to run 45919964077.",
+    "standalone": "Identical concurrent up/down 3x and 1x selections to run 45919964077.",
 }
 CPU = "Neoverse-N2"
+PRIOR_NATIVE = {
+    "run": 45919964077,
+    "attempt": 1,
+    "diagnosticHead": "8d8127faa8badd4403e2e0db266f882cccc6b326",
+    "products": {
+        "P": "75aebe5bd2fa6b45a1c614ace1a816ebc63e4c0a",
+        "W": "d5f47f034f5cad2c40ed7b05ae699bcc45948b21",
+        "C": "3a0f6cbdc7e3ce4bc3804babf40874ed5c43728c"
+    },
+    "artifacts": {
+        "retry": {
+            "id": 15163797154,
+            "sha256": "46065cda77156f5e88f3946ff4ad94b07c7838a214e699689f2d63e488241520"
+        },
+        "lifecycle": {
+            "id": 15163597784,
+            "sha256": "edfefd498527535ea933458976e004ca7cc26d10a3972ea4cd077093279b0287"
+        }
+    }
+}
+READABLE_BINDING = {
+    "C": "3a0f6cbdc7e3ce4bc3804babf40874ed5c43728c",
+    "productOnlyReadableTree": "20a1aaff93bf6ced052baaa1d26db2fc163b954c",
+    "fullProductTestsTree": "06756b5c9c6476f5118f1538833cce734e12181a",
+    "productionPatchSHA256": "3e21589d3d342833b679a7cf2722b627d384395452d0bc957ebddea2ee040ade",
+    "productionPaths": {
+        "pkg/lux/pg/migrate/migration_execution.go": {
+            "sha256": "cfe71c542d65cc0517133892e62037d93c2f896a403ad50fb3e8cf8398a0c379",
+            "gitBlob": "7e12c160e085cbedb10e0740afca638222d54220"
+        }
+    }
+}
 COMBINED_BINDING = {
     "W": "d5f47f034f5cad2c40ed7b05ae699bcc45948b21",
     "combinedProductTree": "3a0f6cbdc7e3ce4bc3804babf40874ed5c43728c",
@@ -150,7 +185,7 @@ def put(path, value):
 def payload():
     names = {"shared.py", "advisory_pair_test.go", "first_query_test.go", "migration_pair_test.go",
              "durable_reset_test.go", "used_holder_reuse_test.go", "capacity_public_test.go", "recovery_test.go",
-             "arm-Q.patch.gz.b64", "arm-R.patch.gz.b64", "arm-S.patch.gz.b64", "arm-T.patch.gz.b64", "arm-U.patch.gz.b64", "arm-V.patch.gz.b64", "arm-W.patch.gz.b64", "arm-C.patch.gz.b64"}
+             "arm-Q.patch.gz.b64", "arm-R.patch.gz.b64", "arm-S.patch.gz.b64", "arm-T.patch.gz.b64", "arm-U.patch.gz.b64", "arm-V.patch.gz.b64", "arm-W.patch.gz.b64", "arm-C.patch.gz.b64", "arm-D.patch.gz.b64"}
     entries = {}
     for line in (PAYLOAD / "inputs.sha256").read_text().splitlines():
         digest, name = line.split("  ", 1)
@@ -196,6 +231,9 @@ def trees(repo, root):
     actual = {path: run(*git, "rev-parse", f"{ARMS['C']}:{path}", text=True).strip()
               for path in COMBINED_BINDING["productionPaths"]}
     require_production_blobs(actual)
+    readable = {path: run(*git, "rev-parse", f"{ARMS['D']}:{path}", text=True).strip()
+                for path in READABLE_BINDING["productionPaths"]}
+    require_readable_production(readable)
     return git
 
 
@@ -203,6 +241,12 @@ def require_production_blobs(actual):
     expected = {path: value["gitBlob"] for path, value in COMBINED_BINDING["productionPaths"].items()}
     if actual != expected:
         raise RuntimeError("combined production differs from its full tested source")
+
+
+def require_readable_production(actual):
+    expected = {path: value["gitBlob"] for path, value in READABLE_BINDING["productionPaths"].items()}
+    if actual != expected:
+        raise RuntimeError("readable SQL production differs from its full PG-tested source")
 
 
 def require_fixture_hashes(lane, actual):
@@ -371,7 +415,7 @@ def sample(root, lane, name, arm, slots, slot, identities, iterations, evidence,
 
 
 def schedule(lane):
-    comparisons, controls = ("WC", "PC"), ("PP", "WW", "CC")
+    comparisons, controls = ("CD", "PD"), ("PP", "CC", "DD")
     control_count = {"recovery": 10, "journal": 10, "standalone": 5}[lane]
     for group, slots in enumerate(("ab", "ba"), 1):
         for pair in range(1, 11):
@@ -481,9 +525,10 @@ def replay(repo, root, evidence, entries):
                                   "projection": PROJECTION, "historical": HISTORICAL, "modulePins": MODULE_PINS,
                                   "patchTrees": PATCH_TREES, "migrationFilesByPatch": CHANGE_PATHS,
                                   "job": job, "processProtocols": {lane: PROCESS_PROTOCOLS[lane] for lane in lanes},
-                                  "comparisons": {"WC": "combined retry lookups, object-name capacity and single standalone journal writes",
-                                                  "PC": "full remaining product costs"},
-                                  "combinedBinding": COMBINED_BINDING, "fixtureIdentity": EXPECTED_FIXTURE_SHA256})
+                                  "comparisons": {"CD": "readable compile-time catalog binding SQL",
+                                                  "PD": "full remaining product costs"},
+                                  "combinedBinding": COMBINED_BINDING, "readableBinding": READABLE_BINDING, "priorNative": PRIOR_NATIVE,
+                                  "fixtureIdentity": EXPECTED_FIXTURE_SHA256})
     git = trees(repo, root)
     identities = {arm: prepare_arm(git, root, arm, env, evidence, lanes) for arm in ARMS}
     shared = runpy.run_path(str(PAYLOAD / "shared.py"))

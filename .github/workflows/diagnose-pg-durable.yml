@@ -1,4 +1,4 @@
-name: Compare PostgreSQL combined migration costs
+name: Compare PostgreSQL readable binding SQL
 
 on:
   push:
