@@ -21,6 +21,18 @@ function narrow(items, count = 128) {
   assert.equal(item.id, undefined)
   assert.equal(item.price, undefined)
   assert.equal(item.description, undefined)
+  const copied = { ...item }
+  assert.equal(Object.hasOwn(item, 'name'), true)
+  assert.equal(Object.hasOwn(copied, 'name'), true)
+  assert.equal(copied.name, item.name)
+  for (const field of ['id', 'price', 'description']) {
+   assert.equal(Object.hasOwn(item, field), false, `unselected ${field} became an own property`)
+   assert.equal(Object.hasOwn(copied, field), false, `spread copied unselected ${field}`)
+  }
+  const applied = { id: 0n, price: 0n, description: '', ...item }
+  assert.equal(applied.id, 0n)
+  assert.equal(applied.price, 0n)
+  assert.equal(applied.description, '')
  }
 }
 try {

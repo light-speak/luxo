@@ -356,11 +356,20 @@ const inheritedObjectFields = new Set([
   '__defineGetter__', '__defineSetter__', '__lookupGetter__', '__lookupSetter__',
 ])
 
-function decodedObjectLiteral(model: LuxoModel): string {
-  const fields = model.fields.filter(field => inheritedObjectFields.has(field.name))
-  if (fields.length === 0) return '{}'
-  // Own slots preserve Selected<T> and bypass the inherited __proto__ setter.
-  return `{ ${fields.map(field => `[${JSON.stringify(field.name)}]: undefined`).join(', ')} }`
+function decodedObjectLiteral(fields: LuxoField[]): string {
+  const inherited = fields.filter(field => inheritedObjectFields.has(field.name))
+  if (inherited.length === 0) return '{}'
+  // Non-enumerable slots hide inherited values without overriding spread sources.
+  const slots = inherited.map(field =>
+    `[${JSON.stringify(field.name)}]: { value: undefined, writable: true, configurable: true }`)
+  return `Object.defineProperties({}, { ${slots.join(', ')} })`
+}
+
+function decodedFieldWrite(name: string, value: string): string {
+  if (inheritedObjectFields.has(name)) {
+    return `Object.defineProperty(obj, '${name}', { value: ${value}, enumerable: true })`
+  }
+  return `obj['${name}'] = ${value}`
 }
 
 function literalPropertyName(name: string, quoted = false): string {
@@ -374,12 +383,12 @@ function genBinaryDecode(model: LuxoModel, schema: LuxoSchema, trackDepth: boole
     out += `function decode${model.name}$value(dec: Decoder, depth: number): ${model.name}<true> {\n`
     out += `  if (depth > 64) throw new RangeError('model nesting exceeds 64 levels')\n`
   }
-  out += `  const obj: { [key: string]: unknown } = ${decodedObjectLiteral(model)}\n`
+  out += `  const obj: { [key: string]: unknown } = ${decodedObjectLiteral(model.fields)}\n`
   out += `  dec.skipArenaHeader()\n`
   out += `  while (dec.nextField()) {\n`
   out += `    switch (dec.fieldID) {\n`
   for (const field of model.fields) {
-    out += `      case ${field.id}: obj['${field.name}'] = ${genFieldRead(field, schema)}; break\n`
+    out += `      case ${field.id}: ${decodedFieldWrite(field.name, genFieldRead(field, schema))}; break\n`
   }
   out += `      default: throw new Error(\`unknown ${model.name} field ID \${dec.fieldID}\`)\n`
   out += `    }\n`
@@ -398,7 +407,7 @@ function genJSONDecode(model: LuxoModel, schema: LuxoSchema, trackDepth: boolean
   out += `function decodeJSON${model.name}$value(data: { [key: string]: unknown }, requireField: boolean${trackDepth ? ', depth: number' : ''}): ${model.name}<true> {\n`
   if (trackDepth) out += `  if (depth > 64) throw new RangeError('model nesting exceeds 64 levels')\n`
   out += `  if (requireField && (data === null || typeof data !== 'object' || Array.isArray(data))) throw new TypeError('${model.name} list item must be an object')\n`
-  out += `  const obj = ${decodedObjectLiteral(model)} as ${model.name}<true>\n`
+  out += `  const obj = ${decodedObjectLiteral(model.fields)} as ${model.name}<true>\n`
   out += `  let hasField = false\n`
   for (const field of model.fields) {
     const raw = `data['${field.name}']`
@@ -406,11 +415,11 @@ function genJSONDecode(model: LuxoModel, schema: LuxoSchema, trackDepth: boolean
     out += `  if (Object.prototype.hasOwnProperty.call(data, '${field.name}')) {\n`
     out += `    hasField = true\n`
     if (field.nullable) {
-      out += `    obj.${field.name} = ${raw} == null ? null : ${decoded}\n`
+      out += `    ${decodedFieldWrite(field.name, `${raw} == null ? null : ${decoded}`)}\n`
     } else {
       const jsonScalar = field.type === 'JSON' && !field.isList && !field.list
       out += `    if (${raw} ${jsonScalar ? '=== undefined' : '== null'}) throw new TypeError('${model.name}.${field.name} cannot be ${jsonScalar ? 'undefined' : 'null'}')\n`
-      out += `    obj.${field.name} = ${decoded}\n`
+      out += `    ${decodedFieldWrite(field.name, decoded)}\n`
     }
     out += `  }\n`
   }
@@ -498,43 +507,37 @@ function genColumnRead(field: LuxoField, schema: LuxoSchema): string {
 }
 
 function columnValue(field: LuxoField, schema: LuxoSchema, usages: TypeUsages, depth = '1'): string {
-  const column = `_${field.name}`
+  const item = `_${field.name}[i]`
+  const present = field.nullable ? `${item}!` : item
   const typeName = field.typeName || field.type
   if (isNestedField(field, schema)) {
     if (field.isList || field.list) {
-      const item = field.nullable ? `${column}[i]!` : `${column}[i]`
       const decoded = schemaEntry(schema.sealeds, typeName)
-        ? `decodeSealedList${typeName}$value(new Decoder(${item}), ${depth} + 1, true)`
-        : `decodeColumnar${typeName}$value(${item}, ${depth} + 1)`
-      return selectedColumnValue(column, decoded, field.nullable)
+        ? `decodeSealedList${typeName}$value(new Decoder(${present}), ${depth} + 1, true)`
+        : `decodeColumnar${typeName}$value(${present}, ${depth} + 1)`
+      return nullableColumnValue(item, decoded, field.nullable)
     }
-    const decoded = `decode${typeName}$value(new Decoder(${column}[i]!), ${depth} + 1)`
-    if (field.nullable) {
-      return `${column} ? (${column}[i] ? ${decoded} : null) : undefined`
-    }
-    return `${column} ? ${decoded} : undefined`
+    const decoded = `decode${typeName}$value(new Decoder(${present}), ${depth} + 1)`
+    return nullableColumnValue(item, decoded, field.nullable)
   }
   if (field.isList || field.list) {
     const ts = resolveFieldType({ ...field, isList: false, list: false }, schema, usages)
-    const item = field.nullable ? `${column}[i]!` : `${column}[i]`
     const decoded = schemaEntry(schema.enums, typeName)
-      ? `(decodeScalarArray(${item}, 'Enum') as string[]).map(decodeEnum$${typeName})`
-      : `decodeScalarArray(${item}, '${field.type}') as ${ts}[]`
-    return selectedColumnValue(column, decoded, field.nullable)
+      ? `(decodeScalarArray(${present}, 'Enum') as string[]).map(decodeEnum$${typeName})`
+      : `decodeScalarArray(${present}, '${field.type}') as ${ts}[]`
+    return nullableColumnValue(item, decoded, field.nullable)
   }
-  if (schemaEntry(schema.enums, typeName)) return selectedColumnValue(column, `decodeEnum$${typeName}(${column}[i]!)`, field.nullable)
+  if (schemaEntry(schema.enums, typeName)) {
+    return nullableColumnValue(item, `decodeEnum$${typeName}(${present})`, field.nullable)
+  }
   if (field.type === 'JSON') {
-    const decoded = `decodeJSONValue(${column}![i]!)`
-    return field.nullable
-      ? `${column} ? (${column}[i] ? ${decoded} : null) : undefined`
-      : `${column} ? ${decoded} : undefined`
+    return nullableColumnValue(item, `decodeJSONValue(${present})`, field.nullable)
   }
-  return `${column} ? ${column}[i] : undefined`
+  return item
 }
 
-function selectedColumnValue(column: string, decoded: string, nullable?: boolean): string {
-  const value = nullable ? `(${column}[i] === null ? null : ${decoded})` : decoded
-  return `${column} ? ${value} : undefined`
+function nullableColumnValue(item: string, decoded: string, nullable?: boolean): string {
+  return nullable ? `${item} === null ? null : ${decoded}` : decoded
 }
 
 function genColumnCase(field: LuxoField, schema: LuxoSchema, usages: TypeUsages, depth = '1'): string {
@@ -583,14 +586,7 @@ function genColumnarDecode(model: LuxoModel, schema: LuxoSchema, includeNested: 
   out += `    }\n`
   out += `  }\n`
   out += genCompleteCheck('r', 'r.offset() !== data.length', `${model.name} columnar response`)
-  out += `  const items: ${model.name}<true>[] = new Array(r.count)\n`
-  out += `  for (let i = 0; i < r.count; i++) {\n`
-  out += `    items[i] = {\n`
-  for (const f of fields) {
-    out += `      ${literalPropertyName(f.name)}: ${columnValue(f, schema, usages, 'depth')},\n`
-  }
-  out += `    } as unknown as ${model.name}<true>\n`
-  out += `  }\n`
+  out += genColumnRows(model.name, fields, schema, usages, 'depth')
   out += `  return items\n`
   out += '}\n\n'
   return out
@@ -612,14 +608,7 @@ function genPaginatedDecode(model: LuxoModel, schema: LuxoSchema, includeNested:
   out += `    }\n`
   out += `  }\n`
   out += `  if (r.error) throw new Error(r.error)\n`
-  out += `  const items: ${model.name}<true>[] = new Array(r.count)\n`
-  out += `  for (let i = 0; i < r.count; i++) {\n`
-  out += `    items[i] = {\n`
-  for (const f of fields) {
-    out += `      ${literalPropertyName(f.name)}: ${columnValue(f, schema, usages)},\n`
-  }
-  out += `    } as unknown as ${model.name}<true>\n`
-  out += `  }\n`
+  out += genColumnRows(model.name, fields, schema, usages)
   out += `  const total = r.readSvarint()\n`
   out += `  const page = r.readSvarint()\n`
   out += `  const pageSize = r.readSvarint()\n`
@@ -627,6 +616,32 @@ function genPaginatedDecode(model: LuxoModel, schema: LuxoSchema, includeNested:
   out += `  return { items, total, page, pageSize }\n`
   out += '}\n\n'
   return out
+}
+
+function genColumnRows(name: string, fields: LuxoField[], schema: LuxoSchema, usages: TypeUsages, depth = '1'): string {
+  const columns = fields.map(field => ({ name: field.name, value: columnValue(field, schema, usages, depth) }))
+  let out = `  const items: ${name}<true>[] = new Array(r.count)\n`
+  // A literal allocates the final shape directly for wide, fully selected rows.
+  const wide = fields.length > 4
+  if (wide) {
+    out += `  if (${columns.map(column => `_${column.name} !== undefined`).join(' && ')}) {\n`
+    out += `    for (let i = 0; i < r.count; i++) {\n`
+    out += `      items[i] = {\n`
+    for (const column of columns) {
+      out += `        ${literalPropertyName(column.name)}: ${column.value},\n`
+    }
+    out += `      } as unknown as ${name}<true>\n`
+    out += `    }\n  } else {\n`
+  }
+  const indent = wide ? '    ' : '  '
+  out += `${indent}for (let i = 0; i < r.count; i++) {\n`
+  out += `${indent}  const obj: { [key: string]: unknown } = ${decodedObjectLiteral(fields)}\n`
+  for (const column of columns) {
+    out += `${indent}  if (_${column.name} !== undefined) ${decodedFieldWrite(column.name, column.value)}\n`
+  }
+  out += `${indent}  items[i] = obj as unknown as ${name}<true>\n`
+  out += `${indent}}\n`
+  return wide ? out + '  }\n' : out
 }
 
 function genFieldRead(field: { type: string; typeName?: string; nullable?: boolean; isList?: boolean; list?: boolean; relation?: boolean }, schema: LuxoSchema): string {
