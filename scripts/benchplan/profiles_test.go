@@ -60,7 +60,7 @@ func TestPairedBenchmarkProfilesRequireTheirExactInventories(t *testing.T) {
 		pkg, profile, root, defaultRoot string
 		inputs                          []string
 	}{
-		{"pkg/lux/rpc", "rpc-prepared-frame", "BenchmarkLRPCPreparedFrame", "BenchmarkLRPCConnectionFrameReuseCandidate", []string{"0", "128", "4096", "65536"}},
+		{"pkg/lux/rpc", "rpc-prepared-frame", "BenchmarkLRPCPreparedFrame", "BenchmarkRPCUUIDTraceGuard", []string{"0", "128", "4096", "65536"}},
 		{"pkg/lux/queue", "queue-stream-name", "BenchmarkQueueStreamName", "BenchmarkMemoryRepeatedClose", []string{"tasks", "email.send", "email_send"}},
 	} {
 		t.Run(tc.profile, func(t *testing.T) {
@@ -295,6 +295,7 @@ func TestAPIBinaryParamLookupProfileKeepsExactLeaves(t *testing.T) {
 	const root = "BenchmarkBinaryParamLookup/"
 	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
 	const other = "BenchmarkHandlerPanicFormatting/Success/After" + measurement
+	const broad = "BenchmarkWSConnectionRegistrationCold/false" + measurement
 	var samples strings.Builder
 	for _, width := range []string{"n=1", "n=16"} {
 		for _, stride := range []string{"stride=1", "stride=1001", "stride=65537"} {
@@ -314,9 +315,9 @@ func TestAPIBinaryParamLookupProfileKeepsExactLeaves(t *testing.T) {
 		{"exact isolated fixture", "api-binary-param-lookup", full + other, full, true},
 		{"same missing leaf in both binaries", "api-binary-param-lookup", partial + other, partial, false},
 		{"unrelated leaf in isolated profile", "api-binary-param-lookup", full + other, full + other, false},
-		{"discovery keeps both families", "api-non-identity", full + other, full + other, true},
-		{"discovery loses lookup leaf", "api-non-identity", full + other, partial + other, false},
-		{"discovery loses handler leaf", "api-non-identity", full + other, full, false},
+		{"discovery keeps both families", "api-non-identity", full + other + broad, full + other + broad, true},
+		{"discovery loses lookup leaf", "api-non-identity", full + other + broad, partial + other + broad, false},
+		{"discovery loses handler leaf", "api-non-identity", full + other + broad, full + broad, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			writeFixture(t, ordinary, tc.ordinary+"PASS\n")
@@ -458,20 +459,23 @@ func TestLuviaAuthPrimaryAndConfirmationStayExclusive(t *testing.T) {
 		"inherited-other-key/after", "^inherited-other-key$/^after$")
 }
 
-func verifyExactProfileInventory(t *testing.T, pkg, controlRoot, profile, benchmark string, rows []string, extraLeaf string) {
+func exactProfileMeasurements(benchmark string, leaves []string) string {
+	var output strings.Builder
+	for _, leaf := range leaves {
+		output.WriteString(benchmark + "/" + leaf + "-2 1 3 ns/op 0 B/op 0 allocs/op\n")
+	}
+	return output.String()
+}
+
+func verifyExactProfileInventory(t *testing.T, pkg, controlRoot, profile, benchmark string, rows []string, extraLeaf string, companions ...string) {
 	t.Helper()
 	root := benchmarkTempDir(t)
 	ordinary, isolated := root+"/ordinary.log", root+"/isolated.log"
 	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
-	measure := func(leaves []string) string {
-		var output strings.Builder
-		for _, leaf := range leaves {
-			output.WriteString(benchmark + "/" + leaf + measurement)
-		}
-		return output.String()
-	}
-	full, shortened := measure(rows), measure(rows[:len(rows)-1])
-	extra := measure([]string{extraLeaf})
+	required := strings.Join(companions, "")
+	full := required + exactProfileMeasurements(benchmark, rows)
+	shortened := required + exactProfileMeasurements(benchmark, rows[:len(rows)-1])
+	extra := exactProfileMeasurements(benchmark, []string{extraLeaf})
 	control := controlRoot + measurement
 	args := []string{"--verify-profile-inventory", pkg, profile, ordinary, isolated}
 	for _, tc := range []struct {
@@ -536,6 +540,22 @@ func verifyExactProfileRouting(t *testing.T, pkg, control, profile, root, target
 			}
 		})
 	}
+}
+
+func TestRelationLoaderProfileKeepsExactlyFourLeaves(t *testing.T) {
+	verifyExactProfileInventory(t, "pkg/codegen", "BenchmarkRelationResolverEmission", "codegen-relation-loader",
+		"BenchmarkRelationLoaderGeneration", []string{"1/metadata", "1/source", "128/metadata", "128/source"}, "128/custom")
+	verifyExactProfileRouting(t, "pkg/codegen", "BenchmarkRelationResolverEmission", "codegen-relation-loader",
+		"BenchmarkRelationLoaderGeneration", "128/source", "^128$/^source$")
+}
+
+func TestCollectEventEmitsProfileKeepsExactlySixLeaves(t *testing.T) {
+	verifyExactProfileInventory(t, "pkg/semantic", "BenchmarkEventSnapshotContract", "semantic-event-emits",
+		"BenchmarkCollectEventEmits", []string{"direct_0/recursive=false", "direct_0/recursive=true",
+			"direct_1/recursive=false", "direct_1/recursive=true", "direct_128/recursive=false", "direct_128/recursive=true"},
+		"direct_256/recursive=true")
+	verifyExactProfileRouting(t, "pkg/semantic", "BenchmarkEventSnapshotContract", "semantic-event-emits",
+		"BenchmarkCollectEventEmits", "direct_128/recursive=true", "^direct_128$/^recursive=true$")
 }
 
 func TestCodegenLiteralProfileKeepsExactlyFourLeaves(t *testing.T) {
@@ -867,4 +887,145 @@ func TestAPIRequestLogPrimaryAndConfirmationProfiles(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAPIBodyReadAndQuoteInventories(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	verifyExactProfileInventory(t, pkg, "BenchmarkBodyReadReverse", "api-body-read", "BenchmarkBodyRead",
+		benchmarkCaseProduct([]string{"0", "128", "4096", "4097", "65536"}, []string{"direct", "previous"}), "2/direct")
+	verifyExactProfileInventory(t, pkg, "BenchmarkJSONQuoteInvalidCandidate", "api-json-quote-candidate",
+		"BenchmarkJSONQuoteCandidate", benchmarkCaseProduct(
+			[]string{"empty", "ascii16", "ascii1024", "unicode24", "unicode1026", "escapes24", "html"},
+			[]string{"current", "manual-strict", "stdlib"}), "empty/unverified")
+}
+
+func TestAPIIntelProfilesKeepCompleteOriginalInventories(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	const identity = "BenchmarkIdentityConditionValidity"
+	const subject = "BenchmarkIdentitySubjectVisibility"
+	const handler = "BenchmarkHandlerPanicFormatting"
+	const buffer = "BenchmarkHandlerResponseBuffer"
+	const websocket = "BenchmarkWSConnectionRegistrations"
+	identityLeaves := benchmarkCaseProduct([]string{"empty", "member", "missing", "wrong-kind"},
+		[]string{"EnumChecked", "EnumReference", "OwnChecked", "OwnReference", "TextChecked", "TextReference"})
+	subjectLeaves := []string{"pointer/reference", "pointer/subject", "value/reference", "value/subject"}
+	handlerLeaves := []string{"BusinessError/Before", "BusinessError/After", "OpaquePanic/Before", "OpaquePanic/After",
+		"StringPanic/Before", "StringPanic/After", "Success/Before", "Success/After"}
+	bufferLeaves := []string{"BusinessError", "Bytes4KiB", "Empty", "Int"}
+	verifyExactProfileInventory(t, pkg, "BenchmarkIdentityEnumArray", "api-identity-condition",
+		identity, identityLeaves, "member/Unverified", exactProfileMeasurements(subject, subjectLeaves))
+	verifyExactProfileInventory(t, pkg, "BenchmarkIdentityEnumArray", "api-identity-condition",
+		subject, subjectLeaves, "other/reference", exactProfileMeasurements(identity, identityLeaves))
+	verifyExactProfileInventory(t, pkg, "BenchmarkWSConnectionRegistrationCold", "api-handler-panic",
+		handler, handlerLeaves, "Success/Alternate", exactProfileMeasurements(buffer, bufferLeaves))
+	verifyExactProfileInventory(t, pkg, "BenchmarkWSConnectionRegistrationCold", "api-handler-panic",
+		buffer, bufferLeaves, "Other", exactProfileMeasurements(handler, handlerLeaves))
+	verifyExactProfileInventory(t, pkg, "BenchmarkWSConnectionRegistrationCold", "api-websocket-registrations",
+		websocket, []string{"size=1/checked", "size=1/former", "size=8/checked", "size=8/former",
+			"size=64/checked", "size=64/former"}, "size=128/checked")
+	verifyExactProfileInventory(t, pkg, "BenchmarkResponseOriginContended", "api-response-origin-run",
+		"BenchmarkResponseOriginRun", []string{"bounded", "unbounded"}, "other")
+}
+
+func TestAPIIntelProfilesKeepBroadInventoryAndRouteExclusively(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	const identity = "BenchmarkIdentityConditionValidity"
+	const subject = "BenchmarkIdentitySubjectVisibility"
+	const handler = "BenchmarkHandlerPanicFormatting"
+	const buffer = "BenchmarkHandlerResponseBuffer"
+	const websocket = "BenchmarkWSConnectionRegistrations"
+	const other = "BenchmarkWSConnectionRegistrationCold"
+	const origin, contended = "BenchmarkResponseOriginRun", "BenchmarkResponseOriginContended"
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	handlerRow, websocketRow := handler+"/OpaquePanic/Before"+measurement, websocket+"/size=64/checked"+measurement
+	bufferRow := buffer + "/Int" + measurement
+	originRow := origin + "/unbounded" + measurement
+	broad := handlerRow + bufferRow + websocketRow + originRow + contended + measurement + other + "/false" + measurement
+	writeFixture(t, ordinary, identity+"/member/EnumChecked"+measurement+subject+"/value/reference"+measurement+broad+"PASS\n")
+	writeFixture(t, isolated, broad+"PASS\n")
+	args := []string{"--verify-profile-inventory", pkg, "api-non-identity", ordinary, isolated}
+	if err := run(args, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []string{handlerRow, bufferRow, websocketRow, originRow} {
+		writeFixture(t, isolated, strings.Replace(broad, row, "", 1)+"PASS\n")
+		if err := run(args, io.Discard); err == nil {
+			t.Fatalf("broad benchmark binary lost its verified row: %s", row)
+		}
+	}
+	writeFixture(t, isolated, broad+subject+"/value/reference"+measurement+"PASS\n")
+	if err := run(args, io.Discard); err == nil {
+		t.Fatal("broad benchmark binary accepted an isolated identity subject leaf")
+	}
+
+	keys := []sampleKey{{pkg, identity + "/member/EnumChecked-2"}, {pkg, subject + "/value/reference-2"},
+		{pkg, handler + "/Success/Before-2"}, {pkg, buffer + "/Int-2"},
+		{pkg, websocket + "/size=64/checked-2"}, {pkg, other + "/false-2"}, {pkg, origin + "/unbounded-2"}, {pkg, contended + "-2"}}
+	groups := []benchGroup{{Package: pkg, Name: identity}, {Package: pkg, Name: subject},
+		{Package: pkg, Name: handler}, {Package: pkg, Name: buffer},
+		{Package: pkg, Name: websocket}, {Package: pkg, Name: other}, {Package: pkg, Name: origin}, {Package: pkg, Name: contended}}
+	body, err := json.Marshal(expectedSamples{Base: keys, Head: keys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, batch := dir+"/expected.json", dir+"/batch.tsv"
+	writeFixture(t, expected, string(body))
+	for _, tc := range []struct{ phase, batch string }{
+		{"primary", formatShard(benchShard{Groups: groups})},
+		{"confirmation", formatConfirmationBatch(keys)},
+	} {
+		t.Run(tc.phase, func(t *testing.T) {
+			for _, profile := range []string{"api-identity-condition", "api-handler-panic", "api-websocket-registrations", "api-response-origin-run", "api-non-identity"} {
+				if strings.Count(tc.batch, "\t"+profile+"\t") != 1 {
+					t.Fatalf("wrong routed profile %s in %s", profile, tc.batch)
+				}
+			}
+			for root, profile := range map[string]string{subject: "api-identity-condition", buffer: "api-handler-panic",
+				origin: "api-response-origin-run", contended: "api-non-identity"} {
+				for _, row := range strings.Split(tc.batch, "\n") {
+					if strings.Contains(row, root) && !strings.Contains(row, "\t"+profile+"\t") {
+						t.Fatalf("misrouted %s in %s", root, row)
+					}
+				}
+			}
+			args := []string{"--verify-profile-batch", tc.phase, expected, batch}
+			writeFixture(t, batch, tc.batch)
+			if err := run(args, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			for _, profile := range []string{"api-handler-panic", "api-response-origin-run"} {
+				writeFixture(t, batch, strings.Replace(tc.batch, "\t"+profile+"\t", "\tapi-non-identity\t", 1))
+				if err := run(args, io.Discard); err == nil {
+					t.Fatalf("accepted %s samples from a different benchmark binary", profile)
+				}
+			}
+		})
+	}
+}
+
+func TestRPCHandlerPanicProfileKeepsAllEightLeavesAndRoutesBothPhases(t *testing.T) {
+	const pkg, root, profile = "pkg/lux/rpc", "BenchmarkHandlerPanicFormatting", "rpc-handler-panic"
+	leaves := benchmarkCaseProduct([]string{"BusinessError", "OpaquePanic", "StringPanic", "Success"}, []string{"Before", "After"})
+	verifyExactProfileInventory(t, pkg, "BenchmarkRPCUUIDTraceGuard", profile, root, leaves, "Success/Alternate")
+	verifyExactProfileRouting(t, pkg, "BenchmarkRPCUUIDTraceGuard", profile, root, "Success/After", "^Success$/^After$")
+}
+
+func TestRPCInventoryRejectsUnsupportedProfile(t *testing.T) {
+	if err := verifyRPCProfileLeaves("not-rpc", nil); err == nil {
+		t.Fatal("unknown RPC inventory profile accepted")
+	}
+}
+
+func TestTransportRejectionAndReplacementInventoriesAndRouting(t *testing.T) {
+	const rpc, h2 = "pkg/lux/rpc", "pkg/lux/h2transport"
+	const rpcRoot, h2Root = "BenchmarkRPCPoolReturnRejection", "BenchmarkTaskDeadlineReplacement"
+	const rpcProfile, h2Profile = "rpc-pool-return-rejection", "h2-task-deadline-replacement"
+	verifyExactProfileInventory(t, rpc, "BenchmarkRPC_Ping", rpcProfile, rpcRoot,
+		[]string{"closed/after", "closed/before", "full/after", "full/before"}, "other/before")
+	verifyExactProfileInventory(t, h2, "BenchmarkRequestHead", h2Profile, h2Root,
+		benchmarkCaseProduct([]string{"1", "8", "128"}, []string{"conditional", "scan"}), "16/scan")
+	verifyExactProfileRouting(t, rpc, "BenchmarkRPC_Ping", rpcProfile, rpcRoot, "full/after", "^full$/^after$")
+	verifyExactProfileRouting(t, h2, "BenchmarkRequestHead", h2Profile, h2Root, "128/conditional", "^128$/^conditional$")
 }

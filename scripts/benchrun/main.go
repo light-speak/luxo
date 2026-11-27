@@ -48,11 +48,7 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 	if err != nil {
 		return err
 	}
-	pkg := args[3]
-	if profile == benchlayout.QueueStreamNameProfile {
-		pkg = benchlayout.NATSQueuePackage
-	}
-	packages, err := benchlayout.Packages(root, pkg)
+	packages, err := performancePackages(root, args[3], profile)
 	if err != nil {
 		return err
 	}
@@ -79,6 +75,22 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 		}
 	}
 	return nil
+}
+
+func performancePackages(root, pkg, profile string) ([]string, error) {
+	if profile == benchlayout.QueueStreamNameProfile {
+		return benchlayout.Packages(root, benchlayout.NATSQueuePackage)
+	}
+	packages, err := benchlayout.Packages(root, pkg)
+	if err != nil || profile != benchlayout.PGDurationWriteRejectProfile {
+		return packages, err
+	}
+	for _, physical := range packages {
+		if physical == benchlayout.PGPackage {
+			return []string{physical}, nil
+		}
+	}
+	return nil, fmt.Errorf("missing benchmark package %s in %s", benchlayout.PGPackage, root)
 }
 
 func writeIsolationProfiles(output io.Writer, pkg string) error {
@@ -112,14 +124,10 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-lux-short-path-*", writeLuxShortPathOverlay)
 	case benchlayout.CodecReaderProfile:
 		return codecReaderOverlay(root)
-	case benchlayout.RPCOwnedRequestProfile:
-		return packageTestOverlay(root, packagePath, "bench-rpc-owned-request-*", writeRPCOwnedRequestOverlay)
-	case benchlayout.RPCDeadlineProfile:
-		return packageTestOverlay(root, packagePath, "bench-rpc-deadline-*", writeRPCDeadlineOverlay)
-	case benchlayout.RPCNilContextGuardProfile:
-		return packageTestOverlay(root, packagePath, "bench-rpc-nil-context-guard-*", writeRPCNilContextGuardOverlay)
-	case benchlayout.RPCPreparedFrameProfile:
-		return pairedBenchmarkOverlay(root, packagePath, profile, rpcPreparedFrameFixture)
+	case benchlayout.RPCOwnedRequestProfile, benchlayout.RPCDeadlineProfile, benchlayout.RPCNilContextGuardProfile, benchlayout.RPCPreparedFrameProfile, benchlayout.RPCHandlerPanicProfile:
+		return rpcBenchmarkOverlay(root, packagePath, profile)
+	case benchlayout.RPCPoolReturnRejectionProfile, benchlayout.H2TaskDeadlineReplacementProfile:
+		return transportBenchmarkOverlay(root, packagePath, profile)
 	case benchlayout.QueueStreamNameProfile:
 		return pairedBenchmarkOverlay(root, packagePath, profile, queueStreamNameFixture)
 	case benchlayout.APINonIdentityProfile:
@@ -134,6 +142,13 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-api-request-log-*", func(pkg, workspace string) (string, error) {
 			return writeAPIRequestLogOverlay(pkg, workspace, apiRequestLogProjectionSHA, apiRequestLogSourceSHA)
 		})
+	case benchlayout.APIIdentityConditionProfile, benchlayout.APIHandlerPanicProfile, benchlayout.APIWebSocketRegistrationsProfile,
+		benchlayout.APIBodyReadProfile, benchlayout.APIJSONQuoteCandidateProfile:
+		return packageTestOverlay(root, packagePath, "bench-"+profile+"-*", func(pkg, workspace string) (string, error) {
+			return writeAPIBenchmarkFileOverlay(pkg, workspace, profile)
+		})
+	case benchlayout.APIResponseOriginRunProfile:
+		return packageTestOverlay(root, packagePath, "bench-api-response-origin-run-*", writeAPIResponseOriginOverlay)
 	case benchlayout.LuviaPrimaryTraceProfile:
 		return packageTestOverlay(root, packagePath, "bench-luvia-primary-trace-*", writeLuviaBenchmarkOverlay)
 	case benchlayout.LuviaGatewayIdentityProfile:
@@ -152,8 +167,12 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-codegen-global-receiver-*", writeCodegenReceiverOverlay)
 	case benchlayout.CodegenMigrationStateProfile:
 		return packageTestOverlay(root, packagePath, "bench-codegen-migration-state-*", writeCodegenMigrationStateOverlay)
+	case benchlayout.CodegenRelationLoaderProfile:
+		return pairedBenchmarkOverlay(root, packagePath, profile, codegenRelationLoaderFixture)
+	case benchlayout.SemanticEventEmitsProfile:
+		return pairedBenchmarkOverlay(root, packagePath, profile, semanticEventEmitsFixture)
 	default:
-		return performanceOverlay(root, packagePath, baseline)
+		return compileCompactBenchmarkOverlay(root, packagePath, baseline, profile)
 	}
 }
 

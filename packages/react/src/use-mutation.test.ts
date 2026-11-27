@@ -66,6 +66,60 @@ describe('useLuxoMutation', () => {
     expect(events).toEqual(['success', 'invalidated'])
   })
 
+  it.each(['static', 'derived'] as const)('keeps the starting project for %s invalidation after a project switch', async kind => {
+    type Project = 'A' | 'B'
+    const queryClient = new QueryClient({ staleTime: Infinity, gcTime: Infinity })
+    const keys = { A: ['tickets', 'A'], B: ['tickets', 'B'] } as const
+    const statuses = { A: 'open', B: 'open' }
+    const reads = { A: vi.fn(async () => statuses.A), B: vi.fn(async () => statuses.B) }
+    const callbacks = { A: vi.fn(), B: vi.fn() }
+    for (const project of ['A', 'B'] as const) queryClient.setQueryData(keys[project], statuses[project])
+
+    let finishA!: (status: string) => void
+    const writeA = new Promise<string>(resolve => { finishA = resolve })
+    const closeTicket = vi.fn(async (project: Project, _id: number) => {
+      if (project === 'A') return writeA
+      statuses.B = 'closed'
+      return statuses.B
+    })
+    const lists = renderHook(() => ({
+      A: useLuxoQuery(reads.A, [], { queryClient, queryKey: keys.A }),
+      B: useLuxoQuery(reads.B, [], { queryClient, queryKey: keys.B }),
+    }))
+    const { result, rerender } = renderHook(({ project }: { project: Project }) => useLuxoMutation(
+      (id: number) => closeTicket(project, id),
+      {
+        queryClient,
+        onSuccess: callbacks[project],
+        invalidateQueries: kind === 'static' ? [keys[project]] : () => [keys[project]],
+      },
+    ), { initialProps: { project: 'A' } })
+
+    let closing!: Promise<string>
+    act(() => { closing = result.current.mutate(7) })
+    expect(closeTicket).toHaveBeenCalledWith('A', 7)
+    rerender({ project: 'B' })
+
+    await act(async () => {
+      statuses.A = 'closed'
+      finishA(statuses.A)
+      await expect(closing).resolves.toBe('closed')
+    })
+    expect({
+      callbacks: [callbacks.A.mock.calls, callbacks.B.mock.calls],
+      reads: [reads.A.mock.calls.length, reads.B.mock.calls.length],
+      data: [lists.result.current.A.data, lists.result.current.B.data],
+      cached: [queryClient.getQueryData(keys.A), queryClient.getQueryData(keys.B)],
+    }).toEqual({ callbacks: [[['closed', 7]], []], reads: [1, 0], data: ['closed', 'open'], cached: ['closed', 'open'] })
+
+    await act(async () => { await result.current.mutate(8) })
+    expect(closeTicket).toHaveBeenCalledWith('B', 8)
+    expect(callbacks.B).toHaveBeenCalledExactlyOnceWith('closed', 8)
+    expect(reads.A).toHaveBeenCalledOnce()
+    expect(reads.B).toHaveBeenCalledOnce()
+    expect(queryClient.getQueryData(keys.B)).toBe('closed')
+  })
+
   it.each(['throw', 'reject'] as const)('resolves a saved mutation and refreshes active queries when onSuccess can %s', async kind => {
     const queryClient = new QueryClient({ staleTime: Infinity, gcTime: Infinity })
     const queryKey = ['tickets']
