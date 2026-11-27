@@ -1866,6 +1866,10 @@ func (a *Analyzer) checkBinaryExpr(e *ast.BinaryExpr, scope *Scope) *ResolvedTyp
 	if e.Op == "<-" {
 		return a.checkChannelSend(left, right, e.Pos)
 	}
+	if (e.Op == "==" || e.Op == "!=") && sealedComparisonLacksValue(e.Left, e.Right, left, right) {
+		a.reportUnresolvedSealedComparison(e.Pos)
+		return a.types["Boolean"]
+	}
 	return a.checkBinaryOp(e.Op, left, right, e.Pos)
 }
 
@@ -1991,7 +1995,7 @@ func (a *Analyzer) checkWhen(e *ast.WhenExpr, scope *Scope, required bool) *Reso
 			}
 		}
 		if b.Condition != nil {
-			a.checkWhenCondition(b.Condition, subjectType, scope)
+			a.checkWhenCondition(b.Condition, e.Subject, subjectType, scope)
 		}
 		if b.Body != nil {
 			// sealed variant narrowing: inject variant fields into subject
@@ -2013,14 +2017,16 @@ func (a *Analyzer) checkWhen(e *ast.WhenExpr, scope *Scope, required bool) *Reso
 	return resultType
 }
 
-func (a *Analyzer) checkWhenCondition(condition ast.Expr, subject *ResolvedType, scope *Scope) {
+func (a *Analyzer) checkWhenCondition(condition, subjectExpr ast.Expr, subject *ResolvedType, scope *Scope) {
 	actual := a.checkExpr(condition, scope)
-	if actual == nil {
-		return
-	}
 	if subject != nil {
-		a.checkBinaryOp("==", subject, actual, condition.GetPos())
-	} else if !actual.IsNonNullBoolean() {
+		pos := condition.GetPos()
+		if sealedComparisonLacksValue(subjectExpr, condition, subject, actual) {
+			a.reportUnresolvedSealedComparison(pos)
+			return
+		}
+		a.checkBinaryOp("==", subject, actual, pos)
+	} else if actual != nil && !actual.IsNonNullBoolean() {
 		a.addError(condition.GetPos(), "when condition requires non-null Boolean / when 条件必须是非空 Boolean")
 	}
 }
