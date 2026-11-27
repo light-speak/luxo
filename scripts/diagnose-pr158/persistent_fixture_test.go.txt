@@ -1,0 +1,105 @@
+package h2transport
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"runtime/metrics"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// The transport, TCP connection, HTTP/2 handshake and one warm request are outside
+// the counter window. Every measured iteration is a request on the same peer.
+func BenchmarkPriorKnowledgePersistentRequests(b *testing.B) {
+	finished := make(chan struct{}, 1)
+	var handled atomic.Int64
+	server, err := NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+		handled.Add(1)
+		finished <- struct{}{}
+	}))
+	if err != nil {
+		b.Fatal(err)
+	}
+	outer := httptest.NewUnstartedServer(nil)
+	if err := server.ConfigureHTTPServer(outer.Config); err != nil {
+		b.Fatal(err)
+	}
+	var accepted atomic.Int64
+	outer.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			accepted.Add(1)
+		}
+	}
+	outer.Start()
+	b.Cleanup(func() { _ = server.Close(); outer.Close() })
+	request, err := http.NewRequestWithContext(b.Context(), http.MethodPost, outer.URL, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	dialer := net.Dialer{Timeout: time.Second}
+	protocols := new(http.Protocols)
+	protocols.SetUnencryptedHTTP2(true)
+	var dialed atomic.Int64
+	transport := &http.Transport{
+		Protocols:           protocols,
+		MaxConnsPerHost:     1,
+		MaxIdleConnsPerHost: 1,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialed.Add(1)
+			conn, err := dialer.DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			return conn, nil
+		},
+	}
+	b.Cleanup(transport.CloseIdleConnections)
+	roundTrip := func() {
+		response, err := transport.RoundTrip(request)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := response.Body.Close(); err != nil {
+			b.Fatal(err)
+		}
+		if response.StatusCode != http.StatusNoContent || response.ProtoMajor != 2 {
+			b.Fatal("persistent request did not complete HTTP/2")
+		}
+		<-finished
+	}
+	roundTrip()
+	if dialed.Load() != 1 || accepted.Load() != 1 || handled.Load() != 1 {
+		b.Fatal("persistent fixture did not warm exactly one connection")
+	}
+	samples := [...]metrics.Sample{{Name: "/gc/heap/tiny/allocs:objects"}, {Name: "/gc/heap/allocs:objects"}, {Name: "/gc/heap/allocs:bytes"}}
+	metrics.Read(samples[:])
+	var start [len(samples)]uint64
+	for i := range samples {
+		start[i] = samples[i].Value.Uint64()
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		roundTrip()
+	}
+	clients, servers, requests := dialed.Load(), accepted.Load(), handled.Load()-1
+	if clients != 1 || servers != 1 || requests != int64(b.N) {
+		b.Fatal("persistent request changed connection or workload")
+	}
+	metrics.Read(samples[:])
+	for i := range samples {
+		if samples[i].Value.Uint64() < start[i] {
+			b.Fatal("allocation counter decreased")
+		}
+	}
+	fmt.Printf("LUXO-H2-PERSISTENT %d %d %d %d %d %d %d\n", b.N, requests, clients, servers,
+		samples[0].Value.Uint64()-start[0], samples[1].Value.Uint64()-start[1], samples[2].Value.Uint64()-start[2])
+}

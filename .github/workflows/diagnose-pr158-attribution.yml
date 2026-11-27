@@ -1,4 +1,4 @@
-name: Measure #158 HTTP/2 allocation counters on EPYC 7763
+name: Measure #158 persistent HTTP/2 request allocations on EPYC 7763
 
 on:
   push:
@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 6
+          fetch-depth: 7
           persist-credentials: false
 
       - name: Require the original EPYC 7763 runner CPU
@@ -38,16 +38,16 @@ jobs:
           path: .tmp/pr158-base
           persist-credentials: false
 
-      - name: Measure tiny and other allocations on the pinned HTTP/2 workload
+      - name: Count allocations across 128 successful requests on each established peer
         env:
           RUNNER_KIND: ${{ runner.environment }}
           NATIVE_ROUTE: ${{ steps.route.outputs.route }}
-        run: python3 -I -B scripts/diagnose-pr158/run.py --tiny "$NATIVE_ROUTE"
+        run: python3 -I -B scripts/diagnose-pr158/run.py --persistent "$NATIVE_ROUTE"
 
       - if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: pr158-attribution-native-${{ github.run_id }}-${{ github.run_attempt }}
+          name: pr158-h2-persistent-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/pr158-attribution
           if-no-files-found: error
           retention-days: 14

@@ -20,16 +20,22 @@ INPUT = Path(__file__).resolve().parent
 ROOT = INPUT.parents[1]
 OUT = ROOT / '.tmp/pr158-attribution'
 RUN_CONFIG_SHA = 'bf3be34db7cca43489c678e725e5baa66ca03e323c4a282df9e8650db93cdc81'
-DIAGNOSTIC_PARENT = '2c5890285ef03d2fb7e55211550cba4bc06cc0b6'
+DIAGNOSTIC_PARENT = 'ee59a8b0c89e6adc97f0806b893e4a86e7802168'
+TINY_PARENT = '2c5890285ef03d2fb7e55211550cba4bc06cc0b6'
 PROFILE_PARENT = 'd586d4283c290501fb9f4e911996be13aa6945d7'
 ORIGINAL_WITNESS = '5d63fd896bcc88aa35968e986985bb387e7de661'
 DIAGNOSTIC_REF = 'refs/heads/diagnostics/pr158-attribution'
+PERSISTENT_PLAN_SHA = 'b4507306a64469df4c95f765a7e1dd07d4dc39e552be908d43f921686d27cdb5'
 CONFIG = json.loads((INPUT / 'routes.json').read_bytes())
 PATHS = ('.github/workflows/diagnose-pr158-attribution.yml',
          *('scripts/diagnose-pr158/' + name for name in (
-             'arm-b.patch.b64', 'go-capture.py', 'h2_metrics.py', 'h2_profile.py', 'routes.json', 'run.py')))
+             'arm-b.patch.b64', 'go-capture.py', 'h2_metrics.py', 'h2_profile.py', 'persistent-native-plan.json',
+             'persistent_fixture_test.go.txt', 'persistent_metrics.py', 'routes.json', 'run.py')))
 FOLLOWUP_PATHS = ('M\t.github/workflows/diagnose-pr158-attribution.yml',
-                  'A\tscripts/diagnose-pr158/h2_metrics.py', 'M\tscripts/diagnose-pr158/run.py')
+                  'A\tscripts/diagnose-pr158/persistent-native-plan.json',
+                  'A\tscripts/diagnose-pr158/persistent_fixture_test.go.txt',
+                  'A\tscripts/diagnose-pr158/persistent_metrics.py',
+                  'M\tscripts/diagnose-pr158/run.py')
 PAIRS = ('AA', 'BB', 'CC', 'AB', 'BC', 'AC')
 METRICS = '.unit:(sec/op OR B/op OR allocs/op)'
 HOT = {
@@ -101,7 +107,8 @@ def verify_provenance():
     active = git('rev-parse', 'HEAD')
     need(active == os.environ.get('GITHUB_SHA') and git('show', '-s', '--format=%P', active) == DIAGNOSTIC_PARENT,
          'the diagnostic must append one commit to the published witness')
-    need(git('show', '-s', '--format=%P', DIAGNOSTIC_PARENT) == PROFILE_PARENT and
+    need(git('show', '-s', '--format=%P', DIAGNOSTIC_PARENT) == TINY_PARENT and
+         git('show', '-s', '--format=%P', TINY_PARENT) == PROFILE_PARENT and
          git('show', '-s', '--format=%P', PROFILE_PARENT) == ORIGINAL_WITNESS and
          git('show', '-s', '--format=%P', ORIGINAL_WITNESS) == CONFIG['candidateCommit'],
          'the published witness must descend directly from the historical candidate')
@@ -260,7 +267,8 @@ def main():
     args = sys.argv[1:]
     probe = args[:1] == ['--probe']
     tiny = args[:1] == ['--tiny']
-    if probe or tiny:
+    persistent = args[:1] == ['--persistent']
+    if probe or tiny or persistent:
         args = args[1:]
     need(args == ['epyc'], 'this witness requires the original EPYC route')
     selected, cpu = route_guard(args[0])
@@ -277,13 +285,15 @@ def main():
                                     'diagnosticCommit': os.environ['GITHUB_SHA'], 'diagnosticParent': DIAGNOSTIC_PARENT,
                                     'goEnvironment': version.decode().splitlines(), 'goSHA256': digest(Path(go)),
                                     'runner': call('uname', '-a').decode().strip()})
-    grouped = group_cases(route['cases'])
-    rows = sorted(({'Package': item['package'], 'Name': item['name']} for item in route['cases']),
-                  key=lambda item: (item['Package'], item['Name']))
-    expected = OUT / 'expected.json'
-    json_file(expected, {'Base': rows, 'Head': rows})
     with tempfile.TemporaryDirectory(prefix='pr158-witness.', dir=OUT.parent) as temp:
         work = Path(temp)
+        if persistent:
+            arms = materialize(work)
+            compare = runpy.run_path(str(INPUT / 'persistent_metrics.py'))['capture']
+            processes = compare(go, call, json_file, need, OUT, arms, work, CONFIG['trees'], cpu, PERSISTENT_PLAN_SHA)
+            json_file(OUT / 'status.json', {'matched': True, 'route': selected, 'cpu': cpu,
+                                          'persistentCounterProcesses': processes, 'timedComparison': False})
+            return
         if tiny:
             arms = materialize(work)
             measure_tiny = runpy.run_path(str(INPUT / 'h2_metrics.py'))['capture']
@@ -291,6 +301,11 @@ def main():
             json_file(OUT / 'status.json', {'matched': True, 'route': selected, 'cpu': cpu,
                                           'counterProcesses': processes, 'timedComparison': False})
             return
+        grouped = group_cases(route['cases'])
+        rows = sorted(({'Package': item['package'], 'Name': item['name']} for item in route['cases']),
+                      key=lambda item: (item['Package'], item['Name']))
+        expected = OUT / 'expected.json'
+        json_file(expected, {'Base': rows, 'Head': rows})
         tools, wrapper = work / 'bin', work / 'wrapper'
         tools.mkdir()
         wrapper.mkdir()

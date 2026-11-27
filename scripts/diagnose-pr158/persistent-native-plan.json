@@ -1,0 +1,60 @@
+{
+  "Go": "go1.27.4 linux/amd64-v1 CGO1",
+  "benchmark": "BenchmarkPriorKnowledgePersistentRequests",
+  "checks": [
+    "one client dial and one server connection, 128 requests delivered and completed on the same peer",
+    "single benchmark/counter line with matching counts, actual host CPU/OS/architecture and PASS",
+    "B and C share the same H2 file hashes with an identical new test overlay",
+    "pinned Go build information, resolved B/C module versions and binary/raw SHA256",
+    "BB and CC original and reverse controls; every raw signed tiny/non-tiny/byte observation remains"
+  ],
+  "comparability": "exact stock server H2 sources; same Go1.27.4 standard library net/http unencrypted HTTP/2 client, request, handler and counts; successful warm request before counters; no x/net client fixture imports",
+  "counters": [
+    "/gc/heap/tiny/allocs:objects",
+    "/gc/heap/allocs:objects",
+    "/gc/heap/allocs:bytes"
+  ],
+  "cpu": "AMD EPYC 7763 64-Core Processor",
+  "fixtureSHA256": "9f34d994234c85c6e0dcdbcd7a1f59fd80236e50ad1758f6eef935bb48b8ffae",
+  "goEnvironment": [
+    "go1.27.4",
+    "linux",
+    "amd64",
+    "linux",
+    "amd64",
+    "v1",
+    "1",
+    "",
+    "local"
+  ],
+  "groups": 2,
+  "iterations": 128,
+  "limits": [
+    "separate persistent request leaf; retain the original 1-request-per-connection result",
+    "one valid request HEADERS block per request, no request trailers in this fixture",
+    "no timing acceptance or claimed tail latency",
+    "allocation metrics cover the complete stable fixed-client/server window, not a per-stack count; original mechanical Framer proof remains independent"
+  ],
+  "matrix": [
+    "BB",
+    "CC",
+    "BC"
+  ],
+  "measurement": "128 sequential successful 204 responses, after one warm request; one dial, one accepted socket and exact handler completions",
+  "modules": {
+    "B": "v0.58.0",
+    "C": "v0.63.0"
+  },
+  "order": "alternate arm order, rotate comparisons each round; keep every raw value",
+  "pairs_per_group": 10,
+  "previousFixtureSHA256": "550bdd3a16df200e96d854521f0e0c1ec47ff2fc6f4b675347b0d41778958be5",
+  "processes": 120,
+  "production_sources": "unaltered stock H2 in both arms; do not apply embedded-guard prototype",
+  "runnerSHA256": "e4d21a59e5a38761609180a5aba3dd93a5a99c21e53b7cb0b6ba2d560e05605d",
+  "same_machine": "AMD EPYC 7763 original native class",
+  "status": "allocation-only normal HTTP/2 validation",
+  "trees": {
+    "B": "be79c5f10e0bf505016c1182b02839016eedfe16",
+    "C": "0f2d71d92a0e1fc39918369a95330cf659ec1a84"
+  }
+}
