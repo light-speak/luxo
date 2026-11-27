@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -224,6 +225,33 @@ func writeMigration(t *testing.T, dir, name, up, down string) {
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestIntegrationMigrationSQLAtomicRoutineBody(t *testing.T) {
+	runner := migrationAuditRunner(t)
+	const up = `CREATE FUNCTION migration_answer() RETURNS integer LANGUAGE SQL BEGIN ATOMIC
+		SELECT 1 AS end;
+		RETURN CASE WHEN true THEN CASE WHEN true THEN 42 ELSE 2 END ELSE 3 END;
+	END;`
+	ctx := t.Context()
+	writeMigration(t, runner.dir, auditChange, up, "DROP FUNCTION migration_answer();")
+	names, _, err := runner.DryRun(ctx)
+	if err != nil || !slices.Equal(names, []string{auditChange}) {
+		t.Fatalf("preview routine migration: %v, %v", names, err)
+	}
+	auditUp(t, runner.Runner, 1)
+	var result int
+	if err := runner.db.QueryRow(ctx, "SELECT migration_answer()").Scan(&result); err != nil || result != 42 {
+		t.Fatalf("invoke migrated routine: result=%d, err=%v", result, err)
+	}
+	done, err := runner.Down(ctx, 1)
+	if err != nil || !slices.Equal(done, []string{auditChange}) {
+		t.Fatalf("rollback routine migration: %v, %v", done, err)
+	}
+	var exists bool
+	if err := runner.db.QueryRow(ctx, "SELECT pg_catalog.to_regprocedure('migration_answer()') IS NOT NULL").Scan(&exists); err != nil || exists {
+		t.Fatalf("routine after rollback: exists=%t, err=%v", exists, err)
 	}
 }
 
@@ -1074,6 +1102,30 @@ func TestIntegrationAdvisoryLockCloseAfterReservation(t *testing.T) {
 	}
 }
 
+func TestIntegrationAdvisoryCloseReleasesLockBeforePublicQuery(t *testing.T) {
+	runner, _ := setupTestRunner(t)
+	db := runner.db.(*PGDB)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	observer, err := NewPGDB(ctx, BuildDatabaseURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	if err := db.AcquireLock(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- db.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", pgLockID) }()
+	waitForAdvisoryLockQuery(t, ctx, observer)
+	closeCtx, stop := context.WithTimeout(ctx, 3*time.Second)
+	defer stop()
+	waitForAdvisoryClose(t, closeCtx, closeAdvisoryAdapter(db))
+	if err := <-result; err != nil {
+		t.Fatalf("public query did not finish after the advisory lock was released: %v", err)
+	}
+}
+
 func closeAdvisoryAdapter(db *PGDB) <-chan struct{} {
 	closed := make(chan struct{})
 	go func() {
@@ -1671,7 +1723,8 @@ func assertMigrationHolderStopsActiveWork(t *testing.T, closeRunner bool) {
 		result <- err
 	}()
 	select {
-	case <-started:
+	case pid := <-started:
+		waitForMigrationHolderSleep(t, ctx, observer, pid)
 	case <-ctx.Done():
 		t.Fatal("no running holder statement", ctx.Err())
 	}
@@ -1700,6 +1753,30 @@ func assertMigrationHolderStopsActiveWork(t *testing.T, closeRunner bool) {
 		(SELECT count(*) FROM _migrations)`).Scan(&tableExists, &history)
 	if err != nil || tableExists || history != 0 {
 		t.Fatalf("canceled transaction: table=%t, history=%d, error=%v", tableExists, history, err)
+	}
+}
+
+func waitForMigrationHolderSleep(t *testing.T, ctx context.Context, observer *pgx.Conn, pid uint32) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var sleeping bool
+		err := observer.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_catalog.pg_stat_activity
+			WHERE pid = $1 AND state = 'active' AND wait_event = 'PgSleep'
+		)`, pid).Scan(&sleeping)
+		if err != nil {
+			t.Fatal("inspect migration holder", err)
+		}
+		if sleeping {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("migration holder did not reach pg_sleep", ctx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -1735,11 +1812,11 @@ func cleanupMigrationHolderObserver(t *testing.T, observer *pgx.Conn) {
 	}
 }
 
-type migrationHolderStarted chan struct{}
+type migrationHolderStarted chan uint32
 
-func (started migrationHolderStarted) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+func (started migrationHolderStarted) TraceQueryStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
 	if strings.Contains(data.SQL, "pg_sleep(30)") {
-		started <- struct{}{}
+		started <- conn.PgConn().PID()
 	}
 	return ctx
 }

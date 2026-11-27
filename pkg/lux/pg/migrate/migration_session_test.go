@@ -177,10 +177,10 @@ func TestIntegrationMigrationStandaloneAcquireHonorsCancellation(t *testing.T) {
 	}
 }
 
-func setupPingLockTest(t *testing.T) (*PGDB, uint32) {
+func setupPingLockTest(t *testing.T, ctx context.Context) (*PGDB, uint32) {
 	t.Helper()
-	ctx := t.Context()
 	db := openPingLockTest(t, ctx, nil)
+	keepPingFreshUntilTestDeadline(t, ctx, db)
 	initial := db.pool.AcquireAllIdle(ctx)
 	for _, conn := range initial {
 		defer conn.Release()
@@ -189,6 +189,16 @@ func setupPingLockTest(t *testing.T) (*PGDB, uint32) {
 		t.Fatalf("idle connections after Ping = %d, want 1", len(initial))
 	}
 	return db, initial[0].Conn().PgConn().PID()
+}
+
+func keepPingFreshUntilTestDeadline(t *testing.T, ctx context.Context, db *PGDB) {
+	t.Helper()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("ping session tests require a deadline")
+	}
+	// Keep freshness independent of scheduling. Expiry is exercised separately.
+	db.pingFreshUntil = deadline
 }
 
 func pingLockTestDSN(t *testing.T, overrides url.Values) string {
@@ -226,9 +236,9 @@ func openPingLockTest(t *testing.T, ctx context.Context, overrides url.Values) *
 }
 
 func TestIntegrationPGDBUsesPingSessionForFirstLock(t *testing.T) {
-	db, initialPID := setupPingLockTest(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
+	db, initialPID := setupPingLockTest(t, ctx)
 	cancelled, stop := context.WithCancel(ctx)
 	stop()
 	if err := db.AcquireLock(cancelled); !errors.Is(err, context.Canceled) {
@@ -293,9 +303,9 @@ func TestIntegrationPGDBFirstLockIgnoresUsedPoolSession(t *testing.T) {
 		{"migration-statement", func(ctx context.Context, db *PGDB) error { return db.execMigrationStatement(ctx, change) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			db, initialPID := setupPingLockTest(t)
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
+			db, initialPID := setupPingLockTest(t, ctx)
 			if err := tc.use(ctx, db); err != nil {
 				t.Fatal(err)
 			}
@@ -315,9 +325,9 @@ func TestIntegrationPGDBFirstLockIgnoresUsedPoolSession(t *testing.T) {
 }
 
 func TestIntegrationPGDBRetiresAdoptedSessionAfterWrite(t *testing.T) {
-	db, initialPID := setupPingLockTest(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
+	db, initialPID := setupPingLockTest(t, ctx)
 	dir := t.TempDir()
 	const name = "001_holder.sql"
 	writeMigration(t, dir, name, "CREATE TABLE holder_pid AS SELECT pg_catalog.pg_backend_pid() AS pid;", "DROP TABLE holder_pid;")
@@ -378,8 +388,7 @@ func TestIntegrationPGDBReturnsUnrelatedIdleSession(t *testing.T) {
 	}
 	otherConn := other.Conn()
 	other.Release()
-	// Start the same one-second freshness window at the controlled pool snapshot.
-	db.pingFreshUntil = time.Now().Add(time.Second)
+	keepPingFreshUntilTestDeadline(t, ctx, db)
 	if err := db.AcquireLock(ctx); err != nil {
 		t.Fatal(err)
 	}

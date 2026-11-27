@@ -190,10 +190,8 @@ func TestIntegrationPendingMigrationRetainsDownReceipt(t *testing.T) {
 		"CREATE INDEX CONCURRENTLY audit_idx ON audit_users (label);",
 		"DROP INDEX CONCURRENTLY audit_idx;")
 	auditUp(t, first.Runner, 1)
-	fault := errors.New("migration fixture lost the acknowledgement reply")
-	lost := NewFromDB(migrationLostAcknowledgementDB{MigrationSessionDB: first.openBoundSession(t), fault: fault}, first.dir)
-	if _, err := lost.Down(ctx, 1); err != nil && !errors.Is(err, fault) {
-		t.Fatalf("unexpected rollback error: %v", err)
+	if done, err := first.Down(ctx, 1); err != nil || !slices.Equal(done, []string{auditChange}) {
+		t.Fatalf("standalone rollback: done=%v err=%v", done, err)
 	}
 	auditIndexAndHistory(t, first.db, false, 1)
 	first.Close()
@@ -202,6 +200,34 @@ func TestIntegrationPendingMigrationRetainsDownReceipt(t *testing.T) {
 	var pending *MigrationReconciliationError
 	if len(done) != 0 || !errors.As(err, &pending) || pending.Attempt.Name != auditChange || !pending.Attempt.HistoryCommitted {
 		t.Fatalf("the completed standalone rollback lost its receipt: done=%v err=%v", done, err)
+	}
+	auditIndexAndHistory(t, restarted.db, false, 1)
+}
+
+func TestIntegrationPendingMigrationAcknowledgementReplyIsLost(t *testing.T) {
+	ctx := t.Context()
+	first := migrationAuditRunner(t)
+	writeMigration(t, first.dir, auditChange,
+		"CREATE INDEX CONCURRENTLY audit_idx ON audit_users (label);",
+		"DROP INDEX CONCURRENTLY audit_idx;")
+	auditUp(t, first.Runner, 1)
+	if done, err := first.Down(ctx, 1); err != nil || !slices.Equal(done, []string{auditChange}) {
+		t.Fatalf("standalone rollback: done=%v err=%v", done, err)
+	}
+	receipt, err := first.PendingAttempt(ctx)
+	if err != nil || receipt == nil || !receipt.HistoryCommitted {
+		t.Fatalf("committed rollback receipt: %+v %v", receipt, err)
+	}
+	first.Close()
+
+	fault := errors.New("migration fixture lost the acknowledgement reply")
+	lost := NewFromDB(migrationLostAcknowledgementDB{MigrationSessionDB: first.openBoundSession(t), fault: fault}, first.dir)
+	if err := lost.Reconcile(ctx, receipt.ID, AcknowledgeMigration); !errors.Is(err, fault) {
+		t.Fatalf("lost acknowledgement did not propagate: %v", err)
+	}
+	restarted := first.open(t, first.dir)
+	if pending, err := restarted.PendingAttempt(ctx); err != nil || pending != nil {
+		t.Fatalf("acknowledged rollback remained pending: %+v %v", pending, err)
 	}
 	auditIndexAndHistory(t, restarted.db, false, 1)
 }

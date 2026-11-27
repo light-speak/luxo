@@ -174,6 +174,10 @@ func planMigrationSQL(sql string) (migrationMode, error) {
 }
 
 func migrationStatementEnd(sql string, start int) int {
+	cursor := migrationTokens{sql: sql, pos: start}
+	if cursor.accept("CREATE") && cursor.acceptRoutineDeclaration() {
+		return migrationRoutineStatementEnd(cursor)
+	}
 	depth := 0
 	for i := start; i < len(sql); {
 		if next := skipMigrationToken(sql, i); next != i {
@@ -193,6 +197,46 @@ func migrationStatementEnd(sql string, start int) int {
 		i++
 	}
 	return len(sql)
+}
+
+// SQL routine bodies end only between child statements. Keywords inside expressions
+// (such as CASE ... END) are part of a child statement, even outside parentheses.
+func migrationRoutineStatementEnd(cursor migrationTokens) int {
+	var parenDepth, atomicDepth int
+	routineHeader, childStart := true, false
+	for token := cursor.next(); token != ""; token = cursor.next() {
+		switch token {
+		case "(":
+			parenDepth++
+			continue
+		case ")":
+			parenDepth--
+			continue
+		}
+		if parenDepth != 0 {
+			continue
+		}
+		if token == ";" {
+			if atomicDepth == 0 {
+				return cursor.pos - 1
+			}
+			routineHeader, childStart = false, true
+			continue
+		}
+		if childStart {
+			childStart = false
+			if strings.EqualFold(token, "END") && cursor.endsRoutine() {
+				atomicDepth--
+			}
+			routineHeader = strings.EqualFold(token, "CREATE") && cursor.acceptRoutineDeclaration()
+			continue
+		}
+		if routineHeader && strings.EqualFold(token, "BEGIN") && cursor.accept("ATOMIC") {
+			atomicDepth++
+			routineHeader, childStart = false, true
+		}
+	}
+	return len(cursor.sql)
 }
 
 func skipMigrationToken(sql string, index int) int {
@@ -253,6 +297,19 @@ func (c *migrationTokens) accept(keyword string) bool {
 	}
 	c.pos = start
 	return false
+}
+
+func (c *migrationTokens) acceptRoutineDeclaration() bool {
+	if c.accept("OR") && !c.accept("REPLACE") {
+		return false
+	}
+	return c.accept("FUNCTION") || c.accept("PROCEDURE")
+}
+
+func (c migrationTokens) endsRoutine() bool {
+	token := c.next()
+	// CREATE FUNCTION allows the legacy WITH (...) option after the body.
+	return token == "" || token == ";" || strings.EqualFold(token, "WITH")
 }
 
 func (c *migrationTokens) firstStatementKind() migrationSQLKind {

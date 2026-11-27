@@ -165,7 +165,7 @@ func TestMigrationExecutionNamespacePreservesDriverErrors(t *testing.T) {
 	} {
 		t.Run(sample.name, func(t *testing.T) {
 			runner := NewFromDB(sample.db, t.TempDir())
-			err := runner.restoreMigrationExecution(t.Context(), &storedMigrationAttempt{})
+			err := runner.restoreMigrationExecution(t.Context(), &storedMigrationAttempt{}, migrationExecutionPlan{}, migrationExecutionBinding{})
 			if !errors.Is(err, cause) {
 				t.Fatalf("lost original database error: %v", err)
 			}

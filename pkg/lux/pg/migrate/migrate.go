@@ -24,11 +24,13 @@ type Runner struct {
 }
 
 type migrationOperation struct {
-	db              migrationQueries
-	dir             string
-	metadata        migrationMetadata
-	rollbackReceipt string
-	sessionBound    bool
+	db                        migrationQueries
+	dir                       string
+	metadata                  migrationMetadata
+	rollbackReceipt           string
+	sessionBound              bool
+	uncachedRetryQueries      bool
+	uncachedStandaloneJournal bool
 }
 
 // New creates a Runner from DATABASE_* env vars.
@@ -76,12 +78,15 @@ func (r *Runner) withMigrationLock(ctx context.Context, checkStringMode bool, ru
 	if db, ok := r.db.(*PGDB); ok {
 		operationCtx, stop := db.lockContext(ctx)
 		defer stop()
-		conn, err := db.acquireLockSession(operationCtx)
+		session, err := db.acquireLockSession(operationCtx, true)
 		if err != nil {
 			return nil, fmt.Errorf("acquire lock: %w", err)
 		}
-		holder := pgMigrationHolder{pgMigrationQueries: pgMigrationQueries[*pgx.Conn]{conn: conn}}
-		defer func() { db.releaseLockSession(ctx, conn, !holder.wrote) }()
+		holder := pgMigrationHolder{
+			pgMigrationQueries: pgMigrationQueries[*pgx.Conn]{conn: session.conn},
+			cachedStatements:   db.lockConfig.DefaultQueryExecMode == pgx.QueryExecModeCacheStatement && db.lockConfig.StatementCacheCapacity > 0,
+		}
+		defer func() { db.releaseLockSession(ctx, session, !holder.wrote) }()
 		if err := db.lockLifetime.Err(); err != nil {
 			return nil, err
 		}
@@ -122,6 +127,7 @@ func (r *migrationOperation) up(ctx context.Context) ([]string, error) {
 	if err := r.requireStandaloneSession(plan, "UP"); err != nil {
 		return nil, err
 	}
+	r.configureStandaloneJournal(plan)
 	if !r.metadata.historyExists {
 		if err := r.init(ctx); err != nil {
 			return nil, err
@@ -136,6 +142,17 @@ func (r *migrationOperation) up(ctx context.Context) ([]string, error) {
 		executed = append(executed, migration.name)
 	}
 	return executed, nil
+}
+
+// Only a native single-statement journal has no later write to reuse its
+// cached statements. All multi-migration plans keep their existing cache policy.
+func (r *migrationOperation) configureStandaloneJournal(plan []plannedMigration) {
+	holder, native := r.db.(*pgMigrationHolder)
+	r.uncachedStandaloneJournal = native && holder.cachedStatements && len(plan) == 1 && plan[0].mode.autocommit
+}
+
+func (r *migrationOperation) journalWritesUncached() bool {
+	return r.uncachedRetryQueries || r.uncachedStandaloneJournal
 }
 
 // DryRun returns the pending SQL in execution order without changing the database.
@@ -215,6 +232,7 @@ func (r *migrationOperation) down(ctx context.Context, n int) ([]string, error) 
 	if err := r.requireStandaloneSession(plan, "DOWN"); err != nil {
 		return nil, err
 	}
+	r.configureStandaloneJournal(plan)
 
 	var rolledBack []string
 	for _, migration := range plan {
@@ -361,12 +379,18 @@ func (r *migrationOperation) execSection(ctx context.Context, migration plannedM
 
 func (r *migrationOperation) finishMigrationAttempt(ctx context.Context, migration plannedMigration, attempt *storedMigrationAttempt) error {
 	record := insertHistory.sql(r.metadata.relation(migrationHistoryTable))
-	args := []any{migration.name, migration.checksum}
+	value := any(migration.checksum)
 	if attempt.Direction == "DOWN" {
 		record = `WITH removed AS (
             DELETE FROM ` + r.metadata.relation(migrationHistoryTable) + ` WHERE name = $1 AND id = $2 RETURNING 1
         ) SELECT 1 / count(*) FROM removed`
-		args = []any{migration.name, *attempt.historyID}
+		value = *attempt.historyID
+	}
+	var args []any
+	if r.journalWritesUncached() {
+		args = []any{pgx.QueryExecModeExec, migration.name, value}
+	} else {
+		args = []any{migration.name, value}
 	}
 	if err := r.commitMigrationSection(ctx, migration, attempt, record, args...); err != nil {
 		return fmt.Errorf("migration attempt %s: %w", attempt.ID, err)
@@ -430,19 +454,25 @@ func migrationHistoryUncommitted(autocommit bool, err error) error {
 	return fmt.Errorf("autocommit statement returned success. The change to migration history remains uncommitted. %s: %w", migrationRetryAdvice, err)
 }
 
-// PostgreSQL may report success when IF NOT EXISTS skips an invalid index left
-// by an earlier failed concurrent build. Verify the index before writing history.
-func (r *migrationOperation) verifyConcurrentIndex(ctx context.Context, mode migrationMode) error {
-	var valid bool
-	err := r.db.QueryRow(ctx, `SELECT EXISTS (
+const concurrentIndexExists = `EXISTS (
 		SELECT 1
 		FROM pg_catalog.pg_class t
 		JOIN pg_catalog.pg_index i ON i.indrelid = t.oid
 		JOIN pg_catalog.pg_class x ON x.oid = i.indexrelid AND x.relnamespace = t.relnamespace
-		WHERE t.oid = pg_catalog.to_regclass($2)
+		WHERE t.oid = CASE WHEN $3::pg_catalog.oid = 0 THEN pg_catalog.to_regclass($2)::pg_catalog.oid ELSE $3 END
 		  AND x.relname = (pg_catalog.parse_ident($1))[1]::pg_catalog.name
 		  AND i.indisvalid AND i.indisready AND i.indislive
-	)`, mode.index, mode.table).Scan(&valid)
+	)`
+
+// PostgreSQL may report success when IF NOT EXISTS skips an invalid index left
+// by an earlier failed concurrent build. Verify the index before writing history.
+func (r *migrationOperation) verifyConcurrentIndex(ctx context.Context, mode migrationMode, tableOID uint32) error {
+	var valid bool
+	err := r.db.QueryRow(ctx, "SELECT "+concurrentIndexExists, mode.index, mode.table, tableOID).Scan(&valid)
+	return concurrentIndexResult(mode, valid, err)
+}
+
+func concurrentIndexResult(mode migrationMode, valid bool, err error) error {
 	if err != nil {
 		return fmt.Errorf("verify index %s on %s: %w", mode.index, mode.table, err)
 	}
@@ -669,10 +699,9 @@ func (r *migrationOperation) verify(ctx context.Context) ([]string, error) {
 func (r *migrationOperation) listTables(ctx context.Context) (map[string]bool, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT table_name FROM information_schema.tables
-		WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-		AND table_name != '_migrations'
-		AND NOT (table_schema = $1 AND table_name = $2)
-	`, r.metadata.schema, migrationAttemptTable)
+		WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+		AND table_name NOT IN ($2, $3)
+	`, r.metadata.schema, migrationHistoryTable, migrationAttemptTable)
 	if err != nil {
 		return nil, err
 	}

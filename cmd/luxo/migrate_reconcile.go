@@ -15,8 +15,16 @@ func newMigrateReconcileCmd() *cobra.Command {
 		Short: "Inspect or resolve a migration attempt / 查看或处理迁移尝试",
 		Long: `Read the pending migration attempt with no arguments.
 After inspecting the affected database objects, pass the attempt ID and one action.
+
+For --record-executed or --retry, pause conflicting DDL from clients that do not
+acquire Luxo's PostgreSQL migration advisory lock. Keep it paused from the start
+of inspection until the action completes.
+
 不带参数时只读查看待处理的迁移尝试。
-检查受影响的数据库对象后，传入尝试 ID 和一项处理操作。`,
+检查受影响的数据库对象后，传入尝试 ID 和一项处理操作。
+
+使用 --record-executed 或 --retry 时，从开始检查到操作结束，
+须暂停其他未获取 Luxo PostgreSQL 迁移咨询锁的客户端所执行的冲突 DDL。`,
 		Args: cobra.MaximumNArgs(1),
 	}
 	options := [...]struct {

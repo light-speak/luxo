@@ -387,6 +387,46 @@ func TestPlanMigrationSQL(t *testing.T) {
 	}
 }
 
+func TestPlanMigrationSQLAtomicRoutineBody(t *testing.T) {
+	const function = `CREATE FUNCTION migration_answer() RETURNS integer LANGUAGE SQL
+		BEGIN /* boundary */ ATOMIC
+			SELECT 1 AS end, E'quoted\'; END; text' AS quoted, $body$END; $body$ AS dollar;
+			RETURN CASE WHEN true THEN CASE WHEN true THEN 42 ELSE 2 END ELSE 3 END;
+		END`
+	const procedure = `CREATE OR REPLACE PROCEDURE "end"() LANGUAGE SQL
+		begin -- Inside the declaration, this newline does not terminate the header.
+		atomic
+			INSERT INTO app_table (value) VALUES (CASE WHEN TRUE THEN 1 ELSE 2 END);
+			/* nested /* inner END; */ comment */
+		end`
+	for _, tc := range []struct{ name, sql, wantError string }{
+		{"function", function + "; SELECT 1;", ""},
+		{"procedure", procedure, ""},
+		{"closed routine with options", function + " WITH (isstrict);", ""},
+		{"two routines", function + "; " + procedure + ";", ""},
+		{"nested routine", "CREATE PROCEDURE outer() LANGUAGE SQL BEGIN ATOMIC " + function + "; END;", ""},
+		{"quoted routine body", "CREATE FUNCTION old_style() RETURNS integer LANGUAGE SQL AS $$SELECT 1;$$; SELECT 1;", ""},
+		{"empty atomic procedure", "CREATE PROCEDURE empty() LANGUAGE SQL BEGIN ATOMIC END;", ""},
+		{"malformed routine prefix", "CREATE OR FUNCTION migration_answer(); COMMIT;", "statement 2 controls a transaction boundary"},
+		{"top-level commit", function + "; COMMIT;", "statement 2 controls a transaction boundary"},
+		{"top-level end", function + "; END WORK;", "statement 2 controls a transaction boundary"},
+		{"mixed", function + "; CREATE INDEX CONCURRENTLY idx ON app_table(value);", "statement 2 must run outside a transaction"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mode, err := planMigrationSQL(tc.sql)
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("plan error: %v, want %q", err, tc.wantError)
+				}
+				return
+			}
+			if err != nil || mode.autocommit {
+				t.Fatalf("routine requires an ordinary migration transaction: mode=%+v err=%v", mode, err)
+			}
+		})
+	}
+}
+
 func TestFileChecksum(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.sql")

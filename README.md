@@ -412,7 +412,7 @@ Registration, heartbeats, deregistration, metrics, and trace exports never follo
 
 ### Release and Stability Policy
 
-The cross-repository Swift CI checks out commit `d6578969bcef258141c7c99cb6cface30a22a0e2` and verifies that its `VERSION` matches the core. The conformance lane checks direct and gateway calls, WebSocket token renewal, and rolling enum upgrades over JSON and Binary. Release validation also requires the remote checkout and complete release gates. Record the tested revisions and compatibility matrix for each candidate update.
+The cross-repository Swift CI checks out commit `476e861a3b8a76e4bf7a4ece676f4be75fa10013` and verifies that its `VERSION` matches the core. The conformance lane checks direct and gateway calls, WebSocket token renewal, and rolling enum upgrades over JSON and Binary. Release validation also requires the remote checkout and complete release gates. Record the tested revisions and compatibility matrix for each candidate update.
 
 The next release target is **`v1.0.0-beta.1`**, not an already published stable release. Luxo follows [Semantic Versioning](https://semver.org/): Git tags use the `v` prefix; package versions use the format required by their ecosystem.
 
@@ -642,6 +642,8 @@ In PostgreSQL migrations, run each supported statement that requires execution o
 Luxo binds migration history and recovery state to PostgreSQL's `current_schema()` at the start of each operation. Configure the same `search_path` for preview, apply, rollback, and reconciliation. Migration SQL requires `standard_conforming_strings=on`, the PostgreSQL default. Use explicit `E'...'` literals for backslash escapes.
 
 `luxo migrate reconcile` reads the outstanding attempt ID, migration name, direction, and history state. If history is unconfirmed, inspect the affected PostgreSQL objects. Use `luxo migrate reconcile <attempt-id> --record-executed` after verifying that the statement took effect, or `--retry` after confirming the recorded statement can safely run again. Use `luxo migrate reconcile <attempt-id> --acknowledge` when the history is already committed, including a retained rollback receipt. Each recovery command takes exactly one action.
+
+For `--record-executed` or `--retry`, pause conflicting DDL from clients that do not acquire Luxo's PostgreSQL migration advisory lock. Keep it paused from the start of inspection until the action completes. The same requirement applies to direct calls to `migrate.Runner.Reconcile` with `RecordApplied` or `RetryMigration`.
 
 If a previously applied file has a mixed `DOWN` section, leave its recorded file intact and create new compensating migrations in dependency order. When a concurrent index build fails, PostgreSQL can leave an invalid index. Inspect and resolve that index before retrying. A concurrent `CREATE INDEX IF NOT EXISTS` only counts as successful if the index is valid and belongs to the intended table.
 

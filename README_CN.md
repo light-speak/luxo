@@ -393,7 +393,7 @@ Luxo 的追踪是请求级、跨网关、服务、DataLoader 与数据库的执�
 
 ### 发布与稳定性规范
 
-跨仓库 Swift CI 固定检出提交 `d6578969bcef258141c7c99cb6cface30a22a0e2`，并验证 Swift 与核心的 `VERSION` 一致。该兼容性门禁覆盖 JSON 和 Binary 下的直连、网关调用、WebSocket 令牌续期和枚举滚动升级。发行验收还需完成远端检出及完整发行门禁。每次升级候选版本时记录受测提交和兼容矩阵。
+跨仓库 Swift CI 固定检出提交 `476e861a3b8a76e4bf7a4ece676f4be75fa10013`，并验证 Swift 与核心的 `VERSION` 一致。该兼容性门禁覆盖 JSON 和 Binary 下的直连、网关调用、WebSocket 令牌续期和枚举滚动升级。发行验收还需完成远端检出及完整发行门禁。每次升级候选版本时记录受测提交和兼容矩阵。
 
 下一发布目标为 **`v1.0.0-beta.1`**，不是已经发布的稳定版。Luxo 遵循 [语义化版本规范](https://semver.org/lang/zh-CN/)：Git tag 使用 `v` 前缀，包版本采用各生态要求的格式。
 
@@ -607,6 +607,8 @@ PostgreSQL 迁移中，`CREATE INDEX CONCURRENTLY` 等受支持的事务外语�
 每次操作开始时，Luxo 使用 PostgreSQL 的 `current_schema()` 选定迁移历史与恢复状态所在的 schema。预览、执行、回滚和恢复请配置同一 `search_path`。迁移 SQL 要求 PostgreSQL 默认设置 `standard_conforming_strings=on`。需要反斜杠转义时使用显式的 `E'...'` 字符串。
 
 `luxo migrate reconcile` 只读显示待处理的尝试 ID、迁移名称、方向和历史状态。历史提交未确认时，先检查受影响的 PostgreSQL 对象。确认语句已生效后用 `luxo migrate reconcile <attempt-id> --record-executed` 补记历史。确认可以安全重跑时，用 `--retry` 重试已记录的语句。历史已经提交时，包括保留的回滚回执，用 `luxo migrate reconcile <attempt-id> --acknowledge` 确认回执。每次处理只接受一项操作。
+
+使用 `--record-executed` 或 `--retry` 时，从开始检查到操作结束，须暂停其他未获取 Luxo PostgreSQL 迁移咨询锁的客户端所执行的冲突 DDL。直接调用 `migrate.Runner.Reconcile` 并指定 `RecordApplied` 或 `RetryMigration` 时，也须遵守此要求。
 
 如果已应用文件的 `DOWN` 段混用了两类语句，保留已记录文件，按依赖顺序新建补偿迁移。并发索引构建失败时，PostgreSQL 可能留下无效索引。重试前先检查并处理该索引。并发的 `CREATE INDEX IF NOT EXISTS` 只有在索引有效且属于目标表时才记为成功。
 
