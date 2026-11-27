@@ -42,7 +42,8 @@ func TestIsolationProfileCommand(t *testing.T) {
 			"rpc-deadline-classification\t^BenchmarkRPCDeadlineClassification$\n" +
 			"rpc-nil-context-guard\t^BenchmarkRPCNilContextGuard$\n" +
 			"rpc-prepared-frame\t^BenchmarkLRPCPreparedFrame$\n" +
-			"rpc-frame-reuse\t^BenchmarkLRPCConnectionFrameReuseCandidate$\n"},
+			"rpc-frame-reuse\t^BenchmarkLRPCConnectionFrameReuseCandidate$\n" +
+			"rpc-handler-panic\t^BenchmarkHandlerPanicFormatting$\n"},
 		{"pkg/lux/pg", "pg-duration-write-reject\t^BenchmarkDurationWriteReject$\n"},
 		{"pkg/lux/queue", "queue-stream-name\t^BenchmarkQueueStreamName$\n"},
 	} {
