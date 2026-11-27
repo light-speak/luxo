@@ -1,149 +1,126 @@
 {
   "A": {
-    "commit": "bc18a70e66da8053deb70d575b4752a4343ef1f8",
-    "tree": "93b5ed667a8964f173e321ed34955a3b15560543"
+    "commit": "b5f6b0eb95f93516c306ca47dd74a1b532ecf018",
+    "sourceSHA256": {
+      "pkg/lux/api/request_log_async.go": "e54cf0391a7a1f25421816922e3ea8b2c3ceb87e570b2af45f2a77f64b211110",
+      "pkg/lux/api/request_log_async_test.go": "ce47aebb7d132885536fe9eb2fb4a12b1f08d7b0d68ecc3b5f24b10b4dd720dc"
+    },
+    "tree": "a3e3a3eb9c15352b303672b83914d307b1a1b87e"
   },
   "H": {
-    "commit": "1a01ee3808b23c8145bb3993ab4f07963248175c",
+    "commit": "f72667fbb2f76101e611a45cfc9cbb670548b6db",
     "parents": [
-      "0656423e61b98515dc2caa2d56f2041ea551942c",
-      "bc18a70e66da8053deb70d575b4752a4343ef1f8"
+      "1a01ee3808b23c8145bb3993ab4f07963248175c",
+      "b5f6b0eb95f93516c306ca47dd74a1b532ecf018"
     ],
-    "tree": "159e6ebd7b2982604e15224d71093c6532042d42"
+    "sourceSHA256": {
+      "pkg/lux/api/request_log_async.go": "6dc7ca72cbfcf29fd5e6f30b6010b7b44bbaea9f65ecff6d96f7ba46915a1c48",
+      "pkg/lux/api/request_log_async_test.go": "18953d4af73fe0cdc9d8cbced337215e73f2eade18d892a31322534ca3a9c022"
+    },
+    "tree": "f773518b4c5a242a0d1fa6e0a082057fff342f3b"
   },
   "case": {
-    "cache": {
-      "confirmed": "github.com/light-speak/luxo/pkg/lux/api/CacheExecutionDependencyCollection/models=1-2",
-      "hot": "BenchmarkCacheExecutionDependencyCollection|\\(\\*cacheDependencyPlan\\)\\.appendModels",
-      "inventory": "cache",
-      "originalArtifact": 15184459162,
-      "originalDigest": "2f844b7325c9d41a85fe993400d6d12b7830bdcea700ae01413581efd031b6ad",
+    "api-non-identity": {
+      "confirmed": [
+        "github.com/light-speak/luxo/pkg/lux/api/BinaryJSONDocuments/1/typed-2",
+        "github.com/light-speak/luxo/pkg/lux/api/BinarySelection/width=16/selected=16/branches=0/request-2",
+        "github.com/light-speak/luxo/pkg/lux/api/CacheExecutionDependencyCollection/models=1-2",
+        "github.com/light-speak/luxo/pkg/lux/api/ParseBinaryRequestPaginatedDefaults-2"
+      ],
+      "fullProfileInventorySHA256": "02c1401e26206cf3f5c9d69ab50539129bfc5118b1513ffbd00cfd4573891a05",
+      "fullProfileLeaves": 979,
+      "hot": "Benchmark(CacheExecutionDependencyCollection|BinaryJSONDocuments|BinarySelection|ParseBinaryRequestPaginatedDefaults)|/api\\.(EncodeBinaryRequest|appendJSONArray|\\(\\*cacheDependencyPlan\\)\\.appendModels|\\(\\*APIRegistry\\)\\.ParseBinaryRequest)",
+      "inventory": "api-non-identity",
+      "originalArtifacts": {
+        "02": {
+          "id": 15206067286,
+          "sha256": "4543d9564f841eb06f0edfad546592e926d4f9a09d76a5bd6344307f98384793"
+        },
+        "08": {
+          "id": 15206357460,
+          "sha256": "6b35e88be7bcb91df92620f486d34802a82f90b0fd92dd23e6510fa915cf9a7b"
+        }
+      },
       "package": "pkg/lux/api",
       "profile": "api-non-identity",
       "required": [
         "\\.BenchmarkCacheExecutionDependencyCollection\\.func1$",
-        "\\.\\(\\*cacheDependencyPlan\\)\\.appendModels$"
+        "\\.BenchmarkBinaryJSONDocuments\\.func1$",
+        "\\.BenchmarkBinarySelection\\.func2$",
+        "\\.BenchmarkParseBinaryRequestPaginatedDefaults$",
+        "\\.\\(\\*cacheDependencyPlan\\)\\.appendModels$",
+        "\\.EncodeBinaryRequest$",
+        "\\.\\(\\*APIRegistry\\)\\.ParseBinaryRequestInto$"
       ],
-      "selector": "^BenchmarkCacheExecutionDependencyCollection$/^models=1$",
+      "selector": "^BenchmarkBinaryJSONDocuments$/^1$/^boxed$|^BenchmarkBinaryJSONDocuments$/^1$/^typed$|^BenchmarkBinarySelection$/^width=16$/^selected=16$/^branches=0$/^request$|^BenchmarkCacheExecutionDependencyCollection$/^models=1$|^BenchmarkParseBinaryRequestPaginatedDefaults$",
       "timed": [
-        "BenchmarkCacheExecutionDependencyCollection/models=1-2"
+        "BenchmarkBinaryJSONDocuments/1/boxed-2",
+        "BenchmarkBinaryJSONDocuments/1/typed-2",
+        "BenchmarkBinarySelection/width=16/selected=16/branches=0/request-2",
+        "BenchmarkCacheExecutionDependencyCollection/models=1-2",
+        "BenchmarkParseBinaryRequestPaginatedDefaults-2"
       ]
     },
-    "event": {
-      "confirmed": "github.com/light-speak/luxo/pkg/lux/api/EventIdentityDispatch/subscribers=1/bytes=8/identity=false-2",
-      "hot": "BenchmarkEventIdentityDispatch|EventStream\\[.*\\]\\)\\.Dispatch$|enqueueStreamData|cachedStreamEncoding",
-      "inventory": "event",
-      "originalArtifact": 15184339275,
-      "originalDigest": "ac9f58b61fa1ed4e2d409169d9d43822cd7bf2a6dd446455b6aa01a343a0a92d",
-      "package": "pkg/lux/api",
-      "profile": "api-non-identity",
-      "required": [
-        "\\.BenchmarkEventIdentityDispatch\\.func1$",
-        "EventStream\\[go\\.shape\\.int\\]\\)\\.Dispatch$"
+    "rpc-handler-panic": {
+      "confirmed": [
+        "github.com/light-speak/luxo/pkg/lux/rpc/HandlerPanicFormatting/Success/Before-2"
       ],
-      "selector": "^BenchmarkEventIdentityDispatch$/^subscribers=1$/^bytes=8$/^identity=false$",
-      "timed": [
-        "BenchmarkEventIdentityDispatch/subscribers=1/bytes=8/identity=false-2"
-      ]
-    },
-    "gateway": {
-      "confirmed": "github.com/light-speak/luxo/pkg/lux/luvia/GatewayIdentity/authenticated/after-2",
-      "hot": "BenchmarkGatewayIdentity|luvia\\.(New|newGateway|Identity)|context\\.\\(\\*valueCtx\\)\\.Value",
-      "inventory": "gateway",
-      "originalArtifact": 15185761840,
-      "originalDigest": "e21c2b11b95235b265af433c1e4805455610a55a635a68026f4e7ad8ebb67491",
-      "package": "pkg/lux/luvia",
-      "profile": "luvia-gateway-identity",
-      "required": [
-        "\\.newGateway\\.func1$",
-        "\\.BenchmarkGatewayIdentity$"
-      ],
-      "selector": "^BenchmarkGatewayIdentity$/^authenticated$/^after$|^BenchmarkGatewayIdentity$/^authenticated$/^before$",
-      "timed": [
-        "BenchmarkGatewayIdentity/authenticated/after-2",
-        "BenchmarkGatewayIdentity/authenticated/before-2"
-      ]
-    },
-    "handler-business": {
-      "confirmed": "github.com/light-speak/luxo/pkg/lux/api/HandlerPanicFormatting/BusinessError/After-2",
-      "hot": "BenchmarkHandlerPanicFormatting|/api\\.\\(\\*Router\\)\\.callHandler",
-      "inventory": "handler",
-      "originalArtifact": 15185960474,
-      "originalDigest": "1e49b78b4dd5ae7c92ae700349bbee1a16220af33b9db8bd5049fd559c98ef7c",
-      "package": "pkg/lux/api",
-      "profile": "api-handler-panic",
+      "fullProfileInventorySHA256": "fa78c4559fde45c8264287c0ba85dbdca7bf012bcb70797b28b0376c14899c89",
+      "fullProfileLeaves": 8,
+      "hot": "BenchmarkHandlerPanicFormatting|/rpc\\.(beforeHandlerPanicFormatting|\\(\\*Server\\)\\.callHandler)",
+      "inventory": "rpc-handler-panic",
+      "originalArtifacts": {
+        "08": {
+          "id": 15206357460,
+          "sha256": "6b35e88be7bcb91df92620f486d34802a82f90b0fd92dd23e6510fa915cf9a7b"
+        }
+      },
+      "package": "pkg/lux/rpc",
+      "profile": "rpc-handler-panic",
       "required": [
         "\\.BenchmarkHandlerPanicFormatting$",
-        "\\.\\(\\*Router\\)\\.callHandler$"
+        "\\.beforeHandlerPanicFormatting$",
+        "\\.\\(\\*Server\\)\\.callHandler$"
       ],
-      "selector": "^BenchmarkHandlerPanicFormatting$/^BusinessError$/^After$|^BenchmarkHandlerPanicFormatting$/^BusinessError$/^Before$",
+      "selector": "^BenchmarkHandlerPanicFormatting$/^Success$/^After$|^BenchmarkHandlerPanicFormatting$/^Success$/^Before$",
       "timed": [
-        "BenchmarkHandlerPanicFormatting/BusinessError/After-2",
-        "BenchmarkHandlerPanicFormatting/BusinessError/Before-2"
-      ]
-    },
-    "handler-empty": {
-      "confirmed": "github.com/light-speak/luxo/pkg/lux/api/HandlerResponseBuffer/Empty-2",
-      "hot": "BenchmarkHandlerResponseBuffer|/api\\.\\(\\*Router\\)\\.callHandler",
-      "inventory": "handler",
-      "originalArtifact": 15184793419,
-      "originalDigest": "d87686df4fc23c7f7ea0a779b22e64ab7ef0d5c07d2bc8276b5fd91554e4afd0",
-      "package": "pkg/lux/api",
-      "profile": "api-handler-panic",
-      "required": [
-        "\\.BenchmarkHandlerResponseBuffer$",
-        "\\.\\(\\*Router\\)\\.callHandler$"
-      ],
-      "selector": "^BenchmarkHandlerResponseBuffer$/^Empty$",
-      "timed": [
-        "BenchmarkHandlerResponseBuffer/Empty-2"
+        "BenchmarkHandlerPanicFormatting/Success/After-2",
+        "BenchmarkHandlerPanicFormatting/Success/Before-2"
       ]
     }
   },
-  "compileProfileSHA256": "38bf34a317f189d892fb16e3021137ab29464469cb3c0ffeb239f4ba4fd8cedc",
+  "compileProfileSHA256": "9f18768b43bb2154783ccc26c37a090f8d5380cbde942cc9b321b860e964bf48",
   "diffSHA256": "d464f8ad1cac256a6a4052dbb2a9fa3b229ff582172a17532a0e3a1dd6dd8e9f",
   "inventory": {
-    "cache": [
+    "api-non-identity": [
+      "BenchmarkBinaryJSONDocuments/0/boxed-2",
+      "BenchmarkBinaryJSONDocuments/0/typed-2",
+      "BenchmarkBinaryJSONDocuments/1/boxed-2",
+      "BenchmarkBinaryJSONDocuments/1/typed-2",
+      "BenchmarkBinaryJSONDocuments/128/boxed-2",
+      "BenchmarkBinaryJSONDocuments/128/typed-2",
+      "BenchmarkBinarySelection/width=1/selected=1/branches=0/request-2",
+      "BenchmarkBinarySelection/width=1/selected=1/branches=0/tree-2",
+      "BenchmarkBinarySelection/width=1/selected=1/branches=16/request-2",
+      "BenchmarkBinarySelection/width=1/selected=1/branches=16/tree-2",
+      "BenchmarkBinarySelection/width=1/selected=1/branches=2/request-2",
+      "BenchmarkBinarySelection/width=1/selected=1/branches=2/tree-2",
+      "BenchmarkBinarySelection/width=128/selected=1/branches=0/request-2",
+      "BenchmarkBinarySelection/width=128/selected=1/branches=0/tree-2",
+      "BenchmarkBinarySelection/width=128/selected=128/branches=0/request-2",
+      "BenchmarkBinarySelection/width=128/selected=128/branches=0/tree-2",
+      "BenchmarkBinarySelection/width=16/selected=1/branches=0/request-2",
+      "BenchmarkBinarySelection/width=16/selected=1/branches=0/tree-2",
+      "BenchmarkBinarySelection/width=16/selected=16/branches=0/request-2",
+      "BenchmarkBinarySelection/width=16/selected=16/branches=0/tree-2",
+      "BenchmarkBinarySelection/width=16/selected=16/branches=4/request-2",
+      "BenchmarkBinarySelection/width=16/selected=16/branches=4/tree-2",
       "BenchmarkCacheExecutionDependencyCollection/models=1-2",
       "BenchmarkCacheExecutionDependencyCollection/models=128-2",
-      "BenchmarkCacheExecutionDependencyCollection/models=16-2"
+      "BenchmarkCacheExecutionDependencyCollection/models=16-2",
+      "BenchmarkParseBinaryRequestPaginatedDefaults-2"
     ],
-    "event": [
-      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=4096/identity=false-2",
-      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=4096/identity=selection-private-2",
-      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=4096/identity=selection-public-2",
-      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=4096/identity=true-2",
-      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=8/identity=false-2",
-      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=8/identity=selection-private-2",
-      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=8/identity=selection-public-2",
-      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=8/identity=true-2",
-      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=4096/identity=false-2",
-      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=4096/identity=selection-private-2",
-      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=4096/identity=selection-public-2",
-      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=4096/identity=true-2",
-      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=8/identity=false-2",
-      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=8/identity=selection-private-2",
-      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=8/identity=selection-public-2",
-      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=8/identity=true-2",
-      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=4096/identity=false-2",
-      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=4096/identity=selection-private-2",
-      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=4096/identity=selection-public-2",
-      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=4096/identity=true-2",
-      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=8/identity=false-2",
-      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=8/identity=selection-private-2",
-      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=8/identity=selection-public-2",
-      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=8/identity=true-2"
-    ],
-    "gateway": [
-      "BenchmarkGatewayIdentity/anonymous/after-2",
-      "BenchmarkGatewayIdentity/anonymous/before-2",
-      "BenchmarkGatewayIdentity/authenticated/after-2",
-      "BenchmarkGatewayIdentity/authenticated/before-2",
-      "BenchmarkGatewayIdentity/typed-nil/after-2",
-      "BenchmarkGatewayIdentity/typed-nil/before-2"
-    ],
-    "handler": [
-      "BenchmarkHandlerDetachedResponseBuffer-2",
+    "rpc-handler-panic": [
       "BenchmarkHandlerPanicFormatting/BusinessError/After-2",
       "BenchmarkHandlerPanicFormatting/BusinessError/Before-2",
       "BenchmarkHandlerPanicFormatting/OpaquePanic/After-2",
@@ -151,39 +128,29 @@
       "BenchmarkHandlerPanicFormatting/StringPanic/After-2",
       "BenchmarkHandlerPanicFormatting/StringPanic/Before-2",
       "BenchmarkHandlerPanicFormatting/Success/After-2",
-      "BenchmarkHandlerPanicFormatting/Success/Before-2",
-      "BenchmarkHandlerResponseBuffer/BusinessError-2",
-      "BenchmarkHandlerResponseBuffer/Bytes4KiB-2",
-      "BenchmarkHandlerResponseBuffer/Empty-2",
-      "BenchmarkHandlerResponseBuffer/Int-2"
+      "BenchmarkHandlerPanicFormatting/Success/Before-2"
     ]
   },
   "originalAttempt": 1,
-  "originalRun": 45967887667,
+  "originalRun": 46012121137,
+  "planArtifact": {
+    "id": 15203779224,
+    "sha256": "f16adef230581d25402c18e48586b6bd51f2ce22d8e8ccc62d12b4ba03ca85f1"
+  },
   "routes": {
     "AMD EPYC 9V45 96-Core Processor": [
-      "handler-business"
-    ],
-    "AMD EPYC 9V74 80-Core Processor": [
-      "event"
-    ],
-    "Intel(R) Xeon(R) 6975P-C": [
-      "cache",
-      "handler-empty",
-      "gateway"
+      "api-non-identity",
+      "rpc-handler-panic"
     ]
   },
   "sourceSHA256": {
+    "pkg/lux/api/binary.go": "6f52f1f9c662a9832a58a174f5212698af4ef0572e4e41ae0759e2d4988c9cbe",
+    "pkg/lux/api/binary_bench_test.go": "25c281c1a5ccccd2a4d16f5ba13c243a743faef715481622248e5c33e7ee4b07",
+    "pkg/lux/api/binary_selection_bench_test.go": "28b8dc4368329a2c150ad5d808c5cfdabdf584ee98981fe8eadb21ac28c3b46d",
     "pkg/lux/api/cache_dependencies.go": "1d463c1cc2ba3a5d9bd86ed4833bf86930752d74c9ad3b4f26e17e0312afe87b",
     "pkg/lux/api/cache_dependencies_bench_test.go": "69dd6bf66f6b81ae2320762a6794bc70fb1a007851e6dd4fe0837ab3924fba14",
-    "pkg/lux/api/cache_dependencies_test.go": "503197b83cd959cb1dcdbe3b15e2a099cf74ee29bcb47148030c2935251fe32c",
-    "pkg/lux/api/handler_panic_bench_test.go": "01122e4a09e5c6d6a20018f47566fb801ad4888db504fd9d2c932be56146e302",
-    "pkg/lux/api/response_cache_test.go": "982d2c580b26a16a249d8e9abf57e9059d03f8d7870336927c5a688bee1bfb04",
-    "pkg/lux/api/router.go": "cd1c12633cd495e98f4b2bb55fe58a1905f2f94d6794c76d5480ebdb3f2e5cc6",
-    "pkg/lux/api/stream_event.go": "024853020eddc56c3b88d0ccfc81a9a3030c961c40196199dbcce863d8c5dfaf",
-    "pkg/lux/api/stream_event_bench_test.go": "f74b75418ed0968b63b02b4aaf59dc678bf668047c9f3b385fb802a571b32e67",
-    "pkg/lux/luvia/luvia.go": "bfca1e822080fbc78f92415f2e3973df57e753a2a384e9b632af7d7955d2898f",
-    "pkg/lux/luvia/middleware.go": "16104944640bd72d4e15e4fbae6c4920b8d005cc5c0cf11ca0d19ba5b9f88374",
-    "pkg/lux/luvia/middleware_test.go": "a284f6673c86a90ed916099ac82a6ffb0e9b190161c946989957839252b07034"
+    "pkg/lux/rpc/handler_panic_bench_test.go": "d3f4a6e1b9e267997b4ab7d33a432e3345f32cc7fe4c248fa5fb47e5d94e9338",
+    "pkg/lux/rpc/server.go": "313870a1f66bbde4e83bfcd88841ccaf70135855ddd5f8d80d308b968736da0a",
+    "scripts/benchrun/rpc_handler_panic.go": "e26104fd69f69476214f23f7af8679513a5126c4c2a27dc685246b3ba353ce31"
   }
 }

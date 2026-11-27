@@ -1,8 +1,8 @@
-name: Recheck the remaining PR 83 timing samples on their original AMD CPUs
+name: Recheck PR 83 timing on AMD EPYC 9V45
 
 on:
   push:
-    branches: [diagnostics/pr83-bc18-native-layout]
+    branches: [diagnostics/pr83-b5-native-9v45]
 
 permissions:
   contents: read
@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        slot: [1, 2, 3, 4, 5, 6]
+        slot: [1, 2, 3]
     env:
       GOTOOLCHAIN: local
       SLOT: ${{ matrix.slot }}
@@ -47,14 +47,14 @@ jobs:
       - if: steps.route.outputs.matched == 'true'
         uses: actions/checkout@v7
         with:
-          ref: bc18a70e66da8053deb70d575b4752a4343ef1f8
+          ref: b5f6b0eb95f93516c306ca47dd74a1b532ecf018
           path: .tmp/pr83-bc18-native-inputs/A
           persist-credentials: false
 
       - if: steps.route.outputs.matched == 'true'
         uses: actions/checkout@v7
         with:
-          ref: 1a01ee3808b23c8145bb3993ab4f07963248175c
+          ref: f72667fbb2f76101e611a45cfc9cbb670548b6db
           path: .tmp/pr83-bc18-native-inputs/H
           fetch-depth: 2
           persist-credentials: false
@@ -88,7 +88,7 @@ jobs:
           sparse-checkout: scripts/diagnose-pr83-bc18-native-layout
           persist-credentials: false
 
-      - name: Require both AMD CPU routes and unchanged thresholds
+      - name: Require all original signals on a matching 9V45 slot
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

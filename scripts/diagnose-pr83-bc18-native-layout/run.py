@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recheck the remaining PR 83 timing on the original CPUs and profiles."""
+"""Recheck the current PR 83 timing on the original 9V45 CPU."""
 from hashlib import sha256
 import importlib.util
 import io
@@ -24,14 +24,14 @@ HARNESS_FILES = {
     "go-capture.py": "b93cb28f2b092f63a07543a71cd39d46f3f28044d73f3547aaf16078c2d07db9",
     "manifest.json": "0c12129c702cf833c79f9e8d3269d1cfb7171d7cd54b1b6255c63a0598bc09a0",
 }
-PARENT = "f8290c866862d689746a53a54e56fdf921b5c6d4"
+PARENT = "b5de982bbd569511d9047a3273ff94e012dd16e5"
 HARNESS_REVISION = "5376367706e217b18a676dfe932004a0f5419a04"
-REF = "refs/heads/diagnostics/pr83-bc18-native-layout"
+REF = "refs/heads/diagnostics/pr83-b5-native-9v45"
 MANIFEST = INPUT / "manifest.json"
-MANIFEST_SHA = "46e93f3752bb106a44a2e91e52735ca8c890cda44e0303b4c0fb27cdd30f521e"
+MANIFEST_SHA = "779496ec6c48fdd6b87dee17f27b3a0e2285f1d4dbb286d6b07607b4b77359c3"
 CONFIG = json.loads(MANIFEST.read_bytes())
-SLOTS = set(range(1, 7))
-TARGET_CASES = {"event", "handler-business"}
+SLOTS = set(range(1, 4))
+TARGET_CASES = {"api-non-identity", "rpc-handler-panic"}
 PAIRS = {f"{arm}-{group}.{direction}" for arm in ("AA", "HH")
          for group in (1, 2) for direction in ("forward", "reverse")}
 
@@ -67,7 +67,7 @@ def bind_event():
             os.environ.get("GITHUB_EVENT_NAME") == "push" and os.environ.get("GITHUB_REF") == REF and
             os.environ.get("GITHUB_SHA") == active, "unexpected diagnostic event")
     paths = [".github/workflows/diagnose-pr83-bc18-native-layout.yml",
-             *(str((INPUT / file).relative_to(ROOT)) for file in ("layout.py", "run.py"))]
+             *(str((INPUT / file).relative_to(ROOT)) for file in ("manifest.json", "run.py"))]
     require(git(ROOT, "show", "-s", "--format=%P", active) == PARENT and
             git(ROOT, "diff", "--name-status", PARENT, active).splitlines() ==
             ["M\t" + path for path in sorted(paths)], "unexpected diagnostic parent or paths")
@@ -124,7 +124,7 @@ def arm_sources(go, work):
         require(not any(Path(name).name == ".gitattributes"
                         for name in git(checkout, "ls-tree", "-r", "--name-only", "HEAD").splitlines()),
                 "archive attributes changed benchmark source")
-        for name, digest in CONFIG["sourceSHA256"].items():
+        for name, digest in (CONFIG["sourceSHA256"] | exact["sourceSHA256"]).items():
             require(sha(checkout / name) == digest, f"changed hot-path fixture {name}")
     a, h = checkouts["A"], checkouts["H"]
     require(git(h, "show", "-s", "--format=%P", "HEAD").split() == CONFIG["H"]["parents"] and
@@ -167,11 +167,8 @@ def expected_overlay(source, package, profile):
         return {f"{package}/{name}": "" for name in ("identity_reader_bench_test.go",
                 "identity_reader_fuzz_test.go", "identity_reader_test.go", "identity_value_test.go")}
     files = sorted((source / package).glob("*_test.go"))
-    if profile == "api-handler-panic":
-        return {f"{package}/{path.name}": "" for path in files if path.name != "handler_panic_bench_test.go"}
-    require(profile == "luvia-gateway-identity", "unknown compile profile")
-    return {f"{package}/{path.name}": "ae790127f4acd6df4fe2388d239b2657c999add2e742584284c411bef514e365"
-            if path.name == "middleware_test.go" else "" for path in files}
+    require(profile == "rpc-handler-panic", "unknown compile profile")
+    return {f"{package}/{path.name}": "" for path in files if path.name != "handler_panic_bench_test.go"}
 
 
 def compile_binary(runtime, driver, go, tools, source, role, case, mode, work, evidence):
@@ -212,30 +209,29 @@ def compile_binary(runtime, driver, go, tools, source, role, case, mode, work, e
     return binary
 
 
-def measure_modes(runtime, arms, binaries, case, directory):
-    modes = tuple(binaries)
-    counts = dict.fromkeys(modes, 0)
+def measure_mode(runtime, arms, binaries, case, directory):
+    processes = 0
     with (directory / "order.tsv").open("x", buffering=1) as order:
-        order.write("process\tblock\tpair\tcomparison\tmode\tside\tarm\n")
+        order.write("process\tblock\tpair\tcomparison\tside\tarm\n")
         for block, index, comparison, matching in runtime.schedule():
-            for mode in modes if (block + index) % 2 == 0 else modes[::-1]:
-                for side in matching:
-                    label, role = ("left", "right")[side], comparison[side]
-                    line = (sum(counts.values()) + 1, block, index, comparison, mode, label, role)
-                    order.write("\t".join(map(str, line)) + "\n")
-                    raw = runtime.sample(binaries[mode][role], arms[role], case["package"], case["selector"], "200ms")
-                    runtime.inventory(raw, case["timed"], runtime.CONFIG["cpu"], case["package"])
-                    with (directory / mode / f"{comparison}-{block}.{label}.raw").open("ab") as sink:
-                        sink.write(raw)
-                    counts[mode] += 1
-    require(all(count == 120 for count in counts.values()), "invalid scheduled sample count")
-    return counts
+            for side in matching:
+                label, role = ("left", "right")[side], comparison[side]
+                processes += 1
+                line = (processes, block, index, comparison, label, role)
+                order.write("\t".join(map(str, line)) + "\n")
+                raw = runtime.sample(binaries[role], arms[role], case["package"], case["selector"], "200ms")
+                runtime.inventory(raw, case["timed"], runtime.CONFIG["cpu"], case["package"])
+                with (directory / f"{comparison}-{block}.{label}.raw").open("ab") as sink:
+                    sink.write(raw)
+    require(processes == 120, "invalid scheduled sample count")
+    return processes
 
 
-def classify(case, modes):
-    require(modes.keys() == {"stock", "aligned"}, "missing compiler arms")
-    prefix = "github.com/light-speak/luxo/"+case["package"]+"/"
-    known = {prefix+name.removeprefix("Benchmark") for name in case["timed"]}
+def classify(case, modes, layout):
+    require(set(modes) in ({"stock"}, {"stock", "aligned"}), "unexpected compiler arms")
+    prefix = "github.com/light-speak/luxo/" + case["package"] + "/"
+    known = {prefix + name.removeprefix("Benchmark") for name in case["timed"]}
+    required = {(name, "sec/op") for name in case["confirmed"]}
     for row in modes.values():
         gates = row["gates"]
         confirmed = [tuple(item) for item in row["confirmed"]]
@@ -244,33 +240,53 @@ def classify(case, modes):
                 bool(confirmed) == bool(gates["AH-1.forward"]) and len(set(confirmed)) == len(confirmed) and
                 all(name in known and unit in ("sec/op", "B/op", "allocs/op") for name, unit in confirmed),
                 "invalid gate receipt")
-    return {"controlsGreen": all(mode["gates"][name] == 0 for mode in modes.values() for name in PAIRS),
-            "originalReproduced": modes["stock"]["confirmed"] == [[case["confirmed"], "sec/op"]],
-            "alignedExit": modes["aligned"]["gates"]["AH-1.forward"]}
+    original = {tuple(item) for item in modes["stock"]["confirmed"]}
+    controls = all(mode["gates"][name] == 0 for mode in modes.values() for name in PAIRS)
+    require(("aligned" in modes) == (layout is not None), "layout evidence disagrees with measurement")
+    if layout is not None:
+        require(required & original, "alignment requires a reproduced stock target")
+        symbols = set().union(*(set(arm["required"]) for arm in layout["arms"].values()))
+        same_hot = bool(symbols) and all(layout["sameStockHotInstructions"].get(name) is True for name in symbols)
+        shifted = layout["linkOnly"] is True
+        aligned_exit = modes["aligned"]["gates"]["AH-1.forward"]
+    else:
+        same_hot, shifted, aligned_exit = False, False, None
+    return {
+        "controlsGreen": controls,
+        "reproducedTargets": sorted(name for name, _ in required & original),
+        "unexpectedConfirmed": sorted([list(item) for item in original - required]),
+        "sameStockHotInstructions": same_hot,
+        "linkOnly": shifted,
+        "alignedExit": aligned_exit,
+        "qualifiedLayout": controls and original == required and same_hot and shifted and aligned_exit == 0,
+    }
 
 
 def summarize(directory, diagnostic):
     receipts = sorted(directory.glob("*/status.json"))
     require(len(receipts) == len(SLOTS), "missing slot receipt")
-    results, slots = {case: [] for case in sorted(TARGET_CASES)}, set()
+    results, seen = {}, set()
     for path in receipts:
         status = json.loads(path.read_bytes())
         cases = target_cases(status["cpu"])
         slot = status["slot"]
-        require(slot in SLOTS-slots and status["diagnostic"] == diagnostic and status["cases"] == cases and
-                status["processes"] == 240*len(cases) and status["results"].keys() == set(cases), "invalid route receipt")
-        slots.add(slot)
+        require(slot in SLOTS-seen and status["diagnostic"] == diagnostic and status["cases"] == cases and
+                status["results"].keys() == set(cases), "invalid route receipt")
+        seen.add(slot)
+        outcomes, processes = {}, 0
         for key, item in status["results"].items():
-            outcome = classify(CONFIG["case"][key], item["comparisons"])
+            layout_path = path.parent / key / "alignment.json"
+            layout = json.loads(layout_path.read_bytes()) if layout_path.is_file() else None
+            outcome = classify(CONFIG["case"][key], item["comparisons"], layout)
             require(outcome == item["outcome"], "unstable gate outcome")
-            layout = json.loads((path.parent/key/"alignment.json").read_bytes())
-            results[key].append({"slot": slot, "linkOnly": layout["linkOnly"],
-                                 "oldCacheStockELFMatch": layout.get("oldCacheStockELFMatch"), **outcome})
+            outcomes[key] = outcome
+            processes += sum(mode["processes"] for mode in item["comparisons"].values())
+        require(status["processes"] == processes, "wrong per-slot process totals")
+        results[slot] = outcomes
     print(json.dumps(results, sort_keys=True))
-    require(all(items and all(i["controlsGreen"] and i["alignedExit"] == 0 and i["linkOnly"] for i in items)
-                for items in results.values()), "missing exact route, invalid control or unqualified alignment")
-    require(all(any(item["originalReproduced"] for item in items) for items in results.values()),
-            "original stock signal not reproduced in each case")
+    require(any(set(items) == TARGET_CASES and all(value["qualifiedLayout"] for value in items.values())
+                for items in results.values()),
+            "no exact 9V45 slot reproduced and isolated all original targets")
 
 
 def run_case(runtime, driver, go, tools, arms, key, work):
@@ -278,17 +294,27 @@ def run_case(runtime, driver, go, tools, arms, key, work):
     directory = OUT / key
     directory.mkdir()
     expected = plan_route(tools, directory, case)
-    binaries = {mode: {role: compile_binary(runtime, driver, go, tools, source, role, case, mode, work, directory/mode/role)
-                       for role, source in arms.items()} for mode in ("stock", "aligned")}
-    save(directory/"alignment.json", driver["compare"](directory, case, cache=key=="cache"))
-    comparisons = {}
-    for mode, count in measure_modes(runtime, arms, binaries, case, directory).items():
+
+    def evaluate(mode):
         target = directory / mode
+        binaries = {role: compile_binary(runtime, driver, go, tools, source, role, case, mode,
+                                         work, target / role) for role, source in arms.items()}
+        if mode == "aligned":
+            layout = driver["compare"](directory, case, cache=False)
+            save(directory / "alignment.json", layout)
+        count = measure_mode(runtime, arms, binaries, case, target)
         gates = runtime.gate(tools, expected, arms["H"], target, case["package"], case["timed"])
-        transcript = (target/"AH-1.forward.gate.txt").read_text()
+        transcript = (target / "AH-1.forward.gate.txt").read_text()
         found = re.findall(r"^confirmed performance regression: (\S+) (\S+) ", transcript, re.M)
-        comparisons[mode] = {"processes": count, "gates": gates, "confirmed": [list(item) for item in found]}
-    return {"comparisons": comparisons, "outcome": classify(case, comparisons)}
+        return {"processes": count, "gates": gates, "confirmed": [list(item) for item in found]}
+
+    modes = {"stock": evaluate("stock")}
+    stock = classify(case, modes, None)
+    layout = None
+    if stock["controlsGreen"] and stock["reproducedTargets"] and not stock["unexpectedConfirmed"]:
+        modes["aligned"] = evaluate("aligned")
+        layout = json.loads((directory / "alignment.json").read_bytes())
+    return {"comparisons": modes, "outcome": classify(case, modes, layout)}
 
 
 def main():
@@ -317,15 +343,15 @@ def main():
         try:
             tools = runtime.build_tools(go, arms["H"], work)
             for key in host["cases"]:
-                observed["results"][key] = run_case(runtime, driver, go, tools, arms, key, work)
-                observed["processes"] += 240
+                result = run_case(runtime, driver, go, tools, arms, key, work)
+                observed["results"][key] = result
+                observed["processes"] += sum(item["processes"] for item in result["comparisons"].values())
         finally:
             for name in ("go.work", "go.work.sum"):
                 (arms["A"]/name).unlink(missing_ok=True)
             (arms["A"]/".tmp").rmdir()
     save(OUT/"status.json", observed)
-    require(all(i["outcome"]["controlsGreen"] and i["outcome"]["alignedExit"] == 0
-                for i in observed["results"].values()), "same-arm controls failed or alignment remains red")
+    require(all(i["outcome"]["controlsGreen"] for i in observed["results"].values()), "same-arm controls failed")
 
 
 if __name__ == "__main__":
