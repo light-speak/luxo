@@ -19,9 +19,13 @@ import (
 func TestIsolationProfileCommand(t *testing.T) {
 	for _, tc := range []struct{ pkg, want string }{
 		{"pkg/lux/api", "api-non-identity\t.\napi-local-route-export\t^BenchmarkLocalRouteExport$\n" +
+			"api-static-value-params\t^BenchmarkStaticValueParams$\n" +
 			"api-canonical-json\t^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$\n" +
 			"api-binary-param-lookup\t^BenchmarkBinaryParamLookup$\n" +
-			"api-request-log\t^BenchmarkRequestLogBoundary$|^BenchmarkRequestLogDelivered$\n"},
+			"api-request-log\t^BenchmarkRequestLogBoundary$|^BenchmarkRequestLogDelivered$\n" +
+			"api-identity-condition\t^BenchmarkIdentityConditionValidity$\n" +
+			"api-handler-panic\t^BenchmarkHandlerPanicFormatting$\n" +
+			"api-websocket-registrations\t^BenchmarkWSConnectionRegistrations$\n"},
 		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n" +
 			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n" +
 			"luvia-auth-middleware\t^BenchmarkAuthMiddlewareIsolation$\n" +
@@ -30,12 +34,17 @@ func TestIsolationProfileCommand(t *testing.T) {
 			"luvia-convenience-keys\t^BenchmarkConvenienceKeyParentValidation$\n"},
 		{"pkg/codegen", "codegen-integer-literals\t^BenchmarkCompileDecimalIntegerLiterals$\n" +
 			"codegen-global-receiver\t^BenchmarkGlobalReceiverName$\n" +
-			"codegen-migration-state\t^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$\n"},
+			"codegen-migration-state\t^BenchmarkGlobalReceiverName$|^BenchmarkMigrationStateValidation$\n" +
+			"codegen-relation-loader\t^BenchmarkRelationLoaderGeneration$\n"},
+		{"pkg/semantic", "semantic-event-emits\t^BenchmarkCollectEventEmits$\n"},
 		{"pkg/lux", "lux-short-path\t^BenchmarkStrictFilterContract$|^BenchmarkDecimalAlignment$\n"},
 		{"pkg/lux/rpc", "rpc-owned-request\t^BenchmarkLRPCOwnedRequest$\n" +
 			"rpc-deadline-classification\t^BenchmarkRPCDeadlineClassification$\n" +
 			"rpc-nil-context-guard\t^BenchmarkRPCNilContextGuard$\n" +
-			"rpc-prepared-frame\t^BenchmarkLRPCPreparedFrame$\n"},
+			"rpc-prepared-frame\t^BenchmarkLRPCPreparedFrame$\n" +
+			"rpc-frame-reuse\t^BenchmarkLRPCConnectionFrameReuseCandidate$\n" +
+			"rpc-handler-panic\t^BenchmarkHandlerPanicFormatting$\n"},
+		{"pkg/lux/pg", "pg-duration-write-reject\t^BenchmarkDurationWriteReject$\n"},
 		{"pkg/lux/queue", "queue-stream-name\t^BenchmarkQueueStreamName$\n"},
 	} {
 		var output bytes.Buffer
@@ -155,10 +164,52 @@ func TestQueueStreamNameRequiresItsPhysicalAdapter(t *testing.T) {
 	}
 }
 
+func TestCompilerBenchmarkProfilesMatchNativeFixtures(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ pkg, profile, name, sourceHash, projectionHash string }{
+		{"pkg/codegen", "codegen-relation-loader", "dataloader_nullable_bench_test.go",
+			"4f58c514dc0f2ac9c310a3142e961c15cbaffa47b2dc745192ea3b30be95729e", "9e1e181a3e49000a4543842e444ac9387b0a30503a524eb218cd7f651276957d"},
+		{"pkg/semantic", "semantic-event-emits", "analyzer_bench_test.go",
+			"ee8320cdca18a8700a37b504b8ee2f3ff05624c8e25a6ef35fe9ea8d4bad2a51", "94ef2558fb21f50051ac83b9fe1ca7baa7ec52456bfb16735879344b71d5d4ca"},
+	} {
+		t.Run(tc.profile, func(t *testing.T) {
+			binding := "\n" + tc.profile + "-overlay-v1 " + tc.name + "=" + tc.projectionHash + " " + tc.sourceHash + "\n"
+			if !strings.Contains(performanceProfile+"\n", binding) {
+				t.Error("performance compilation does not bind the verified source and projection")
+			}
+			for _, baseline := range []bool{true, false} {
+				path, cleanup, err := compileOverlay(root, tc.pkg, baseline, tc.profile)
+				if err != nil || path == "" {
+					t.Fatalf("overlay for baseline=%v: %q, %v", baseline, path, err)
+				}
+				t.Cleanup(func() {
+					if err := cleanup(); err != nil {
+						t.Error(err)
+					}
+				})
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var overlay struct{ Replace map[string]string }
+				if err := json.Unmarshal(data, &overlay); err != nil {
+					t.Fatal(err)
+				}
+				verifyNativePairedFixture(t, overlay.Replace, filepath.Join(root, tc.pkg), tc.name, tc.projectionHash)
+			}
+		})
+	}
+}
+
 func TestPairedFixtureOverlaysRejectInvalidInputs(t *testing.T) {
 	for _, fixture := range []struct{ pkg, name, profile string }{
 		{"pkg/lux/rpc", "frame_prepared_bench_test.go", "rpc-prepared-frame"},
 		{"pkg/lux/nats/queue", "nats_retry_bench_test.go", "queue-stream-name"},
+		{"pkg/codegen", "dataloader_nullable_bench_test.go", "codegen-relation-loader"},
+		{"pkg/semantic", "analyzer_bench_test.go", "semantic-event-emits"},
 	} {
 		t.Run(fixture.profile, func(t *testing.T) {
 			body, err := os.ReadFile(filepath.Join("../..", fixture.pkg, fixture.name))
@@ -881,4 +932,59 @@ func TestAPIRequestLogProjection(t *testing.T) {
 			t.Fatalf("on-disk request-log projection = %q, %v", projected, err)
 		}
 	})
+}
+
+// These whole fixtures are the same link inputs on both sides of the native comparison.
+func TestAPIIntelBenchmarkOverlaysKeepOriginalFiles(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ profile, fixture, hash string }{
+		{"api-identity-condition", "identity_reader_bench_test.go", "20d45a1c2a71419d6c2c44e33b49e691cf15f3522f6e1041541dbce5097a3c5f"},
+		{"api-handler-panic", "handler_panic_bench_test.go", "01122e4a09e5c6d6a20018f47566fb801ad4888db504fd9d2c932be56146e302"},
+		{"api-websocket-registrations", "websocket_subscriptions_bench_test.go", "5abe6b7846bb541fa73512dd924d2eec3b4a66c1ed64f5839ee658f43492b584"},
+	} {
+		t.Run(tc.profile, func(t *testing.T) {
+			binding := "\n" + tc.profile + "-overlay-v1 " + tc.fixture + "=" + tc.hash + "\n"
+			if !strings.Contains(performanceProfile+"\n", binding) {
+				t.Error("performance fingerprint lacks the verified fixture binding")
+			}
+			for _, baseline := range []bool{true, false} {
+				verifyAPIWholeFixtureOverlay(t, root, tc.profile, tc.fixture, baseline)
+			}
+			missing := newBenchmarkRunTree(t)
+			writeBenchmarkRunFixture(t, missing, "pkg/lux/api/ordinary_test.go", "package api")
+			if _, cleanup, err := compileOverlay(missing, benchlayout.APIPackage, false, tc.profile); cleanup != nil || !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("expected missing retained fixture, got %v", err)
+			}
+			writeBenchmarkRunFixture(t, missing, "pkg/lux/api/"+tc.fixture, "package api\n// changed fixture\n")
+			if _, cleanup, err := compileOverlay(missing, benchlayout.APIPackage, true, tc.profile); cleanup != nil ||
+				err == nil || !strings.Contains(err.Error(), "verified source") {
+				t.Fatalf("changed fixture was not rejected: %v", err)
+			}
+		})
+	}
+}
+
+func verifyAPIWholeFixtureOverlay(t *testing.T, root, profile, fixture string, baseline bool) {
+	t.Helper()
+	path, cleanup, err := compileOverlay(root, benchlayout.APIPackage, baseline, profile)
+	if err != nil || path == "" {
+		t.Fatalf("missing retained overlay for baseline=%v: %q, %v", baseline, path, err)
+	}
+	defer func() {
+		if err := cleanup(); err != nil {
+			t.Error(err)
+		}
+	}()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var overlay struct{ Replace map[string]string }
+	if err := json.Unmarshal(data, &overlay); err != nil {
+		t.Fatal(err)
+	}
+	verifyOnlyListedTestFiles(t, overlay.Replace, filepath.Join(root, benchlayout.APIPackage), fixture)
 }
