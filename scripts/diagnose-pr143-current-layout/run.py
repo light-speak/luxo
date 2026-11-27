@@ -24,7 +24,7 @@ HARNESS_FILES = {
     "go-capture.py": "b93cb28f2b092f63a07543a71cd39d46f3f28044d73f3547aaf16078c2d07db9",
     "manifest.json": "0c12129c702cf833c79f9e8d3269d1cfb7171d7cd54b1b6255c63a0598bc09a0",
 }
-PARENT = "9e999fc4be42a765e61b8d7bc5e59ccd781352c6"
+PARENT = "91cec71d14e067c1b687115518ca044a8c28e4c1"
 HARNESS_REVISION = "5376367706e217b18a676dfe932004a0f5419a04"
 REF = "refs/heads/diagnostics/pr143-current-layout"
 LAYOUT_HELPER_COMMIT = "f9d0454826d1763b46e41eb26ef2a7aecdb86205"
@@ -34,7 +34,7 @@ PACKAGE = "pkg/lux/luvia"
 MANIFEST = INPUT / "manifest.json"
 MANIFEST_SHA = "d033532e920d9324659a32e3f145f95f3b87750dccb7a2507a645704e0ee4d66"
 CONFIG = json.loads(MANIFEST.read_bytes())
-SLOTS = {1, 2, 3}
+SLOTS = set(range(1, 6))
 PAIRS = {f"{arm}-{group}.{direction}" for arm in ("AA", "HH")
          for group in (1, 2) for direction in ("forward", "reverse")}
 
@@ -69,10 +69,15 @@ def bind_event():
             os.environ.get("GITHUB_REPOSITORY") == "light-speak/luxo" and
             os.environ.get("GITHUB_EVENT_NAME") == "push" and os.environ.get("GITHUB_REF") == REF and
             os.environ.get("GITHUB_SHA") == active, "unexpected diagnostic event")
+    paths = [".github/workflows/diagnose-pr143-current-layout.yml", str(Path(__file__).relative_to(ROOT))]
     require(git(ROOT, "show", "-s", "--format=%P", active) == PARENT and
             git(ROOT, "diff", "--name-status", PARENT, active).splitlines() ==
-            ["M\t" + str(Path(__file__).relative_to(ROOT))], "unexpected diagnostic paths or parent")
+            ["M\t" + path for path in sorted(paths)], "unexpected diagnostic paths or parent")
     return active, slot
+
+
+def target_case(cpu):
+    return "latency" if CONFIG["routes"].get(cpu) == "latency" else ""
 
 
 def cpu_families(cpuinfo):
@@ -80,7 +85,7 @@ def cpu_families(cpuinfo):
               if line.startswith("model name")}
     require(len(models) == 1, "unknown or mixed CPU model")
     cpu = models.pop()
-    return cpu, CONFIG["routes"].get(cpu, "")
+    return cpu, target_case(cpu)
 
 
 def route():
@@ -317,10 +322,10 @@ def classify(case, modes):
 def summarize(directory, diagnostic):
     files = sorted(directory.glob("*/status.json"))
     require(len(files) == len(SLOTS), "missing slot receipt")
-    results, slots = {case: [] for case in CONFIG["cases"]}, set()
+    results, slots = {"latency": []}, set()
     for path in files:
         status = json.loads(path.read_bytes())
-        expected = CONFIG["routes"].get(status["cpu"], "")
+        expected = target_case(status["cpu"])
         slot = status["slot"]
         require(slot in SLOTS-slots and status["diagnostic"] == diagnostic and status["case"] == expected and
                 status["processes"] == (240 if expected else 0), "invalid route receipt")
