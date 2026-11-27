@@ -1,0 +1,45 @@
+{
+  "path": "pkg/lux/api/request_list_bench_test.go",
+  "projectionSHA256": "a8fd9a37ceaaf2c5d61f3147fd27acc397d412247bc97e7bae3beea3274f3730",
+  "rawAttempt": 1,
+  "rawRun": 46005543383,
+  "rawSlots": {
+    "3": {
+      "artifact": 15201931895,
+      "sha256": "1c58c47dc409fa7418740188104783837e64622b8f1ea07ae127632833a76736"
+    },
+    "4": {
+      "artifact": 15201982071,
+      "sha256": "6bf15e0020303f9fc2658d5bd1b05b7cc284a1e13be36867ebddbda88ad8e15e"
+    }
+  },
+  "retainedLines": [
+    [
+      1,
+      1
+    ],
+    [
+      3,
+      3
+    ],
+    [
+      5,
+      7
+    ],
+    [
+      9,
+      11
+    ],
+    [
+      14,
+      14
+    ],
+    [
+      110,
+      153
+    ]
+  ],
+  "sourceLines": 153,
+  "sourceSHA256": "7de8d4387a94119bc2c6d71287c3e344d2423453a566b750d809fab0afd1a4c5",
+  "sourceSize": 5055
+}
