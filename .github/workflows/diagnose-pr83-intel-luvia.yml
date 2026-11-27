@@ -17,16 +17,17 @@ jobs:
         slot: [1, 2, 3]
     env:
       GOTOOLCHAIN: local
-      RUNNER_KIND: ${{ runner.environment }}
       SLOT: ${{ matrix.slot }}
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
 
       - name: Match the original CPU before setup
         id: route
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
         run: python3 -I -B scripts/diagnose-pr83-intel-luvia/run.py --probe
 
       - if: steps.route.outputs.matched == 'true'
@@ -61,6 +62,8 @@ jobs:
       - if: steps.route.outputs.matched == 'true'
         name: Compare original and projected binaries
         timeout-minutes: 27
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
         run: python3 -I -B scripts/diagnose-pr83-intel-luvia/run.py
 
       - if: always()

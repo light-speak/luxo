@@ -22,7 +22,8 @@ HARNESS_FILES = {
     "go-capture.py": "b93cb28f2b092f63a07543a71cd39d46f3f28044d73f3547aaf16078c2d07db9",
     "manifest.json": "0c12129c702cf833c79f9e8d3269d1cfb7171d7cd54b1b6255c63a0598bc09a0",
 }
-PARENT = "aaf44cbe5911a6f357f601720ac6c4f2d894a0dd"
+PARENT = "2690c4edbc5856f03773db8114188056110c9b57"
+ORIGINAL_BASE = "aaf44cbe5911a6f357f601720ac6c4f2d894a0dd"
 HARNESS_REVISION = "5376367706e217b18a676dfe932004a0f5419a04"
 REF = "refs/heads/diagnostics/pr83-intel-luvia"
 MANIFEST = INPUT / "manifest.json"
@@ -74,9 +75,14 @@ def bind_event():
             os.environ.get("GITHUB_REPOSITORY") == "light-speak/luxo" and
             os.environ.get("GITHUB_EVENT_NAME") == "push" and os.environ.get("GITHUB_REF") == REF and
             os.environ.get("GITHUB_SHA") == active, "unexpected diagnostic event")
+    workflow = ".github/workflows/diagnose-pr83-intel-luvia.yml"
+    driver = str((INPUT / "run.py").relative_to(ROOT))
     require(git(ROOT, "show", "-s", "--format=%P", active) == PARENT and
+            git(ROOT, "show", "-s", "--format=%P", PARENT) == ORIGINAL_BASE and
+            git(ROOT, "diff", "--name-status", ORIGINAL_BASE, active).splitlines() ==
+            ["A\t" + path for path in diagnostic_paths()] and
             git(ROOT, "diff", "--name-status", PARENT, active).splitlines() ==
-            ["A\t" + path for path in diagnostic_paths()], "unexpected diagnostic paths or parent")
+            ["M\t" + path for path in sorted([workflow, driver])], "unexpected diagnostic paths or parent")
     return active, slot
 
 
