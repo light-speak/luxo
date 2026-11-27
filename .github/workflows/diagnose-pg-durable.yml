@@ -1,4 +1,4 @@
-name: Compare PostgreSQL readable binding SQL
+name: Compare PostgreSQL retry projection scope
 
 on:
   push:
