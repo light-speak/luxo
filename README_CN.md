@@ -433,6 +433,10 @@ Studio 发布时必须将核心 Go module、CLI、前端 SDK 和 CI checkout 固
 
 #### Beta 前的内部 RPC 升级（验收中）
 
+生成的网关为每个目标服务共用一个 LRPC 连接池。默认共 32 条连接，原生流最多占 24 条。流配额或连接池已满时，新流立即收到 `LRPCPoolBusy`（503）。普通 RPC 可以使用池内任意可用连接。
+
+在网关进程设置 `LRPC_MAX_OPEN` 和 `LRPC_UNARY_RESERVE` 可调整总连接上限和普通 RPC 预留。预留未设置或为零时，按总数的四分之一向上取整。预留等于总数时，该池关闭原生流。Go 调用方也可设置 `rpc.PoolOptions` 的 `MaxOpen` 和 `UnaryReserve`，并确保 `MaxIdle` 不超过 `MaxOpen`。
+
 `fn @service`、自动批量加载、关系解析与命名跨服务加载通过
 `Router.HandleInternal`注册。HTTP/WebSocket只查询公开路由表，RPC在启动时
 导出公开API和内部函数；Schema携带`internal`元数据，启动时拒绝注册作用域

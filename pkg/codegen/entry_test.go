@@ -1342,6 +1342,8 @@ func TestGeneratedEntriesBridgeNativeStreamsThroughRPC(t *testing.T) {
 	gateway := string(generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}))
 	for _, want := range []string{
 		"score_luxo.RegisterStreams(gw.Router, eventBus, nil)",
+		"poolOptions, err := rpc.PoolOptionsFromEnv()",
+		`rpc.NewNamedClientWithOptions("score", env.GetOrDefault("SCORE_SERVICE_ADDR", "score:9000"), poolOptions)`,
 		`gw.Router.HandleStreamForwarded("watchLiveScore", rpcStreamProxy(rpcClients["score"]`,
 		"client.SubscribeContext(ctx, luvia.BearerToken(ctx)",
 		"req.BinaryParams()",

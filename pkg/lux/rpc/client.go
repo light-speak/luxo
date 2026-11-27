@@ -160,9 +160,11 @@ func (c *Client) SubscribeContext(ctx context.Context, bearerToken string, apiID
 	if size := callFrameSize(bearerToken, apiID, fieldMask, params); size > maxFrameSize || size < 0 {
 		return nil, errRequestFrameTooLarge
 	}
-	payload := prepareCallFrame(requestKindStream, bearerToken, apiID, fieldMask, params)
-	conn, err := c.pool.GetContext(ctx)
+	conn, err := c.pool.getStreamContext(ctx)
 	if err != nil {
+		if err == ErrPoolExhausted {
+			return nil, err
+		}
 		return nil, fmt.Errorf("rpc: dial %s: %w", c.pool.addr, err)
 	}
 	if deadline, ok := ctx.Deadline(); ok {
@@ -171,6 +173,7 @@ func (c *Client) SubscribeContext(ctx context.Context, bearerToken string, apiID
 			return nil, fmt.Errorf("rpc: stream deadline: %w", err)
 		}
 	}
+	payload := prepareCallFrame(requestKindStream, bearerToken, apiID, fieldMask, params)
 	streamCtx, cancel := context.WithCancel(ctx)
 	subscription := &Subscription{
 		messages: make(chan []byte, 64),

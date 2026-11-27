@@ -794,12 +794,20 @@ func generateGatewayEntry(result *semantic.Result, modulePath string, backends E
 	b.WriteString("\t}\n\n")
 
 	// RPC clients — default address = moduleName:9000 (Docker/K8s DNS)
+	b.WriteString("\tpoolOptions, err := rpc.PoolOptionsFromEnv()\n")
+	b.WriteString("\tif err != nil {\n")
+	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: RPC pool configuration: %v\\n\", err)\n")
+	b.WriteString("\t\tos.Exit(1)\n")
+	b.WriteString("\t}\n\n")
 	b.WriteString("\trpcClients := map[string]*rpc.Client{}\n")
 	for _, m := range allModules {
 		envKey := strings.ToUpper(m.name) + "_SERVICE_ADDR"
 		defaultAddr := m.name + ":9000"
-		fmt.Fprintf(&b, "\trpcClients[%q] = rpc.NewNamedClient(%q, env.GetOrDefault(%q, %q))\n",
+		fmt.Fprintf(&b, "\trpcClients[%q], err = rpc.NewNamedClientWithOptions(%q, env.GetOrDefault(%q, %q), poolOptions)\n",
 			m.name, m.name, envKey, defaultAddr)
+		b.WriteString("\tif err != nil {\n")
+		fmt.Fprintf(&b, "\t\tfmt.Fprintf(os.Stderr, \"fatal: %s RPC client: %%v\\n\", err)\n", m.name)
+		b.WriteString("\t\tos.Exit(1)\n\t}\n")
 	}
 	b.WriteString("\n")
 
