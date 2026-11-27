@@ -163,6 +163,8 @@ def plan_route(tools, directory, case):
 
 
 def expected_overlay(source, package, profile):
+    if profile == "default":
+        return {}
     if profile == "api-non-identity":
         return {f"{package}/{name}": "" for name in ("identity_reader_bench_test.go",
                 "identity_reader_fuzz_test.go", "identity_reader_test.go", "identity_value_test.go")}
@@ -195,13 +197,15 @@ def compile_binary(runtime, driver, go, tools, source, role, case, mode, work, e
     invocation = driver["link_invocation"](trace, linker, Path(package).name + ".test", mode == "aligned")
     save(evidence/"link-command.json", invocation)
     trace.unlink()
-    stem = package.replace("/", "-") + "-" + profile
+    stem = package.replace("/", "-")
+    if profile != "default":
+        stem += "-" + profile
     binary = binary_root / (stem + ".test")
     overlay = expected_overlay(source, package, profile)
     runtime.assert_overlay(evidence, stem, overlay)
     inventory = CONFIG["inventory"][case["inventory"]]
     roots = sorted({name.removesuffix("-2").split("/")[0] for name in inventory})
-    if profile != "api-non-identity":
+    if profile not in {"default", "api-non-identity"}:
         require(sorted(output(binary, "-test.list=.*", cwd=source/package).decode().splitlines()) == roots,
                 "isolated profile acquired another root")
     selector = "^(" + "|".join(roots) + ")$"
@@ -244,8 +248,12 @@ def classify(case, modes):
                 bool(confirmed) == bool(gates["AH-1.forward"]) and len(set(confirmed)) == len(confirmed) and
                 all(name in known and unit in ("sec/op", "B/op", "allocs/op") for name, unit in confirmed),
                 "invalid gate receipt")
+    expected = case["confirmed"]
+    if isinstance(expected, str):
+        expected = [expected]
+    require(len(set(expected)) == len(expected) and set(expected) <= known, "invalid original regression names")
     return {"controlsGreen": all(mode["gates"][name] == 0 for mode in modes.values() for name in PAIRS),
-            "originalReproduced": modes["stock"]["confirmed"] == [[case["confirmed"], "sec/op"]],
+            "originalReproduced": sorted(modes["stock"]["confirmed"]) == sorted([[name, "sec/op"] for name in expected]),
             "alignedExit": modes["aligned"]["gates"]["AH-1.forward"]}
 
 

@@ -1,0 +1,191 @@
+{
+  "A": {
+    "commit": "a7eff24612a0acc0676364247acf4fb622b9b786",
+    "tree": "c376e2752ef476cf2e02bd056ea60c3ebd1d9f43"
+  },
+  "H": {
+    "commit": "17fa8af5bd108b203f72fc3a62b9d4278441a4b8",
+    "parents": [
+      "9c174866c68a8cbd241720cbf2c13c1ea8d4c9f4",
+      "a7eff24612a0acc0676364247acf4fb622b9b786"
+    ],
+    "tree": "752fa6640e8e3b611a2ff7a030a6a137fc91dabb"
+  },
+  "artifacts": {
+    "04": {
+      "artifact": 15198457915,
+      "confirmationSHA256": "b26749d2affde55fe9cab662a9f7994015a885ddde2365652cc9b2ded35ead96",
+      "expectedSHA256": "bc5e79ab34bb0d7a1e06ef9d720fef5269a6758a0f01099e3e00562360aa6e5c",
+      "sha256": "0792112231c45cc990935613ca6e91b7695fa8dffc9b054a1955f6636009a93a",
+      "size": 136822
+    },
+    "08": {
+      "artifact": 15199056286,
+      "confirmationSHA256": "7174504e8e7df8c32534d06e16ade007fda433f148798692d6f4d575cb2f4d22",
+      "expectedSHA256": "08c57888b5bdf7612bfdc3fd4250124e10a44199bf133072e3d1924c64fbad43",
+      "sha256": "484db2997d9b6450ebe33ec9dae5a21261b735ececc07210774b248f22b59274",
+      "size": 127327
+    }
+  },
+  "case": {
+    "binary-selection": {
+      "companions": [
+        "BenchmarkJSONQuoteInvalidCandidate/last16/stdlib-2"
+      ],
+      "confirmed": [
+        "github.com/light-speak/luxo/pkg/lux/api/BinarySelection/width=128/selected=1/branches=0/request-2",
+        "github.com/light-speak/luxo/pkg/lux/api/BinarySelection/width=128/selected=1/branches=0/tree-2"
+      ],
+      "hot": "BenchmarkBinarySelection|decodeFieldMask|ParseBinaryRequestInto|BenchmarkJSONQuoteInvalidCandidate|appendStrictJSONQuote",
+      "inventory": "binary-selection",
+      "originalShard": "08",
+      "package": "pkg/lux/api",
+      "profile": "api-non-identity",
+      "required": [
+        "\\.BenchmarkBinarySelection\\.func1$",
+        "\\.BenchmarkBinarySelection\\.func2$",
+        "\\.decodeFieldMask$",
+        "\\.\\(\\*APIRegistry\\)\\.ParseBinaryRequestInto$"
+      ],
+      "selector": "^BenchmarkBinarySelection$/^width=128$/^selected=1$/^branches=0$/^request$|^BenchmarkBinarySelection$/^width=128$/^selected=1$/^branches=0$/^tree$|^BenchmarkJSONQuoteInvalidCandidate$/^last16$/^stdlib$",
+      "timed": [
+        "BenchmarkBinarySelection/width=128/selected=1/branches=0/request-2",
+        "BenchmarkBinarySelection/width=128/selected=1/branches=0/tree-2",
+        "BenchmarkJSONQuoteInvalidCandidate/last16/stdlib-2"
+      ]
+    },
+    "identity-enum": {
+      "companions": [],
+      "confirmed": [
+        "github.com/light-speak/luxo/pkg/lux/api/IdentityEnumArray/empty-2"
+      ],
+      "hot": "BenchmarkIdentityEnumArray|jsonutil\\.ParseStringValuesLimit\\[",
+      "inventory": "identity-enum",
+      "originalShard": "04",
+      "package": "pkg/lux/api",
+      "profile": "default",
+      "required": [
+        "\\.BenchmarkIdentityEnumArray\\.func1$",
+        "\\.ParseStringValuesLimit\\[go\\.shape\\.string\\]$"
+      ],
+      "selector": "^BenchmarkIdentityEnumArray$/^empty$",
+      "timed": [
+        "BenchmarkIdentityEnumArray/empty-2"
+      ]
+    },
+    "json-list": {
+      "companions": [],
+      "confirmed": [
+        "github.com/light-speak/luxo/pkg/lux/api/JSONListMetadata/escaped/0/metadata-2",
+        "github.com/light-speak/luxo/pkg/lux/api/JSONListMetadata/filters/0/metadata-2",
+        "github.com/light-speak/luxo/pkg/lux/api/JSONListMetadata/sorters/100/metadata-2",
+        "github.com/light-speak/luxo/pkg/lux/api/JSONListMetadata/sorters/100/request-2",
+        "github.com/light-speak/luxo/pkg/lux/api/JSONListMetadata/sorters/16/metadata-2"
+      ],
+      "hot": "BenchmarkJSONListMetadata|benchmarkListMetadata|parseListParams|readListMetadata|/api\\.ParseRequest",
+      "inventory": "json-list",
+      "originalShard": "04",
+      "package": "pkg/lux/api",
+      "profile": "api-non-identity",
+      "required": [
+        "\\.benchmarkListMetadata\\.func1$",
+        "\\.benchmarkListMetadata\\.func2$",
+        "\\.\\(\\*Request\\)\\.parseListParams$",
+        "\\.readListMetadata$"
+      ],
+      "selector": "^BenchmarkJSONListMetadata$/^escaped$/^0$/^metadata$|^BenchmarkJSONListMetadata$/^filters$/^0$/^metadata$|^BenchmarkJSONListMetadata$/^sorters$/^100$/^metadata$|^BenchmarkJSONListMetadata$/^sorters$/^100$/^request$|^BenchmarkJSONListMetadata$/^sorters$/^16$/^metadata$",
+      "timed": [
+        "BenchmarkJSONListMetadata/escaped/0/metadata-2",
+        "BenchmarkJSONListMetadata/filters/0/metadata-2",
+        "BenchmarkJSONListMetadata/sorters/100/metadata-2",
+        "BenchmarkJSONListMetadata/sorters/100/request-2",
+        "BenchmarkJSONListMetadata/sorters/16/metadata-2"
+      ]
+    }
+  },
+  "compileProfileSHA256": "42975eeab574bcef79503417100adbf5d2a04205e962e2cf15b48d0e5cf2017a",
+  "diffSHA256": "56aec8e100a11b6f471c82d759cf0fa1cfe31989eeb005b25af36b017c142e67",
+  "inventory": {
+    "binary-selection": [
+      "BenchmarkBinarySelection/width=1/selected=1/branches=0/request-2",
+      "BenchmarkBinarySelection/width=1/selected=1/branches=0/tree-2",
+      "BenchmarkBinarySelection/width=1/selected=1/branches=16/request-2",
+      "BenchmarkBinarySelection/width=1/selected=1/branches=16/tree-2",
+      "BenchmarkBinarySelection/width=1/selected=1/branches=2/request-2",
+      "BenchmarkBinarySelection/width=1/selected=1/branches=2/tree-2",
+      "BenchmarkBinarySelection/width=128/selected=1/branches=0/request-2",
+      "BenchmarkBinarySelection/width=128/selected=1/branches=0/tree-2",
+      "BenchmarkBinarySelection/width=128/selected=128/branches=0/request-2",
+      "BenchmarkBinarySelection/width=128/selected=128/branches=0/tree-2",
+      "BenchmarkBinarySelection/width=16/selected=1/branches=0/request-2",
+      "BenchmarkBinarySelection/width=16/selected=1/branches=0/tree-2",
+      "BenchmarkBinarySelection/width=16/selected=16/branches=0/request-2",
+      "BenchmarkBinarySelection/width=16/selected=16/branches=0/tree-2",
+      "BenchmarkBinarySelection/width=16/selected=16/branches=4/request-2",
+      "BenchmarkBinarySelection/width=16/selected=16/branches=4/tree-2",
+      "BenchmarkJSONQuoteInvalidCandidate/first1024/manual-strict-2",
+      "BenchmarkJSONQuoteInvalidCandidate/first1024/stdlib-2",
+      "BenchmarkJSONQuoteInvalidCandidate/first16/manual-strict-2",
+      "BenchmarkJSONQuoteInvalidCandidate/first16/stdlib-2",
+      "BenchmarkJSONQuoteInvalidCandidate/last1024/manual-strict-2",
+      "BenchmarkJSONQuoteInvalidCandidate/last1024/stdlib-2",
+      "BenchmarkJSONQuoteInvalidCandidate/last16/manual-strict-2",
+      "BenchmarkJSONQuoteInvalidCandidate/last16/stdlib-2"
+    ],
+    "identity-enum": [
+      "BenchmarkIdentityEnumArray/128-2",
+      "BenchmarkIdentityEnumArray/empty-2",
+      "BenchmarkIdentityEnumArray/one-2"
+    ],
+    "json-list": [
+      "BenchmarkJSONListMetadata/chinese72KB/1/metadata-2",
+      "BenchmarkJSONListMetadata/chinese72KB/1/request-2",
+      "BenchmarkJSONListMetadata/escaped/0/metadata-2",
+      "BenchmarkJSONListMetadata/escaped/0/request-2",
+      "BenchmarkJSONListMetadata/escaped/1/metadata-2",
+      "BenchmarkJSONListMetadata/escaped/1/request-2",
+      "BenchmarkJSONListMetadata/escaped/100/metadata-2",
+      "BenchmarkJSONListMetadata/escaped/100/request-2",
+      "BenchmarkJSONListMetadata/escaped/16/metadata-2",
+      "BenchmarkJSONListMetadata/escaped/16/request-2",
+      "BenchmarkJSONListMetadata/filters/0/metadata-2",
+      "BenchmarkJSONListMetadata/filters/0/request-2",
+      "BenchmarkJSONListMetadata/filters/1/metadata-2",
+      "BenchmarkJSONListMetadata/filters/1/request-2",
+      "BenchmarkJSONListMetadata/filters/100/metadata-2",
+      "BenchmarkJSONListMetadata/filters/100/request-2",
+      "BenchmarkJSONListMetadata/filters/16/metadata-2",
+      "BenchmarkJSONListMetadata/filters/16/request-2",
+      "BenchmarkJSONListMetadata/sorters/0/metadata-2",
+      "BenchmarkJSONListMetadata/sorters/0/request-2",
+      "BenchmarkJSONListMetadata/sorters/1/metadata-2",
+      "BenchmarkJSONListMetadata/sorters/1/request-2",
+      "BenchmarkJSONListMetadata/sorters/100/metadata-2",
+      "BenchmarkJSONListMetadata/sorters/100/request-2",
+      "BenchmarkJSONListMetadata/sorters/16/metadata-2",
+      "BenchmarkJSONListMetadata/sorters/16/request-2"
+    ]
+  },
+  "originalRun": 45999580339,
+  "routes": {
+    "AMD EPYC 7763 64-Core Processor": [
+      "identity-enum",
+      "json-list"
+    ],
+    "AMD EPYC 9V74 80-Core Processor": [
+      "binary-selection"
+    ]
+  },
+  "runAttempt": 1,
+  "sourceSHA256": {
+    "pkg/lux/api/binary.go": "6f52f1f9c662a9832a58a174f5212698af4ef0572e4e41ae0759e2d4988c9cbe",
+    "pkg/lux/api/binary_selection_bench_test.go": "28b8dc4368329a2c150ad5d808c5cfdabdf584ee98981fe8eadb21ac28c3b46d",
+    "pkg/lux/api/buf_quote_reference_test.go": "1c12228639bcf3cf6506c93f24772dc12bc93512ee3fb300079ef93b045a439d",
+    "pkg/lux/api/buf_quote_test.go": "f6f5f6869a72a6fd35c54b9ddff66dd341e9962d209a451cd3cc219193e274b9",
+    "pkg/lux/api/identity_reader_bench_test.go": "20d45a1c2a71419d6c2c44e33b49e691cf15f3522f6e1041541dbce5097a3c5f",
+    "pkg/lux/api/identity_value.go": "8344d738fcfb1af85f6255fe1a9993756ee6f60d89b7553ce1e78daaf8a887a1",
+    "pkg/lux/api/request.go": "5aa9eedd8b3c44f1d8d03ef9777b3a3489e1f4ca5f4d049073ec6ccdd7bafae1",
+    "pkg/lux/api/request_list.go": "c4db02c8b50e26306379c5e6abefb91e8a1f0cd0b6224c47a121debadc8a3a62",
+    "pkg/lux/api/request_list_bench_test.go": "7de8d4387a94119bc2c6d71287c3e344d2423453a566b750d809fab0afd1a4c5"
+  }
+}

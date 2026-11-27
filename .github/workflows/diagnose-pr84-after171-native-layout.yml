@@ -1,0 +1,104 @@
+name: Recheck PR 84 API timing samples on their original AMD CPUs
+
+on:
+  push:
+    branches: [diagnostics/pr84-after171-native-layout]
+
+permissions:
+  contents: read
+
+jobs:
+  witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 32
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6]
+    env:
+      GOTOOLCHAIN: local
+      SLOT: ${{ matrix.slot }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Match the original CPU before setup
+        id: route
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: python3 -I -B scripts/diagnose-pr84-after171/run.py --probe
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: 5376367706e217b18a676dfe932004a0f5419a04
+          path: .tmp/pr84-native-harness
+          sparse-checkout: scripts/diagnose-pr83-amd
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: a7eff24612a0acc0676364247acf4fb622b9b786
+          path: .tmp/pr84-after171-native-inputs/A
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: 17fa8af5bd108b203f72fc3a62b9d4278441a4b8
+          path: .tmp/pr84-after171-native-inputs/H
+          fetch-depth: 2
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        name: Compare original and link-aligned binaries
+        timeout-minutes: 27
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: python3 -I -B scripts/diagnose-pr84-after171/run.py
+
+      - if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr84-after171-native-layout-${{ github.run_id }}-${{ github.run_attempt }}-slot-${{ matrix.slot }}
+          path: .tmp/pr84-after171-native-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  qualification:
+    needs: witness
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            scripts/diagnose-pr83-bc18-native-layout
+            scripts/diagnose-pr84-after171
+          persist-credentials: false
+
+      - name: Require both AMD CPU routes and unchanged thresholds
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          results=$(mktemp -d .tmp/pr84-after171-native-layout-receipts.XXXXXXXX)
+          trap 'rm -rf -- "$results"' EXIT
+          gh run download "$GITHUB_RUN_ID" --pattern "pr84-after171-native-layout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-slot-*" --dir "$results"
+          python3 -I -B scripts/diagnose-pr84-after171/run.py --summarize "$results" "$GITHUB_SHA"
