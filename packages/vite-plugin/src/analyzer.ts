@@ -85,13 +85,18 @@ export async function analyzeVerifiedCalls(
 export async function analyzeVerifiedEdits(
   code: string, id: string, schema: LuxoSchema,
   verify: (calls: readonly SelectionCandidate[]) => Promise<ReadonlySet<number>>,
+  watchSchema?: () => void,
 ): Promise<TextEdit[] | null> {
   const ast = parseSource(code, id)
   try {
     const state = createAnalysisState(schema)
     const candidates: SelectionCandidate[] = []
+    const watch = watchSchema && (() => {
+      watchSchema?.()
+      watchSchema = undefined
+    })
     traverse(ast, { CallExpression(path) {
-      const call = findAPICall(path, state)
+      const call = findAPICall(path, state, watch)
       if (!call || hasManualSelection(call.path.node)) return
       // findAPICall validates the member; parseSource always retains its position.
       candidates.push({ memberStart: call.path.node.callee.property.start! })
@@ -467,6 +472,7 @@ function rootValue(usage: CallUsage): ValueBinding {
 function findAPICall(
   path: NodePath<t.Node>,
   state: AnalysisState,
+  watchSchema?: () => void,
 ): { api: LuxoAPI; path: NodePath<MemberCall>; stream: boolean } | null {
   const expression = unwrapExpression(path)
   if (!expression.isCallExpression()) return null
@@ -474,6 +480,7 @@ function findAPICall(
   if (!callee || (!callee.isMemberExpression() && !callee.isOptionalMemberExpression())) return null
   if (state.verifiedMembers && !state.verifiedMembers.has(callee.node.property.start ?? -1)) return null
   const name = memberPropertyName(callee.node)
+  if (name) watchSchema?.()
   const api = name ? state.apis.get(name) ?? state.streamAPIs.get(name) : undefined
   if (!api?.returnType || !declaration(state.schema, api.returnType)) return null
   if (schemaEntry(state.schema.sealeds, api.returnType)?.variants.length === 0) return null

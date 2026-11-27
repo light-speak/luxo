@@ -146,6 +146,36 @@ func TestHandshakeCancellationAndTimeout(t *testing.T) {
 	}
 }
 
+func TestHandshakeCancellationAfterCompleteReply(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conn, peer := net.Pipe()
+		defer conn.Close()
+		defer peer.Close()
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		preface := protocolPreface()
+		client := &cancelOnResponseConn{Conn: conn, remaining: len(preface), cancel: cancel}
+		written := make(chan error, 1)
+		go func() {
+			var request [12]byte
+			if _, err := io.ReadFull(peer, request[:]); err != nil {
+				written <- err
+				return
+			}
+			written <- writePreface(peer, &preface)
+		}()
+		if err := initiateHandshake(ctx, client, time.Second); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancellation after a complete reply: %v", err)
+		}
+		if err := <-written; err != nil {
+			t.Fatalf("write complete handshake reply: %v", err)
+		}
+		if _, err := peer.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Fatalf("canceled connection remained open: %v", err)
+		}
+	})
+}
+
 func TestPoolRejectsUnverifiedConnection(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

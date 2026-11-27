@@ -52,6 +52,45 @@ fn equal(left: Outcome, right: Outcome): Boolean { return left == right }
 	expectError(t, unknown, "does not support equality")
 }
 
+func TestSealedComparisonRejectsOperandsWithoutACompatibleValue(t *testing.T) {
+	for _, sample := range []struct {
+		name       string
+		expression string
+	}{
+		{"empty list", "value == []"},
+		{"empty list on the left", "[] != value"},
+		{"void call", "value == effect()"},
+		{"void call on the left", "effect() != value"},
+		{"untyped computed null", "value == (when { true -> null else -> null })"},
+		{"empty list pattern", "when(value) { [] -> true else -> false }"},
+		{"void call pattern", "when(value) { effect() -> true else -> false }"},
+		{"untyped computed null pattern", "when(value) { (when { true -> null else -> null }) -> true else -> false }"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			result := analyze(t, `
+sealed Outcome { Value(value: Int) Pending }
+fn effect() {}
+fn compare(value: Outcome?): Boolean { return `+sample.expression+` }
+`)
+			expectError(t, result, "sealed comparison requires")
+		})
+	}
+}
+
+func TestSealedComparisonAcceptsTypedAndSupportedNullValues(t *testing.T) {
+	result := analyze(t, `
+sealed Outcome { Value(value: Int) Pending }
+fn compare(value: Outcome?, other: Outcome?, flag: Boolean): Boolean {
+ val absent: Outcome? = null
+ val choice = when { flag -> other else -> null }
+ val selected = when(value) { null -> true choice -> false else -> true }
+ val awaited = when(value) { await { null } -> true else -> false }
+ return value == absent || null != value || value == await { null } || await { null } != value || selected || awaited
+}
+`)
+	expectNoErrors(t, result)
+}
+
 func TestSealedPayloadFieldsRemainReadOnly(t *testing.T) {
 	for _, operation := range []string{"=", "+="} {
 		result := analyze(t, `sealed Outcome { Value(value: Int) Empty }

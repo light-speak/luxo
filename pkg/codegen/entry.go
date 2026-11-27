@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"fmt"
+	"path"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/ast"
@@ -561,9 +562,16 @@ func writeStartupRegistration(b *strings.Builder, kind, call string) {
 	b.WriteString("\t\tos.Exit(1)\n\t}\n")
 }
 
-// generateModuleEntryFiles produces per-module entry points for cluster mode.
-// Each module gets its own main.gen.go under lucis/<module>/.
-// Returns map[moduleName][]byte.
+// ModuleEntryDirectory returns the slash-separated directory for a cluster entry.
+func ModuleEntryDirectory(name string) string {
+	// Reserve lucis/app and lucis/gateway for the system entries across filesystems.
+	if strings.EqualFold(name, "app") || strings.EqualFold(name, "gateway") {
+		return path.Join("lucis", "modules", name)
+	}
+	return path.Join("lucis", name)
+}
+
+// generateModuleEntryFiles maps each module name to its cluster entry source.
 func generateModuleEntryFiles(result *semantic.Result, modulePath string, backends EntryBackends) map[string][]byte {
 	allModules := collectModules(result)
 	if len(allModules) == 0 {

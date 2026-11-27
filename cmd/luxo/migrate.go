@@ -32,7 +32,8 @@ var migrateCmd = &cobra.Command{
 Commands / 子命令:
   diff [name]    Generate migration from origin changes / 从 origin 变更生成迁移
   up             Apply pending migrations / 执行未执行的迁移
-  status         Show migration status / 查看迁移状态`,
+  status         Show migration status / 查看迁移状态
+  reconcile      Inspect or resolve a migration attempt / 查看或处理迁移尝试`,
 }
 
 var migrateDiffCmd = &cobra.Command{
@@ -94,6 +95,7 @@ func init() {
 	migrateCmd.AddCommand(migrateUpCmd)
 	migrateCmd.AddCommand(migrateDownCmd)
 	migrateCmd.AddCommand(migrateStatusCmd)
+	migrateCmd.AddCommand(newMigrateReconcileCmd())
 	migrateCmd.AddCommand(migrateVerifyCmd)
 	migrateCmd.AddCommand(migrateSquashCmd)
 	rootCmd.AddCommand(migrateCmd)
@@ -542,7 +544,7 @@ func runMigrateDown(cmd *cobra.Command, args []string) error {
 	}
 	defer runner.Close()
 
-	rolledBack, err := runner.Down(ctx, n)
+	rolledBack, receipt, err := runner.DownWithReceipt(ctx, n)
 	if err != nil {
 		return fmt.Errorf("migrate down: %w", err)
 	}
@@ -555,6 +557,10 @@ func runMigrateDown(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\n  %s%s✓ %d migration(s) rolled back / 已回滚 %d 个迁移%s\n\n", bold, yellow, len(rolledBack), len(rolledBack), reset)
 	for _, name := range rolledBack {
 		fmt.Printf("  %s↩%s %s%s%s\n", yellow, reset, dim, name, reset)
+	}
+	if receipt != "" {
+		fmt.Printf("  Rollback receipt / 回滚回执 %q\n", receipt)
+		fmt.Printf("  luxo migrate reconcile %s --acknowledge\n", receipt)
 	}
 	fmt.Println()
 	return nil

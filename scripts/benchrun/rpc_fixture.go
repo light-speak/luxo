@@ -32,6 +32,7 @@ const (
 	rpcNilContextGuardSHA       = "cd1b4a5dd0d0622ce19cfc144057482a1059cd61245cf38cf9205f46aaece2c3"
 	// Discovery and sampling must consume the same benchmark compilation profile.
 	performanceProfile = "rpc-boundary-overlay-v2 " + rpcBoundarySHA +
+		compactBenchmarkFingerprint +
 		"\ncodec-reader-overlay-v1\napi-non-identity-overlay-v1\nluvia-primary-trace-overlay-v1\ncodegen-integer-literals-overlay-v1" +
 		"\ncodegen-global-receiver-overlay-v1 " + codegenReceiverProjectionSHA +
 		"\nluvia-gateway-identity-overlay-v1 " + luviaGatewayIdentityProjectionSHA +
@@ -41,13 +42,27 @@ const (
 		" " + codegenReceiverFixture + "=" + codegenReceiverProjectionSHA +
 		"\nluvia-merge-destination-overlay-v1\napi-local-route-export-overlay-v1" +
 		"\napi-canonical-json-overlay-v1\nluvia-resolved-fields-overlay-v1\nluvia-convenience-keys-overlay-v1" +
+		"\n" + benchlayout.APIIdentityConditionProfile + "-overlay-v1 " + apiIdentityConditionFixture + "=" + apiIdentityConditionSHA +
+		"\n" + benchlayout.APIHandlerPanicProfile + "-overlay-v1 " + apiHandlerPanicFixture + "=" + apiHandlerPanicSHA +
+		"\n" + benchlayout.APIWebSocketRegistrationsProfile + "-overlay-v1 " + apiWSRegistrationsFixture + "=" + apiWSRegistrationsSHA +
+		"\n" + benchlayout.APIBodyReadProfile + "-overlay-v1 " + apiBodyReadFixture + "=" + apiBodyReadSHA +
+		"\n" + benchlayout.APIJSONQuoteCandidateProfile + "-overlay-v1 " + apiJSONQuoteFixture + "=" + apiJSONQuoteSHA +
+		" " + apiJSONQuoteReferenceFixture + "=" + apiJSONQuoteReferenceSHA +
+		"\n" + benchlayout.APIResponseOriginRunProfile + "-overlay-v1 " + apiResponseOriginBenchmarkFixture + "=" + apiResponseOriginBenchmarkSHA +
+		" " + apiResponseOriginHelperFixture + "=" + apiResponseOriginHelperSHA + ":" + apiResponseOriginProjectionSHA +
 		"\nrpc-owned-request-overlay-v1 " + rpcOwnedRequestFixture +
 		"\nrpc-deadline-classification-overlay-v1 " + rpcDeadlineBenchmarkFixture + "=" + rpcDeadlineBenchmarkSHA +
 		" " + rpcDeadlineContextFixture + "=" + rpcDeadlineContextSHA +
 		"\nrpc-nil-context-guard-overlay-v1 " + rpcNilContextGuardFixture + "=" + rpcNilContextGuardSHA +
+		"\nrpc-prepared-frame-overlay-v1 " + rpcPreparedFrameFilename + "=" + rpcPreparedFrameProjectionSHA + " " + rpcPreparedFrameSourceSHA +
+		"\nrpc-handler-panic-overlay-v1 " + rpcHandlerPanicFixture + "=" + rpcHandlerPanicSHA +
+		"\nqueue-stream-name-overlay-v1 " + queueStreamNameFilename + "=" + queueStreamNameProjectionSHA + " " + queueStreamNameSourceSHA +
 		"\nluvia-auth-middleware-overlay-v1 " + luviaAuthBenchmarkFixture + "=" + luviaAuthBenchmarkSHA +
 		" " + luviaAuthHelperFixture + "=" + luviaAuthHelperSHA +
-		"\napi-binary-param-lookup-overlay-v1 " + apiBinaryParamLookupFixture
+		"\napi-binary-param-lookup-overlay-v1 " + apiBinaryParamLookupFixture +
+		"\napi-request-log-overlay-v1 " + apiRequestLogFixture + "=" + apiRequestLogProjectionSHA + " " + apiRequestLogSourceSHA +
+		"\ncodegen-relation-loader-overlay-v1 " + codegenRelationLoaderFilename + "=" + codegenRelationLoaderProjectionSHA + " " + codegenRelationLoaderSourceSHA +
+		"\nsemantic-event-emits-overlay-v1 " + semanticEventEmitsFilename + "=" + semanticEventEmitsProjectionSHA + " " + semanticEventEmitsSourceSHA + transportBenchmarkFingerprint + sealedCompilerFixtureBindings
 )
 
 func writeRPCOwnedRequestOverlay(pkg, workspace string) (string, error) {
@@ -136,20 +151,21 @@ var rpcDeadlineSources = map[string]rpcDeadlineSource{
 }
 
 func writeRPCDeadlineOverlay(pkg, workspace string) (string, error) {
-	return writeProjectedRPCTestOverlay(pkg, workspace, "RPC deadline", projectRPCDeadlineFixture,
+	return writeProjectedBenchmarkOverlay(pkg, workspace, "RPC deadline", projectRPCDeadlineFixture,
 		rpcDeadlineBenchmarkFixture, rpcDeadlineContextFixture)
 }
 
 func writeRPCNilContextGuardOverlay(pkg, workspace string) (string, error) {
-	return writeProjectedRPCTestOverlay(pkg, workspace, "RPC nil-context guard", projectRPCNilContextGuardFixture, rpcNilContextGuardFixture)
+	return writeProjectedBenchmarkOverlay(pkg, workspace, "RPC nil-context guard", projectRPCNilContextGuardFixture, rpcNilContextGuardFixture)
 }
 
-func writeProjectedRPCTestOverlay(pkg, workspace, description string, project func(string, string) (string, error), fixtures ...string) (string, error) {
+func writeProjectedBenchmarkOverlay(pkg, workspace, description string, project func(string, string) (string, error), fixtures ...string) (string, error) {
 	entries, err := os.ReadDir(pkg)
 	if err != nil {
 		return "", err
 	}
 	replacements := make(map[string]string)
+	retained := make(map[string]bool)
 	for _, entry := range entries {
 		if name := entry.Name(); strings.HasSuffix(name, "_test.go") {
 			path := filepath.Join(pkg, name)
@@ -157,11 +173,15 @@ func writeProjectedRPCTestOverlay(pkg, workspace, description string, project fu
 			if err != nil {
 				return "", fmt.Errorf("%s fixture %s: %w", description, name, err)
 			}
-			replacements[path] = projection
+			retained[name] = projection != ""
+			// The projector returns the source path when it retains the original test file.
+			if projection != path {
+				replacements[path] = projection
+			}
 		}
 	}
 	for _, name := range fixtures {
-		if replacements[filepath.Join(pkg, name)] == "" {
+		if !retained[name] {
 			return "", fmt.Errorf("missing %s fixture %s", description, name)
 		}
 	}
