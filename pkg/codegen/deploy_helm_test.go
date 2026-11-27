@@ -496,11 +496,40 @@ func TestHelmHelpersSizeMatchesTemplates(t *testing.T) {
 	for _, modules := range [][]moduleInfo{
 		{{name: "module001"}},
 		{{name: "user"}, {name: "dotless-ı"}, {name: "latin-ɜ"}},
+		{{name: "gateway"}, {name: "module-gateway"}},
 	} {
-		got := len(generateHelpers(modules))
-		if predicted := helmHelpersSize(modules); predicted != got {
+		names := planDeploymentAliases(modules, "", "gateway")
+		got := len(generateHelpers(modules, names))
+		if predicted := helmHelpersSize(modules, names); predicted != got {
 			t.Errorf("helpers size = %d, want %d emitted bytes", predicted, got)
 		}
+	}
+}
+
+func TestHelmGatewayModuleHasDistinctDeploymentIdentity(t *testing.T) {
+	chart, err := GenerateHelmFilesChecked(makeHelmResult("gateway", "postgres", "builder"), "probe", EntryBackends{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := map[string][]string{
+		"templates/gateway-deployment.yaml":        {`name: {{ include "luxo.fullname" . }}-gateway`, `/gateway:{{ .Values.image.tag }}`},
+		"templates/module-gateway-deployment.yaml": {`name: {{ include "luxo.fullname" . }}-module-gateway`, "app.kubernetes.io/component: module-gateway", `/module-gateway:{{ .Values.image.tag }}`, ".Values.modules.gateway.replicas"},
+		"templates/module-gateway-service.yaml":    {`name: {{ include "luxo.fullname" . }}-module-gateway`, "app.kubernetes.io/component: module-gateway", ".Values.modules.gateway.rpcPort"},
+		"templates/module-postgres-service.yaml":   {`name: {{ include "luxo.fullname" . }}-postgres`},
+		"templates/module-builder-service.yaml":    {`name: {{ include "luxo.fullname" . }}-builder`},
+		"templates/hpa.yaml":                       {`name: {{ include "luxo.fullname" . }}-module-gateway`, ".Values.modules.gateway.autoscaling.enabled"},
+		"templates/_helpers.tpl":                   {`GATEWAY_SERVICE_ADDR: {{ include "luxo.fullname" . }}-module-gateway:{{ .Values.modules.gateway.rpcPort }}`},
+		"values.yaml":                              {"modules:\n  gateway:\n"},
+	}
+	for path, expected := range checks {
+		for _, pattern := range expected {
+			if !strings.Contains(string(chart.Files[path]), pattern) {
+				t.Errorf("%s is missing %q", path, pattern)
+			}
+		}
+	}
+	if got := strings.Count(string(chart.Files["templates/hpa.yaml"]), `name: {{ include "luxo.fullname" . }}-module-gateway`); got != 2 {
+		t.Errorf("module HPA must have a distinct name and target, got %d references", got)
 	}
 }
 
