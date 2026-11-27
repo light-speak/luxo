@@ -153,12 +153,17 @@ func writeLuviaBenchmarkOverlay(pkg, workspace string) (string, error) {
 const apiBinaryParamLookupFixture = "binary_param_lookup_test.go"
 
 const (
-	apiIdentityConditionFixture = "identity_reader_bench_test.go"
-	apiIdentityConditionSHA     = "20d45a1c2a71419d6c2c44e33b49e691cf15f3522f6e1041541dbce5097a3c5f"
-	apiHandlerPanicFixture      = "handler_panic_bench_test.go"
-	apiHandlerPanicSHA          = "01122e4a09e5c6d6a20018f47566fb801ad4888db504fd9d2c932be56146e302"
-	apiWSRegistrationsFixture   = "websocket_subscriptions_bench_test.go"
-	apiWSRegistrationsSHA       = "5abe6b7846bb541fa73512dd924d2eec3b4a66c1ed64f5839ee658f43492b584"
+	apiIdentityConditionFixture       = "identity_reader_bench_test.go"
+	apiIdentityConditionSHA           = "20d45a1c2a71419d6c2c44e33b49e691cf15f3522f6e1041541dbce5097a3c5f"
+	apiHandlerPanicFixture            = "handler_panic_bench_test.go"
+	apiHandlerPanicSHA                = "01122e4a09e5c6d6a20018f47566fb801ad4888db504fd9d2c932be56146e302"
+	apiWSRegistrationsFixture         = "websocket_subscriptions_bench_test.go"
+	apiWSRegistrationsSHA             = "5abe6b7846bb541fa73512dd924d2eec3b4a66c1ed64f5839ee658f43492b584"
+	apiResponseOriginBenchmarkFixture = "response_origin_bench_test.go"
+	apiResponseOriginBenchmarkSHA     = "73022ebed1b57a2f54344199b406cbc20028063819f634c74eab84a867feb1e0"
+	apiResponseOriginHelperFixture    = "response_origin_test.go"
+	apiResponseOriginHelperSHA        = "42fb8c4bf2d07d23138b27c10302a54e42ab5de674b0ff890c55894e06cc5973"
+	apiResponseOriginProjectionSHA    = "386e2dd6bc21b04dd35e49a9201ca0df47bf727288b9e6aa2301828336cf8683"
 )
 
 var apiBenchmarkFileFixtures = map[string]struct{ name, sourceSHA string }{
@@ -169,15 +174,46 @@ var apiBenchmarkFileFixtures = map[string]struct{ name, sourceSHA string }{
 
 func writeAPIBenchmarkFileOverlay(pkg, workspace, profile string) (string, error) {
 	fixture := apiBenchmarkFileFixtures[profile]
-	data, err := readRegularTestFixture(filepath.Join(pkg, fixture.name))
-	if err != nil {
-		return "", fmt.Errorf("%s fixture: %w", profile, err)
-	}
-	if fmt.Sprintf("%x", sha256.Sum256(data)) != fixture.sourceSHA {
-		return "", fmt.Errorf("%s fixture does not match the verified source", profile)
+	if err := verifyAPIBenchmarkFixture(pkg, profile, fixture.name, fixture.sourceSHA); err != nil {
+		return "", err
 	}
 	// Keep the native witness's complete benchmark file, including its companion declarations.
 	return retainBenchmarkTestFiles(pkg, workspace, profile, fixture.name)
+}
+
+func verifyAPIBenchmarkFixture(pkg, profile, name, sourceSHA string) error {
+	data, err := readRegularTestFixture(filepath.Join(pkg, name))
+	if err != nil {
+		return fmt.Errorf("%s fixture: %w", profile, err)
+	}
+	if fmt.Sprintf("%x", sha256.Sum256(data)) != sourceSHA {
+		return fmt.Errorf("%s fixture does not match the verified source", profile)
+	}
+	return nil
+}
+
+var apiResponseOriginHelper = pairedBenchmarkFixture{
+	name: apiResponseOriginHelperFixture, sourceSHA: apiResponseOriginHelperSHA, projectionSHA: apiResponseOriginProjectionSHA,
+	imports: []string{`"testing"`, `"time"`}, functions: []string{"testResponseOrigin"},
+}
+
+func writeAPIResponseOriginOverlay(pkg, workspace string) (string, error) {
+	const profile = benchlayout.APIResponseOriginRunProfile
+	if err := verifyAPIBenchmarkFixture(pkg, profile, apiResponseOriginBenchmarkFixture, apiResponseOriginBenchmarkSHA); err != nil {
+		return "", err
+	}
+	replacements, err := retainedBenchmarkTestReplacements(pkg, profile, apiResponseOriginBenchmarkFixture, apiResponseOriginHelperFixture)
+	if err != nil {
+		return "", err
+	}
+	// The native witness retains the whole benchmark file and only its exact domain helper.
+	helper := filepath.Join(pkg, apiResponseOriginHelperFixture)
+	projection, err := apiResponseOriginHelper.projectFile(helper, workspace)
+	if err != nil {
+		return "", fmt.Errorf("%s fixture %s: %w", profile, apiResponseOriginHelperFixture, err)
+	}
+	replacements[helper] = projection
+	return writeTestOverlay(workspace, replacements)
 }
 
 func writeAPIBinaryParamLookupOverlay(pkg, workspace string) (string, error) {
@@ -209,9 +245,17 @@ func writeLuviaConvenienceKeysOverlay(pkg, workspace string) (string, error) {
 }
 
 func retainBenchmarkTestFiles(pkg, workspace, description string, fixtures ...string) (string, error) {
-	entries, err := os.ReadDir(pkg)
+	replacements, err := retainedBenchmarkTestReplacements(pkg, description, fixtures...)
 	if err != nil {
 		return "", err
+	}
+	return writeTestOverlay(workspace, replacements)
+}
+
+func retainedBenchmarkTestReplacements(pkg, description string, fixtures ...string) (map[string]string, error) {
+	entries, err := os.ReadDir(pkg)
+	if err != nil {
+		return nil, err
 	}
 	replacements := make(map[string]string)
 	retained := 0
@@ -223,10 +267,10 @@ func retainBenchmarkTestFiles(pkg, workspace, description string, fixtures ...st
 		path := filepath.Join(pkg, name)
 		data, err := readRegularTestFixture(path)
 		if err != nil {
-			return "", fmt.Errorf("%s fixture %s: %w", description, name, err)
+			return nil, fmt.Errorf("%s fixture %s: %w", description, name, err)
 		}
 		if _, err := parseBenchmarkFixture(token.NewFileSet(), path, data); err != nil {
-			return "", err
+			return nil, err
 		}
 		if slices.Contains(fixtures, name) {
 			retained++
@@ -235,9 +279,9 @@ func retainBenchmarkTestFiles(pkg, workspace, description string, fixtures ...st
 		replacements[path] = ""
 	}
 	if retained != len(fixtures) {
-		return "", fmt.Errorf("missing %s test fixture", description)
+		return nil, fmt.Errorf("missing %s test fixture", description)
 	}
-	return writeTestOverlay(workspace, replacements)
+	return replacements, nil
 }
 
 func projectLuviaFixture(path, workspace string) (string, error) {
