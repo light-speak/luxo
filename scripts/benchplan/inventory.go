@@ -121,6 +121,9 @@ func verifyProfileInventory(args []string) error {
 	if len(ordinary) == 0 || !maps.EqualFunc(ordinary, isolated, maps.Equal[map[string]struct{}]) {
 		return fmt.Errorf("benchmark profile %q must reproduce its exact ordinary benchmark inventory", profile)
 	}
+	if err := verifyCompactProfileLeaves(profile, isolated); err != nil {
+		return err
+	}
 	return verifyProfileLeaves(profile, isolated)
 }
 
@@ -128,15 +131,15 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 	switch profile {
 	case benchlayout.LuxShortPathProfile:
 		return verifyLuxShortPathInventory(isolated)
-	case benchlayout.CodegenLiteralProfile:
-		const root = benchlayout.CodegenLiteralBenchmark
-		if !verifiedBenchmarkLeaves(isolated[root], root, "duration_leading_zero", "duration_plain", "int_leading_zero", "int_plain") {
-			return errors.New("codegen integer literal profile requires the four verified integer and duration leaves")
+	case benchlayout.CodegenLiteralProfile, benchlayout.CodegenReceiverProfile,
+		benchlayout.CodegenMigrationStateProfile, benchlayout.CodegenRelationLoaderProfile:
+		return verifyCodegenProfileLeaves(profile, isolated)
+	case benchlayout.SemanticEventEmitsProfile:
+		const root = benchlayout.SemanticEventEmitsBenchmark
+		leaves := benchmarkCaseProduct([]string{"direct_0", "direct_1", "direct_128"}, []string{"recursive=false", "recursive=true"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("semantic event collection profile requires the six verified benchmark leaves")
 		}
-	case benchlayout.CodegenReceiverProfile:
-		return verifyCodegenReceiverInventory(isolated)
-	case benchlayout.CodegenMigrationStateProfile:
-		return verifyCodegenMigrationStateInventory(isolated)
 	case benchlayout.APILocalRouteExportProfile:
 		const root = benchlayout.APILocalRouteExportBenchmark
 		if !verifiedBenchmarkLeaves(isolated[root], root, "routes=1/previous", "routes=1/current", "routes=16/previous",
@@ -147,6 +150,8 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 		return verifyAPICanonicalJSONInventory(isolated)
 	case benchlayout.APIBinaryParamLookupProfile:
 		return verifyAPIBinaryParamLookupInventory(isolated)
+	case benchlayout.APIRequestLogProfile:
+		return verifyAPIRequestLogInventory(isolated)
 	case benchlayout.LuviaGatewayIdentityProfile:
 		const root = benchlayout.LuviaGatewayIdentityBenchmark
 		if !verifiedBenchmarkLeaves(isolated[root], root, "anonymous/before", "anonymous/after", "authenticated/before",
@@ -170,21 +175,10 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 		}
 	case benchlayout.LuviaResolvedFieldsProfile:
 		return verifyResolvedFieldsInventory(isolated)
-	case benchlayout.RPCOwnedRequestProfile:
-		const root = benchlayout.RPCOwnedRequestBenchmark
-		leaves := benchmarkCaseProduct([]string{"0", "128", "4096", "65536"}, []string{"before", "owned"})
-		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
-			return errors.New("RPC owned-request profile requires the eight verified benchmark leaves")
-		}
-	case benchlayout.RPCDeadlineProfile:
-		const root = benchlayout.RPCDeadlineBenchmark
-		leaves := benchmarkCaseProduct([]string{"NoDeadline", "Cancelled", "ExpiredEOF", "FutureTimeout", "ExpiredTimeout", "WrappedTimeout"},
-			[]string{"Before", "After"})
-		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
-			return errors.New("RPC deadline classification profile requires the twelve verified benchmark leaves")
-		}
-	case benchlayout.RPCNilContextGuardProfile:
-		return verifyRPCNilContextGuardInventory(isolated)
+	case benchlayout.RPCOwnedRequestProfile, benchlayout.RPCDeadlineProfile, benchlayout.RPCNilContextGuardProfile, benchlayout.RPCPreparedFrameProfile, benchlayout.RPCHandlerPanicProfile:
+		return verifyRPCProfileLeaves(profile, isolated)
+	case benchlayout.QueueStreamNameProfile:
+		return verifyPairedBenchmarkInventory(isolated, benchlayout.QueueStreamNameBenchmark, "tasks", "email.send", "email_send")
 	case benchlayout.LuviaConvenienceKeysProfile:
 		const root = benchlayout.LuviaConvenienceKeysBenchmark
 		leaves := benchmarkCaseProduct([]string{"row-small", "row-wide", "column-small", "column-batch", "column-many"},
@@ -192,6 +186,35 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
 			return errors.New("Luvia convenience keys profile requires the twenty verified benchmark leaves")
 		}
+	default:
+		return verifyAPIWholeFixtureLeaves(profile, isolated)
+	}
+	return nil
+}
+
+func verifyRPCOwnedRequestInventory(isolated inventory) error {
+	const root = benchlayout.RPCOwnedRequestBenchmark
+	leaves := benchmarkCaseProduct([]string{"0", "128", "4096", "65536"}, []string{"before", "owned"})
+	if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+		return errors.New("RPC owned-request profile requires the eight verified benchmark leaves")
+	}
+	return nil
+}
+
+func verifyRPCDeadlineInventory(isolated inventory) error {
+	const root = benchlayout.RPCDeadlineBenchmark
+	leaves := benchmarkCaseProduct([]string{"NoDeadline", "Cancelled", "ExpiredEOF", "FutureTimeout", "ExpiredTimeout", "WrappedTimeout"},
+		[]string{"Before", "After"})
+	if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+		return errors.New("RPC deadline classification profile requires the twelve verified benchmark leaves")
+	}
+	return nil
+}
+
+func verifyPairedBenchmarkInventory(isolated inventory, root string, inputs ...string) error {
+	leaves := benchmarkCaseProduct(inputs, []string{"before", "after"})
+	if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+		return fmt.Errorf("%s profile requires the %d verified benchmark leaves", root, len(leaves))
 	}
 	return nil
 }
@@ -217,17 +240,58 @@ func verifyResolvedFieldsInventory(isolated inventory) error {
 	return nil
 }
 
+func verifyAPIWholeFixtureLeaves(profile string, isolated inventory) error {
+	switch profile {
+	case benchlayout.APIIdentityConditionProfile:
+		const root = benchlayout.APIIdentityConditionBenchmark
+		leaves := benchmarkCaseProduct([]string{"empty", "member", "missing", "wrong-kind"},
+			[]string{"EnumChecked", "EnumReference", "OwnChecked", "OwnReference", "TextChecked", "TextReference"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("API identity condition profile requires the 24 verified benchmark leaves")
+		}
+	case benchlayout.APIHandlerPanicProfile:
+		const root = benchlayout.APIHandlerPanicBenchmark
+		leaves := benchmarkCaseProduct([]string{"BusinessError", "OpaquePanic", "StringPanic", "Success"}, []string{"Before", "After"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("API handler panic profile requires the eight verified benchmark leaves")
+		}
+	case benchlayout.APIWebSocketRegistrationsProfile:
+		const root = benchlayout.APIWebSocketRegistrationsBenchmark
+		leaves := benchmarkCaseProduct([]string{"size=1", "size=8", "size=64"}, []string{"checked", "former"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("API WebSocket registration profile requires the six verified benchmark leaves")
+		}
+	}
+	return nil
+}
+
 func verifyAPINonIdentityCompanions(ordinary, isolated inventory) error {
 	// Discovery still checks the broad binary before assigning these roots
 	// exclusively to their corresponding sampling binaries.
 	for root, leaves := range ordinary {
 		switch benchlayout.ProfileForBenchmark(benchlayout.APIPackage, root) {
-		case benchlayout.APILocalRouteExportProfile, benchlayout.APICanonicalJSONProfile, benchlayout.APIBinaryParamLookupProfile:
+		case benchlayout.APIStaticValueParamsProfile:
+			fallthrough
+		case benchlayout.APILocalRouteExportProfile, benchlayout.APICanonicalJSONProfile,
+			benchlayout.APIBinaryParamLookupProfile, benchlayout.APIRequestLogProfile,
+			benchlayout.APIHandlerPanicProfile, benchlayout.APIWebSocketRegistrationsProfile:
 			if !maps.Equal(leaves, isolated[root]) {
 				return fmt.Errorf("API non-identity profile must retain the ordinary %s inventory", root)
 			}
 			delete(isolated, root)
 		}
+	}
+	return nil
+}
+
+func verifyAPIRequestLogInventory(isolated inventory) error {
+	const boundary = benchlayout.APIRequestLogBoundaryBenchmark
+	const delivered = benchlayout.APIRequestLogDeliveredBenchmark
+	if !verifiedBenchmarkLeaves(isolated[boundary], boundary, "disabled", "full", "synchronous", "unsampled") {
+		return errors.New("API request-log profile requires the four verified boundary leaves")
+	}
+	if _, ok := isolated[delivered][delivered+"-2"]; !ok || len(isolated[delivered]) != 1 {
+		return errors.New("API request-log profile requires the verified delivery leaf")
 	}
 	return nil
 }
@@ -278,6 +342,26 @@ func benchmarkCaseProduct(values, variants []string) []string {
 		}
 	}
 	return cases
+}
+
+func verifyCodegenProfileLeaves(profile string, isolated inventory) error {
+	switch profile {
+	case benchlayout.CodegenLiteralProfile:
+		const root = benchlayout.CodegenLiteralBenchmark
+		if !verifiedBenchmarkLeaves(isolated[root], root, "duration_leading_zero", "duration_plain", "int_leading_zero", "int_plain") {
+			return errors.New("codegen integer literal profile requires the four verified integer and duration leaves")
+		}
+	case benchlayout.CodegenReceiverProfile:
+		return verifyCodegenReceiverInventory(isolated)
+	case benchlayout.CodegenMigrationStateProfile:
+		return verifyCodegenMigrationStateInventory(isolated)
+	case benchlayout.CodegenRelationLoaderProfile:
+		const root = benchlayout.CodegenRelationLoaderBenchmark
+		if !verifiedBenchmarkLeaves(isolated[root], root, "1/metadata", "1/source", "128/metadata", "128/source") {
+			return errors.New("codegen relation loader profile requires the four verified benchmark leaves")
+		}
+	}
+	return nil
 }
 
 func verifyCodegenReceiverInventory(isolated inventory) error {
@@ -412,4 +496,53 @@ func leafNames(leaves map[string]struct{}) []string {
 	}
 	slices.Sort(result)
 	return result
+}
+
+func verifyCompactProfileLeaves(profile string, isolated inventory) error {
+	switch profile {
+	case benchlayout.APIStaticValueParamsProfile:
+		const root = benchlayout.APIStaticValueParams
+		inputs := []string{"Bytes", "Decimal", "Duration", "RawJSON/short", "RawJSON/72KB", "UUID"}
+		inputs = append(inputs, benchmarkCaseProduct(
+			[]string{"BoolArray", "BytesArray", "DateTimeArray", "DecimalArray", "DurationArray", "FloatArray", "RawJSONArray"},
+			[]string{"0", "1", "128"})...)
+		leaves := benchmarkCaseProduct(inputs, []string{"JSON/previous", "JSON/static", "Binary/previous", "Binary/static"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("API static value profile requires the 108 verified benchmark leaves")
+		}
+	case benchlayout.RPCFrameReuseProfile:
+		const root = benchlayout.RPCFrameReuseBenchmark
+		leaves := benchmarkCaseProduct([]string{"0", "128", "4096", "65536"}, []string{"before", "reuse"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("RPC frame reuse profile requires the eight verified benchmark leaves")
+		}
+	case benchlayout.PGDurationWriteRejectProfile:
+		const root = benchlayout.PGDurationWriteReject
+		if !verifiedBenchmarkLeaves(isolated[root], root, "Scalar", "List128Last", "AfterDecimal") {
+			return errors.New("PG duration write reject profile requires the three verified benchmark leaves")
+		}
+	}
+	return nil
+}
+
+func verifyRPCProfileLeaves(profile string, isolated inventory) error {
+	switch profile {
+	case benchlayout.RPCOwnedRequestProfile:
+		return verifyRPCOwnedRequestInventory(isolated)
+	case benchlayout.RPCDeadlineProfile:
+		return verifyRPCDeadlineInventory(isolated)
+	case benchlayout.RPCNilContextGuardProfile:
+		return verifyRPCNilContextGuardInventory(isolated)
+	case benchlayout.RPCPreparedFrameProfile:
+		return verifyPairedBenchmarkInventory(isolated, benchlayout.RPCPreparedFrameBenchmark, "0", "128", "4096", "65536")
+	case benchlayout.RPCHandlerPanicProfile:
+		const root = benchlayout.RPCHandlerPanicBenchmark
+		leaves := benchmarkCaseProduct([]string{"BusinessError", "OpaquePanic", "StringPanic", "Success"}, []string{"Before", "After"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("RPC handler panic profile requires all eight verified leaves")
+		}
+	default:
+		return errors.New("unsupported RPC benchmark inventory profile")
+	}
+	return nil
 }

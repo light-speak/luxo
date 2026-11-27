@@ -1,4 +1,4 @@
-import { writeFileSync, mkdirSync, existsSync } from 'fs'
+import { writeFileSync, mkdirSync, existsSync, statSync } from 'fs'
 import { join } from 'path'
 import type { LuxoSchema, LuxoAPI, LuxoModel, LuxoField, TypeUsage } from '@luxojs/client'
 import { validateSchemaIDs } from '@luxojs/client'
@@ -7,8 +7,13 @@ import { genRequests, requestClass } from './codegen-request'
 import { genQueryBuilders, isDSLIdentifier } from './codegen-query'
 import { genCompleteCheck, genResponseBody, genScalarJSONRead, hasStructuredReturn, isScalar, luxoTypeToTS, schemaEntry } from './codegen-response'
 
+interface GenerationOptions {
+  staticRequests?: boolean
+  onWrite?: (file: string, contents: string) => void
+}
+
 /** Generate TypeScript types + client from Luxo schema */
-export async function generateTypes(schema: LuxoSchema, outDir: string, candidate?: { staticRequests: boolean }): Promise<void> {
+export async function generateTypes(schema: LuxoSchema, outDir: string, candidate?: GenerationOptions): Promise<void> {
   validateSchemaIDs(schema)
   validateTypeReferences(schema)
   const queries = genQueryBuilders(schema)
@@ -24,7 +29,17 @@ export async function generateTypes(schema: LuxoSchema, outDir: string, candidat
   if (!existsSync(outDir)) {
     mkdirSync(outDir, { recursive: true })
   }
-  for (const [name, contents] of files) writeFileSync(join(outDir, name), contents)
+  // Reject an obstructed destination before replacing any generated file.
+  for (const [name] of files) {
+    const file = join(outDir, name)
+    const existing = statSync(file, { throwIfNoEntry: false })
+    if (existing && !existing.isFile()) throw new Error(`[luxo] Cannot replace non-file SDK output: ${file}`)
+  }
+  for (const [name, contents] of files) {
+    const file = join(outDir, name)
+    writeFileSync(file, contents)
+    candidate?.onWrite?.(file, contents)
+  }
   console.log(`[luxo] Generated types → ${outDir}/`)
 }
 

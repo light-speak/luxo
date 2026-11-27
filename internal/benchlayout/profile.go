@@ -6,6 +6,16 @@ import (
 )
 
 const (
+	RPCFrameReuseProfile         = "rpc-frame-reuse"
+	RPCFrameReuseBenchmark       = "BenchmarkLRPCConnectionFrameReuseCandidate"
+	PGPackage                    = "pkg/lux/pg"
+	PGDurationWriteRejectProfile = "pg-duration-write-reject"
+	PGDurationWriteReject        = "BenchmarkDurationWriteReject"
+	APIStaticValueParamsProfile  = "api-static-value-params"
+	APIStaticValueParams         = "BenchmarkStaticValueParams"
+)
+
+const (
 	LuxShortPathProfile           = "lux-short-path"
 	LuxPackage                    = "pkg/lux"
 	LuxStrictFilterBenchmark      = "BenchmarkStrictFilterContract"
@@ -26,6 +36,14 @@ const (
 	RPCDeadlineBenchmark          = "BenchmarkRPCDeadlineClassification"
 	RPCNilContextGuardProfile     = "rpc-nil-context-guard"
 	RPCNilContextGuardBenchmark   = "BenchmarkRPCNilContextGuard"
+	RPCPreparedFrameProfile       = "rpc-prepared-frame"
+	RPCPreparedFrameBenchmark     = "BenchmarkLRPCPreparedFrame"
+	RPCHandlerPanicProfile        = "rpc-handler-panic"
+	RPCHandlerPanicBenchmark      = "BenchmarkHandlerPanicFormatting"
+	QueuePackage                  = "pkg/lux/queue"
+	NATSQueuePackage              = "pkg/lux/nats/queue"
+	QueueStreamNameProfile        = "queue-stream-name"
+	QueueStreamNameBenchmark      = "BenchmarkQueueStreamName"
 	CodecReaderBenchmark          = "BenchmarkElementPayload"
 	APIPackage                    = "pkg/lux/api"
 	LuviaPackage                  = "pkg/lux/luvia"
@@ -38,11 +56,28 @@ const (
 	CodegenMigrationStateProfile   = "codegen-migration-state"
 	CodegenMigrationStateBenchmark = "BenchmarkMigrationStateValidation"
 
-	APILocalRouteExportProfile    = "api-local-route-export"
-	APILocalRouteExportBenchmark  = "BenchmarkLocalRouteExport"
-	APICanonicalJSONProfile       = "api-canonical-json"
-	APIBinaryParamLookupProfile   = "api-binary-param-lookup"
-	APIBinaryParamLookupBenchmark = "BenchmarkBinaryParamLookup"
+	CodegenRelationLoaderProfile   = "codegen-relation-loader"
+	CodegenRelationLoaderBenchmark = "BenchmarkRelationLoaderGeneration"
+
+	SemanticPackage             = "pkg/semantic"
+	SemanticEventEmitsProfile   = "semantic-event-emits"
+	SemanticEventEmitsBenchmark = "BenchmarkCollectEventEmits"
+
+	APILocalRouteExportProfile      = "api-local-route-export"
+	APILocalRouteExportBenchmark    = "BenchmarkLocalRouteExport"
+	APICanonicalJSONProfile         = "api-canonical-json"
+	APIBinaryParamLookupProfile     = "api-binary-param-lookup"
+	APIBinaryParamLookupBenchmark   = "BenchmarkBinaryParamLookup"
+	APIRequestLogProfile            = "api-request-log"
+	APIRequestLogBoundaryBenchmark  = "BenchmarkRequestLogBoundary"
+	APIRequestLogDeliveredBenchmark = "BenchmarkRequestLogDelivered"
+
+	APIIdentityConditionProfile        = "api-identity-condition"
+	APIIdentityConditionBenchmark      = "BenchmarkIdentityConditionValidity"
+	APIHandlerPanicProfile             = "api-handler-panic"
+	APIHandlerPanicBenchmark           = "BenchmarkHandlerPanicFormatting"
+	APIWebSocketRegistrationsProfile   = "api-websocket-registrations"
+	APIWebSocketRegistrationsBenchmark = "BenchmarkWSConnectionRegistrations"
 
 	LuviaMergeDestinationProfile   = "luvia-merge-destination"
 	LuviaMergeDestinationBenchmark = "BenchmarkMergeDestination"
@@ -55,7 +90,12 @@ const (
 )
 
 var apiIdentityRoots = []string{
-	"BenchmarkIdentityConditionValidity", "BenchmarkIdentityEnumArray", "BenchmarkIdentitySubjectVisibility",
+	APIIdentityConditionBenchmark, "BenchmarkIdentityEnumArray", "BenchmarkIdentitySubjectVisibility",
+}
+
+// IsAPIIdentityBenchmark reports whether the broad API binary must omit the root.
+func IsAPIIdentityBenchmark(root string) bool {
+	return slices.Contains(apiIdentityRoots, root)
 }
 
 const apiCanonicalJSONPrefix = "BenchmarkCanonicalJSON"
@@ -76,14 +116,15 @@ func ProfileForBenchmark(pkg, name string) string {
 		if root == CodecReaderBenchmark {
 			return CodecReaderProfile
 		}
+	case PGPackage:
+		if root == PGDurationWriteReject {
+			return PGDurationWriteRejectProfile
+		}
 	case RPCPackage:
-		switch root {
-		case RPCOwnedRequestBenchmark:
-			return RPCOwnedRequestProfile
-		case RPCDeadlineBenchmark:
-			return RPCDeadlineProfile
-		case RPCNilContextGuardBenchmark:
-			return RPCNilContextGuardProfile
+		return rpcBenchmarkProfile(root)
+	case QueuePackage:
+		if root == QueueStreamNameBenchmark {
+			return QueueStreamNameProfile
 		}
 	case APIPackage:
 		return apiBenchmarkProfile(root)
@@ -104,21 +145,47 @@ func ProfileForBenchmark(pkg, name string) string {
 			return LuviaPrimaryTraceProfile
 		}
 	case CodegenPackage:
-		switch root {
-		case CodegenLiteralBenchmark:
-			return CodegenLiteralProfile
-		case CodegenReceiverBenchmark:
-			return CodegenReceiverProfile
-		case CodegenMigrationStateBenchmark:
-			return CodegenMigrationStateProfile
+		return codegenBenchmarkProfile(root)
+	case SemanticPackage:
+		if root == SemanticEventEmitsBenchmark {
+			return SemanticEventEmitsProfile
 		}
 	}
 	return DefaultProfile
 }
 
+func codegenBenchmarkProfile(root string) string {
+	switch root {
+	case CodegenLiteralBenchmark:
+		return CodegenLiteralProfile
+	case CodegenReceiverBenchmark:
+		return CodegenReceiverProfile
+	case CodegenMigrationStateBenchmark:
+		return CodegenMigrationStateProfile
+	case CodegenRelationLoaderBenchmark:
+		return CodegenRelationLoaderProfile
+	default:
+		return DefaultProfile
+	}
+}
+
 func apiBenchmarkProfile(root string) string {
+	switch root {
+	case APIIdentityConditionBenchmark:
+		return APIIdentityConditionProfile
+	case APIHandlerPanicBenchmark:
+		return APIHandlerPanicProfile
+	case APIWebSocketRegistrationsBenchmark:
+		return APIWebSocketRegistrationsProfile
+	}
+	if root == APIRequestLogBoundaryBenchmark || root == APIRequestLogDeliveredBenchmark {
+		return APIRequestLogProfile
+	}
 	if root == APIBinaryParamLookupBenchmark {
 		return APIBinaryParamLookupProfile
+	}
+	if root == APIStaticValueParams {
+		return APIStaticValueParamsProfile
 	}
 	if root == APILocalRouteExportBenchmark {
 		return APILocalRouteExportProfile
@@ -126,7 +193,7 @@ func apiBenchmarkProfile(root string) string {
 	if family, ok := strings.CutPrefix(root, apiCanonicalJSONPrefix); ok && slices.Contains(apiCanonicalJSONFamilies, family) {
 		return APICanonicalJSONProfile
 	}
-	if !slices.Contains(apiIdentityRoots, root) {
+	if !IsAPIIdentityBenchmark(root) {
 		return APINonIdentityProfile
 	}
 	return DefaultProfile
@@ -144,18 +211,30 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 		return []IsolationSpec{{LuxShortPathProfile, "^" + LuxStrictFilterBenchmark + "$|^" + LuxDecimalAlignmentBenchmark + "$"}}
 	case CodecPackage:
 		return []IsolationSpec{{CodecReaderProfile, "."}}
+	case PGPackage:
+		return []IsolationSpec{{PGDurationWriteRejectProfile, "^" + PGDurationWriteReject + "$"}}
 	case RPCPackage:
 		return []IsolationSpec{
 			{RPCOwnedRequestProfile, "^" + RPCOwnedRequestBenchmark + "$"},
 			{RPCDeadlineProfile, "^" + RPCDeadlineBenchmark + "$"},
 			{RPCNilContextGuardProfile, "^" + RPCNilContextGuardBenchmark + "$"},
+			{RPCPreparedFrameProfile, "^" + RPCPreparedFrameBenchmark + "$"},
+			{RPCFrameReuseProfile, "^" + RPCFrameReuseBenchmark + "$"},
+			{RPCHandlerPanicProfile, "^" + RPCHandlerPanicBenchmark + "$"},
 		}
+	case QueuePackage:
+		return []IsolationSpec{{QueueStreamNameProfile, "^" + QueueStreamNameBenchmark + "$"}}
 	case APIPackage:
 		return []IsolationSpec{
 			{APINonIdentityProfile, "."},
 			{APILocalRouteExportProfile, "^" + APILocalRouteExportBenchmark + "$"},
+			{APIStaticValueParamsProfile, "^" + APIStaticValueParams + "$"},
 			{APICanonicalJSONProfile, "^" + apiCanonicalJSONPrefix + "(" + strings.Join(apiCanonicalJSONFamilies, "|") + ")$"},
 			{APIBinaryParamLookupProfile, "^" + APIBinaryParamLookupBenchmark + "$"},
+			{APIRequestLogProfile, "^" + APIRequestLogBoundaryBenchmark + "$|^" + APIRequestLogDeliveredBenchmark + "$"},
+			{APIIdentityConditionProfile, "^" + APIIdentityConditionBenchmark + "$"},
+			{APIHandlerPanicProfile, "^" + APIHandlerPanicBenchmark + "$"},
+			{APIWebSocketRegistrationsProfile, "^" + APIWebSocketRegistrationsBenchmark + "$"},
 		}
 	case LuviaPackage:
 		return []IsolationSpec{
@@ -171,7 +250,10 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{CodegenLiteralProfile, "^" + CodegenLiteralBenchmark + "$"},
 			{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"},
 			{CodegenMigrationStateProfile, "^" + CodegenReceiverBenchmark + "$|^" + CodegenMigrationStateBenchmark + "$"},
+			{CodegenRelationLoaderProfile, "^" + CodegenRelationLoaderBenchmark + "$"},
 		}
+	case SemanticPackage:
+		return []IsolationSpec{{SemanticEventEmitsProfile, "^" + SemanticEventEmitsBenchmark + "$"}}
 	default:
 		return nil
 	}
@@ -184,4 +266,23 @@ func ValidPerformanceProfile(pkg, profile string) bool {
 	return slices.ContainsFunc(IsolationProfiles(pkg), func(spec IsolationSpec) bool {
 		return spec.Name == profile
 	})
+}
+
+func rpcBenchmarkProfile(root string) string {
+	switch root {
+	case RPCOwnedRequestBenchmark:
+		return RPCOwnedRequestProfile
+	case RPCDeadlineBenchmark:
+		return RPCDeadlineProfile
+	case RPCNilContextGuardBenchmark:
+		return RPCNilContextGuardProfile
+	case RPCPreparedFrameBenchmark:
+		return RPCPreparedFrameProfile
+	case RPCFrameReuseBenchmark:
+		return RPCFrameReuseProfile
+	case RPCHandlerPanicBenchmark:
+		return RPCHandlerPanicProfile
+	default:
+		return DefaultProfile
+	}
 }

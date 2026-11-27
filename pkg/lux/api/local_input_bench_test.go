@@ -24,24 +24,29 @@ func BenchmarkLocalRouteLookup(b *testing.B) {
 		name := fmt.Sprintf("api%d", count-1)
 		ctx, req := b.Context(), &Request{}
 		b.Run(fmt.Sprintf("routes=%d/previous", count), func(b *testing.B) {
+			before := calls
 			b.ReportAllocs()
 			for b.Loop() {
 				if err := previous[name](ctx, req); err != nil {
 					b.Fatal(err)
 				}
 			}
+			if calls == before {
+				b.Fatal("no calls")
+			}
 		})
 		b.Run(fmt.Sprintf("routes=%d/current", count), func(b *testing.B) {
+			before := calls
 			b.ReportAllocs()
 			for b.Loop() {
 				if err := current[name].call(ctx, req); err != nil {
 					b.Fatal(err)
 				}
 			}
+			if calls == before {
+				b.Fatal("no calls")
+			}
 		})
-		if calls == 0 {
-			b.Fatal("no calls")
-		}
 	}
 }
 
