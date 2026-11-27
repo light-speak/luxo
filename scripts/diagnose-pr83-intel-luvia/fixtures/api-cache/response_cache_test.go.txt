@@ -1,0 +1,26 @@
+package api
+
+import (
+	"github.com/light-speak/luxo/pkg/cachepolicy"
+	"github.com/light-speak/luxo/pkg/lux/cache"
+	"github.com/light-speak/luxo/pkg/lux/schema"
+	"testing"
+	"time"
+)
+
+func testPrivateCachePolicy(ttl time.Duration) *schema.CachePolicy {
+	return &schema.CachePolicy{Mode: cachepolicy.TTL, TTL: ttl, Scope: cachepolicy.Private}
+}
+
+func testResponseCache(t testing.TB, backend cache.Cache, service string) *ResponseCache {
+	t.Helper()
+	c, err := NewResponseCache(backend, CacheNamespace{Project: "project", Environment: "test", Service: service, Revision: "revision"}, testResponseOriginOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func testResponseOriginOptions() ResponseOriginOptions {
+	return ResponseOriginOptions{MaxConcurrent: 16, MaxWaiting: 128, WaitTimeout: time.Second}
+}

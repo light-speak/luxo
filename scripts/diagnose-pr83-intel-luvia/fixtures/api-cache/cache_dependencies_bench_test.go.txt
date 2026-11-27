@@ -1,0 +1,34 @@
+package api
+
+import (
+	"fmt"
+	"github.com/light-speak/luxo/pkg/lux/schema"
+	"testing"
+)
+
+func BenchmarkCacheExecutionDependencyCollection(b *testing.B) {
+	for _, count := range []int{1, 16, 128} {
+		b.Run(fmt.Sprintf("models=%d", count), func(b *testing.B) {
+			rt := cacheDependencyRouter(b)
+			definition := rt.Schema.APIs["cached"]
+			definition.ReturnType = "Int"
+			definition.CacheDependencies.Models = nil
+			for i := range count {
+				name := fmt.Sprintf("Model%d", i)
+				rt.Schema.RegisterModel(&schema.Model{Name: name, Module: "s"})
+				definition.CacheDependencies.Models = append(definition.CacheDependencies.Models, schema.ComputedSource{Model: name, Module: "s"})
+			}
+			if err := rt.Validate(); err != nil {
+				b.Fatal(err)
+			}
+			plan, dst := rt.cachePlans["cached"], make([]schema.ComputedSource, 0, count)
+			b.ReportAllocs()
+			for b.Loop() {
+				got, err := plan.appendModels(dst, nil)
+				if err != nil || len(got) != count {
+					b.Fatalf("got %d, %v", len(got), err)
+				}
+			}
+		})
+	}
+}

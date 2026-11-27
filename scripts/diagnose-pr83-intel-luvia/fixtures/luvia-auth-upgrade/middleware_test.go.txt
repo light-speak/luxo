@@ -1,0 +1,17 @@
+package luvia
+
+import (
+	"github.com/light-speak/luxo/pkg/lux/auth"
+	"time"
+)
+
+func testCfg() *auth.Config {
+	return &auth.Config{
+		Secret:  "test-secret",
+		Expires: time.Hour,
+	}
+}
+
+func testClaimsJSON(raw string) auth.ClaimsWriter {
+	return func(dst []byte) ([]byte, error) { return append(dst, raw...), nil }
+}

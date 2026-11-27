@@ -1,0 +1,180 @@
+{
+  "A": {
+    "commit": "3112404a791a34bc0dcfec08ee27269b7bcb25a4",
+    "tree": "e7cdef6f425ebae67b5a86543cb19f5af2fbc0dd"
+  },
+  "H": {
+    "commit": "0656423e61b98515dc2caa2d56f2041ea551942c",
+    "parents": [
+      "a6cca9106891c4207a90358642242b47590a5703",
+      "3112404a791a34bc0dcfec08ee27269b7bcb25a4"
+    ],
+    "tree": "716ba1ee8dd2796d7214db454b4e84cd810f1027"
+  },
+  "artifacts": {
+    "02": [
+      15167066723,
+      "fac922bbbaf7091eb66d4013eeb1d3e7d2badf423db4e61a6225c9853469728b"
+    ],
+    "04": [
+      15167147232,
+      "a5687c2996fe270517256c6990d9bb81d3da5533a1c3e0a8c9838410f85cb091"
+    ],
+    "plan": [
+      15165951923,
+      "c07bfbdbd786c5c50fbd941b60e3ba66a35f6171e6e3776363605444b7bf654e"
+    ]
+  },
+  "compileProfileSHA256": "da420a1b162d65db84cebd32bd329720aadbcc36508fb51df6b9378a6b963803",
+  "families": {
+    "api-cache": {
+      "expected": [
+        "BenchmarkCacheExecutionDependencyCollection/models=1-2",
+        "BenchmarkCacheExecutionDependencyCollection/models=128-2",
+        "BenchmarkCacheExecutionDependencyCollection/models=16-2"
+      ],
+      "hot": "BenchmarkCacheExecutionDependencyCollection|cacheExecutionPlan.*appendModels",
+      "keep": {
+        "cache_dependencies_bench_test.go": {
+          "declarations": {
+            "BenchmarkCacheExecutionDependencyCollection": "5f42c22dc2a40cbc50f6b777d0246272f4d390abdad1bd8ecdbfd10d6090a3e5"
+          },
+          "inputSHA256": "69dd6bf66f6b81ae2320762a6794bc70fb1a007851e6dd4fe0837ab3924fba14",
+          "projectedSHA256": "af4753fb89d25d389f29d671d35addcea0aa0ce2c2316d654eb8de8d5cfd2cc2"
+        },
+        "cache_dependencies_test.go": {
+          "declarations": {
+            "cacheDependencyRouter": "beecfda735344dc927efa8d807ac2228bf63e0c61c2cab6cf9c472dd54d45d94"
+          },
+          "inputSHA256": "503197b83cd959cb1dcdbe3b15e2a099cf74ee29bcb47148030c2935251fe32c",
+          "projectedSHA256": "e026ae8b092be6d2d830ced53a15a79ac5042f175c0e2edfb040f64a9b4de21b"
+        },
+        "response_cache_test.go": {
+          "declarations": {
+            "testPrivateCachePolicy": "5610177d42b551c789bbf686575b9daf2ceeb34c17502f9c2433a305b51a45b6",
+            "testResponseCache": "4ab5204ec00217f1ffd5ab8ec363d766fbabcbb5b07c5210e7a887e0c1d57da0",
+            "testResponseOriginOptions": "2bb74cdff2704a032519bfb757eb29264ef01a3618b00e1c6a4ddef5d090d31c"
+          },
+          "inputSHA256": "982d2c580b26a16a249d8e9abf57e9059d03f8d7870336927c5a688bee1bfb04",
+          "projectedSHA256": "f92db0d731ae574bc7b9e2ed9113ae4ed8ff3c9052a411d344e771568c29c901"
+        }
+      },
+      "package": "pkg/lux/api",
+      "projection": {
+        "projected": {
+          "cache_dependencies_bench_test.go": "af4753fb89d25d389f29d671d35addcea0aa0ce2c2316d654eb8de8d5cfd2cc2",
+          "cache_dependencies_test.go": "e026ae8b092be6d2d830ced53a15a79ac5042f175c0e2edfb040f64a9b4de21b",
+          "response_cache_test.go": "f92db0d731ae574bc7b9e2ed9113ae4ed8ff3c9052a411d344e771568c29c901"
+        },
+        "removed": 126
+      },
+      "root": "BenchmarkCacheExecutionDependencyCollection",
+      "shard": "02",
+      "stockOverlay": {
+        "pkg/lux/api/identity_reader_bench_test.go": "",
+        "pkg/lux/api/identity_reader_fuzz_test.go": "",
+        "pkg/lux/api/identity_reader_test.go": "",
+        "pkg/lux/api/identity_value_test.go": ""
+      },
+      "stockProfile": "api-non-identity",
+      "timed": [
+        "models=1"
+      ]
+    },
+    "luvia-auth-upgrade": {
+      "expected": [
+        "BenchmarkAuthUpgradeHeaders/anonymous-get/before-2",
+        "BenchmarkAuthUpgradeHeaders/anonymous-get/current-2",
+        "BenchmarkAuthUpgradeHeaders/anonymous-http/before-2",
+        "BenchmarkAuthUpgradeHeaders/anonymous-http/current-2",
+        "BenchmarkAuthUpgradeHeaders/bearer-get/before-2",
+        "BenchmarkAuthUpgradeHeaders/bearer-get/current-2",
+        "BenchmarkAuthUpgradeHeaders/bearer-http/before-2",
+        "BenchmarkAuthUpgradeHeaders/bearer-http/current-2",
+        "BenchmarkAuthUpgradeHeaders/bearer-ws/before-2",
+        "BenchmarkAuthUpgradeHeaders/bearer-ws/current-2",
+        "BenchmarkAuthUpgradeHeaders/query-ws/before-2",
+        "BenchmarkAuthUpgradeHeaders/query-ws/current-2"
+      ],
+      "hot": "BenchmarkAuthUpgradeHeaders|benchmarkAuthUpgrade|authMiddlewareBeforeUpgradeHeaders|[.]AuthMiddleware",
+      "keep": {
+        "middleware_test.go": {
+          "declarations": {
+            "testCfg": "b3c19f1a1f3fca138ec27ed85a195e4c132a05fa90c3936ca2315a075dde8cf4",
+            "testClaimsJSON": "b1688b85788434500d15393ca3413187d8d47843e0a55974c5b526bcd8398272"
+          },
+          "inputSHA256": "a284f6673c86a90ed916099ac82a6ffb0e9b190161c946989957839252b07034",
+          "projectedSHA256": "8b4c7c40fdad6eed73640108a3bfc88b9107649c2fd381494c1229b47dae2536"
+        },
+        "middleware_upgrade_bench_test.go": {
+          "declarations": "complete stock fixture",
+          "inputSHA256": "51a1221852e6c2488499172dbd5bb904ad157e268871ec06f9a365495b3a25aa",
+          "projectedSHA256": null
+        }
+      },
+      "package": "pkg/lux/luvia",
+      "projection": {
+        "projected": {
+          "middleware_test.go": "8b4c7c40fdad6eed73640108a3bfc88b9107649c2fd381494c1229b47dae2536"
+        },
+        "removed": 42
+      },
+      "root": "BenchmarkAuthUpgradeHeaders",
+      "shard": "04",
+      "stockOverlay": {},
+      "stockProfile": "default",
+      "timed": [
+        "bearer-get/before",
+        "bearer-http/before"
+      ]
+    },
+    "luvia-plan": {
+      "expected": [
+        "BenchmarkPlanSelection/all-2",
+        "BenchmarkPlanSelection/nested-2"
+      ],
+      "hot": "BenchmarkPlanSelection|/luvia[.]Plan\\b",
+      "keep": {
+        "planner_test.go": {
+          "declarations": {
+            "BenchmarkPlanSelection": "c6f66d3768286d2bb017cd6795825a329afa6afffad03d495226bbddef9f9ae1",
+            "selectionNode": "937a853c8f0fa6503b03f53c2300a5e2a9c60520265cb3ee00f61cc7acdbc17f",
+            "userModelWithExtend": "852ad684d20db5c423a5083e576e27f60db0416333fe6a1a8bfa745490289c0c"
+          },
+          "inputSHA256": "b6c167a7901aad28d8535ec431ea9f138dc21ea31a990a6c3567c7d8592d3481",
+          "projectedSHA256": "9c7245b0abb427cd028e6de99214d842174dd76b7c8f98da77db392bfbf755cc"
+        }
+      },
+      "package": "pkg/lux/luvia",
+      "projection": {
+        "projected": {
+          "planner_test.go": "9c7245b0abb427cd028e6de99214d842174dd76b7c8f98da77db392bfbf755cc"
+        },
+        "removed": 43
+      },
+      "root": "BenchmarkPlanSelection",
+      "shard": "04",
+      "stockOverlay": {},
+      "stockProfile": "default",
+      "timed": [
+        "all",
+        "nested"
+      ]
+    }
+  },
+  "originalAttempt": 1,
+  "originalRun": 45924573899,
+  "revisions": [
+    "3112404a791a34bc0dcfec08ee27269b7bcb25a4",
+    "0656423e61b98515dc2caa2d56f2041ea551942c"
+  ],
+  "routes": {
+    "AMD EPYC 9V45 96-Core Processor": [
+      "luvia-auth-upgrade",
+      "luvia-plan"
+    ],
+    "Intel(R) Xeon(R) 6975P-C": [
+      "api-cache"
+    ]
+  }
+}

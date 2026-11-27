@@ -1,0 +1,24 @@
+package api
+
+import (
+	"github.com/light-speak/luxo/pkg/lux/cache"
+	"github.com/light-speak/luxo/pkg/lux/schema"
+	"testing"
+	"time"
+)
+
+func cacheDependencyRouter(t testing.TB) *Router {
+	t.Helper()
+	rt := NewRouterWithOptions(RouterOptions{ResponseCache: testResponseCache(t, cache.Nop{}, "s")})
+	rt.Schema.RegisterModel(&schema.Model{Name: "User", Module: "s", Fields: []schema.Field{
+		{ID: 1, Name: "id", Type: schema.FieldInt},
+		{ID: 2, Name: "posts", Type: schema.FieldModel, TypeName: "Post", Relation: true},
+		{ID: 3, Name: "postCount", Type: schema.FieldInt, Computed: true},
+	}, ComputedSources: map[string]schema.ComputedSource{"postCount": {Model: "Post", Module: "content"}}})
+	rt.Schema.RegisterModel(&schema.Model{Name: "Post", Module: "content", Fields: []schema.Field{{ID: 1, Name: "id", Type: schema.FieldInt}}})
+	rt.Schema.RegisterAPI(&schema.API{ID: 1, Name: "cached", Module: "s", ReturnType: "User", CachePolicy: testPrivateCachePolicy(time.Minute), CacheDependencies: &schema.CacheDependencies{
+		Models: []schema.ComputedSource{{Model: "User", Module: "s"}},
+	}})
+	rt.RequireCache("cached")
+	return rt
+}

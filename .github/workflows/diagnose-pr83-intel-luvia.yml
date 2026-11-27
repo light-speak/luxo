@@ -1,0 +1,99 @@
+name: Recheck PR 83 cache and Luvia timing on their original CPUs
+
+on:
+  push:
+    branches: [diagnostics/pr83-intel-luvia]
+
+permissions:
+  contents: read
+
+jobs:
+  witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 32
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3]
+    env:
+      GOTOOLCHAIN: local
+      RUNNER_KIND: ${{ runner.environment }}
+      SLOT: ${{ matrix.slot }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Match the original CPU before setup
+        id: route
+        run: python3 -I -B scripts/diagnose-pr83-intel-luvia/run.py --probe
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: 5376367706e217b18a676dfe932004a0f5419a04
+          path: .tmp/pr83-native-harness
+          sparse-checkout: scripts/diagnose-pr83-amd
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: 3112404a791a34bc0dcfec08ee27269b7bcb25a4
+          path: .tmp/pr83-intel-luvia-inputs/A
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: 0656423e61b98515dc2caa2d56f2041ea551942c
+          path: .tmp/pr83-intel-luvia-inputs/H
+          fetch-depth: 2
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        name: Compare original and projected binaries
+        timeout-minutes: 27
+        run: python3 -I -B scripts/diagnose-pr83-intel-luvia/run.py
+
+      - if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr83-intel-luvia-${{ github.run_id }}-${{ github.run_attempt }}-slot-${{ matrix.slot }}
+          path: .tmp/pr83-intel-luvia-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  qualification:
+    needs: witness
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/diagnose-pr83-intel-luvia
+          persist-credentials: false
+
+      - name: Require both CPU routes and unchanged threshold
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          results=$(mktemp -d .tmp/pr83-intel-luvia-receipts.XXXXXXXX)
+          trap 'rm -rf -- "$results"' EXIT
+          gh run download "$GITHUB_RUN_ID" --pattern "pr83-intel-luvia-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-slot-*" --dir "$results"
+          python3 -I -B scripts/diagnose-pr83-intel-luvia/run.py --summarize "$results" "$GITHUB_SHA"

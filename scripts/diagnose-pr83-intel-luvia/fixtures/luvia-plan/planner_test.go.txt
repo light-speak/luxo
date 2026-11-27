@@ -1,0 +1,55 @@
+package luvia
+
+import (
+	"github.com/light-speak/luxo/internal/testutil"
+	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/schema"
+	"testing"
+)
+
+func userModelWithExtend() *schema.Model {
+	s := schema.New()
+	s.RegisterModel(&schema.Model{
+		Name: "User",
+		Fields: []schema.Field{
+			{ID: 1, Name: "id", Type: schema.FieldInt},
+			{ID: 2, Name: "name", Type: schema.FieldString},
+			{ID: 3, Name: "email", Type: schema.FieldString},
+			// Extend field from post module
+			{ID: 10, Name: "posts", Type: schema.FieldModel, TypeName: "Post",
+				IsList: true, Relation: true, Module: "post", ForeignKey: "userId"},
+			// Extend field from comment module (relation, resolves via Comment model)
+			{ID: 11, Name: "comments", Type: schema.FieldModel, TypeName: "Comment",
+				IsList: true, Relation: true, Module: "comment", ForeignKey: "userId"},
+		},
+	})
+	return s.Models["User"]
+}
+
+func selectionNode(t testing.TB, mask []byte, children ...codec.SelectionMaskChild) []byte {
+	return testutil.Bytes(t)(codec.AppendSelectionMask(nil, mask, children))
+}
+
+func BenchmarkPlanSelection(b *testing.B) {
+	model := userModelWithExtend()
+	fields := testutil.Bytes(b)(codec.FieldMaskSet([]byte{3}, 10))
+	child := selectionNode(b, []byte{1})
+	selected := selectionNode(b, fields, codec.SelectionMaskChild{FieldID: 10, Mask: child})
+	for _, sample := range []struct {
+		name string
+		mask []byte
+	}{
+		{"all", nil},
+		{"nested", selected},
+	} {
+		b.Run(sample.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				plan, err := Plan(model, sample.mask, "user")
+				if err != nil || plan == nil {
+					b.Fatalf("valid plan failed: %v", err)
+				}
+			}
+		})
+	}
+}
