@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare migration history and acknowledgement writes on the pinned PostgreSQL protocols."""
+"""Compare combined migration journal and recovery costs on the pinned PostgreSQL protocols."""
 import argparse
 import base64
 import gzip
@@ -22,7 +22,7 @@ from types import SimpleNamespace
 HERE = Path(__file__).resolve().parent
 PAYLOAD = HERE / ".payload"
 SERVER = runpy.run_path(str(HERE / "server.py"))
-PARENT = '4b9bc65d1932815a86d6b24e566844a2c56bc9e2'
+PARENT = 'b5f89c3462e5e189b81524e583f3ae4a697c8a6c'
 BASE = '15765dee6705d39de0b5a505d3039d59ebf43584'
 BASE_TREE = '75aebe5bd2fa6b45a1c614ace1a816ebc63e4c0a'
 PROJECTION = {
@@ -51,8 +51,9 @@ PATCH_TREES = {
     "U": "d6abb02b268e93546c75ffc179d134f53f7e41d6",
     "V": "79efa3b5dfefe0e3c1f1c5440e9a4e95c61158a1",
     "W": "d5f47f034f5cad2c40ed7b05ae699bcc45948b21",
+    "C": "3a0f6cbdc7e3ce4bc3804babf40874ed5c43728c",
 }
-ARMS = {"P": BASE_TREE, "V": PATCH_TREES["V"], "W": PATCH_TREES["W"]}
+ARMS = {"P": BASE_TREE, "W": PATCH_TREES["W"], "C": PATCH_TREES["C"]}
 PATCHES = {
     "Q": (PROJECTION["mergeTree"], "a2c84ab8db37a7965c63f0a87befc0c5ab3875da2fb49235cc448b8975d8dccd"),
     "S": (PATCH_TREES["Q"], "42169934c30dd834f78222031bd50a7092bf2449615368d1fdea905cddef3ae2"),
@@ -60,10 +61,11 @@ PATCHES = {
     "U": (PATCH_TREES["T"], "dc9b089bb6c4933868e86ab88a4392a905dda333f5e83f2c39d753b0757898ff"),
     "V": (PATCH_TREES["U"], "98a42aa26e85a613014d0bb5f7f3b02a7e67237c4d3eb0509540c9880a373dd2"),
     "W": (PATCH_TREES["V"], "688c1cca1c13e4d746b9e651c8df3a4839f61fffe2c0aad38ec16143fd96e637"),
+    "C": (PATCH_TREES["W"], "65eb5a91b85c96ca850708fef0c47115fc2da35fc81e7b0a1fe0c7308fb00dc3"),
 }
 DIAGNOSTIC_PATHS = (
     "M\t.github/workflows/diagnose-pg-durable.yml",
-    "A\tscripts/diagnostics/pg-durable-hosted/.payload/arm-W.patch.gz.b64",
+    "A\tscripts/diagnostics/pg-durable-hosted/.payload/arm-C.patch.gz.b64",
     "M\tscripts/diagnostics/pg-durable-hosted/.payload/inputs.sha256",
     "M\tscripts/diagnostics/pg-durable-hosted/hosted.py",
 )
@@ -74,6 +76,7 @@ CHANGE_PATHS = {
     "U": ("migration_execution.go",),
     "V": ("migration_attempt.go", "migration_execution_test.go"),
     "W": ("migrate.go", "migration_attempt.go", "migration_execution_test.go"),
+    "C": ("migrate.go", "migration_attempt.go", "migration_execution.go", "pgdb.go"),
 }
 RETRY_LEAF = "retry-after-invalid-index-repair"
 JOURNAL_LEAF = "first-journal-and-create-index"
@@ -91,6 +94,45 @@ PROCESS_PROTOCOLS = {
     "standalone": "Identical concurrent up/down 3x and 1x selections to run 45900142426.",
 }
 CPU = "Neoverse-N2"
+COMBINED_BINDING = {
+    "W": "d5f47f034f5cad2c40ed7b05ae699bcc45948b21",
+    "combinedProductTree": "3a0f6cbdc7e3ce4bc3804babf40874ed5c43728c",
+    "fullProductAndTestsTree": "f16434141392d077c5e3028c6207c6b1af2b9ad6",
+    "productionPatchSHA256": "65eb5a91b85c96ca850708fef0c47115fc2da35fc81e7b0a1fe0c7308fb00dc3",
+    "productionPaths": {
+        "pkg/lux/pg/migrate/migrate.go": {
+            "sha256": "c6934015b65e7a01ef20c6aff1140a2a54955f42db2b09d3dde84fd1c17f8aa8",
+            "gitBlob": "875da07486e4664914b0756264d40ba9bffdd6a5"
+        },
+        "pkg/lux/pg/migrate/migration_attempt.go": {
+            "sha256": "8ceb154d6eb9e625c8935cdf2c7b91ca7b6aff80885d4b54652b465403a94a1a",
+            "gitBlob": "37e10b25b06d06e8343ac9ca63fb21f2f600396e"
+        },
+        "pkg/lux/pg/migrate/migration_execution.go": {
+            "sha256": "5a2bf83a19e1ea816f98262a171098e05ff9b4ecf1e8979da0ad6460ec110d65",
+            "gitBlob": "d292822099968fd224ba8df1884b629df625de59"
+        },
+        "pkg/lux/pg/migrate/pgdb.go": {
+            "sha256": "0d50fd2dddfb10a615dda91edf282168edf380eaee3c92d6690b997b5959856a",
+            "gitBlob": "f5c504779969c6e79d7f6d25af075ee7f88c2a15"
+        }
+    }
+}
+EXPECTED_FIXTURE_SHA256 = {
+    "recovery": {
+        "advisory_pair_test.go": "61f9bef4eed3ae0646484291fd8a0abdd4686edac23e799f6ec5559d511a0577",
+        "recovery_test.go": "e6d364b7362b55360ed352bfe9bdc6646fbf4f2ca2a662d6f69117ce2affbdef"
+    },
+    "journal": {
+        "advisory_pair_test.go": "61f9bef4eed3ae0646484291fd8a0abdd4686edac23e799f6ec5559d511a0577",
+        "recovery_test.go": "e6d364b7362b55360ed352bfe9bdc6646fbf4f2ca2a662d6f69117ce2affbdef"
+    },
+    "standalone": {
+        "durable_reset_test.go": "2e2017c28a0750dded29943e04a734d6935f2f4a1243ddfe18caef89b3906cac",
+        "migration_pair_test.go": "b3174256682ece5d3d42c3a419bbd35c698582e15895835580be20a42b1384f3"
+    }
+}
+
 
 
 def run(*args, **kwargs):
@@ -108,7 +150,7 @@ def put(path, value):
 def payload():
     names = {"shared.py", "advisory_pair_test.go", "first_query_test.go", "migration_pair_test.go",
              "durable_reset_test.go", "used_holder_reuse_test.go", "capacity_public_test.go", "recovery_test.go",
-             "arm-Q.patch.gz.b64", "arm-R.patch.gz.b64", "arm-S.patch.gz.b64", "arm-T.patch.gz.b64", "arm-U.patch.gz.b64", "arm-V.patch.gz.b64", "arm-W.patch.gz.b64"}
+             "arm-Q.patch.gz.b64", "arm-R.patch.gz.b64", "arm-S.patch.gz.b64", "arm-T.patch.gz.b64", "arm-U.patch.gz.b64", "arm-V.patch.gz.b64", "arm-W.patch.gz.b64", "arm-C.patch.gz.b64"}
     entries = {}
     for line in (PAYLOAD / "inputs.sha256").read_text().splitlines():
         digest, name = line.split("  ", 1)
@@ -151,7 +193,21 @@ def trees(repo, root):
             expected = [f"pkg/lux/pg/migrate/{path}" for path in CHANGE_PATHS[arm]]
             if changed != expected:
                 raise RuntimeError(f"{arm} changed files outside its bound scope")
+    actual = {path: run(*git, "rev-parse", f"{ARMS['C']}:{path}", text=True).strip()
+              for path in COMBINED_BINDING["productionPaths"]}
+    require_production_blobs(actual)
     return git
+
+
+def require_production_blobs(actual):
+    expected = {path: value["gitBlob"] for path, value in COMBINED_BINDING["productionPaths"].items()}
+    if actual != expected:
+        raise RuntimeError("combined production differs from its full tested source")
+
+
+def require_fixture_hashes(lane, actual):
+    if actual != EXPECTED_FIXTURE_SHA256[lane]:
+        raise RuntimeError("benchmark fixture differs from the bound native inventory")
 
 
 def standalone_fixture():
@@ -214,6 +270,7 @@ def prepare_arm(git, root, arm, env, evidence, lanes):
             for name in fixtures:
                 shutil.copyfile(PAYLOAD / name, target / name)
             fixture_hashes[lane] = {file.name: sha(file.read_bytes()) for file in sorted(target.glob("*.go"))}
+            require_fixture_hashes(lane, fixture_hashes[lane])
         packages = ["./pkg/lux/pg/" + PACKAGES[lane] for lane in lanes]
         graph = run("go", "list", "-mod=readonly", "-p=1", "-deps", "-test", *packages, cwd=src, env=workspace)
         verified = run("go", "mod", "verify", cwd=src, env=workspace, text=True).strip()
@@ -314,7 +371,7 @@ def sample(root, lane, name, arm, slots, slot, identities, iterations, evidence,
 
 
 def schedule(lane):
-    comparisons, controls = ("VW", "PW"), ("PP", "VV", "WW")
+    comparisons, controls = ("WC", "PC"), ("PP", "WW", "CC")
     control_count = {"recovery": 10, "journal": 10, "standalone": 5}[lane]
     for group, slots in enumerate(("ab", "ba"), 1):
         for pair in range(1, 11):
@@ -397,13 +454,17 @@ def run_lane(root, evidence, helper, lane, identities, smoke):
             raise RuntimeError(f"incomplete cleanup in {lane}")
 
 
-def replay(repo, root, evidence, entries):
-    current = run("git", "-C", str(repo), "rev-list", "--parents", "-n", "1", "HEAD", text=True).strip().split()
-    if current != [os.environ["GITHUB_SHA"], PARENT]:
+def require_append_identity(current, changed, head):
+    if current != [head, PARENT]:
         raise RuntimeError("unexpected diagnostic commit or parent")
-    changed = run("git", "-C", str(repo), "diff", "--name-status", PARENT, "HEAD", text=True).splitlines()
     if changed != list(DIAGNOSTIC_PATHS):
         raise RuntimeError("unexpected diagnostic append scope")
+
+
+def replay(repo, root, evidence, entries):
+    current = run("git", "-C", str(repo), "rev-list", "--parents", "-n", "1", "HEAD", text=True).strip().split()
+    changed = run("git", "-C", str(repo), "diff", "--name-status", PARENT, "HEAD", text=True).splitlines()
+    require_append_identity(current, changed, os.environ["GITHUB_SHA"])
     cpu = json.loads(run("lscpu", "-J"))
     put(evidence / "host-cpu.json", cpu)
     require_cpu(cpu)
@@ -420,7 +481,9 @@ def replay(repo, root, evidence, entries):
                                   "projection": PROJECTION, "historical": HISTORICAL, "modulePins": MODULE_PINS,
                                   "patchTrees": PATCH_TREES, "migrationFilesByPatch": CHANGE_PATHS,
                                   "job": job, "processProtocols": {lane: PROCESS_PROTOCOLS[lane] for lane in lanes},
-                                  "comparisons": {"VW": "retry history and acknowledgement execution modes", "PW": "remaining product costs"}})
+                                  "comparisons": {"WC": "combined retry lookups, object-name capacity and single standalone journal writes",
+                                                  "PC": "full remaining product costs"},
+                                  "combinedBinding": COMBINED_BINDING, "fixtureIdentity": EXPECTED_FIXTURE_SHA256})
     git = trees(repo, root)
     identities = {arm: prepare_arm(git, root, arm, env, evidence, lanes) for arm in ARMS}
     shared = runpy.run_path(str(PAYLOAD / "shared.py"))

@@ -1,4 +1,4 @@
-name: Compare PostgreSQL migration history and acknowledgement writes
+name: Compare PostgreSQL combined migration costs
 
 on:
   push:
