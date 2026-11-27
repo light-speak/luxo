@@ -175,14 +175,8 @@ func verifyProfileLeaves(profile string, isolated inventory) error {
 		}
 	case benchlayout.LuviaResolvedFieldsProfile:
 		return verifyResolvedFieldsInventory(isolated)
-	case benchlayout.RPCOwnedRequestProfile:
-		return verifyRPCOwnedRequestInventory(isolated)
-	case benchlayout.RPCDeadlineProfile:
-		return verifyRPCDeadlineInventory(isolated)
-	case benchlayout.RPCNilContextGuardProfile:
-		return verifyRPCNilContextGuardInventory(isolated)
-	case benchlayout.RPCPreparedFrameProfile:
-		return verifyPairedBenchmarkInventory(isolated, benchlayout.RPCPreparedFrameBenchmark, "0", "128", "4096", "65536")
+	case benchlayout.RPCOwnedRequestProfile, benchlayout.RPCDeadlineProfile, benchlayout.RPCNilContextGuardProfile, benchlayout.RPCPreparedFrameProfile, benchlayout.RPCHandlerPanicProfile:
+		return verifyRPCProfileLeaves(profile, isolated)
 	case benchlayout.QueueStreamNameProfile:
 		return verifyPairedBenchmarkInventory(isolated, benchlayout.QueueStreamNameBenchmark, "tasks", "email.send", "email_send")
 	case benchlayout.LuviaConvenienceKeysProfile:
@@ -527,6 +521,28 @@ func verifyCompactProfileLeaves(profile string, isolated inventory) error {
 		if !verifiedBenchmarkLeaves(isolated[root], root, "Scalar", "List128Last", "AfterDecimal") {
 			return errors.New("PG duration write reject profile requires the three verified benchmark leaves")
 		}
+	}
+	return nil
+}
+
+func verifyRPCProfileLeaves(profile string, isolated inventory) error {
+	switch profile {
+	case benchlayout.RPCOwnedRequestProfile:
+		return verifyRPCOwnedRequestInventory(isolated)
+	case benchlayout.RPCDeadlineProfile:
+		return verifyRPCDeadlineInventory(isolated)
+	case benchlayout.RPCNilContextGuardProfile:
+		return verifyRPCNilContextGuardInventory(isolated)
+	case benchlayout.RPCPreparedFrameProfile:
+		return verifyPairedBenchmarkInventory(isolated, benchlayout.RPCPreparedFrameBenchmark, "0", "128", "4096", "65536")
+	case benchlayout.RPCHandlerPanicProfile:
+		const root = benchlayout.RPCHandlerPanicBenchmark
+		leaves := benchmarkCaseProduct([]string{"BusinessError", "OpaquePanic", "StringPanic", "Success"}, []string{"Before", "After"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("RPC handler panic profile requires all eight verified leaves")
+		}
+	default:
+		return errors.New("unsupported RPC benchmark inventory profile")
 	}
 	return nil
 }

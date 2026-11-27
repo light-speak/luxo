@@ -124,14 +124,8 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-lux-short-path-*", writeLuxShortPathOverlay)
 	case benchlayout.CodecReaderProfile:
 		return codecReaderOverlay(root)
-	case benchlayout.RPCOwnedRequestProfile:
-		return packageTestOverlay(root, packagePath, "bench-rpc-owned-request-*", writeRPCOwnedRequestOverlay)
-	case benchlayout.RPCDeadlineProfile:
-		return packageTestOverlay(root, packagePath, "bench-rpc-deadline-*", writeRPCDeadlineOverlay)
-	case benchlayout.RPCNilContextGuardProfile:
-		return packageTestOverlay(root, packagePath, "bench-rpc-nil-context-guard-*", writeRPCNilContextGuardOverlay)
-	case benchlayout.RPCPreparedFrameProfile:
-		return pairedBenchmarkOverlay(root, packagePath, profile, rpcPreparedFrameFixture)
+	case benchlayout.RPCOwnedRequestProfile, benchlayout.RPCDeadlineProfile, benchlayout.RPCNilContextGuardProfile, benchlayout.RPCPreparedFrameProfile, benchlayout.RPCHandlerPanicProfile:
+		return rpcBenchmarkOverlay(root, packagePath, profile)
 	case benchlayout.QueueStreamNameProfile:
 		return pairedBenchmarkOverlay(root, packagePath, profile, queueStreamNameFixture)
 	case benchlayout.APINonIdentityProfile:
