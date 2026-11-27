@@ -1,86 +1,64 @@
 {
   "A": {
-    "commit": "f8924ac56afa77c460d7fc62f81df10e2673c202",
-    "tree": "d02e06f82eccee00666d9aec3e1c9c111149d27d"
+    "commit": "b5f6b0eb95f93516c306ca47dd74a1b532ecf018",
+    "tree": "a3e3a3eb9c15352b303672b83914d307b1a1b87e"
   },
   "H": {
-    "commit": "92cf68a18891338219102cec1aecb8e132a8c2c9",
+    "commit": "c28830cfa07be637af73c0861e662561f84780ad",
     "parents": [
-      "c884024aa15c7df09de2c42f70abd616bca8ac1c",
-      "f8924ac56afa77c460d7fc62f81df10e2673c202"
+      "92cf68a18891338219102cec1aecb8e132a8c2c9",
+      "b5f6b0eb95f93516c306ca47dd74a1b532ecf018"
     ],
-    "tree": "7cd4b1c24ec961f7101115d43293db79be94dc23"
+    "tree": "ba6eba050887a576a22ab2d5271208b4afbd5dd8"
   },
   "artifacts": {
     "01": {
-      "id": 15167980665,
-      "sha256": "424a85bc8ba6c65af137de68e377a7df84a82af77ee5d731c53dc4b093fb78d5"
+      "id": 15207238821,
+      "sha256": "6cc30df799a473310e69b6dd40246968d4ab79318a22462e6a35e3871b11234f"
     },
-    "03": {
-      "id": 15167579287,
-      "sha256": "d337c4ed7dd3a50e707b05279308cc7d68e3f5063915f48f93709127c4bd9589"
+    "plan": {
+      "id": 15206403065,
+      "sha256": "06ff4ecf39fd110f4ea0ef2749adb6e3ed651a5717e74be60f14b86fa4726814"
     }
   },
-  "cases": {
-    "gateway": {
-      "confirmed": [
-        "authenticated/after"
-      ],
-      "fixture": "middleware_test.go",
-      "hot": "BenchmarkGatewayIdentity|luvia\\.(New|newGateway|Identity)|context\\.\\(\\*valueCtx\\)\\.Value",
-      "leaves": [
-        "anonymous/before",
-        "anonymous/after",
-        "authenticated/before",
-        "authenticated/after",
-        "typed-nil/before",
-        "typed-nil/after"
-      ],
-      "profile": "luvia-gateway-identity",
-      "projectionSHA256": "ae790127f4acd6df4fe2388d239b2657c999add2e742584284c411bef514e365",
-      "root": "BenchmarkGatewayIdentity",
-      "shard": "01",
-      "timed": [
-        "authenticated/after",
-        "authenticated/before"
-      ]
-    },
-    "latency": {
-      "confirmed": [
-        "small/current",
-        "small/previous"
-      ],
-      "fixture": "metrics_json_test.go",
-      "hot": "BenchmarkLatencyPercentiles|/luvia\\.(latencyPercentiles|percentile)|slices\\..*pdqsortOrdered",
-      "leaves": [
-        "small/previous",
-        "small/current",
-        "medium/previous",
-        "medium/current",
-        "cap/previous",
-        "cap/current"
-      ],
-      "profile": "default",
-      "projectionSHA256": "4fd751f642f476c27882c067754968bfd525dd016ac1115dfa351b52f6fb75eb",
-      "root": "BenchmarkLatencyPercentiles",
-      "shard": "03",
-      "timed": [
-        "small/current",
-        "small/previous"
-      ]
-    }
+  "case": {
+    "confirmed": [
+      "authenticated/after",
+      "typed-nil/after"
+    ],
+    "fixture": "middleware_test.go",
+    "hot": "BenchmarkGatewayIdentity|luvia\\.(New|newGateway|Identity)|context\\.\\(\\*valueCtx\\)\\.Value",
+    "leaves": [
+      "anonymous/before",
+      "anonymous/after",
+      "authenticated/before",
+      "authenticated/after",
+      "typed-nil/before",
+      "typed-nil/after"
+    ],
+    "profile": "luvia-gateway-identity",
+    "projectionSHA256": "ae790127f4acd6df4fe2388d239b2657c999add2e742584284c411bef514e365",
+    "root": "BenchmarkGatewayIdentity",
+    "shard": "01",
+    "timed": [
+      "authenticated/after",
+      "authenticated/before",
+      "typed-nil/after",
+      "typed-nil/before"
+    ]
   },
-  "compileProfileSHA256": "8baea9be26bbb9772f30260da8e572a97903c8ebb5b6ffb418529ca8c70181de",
+  "compileProfileSHA256": "9f18768b43bb2154783ccc26c37a090f8d5380cbde942cc9b321b860e964bf48",
+  "cpu": "Intel(R) Xeon(R) 6975P-C",
   "diffSHA256": "ea584e777118545b3b51f9678eaa0e74c350ff803b96cdd6a35c91ec78ed7eb7",
   "originalAttempt": 1,
-  "originalRun": 45927527663,
-  "routes": {
-    "AMD EPYC 7763 64-Core Processor": "latency",
-    "Intel(R) Xeon(R) 6975P-C": "gateway"
+  "originalBatch": "pkg/lux/luvia\tluvia-gateway-identity\t^BenchmarkGatewayIdentity$/^authenticated$/^after$|^BenchmarkGatewayIdentity$/^authenticated$/^before$|^BenchmarkGatewayIdentity$/^typed-nil$/^after$|^BenchmarkGatewayIdentity$/^typed-nil$/^before$",
+  "originalJob": 140568081907,
+  "originalRun": 46016870449,
+  "projectionCompiler": {
+    "path": "scripts/benchrun/luvia_gateway_identity.go",
+    "sha256": "dea7c077dc93188d8166eb82d81cf21027edd8a83439473a31224b2b3575046c"
   },
   "sourceSHA256": {
-    "metrics.go": "b8e32ce21cd62e4d450e983c81370fd8eec78fc35f074675bc91a04d38a58956",
-    "metrics_json_test.go": "3956d8a85e34e50d5cf063966b1280b66816c0b5e7f942453d91ee8e765e5632",
     "middleware.go": "16104944640bd72d4e15e4fbae6c4920b8d005cc5c0cf11ca0d19ba5b9f88374",
     "middleware_test.go": "a284f6673c86a90ed916099ac82a6ffb0e9b190161c946989957839252b07034"
   }

@@ -1,4 +1,4 @@
-name: Recheck PR 143 latency on the original EPYC 7763 CPU
+name: Recheck PR 143 gateway identity on the original Xeon 6975P-C
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 jobs:
   witness:
     runs-on: ubuntu-24.04
-    timeout-minutes: 32
+    timeout-minutes: 38
     strategy:
       fail-fast: false
       matrix:
@@ -56,21 +56,21 @@ jobs:
       - if: steps.route.outputs.matched == 'true'
         uses: actions/checkout@v7
         with:
-          ref: f8924ac56afa77c460d7fc62f81df10e2673c202
+          ref: b5f6b0eb95f93516c306ca47dd74a1b532ecf018
           path: .tmp/pr143-current-inputs/A
           persist-credentials: false
 
       - if: steps.route.outputs.matched == 'true'
         uses: actions/checkout@v7
         with:
-          ref: 92cf68a18891338219102cec1aecb8e132a8c2c9
+          ref: c28830cfa07be637af73c0861e662561f84780ad
           path: .tmp/pr143-current-inputs/H
           fetch-depth: 2
           persist-credentials: false
 
       - if: steps.route.outputs.matched == 'true'
         name: Compare original and layout-controlled binaries
-        timeout-minutes: 27
+        timeout-minutes: 32
         env:
           RUNNER_KIND: ${{ runner.environment }}
         run: python3 -I -B scripts/diagnose-pr143-current-layout/run.py
@@ -97,7 +97,7 @@ jobs:
           sparse-checkout: scripts/diagnose-pr143-current-layout
           persist-credentials: false
 
-      - name: Require a qualified EPYC 7763 latency witness
+      - name: Require a qualified Xeon 6975P-C identity witness
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

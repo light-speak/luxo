@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recheck the remaining PR 143 timing on the original CPUs and profiles."""
+"""Recheck the two gateway identity timing signals on the original Intel CPU."""
 from hashlib import sha256
 import importlib.util
 import io
@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import runpy
+import shlex
 import shutil
 import subprocess
 import sys
@@ -24,7 +25,7 @@ HARNESS_FILES = {
     "go-capture.py": "b93cb28f2b092f63a07543a71cd39d46f3f28044d73f3547aaf16078c2d07db9",
     "manifest.json": "0c12129c702cf833c79f9e8d3269d1cfb7171d7cd54b1b6255c63a0598bc09a0",
 }
-PARENT = "91cec71d14e067c1b687115518ca044a8c28e4c1"
+PARENT = "5a17f908912055c353cb9acd6f4813821c1d3a42"
 HARNESS_REVISION = "5376367706e217b18a676dfe932004a0f5419a04"
 REF = "refs/heads/diagnostics/pr143-current-layout"
 LAYOUT_HELPER_COMMIT = "f9d0454826d1763b46e41eb26ef2a7aecdb86205"
@@ -32,8 +33,9 @@ LAYOUT_HELPER_SHA = "f7e1c7b985067778915c4a18a2a9293b6092d98a0dc94801152526aca56
 LAYOUT_HELPER = ROOT / ".tmp/pr143-layout-helper/scripts/diagnose-pr143-strict-native.py"
 PACKAGE = "pkg/lux/luvia"
 MANIFEST = INPUT / "manifest.json"
-MANIFEST_SHA = "d033532e920d9324659a32e3f145f95f3b87750dccb7a2507a645704e0ee4d66"
+MANIFEST_SHA = "b902e8a90dda5455c6b8b3b5f432923db89992524474c8e50c2eae05b4e06a5d"
 CONFIG = json.loads(MANIFEST.read_bytes())
+CASE = CONFIG["case"]
 SLOTS = set(range(1, 6))
 PAIRS = {f"{arm}-{group}.{direction}" for arm in ("AA", "HH")
          for group in (1, 2) for direction in ("forward", "reverse")}
@@ -69,7 +71,8 @@ def bind_event():
             os.environ.get("GITHUB_REPOSITORY") == "light-speak/luxo" and
             os.environ.get("GITHUB_EVENT_NAME") == "push" and os.environ.get("GITHUB_REF") == REF and
             os.environ.get("GITHUB_SHA") == active, "unexpected diagnostic event")
-    paths = [".github/workflows/diagnose-pr143-current-layout.yml", str(Path(__file__).relative_to(ROOT))]
+    paths = [".github/workflows/diagnose-pr143-current-layout.yml", str(Path(__file__).relative_to(ROOT)),
+             str(MANIFEST.relative_to(ROOT))]
     require(git(ROOT, "show", "-s", "--format=%P", active) == PARENT and
             git(ROOT, "diff", "--name-status", PARENT, active).splitlines() ==
             ["M\t" + path for path in sorted(paths)], "unexpected diagnostic paths or parent")
@@ -77,7 +80,7 @@ def bind_event():
 
 
 def target_case(cpu):
-    return "latency" if CONFIG["routes"].get(cpu) == "latency" else ""
+    return "gateway" if cpu == CONFIG["cpu"] else ""
 
 
 def cpu_families(cpuinfo):
@@ -129,6 +132,8 @@ def arm_sources(go, work):
                 "archive attributes changed benchmark source")
         for name, digest in CONFIG["sourceSHA256"].items():
             require(sha(checkout / PACKAGE / name) == digest, f"changed hot-path fixture {name}")
+        projection = CONFIG["projectionCompiler"]
+        require(sha(checkout / projection["path"]) == projection["sha256"], "changed profile compiler")
     a, h = checkouts["A"], checkouts["H"]
     require(git(h, "show", "-s", "--format=%P", "HEAD").split() == CONFIG["H"]["parents"] and
             sha256(output("git", "--no-replace-objects", "-C", h, "diff", "--name-status",
@@ -162,33 +167,9 @@ def plan_route(runtime, tools, case):
     output(tools / "benchplan", "--confirmation-plan", expected, targets, batch, confirmed)
     output(tools / "benchplan", "--verify-profile-batch", "confirmation", confirmed, batch)
     selector = "|".join("/".join(f"^{part}$" for part in name[:-2].split("/")) for name in sorted(names))
-    require(batch.read_text().splitlines() == [f"{PACKAGE}\t{case['profile']}\t{selector}"], "wrong archived selector/profile")
+    require(batch.read_text() == CONFIG["originalBatch"]+"\n" and
+            CONFIG["originalBatch"] == f"{PACKAGE}\t{case['profile']}\t{selector}", "wrong archived selector/profile")
     return expected, selector, names
-
-
-def latency_projection(source, workspace, case):
-    package = source / PACKAGE
-    require(sha(package / case["fixture"]) == CONFIG["sourceSHA256"][case["fixture"]], "changed latency source")
-    original = (package / case["fixture"]).read_bytes()
-    begin = original.index(b"func BenchmarkLatencyPercentiles")
-    end = original.index(b"\n\nfunc TestStaticMetricsJSON", begin)
-    fixture = INPUT / "latency-fixture.txt"
-    content = fixture.read_bytes()
-    require(sha(fixture) == case["projectionSHA256"] and
-            content == b'package luvia\n\nimport (\n\t"slices"\n\t"sort"\n\t"testing"\n)\n\n' + original[begin:end] + b"\n",
-            "projection changed the signed benchmark fixture")
-    target = workspace / case["fixture"]
-    target.write_bytes(content)
-    files = sorted(package.glob("*_test.go"))
-    mapping = {}
-    for path in files:
-        require(path.is_file() and not path.is_symlink() and
-                not re.search(rb"(?m)^func\s+(TestMain|init)\s*\(", path.read_bytes()), "unknown Luvia test setup")
-        mapping[str(path)] = str(target) if path.name == case["fixture"] else ""
-    require(str(package / case["fixture"]) in mapping, "expected latency fixture not emitted")
-    overlay = workspace / "overlay.json"
-    save(overlay, {"Replace": mapping})
-    return overlay
 
 
 def evidence_for(signer, go, binary, case, prefix, work):
@@ -205,142 +186,152 @@ def evidence_for(signer, go, binary, case, prefix, work):
     symbols = OUT / (prefix + ".symbols.txt")
     symbols.write_text("\n".join(hot)+"\n")
     save(OUT / (prefix + ".symbols.json"), signer["symbol_fingerprints"](binary, symbols, OUT / (prefix + ".elf.json")))
-    if case["root"] == "BenchmarkGatewayIdentity":
-        addresses = work / "address-map.txt"
-        addresses.write_text("\n".join(row for row in rows if len(row.split()) >= 4 and row.split()[2] in ("T", "t"))+"\n")
-        signer["nearby_text_map"](addresses, OUT / (prefix + ".address-map.txt"))
+    addresses = work / "address-map.txt"
+    addresses.write_text("\n".join(row for row in rows if len(row.split()) >= 4 and row.split()[2] in ("T", "t"))+"\n")
+    signer["nearby_text_map"](addresses, OUT / (prefix + ".address-map.txt"))
 
 
-def prepare_binary(runtime, signer, go, tools, arms, role, mode, case, work):
+def install_link_capture(work):
+    proxy = work / "trace-go"
+    proxy.write_text("""#!/usr/bin/env bash
+set -eu
+if [[ "$1" != test ]]; then
+    exec "$TRACE_REAL_GO" "$@"
+fi
+if ! "$TRACE_REAL_GO" "$1" -x "${@:2}" 2>"$TRACE_FILE"; then
+    tail -n 40 "$TRACE_FILE" >&2
+    exit 1
+fi
+""")
+    proxy.chmod(0o700)
+    return proxy
+
+
+def actual_link(trace, linker, test_name, aligned):
+    commands = []
+    with trace.open() as stream:
+        for row in stream:
+            if str(linker) not in row:
+                continue
+            args = shlex.split(row)
+            if args[:1] == ["GOROOT="]:
+                args.pop(0)
+            if args[:1] == [str(linker)]:
+                commands.append(args)
+    require(len(commands) == 1, "expected one actual test link command")
+    argv, = commands
+    require(argv.count("-o") == argv.count("-importcfg") == 1 and "testing.testBinary=1" in argv and
+            Path(argv[argv.index("-o") + 1]).name == test_name and
+            Path(argv[argv.index("-importcfg") + 1]).name == "importcfg.link" and
+            re.fullmatch(r"_pkg_\.a|[0-9a-f]{64}-d", Path(argv[-1]).name), "unexpected link invocation")
+    flags = [arg for arg in argv if arg.startswith(("-funcalign", "--funcalign"))]
+    require(flags == (["-funcalign=64"] if aligned else []), "unexpected effective alignment flag")
+    volatile = {argv.index("-o")+1, argv.index("-importcfg")+1, len(argv)-1}
+    normalized = [arg for index, arg in enumerate(argv) if index not in volatile and
+                  not arg.startswith("-buildid=") and arg != "-funcalign=64"]
+    return {"argv": argv, "normalized": normalized}
+
+
+def prepare_binary(runtime, signer, go, tools, arms, role, mode, work):
     source = arms[role]
+    aligned = mode == "aligned"
     side = "base" if role == "A" else "head"
-    prefix = side + ("64" if mode == "aligned" else "-projected" if mode == "projected" else "")
+    prefix = side + ("64" if aligned else "")
     built = work / ("binary-" + prefix)
     built.mkdir()
     capture = OUT / "compile" / prefix
     capture.mkdir(parents=True)
     wrapper = work / "wrapper/go"
+    trace = work / f"{prefix}.trace"
     env = dict(os.environ, PATH=str(wrapper.parent)+os.pathsep+os.environ["PATH"],
-               LUXO_WITNESS_REAL_GO=go, LUXO_WITNESS_PROFILE_LOG=str(capture), GOWORK=str(source/"go.work"),
-               GOFLAGS="-ldflags=-funcalign=64" if mode == "aligned" else "")
-    profile = case["profile"]
-    stem = "pkg-lux-luvia" + ("" if profile == "default" else "-"+profile)
+               LUXO_WITNESS_REAL_GO=str(work / "trace-go"), LUXO_WITNESS_PROFILE_LOG=str(capture),
+               TRACE_REAL_GO=go, TRACE_FILE=str(trace), GOWORK=str(source/"go.work"),
+               GOFLAGS="-ldflags=-funcalign=64" if aligned else "")
+    profile = CASE["profile"]
+    stem = "pkg-lux-luvia-" + profile
     binary = built / (stem + ".test")
-    if mode == "projected":
-        overlay = latency_projection(source, built, case)
-        runtime.call(wrapper, "test", "-trimpath", "-c", "-overlay="+str(overlay),
-                     "./"+PACKAGE, "-o", binary, cwd=source, env=env)
-    else:
-        cmd = "compile-performance-baseline" if role == "A" else "compile-performance"
-        runtime.call(tools/"benchrun", cmd, source, built, PACKAGE, profile, env=env)
+    cmd = "compile-performance-baseline" if role == "A" else "compile-performance"
+    runtime.call(tools/"benchrun", cmd, source, built, PACKAGE, profile, env=env)
+    linker = Path(output(go, "env", "GOTOOLDIR").decode().strip()) / "link"
+    save(capture / "link.json", actual_link(trace, linker, "luvia.test", aligned))
+    trace.unlink()
     captured = json.loads((capture/(stem+".overlay.json")).read_bytes())
-    if mode == "projected" or profile != "default":
-        expect = {PACKAGE + "/" + path.name: case["projectionSHA256"] if path.name == case["fixture"] else ""
-                  for path in (source/PACKAGE).glob("*_test.go")}
-        require(captured == expect, "unexpected effective test-only overlay")
-        require(output(binary, "-test.list=.*", cwd=source/PACKAGE).decode().splitlines() == [case["root"]],
-                "isolated binary introduced another test")
-    else:
-        require(captured == {}, "unexpected overlay on the stock Luvia binary")
-    evidence_for(signer, go, binary, case, prefix, work)
-    raw = runtime.sample(binary, source, PACKAGE, "^"+case["root"]+"$", "1x")
+    expected = {PACKAGE + "/" + path.name: CASE["projectionSHA256"] if path.name == CASE["fixture"] else ""
+                for path in (source/PACKAGE).glob("*_test.go")}
+    require(captured == expected, "unexpected effective test-only overlay")
+    require(output(binary, "-test.list=.*", cwd=source/PACKAGE).decode().splitlines() == [CASE["root"]],
+            "isolated binary introduced another test")
+    evidence_for(signer, go, binary, CASE, prefix, work)
+    raw = runtime.sample(binary, source, PACKAGE, "^"+CASE["root"]+"$", "1x")
     (capture/"full-inventory.raw").write_bytes(raw)
-    runtime.inventory(raw, runtime.full_names(case, "leaves"), runtime.CONFIG["cpu"], PACKAGE, one_iteration=True)
+    runtime.inventory(raw, runtime.full_names(CASE, "leaves"), runtime.CONFIG["cpu"], PACKAGE, one_iteration=True)
     return binary
 
 
-def normalized_latency(signer):
-    layouts = {}
-    for prefix in ("base", "head", "base-projected", "head-projected"):
-        lines = (OUT/(prefix+".objdump.txt")).read_text().split("TEXT ")[1:]
-        keys = {}
-        for section in lines:
-            name, *rows = section.splitlines()
-            instructions = []
-            for row in filter(str.strip, rows):
-                _, address, encoding, decoded = row.split(maxsplit=3)
-                addr = int(address, 16)
-                instructions.append((addr, signer["instruction_without_relocation"](encoding, decoded.strip())))
-            if instructions:
-                begin = instructions[0][0]
-                symbol = name.split()[0].removesuffix("(SB)")
-                require(symbol not in keys, "repeated disassembly symbol")
-                keys[symbol] = [[address-begin, *op] for address, op in instructions]
-        require(keys, "missing normalized latency instructions")
-        layouts[prefix] = keys
-
-    def same(a, h):
-        return {key: layouts[a][key] == layouts[h][key] for key in sorted(layouts[a].keys() & layouts[h].keys())}
-
-    save(OUT/"normalized-latency.json", {"instructions": layouts,
-        "stockCompare": same("base","head"), "projectedCompare": same("base-projected","head-projected"),
-        "AStockToProjected": same("base","base-projected"), "HStockToProjected": same("head","head-projected")})
+def verify_intervention(signer):
+    signer["verify_alignment"](OUT, current_source=True)
+    align = json.loads((OUT / "alignment-verification.json").read_bytes())
+    before_a, after_a = align["base"]["identityEntryMod64"]
+    before_h, after_h = align["head"]["identityEntryMod64"]
+    require(align["stockIdentityInstructionsMatch"] and before_a != before_h and after_a == after_h == 0,
+            "stock hot instructions or entry displacement do not support alignment attribution")
+    for arm in ("base", "head"):
+        commands = [json.loads((OUT/"compile"/prefix/"link.json").read_bytes()) for prefix in (arm, arm+"64")]
+        require(commands[0]["normalized"] == commands[1]["normalized"], "linker changed more than alignment")
 
 
-def measure_modes(runtime, arms, binaries, selector, names):
-    modes = tuple(binaries)
-    counts = dict.fromkeys(modes, 0)
-    for mode in modes:
-        (OUT / mode).mkdir()
-    with (OUT / "order.tsv").open("x", buffering=1) as order:
-        order.write("process\tblock\tpair\tcomparison\tmode\tside\tarm\n")
-        for block, index, comparison, matching in runtime.schedule():
-            for mode in modes if (block + index) % 2 == 0 else modes[::-1]:
-                for side in matching:
-                    label, role = ("left", "right")[side], comparison[side]
-                    line = (sum(counts.values()) + 1, block, index, comparison, mode, label, role)
-                    order.write("\t".join(map(str, line)) + "\n")
-                    data = runtime.sample(binaries[mode][role], arms[role], PACKAGE, selector, "200ms")
-                    runtime.inventory(data, names, runtime.CONFIG["cpu"], PACKAGE)
-                    with (OUT / mode / f"{comparison}-{block}.{label}.raw").open("ab") as sink:
-                        sink.write(data)
-                    counts[mode] += 1
-    require(all(count == 120 for count in counts.values()), "invalid scheduled sample count")
-    return counts
+def measure(runtime, tools, arms, binaries, expected, selector, names, mode):
+    directory = OUT / mode
+    directory.mkdir()
+    count = runtime.measure(arms, binaries, PACKAGE, selector, names, directory)
+    gates = runtime.gate(tools, expected, arms["H"], directory, PACKAGE, names)
+    report = (directory/"AH-1.forward.gate.txt").read_text()
+    confirmed = re.findall(r"^confirmed performance regression: (\S+) (\S+) ", report, re.M)
+    return {"processes": count, "gates": gates, "confirmed": confirmed}
 
 
-def classify(case, modes):
-    spec = CONFIG["cases"][case]
-    alternative = "aligned" if case == "gateway" else "projected"
-    require(modes.keys() == {"stock", alternative}, "missing compiler arms")
-    prefix = "github.com/light-speak/luxo/"+PACKAGE+"/"+spec["root"].removeprefix("Benchmark")+"/"
-    expected = {prefix+sample+"-2" for sample in spec["confirmed"]}
-    known = {prefix+sample+"-2" for sample in spec["timed"]}
-    for mode in modes.values():
-        gates = mode["gates"]
-        confirmed = [tuple(row) for row in mode["confirmed"]]
-        require(mode["processes"] == 120 and gates.keys() == PAIRS | {"AH-1.forward"} and
-                all(type(code) is int and code in (0,1) for code in gates.values()) and
-                bool(confirmed) == bool(gates["AH-1.forward"]) and len(set(confirmed)) == len(confirmed) and
-                all(name in known and unit in ("sec/op","B/op","allocs/op") for name,unit in confirmed), "invalid gate receipt")
-    stock = modes["stock"]["confirmed"]
-    original = {name for name, unit in stock if unit == "sec/op"} == expected and all(row[1] == "sec/op" for row in stock)
-    return {"controlsGreen": all(mode["gates"][name] == 0 for mode in modes.values() for name in PAIRS),
-            "originalReproduced": original, "alternateExit": modes[alternative]["gates"]["AH-1.forward"]}
+def classify(mode):
+    prefix = "github.com/light-speak/luxo/"+PACKAGE+"/"+CASE["root"].removeprefix("Benchmark")+"/"
+    wanted = {(prefix+leaf+"-2", "sec/op") for leaf in CASE["confirmed"]}
+    known = {prefix+leaf+"-2" for leaf in CASE["timed"]}
+    gates = mode["gates"]
+    confirmed = [tuple(row) for row in mode["confirmed"]]
+    require(mode["processes"] == 120 and gates.keys() == PAIRS | {"AH-1.forward"} and
+            all(type(code) is int and code in (0,1) for code in gates.values()) and
+            bool(confirmed) == bool(gates["AH-1.forward"]) and len(set(confirmed)) == len(confirmed) and
+            all(name in known and unit in ("sec/op","B/op","allocs/op") for name,unit in confirmed), "invalid gate receipt")
+    return {"controlsGreen": all(gates[name] == 0 for name in PAIRS), "expectedReproduced": set(confirmed) == wanted,
+            "crossExit": gates["AH-1.forward"]}
 
 
 def summarize(directory, diagnostic):
     files = sorted(directory.glob("*/status.json"))
     require(len(files) == len(SLOTS), "missing slot receipt")
-    results, slots = {"latency": []}, set()
+    results, slots = [], set()
     for path in files:
         status = json.loads(path.read_bytes())
         expected = target_case(status["cpu"])
         slot = status["slot"]
-        require(slot in SLOTS-slots and status["diagnostic"] == diagnostic and status["case"] == expected and
-                status["processes"] == (240 if expected else 0), "invalid route receipt")
+        require(slot in SLOTS-slots and status["diagnostic"] == diagnostic and status["case"] == expected,
+                "invalid route receipt")
         slots.add(slot)
-        if expected:
-            computed = classify(expected, status["comparisons"])
-            require(computed == status["outcome"], "unstable gate outcome")
-            results[expected].append({"slot": slot, **computed})
-        else:
-            require(not status["comparisons"], "samples from unmatched CPU")
+        if not expected:
+            require(not status["comparisons"] and status["processes"] == 0, "samples from unmatched CPU")
+            continue
+        modes = status["comparisons"]
+        stock = classify(modes["stock"])
+        opened = stock["controlsGreen"] and stock["expectedReproduced"]
+        require(set(modes) == ({"stock", "aligned"} if opened else {"stock"}) and
+                status["processes"] == (240 if opened else 120), "invalid alignment state transition")
+        aligned = classify(modes["aligned"]) if opened else None
+        require(status["outcome"] == {"stock": stock, "aligned": aligned}, "unstable gate outcome")
+        results.append({"slot": slot, "stock": stock, "aligned": aligned})
     print(json.dumps(results, sort_keys=True))
-    require(all(items and all(item["controlsGreen"] and item["alternateExit"] == 0 for item in items)
-                for items in results.values()), "matched case missing, controls failed or alternate still regressed")
-    require(all(any(item["originalReproduced"] for item in items) for items in results.values()),
-            "original timing signal not reproduced in each case")
+    require(results and all(item["stock"]["controlsGreen"] and
+            (item["aligned"] is None and item["stock"]["crossExit"] == 0 or
+             item["aligned"] and item["aligned"]["controlsGreen"] and item["aligned"]["crossExit"] == 0)
+            for item in results), "matching CPU absent, an unclassified regression or control failed")
+    require(any(item["aligned"] for item in results), "stock did not reproduce both original after signals")
 
 
 def main():
@@ -366,36 +357,38 @@ def main():
     signer = runpy.run_path(str(LAYOUT_HELPER))
     go = shutil.which("go")
     require(go, "Go not found")
-    scope = host["case"]
-    case = CONFIG["cases"][scope]
-    modes = ("stock", "aligned" if scope == "gateway" else "projected")
+    outcome = {"stock": None, "aligned": None}
     with TemporaryDirectory(prefix="pr143-current.", dir=OUT.parent) as folder:
         work = Path(folder)
         arms = arm_sources(go, work)
         try:
             tools = runtime.build_tools(go, arms["H"], work)
-            expected, selector, names = plan_route(runtime, tools, case)
-            binaries = {mode: {role: prepare_binary(runtime, signer, go, tools, arms, role, mode, case, work)
-                               for role in ("A","H")} for mode in modes}
-            if scope == "gateway":
-                signer["verify_alignment"](OUT, current_source=True)
-            else:
-                normalized_latency(signer)
-            for mode, count in measure_modes(runtime, arms, binaries, selector, names).items():
-                directory = OUT/mode
-                gates = runtime.gate(tools, expected, arms["H"], directory, PACKAGE, names)
-                raw = (directory/"AH-1.forward.gate.txt").read_text()
-                confirmed = re.findall(r"^confirmed performance regression: (\S+) (\S+) ", raw, re.M)
-                observed["comparisons"][mode] = {"processes": count, "gates": gates, "confirmed": confirmed}
-                observed["processes"] += count
+            install_link_capture(work)
+            expected, selector, names = plan_route(runtime, tools, CASE)
+            for mode in ("stock", "aligned"):
+                binaries = {role: prepare_binary(runtime, signer, go, tools, arms, role, mode, work)
+                            for role in ("A", "H")}
+                if mode == "aligned":
+                    verify_intervention(signer)
+                result = measure(runtime, tools, arms, binaries, expected, selector, names, mode)
+                observed["comparisons"][mode] = result
+                observed["processes"] += result["processes"]
+                outcome[mode] = classify(result)
+                if mode == "stock":
+                    save(OUT/"stock-status.json", {**observed, "outcome": outcome[mode]})
+                    if not (outcome[mode]["controlsGreen"] and outcome[mode]["expectedReproduced"]):
+                        break
         finally:
             for name in ("go.work","go.work.sum"):
                 (arms["A"]/name).unlink(missing_ok=True)
             (arms["A"]/".tmp").rmdir()
-    outcome = observed["outcome"] = classify(scope, observed["comparisons"])
-    save(OUT/"status.json", observed)
-    require(outcome["controlsGreen"] and outcome["alternateExit"] == 0,
-            "controls failed or alternate still regressed")
+    save(OUT/"status.json", {**observed, "outcome": outcome})
+    require(outcome["stock"]["controlsGreen"], "stock controls failed")
+    if outcome["aligned"] is None:
+        require(outcome["stock"]["crossExit"] == 0, "stock reported a different strict regression")
+    else:
+        require(outcome["aligned"]["controlsGreen"] and outcome["aligned"]["crossExit"] == 0,
+                "aligned controls failed or original timing still regressed")
 
 
 if __name__ == "__main__":
