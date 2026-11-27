@@ -50,6 +50,7 @@ const (
 		" " + rpcDeadlineContextFixture + "=" + rpcDeadlineContextSHA +
 		"\nrpc-nil-context-guard-overlay-v1 " + rpcNilContextGuardFixture + "=" + rpcNilContextGuardSHA +
 		"\nrpc-prepared-frame-overlay-v1 " + rpcPreparedFrameFilename + "=" + rpcPreparedFrameProjectionSHA + " " + rpcPreparedFrameSourceSHA +
+		"\nrpc-handler-panic-overlay-v1 " + rpcHandlerPanicFixture + "=" + rpcHandlerPanicSHA +
 		"\nqueue-stream-name-overlay-v1 " + queueStreamNameFilename + "=" + queueStreamNameProjectionSHA + " " + queueStreamNameSourceSHA +
 		"\nluvia-auth-middleware-overlay-v1 " + luviaAuthBenchmarkFixture + "=" + luviaAuthBenchmarkSHA +
 		" " + luviaAuthHelperFixture + "=" + luviaAuthHelperSHA +

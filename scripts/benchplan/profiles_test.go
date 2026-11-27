@@ -959,3 +959,16 @@ func TestAPIIntelProfilesKeepBroadInventoryAndRouteExclusively(t *testing.T) {
 		})
 	}
 }
+
+func TestRPCHandlerPanicProfileKeepsAllEightLeavesAndRoutesBothPhases(t *testing.T) {
+	const pkg, root, profile = "pkg/lux/rpc", "BenchmarkHandlerPanicFormatting", "rpc-handler-panic"
+	leaves := benchmarkCaseProduct([]string{"BusinessError", "OpaquePanic", "StringPanic", "Success"}, []string{"Before", "After"})
+	verifyExactProfileInventory(t, pkg, "BenchmarkRPCUUIDTraceGuard", profile, root, leaves, "Success/Alternate")
+	verifyExactProfileRouting(t, pkg, "BenchmarkRPCUUIDTraceGuard", profile, root, "Success/After", "^Success$/^After$")
+}
+
+func TestRPCInventoryRejectsUnsupportedProfile(t *testing.T) {
+	if err := verifyRPCProfileLeaves("not-rpc", nil); err == nil {
+		t.Fatal("unknown RPC inventory profile accepted")
+	}
+}

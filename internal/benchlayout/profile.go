@@ -38,6 +38,8 @@ const (
 	RPCNilContextGuardBenchmark   = "BenchmarkRPCNilContextGuard"
 	RPCPreparedFrameProfile       = "rpc-prepared-frame"
 	RPCPreparedFrameBenchmark     = "BenchmarkLRPCPreparedFrame"
+	RPCHandlerPanicProfile        = "rpc-handler-panic"
+	RPCHandlerPanicBenchmark      = "BenchmarkHandlerPanicFormatting"
 	QueuePackage                  = "pkg/lux/queue"
 	NATSQueuePackage              = "pkg/lux/nats/queue"
 	QueueStreamNameProfile        = "queue-stream-name"
@@ -218,6 +220,7 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{RPCNilContextGuardProfile, "^" + RPCNilContextGuardBenchmark + "$"},
 			{RPCPreparedFrameProfile, "^" + RPCPreparedFrameBenchmark + "$"},
 			{RPCFrameReuseProfile, "^" + RPCFrameReuseBenchmark + "$"},
+			{RPCHandlerPanicProfile, "^" + RPCHandlerPanicBenchmark + "$"},
 		}
 	case QueuePackage:
 		return []IsolationSpec{{QueueStreamNameProfile, "^" + QueueStreamNameBenchmark + "$"}}
@@ -277,6 +280,8 @@ func rpcBenchmarkProfile(root string) string {
 		return RPCPreparedFrameProfile
 	case RPCFrameReuseBenchmark:
 		return RPCFrameReuseProfile
+	case RPCHandlerPanicBenchmark:
+		return RPCHandlerPanicProfile
 	default:
 		return DefaultProfile
 	}

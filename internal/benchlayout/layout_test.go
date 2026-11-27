@@ -173,7 +173,7 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{APIPackage, "BenchmarkHandlerResponseBuffer/Int-2", APINonIdentityProfile},
 		{APIPackage, "BenchmarkWSConnectionRegistrationCold/false-2", APINonIdentityProfile},
 		{APIPackage, "BenchmarkWSConnectionRegistrationsSibling-2", APINonIdentityProfile},
-		{RPCPackage, "BenchmarkHandlerPanicFormatting", DefaultProfile},
+		{RPCPackage, "BenchmarkHandlerPanicFormatting", RPCHandlerPanicProfile},
 		{APIPackage, "BenchmarkIdentityEnumArray", DefaultProfile},
 		{APIPackage, "BenchmarkIdentitySubjectVisibility", DefaultProfile},
 		{APIPackage, "BenchmarkIdentitySurface", APINonIdentityProfile},
@@ -386,5 +386,17 @@ func TestIntelBenchmarkProfilesKeepRootsAndPackagesIndependent(t *testing.T) {
 	}
 	if ValidPerformanceProfile("pkg/lux/dialect/pg", "pg-duration-write-reject") {
 		t.Fatal("the dialect package cannot compile the concrete PG fixture")
+	}
+}
+
+func TestRPCHandlerPanicProfileRequiresItsExactPackageAndRoot(t *testing.T) {
+	const root, profile = "BenchmarkHandlerPanicFormatting", "rpc-handler-panic"
+	for _, name := range []string{root, root + "/OpaquePanic/After-2"} {
+		if got := ProfileForBenchmark(RPCPackage, name); got != profile || !ValidPerformanceProfile(RPCPackage, got) {
+			t.Fatalf("RPC handler profile=%s", got)
+		}
+	}
+	if ProfileForBenchmark(RPCPackage, root+"Sibling-2") != DefaultProfile || ValidPerformanceProfile(APIPackage, profile) || ValidPerformanceProfile(RPCPackage, "api-handler-panic") || ProfileForBenchmark(APIPackage, root) == profile {
+		t.Fatal("RPC profile leaked across root or package")
 	}
 }
