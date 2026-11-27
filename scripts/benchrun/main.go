@@ -126,6 +126,8 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return codecReaderOverlay(root)
 	case benchlayout.RPCOwnedRequestProfile, benchlayout.RPCDeadlineProfile, benchlayout.RPCNilContextGuardProfile, benchlayout.RPCPreparedFrameProfile, benchlayout.RPCHandlerPanicProfile:
 		return rpcBenchmarkOverlay(root, packagePath, profile)
+	case benchlayout.RPCPoolReturnRejectionProfile, benchlayout.H2TaskDeadlineReplacementProfile:
+		return transportBenchmarkOverlay(root, packagePath, profile)
 	case benchlayout.QueueStreamNameProfile:
 		return pairedBenchmarkOverlay(root, packagePath, profile, queueStreamNameFixture)
 	case benchlayout.APINonIdentityProfile:
@@ -140,10 +142,13 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-api-request-log-*", func(pkg, workspace string) (string, error) {
 			return writeAPIRequestLogOverlay(pkg, workspace, apiRequestLogProjectionSHA, apiRequestLogSourceSHA)
 		})
-	case benchlayout.APIIdentityConditionProfile, benchlayout.APIHandlerPanicProfile, benchlayout.APIWebSocketRegistrationsProfile:
+	case benchlayout.APIIdentityConditionProfile, benchlayout.APIHandlerPanicProfile, benchlayout.APIWebSocketRegistrationsProfile,
+		benchlayout.APIBodyReadProfile, benchlayout.APIJSONQuoteCandidateProfile:
 		return packageTestOverlay(root, packagePath, "bench-"+profile+"-*", func(pkg, workspace string) (string, error) {
 			return writeAPIBenchmarkFileOverlay(pkg, workspace, profile)
 		})
+	case benchlayout.APIResponseOriginRunProfile:
+		return packageTestOverlay(root, packagePath, "bench-api-response-origin-run-*", writeAPIResponseOriginOverlay)
 	case benchlayout.LuviaPrimaryTraceProfile:
 		return packageTestOverlay(root, packagePath, "bench-luvia-primary-trace-*", writeLuviaBenchmarkOverlay)
 	case benchlayout.LuviaGatewayIdentityProfile:
@@ -162,12 +167,9 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-codegen-global-receiver-*", writeCodegenReceiverOverlay)
 	case benchlayout.CodegenMigrationStateProfile:
 		return packageTestOverlay(root, packagePath, "bench-codegen-migration-state-*", writeCodegenMigrationStateOverlay)
-	case benchlayout.CodegenRelationLoaderProfile:
-		return pairedBenchmarkOverlay(root, packagePath, profile, codegenRelationLoaderFixture)
-	case benchlayout.SemanticEventEmitsProfile:
-		return pairedBenchmarkOverlay(root, packagePath, profile, semanticEventEmitsFixture)
+
 	default:
-		return compileCompactBenchmarkOverlay(root, packagePath, baseline, profile)
+		return compilerProfileOverlay(root, packagePath, baseline, profile)
 	}
 }
 

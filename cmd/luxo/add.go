@@ -26,8 +26,10 @@ Generated files / 生成的文件:
   origin/<module>.luxo                    Schema definition / Schema 定义
   service/<module>/resolver/resolver.go   Resolver scaffold / Resolver 骨架
 
-The lucis/<module>/main.go entry point is produced by 'luxo gen' (main.gen.go).
-lucis/<module>/main.go 入口由 'luxo gen' 生成 (main.gen.go)。
+'luxo gen' writes the cluster entry to lucis/<module>/main.gen.go.
+Modules named app or gateway (regardless of case) use lucis/modules/<module>/main.gen.go.
+'luxo gen' 将集群入口写入 lucis/<module>/main.gen.go。
+名为 app 或 gateway 的模块（不区分大小写）使用 lucis/modules/<module>/main.gen.go。
 
 Example / 示例:
   luxo add user

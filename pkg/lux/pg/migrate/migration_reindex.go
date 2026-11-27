@@ -166,23 +166,31 @@ func (c *migrationTokens) reindexQuoted(start int, escaped bool) (string, bool) 
 }
 
 func (c *migrationTokens) reindexUnicodeString() (string, bool) {
-	value, ok := c.reindexQuoted(c.pos+1, false)
+	value, escape, ok := c.unicodeEscapeSource()
 	if !ok {
 		return "", false
+	}
+	return decodeReindexEscapes(value, escape, true)
+}
+
+func (c *migrationTokens) unicodeEscapeSource() (string, byte, bool) {
+	value, ok := c.reindexQuoted(c.pos+1, false)
+	if !ok {
+		return "", 0, false
 	}
 	escape := byte('\\')
 	if c.accept("UESCAPE") {
 		token := c.next()
 		if token == "" || token[0] != '\'' && token[0] != '$' && !strings.EqualFold(token, "E") {
-			return "", false
+			return "", 0, false
 		}
 		arg, valid := c.reindexOptionString(token)
 		if !valid || len(arg) != 1 || strings.ContainsRune("0123456789abcdefABCDEF+'\" \t\n\r\f\v", rune(arg[0])) {
-			return "", false
+			return "", 0, false
 		}
 		escape = arg[0]
 	}
-	return decodeReindexEscapes(value, escape, true)
+	return value, escape, true
 }
 
 // Only ASCII option names and boolean words need to be decoded.

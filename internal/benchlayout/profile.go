@@ -16,42 +16,47 @@ const (
 )
 
 const (
-	LuxShortPathProfile           = "lux-short-path"
-	LuxPackage                    = "pkg/lux"
-	LuxStrictFilterBenchmark      = "BenchmarkStrictFilterContract"
-	LuxDecimalAlignmentBenchmark  = "BenchmarkDecimalAlignment"
-	DefaultProfile                = "default"
-	CodecReaderProfile            = "codec-reader"
-	APINonIdentityProfile         = "api-non-identity"
-	LuviaPrimaryTraceProfile      = "luvia-primary-trace"
-	LuviaGatewayIdentityProfile   = "luvia-gateway-identity"
-	LuviaAuthMiddlewareProfile    = "luvia-auth-middleware"
-	CodegenLiteralProfile         = "codegen-integer-literals"
-	CodegenReceiverProfile        = "codegen-global-receiver"
-	CodecPackage                  = "pkg/lux/codec"
-	RPCPackage                    = "pkg/lux/rpc"
-	RPCOwnedRequestProfile        = "rpc-owned-request"
-	RPCOwnedRequestBenchmark      = "BenchmarkLRPCOwnedRequest"
-	RPCDeadlineProfile            = "rpc-deadline-classification"
-	RPCDeadlineBenchmark          = "BenchmarkRPCDeadlineClassification"
-	RPCNilContextGuardProfile     = "rpc-nil-context-guard"
-	RPCNilContextGuardBenchmark   = "BenchmarkRPCNilContextGuard"
-	RPCPreparedFrameProfile       = "rpc-prepared-frame"
-	RPCPreparedFrameBenchmark     = "BenchmarkLRPCPreparedFrame"
-	RPCHandlerPanicProfile        = "rpc-handler-panic"
-	RPCHandlerPanicBenchmark      = "BenchmarkHandlerPanicFormatting"
-	QueuePackage                  = "pkg/lux/queue"
-	NATSQueuePackage              = "pkg/lux/nats/queue"
-	QueueStreamNameProfile        = "queue-stream-name"
-	QueueStreamNameBenchmark      = "BenchmarkQueueStreamName"
-	CodecReaderBenchmark          = "BenchmarkElementPayload"
-	APIPackage                    = "pkg/lux/api"
-	LuviaPackage                  = "pkg/lux/luvia"
-	LuviaGatewayIdentityBenchmark = "BenchmarkGatewayIdentity"
-	LuviaAuthMiddlewareBenchmark  = "BenchmarkAuthMiddlewareIsolation"
-	CodegenPackage                = "pkg/codegen"
-	CodegenLiteralBenchmark       = "BenchmarkCompileDecimalIntegerLiterals"
-	CodegenReceiverBenchmark      = "BenchmarkGlobalReceiverName"
+	LuxShortPathProfile                = "lux-short-path"
+	LuxPackage                         = "pkg/lux"
+	LuxStrictFilterBenchmark           = "BenchmarkStrictFilterContract"
+	LuxDecimalAlignmentBenchmark       = "BenchmarkDecimalAlignment"
+	DefaultProfile                     = "default"
+	CodecReaderProfile                 = "codec-reader"
+	APINonIdentityProfile              = "api-non-identity"
+	LuviaPrimaryTraceProfile           = "luvia-primary-trace"
+	LuviaGatewayIdentityProfile        = "luvia-gateway-identity"
+	LuviaAuthMiddlewareProfile         = "luvia-auth-middleware"
+	CodegenLiteralProfile              = "codegen-integer-literals"
+	CodegenReceiverProfile             = "codegen-global-receiver"
+	CodecPackage                       = "pkg/lux/codec"
+	RPCPackage                         = "pkg/lux/rpc"
+	RPCOwnedRequestProfile             = "rpc-owned-request"
+	RPCOwnedRequestBenchmark           = "BenchmarkLRPCOwnedRequest"
+	RPCDeadlineProfile                 = "rpc-deadline-classification"
+	RPCDeadlineBenchmark               = "BenchmarkRPCDeadlineClassification"
+	RPCNilContextGuardProfile          = "rpc-nil-context-guard"
+	RPCNilContextGuardBenchmark        = "BenchmarkRPCNilContextGuard"
+	RPCPreparedFrameProfile            = "rpc-prepared-frame"
+	RPCPreparedFrameBenchmark          = "BenchmarkLRPCPreparedFrame"
+	RPCHandlerPanicProfile             = "rpc-handler-panic"
+	RPCHandlerPanicBenchmark           = "BenchmarkHandlerPanicFormatting"
+	RPCPoolReturnRejectionProfile      = "rpc-pool-return-rejection"
+	RPCPoolReturnRejectionBenchmark    = "BenchmarkRPCPoolReturnRejection"
+	H2TransportPackage                 = "pkg/lux/h2transport"
+	H2TaskDeadlineReplacementProfile   = "h2-task-deadline-replacement"
+	H2TaskDeadlineReplacementBenchmark = "BenchmarkTaskDeadlineReplacement"
+	QueuePackage                       = "pkg/lux/queue"
+	NATSQueuePackage                   = "pkg/lux/nats/queue"
+	QueueStreamNameProfile             = "queue-stream-name"
+	QueueStreamNameBenchmark           = "BenchmarkQueueStreamName"
+	CodecReaderBenchmark               = "BenchmarkElementPayload"
+	APIPackage                         = "pkg/lux/api"
+	LuviaPackage                       = "pkg/lux/luvia"
+	LuviaGatewayIdentityBenchmark      = "BenchmarkGatewayIdentity"
+	LuviaAuthMiddlewareBenchmark       = "BenchmarkAuthMiddlewareIsolation"
+	CodegenPackage                     = "pkg/codegen"
+	CodegenLiteralBenchmark            = "BenchmarkCompileDecimalIntegerLiterals"
+	CodegenReceiverBenchmark           = "BenchmarkGlobalReceiverName"
 
 	CodegenMigrationStateProfile   = "codegen-migration-state"
 	CodegenMigrationStateBenchmark = "BenchmarkMigrationStateValidation"
@@ -62,6 +67,15 @@ const (
 	SemanticPackage             = "pkg/semantic"
 	SemanticEventEmitsProfile   = "semantic-event-emits"
 	SemanticEventEmitsBenchmark = "BenchmarkCollectEventEmits"
+
+	CodegenFindReadProfile   = "codegen-find-read"
+	CodegenFindReadBenchmark = "BenchmarkFindRead"
+
+	CodegenNumericRangeProfile   = "codegen-numeric-range"
+	CodegenNumericRangeBenchmark = "BenchmarkNumericRangeValidation"
+
+	SemanticEventSnapshotProfile   = "semantic-event-snapshot"
+	SemanticEventSnapshotBenchmark = "BenchmarkEventSnapshotContract"
 
 	APILocalRouteExportProfile      = "api-local-route-export"
 	APILocalRouteExportBenchmark    = "BenchmarkLocalRouteExport"
@@ -74,10 +88,18 @@ const (
 
 	APIIdentityConditionProfile        = "api-identity-condition"
 	APIIdentityConditionBenchmark      = "BenchmarkIdentityConditionValidity"
+	APIIdentitySubjectBenchmark        = "BenchmarkIdentitySubjectVisibility"
 	APIHandlerPanicProfile             = "api-handler-panic"
 	APIHandlerPanicBenchmark           = "BenchmarkHandlerPanicFormatting"
+	APIHandlerResponseBufferBenchmark  = "BenchmarkHandlerResponseBuffer"
 	APIWebSocketRegistrationsProfile   = "api-websocket-registrations"
 	APIWebSocketRegistrationsBenchmark = "BenchmarkWSConnectionRegistrations"
+	APIResponseOriginRunProfile        = "api-response-origin-run"
+	APIResponseOriginRunBenchmark      = "BenchmarkResponseOriginRun"
+	APIBodyReadProfile                 = "api-body-read"
+	APIBodyReadBenchmark               = "BenchmarkBodyRead"
+	APIJSONQuoteCandidateProfile       = "api-json-quote-candidate"
+	APIJSONQuoteCandidateBenchmark     = "BenchmarkJSONQuoteCandidate"
 
 	LuviaMergeDestinationProfile   = "luvia-merge-destination"
 	LuviaMergeDestinationBenchmark = "BenchmarkMergeDestination"
@@ -90,7 +112,7 @@ const (
 )
 
 var apiIdentityRoots = []string{
-	APIIdentityConditionBenchmark, "BenchmarkIdentityEnumArray", "BenchmarkIdentitySubjectVisibility",
+	APIIdentityConditionBenchmark, "BenchmarkIdentityEnumArray", APIIdentitySubjectBenchmark,
 }
 
 // IsAPIIdentityBenchmark reports whether the broad API binary must omit the root.
@@ -122,6 +144,10 @@ func ProfileForBenchmark(pkg, name string) string {
 		}
 	case RPCPackage:
 		return rpcBenchmarkProfile(root)
+	case H2TransportPackage:
+		if root == H2TaskDeadlineReplacementBenchmark {
+			return H2TaskDeadlineReplacementProfile
+		}
 	case QueuePackage:
 		if root == QueueStreamNameBenchmark {
 			return QueueStreamNameProfile
@@ -147,8 +173,11 @@ func ProfileForBenchmark(pkg, name string) string {
 	case CodegenPackage:
 		return codegenBenchmarkProfile(root)
 	case SemanticPackage:
-		if root == SemanticEventEmitsBenchmark {
+		switch root {
+		case SemanticEventEmitsBenchmark:
 			return SemanticEventEmitsProfile
+		case SemanticEventSnapshotBenchmark:
+			return SemanticEventSnapshotProfile
 		}
 	}
 	return DefaultProfile
@@ -164,6 +193,10 @@ func codegenBenchmarkProfile(root string) string {
 		return CodegenMigrationStateProfile
 	case CodegenRelationLoaderBenchmark:
 		return CodegenRelationLoaderProfile
+	case CodegenFindReadBenchmark:
+		return CodegenFindReadProfile
+	case CodegenNumericRangeBenchmark:
+		return CodegenNumericRangeProfile
 	default:
 		return DefaultProfile
 	}
@@ -171,12 +204,18 @@ func codegenBenchmarkProfile(root string) string {
 
 func apiBenchmarkProfile(root string) string {
 	switch root {
-	case APIIdentityConditionBenchmark:
+	case APIIdentityConditionBenchmark, APIIdentitySubjectBenchmark:
 		return APIIdentityConditionProfile
-	case APIHandlerPanicBenchmark:
+	case APIHandlerPanicBenchmark, APIHandlerResponseBufferBenchmark:
 		return APIHandlerPanicProfile
 	case APIWebSocketRegistrationsBenchmark:
 		return APIWebSocketRegistrationsProfile
+	case APIResponseOriginRunBenchmark:
+		return APIResponseOriginRunProfile
+	case APIBodyReadBenchmark:
+		return APIBodyReadProfile
+	case APIJSONQuoteCandidateBenchmark:
+		return APIJSONQuoteCandidateProfile
 	}
 	if root == APIRequestLogBoundaryBenchmark || root == APIRequestLogDeliveredBenchmark {
 		return APIRequestLogProfile
@@ -221,7 +260,10 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{RPCPreparedFrameProfile, "^" + RPCPreparedFrameBenchmark + "$"},
 			{RPCFrameReuseProfile, "^" + RPCFrameReuseBenchmark + "$"},
 			{RPCHandlerPanicProfile, "^" + RPCHandlerPanicBenchmark + "$"},
+			{RPCPoolReturnRejectionProfile, "^" + RPCPoolReturnRejectionBenchmark + "$"},
 		}
+	case H2TransportPackage:
+		return []IsolationSpec{{H2TaskDeadlineReplacementProfile, "^" + H2TaskDeadlineReplacementBenchmark + "$"}}
 	case QueuePackage:
 		return []IsolationSpec{{QueueStreamNameProfile, "^" + QueueStreamNameBenchmark + "$"}}
 	case APIPackage:
@@ -232,9 +274,12 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{APICanonicalJSONProfile, "^" + apiCanonicalJSONPrefix + "(" + strings.Join(apiCanonicalJSONFamilies, "|") + ")$"},
 			{APIBinaryParamLookupProfile, "^" + APIBinaryParamLookupBenchmark + "$"},
 			{APIRequestLogProfile, "^" + APIRequestLogBoundaryBenchmark + "$|^" + APIRequestLogDeliveredBenchmark + "$"},
-			{APIIdentityConditionProfile, "^" + APIIdentityConditionBenchmark + "$"},
-			{APIHandlerPanicProfile, "^" + APIHandlerPanicBenchmark + "$"},
+			{APIIdentityConditionProfile, "^" + APIIdentityConditionBenchmark + "$|^" + APIIdentitySubjectBenchmark + "$"},
+			{APIHandlerPanicProfile, "^" + APIHandlerPanicBenchmark + "$|^" + APIHandlerResponseBufferBenchmark + "$"},
 			{APIWebSocketRegistrationsProfile, "^" + APIWebSocketRegistrationsBenchmark + "$"},
+			{APIResponseOriginRunProfile, "^" + APIResponseOriginRunBenchmark + "$"},
+			{APIBodyReadProfile, "^" + APIBodyReadBenchmark + "$"},
+			{APIJSONQuoteCandidateProfile, "^" + APIJSONQuoteCandidateBenchmark + "$"},
 		}
 	case LuviaPackage:
 		return []IsolationSpec{
@@ -251,9 +296,11 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"},
 			{CodegenMigrationStateProfile, "^" + CodegenReceiverBenchmark + "$|^" + CodegenMigrationStateBenchmark + "$"},
 			{CodegenRelationLoaderProfile, "^" + CodegenRelationLoaderBenchmark + "$"},
+			{CodegenFindReadProfile, "^" + CodegenFindReadBenchmark + "$"},
+			{CodegenNumericRangeProfile, "^" + CodegenNumericRangeBenchmark + "$"},
 		}
 	case SemanticPackage:
-		return []IsolationSpec{{SemanticEventEmitsProfile, "^" + SemanticEventEmitsBenchmark + "$"}}
+		return []IsolationSpec{{SemanticEventEmitsProfile, "^" + SemanticEventEmitsBenchmark + "$"}, {SemanticEventSnapshotProfile, "^" + SemanticEventSnapshotBenchmark + "$"}}
 	default:
 		return nil
 	}
@@ -282,6 +329,8 @@ func rpcBenchmarkProfile(root string) string {
 		return RPCFrameReuseProfile
 	case RPCHandlerPanicBenchmark:
 		return RPCHandlerPanicProfile
+	case RPCPoolReturnRejectionBenchmark:
+		return RPCPoolReturnRejectionProfile
 	default:
 		return DefaultProfile
 	}

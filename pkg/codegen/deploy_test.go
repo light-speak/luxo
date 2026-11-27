@@ -58,18 +58,152 @@ func TestGeneratedToolchainMatchesCoreModule(t *testing.T) {
 		t.Fatalf("new projects must use the core Go version %s", version)
 	}
 	want := "FROM golang:" + version + "-alpine AS builder\n"
-	if !strings.Contains(string(generateDockerfile([]moduleInfo{{name: "user"}})), want) {
+	if !strings.Contains(string(generateDockerfile([]moduleInfo{{name: "user"}}, nil)), want) {
 		t.Fatalf("generated Dockerfile must use the core Go version %s", version)
 	}
 }
 
 func TestGenerateDockerfileStagesOptionalMigrations(t *testing.T) {
-	dockerfile := string(generateDockerfile([]moduleInfo{{name: "user"}, {name: "post"}}))
+	dockerfile := string(generateDockerfile([]moduleInfo{{name: "user"}, {name: "post"}}, nil))
 	mkdir := strings.Index(dockerfile, "mkdir -p /app/migrations")
 	projectCopy := strings.Index(dockerfile, "COPY . .\n")
 	migrationCopy := "COPY --from=builder /app/migrations/ /app/migrations/\n"
 	if mkdir < 0 || projectCopy < mkdir || strings.Count(dockerfile, migrationCopy) != 2 {
 		t.Fatalf("builder must stage an empty migrations directory before copying project files:\n%s", dockerfile)
+	}
+}
+
+func TestComposeAndDockerModuleNameCollisions(t *testing.T) {
+	modules := []moduleInfo{
+		{name: "gateway"}, {name: "postgres"}, {name: "builder"},
+		{name: "module-gateway"}, {name: "nats"}, {name: "redis", hasCache: true},
+		{name: "read", hasLoaders: true, hasExtend: true},
+	}
+	backends := composeBackends{selection: EntryBackends{Queue: "nats", Cache: "redis"}}
+	files := renderDeployFiles(modules, "probe", backends)
+	var compose struct {
+		Services map[string]struct {
+			Build       struct{ Target string }
+			Environment map[string]string
+			DependsOn   map[string]struct{} `yaml:"depends_on"`
+		}
+	}
+	if err := yaml.Unmarshal(files.DockerCompose, &compose); err != nil {
+		t.Fatal(err)
+	}
+	targets := map[string]string{
+		"gateway": "gateway-run", "module-gateway-2": "module-gateway-2-run",
+		"module-postgres": "postgres-run", "builder": "module-builder-run",
+		"module-gateway": "module-gateway-run", "module-nats": "nats-run",
+		"module-redis": "redis-run", "read": "read-run",
+	}
+	for service, want := range targets {
+		if got := compose.Services[service].Build.Target; got != want {
+			t.Errorf("%s target = %q, want %q", service, got, want)
+		}
+		if service != "gateway" {
+			if _, exists := compose.Services["gateway"].DependsOn[service]; !exists {
+				t.Errorf("gateway has no dependency on %s", service)
+			}
+		}
+	}
+	for _, consumer := range []string{"gateway", "read"} {
+		env := compose.Services[consumer].Environment
+		for module, service := range map[string]string{"GATEWAY": "module-gateway-2", "POSTGRES": "module-postgres", "NATS": "module-nats", "REDIS": "module-redis"} {
+			key := module + "_SERVICE_ADDR"
+			if want := "${" + key + ":-" + service + ":9000}"; env[key] != want {
+				t.Errorf("%s %s = %q, want %q", consumer, key, env[key], want)
+			}
+		}
+	}
+	if env := compose.Services["module-redis"].Environment; env["DATABASE_HOST"] != "postgres" ||
+		env["NATS_URL"] != "nats://nats:4222" || env["REDIS_URL"] != "redis://redis:6379" {
+		t.Errorf("module backend addresses changed: %#v", env)
+	}
+	docker := string(files.Dockerfile)
+	for _, want := range []string{
+		"FROM builder AS module-gateway-2\n",
+		"go build -o /service ./lucis/modules/gateway/\n",
+		"FROM builder AS module-builder\n",
+		"COPY --from=module-gateway-2 /service /usr/local/bin/service\n",
+		"COPY --from=module-builder /service /usr/local/bin/service\n",
+	} {
+		if !strings.Contains(docker, want) {
+			t.Errorf("missing %q in Dockerfile", want)
+		}
+	}
+	seen := map[string]bool{}
+	for line := range strings.SplitSeq(docker, "\n") {
+		if _, stage, declared := strings.Cut(line, " AS "); strings.HasPrefix(line, "FROM ") && declared {
+			name := strings.ToLower(stage)
+			if seen[name] {
+				t.Errorf("duplicate Docker stage %q", stage)
+			}
+			seen[name] = true
+		}
+	}
+	for service, stage := range targets {
+		if !seen[stage] {
+			t.Errorf("Compose service %s references missing stage %s", service, stage)
+		}
+	}
+}
+
+func TestComposeOptionalNamesWithoutInfrastructure(t *testing.T) {
+	modules := []moduleInfo{{name: "nats"}, {name: "redis", hasCache: true}}
+	files := renderDeployFiles(modules, "probe", composeBackends{selection: EntryBackends{Cache: "memory"}})
+	dockerCompose := string(files.DockerCompose)
+	for _, name := range []string{"nats", "redis"} {
+		if strings.Count(dockerCompose, "\n  "+name+":\n") != 1 || strings.Contains(dockerCompose, "\n  module-"+name+":\n") {
+			t.Errorf("%s should keep its service name when its infrastructure is absent", name)
+		}
+	}
+}
+
+func TestComposeJetStreamReadinessWithAliasedGatewayModule(t *testing.T) {
+	modules := []moduleInfo{{name: "gateway"}}
+	backends := composeBackends{selection: EntryBackends{Queue: "nats"}}
+	files := renderDeployFiles(modules, "probe", backends)
+	var compose struct {
+		Services map[string]struct {
+			Environment map[string]string
+			DependsOn   map[string]struct{ Condition string } `yaml:"depends_on"`
+		}
+	}
+	if err := yaml.Unmarshal(files.DockerCompose, &compose); err != nil {
+		t.Fatal(err)
+	}
+	module := compose.Services["module-gateway"]
+	const readiness = "LUXO_INTERNAL_COMPOSE_JETSTREAM"
+	if module.Environment[readiness] != "1" || module.DependsOn["nats"].Condition != "service_healthy" {
+		t.Errorf("module lost JetStream readiness: %+v", module)
+	}
+	gateway := compose.Services["gateway"]
+	if gateway.Environment["GATEWAY_SERVICE_ADDR"] != "${GATEWAY_SERVICE_ADDR:-module-gateway:9000}" {
+		t.Errorf("gateway lost its module RPC address: %+v", gateway.Environment)
+	}
+	if _, exists := gateway.Environment[readiness]; exists {
+		t.Error("gateway should only wait for the dependencies it uses")
+	}
+}
+
+func TestDeploymentAliasesReserveBothDockerStageNames(t *testing.T) {
+	modules := []moduleInfo{
+		{name: "worker"}, {name: "worker-run"}, {name: "module-worker-run"},
+		{name: "Builder"}, {name: "normal"},
+	}
+	names := planDeploymentAliases(modules, "-run", "builder", "gateway", "gateway-run")
+	for module, want := range map[string]string{
+		"worker": "worker", "worker-run": "module-worker-run-2",
+		"module-worker-run": "module-worker-run", "Builder": "module-builder", "normal": "normal",
+	} {
+		if got := names.name(module); got != want {
+			t.Errorf("%s assigned %s, want %s", module, got, want)
+		}
+	}
+	normal := []moduleInfo{{name: "user"}, {name: "post"}}
+	if names := planDeploymentAliases(normal, "-run", "builder", "gateway", "gateway-run"); names != nil {
+		t.Errorf("non-colliding module names should not allocate an alias map: %#v", names)
 	}
 }
 
@@ -378,7 +512,7 @@ func TestGenerateDockerfile_MultiModuleBuildStages(t *testing.T) {
 		{name: "payment"},
 		{name: "order"},
 	}
-	df := string(generateDockerfile(modules))
+	df := string(generateDockerfile(modules, nil))
 
 	// Each module should have a build stage + runtime stage
 	for _, m := range modules {

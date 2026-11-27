@@ -15,7 +15,7 @@ interface RequestOptions {
   fail: (error: { errMsg: string }) => void
 }
 
-const request = vi.fn<(options: RequestOptions) => void>()
+const request = vi.fn<(options: RequestOptions) => { abort(): void } | void>()
 
 beforeEach(() => {
   request.mockReset()
@@ -369,5 +369,106 @@ describe('WxTransport precision', () => {
     transport.setSchema({ echo: { id: 1 } })
     await expect(transport.call('echo')).rejects.toMatchObject({ error: 'NetworkError' })
     await expect(transport.subscribe('echo', {}, (value: unknown) => value, () => {})).rejects.toMatchObject({ error: 'ConfigError' })
+  })
+})
+
+
+describe('WxTransport cancellation', () => {
+  const codec: RequestEncoder<RequestValues> = { apiID: 7, initialCapacity: () => 8, writeParameters() {} }
+  const cancelled = { error: 'CancelledError', code: 0, message: 'request cancelled' }
+
+  function reply(mode: 'json' | 'binary') {
+    return { statusCode: 200, data: mode === 'json' ? '{"data":42}' : new Uint8Array([42]).buffer }
+  }
+
+  it.each([
+    ['json', false], ['json', true], ['binary', false], ['binary', true],
+  ] as const)('cancels before %s dispatch (generated=%s)', async (mode, generated) => {
+    const transport = new WxTransport('https://example.test/api', { mode, schema: { echo: { id: 7 } } })
+    const signal = AbortSignal.abort()
+    const checkEncoder = vi.fn(() => 8)
+    request.mockImplementation(options => options.success(reply(mode)))
+
+    const pending = generated
+      ? transport.callGenerated('echo', { ...codec, initialCapacity: checkEncoder, writeJSONParameters: checkEncoder }, undefined, { signal })
+      : transport.call('echo', undefined, { signal })
+    await expect(pending).rejects.toMatchObject(cancelled)
+    expect(checkEncoder).not.toHaveBeenCalled()
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['json', false], ['json', true], ['binary', false], ['binary', true],
+  ] as const)('aborts an in-flight %s task once and ignores late callbacks (generated=%s)', async (mode, generated) => {
+    const transport = new WxTransport('https://example.test/api', { mode, schema: { echo: { id: 7 } } })
+    const controller = new AbortController()
+    const removed = vi.spyOn(controller.signal, 'removeEventListener')
+    const abort = vi.fn(() => request.mock.lastCall?.[0].fail({ errMsg: 'request:fail abort' }))
+    request.mockImplementation(() => ({ abort }))
+
+    const options = { signal: controller.signal, refreshOnUnauthorized: false }
+    const pending = generated ? transport.callGenerated('echo', codec, undefined, options) : transport.call('echo', undefined, options)
+    const callbacks = request.mock.lastCall![0]
+    const readData = vi.fn(() => reply(mode).data)
+    const readError = vi.fn(() => 'late failure')
+
+    controller.abort()
+    controller.abort()
+    callbacks.success({ statusCode: 200, get data() { return readData() } })
+    callbacks.fail({ get errMsg() { return readError() } })
+    await expect(pending).rejects.toMatchObject(cancelled)
+    expect(abort).toHaveBeenCalledTimes(1)
+    expect(removed).toHaveBeenCalledTimes(1)
+    expect(readData).not.toHaveBeenCalled()
+    expect(readError).not.toHaveBeenCalled()
+  })
+
+  it.each(['json', 'binary'] as const)('aborts the task returned after synchronous %s cancellation', async mode => {
+    const transport = new WxTransport('https://example.test/api', { mode, schema: { echo: { id: 7 } } })
+    const controller = new AbortController()
+    const abort = vi.fn(() => { throw new Error('task already gone') })
+    request.mockImplementation(options => {
+      controller.abort()
+      options.success(reply(mode))
+      return { abort }
+    })
+    await expect(transport.call('echo', undefined, { signal: controller.signal })).rejects.toMatchObject(cancelled)
+    expect(abort).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['json', 'binary'] as const)('cancels generated %s dispatch when the codec aborts while preparing', async mode => {
+    const transport = new WxTransport('https://example.test/api', { mode, schema: { echo: { id: 7 } } })
+    const controller = new AbortController()
+    request.mockImplementation(options => options.success(reply(mode)))
+    const cancel = () => controller.abort()
+    const pending = transport.callGenerated('echo', { ...codec, writeParameters: cancel, writeJSONParameters: cancel },
+      undefined, { signal: controller.signal })
+    await expect(pending).rejects.toMatchObject(cancelled)
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it.each(['success', 'failure', 'throw'] as const)('cleans up the listener after synchronous %s', async outcome => {
+    const transport = new WxTransport('https://example.test/api')
+    const controller = new AbortController()
+    const added = vi.spyOn(controller.signal, 'addEventListener')
+    const removed = vi.spyOn(controller.signal, 'removeEventListener')
+    const failure = new Error('request failed to start')
+    const abort = vi.fn()
+    request.mockImplementation(options => {
+      if (outcome === 'throw') throw failure
+      if (outcome === 'success') options.success(reply('json'))
+      else options.fail({ errMsg: 'offline' })
+      controller.abort()
+      return { abort }
+    })
+
+    const pending = transport.call('echo', undefined, { signal: controller.signal })
+    if (outcome === 'success') await expect(pending).resolves.toBe(42)
+    else if (outcome === 'throw') await expect(pending).rejects.toBe(failure)
+    else await expect(pending).rejects.toMatchObject({ error: 'NetworkError', message: 'offline' })
+    expect(added).toHaveBeenCalledTimes(1)
+    expect(removed).toHaveBeenCalledExactlyOnceWith('abort', added.mock.calls[0][1])
+    controller.abort()
+    expect(abort).not.toHaveBeenCalled()
   })
 })

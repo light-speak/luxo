@@ -96,13 +96,13 @@ func runGen(cmd *cobra.Command, args []string) error {
 		}
 		totalFiles++
 
-		// Per-module entries: lucis/<module>/main.gen.go (cluster mode, one binary per module)
+		// Per-module entries: one binary per module in cluster mode.
 		moduleEntries, err := codegen.GenerateModuleEntryFilesChecked(result, modulePath, backends)
 		if err != nil {
 			return err
 		}
 		for modName, src := range moduleEntries {
-			outDir := filepath.Join("lucis", modName)
+			outDir := filepath.FromSlash(codegen.ModuleEntryDirectory(modName))
 			if err := os.MkdirAll(outDir, 0755); err != nil {
 				return fmt.Errorf("create %s: %w", outDir, err)
 			}
@@ -455,7 +455,8 @@ func cleanStaleGenFiles(dir string, written map[string][]byte) ([]string, error)
 }
 
 func cleanStaleEntryFiles(expected map[string][]byte, hasRuntime bool) error {
-	info, err := os.Lstat("lucis")
+	const root = "lucis"
+	info, err := os.Lstat(root)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -465,7 +466,34 @@ func cleanStaleEntryFiles(expected map[string][]byte, hasRuntime bool) error {
 	if !info.IsDir() {
 		return fmt.Errorf("lucis must be a real directory for generated entry cleanup")
 	}
-	entries, err := os.ReadDir("lucis")
+	keep := make(map[string][]string, len(expected)+2)
+	remember := func(dir string) {
+		key := strings.ToLower(dir)
+		keep[key] = append(keep[key], dir)
+	}
+	for name := range expected {
+		remember(filepath.FromSlash(codegen.ModuleEntryDirectory(name)))
+	}
+	if hasRuntime {
+		remember(filepath.Join(root, "app"))
+		remember(filepath.Join(root, "gateway"))
+	}
+	if err := cleanEntryDirectories(root, keep, false); err != nil {
+		return err
+	}
+	modules := filepath.Join(root, "modules")
+	info, err = os.Lstat(modules)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil || !info.IsDir() {
+		return err
+	}
+	return cleanEntryDirectories(modules, keep, true)
+}
+
+func cleanEntryDirectories(parent string, keep map[string][]string, aliasesOnly bool) error {
+	entries, err := os.ReadDir(parent)
 	if err != nil {
 		return err
 	}
@@ -473,11 +501,19 @@ func cleanStaleEntryFiles(expected map[string][]byte, hasRuntime bool) error {
 		if !entry.IsDir() {
 			continue
 		}
-		_, keep := expected[entry.Name()]
-		if keep || hasRuntime && (entry.Name() == "app" || entry.Name() == "gateway") {
+		name := entry.Name()
+		dir := filepath.Join(parent, name)
+		if aliasesOnly && codegen.ModuleEntryDirectory(name) != filepath.ToSlash(dir) {
 			continue
 		}
-		path := filepath.Join("lucis", entry.Name(), "main.gen.go")
+		expected, err := matchesEntryDirectory(dir, keep[strings.ToLower(dir)], entry)
+		if err != nil {
+			return err
+		}
+		if expected {
+			continue
+		}
+		path := filepath.Join(dir, "main.gen.go")
 		removed, err := removeMarkedEntry(path)
 		if err != nil {
 			return fmt.Errorf("clean stale entry %s: %w", path, err)
@@ -487,6 +523,30 @@ func cleanStaleEntryFiles(expected map[string][]byte, hasRuntime bool) error {
 		}
 	}
 	return nil
+}
+
+func matchesEntryDirectory(dir string, expected []string, entry os.DirEntry) (bool, error) {
+	for _, name := range expected {
+		if dir == name {
+			return true, nil
+		}
+		// The directory may retain its old spelling on a case-insensitive filesystem.
+		info, err := os.Lstat(name)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		actual, err := entry.Info()
+		if err != nil {
+			return false, err
+		}
+		if os.SameFile(info, actual) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func removeMarkedEntry(path string) (bool, error) {

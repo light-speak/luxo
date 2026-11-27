@@ -2,11 +2,11 @@ package migrate
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -117,39 +117,9 @@ func TestDecodeReindexBackslashHex(t *testing.T) {
 }
 
 func TestIntegrationReindexMigrationTransactionMode(t *testing.T) {
-	ctx, admin := databaseTestAdmin(t)
-	schema := "luxo_reindex_" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	scope := pgx.Identifier{schema}.Sanitize()
-	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+scope); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		dropCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, err := admin.Exec(dropCtx, "DROP SCHEMA "+scope+" CASCADE"); err != nil {
-			t.Error("drop test schema", err)
-			return
-		}
-		var found bool
-		if err := admin.QueryRow(dropCtx, "SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname=$1)", schema).Scan(&found); err != nil || found {
-			t.Errorf("test schema cleanup: found=%v err=%v", found, err)
-		}
-	})
-	connURL, err := url.Parse(BuildDatabaseURL())
-	if err != nil {
-		t.Fatal(err)
-	}
-	connURL.Path = "/postgres"
-	params := connURL.Query()
-	params.Set("search_path", schema)
-	connURL.RawQuery = params.Encode()
-	db, err := NewPGDB(ctx, connURL.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	runner := NewFromDB(db, dir)
-	t.Cleanup(runner.Close)
+	runner, dir, scope := reindexMigrationFixture(t)
+	ctx := t.Context()
+	db := runner.db
 	if err := db.Exec(ctx, "CREATE TABLE items(id int); CREATE INDEX items_idx ON items(id);"); err != nil {
 		t.Fatal(err)
 	}
@@ -188,4 +158,57 @@ func TestIntegrationReindexMigrationTransactionMode(t *testing.T) {
 	if rolled, err := runner.Down(ctx, 3); err != nil || len(rolled) != 3 {
 		t.Fatalf("rollback: %v %v", rolled, err)
 	}
+}
+
+func reindexMigrationFixture(t *testing.T) (*Runner, string, string) {
+	t.Helper()
+	skipIfNoDB(t)
+	dsn, err := url.Parse(BuildDatabaseURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	t.Cleanup(cancel)
+	conn, err := pgx.Connect(ctx, dsn.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := `luxo reindex "` + strings.ToLower(rand.Text())
+	quoted := pgx.Identifier{schema}.Sanitize()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := conn.Close(ctx); err != nil {
+			t.Error("close REINDEX test connection", err)
+		}
+	})
+	if _, err := conn.Exec(ctx, "CREATE SCHEMA "+quoted); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(ctx, "DROP SCHEMA "+quoted+" CASCADE"); err != nil {
+			t.Error("drop REINDEX test schema", err)
+			return
+		}
+		var found bool
+		if err := conn.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=$1)", schema).Scan(&found); err != nil || found {
+			t.Errorf("REINDEX test schema cleanup: found=%v err=%v", found, err)
+		}
+	})
+	params := dsn.Query()
+	params.Set("pool_max_conns", "1")
+	params.Set("search_path", quoted)
+	params.Set("standard_conforming_strings", "on")
+	dsn.RawQuery = params.Encode()
+	db, err := NewPGDB(ctx, dsn.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	runner := NewFromDB(db, dir)
+	t.Cleanup(runner.Close)
+	assertMetadataCurrentSchema(t, runner, schema)
+	return runner, dir, quoted
 }

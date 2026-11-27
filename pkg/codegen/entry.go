@@ -2,6 +2,7 @@ package codegen
 
 import (
 	"fmt"
+	"path"
 	"strconv"
 	"strings"
 
@@ -582,9 +583,16 @@ func writeStartupRegistrationFailure(b *strings.Builder, kind string) {
 	b.WriteString(", err)\n\t\tos.Exit(1)\n\t}\n")
 }
 
-// emitModuleEntryFiles produces per-module entry points for cluster mode.
-// Each module gets its own main.gen.go under lucis/<module>/.
-// Returns map[moduleName][]byte.
+// ModuleEntryDirectory returns the slash-separated directory for a cluster entry.
+func ModuleEntryDirectory(name string) string {
+	// Reserve lucis/app and lucis/gateway for the system entries across filesystems.
+	if strings.EqualFold(name, "app") || strings.EqualFold(name, "gateway") {
+		return path.Join("lucis", "modules", name)
+	}
+	return path.Join("lucis", name)
+}
+
+// emitModuleEntryFiles maps each module name to its cluster entry source.
 func emitModuleEntryFiles(result *semantic.Result, allModules []moduleInfo, modulePath string, backends EntryBackends) map[string][]byte {
 	if len(allModules) == 0 {
 		return nil
