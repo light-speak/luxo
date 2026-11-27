@@ -1,3 +1,4 @@
+import fs, { type Stats, type StatWatcher } from 'node:fs'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
 import { build, createServer, type InlineConfig, type ViteDevServer } from 'vite'
@@ -192,51 +193,95 @@ function hasSchemaReadError(errors: readonly unknown[], matches: (cause: Error) 
     cause instanceof Error && cause.cause instanceof Error && matches(cause.cause)))
 }
 
+async function waitForSchemaPolling(file: string, registered: () => StatWatcher | undefined) {
+  const mode = statSync(file).mode & 0o777
+  let subscription: StatWatcher | undefined
+  let sampled = false
+  const observe = (current: Stats, previous: Stats) => {
+    if (current.mode !== previous.mode && current.mtimeMs === previous.mtimeMs && current.size === previous.size) sampled = true
+  }
+  try {
+    await vi.waitFor(() => {
+      const latest = registered()
+      expect(latest).toBeDefined()
+      if (subscription !== latest) {
+        subscription?.off('change', observe)
+        subscription = latest
+        subscription?.on('change', observe)
+        sampled = false
+      }
+      // A permission-only change witnesses a real poll while leaving the schema revision intact.
+      if (!sampled) fs.chmodSync(file, statSync(file).mode & 0o200 ? mode & ~0o222 : mode | 0o200)
+      expect(sampled).toBe(true)
+    }, { ...polling, interval: 100 })
+  } finally {
+    subscription?.off('change', observe)
+    fs.chmodSync(file, mode)
+  }
+}
+
 it('rebuilds generated files and cached app transforms for a schema-only change in Vite build watch', async () => {
   const fixture = project()
-  const watcher = await build({ ...fixture.config, build: {
-    watch: { chokidar: watchOptions }, minify: false, lib: { entry: 'entry.ts', formats: ['es'], fileName: 'app' },
-  } })
-  if (!('on' in watcher)) {
-    fixture.clean()
-    throw new Error('expected Vite build watcher')
-  }
-  let completed = 0
-  let ended = 0
-  const errors: unknown[] = []
-  watcher.on('event', event => {
-    if (event.code === 'BUNDLE_END') completed++
-    if (event.code === 'ERROR') errors.push(event.error)
-    if (event.code === 'END') ended++
-  })
+  const registration = vi.spyOn(fs, 'watchFile')
+  let watchBuild: Awaited<ReturnType<typeof build>> | undefined
   try {
+    const watcher = watchBuild = await build({ ...fixture.config, build: {
+      watch: { chokidar: watchOptions }, minify: false, lib: { entry: 'entry.ts', formats: ['es'], fileName: 'app' },
+    } })
+    if (!('on' in watcher)) throw new Error('expected Vite build watcher')
+    let completed = 0
+    let ended = 0
+    let previousEnd = 0
+    const errors: unknown[] = []
+    watcher.on('event', event => {
+      if (event.code === 'BUNDLE_END') completed++
+      if (event.code === 'ERROR') errors.push(event.error)
+      if (event.code === 'END') ended++
+    })
+    const nextSave = async () => {
+      await vi.waitFor(() => expect(ended).toBeGreaterThan(previousEnd), polling)
+      previousEnd = ended
+      // Rollup reports END before its asynchronous file watch can establish the next baseline.
+      await waitForSchemaPolling(fixture.schema, () => {
+        const { calls, results } = registration.mock
+        for (let index = calls.length - 1; index >= 0; index--) {
+          if (calls[index]?.[0] !== fixture.schema) continue
+          const result = results[index]
+          return result?.type === 'return' ? result.value : undefined
+        }
+      })
+    }
     const bundle = () => readFileSync(join(fixture.root, 'dist/app.mjs'), 'utf8')
     await vi.waitFor(() => expect(completed).toBeGreaterThan(0), polling)
     expect(bundle()).not.toContain('$select')
     const before = completed
-    await new Promise(resolve => setTimeout(resolve, 200))
+    await nextSave()
     fixture.save(updatedSchema)
     await vi.waitFor(() => expect(completed).toBeGreaterThan(before), polling)
     expect(errors).toEqual([])
     expect(fixture.client()).toContain('  me<')
     expect(bundle()).toContain('$select')
     const rendered = completed
+    await nextSave()
     rmSync(fixture.clientFile)
     expect(existsSync(fixture.clientFile)).toBe(false)
     fixture.save(updatedSchema)
     await vi.waitFor(() => expect(completed).toBeGreaterThan(rendered), polling)
     expect(fixture.client()).toContain('  me<')
     expect(bundle()).toContain('$select')
-    const beforeError = ended
+    await nextSave()
     fixture.writeSchema('{')
     await vi.waitFor(() => expect(hasSchemaReadError(errors, cause => cause instanceof SyntaxError)).toBe(true), polling)
-    await vi.waitFor(() => expect(ended).toBeGreaterThan(beforeError), polling)
+    expect(fixture.client()).toContain('  me<')
+    expect(bundle()).toContain('$select')
+    await nextSave()
     const failed = completed
     fixture.save(originalSchema)
     await vi.waitFor(() => expect(completed).toBeGreaterThan(failed), polling)
     expect(fixture.client()).not.toContain('  me<')
     expect(bundle()).not.toContain('$select')
     const beforeReplace = completed
+    await nextSave()
     const replacement = `${fixture.schema}.next`
     writeFileSync(replacement, JSON.stringify(updatedSchema))
     renameSync(replacement, fixture.schema)
@@ -245,6 +290,7 @@ it('rebuilds generated files and cached app transforms for a schema-only change 
     expect(bundle()).toContain('$select')
     const previousClient = fixture.client()
     const previousBundle = bundle()
+    await nextSave()
     const beforeDelete = ended
     rmSync(fixture.schema)
     await vi.waitFor(() => expect(hasSchemaReadError(errors, cause => cause.message.includes('ENOENT'))).toBe(true), polling)
@@ -252,7 +298,11 @@ it('rebuilds generated files and cached app transforms for a schema-only change 
     expect(fixture.client()).toBe(previousClient)
     expect(bundle()).toBe(previousBundle)
   } finally {
-    await watcher.close()
-    fixture.clean()
+    try {
+      if (watchBuild && 'on' in watchBuild) await watchBuild.close()
+    } finally {
+      registration.mockRestore()
+      fixture.clean()
+    }
   }
 }, 30000)
