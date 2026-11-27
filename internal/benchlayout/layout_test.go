@@ -170,12 +170,16 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{APIPackage, "BenchmarkHandlerPanicFormatting/OpaquePanic/After-2", "api-handler-panic"},
 		{APIPackage, "BenchmarkWSConnectionRegistrations/size=64/checked-2", "api-websocket-registrations"},
 		{APIPackage, "BenchmarkHandlerDetachedResponseBuffer-2", APINonIdentityProfile},
-		{APIPackage, "BenchmarkHandlerResponseBuffer/Int-2", APINonIdentityProfile},
+		{APIPackage, "BenchmarkHandlerResponseBuffer/Int-2", APIHandlerPanicProfile},
 		{APIPackage, "BenchmarkWSConnectionRegistrationCold/false-2", APINonIdentityProfile},
+		{APIPackage, "BenchmarkResponseOriginRun/bounded-2", "api-response-origin-run"},
+		{APIPackage, "BenchmarkResponseOriginRun/unbounded-2", "api-response-origin-run"},
+		{APIPackage, "BenchmarkResponseOriginContended", APINonIdentityProfile},
+		{RPCPackage, "BenchmarkResponseOriginRun", DefaultProfile},
 		{APIPackage, "BenchmarkWSConnectionRegistrationsSibling-2", APINonIdentityProfile},
 		{RPCPackage, "BenchmarkHandlerPanicFormatting", RPCHandlerPanicProfile},
 		{APIPackage, "BenchmarkIdentityEnumArray", DefaultProfile},
-		{APIPackage, "BenchmarkIdentitySubjectVisibility", DefaultProfile},
+		{APIPackage, "BenchmarkIdentitySubjectVisibility", APIIdentityConditionProfile},
 		{APIPackage, "BenchmarkIdentitySurface", APINonIdentityProfile},
 		{APIPackage, "BenchmarkLocalRouteExport", "api-local-route-export"},
 		{APIPackage, "BenchmarkLocalRouteExport/routes=128/previous-2", "api-local-route-export"},
@@ -244,9 +248,10 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{APICanonicalJSONProfile, "^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$"},
 		{APIBinaryParamLookupProfile, "^BenchmarkBinaryParamLookup$"},
 		{APIRequestLogProfile, "^BenchmarkRequestLogBoundary$|^BenchmarkRequestLogDelivered$"},
-		{"api-identity-condition", "^BenchmarkIdentityConditionValidity$"},
-		{"api-handler-panic", "^BenchmarkHandlerPanicFormatting$"},
+		{"api-identity-condition", "^BenchmarkIdentityConditionValidity$|^BenchmarkIdentitySubjectVisibility$"},
+		{"api-handler-panic", "^BenchmarkHandlerPanicFormatting$|^BenchmarkHandlerResponseBuffer$"},
 		{"api-websocket-registrations", "^BenchmarkWSConnectionRegistrations$"},
+		{"api-response-origin-run", "^BenchmarkResponseOriginRun$"},
 	}
 	if !reflect.DeepEqual(apiProfiles, wantAPI) || ValidPerformanceProfile(RPCPackage, APIBinaryParamLookupProfile) ||
 		ValidPerformanceProfile(RPCPackage, APIRequestLogProfile) {
@@ -373,6 +378,12 @@ func TestIntelBenchmarkProfilesKeepRootsAndPackagesIndependent(t *testing.T) {
 	for _, tc := range []struct{ pkg, name, want string }{
 		{"pkg/lux/api", "BenchmarkStaticValueParams/Bytes/JSON/previous-2", "api-static-value-params"},
 		{"pkg/lux/api", "BenchmarkStaticParamSlot/static-2", APINonIdentityProfile},
+		{"pkg/lux/api", "BenchmarkHandlerResponseBufferSibling-2", APINonIdentityProfile},
+		{"pkg/lux/rpc", "BenchmarkHandlerResponseBuffer/Int-2", DefaultProfile},
+		{"pkg/lux/api", "BenchmarkIdentitySubjectVisibility/value/reference-2", APIIdentityConditionProfile},
+		{"pkg/lux/api", "BenchmarkIdentitySubjectVisibilitySibling-2", APINonIdentityProfile},
+		{"pkg/lux/api", "BenchmarkIdentityEnumArray/empty-2", DefaultProfile},
+		{"pkg/lux/rpc", "BenchmarkIdentitySubjectVisibility/value/reference-2", DefaultProfile},
 		{"pkg/lux/rpc", "BenchmarkLRPCPreparedFrame/128/after-2", RPCPreparedFrameProfile},
 		{"pkg/lux/rpc", "BenchmarkLRPCConnectionFrameReuseCandidate/128/reuse-2", "rpc-frame-reuse"},
 		{"pkg/lux/rpc", "BenchmarkLRPCConnectionFrameReuseCandidateSibling", DefaultProfile},
@@ -398,5 +409,23 @@ func TestRPCHandlerPanicProfileRequiresItsExactPackageAndRoot(t *testing.T) {
 	}
 	if ProfileForBenchmark(RPCPackage, root+"Sibling-2") != DefaultProfile || ValidPerformanceProfile(APIPackage, profile) || ValidPerformanceProfile(RPCPackage, "api-handler-panic") || ProfileForBenchmark(APIPackage, root) == profile {
 		t.Fatal("RPC profile leaked across root or package")
+	}
+}
+
+func TestTransportRejectionAndReplacementProfiles(t *testing.T) {
+	const rpc, h2 = "pkg/lux/rpc", "pkg/lux/h2transport"
+	for _, tc := range []struct{ pkg, other, root, leaf, profile string }{
+		{rpc, h2, "BenchmarkRPCPoolReturnRejection", "/full/after-2", "rpc-pool-return-rejection"},
+		{h2, rpc, "BenchmarkTaskDeadlineReplacement", "/128/conditional-2", "h2-task-deadline-replacement"},
+	} {
+		t.Run(tc.profile, func(t *testing.T) {
+			if ProfileForBenchmark(tc.pkg, tc.root) != tc.profile ||
+				ProfileForBenchmark(tc.pkg, tc.root+tc.leaf) != tc.profile ||
+				ProfileForBenchmark(tc.other, tc.root) != DefaultProfile ||
+				ProfileForBenchmark(tc.pkg, tc.root+"Sibling") != DefaultProfile ||
+				!ValidPerformanceProfile(tc.pkg, tc.profile) || ValidPerformanceProfile(tc.other, tc.profile) {
+				t.Fatalf("incorrect root or package binding for %s", tc.profile)
+			}
+		})
 	}
 }
