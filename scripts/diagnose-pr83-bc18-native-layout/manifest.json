@@ -1,0 +1,189 @@
+{
+  "A": {
+    "commit": "bc18a70e66da8053deb70d575b4752a4343ef1f8",
+    "tree": "93b5ed667a8964f173e321ed34955a3b15560543"
+  },
+  "H": {
+    "commit": "1a01ee3808b23c8145bb3993ab4f07963248175c",
+    "parents": [
+      "0656423e61b98515dc2caa2d56f2041ea551942c",
+      "bc18a70e66da8053deb70d575b4752a4343ef1f8"
+    ],
+    "tree": "159e6ebd7b2982604e15224d71093c6532042d42"
+  },
+  "case": {
+    "cache": {
+      "confirmed": "github.com/light-speak/luxo/pkg/lux/api/CacheExecutionDependencyCollection/models=1-2",
+      "hot": "BenchmarkCacheExecutionDependencyCollection|\\(\\*cacheDependencyPlan\\)\\.appendModels",
+      "inventory": "cache",
+      "originalArtifact": 15184459162,
+      "originalDigest": "2f844b7325c9d41a85fe993400d6d12b7830bdcea700ae01413581efd031b6ad",
+      "package": "pkg/lux/api",
+      "profile": "api-non-identity",
+      "required": [
+        "\\.BenchmarkCacheExecutionDependencyCollection\\.func1$",
+        "\\.\\(\\*cacheDependencyPlan\\)\\.appendModels$"
+      ],
+      "selector": "^BenchmarkCacheExecutionDependencyCollection$/^models=1$",
+      "timed": [
+        "BenchmarkCacheExecutionDependencyCollection/models=1-2"
+      ]
+    },
+    "event": {
+      "confirmed": "github.com/light-speak/luxo/pkg/lux/api/EventIdentityDispatch/subscribers=1/bytes=8/identity=false-2",
+      "hot": "BenchmarkEventIdentityDispatch|EventStream\\[.*\\]\\)\\.Dispatch$|enqueueStreamData|cachedStreamEncoding",
+      "inventory": "event",
+      "originalArtifact": 15184339275,
+      "originalDigest": "ac9f58b61fa1ed4e2d409169d9d43822cd7bf2a6dd446455b6aa01a343a0a92d",
+      "package": "pkg/lux/api",
+      "profile": "api-non-identity",
+      "required": [
+        "\\.BenchmarkEventIdentityDispatch\\.func1$",
+        "EventStream\\[go\\.shape\\.int\\]\\)\\.Dispatch$"
+      ],
+      "selector": "^BenchmarkEventIdentityDispatch$/^subscribers=1$/^bytes=8$/^identity=false$",
+      "timed": [
+        "BenchmarkEventIdentityDispatch/subscribers=1/bytes=8/identity=false-2"
+      ]
+    },
+    "gateway": {
+      "confirmed": "github.com/light-speak/luxo/pkg/lux/luvia/GatewayIdentity/authenticated/after-2",
+      "hot": "BenchmarkGatewayIdentity|luvia\\.(New|newGateway|Identity)|context\\.\\(\\*valueCtx\\)\\.Value",
+      "inventory": "gateway",
+      "originalArtifact": 15185761840,
+      "originalDigest": "e21c2b11b95235b265af433c1e4805455610a55a635a68026f4e7ad8ebb67491",
+      "package": "pkg/lux/luvia",
+      "profile": "luvia-gateway-identity",
+      "required": [
+        "\\.newGateway\\.func1$",
+        "\\.BenchmarkGatewayIdentity$"
+      ],
+      "selector": "^BenchmarkGatewayIdentity$/^authenticated$/^after$|^BenchmarkGatewayIdentity$/^authenticated$/^before$",
+      "timed": [
+        "BenchmarkGatewayIdentity/authenticated/after-2",
+        "BenchmarkGatewayIdentity/authenticated/before-2"
+      ]
+    },
+    "handler-business": {
+      "confirmed": "github.com/light-speak/luxo/pkg/lux/api/HandlerPanicFormatting/BusinessError/After-2",
+      "hot": "BenchmarkHandlerPanicFormatting|/api\\.\\(\\*Router\\)\\.callHandler",
+      "inventory": "handler",
+      "originalArtifact": 15185960474,
+      "originalDigest": "1e49b78b4dd5ae7c92ae700349bbee1a16220af33b9db8bd5049fd559c98ef7c",
+      "package": "pkg/lux/api",
+      "profile": "api-handler-panic",
+      "required": [
+        "\\.BenchmarkHandlerPanicFormatting$",
+        "\\.\\(\\*Router\\)\\.callHandler$"
+      ],
+      "selector": "^BenchmarkHandlerPanicFormatting$/^BusinessError$/^After$|^BenchmarkHandlerPanicFormatting$/^BusinessError$/^Before$",
+      "timed": [
+        "BenchmarkHandlerPanicFormatting/BusinessError/After-2",
+        "BenchmarkHandlerPanicFormatting/BusinessError/Before-2"
+      ]
+    },
+    "handler-empty": {
+      "confirmed": "github.com/light-speak/luxo/pkg/lux/api/HandlerResponseBuffer/Empty-2",
+      "hot": "BenchmarkHandlerResponseBuffer|/api\\.\\(\\*Router\\)\\.callHandler",
+      "inventory": "handler",
+      "originalArtifact": 15184793419,
+      "originalDigest": "d87686df4fc23c7f7ea0a779b22e64ab7ef0d5c07d2bc8276b5fd91554e4afd0",
+      "package": "pkg/lux/api",
+      "profile": "api-handler-panic",
+      "required": [
+        "\\.BenchmarkHandlerResponseBuffer$",
+        "\\.\\(\\*Router\\)\\.callHandler$"
+      ],
+      "selector": "^BenchmarkHandlerResponseBuffer$/^Empty$",
+      "timed": [
+        "BenchmarkHandlerResponseBuffer/Empty-2"
+      ]
+    }
+  },
+  "compileProfileSHA256": "38bf34a317f189d892fb16e3021137ab29464469cb3c0ffeb239f4ba4fd8cedc",
+  "diffSHA256": "d464f8ad1cac256a6a4052dbb2a9fa3b229ff582172a17532a0e3a1dd6dd8e9f",
+  "inventory": {
+    "cache": [
+      "BenchmarkCacheExecutionDependencyCollection/models=1-2",
+      "BenchmarkCacheExecutionDependencyCollection/models=128-2",
+      "BenchmarkCacheExecutionDependencyCollection/models=16-2"
+    ],
+    "event": [
+      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=4096/identity=false-2",
+      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=4096/identity=selection-private-2",
+      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=4096/identity=selection-public-2",
+      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=4096/identity=true-2",
+      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=8/identity=false-2",
+      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=8/identity=selection-private-2",
+      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=8/identity=selection-public-2",
+      "BenchmarkEventIdentityDispatch/subscribers=1/bytes=8/identity=true-2",
+      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=4096/identity=false-2",
+      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=4096/identity=selection-private-2",
+      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=4096/identity=selection-public-2",
+      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=4096/identity=true-2",
+      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=8/identity=false-2",
+      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=8/identity=selection-private-2",
+      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=8/identity=selection-public-2",
+      "BenchmarkEventIdentityDispatch/subscribers=128/bytes=8/identity=true-2",
+      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=4096/identity=false-2",
+      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=4096/identity=selection-private-2",
+      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=4096/identity=selection-public-2",
+      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=4096/identity=true-2",
+      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=8/identity=false-2",
+      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=8/identity=selection-private-2",
+      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=8/identity=selection-public-2",
+      "BenchmarkEventIdentityDispatch/subscribers=16/bytes=8/identity=true-2"
+    ],
+    "gateway": [
+      "BenchmarkGatewayIdentity/anonymous/after-2",
+      "BenchmarkGatewayIdentity/anonymous/before-2",
+      "BenchmarkGatewayIdentity/authenticated/after-2",
+      "BenchmarkGatewayIdentity/authenticated/before-2",
+      "BenchmarkGatewayIdentity/typed-nil/after-2",
+      "BenchmarkGatewayIdentity/typed-nil/before-2"
+    ],
+    "handler": [
+      "BenchmarkHandlerDetachedResponseBuffer-2",
+      "BenchmarkHandlerPanicFormatting/BusinessError/After-2",
+      "BenchmarkHandlerPanicFormatting/BusinessError/Before-2",
+      "BenchmarkHandlerPanicFormatting/OpaquePanic/After-2",
+      "BenchmarkHandlerPanicFormatting/OpaquePanic/Before-2",
+      "BenchmarkHandlerPanicFormatting/StringPanic/After-2",
+      "BenchmarkHandlerPanicFormatting/StringPanic/Before-2",
+      "BenchmarkHandlerPanicFormatting/Success/After-2",
+      "BenchmarkHandlerPanicFormatting/Success/Before-2",
+      "BenchmarkHandlerResponseBuffer/BusinessError-2",
+      "BenchmarkHandlerResponseBuffer/Bytes4KiB-2",
+      "BenchmarkHandlerResponseBuffer/Empty-2",
+      "BenchmarkHandlerResponseBuffer/Int-2"
+    ]
+  },
+  "originalAttempt": 1,
+  "originalRun": 45967887667,
+  "routes": {
+    "AMD EPYC 9V45 96-Core Processor": [
+      "handler-business"
+    ],
+    "AMD EPYC 9V74 80-Core Processor": [
+      "event"
+    ],
+    "Intel(R) Xeon(R) 6975P-C": [
+      "cache",
+      "handler-empty",
+      "gateway"
+    ]
+  },
+  "sourceSHA256": {
+    "pkg/lux/api/cache_dependencies.go": "1d463c1cc2ba3a5d9bd86ed4833bf86930752d74c9ad3b4f26e17e0312afe87b",
+    "pkg/lux/api/cache_dependencies_bench_test.go": "69dd6bf66f6b81ae2320762a6794bc70fb1a007851e6dd4fe0837ab3924fba14",
+    "pkg/lux/api/cache_dependencies_test.go": "503197b83cd959cb1dcdbe3b15e2a099cf74ee29bcb47148030c2935251fe32c",
+    "pkg/lux/api/handler_panic_bench_test.go": "01122e4a09e5c6d6a20018f47566fb801ad4888db504fd9d2c932be56146e302",
+    "pkg/lux/api/response_cache_test.go": "982d2c580b26a16a249d8e9abf57e9059d03f8d7870336927c5a688bee1bfb04",
+    "pkg/lux/api/router.go": "cd1c12633cd495e98f4b2bb55fe58a1905f2f94d6794c76d5480ebdb3f2e5cc6",
+    "pkg/lux/api/stream_event.go": "024853020eddc56c3b88d0ccfc81a9a3030c961c40196199dbcce863d8c5dfaf",
+    "pkg/lux/api/stream_event_bench_test.go": "f74b75418ed0968b63b02b4aaf59dc678bf668047c9f3b385fb802a571b32e67",
+    "pkg/lux/luvia/luvia.go": "bfca1e822080fbc78f92415f2e3973df57e753a2a384e9b632af7d7955d2898f",
+    "pkg/lux/luvia/middleware.go": "16104944640bd72d4e15e4fbae6c4920b8d005cc5c0cf11ca0d19ba5b9f88374",
+    "pkg/lux/luvia/middleware_test.go": "a284f6673c86a90ed916099ac82a6ffb0e9b190161c946989957839252b07034"
+  }
+}
