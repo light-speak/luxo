@@ -1,0 +1,111 @@
+name: Recheck PR 143 gateway identity and latency timing on their original CPUs
+
+on:
+  push:
+    branches: [diagnostics/pr143-current-layout]
+
+permissions:
+  contents: read
+
+jobs:
+  witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 32
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3]
+    env:
+      GOTOOLCHAIN: local
+      SLOT: ${{ matrix.slot }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Match the original CPU before setup
+        id: route
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: python3 -I -B scripts/diagnose-pr143-current-layout/run.py --probe
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: 5376367706e217b18a676dfe932004a0f5419a04
+          path: .tmp/pr83-native-harness
+          sparse-checkout: scripts/diagnose-pr83-amd
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: f9d0454826d1763b46e41eb26ef2a7aecdb86205
+          path: .tmp/pr143-layout-helper
+          sparse-checkout: scripts/diagnose-pr143-strict-native.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: f8924ac56afa77c460d7fc62f81df10e2673c202
+          path: .tmp/pr143-current-inputs/A
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: 92cf68a18891338219102cec1aecb8e132a8c2c9
+          path: .tmp/pr143-current-inputs/H
+          fetch-depth: 2
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        name: Compare original and layout-controlled binaries
+        timeout-minutes: 27
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: python3 -I -B scripts/diagnose-pr143-current-layout/run.py
+
+      - if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr143-current-layout-${{ github.run_id }}-${{ github.run_attempt }}-slot-${{ matrix.slot }}
+          path: .tmp/pr143-current-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  qualification:
+    needs: witness
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/diagnose-pr143-current-layout
+          persist-credentials: false
+
+      - name: Require both CPU routes and unchanged threshold
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          results=$(mktemp -d .tmp/pr143-current-layout-receipts.XXXXXXXX)
+          trap 'rm -rf -- "$results"' EXIT
+          gh run download "$GITHUB_RUN_ID" --pattern "pr143-current-layout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-slot-*" --dir "$results"
+          python3 -I -B scripts/diagnose-pr143-current-layout/run.py --summarize "$results" "$GITHUB_SHA"
