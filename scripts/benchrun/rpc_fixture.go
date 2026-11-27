@@ -45,6 +45,9 @@ const (
 		"\n" + benchlayout.APIIdentityConditionProfile + "-overlay-v1 " + apiIdentityConditionFixture + "=" + apiIdentityConditionSHA +
 		"\n" + benchlayout.APIHandlerPanicProfile + "-overlay-v1 " + apiHandlerPanicFixture + "=" + apiHandlerPanicSHA +
 		"\n" + benchlayout.APIWebSocketRegistrationsProfile + "-overlay-v1 " + apiWSRegistrationsFixture + "=" + apiWSRegistrationsSHA +
+		"\n" + benchlayout.APIBodyReadProfile + "-overlay-v1 " + apiBodyReadFixture + "=" + apiBodyReadSHA +
+		"\n" + benchlayout.APIJSONQuoteCandidateProfile + "-overlay-v1 " + apiJSONQuoteFixture + "=" + apiJSONQuoteSHA +
+		" " + apiJSONQuoteReferenceFixture + "=" + apiJSONQuoteReferenceSHA +
 		"\n" + benchlayout.APIResponseOriginRunProfile + "-overlay-v1 " + apiResponseOriginBenchmarkFixture + "=" + apiResponseOriginBenchmarkSHA +
 		" " + apiResponseOriginHelperFixture + "=" + apiResponseOriginHelperSHA + ":" + apiResponseOriginProjectionSHA +
 		"\nrpc-owned-request-overlay-v1 " + rpcOwnedRequestFixture +

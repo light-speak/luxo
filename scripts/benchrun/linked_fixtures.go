@@ -164,21 +164,36 @@ const (
 	apiResponseOriginHelperFixture    = "response_origin_test.go"
 	apiResponseOriginHelperSHA        = "42fb8c4bf2d07d23138b27c10302a54e42ab5de674b0ff890c55894e06cc5973"
 	apiResponseOriginProjectionSHA    = "386e2dd6bc21b04dd35e49a9201ca0df47bf727288b9e6aa2301828336cf8683"
+	apiBodyReadFixture                = "request_body_test.go"
+	apiBodyReadSHA                    = "05511ef9477759d0ca01ed76634fc3a38537626ccf4db79c5dfcce0e2ac13336"
+	apiJSONQuoteFixture               = "buf_quote_test.go"
+	apiJSONQuoteSHA                   = "f6f5f6869a72a6fd35c54b9ddff66dd341e9962d209a451cd3cc219193e274b9"
+	apiJSONQuoteReferenceFixture      = "buf_quote_reference_test.go"
+	apiJSONQuoteReferenceSHA          = "1c12228639bcf3cf6506c93f24772dc12bc93512ee3fb300079ef93b045a439d"
 )
 
-var apiBenchmarkFileFixtures = map[string]struct{ name, sourceSHA string }{
-	benchlayout.APIIdentityConditionProfile:      {apiIdentityConditionFixture, apiIdentityConditionSHA},
-	benchlayout.APIHandlerPanicProfile:           {apiHandlerPanicFixture, apiHandlerPanicSHA},
-	benchlayout.APIWebSocketRegistrationsProfile: {apiWSRegistrationsFixture, apiWSRegistrationsSHA},
+var apiBenchmarkFileFixtures = map[string][]struct{ name, sourceSHA string }{
+	benchlayout.APIIdentityConditionProfile:      {{apiIdentityConditionFixture, apiIdentityConditionSHA}},
+	benchlayout.APIHandlerPanicProfile:           {{apiHandlerPanicFixture, apiHandlerPanicSHA}},
+	benchlayout.APIWebSocketRegistrationsProfile: {{apiWSRegistrationsFixture, apiWSRegistrationsSHA}},
+	benchlayout.APIBodyReadProfile:               {{apiBodyReadFixture, apiBodyReadSHA}},
+	benchlayout.APIJSONQuoteCandidateProfile: {
+		{apiJSONQuoteFixture, apiJSONQuoteSHA},
+		{apiJSONQuoteReferenceFixture, apiJSONQuoteReferenceSHA},
+	},
 }
 
 func writeAPIBenchmarkFileOverlay(pkg, workspace, profile string) (string, error) {
-	fixture := apiBenchmarkFileFixtures[profile]
-	if err := verifyAPIBenchmarkFixture(pkg, profile, fixture.name, fixture.sourceSHA); err != nil {
-		return "", err
+	fixtures := apiBenchmarkFileFixtures[profile]
+	retained := make([]string, 0, len(fixtures))
+	for _, fixture := range fixtures {
+		if err := verifyAPIBenchmarkFixture(pkg, profile, fixture.name, fixture.sourceSHA); err != nil {
+			return "", err
+		}
+		retained = append(retained, fixture.name)
 	}
-	// Keep the native witness's complete benchmark file, including its companion declarations.
-	return retainBenchmarkTestFiles(pkg, workspace, profile, fixture.name)
+	// Keep the native witness's complete benchmark files and their companion declarations.
+	return retainBenchmarkTestFiles(pkg, workspace, profile, retained...)
 }
 
 func verifyAPIBenchmarkFixture(pkg, profile, name, sourceSHA string) error {

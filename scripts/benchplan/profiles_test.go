@@ -889,6 +889,16 @@ func TestAPIRequestLogPrimaryAndConfirmationProfiles(t *testing.T) {
 	}
 }
 
+func TestAPIBodyReadAndQuoteInventories(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	verifyExactProfileInventory(t, pkg, "BenchmarkBodyReadReverse", "api-body-read", "BenchmarkBodyRead",
+		benchmarkCaseProduct([]string{"0", "128", "4096", "4097", "65536"}, []string{"direct", "previous"}), "2/direct")
+	verifyExactProfileInventory(t, pkg, "BenchmarkJSONQuoteInvalidCandidate", "api-json-quote-candidate",
+		"BenchmarkJSONQuoteCandidate", benchmarkCaseProduct(
+			[]string{"empty", "ascii16", "ascii1024", "unicode24", "unicode1026", "escapes24", "html"},
+			[]string{"current", "manual-strict", "stdlib"}), "empty/unverified")
+}
+
 func TestAPIIntelProfilesKeepCompleteOriginalInventories(t *testing.T) {
 	const pkg = "pkg/lux/api"
 	const identity = "BenchmarkIdentityConditionValidity"
