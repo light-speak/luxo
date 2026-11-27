@@ -24,13 +24,14 @@ HARNESS_FILES = {
     "go-capture.py": "b93cb28f2b092f63a07543a71cd39d46f3f28044d73f3547aaf16078c2d07db9",
     "manifest.json": "0c12129c702cf833c79f9e8d3269d1cfb7171d7cd54b1b6255c63a0598bc09a0",
 }
-PARENT = "bc18a70e66da8053deb70d575b4752a4343ef1f8"
+PARENT = "f8290c866862d689746a53a54e56fdf921b5c6d4"
 HARNESS_REVISION = "5376367706e217b18a676dfe932004a0f5419a04"
 REF = "refs/heads/diagnostics/pr83-bc18-native-layout"
 MANIFEST = INPUT / "manifest.json"
 MANIFEST_SHA = "46e93f3752bb106a44a2e91e52735ca8c890cda44e0303b4c0fb27cdd30f521e"
 CONFIG = json.loads(MANIFEST.read_bytes())
 SLOTS = set(range(1, 7))
+TARGET_CASES = {"event", "handler-business"}
 PAIRS = {f"{arm}-{group}.{direction}" for arm in ("AA", "HH")
          for group in (1, 2) for direction in ("forward", "reverse")}
 
@@ -66,18 +67,22 @@ def bind_event():
             os.environ.get("GITHUB_EVENT_NAME") == "push" and os.environ.get("GITHUB_REF") == REF and
             os.environ.get("GITHUB_SHA") == active, "unexpected diagnostic event")
     paths = [".github/workflows/diagnose-pr83-bc18-native-layout.yml",
-             *(str((INPUT / file).relative_to(ROOT)) for file in ("layout.py", "manifest.json", "run.py"))]
+             *(str((INPUT / file).relative_to(ROOT)) for file in ("layout.py", "run.py"))]
     require(git(ROOT, "show", "-s", "--format=%P", active) == PARENT and
             git(ROOT, "diff", "--name-status", PARENT, active).splitlines() ==
-            ["A\t" + path for path in sorted(paths)], "unexpected diagnostic parent or paths")
+            ["M\t" + path for path in sorted(paths)], "unexpected diagnostic parent or paths")
     return active, slot
+
+
+def target_cases(cpu):
+    return [key for key in CONFIG["routes"].get(cpu, []) if key in TARGET_CASES]
 
 
 def cpu_cases(cpuinfo):
     models = {line.split(":", 1)[1].strip() for line in cpuinfo.splitlines() if line.startswith("model name")}
     require(len(models) == 1, "unknown or mixed CPU model")
     cpu = models.pop()
-    return cpu, CONFIG["routes"].get(cpu, [])
+    return cpu, target_cases(cpu)
 
 
 def route():
@@ -169,7 +174,7 @@ def expected_overlay(source, package, profile):
             if path.name == "middleware_test.go" else "" for path in files}
 
 
-def compile_binary(runtime, go, tools, source, role, case, mode, work, evidence):
+def compile_binary(runtime, driver, go, tools, source, role, case, mode, work, evidence):
     package, profile = case["package"], case["profile"]
     evidence.mkdir(parents=True)
     binary_root = work / ("binary-" + evidence.parent.parent.name + "-" + mode + "-" + role)
@@ -177,9 +182,19 @@ def compile_binary(runtime, go, tools, source, role, case, mode, work, evidence)
     wrapper = work / "wrapper/go"
     environment = dict(os.environ, PATH=str(wrapper.parent)+os.pathsep+os.environ["PATH"],
                        LUXO_WITNESS_REAL_GO=go, LUXO_WITNESS_PROFILE_LOG=str(evidence),
-                       GOWORK=str(source/"go.work"), GOFLAGS="-ldflags=-funcalign=64" if mode == "aligned" else "")
+                       GOWORK=str(source/"go.work"),
+                       GOFLAGS="-x -ldflags=-funcalign=64" if mode == "aligned" else "-x")
     command = "compile-performance-baseline" if role == "A" else "compile-performance"
-    runtime.call(tools/"benchrun", command, source, binary_root, package, profile, env=environment)
+    trace = binary_root / "go-build.trace"
+    args = (tools/"benchrun", command, source, binary_root, package, profile)
+    with trace.open("xb") as stream:
+        result = subprocess.run(args, cwd=ROOT, env=environment, stderr=stream)
+    if result.returncode:
+        raise RuntimeError(f"benchmark compilation failed: {trace.read_text(errors='replace')[-4000:]}")
+    linker = Path(output(go, "env", "GOTOOLDIR").decode().strip()) / "link"
+    invocation = driver["link_invocation"](trace, linker, Path(package).name + ".test", mode == "aligned")
+    save(evidence/"link-command.json", invocation)
+    trace.unlink()
     stem = package.replace("/", "-") + "-" + profile
     binary = binary_root / (stem + ".test")
     overlay = expected_overlay(source, package, profile)
@@ -237,10 +252,10 @@ def classify(case, modes):
 def summarize(directory, diagnostic):
     receipts = sorted(directory.glob("*/status.json"))
     require(len(receipts) == len(SLOTS), "missing slot receipt")
-    results, slots = {case: [] for case in CONFIG["case"]}, set()
+    results, slots = {case: [] for case in sorted(TARGET_CASES)}, set()
     for path in receipts:
         status = json.loads(path.read_bytes())
-        cases = CONFIG["routes"].get(status["cpu"], [])
+        cases = target_cases(status["cpu"])
         slot = status["slot"]
         require(slot in SLOTS-slots and status["diagnostic"] == diagnostic and status["cases"] == cases and
                 status["processes"] == 240*len(cases) and status["results"].keys() == set(cases), "invalid route receipt")
@@ -263,7 +278,7 @@ def run_case(runtime, driver, go, tools, arms, key, work):
     directory = OUT / key
     directory.mkdir()
     expected = plan_route(tools, directory, case)
-    binaries = {mode: {role: compile_binary(runtime, go, tools, source, role, case, mode, work, directory/mode/role)
+    binaries = {mode: {role: compile_binary(runtime, driver, go, tools, source, role, case, mode, work, directory/mode/role)
                        for role, source in arms.items()} for mode in ("stock", "aligned")}
     save(directory/"alignment.json", driver["compare"](directory, case, cache=key=="cache"))
     comparisons = {}

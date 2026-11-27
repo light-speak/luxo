@@ -1,4 +1,4 @@
-name: Recheck five PR 83 timing samples on their original CPUs
+name: Recheck the remaining PR 83 timing samples on their original AMD CPUs
 
 on:
   push:
@@ -88,7 +88,7 @@ jobs:
           sparse-checkout: scripts/diagnose-pr83-bc18-native-layout
           persist-credentials: false
 
-      - name: Require the three original CPU routes and thresholds
+      - name: Require both AMD CPU routes and unchanged thresholds
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

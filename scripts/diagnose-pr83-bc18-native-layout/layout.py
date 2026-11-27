@@ -2,6 +2,8 @@
 from hashlib import sha256
 import json
 import re
+import shlex
+from pathlib import Path
 
 
 STOCK = {
@@ -21,6 +23,9 @@ def relative_instruction(encoding, mnemonic):
     if mnemonic.startswith("LEAQ ") and "(IP), " in mnemonic and len(raw) == 7:
         return [raw[:-4].hex(), mnemonic.split("(IP), ", 1)[1]]
     if mnemonic.startswith("LEAQ ") and "(SB), " in mnemonic and len(raw) == 7:
+        return [raw[:-4].hex(), mnemonic]
+    if (len(raw) == 7 and raw[0] & 0xf8 == 0x48 and raw[1] == 0x8b and raw[2] & 0xc7 == 0x05 and
+            re.fullmatch(r"MOVQ \S+\(SB\), [A-Z0-9]+", mnemonic)):
         return [raw[:-4].hex(), mnemonic]
     return [encoding]
 
@@ -63,8 +68,52 @@ def linked_code(directory, case):
     return result, required
 
 
+def link_invocation(trace, tool, executable, aligned):
+    commands = []
+    with trace.open() as stream:
+        for raw in stream:
+            if str(tool) not in raw:
+                continue
+            args = shlex.split(raw)
+            if args[:1] == ["GOROOT="]:
+                args.pop(0)
+            if args[:1] == [str(tool)]:
+                commands.append(args)
+    if len(commands) != 1:
+        raise ValueError("expected one actual benchmark test linker invocation")
+    args, = commands
+    recorded = {"args": args, "testName": executable}
+    validate_link_command(recorded, aligned)
+    return recorded
+
+
+def validate_link_command(recorded, aligned):
+    argv = recorded["args"]
+    if not argv or not Path(argv[0]).is_absolute() or Path(argv[0]).name != "link":
+        raise ValueError("unexpected linker executable")
+    if argv.count("-o") != 1 or argv.count("-importcfg") != 1 or "testing.testBinary=1" not in argv:
+        raise ValueError("linker did not build a Go test binary")
+    if Path(argv[argv.index("-o") + 1]).name != recorded["testName"]:
+        raise ValueError("wrong linked test binary")
+    if Path(argv[argv.index("-importcfg") + 1]).name != "importcfg.link":
+        raise ValueError("unexpected Go link import configuration")
+    archive = Path(argv[-1]).name
+    if archive != "_pkg_.a" and not re.fullmatch(r"[0-9a-f]{64}-d", archive):
+        raise ValueError("unexpected Go test link archive")
+    actual = [x for x in argv if x.startswith(("-funcalign", "--funcalign"))]
+    if actual != (["-funcalign=64"] if aligned else []):
+        raise ValueError("unexpected actual linker alignment")
+
+
+def normalized_link_command(recorded, aligned):
+    validate_link_command(recorded, aligned)
+    argv = recorded["args"]
+    volatile = {argv.index("-o") + 1, argv.index("-importcfg") + 1, len(argv) - 1}
+    return [arg for i, arg in enumerate(argv) if i not in volatile and
+            not arg.startswith("-buildid=") and arg != "-funcalign=64"]
+
+
 def compare(directory, case, *, cache):
-    flags = "\tbuild\t-ldflags=-funcalign=64"
     report = {"arms": {}, "linkOnly": True}
     if cache:
         report["oldCacheStockELFMatch"] = {}
@@ -75,7 +124,9 @@ def compare(directory, case, *, cache):
                                      for arm in (stock, aligned))
         before, required_before = linked_code(stock, case)
         after, required_after = linked_code(aligned, case)
-        same_flags = aligned_build.count(flags) == 1 and [line for line in aligned_build if line != flags] == base_build
+        stock_link, aligned_link = (json.loads((arm/"link-command.json").read_bytes()) for arm in (stock, aligned))
+        same_flags = (base_build == aligned_build and
+                      normalized_link_command(stock_link, False) == normalized_link_command(aligned_link, True))
         same_required = required_before == required_after
         shape = {name: before[name]["normalizedSHA256"] == after[name]["normalizedSHA256"]
                  for name in sorted(before.keys() & after.keys())}
