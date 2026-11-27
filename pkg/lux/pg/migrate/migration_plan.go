@@ -1,6 +1,8 @@
 package migrate
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -19,6 +21,7 @@ type plannedMigration struct {
 	name     string
 	sql      string
 	checksum string
+	digest   string
 	mode     migrationMode
 }
 
@@ -67,8 +70,11 @@ func planMigration(path, direction string, withChecksum bool, recordedChecksum *
 		return plannedMigration{}, err
 	}
 	var checksum string
-	if withChecksum || recordedChecksum != nil {
-		checksum = migrationChecksum(data)
+	var sum [sha256.Size]byte
+	hashed := withChecksum || recordedChecksum != nil
+	if hashed {
+		sum = sha256.Sum256(data)
+		checksum = hex.EncodeToString(sum[:16])
 		if recordedChecksum != nil && *recordedChecksum != checksum {
 			return plannedMigration{}, fmt.Errorf("migration file has been modified (checksum mismatch: stored=%s, current=%s)", *recordedChecksum, checksum)
 		}
@@ -81,7 +87,14 @@ func planMigration(path, direction string, withChecksum bool, recordedChecksum *
 	if err != nil {
 		return plannedMigration{}, err
 	}
-	return plannedMigration{name: filepath.Base(path), sql: sql, checksum: checksum, mode: mode}, nil
+	var digest string
+	if mode.autocommit && (withChecksum || direction == "DOWN") {
+		if !hashed {
+			sum = sha256.Sum256(data)
+		}
+		digest = hex.EncodeToString(sum[:])
+	}
+	return plannedMigration{name: filepath.Base(path), sql: sql, checksum: checksum, digest: digest, mode: mode}, nil
 }
 
 func migrationSection(content, direction string) (string, error) {
@@ -122,6 +135,7 @@ const (
 	migrationSQLTransaction
 	migrationSQLAutocommit
 	migrationSQLGuardedCreate
+	migrationSQLBoundary
 )
 
 func planMigrationSQL(sql string) (migrationMode, error) {
@@ -137,6 +151,9 @@ func planMigrationSQL(sql string) (migrationMode, error) {
 			continue
 		}
 		statements++
+		if kind == migrationSQLBoundary {
+			return migrationMode{}, fmt.Errorf("statement %d controls a transaction boundary managed by Luxo", statements)
+		}
 		if kind == migrationSQLTransaction || firstAutocommit != 0 {
 			continue
 		}
@@ -157,6 +174,10 @@ func planMigrationSQL(sql string) (migrationMode, error) {
 }
 
 func migrationStatementEnd(sql string, start int) int {
+	cursor := migrationTokens{sql: sql, pos: start}
+	if cursor.accept("CREATE") && cursor.acceptRoutineDeclaration() {
+		return migrationRoutineStatementEnd(cursor)
+	}
 	depth := 0
 	for i := start; i < len(sql); {
 		if next := skipMigrationToken(sql, i); next != i {
@@ -176,6 +197,46 @@ func migrationStatementEnd(sql string, start int) int {
 		i++
 	}
 	return len(sql)
+}
+
+// SQL routine bodies end only between child statements. Keywords inside expressions
+// (such as CASE ... END) are part of a child statement, even outside parentheses.
+func migrationRoutineStatementEnd(cursor migrationTokens) int {
+	var parenDepth, atomicDepth int
+	routineHeader, childStart := true, false
+	for token := cursor.next(); token != ""; token = cursor.next() {
+		switch token {
+		case "(":
+			parenDepth++
+			continue
+		case ")":
+			parenDepth--
+			continue
+		}
+		if parenDepth != 0 {
+			continue
+		}
+		if token == ";" {
+			if atomicDepth == 0 {
+				return cursor.pos - 1
+			}
+			routineHeader, childStart = false, true
+			continue
+		}
+		if childStart {
+			childStart = false
+			if strings.EqualFold(token, "END") && cursor.endsRoutine() {
+				atomicDepth--
+			}
+			routineHeader = strings.EqualFold(token, "CREATE") && cursor.acceptRoutineDeclaration()
+			continue
+		}
+		if routineHeader && strings.EqualFold(token, "BEGIN") && cursor.accept("ATOMIC") {
+			atomicDepth++
+			routineHeader, childStart = false, true
+		}
+	}
+	return len(cursor.sql)
 }
 
 func skipMigrationToken(sql string, index int) int {
@@ -238,6 +299,19 @@ func (c *migrationTokens) accept(keyword string) bool {
 	return false
 }
 
+func (c *migrationTokens) acceptRoutineDeclaration() bool {
+	if c.accept("OR") && !c.accept("REPLACE") {
+		return false
+	}
+	return c.accept("FUNCTION") || c.accept("PROCEDURE")
+}
+
+func (c migrationTokens) endsRoutine() bool {
+	token := c.next()
+	// CREATE FUNCTION allows the legacy WITH (...) option after the body.
+	return token == "" || token == ";" || strings.EqualFold(token, "WITH")
+}
+
 func (c *migrationTokens) firstStatementKind() migrationSQLKind {
 	token := c.next()
 	switch {
@@ -262,6 +336,23 @@ func (c *migrationTokens) firstStatementKind() migrationSQLKind {
 	case strings.EqualFold(token, "ALTER"):
 		if c.concurrentDetach() {
 			return migrationSQLAutocommit
+		}
+	case strings.EqualFold(token, "BEGIN"), strings.EqualFold(token, "START"),
+		strings.EqualFold(token, "COMMIT"), strings.EqualFold(token, "END"), strings.EqualFold(token, "ABORT"):
+		return migrationSQLBoundary
+	case strings.EqualFold(token, "ROLLBACK"):
+		if !c.accept("WORK") {
+			c.accept("TRANSACTION")
+		}
+		if !c.accept("TO") {
+			return migrationSQLBoundary
+		}
+	case strings.EqualFold(token, "PREPARE"):
+		if c.accept("TRANSACTION") {
+			next := c.next()
+			if !strings.EqualFold(next, "AS") && next != "(" {
+				return migrationSQLBoundary
+			}
 		}
 	}
 	return migrationSQLTransaction

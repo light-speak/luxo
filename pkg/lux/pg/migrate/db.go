@@ -2,9 +2,7 @@ package migrate
 
 import "context"
 
-// DB is the minimal database interface for migration execution.
-// PG and MySQL each provide their own implementation.
-type DB interface {
+type migrationQueries interface {
 	// Exec executes a SQL statement.
 	Exec(ctx context.Context, sql string, args ...any) error
 
@@ -16,6 +14,12 @@ type DB interface {
 
 	// Begin starts a transaction.
 	Begin(ctx context.Context) (Tx, error)
+}
+
+// DB is the minimal database interface for migration execution.
+// PG and MySQL each provide their own implementation.
+type DB interface {
+	migrationQueries
 
 	// AcquireLock acquires a database-level advisory lock (prevents concurrent migration).
 	AcquireLock(ctx context.Context) error
@@ -25,6 +29,22 @@ type DB interface {
 
 	// Close closes the database connection.
 	Close()
+}
+
+// MigrationSessionDB allows a custom DB to run standalone migrations and
+// participate in named recovery. All SQL between a successful AcquireLock and
+// ReleaseLock must use the same physical session as the lock.
+type MigrationSessionDB interface {
+	DB
+	MigrationSessionBound() bool
+}
+
+func migrationSessionBound(db DB) bool {
+	if _, stock := db.(*PGDB); stock {
+		return true
+	}
+	session, ok := db.(MigrationSessionDB)
+	return ok && session.MigrationSessionBound()
 }
 
 // Tx is a database transaction.

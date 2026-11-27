@@ -17,6 +17,7 @@ import (
 // mockDB implements DB for unit testing error paths without a real database.
 type mockDB struct {
 	execErr     error
+	execSQL     func(string) error
 	queryResult *mockRows
 	queryErr    error
 	queryRowVal Row
@@ -26,7 +27,12 @@ type mockDB struct {
 	closed      bool
 }
 
-func (m *mockDB) Exec(ctx context.Context, sql string, args ...any) error { return m.execErr }
+func (m *mockDB) Exec(ctx context.Context, sql string, args ...any) error {
+	if m.execSQL != nil {
+		return m.execSQL(sql)
+	}
+	return m.execErr
+}
 func (m *mockDB) Query(ctx context.Context, sql string, args ...any) (Rows, error) {
 	if m.queryErr != nil {
 		return nil, m.queryErr
@@ -96,12 +102,18 @@ func (r *mockRows) Close() { r.closed = true }
 // mockTx simulates a transaction.
 type mockTx struct {
 	execErr   error
+	execSQL   func(string) error
 	commitErr error
 }
 
-func (t *mockTx) Exec(ctx context.Context, sql string, args ...any) error { return t.execErr }
-func (t *mockTx) Commit(ctx context.Context) error                        { return t.commitErr }
-func (t *mockTx) Rollback(ctx context.Context) error                      { return nil }
+func (t *mockTx) Exec(ctx context.Context, sql string, args ...any) error {
+	if t.execSQL != nil {
+		return t.execSQL(sql)
+	}
+	return t.execErr
+}
+func (t *mockTx) Commit(ctx context.Context) error   { return t.commitErr }
+func (t *mockTx) Rollback(ctx context.Context) error { return nil }
 
 // mockRow simulates a single row result.
 type mockRow struct {
@@ -111,12 +123,13 @@ type mockRow struct {
 }
 
 func (r *mockRow) Scan(dest ...any) error {
-	if len(dest) == 3 {
+	if len(dest) == 5 {
 		*dest[0].(*string) = "public"
 		*dest[1].(*bool) = r.history
-		*dest[2].(*bool) = !r.legacyStrings
-	}
-	if len(dest) == 1 {
+		*dest[2].(*bool) = false
+		*dest[3].(*bool) = true
+		*dest[4].(*bool) = !r.legacyStrings
+	} else if len(dest) == 1 {
 		if exists, ok := dest[0].(*bool); ok {
 			*exists = r.history
 		}
@@ -180,7 +193,12 @@ func TestAutocommitHistoryDiagnosticsUnwrapOriginalCause(t *testing.T) {
 		db   *mockDB
 		want string
 	}{
-		{"statement", &mockDB{execErr: cause}, "autocommit statement success is unconfirmed"},
+		{"statement", &mockDB{execSQL: func(query string) error {
+			if strings.HasPrefix(query, "CREATE INDEX CONCURRENTLY") {
+				return cause
+			}
+			return nil
+		}}, "autocommit statement success is unconfirmed"},
 		{"begin", &mockDB{beginErr: cause}, "migration history remains uncommitted"},
 		{"record", &mockDB{beginTx: &mockTx{execErr: cause}}, "migration history remains uncommitted"},
 		{"commit", &mockDB{beginTx: &mockTx{commitErr: cause}}, "migration history commit is unconfirmed"},
@@ -529,7 +547,11 @@ func TestRollbackLegacyMissingChecksumQueryFallback(t *testing.T) {
 			}}
 			dir := t.TempDir()
 			runner := NewFromDB(db, dir)
-			files, err := runner.rollbackFiles(t.Context(), 2)
+			operation, err := runner.bindMetadata(t.Context(), true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			files, err := operation.rollbackFiles(t.Context(), 2)
 			if tc.scanLegacy {
 				if err != nil || queryCount != 2 || len(files) != 1 || files[0].path != filepath.Join(dir, "001.sql") || files[0].checksum != nil {
 					t.Fatalf("legacy rollback selection: %v %v, queries=%d", files, err, queryCount)
