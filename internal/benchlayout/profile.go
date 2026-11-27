@@ -6,6 +6,16 @@ import (
 )
 
 const (
+	RPCFrameReuseProfile         = "rpc-frame-reuse"
+	RPCFrameReuseBenchmark       = "BenchmarkLRPCConnectionFrameReuseCandidate"
+	PGPackage                    = "pkg/lux/pg"
+	PGDurationWriteRejectProfile = "pg-duration-write-reject"
+	PGDurationWriteReject        = "BenchmarkDurationWriteReject"
+	APIStaticValueParamsProfile  = "api-static-value-params"
+	APIStaticValueParams         = "BenchmarkStaticValueParams"
+)
+
+const (
 	LuxShortPathProfile           = "lux-short-path"
 	LuxPackage                    = "pkg/lux"
 	LuxStrictFilterBenchmark      = "BenchmarkStrictFilterContract"
@@ -104,17 +114,12 @@ func ProfileForBenchmark(pkg, name string) string {
 		if root == CodecReaderBenchmark {
 			return CodecReaderProfile
 		}
-	case RPCPackage:
-		switch root {
-		case RPCOwnedRequestBenchmark:
-			return RPCOwnedRequestProfile
-		case RPCDeadlineBenchmark:
-			return RPCDeadlineProfile
-		case RPCNilContextGuardBenchmark:
-			return RPCNilContextGuardProfile
-		case RPCPreparedFrameBenchmark:
-			return RPCPreparedFrameProfile
+	case PGPackage:
+		if root == PGDurationWriteReject {
+			return PGDurationWriteRejectProfile
 		}
+	case RPCPackage:
+		return rpcBenchmarkProfile(root)
 	case QueuePackage:
 		if root == QueueStreamNameBenchmark {
 			return QueueStreamNameProfile
@@ -177,6 +182,9 @@ func apiBenchmarkProfile(root string) string {
 	if root == APIBinaryParamLookupBenchmark {
 		return APIBinaryParamLookupProfile
 	}
+	if root == APIStaticValueParams {
+		return APIStaticValueParamsProfile
+	}
 	if root == APILocalRouteExportBenchmark {
 		return APILocalRouteExportProfile
 	}
@@ -201,12 +209,15 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 		return []IsolationSpec{{LuxShortPathProfile, "^" + LuxStrictFilterBenchmark + "$|^" + LuxDecimalAlignmentBenchmark + "$"}}
 	case CodecPackage:
 		return []IsolationSpec{{CodecReaderProfile, "."}}
+	case PGPackage:
+		return []IsolationSpec{{PGDurationWriteRejectProfile, "^" + PGDurationWriteReject + "$"}}
 	case RPCPackage:
 		return []IsolationSpec{
 			{RPCOwnedRequestProfile, "^" + RPCOwnedRequestBenchmark + "$"},
 			{RPCDeadlineProfile, "^" + RPCDeadlineBenchmark + "$"},
 			{RPCNilContextGuardProfile, "^" + RPCNilContextGuardBenchmark + "$"},
 			{RPCPreparedFrameProfile, "^" + RPCPreparedFrameBenchmark + "$"},
+			{RPCFrameReuseProfile, "^" + RPCFrameReuseBenchmark + "$"},
 		}
 	case QueuePackage:
 		return []IsolationSpec{{QueueStreamNameProfile, "^" + QueueStreamNameBenchmark + "$"}}
@@ -214,6 +225,7 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 		return []IsolationSpec{
 			{APINonIdentityProfile, "."},
 			{APILocalRouteExportProfile, "^" + APILocalRouteExportBenchmark + "$"},
+			{APIStaticValueParamsProfile, "^" + APIStaticValueParams + "$"},
 			{APICanonicalJSONProfile, "^" + apiCanonicalJSONPrefix + "(" + strings.Join(apiCanonicalJSONFamilies, "|") + ")$"},
 			{APIBinaryParamLookupProfile, "^" + APIBinaryParamLookupBenchmark + "$"},
 			{APIRequestLogProfile, "^" + APIRequestLogBoundaryBenchmark + "$|^" + APIRequestLogDeliveredBenchmark + "$"},
@@ -251,4 +263,21 @@ func ValidPerformanceProfile(pkg, profile string) bool {
 	return slices.ContainsFunc(IsolationProfiles(pkg), func(spec IsolationSpec) bool {
 		return spec.Name == profile
 	})
+}
+
+func rpcBenchmarkProfile(root string) string {
+	switch root {
+	case RPCOwnedRequestBenchmark:
+		return RPCOwnedRequestProfile
+	case RPCDeadlineBenchmark:
+		return RPCDeadlineProfile
+	case RPCNilContextGuardBenchmark:
+		return RPCNilContextGuardProfile
+	case RPCPreparedFrameBenchmark:
+		return RPCPreparedFrameProfile
+	case RPCFrameReuseBenchmark:
+		return RPCFrameReuseProfile
+	default:
+		return DefaultProfile
+	}
 }

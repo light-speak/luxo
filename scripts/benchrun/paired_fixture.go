@@ -67,6 +67,11 @@ func pairedBenchmarkOverlay(root, pkg, profile string, fixture pairedBenchmarkFi
 }
 
 func (fixture pairedBenchmarkFixture) projectFile(path, workspace string) (string, error) {
+	return fixture.writeProjection(path, workspace, projectPairedBenchmark)
+}
+
+func (fixture pairedBenchmarkFixture) writeProjection(path, workspace string,
+	render func(string, []byte, pairedBenchmarkFixture) ([]byte, error)) (string, error) {
 	source, err := readRegularTestFixture(path)
 	if err != nil {
 		return "", err
@@ -79,7 +84,7 @@ func (fixture pairedBenchmarkFixture) projectFile(path, workspace string) (strin
 	if hex.EncodeToString(sourceSHA[:]) != fixture.sourceSHA {
 		return "", errors.New("fixture does not match the verified source")
 	}
-	projected, err := projectPairedBenchmark(path, source, fixture)
+	projected, err := render(path, source, fixture)
 	if err != nil {
 		return "", err
 	}

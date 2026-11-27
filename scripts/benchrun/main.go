@@ -48,11 +48,7 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 	if err != nil {
 		return err
 	}
-	pkg := args[3]
-	if profile == benchlayout.QueueStreamNameProfile {
-		pkg = benchlayout.NATSQueuePackage
-	}
-	packages, err := benchlayout.Packages(root, pkg)
+	packages, err := performancePackages(root, args[3], profile)
 	if err != nil {
 		return err
 	}
@@ -79,6 +75,22 @@ func run(args []string, input io.Reader, output, errorOutput io.Writer) error {
 		}
 	}
 	return nil
+}
+
+func performancePackages(root, pkg, profile string) ([]string, error) {
+	if profile == benchlayout.QueueStreamNameProfile {
+		return benchlayout.Packages(root, benchlayout.NATSQueuePackage)
+	}
+	packages, err := benchlayout.Packages(root, pkg)
+	if err != nil || profile != benchlayout.PGDurationWriteRejectProfile {
+		return packages, err
+	}
+	for _, physical := range packages {
+		if physical == benchlayout.PGPackage {
+			return []string{physical}, nil
+		}
+	}
+	return nil, fmt.Errorf("missing benchmark package %s in %s", benchlayout.PGPackage, root)
 }
 
 func writeIsolationProfiles(output io.Writer, pkg string) error {
@@ -161,7 +173,7 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 	case benchlayout.SemanticEventEmitsProfile:
 		return pairedBenchmarkOverlay(root, packagePath, profile, semanticEventEmitsFixture)
 	default:
-		return performanceOverlay(root, packagePath, baseline)
+		return compileCompactBenchmarkOverlay(root, packagePath, baseline, profile)
 	}
 }
 

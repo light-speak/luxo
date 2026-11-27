@@ -240,6 +240,7 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 	wantAPI := []IsolationSpec{
 		{APINonIdentityProfile, "."},
 		{APILocalRouteExportProfile, "^BenchmarkLocalRouteExport$"},
+		{"api-static-value-params", "^BenchmarkStaticValueParams$"},
 		{APICanonicalJSONProfile, "^BenchmarkCanonicalJSON(Structured|Typed|Bytes|Float|Value|Integer)$"},
 		{APIBinaryParamLookupProfile, "^BenchmarkBinaryParamLookup$"},
 		{APIRequestLogProfile, "^BenchmarkRequestLogBoundary$|^BenchmarkRequestLogDelivered$"},
@@ -365,5 +366,25 @@ func TestReadinessBenchmarkProfileIsolation(t *testing.T) {
 				t.Fatalf("discovery does not accept %q for %q", tc.profile, tc.pkg)
 			}
 		})
+	}
+}
+
+func TestIntelBenchmarkProfilesKeepRootsAndPackagesIndependent(t *testing.T) {
+	for _, tc := range []struct{ pkg, name, want string }{
+		{"pkg/lux/api", "BenchmarkStaticValueParams/Bytes/JSON/previous-2", "api-static-value-params"},
+		{"pkg/lux/api", "BenchmarkStaticParamSlot/static-2", APINonIdentityProfile},
+		{"pkg/lux/rpc", "BenchmarkLRPCPreparedFrame/128/after-2", RPCPreparedFrameProfile},
+		{"pkg/lux/rpc", "BenchmarkLRPCConnectionFrameReuseCandidate/128/reuse-2", "rpc-frame-reuse"},
+		{"pkg/lux/rpc", "BenchmarkLRPCConnectionFrameReuseCandidateSibling", DefaultProfile},
+		{"pkg/lux/pg", "BenchmarkDurationWriteReject/List128Last-2", "pg-duration-write-reject"},
+		{"pkg/lux/pg", "BenchmarkRewrittenDuration", DefaultProfile},
+		{"pkg/lux/dialect/pg", "BenchmarkDurationWriteReject", DefaultProfile},
+	} {
+		if got := ProfileForBenchmark(tc.pkg, tc.name); got != tc.want || !ValidPerformanceProfile(tc.pkg, got) {
+			t.Fatalf("%s/%s profile = %q, want %q", tc.pkg, tc.name, got, tc.want)
+		}
+	}
+	if ValidPerformanceProfile("pkg/lux/dialect/pg", "pg-duration-write-reject") {
+		t.Fatal("the dialect package cannot compile the concrete PG fixture")
 	}
 }

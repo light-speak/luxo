@@ -121,6 +121,9 @@ func verifyProfileInventory(args []string) error {
 	if len(ordinary) == 0 || !maps.EqualFunc(ordinary, isolated, maps.Equal[map[string]struct{}]) {
 		return fmt.Errorf("benchmark profile %q must reproduce its exact ordinary benchmark inventory", profile)
 	}
+	if err := verifyCompactProfileLeaves(profile, isolated); err != nil {
+		return err
+	}
 	return verifyProfileLeaves(profile, isolated)
 }
 
@@ -273,6 +276,8 @@ func verifyAPINonIdentityCompanions(ordinary, isolated inventory) error {
 	// exclusively to their corresponding sampling binaries.
 	for root, leaves := range ordinary {
 		switch benchlayout.ProfileForBenchmark(benchlayout.APIPackage, root) {
+		case benchlayout.APIStaticValueParamsProfile:
+			fallthrough
 		case benchlayout.APILocalRouteExportProfile, benchlayout.APICanonicalJSONProfile,
 			benchlayout.APIBinaryParamLookupProfile, benchlayout.APIRequestLogProfile,
 			benchlayout.APIHandlerPanicProfile, benchlayout.APIWebSocketRegistrationsProfile:
@@ -497,4 +502,31 @@ func leafNames(leaves map[string]struct{}) []string {
 	}
 	slices.Sort(result)
 	return result
+}
+
+func verifyCompactProfileLeaves(profile string, isolated inventory) error {
+	switch profile {
+	case benchlayout.APIStaticValueParamsProfile:
+		const root = benchlayout.APIStaticValueParams
+		inputs := []string{"Bytes", "Decimal", "Duration", "RawJSON/short", "RawJSON/72KB", "UUID"}
+		inputs = append(inputs, benchmarkCaseProduct(
+			[]string{"BoolArray", "BytesArray", "DateTimeArray", "DecimalArray", "DurationArray", "FloatArray", "RawJSONArray"},
+			[]string{"0", "1", "128"})...)
+		leaves := benchmarkCaseProduct(inputs, []string{"JSON/previous", "JSON/static", "Binary/previous", "Binary/static"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("API static value profile requires the 108 verified benchmark leaves")
+		}
+	case benchlayout.RPCFrameReuseProfile:
+		const root = benchlayout.RPCFrameReuseBenchmark
+		leaves := benchmarkCaseProduct([]string{"0", "128", "4096", "65536"}, []string{"before", "reuse"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("RPC frame reuse profile requires the eight verified benchmark leaves")
+		}
+	case benchlayout.PGDurationWriteRejectProfile:
+		const root = benchlayout.PGDurationWriteReject
+		if !verifiedBenchmarkLeaves(isolated[root], root, "Scalar", "List128Last", "AfterDecimal") {
+			return errors.New("PG duration write reject profile requires the three verified benchmark leaves")
+		}
+	}
+	return nil
 }
