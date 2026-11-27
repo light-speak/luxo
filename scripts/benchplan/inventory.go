@@ -282,6 +282,19 @@ func verifyAPIWholeFixtureLeaves(profile string, isolated inventory) error {
 		if !verifiedBenchmarkLeaves(isolated[root], root, "bounded", "unbounded") {
 			return errors.New("API response origin run profile requires both verified benchmark leaves")
 		}
+	case benchlayout.APIBodyReadProfile:
+		const root = benchlayout.APIBodyReadBenchmark
+		leaves := benchmarkCaseProduct([]string{"0", "128", "4096", "4097", "65536"}, []string{"direct", "previous"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("API body read profile requires the ten verified benchmark leaves")
+		}
+	case benchlayout.APIJSONQuoteCandidateProfile:
+		const root = benchlayout.APIJSONQuoteCandidateBenchmark
+		leaves := benchmarkCaseProduct([]string{"empty", "ascii16", "ascii1024", "unicode24", "unicode1026", "escapes24", "html"},
+			[]string{"current", "manual-strict", "stdlib"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("API JSON quote candidate profile requires the 21 verified benchmark leaves")
+		}
 	}
 	return nil
 }
@@ -295,7 +308,8 @@ func verifyAPINonIdentityCompanions(ordinary, isolated inventory) error {
 			fallthrough
 		case benchlayout.APILocalRouteExportProfile, benchlayout.APICanonicalJSONProfile,
 			benchlayout.APIBinaryParamLookupProfile, benchlayout.APIRequestLogProfile,
-			benchlayout.APIHandlerPanicProfile, benchlayout.APIWebSocketRegistrationsProfile, benchlayout.APIResponseOriginRunProfile:
+			benchlayout.APIHandlerPanicProfile, benchlayout.APIWebSocketRegistrationsProfile, benchlayout.APIResponseOriginRunProfile,
+			benchlayout.APIBodyReadProfile, benchlayout.APIJSONQuoteCandidateProfile:
 			if !maps.Equal(leaves, isolated[root]) {
 				return fmt.Errorf("API non-identity profile must retain the ordinary %s inventory", root)
 			}

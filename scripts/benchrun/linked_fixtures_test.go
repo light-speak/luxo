@@ -26,7 +26,9 @@ func TestIsolationProfileCommand(t *testing.T) {
 			"api-identity-condition\t^BenchmarkIdentityConditionValidity$|^BenchmarkIdentitySubjectVisibility$\n" +
 			"api-handler-panic\t^BenchmarkHandlerPanicFormatting$|^BenchmarkHandlerResponseBuffer$\n" +
 			"api-websocket-registrations\t^BenchmarkWSConnectionRegistrations$\n" +
-			"api-response-origin-run\t^BenchmarkResponseOriginRun$\n"},
+			"api-response-origin-run\t^BenchmarkResponseOriginRun$\n" +
+			"api-body-read\t^BenchmarkBodyRead$\n" +
+			"api-json-quote-candidate\t^BenchmarkJSONQuoteCandidate$\n"},
 		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n" +
 			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n" +
 			"luvia-auth-middleware\t^BenchmarkAuthMiddlewareIsolation$\n" +
@@ -954,7 +956,7 @@ func TestAPIIntelBenchmarkOverlaysKeepOriginalFiles(t *testing.T) {
 				t.Error("performance fingerprint lacks the verified fixture binding")
 			}
 			for _, baseline := range []bool{true, false} {
-				verifyAPIWholeFixtureOverlay(t, root, tc.profile, tc.fixture, baseline)
+				verifyAPIWholeFixtureOverlay(t, root, tc.profile, baseline, tc.fixture)
 			}
 			missing := newBenchmarkRunTree(t)
 			writeBenchmarkRunFixture(t, missing, "pkg/lux/api/ordinary_test.go", "package api")
@@ -970,7 +972,7 @@ func TestAPIIntelBenchmarkOverlaysKeepOriginalFiles(t *testing.T) {
 	}
 }
 
-func verifyAPIWholeFixtureOverlay(t *testing.T, root, profile, fixture string, baseline bool) {
+func verifyAPIWholeFixtureOverlay(t *testing.T, root, profile string, baseline bool, fixtures ...string) {
 	t.Helper()
 	path, cleanup, err := compileOverlay(root, benchlayout.APIPackage, baseline, profile)
 	if err != nil || path == "" {
@@ -989,7 +991,48 @@ func verifyAPIWholeFixtureOverlay(t *testing.T, root, profile, fixture string, b
 	if err := json.Unmarshal(data, &overlay); err != nil {
 		t.Fatal(err)
 	}
-	verifyOnlyListedTestFiles(t, overlay.Replace, filepath.Join(root, benchlayout.APIPackage), fixture)
+	verifyOnlyListedTestFiles(t, overlay.Replace, filepath.Join(root, benchlayout.APIPackage), fixtures...)
+}
+
+func TestAPIBodyReadAndQuoteOverlaysKeepSignedFiles(t *testing.T) {
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		profile  string
+		fixtures []string
+	}{
+		{"api-body-read", []string{"request_body_test.go"}},
+		{"api-json-quote-candidate", []string{"buf_quote_test.go", "buf_quote_reference_test.go"}},
+	} {
+		t.Run(tc.profile, func(t *testing.T) {
+			for _, baseline := range []bool{true, false} {
+				verifyAPIWholeFixtureOverlay(t, root, tc.profile, baseline, tc.fixtures...)
+			}
+			dir := newBenchmarkRunTree(t)
+			for _, fixture := range tc.fixtures {
+				path := filepath.Join(benchlayout.APIPackage, fixture)
+				data, err := os.ReadFile(filepath.Join(root, path))
+				if err != nil {
+					t.Fatal(err)
+				}
+				writeBenchmarkRunFixture(t, dir, path, string(data))
+			}
+			damaged := filepath.Join(benchlayout.APIPackage, tc.fixtures[len(tc.fixtures)-1])
+			if err := os.Remove(filepath.Join(dir, damaged)); err != nil {
+				t.Fatal(err)
+			}
+			if _, cleanup, err := compileOverlay(dir, benchlayout.APIPackage, false, tc.profile); cleanup != nil || !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("expected missing fixture %s to fail, got %v", damaged, err)
+			}
+			writeBenchmarkRunFixture(t, dir, damaged, "package api\n// changed fixture\n")
+			if _, cleanup, err := compileOverlay(dir, benchlayout.APIPackage, true, tc.profile); cleanup != nil ||
+				err == nil || !strings.Contains(err.Error(), "verified source") {
+				t.Fatalf("expected changed fixture %s to fail, got %v", damaged, err)
+			}
+		})
+	}
 }
 
 func TestAPIResponseOriginOverlayKeepsSignedBenchmarkAndHelper(t *testing.T) {
