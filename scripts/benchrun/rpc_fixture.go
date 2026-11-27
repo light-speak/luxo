@@ -62,7 +62,7 @@ const (
 		"\napi-binary-param-lookup-overlay-v1 " + apiBinaryParamLookupFixture +
 		"\napi-request-log-overlay-v1 " + apiRequestLogFixture + "=" + apiRequestLogProjectionSHA + " " + apiRequestLogSourceSHA +
 		"\ncodegen-relation-loader-overlay-v1 " + codegenRelationLoaderFilename + "=" + codegenRelationLoaderProjectionSHA + " " + codegenRelationLoaderSourceSHA +
-		"\nsemantic-event-emits-overlay-v1 " + semanticEventEmitsFilename + "=" + semanticEventEmitsProjectionSHA + " " + semanticEventEmitsSourceSHA + transportBenchmarkFingerprint
+		"\nsemantic-event-emits-overlay-v1 " + semanticEventEmitsFilename + "=" + semanticEventEmitsProjectionSHA + " " + semanticEventEmitsSourceSHA + transportBenchmarkFingerprint + sealedCompilerFixtureBindings
 )
 
 func writeRPCOwnedRequestOverlay(pkg, workspace string) (string, error) {
