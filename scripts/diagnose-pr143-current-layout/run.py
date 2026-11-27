@@ -24,7 +24,7 @@ HARNESS_FILES = {
     "go-capture.py": "b93cb28f2b092f63a07543a71cd39d46f3f28044d73f3547aaf16078c2d07db9",
     "manifest.json": "0c12129c702cf833c79f9e8d3269d1cfb7171d7cd54b1b6255c63a0598bc09a0",
 }
-PARENT = "aaf44cbe5911a6f357f601720ac6c4f2d894a0dd"
+PARENT = "9e999fc4be42a765e61b8d7bc5e59ccd781352c6"
 HARNESS_REVISION = "5376367706e217b18a676dfe932004a0f5419a04"
 REF = "refs/heads/diagnostics/pr143-current-layout"
 LAYOUT_HELPER_COMMIT = "f9d0454826d1763b46e41eb26ef2a7aecdb86205"
@@ -62,12 +62,6 @@ def sha(path):
     return sha256(path.read_bytes()).hexdigest()
 
 
-def diagnostic_paths():
-    prefix = INPUT.relative_to(ROOT)
-    return sorted([".github/workflows/diagnose-pr143-current-layout.yml",
-                   *(str(prefix / n) for n in ("run.py", "manifest.json", "latency-fixture.txt"))])
-
-
 def bind_event():
     active = git(ROOT, "rev-parse", "HEAD")
     slot = int(os.environ["SLOT"])
@@ -77,7 +71,7 @@ def bind_event():
             os.environ.get("GITHUB_SHA") == active, "unexpected diagnostic event")
     require(git(ROOT, "show", "-s", "--format=%P", active) == PARENT and
             git(ROOT, "diff", "--name-status", PARENT, active).splitlines() ==
-            ["A\t" + path for path in diagnostic_paths()], "unexpected diagnostic paths or parent")
+            ["M\t" + str(Path(__file__).relative_to(ROOT))], "unexpected diagnostic paths or parent")
     return active, slot
 
 
@@ -216,7 +210,7 @@ def prepare_binary(runtime, signer, go, tools, arms, role, mode, case, work):
     source = arms[role]
     side = "base" if role == "A" else "head"
     prefix = side + ("64" if mode == "aligned" else "-projected" if mode == "projected" else "")
-    built = work / prefix
+    built = work / ("binary-" + prefix)
     built.mkdir()
     capture = OUT / "compile" / prefix
     capture.mkdir(parents=True)
