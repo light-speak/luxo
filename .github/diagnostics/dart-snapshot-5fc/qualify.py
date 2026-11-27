@@ -17,13 +17,14 @@ from zipfile import ZipFile
 
 
 BASE = "5fc47e2a77a5a964e945dc6867ddb7061ce9e9fd"
-PARENT = "52ac87397267602b56cacd926c3370e9cc73bdbc"
-PREVIOUS = "4247c57406c05ae0b69c4fa44f96396fb1d0f18d"
+PARENT = "321f5268f195f6b3fefed5780d2e79a66d5ddb4c"
+PREVIOUS = "52ac87397267602b56cacd926c3370e9cc73bdbc"
+ORIGINAL = "4247c57406c05ae0b69c4fa44f96396fb1d0f18d"
 BRANCH = "refs/heads/diagnostics/dart-snapshot-5fc"
 BASE_TREE = "41ee4dd6f070fac672dbfb0450ad203fd60ed3fd"
-TREE = "20f0095ccc51ef7313c9fcffdc68ad0c5a00ddd5"
-DART_TREE = "12bf288898511676c20368688d195149d5e60e97"
-PATCH_SHA = "e4e9ab999d8fa9eaf28e8cb5124cc8e8da047a327e886a2b6ff51edb640174a2"
+TREE = "51d99cf4d2be82ec08dd39fd91b4f1bce6a8671c"
+DART_TREE = "af619c494f7c8a5e760b1dfd122f1d0b49c791f1"
+PATCH_SHA = "2b373410fdc7bd3697a9dc7e1d075824c9cac4425dbf7740ed8edcac8c5d1545"
 LOCK_SHA = "0d107eca2444e58cd48cb37abc48bf7115ed04f5101e6ba753ab13dea7e3f8bc"
 PUBSPEC_SHA = "294368c6b2cc61a62c83880cdca56d1137de356ef9a7682a6396d4fcce9dc5f9"
 DART_REVISION = "b530c21f7de367b94fb04787bfed9d8e989d75e8"
@@ -40,7 +41,7 @@ PRODUCT_FILES = {
     "packages/dart/lib/src/builder/snapshot_topology.dart": "30f6b1bcc2a57f73e87b6016be952252e5a0ab5b22881b16b95b718dbcf1b882",
     "packages/dart/lib/src/builder/snapshot_windows.dart": "a76f85b6abdc7215ea14fa32bbd85831213a05ed55fbfa14d48c412f8055b0b7",
     "packages/dart/test/select_fixture.dart": "8928cc9983c72cd48743b42fd61e1154fddc7a9b5c12524177658d0ae8b75a3f",
-    "packages/dart/test/selection_build_test.dart": "00f866243e81b660c6be7cee98f9d90402ccd2f421b2223294dcd55bc1827f81"
+    "packages/dart/test/selection_build_test.dart": "f5831d5f2b160a3161671b9540454772eb5be982a9d5cc429a12d430456ff076"
 }
 COMMON = (
     "build close releases an unconsumed prepared output",
@@ -54,6 +55,7 @@ JUNCTION = "snapshot refresh rejects a Windows junction and can retry"
 COMPONENT = "build rejects a regular scratch file and can retry"
 UNRESOLVABLE = "an unresolvable Dart path leaves the prior snapshot unchanged"
 READ_ONLY_CLOSE = "snapshot close retries after a Windows read-only file denies deletion"
+SHAPE_RENAME = "snapshot refresh retries a Windows directory rename after its child closes"
 FIXTURE_ENV = "LUXO_TEST_POSIX_SPLIT_DEVICE_PROJECT"
 
 
@@ -73,6 +75,7 @@ def suites(system):
             "artifact_publish.dart": (594,),
             "snapshot_windows.dart": (343,),
         }),
+        ("shape-rename", (SHAPE_RENAME,), {"snapshot_windows.dart": (193,)}),
     )
 
 
@@ -104,7 +107,8 @@ def diagnostic_assets(repo, offline):
         require(os.environ.get("GITHUB_REF") == BRANCH and os.environ.get("GITHUB_EVENT_NAME") == "push"
                 and head == os.environ.get("GITHUB_SHA") and parent == [head, PARENT]
                 and git(repo, "rev-parse", PARENT + "^").decode().strip() == PREVIOUS
-                and git(repo, "rev-parse", PREVIOUS + "^").decode().strip() == BASE,
+                and git(repo, "rev-parse", PREVIOUS + "^").decode().strip() == ORIGINAL
+                and git(repo, "rev-parse", ORIGINAL + "^").decode().strip() == BASE,
                 "expected one diagnostic append to the pinned qualification")
         paths = git(repo, "diff", "--no-renames", "--name-status", BASE, head, "--").decode().splitlines()
         expected = {f"A\t{WORKFLOW}"} | {f"A\t{FIXTURE}/{name}" for name in ("qualify.py", patch_name, "pubspec.lock")}
@@ -260,6 +264,9 @@ def run_gate(dart, package, output, env, tag, names, required):
     report = record_command(command, package, env, output, tag, 5 * 60)
     passed = verify_report(report, names)
     measured = coverage_receipt(raw, required)
+    if tag == "shape-rename":
+        branch = measured["sources"]["snapshot_windows.dart"]["branchHits"].get(192, 0)
+        require(branch > 0, "unexecuted native branch: snapshot_windows.dart:192")
     (output / f"coverage-{tag}.json").write_text(json.dumps(measured, indent=2) + "\n", encoding="utf-8")
     return {"passed": passed, "requiredPhysicalLines": required}
 
@@ -275,6 +282,14 @@ def native_test(package, scratch, output, receipt):
     temp = scratch / "temp"
     temp.mkdir()
     env = dict(os.environ, PUB_CACHE=str(scratch / "pub-cache"), TMP=str(temp), TEMP=str(temp), TMPDIR=str(temp))
+    if system == "windows":
+        volume = record_command(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             "[System.IO.DriveInfo]::new($env:LUXO_TEST_VOLUME).DriveFormat"],
+            package, env | {"LUXO_TEST_VOLUME": package.anchor}, output, "fixture-volume", 30,
+        ).read_text(encoding="utf-8").strip()
+        require(volume == "NTFS", f"native rename witness needs local NTFS, got {volume}")
+        receipt["fixtureFilesystem"] = volume
     record_command([dart, "pub", "get", "--enforce-lockfile"], package, env, output, "locked-pub-get", 5 * 60)
     lock = package / "pubspec.lock"
     require(digest(lock.read_bytes()) == LOCK_SHA, "Dart dependency resolution altered the lock")
