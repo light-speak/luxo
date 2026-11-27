@@ -100,6 +100,8 @@ const (
 	APIBodyReadBenchmark               = "BenchmarkBodyRead"
 	APIJSONQuoteCandidateProfile       = "api-json-quote-candidate"
 	APIJSONQuoteCandidateBenchmark     = "BenchmarkJSONQuoteCandidate"
+	APIJSONListMetadataProfile         = "api-json-list-metadata"
+	APIJSONListMetadataBenchmark       = "BenchmarkJSONListMetadata"
 
 	LuviaMergeDestinationProfile   = "luvia-merge-destination"
 	LuviaMergeDestinationBenchmark = "BenchmarkMergeDestination"
@@ -216,6 +218,8 @@ func apiBenchmarkProfile(root string) string {
 		return APIBodyReadProfile
 	case APIJSONQuoteCandidateBenchmark:
 		return APIJSONQuoteCandidateProfile
+	case APIJSONListMetadataBenchmark:
+		return APIJSONListMetadataProfile
 	}
 	if root == APIRequestLogBoundaryBenchmark || root == APIRequestLogDeliveredBenchmark {
 		return APIRequestLogProfile
@@ -280,6 +284,7 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{APIResponseOriginRunProfile, "^" + APIResponseOriginRunBenchmark + "$"},
 			{APIBodyReadProfile, "^" + APIBodyReadBenchmark + "$"},
 			{APIJSONQuoteCandidateProfile, "^" + APIJSONQuoteCandidateBenchmark + "$"},
+			{APIJSONListMetadataProfile, "^" + APIJSONListMetadataBenchmark + "$"},
 		}
 	case LuviaPackage:
 		return []IsolationSpec{
