@@ -4,11 +4,15 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"go/scanner"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"github.com/light-speak/luxo/internal/benchlayout"
 )
 
 func TestCompactFixturesMatchIntelProjectionsInBothArms(t *testing.T) {
@@ -84,6 +88,26 @@ func TestPGDurationWriteRejectRequiresConcreteAdapter(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "missing benchmark package pkg/lux/pg") {
 			t.Fatalf("%s selected the dialect package: %v", command, err)
 		}
+	}
+}
+
+func TestPGDurationWriteRejectUsesOnlyConcreteAdapter(t *testing.T) {
+	root := newBenchmarkRunTree(t)
+	writeBenchmarkRunFixture(t, root, "pkg/lux/dialect/pg/read_only_test.go", "package pg")
+	writeBenchmarkRunFixture(t, root, "pkg/lux/pg/adapter_test.go", "package pg")
+	got, err := performancePackages(root, benchlayout.PGPackage, benchlayout.PGDurationWriteRejectProfile)
+	if err != nil || !slices.Equal(got, []string{benchlayout.PGPackage}) {
+		t.Fatalf("duration write benchmark packages = %v, %v", got, err)
+	}
+}
+
+func TestProjectCompactBenchmarkRejectsMalformedFixture(t *testing.T) {
+	const path = "broken_bench_test.go"
+	fixture := pairedBenchmarkFixture{functions: []string{"BenchmarkBroken"}}
+	got, err := projectCompactBenchmark(path, []byte("package bench\nfunc BenchmarkBroken("), fixture)
+	parseErrors, ok := err.(scanner.ErrorList)
+	if got != nil || !ok || len(parseErrors) == 0 || parseErrors[0].Pos.Filename != path {
+		t.Fatalf("malformed fixture returned %q, %v", got, err)
 	}
 }
 
