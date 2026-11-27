@@ -1,0 +1,213 @@
+{
+  "A": {
+    "commit": "f8924ac56afa77c460d7fc62f81df10e2673c202",
+    "tree": "d02e06f82eccee00666d9aec3e1c9c111149d27d"
+  },
+  "H": {
+    "commit": "0f55dd635168a58b25d82e08460e10046d2cc0ba",
+    "parents": [
+      "0f3e233220962fbdc96a6ecc4f55750074f03861",
+      "f8924ac56afa77c460d7fc62f81df10e2673c202"
+    ],
+    "tree": "f5b2ef076ec19280f3f83c6bf8fbc78f5b33e094"
+  },
+  "artifacts": {
+    "03": [
+      15166919084,
+      "7eeb909713945ac512ae5755bebc2879d7261b21c6e1a13ef3f0656d972a0994"
+    ],
+    "05": [
+      15167393290,
+      "d9586e29afaa753dbe017bd7507e8d6d3923483273001c836cb4b44ec455cef2"
+    ],
+    "plan": [
+      15167550337,
+      "f8d94f793d9597ebf4141b3dc8fd1f8825eb6029b50e4a248b8c46f73d1c6653"
+    ]
+  },
+  "compileProfileSHA256": "8baea9be26bbb9772f30260da8e572a97903c8ebb5b6ffb418529ca8c70181de",
+  "cpu": "AMD EPYC 9V45 96-Core Processor",
+  "originalAttempt": 1,
+  "originalRun": 45927176483,
+  "packages": {
+    "pkg/codegen": {
+      "files": {
+        "codegen_bench_test.go": {
+          "functions": [
+            "BenchmarkFindRead"
+          ],
+          "imports": [
+            "github.com/light-speak/luxo/pkg/ast",
+            "testing"
+          ],
+          "originalInput": [
+            {
+              "role": "base",
+              "sourceSHA256": "bca2f8c336051736ebb635ab0217f9c865e8551cd2126c1af5e706ffee2243d7",
+              "spans": [
+                [
+                  259,
+                  270
+                ]
+              ]
+            },
+            {
+              "role": "head",
+              "sourceSHA256": "bca2f8c336051736ebb635ab0217f9c865e8551cd2126c1af5e706ffee2243d7",
+              "spans": [
+                [
+                  259,
+                  270
+                ]
+              ]
+            }
+          ],
+          "projectionSHA256": "61dc6e2de1880848a2762f8f0bb5983752d128de20b0a7c8961d4add145df43c"
+        },
+        "compile_test.go": {
+          "functions": [
+            "newCompiler"
+          ],
+          "imports": [
+            "github.com/light-speak/luxo/pkg/ast",
+            "strings"
+          ],
+          "originalInput": [
+            {
+              "role": "base",
+              "sourceSHA256": "4a5fdb53694d84132be177cf1abc478dd572eef99989eef32d52c13c19003584",
+              "spans": [
+                [
+                  110,
+                  124
+                ]
+              ]
+            },
+            {
+              "role": "head",
+              "sourceSHA256": "dfc581f3355e4ae1c955583da7ae52eb3138290f3ecedcd9a4c0eeeae45cf03e",
+              "spans": [
+                [
+                  110,
+                  124
+                ]
+              ]
+            }
+          ],
+          "projectionSHA256": "2bfe47a5eaacaf10f093030b823fec618ef3856252327a3507e37fd5de9a5de1"
+        },
+        "handler_test.go": {
+          "functions": [
+            "testModel",
+            "testField",
+            "directive"
+          ],
+          "imports": [
+            "github.com/light-speak/luxo/pkg/ast",
+            "github.com/light-speak/luxo/pkg/token"
+          ],
+          "originalInput": [
+            {
+              "role": "base",
+              "sourceSHA256": "898db0c8bbe0b59c070468586ac6bd91ec040ed5a7af38b145739ab1cfbe3082",
+              "spans": [
+                [
+                  603,
+                  610
+                ],
+                [
+                  612,
+                  619
+                ],
+                [
+                  621,
+                  623
+                ]
+              ]
+            },
+            {
+              "role": "head",
+              "sourceSHA256": "898db0c8bbe0b59c070468586ac6bd91ec040ed5a7af38b145739ab1cfbe3082",
+              "spans": [
+                [
+                  603,
+                  610
+                ],
+                [
+                  612,
+                  619
+                ],
+                [
+                  621,
+                  623
+                ]
+              ]
+            }
+          ],
+          "projectionSHA256": "3f09b46520e282f1c7b0b88864b43413767f02457e85a8ed7919034af2ebac73"
+        }
+      },
+      "hot": "BenchmarkFindRead|\\(\\*compiler\\)\\.(compileCall|compileExpr|compileExprValue|isPagedQuery|compileModelChain|compileModelCallChain|compileFindChain|compileWhereComparison|queryAliasModel|compileCollectionCall|compileJoinToString|compileSumOf|compileSortBy)$|flattenChain|appendFindCondition",
+      "leaves": [
+        ""
+      ],
+      "root": "BenchmarkFindRead",
+      "shard": "05",
+      "stockOverlay": {},
+      "timed": [
+        ""
+      ]
+    },
+    "pkg/semantic": {
+      "files": {
+        "event_contract_test.go": {
+          "functions": [
+            "BenchmarkEventSnapshotContract"
+          ],
+          "imports": [
+            "fmt",
+            "github.com/light-speak/luxo/pkg/ast",
+            "testing"
+          ],
+          "originalInput": [
+            {
+              "role": "base",
+              "sourceSHA256": "ac3fd6cf95db8f4ac2a51333c78aafeb8d319ab892f0b778b5f1c6d50a066f74",
+              "spans": [
+                [
+                  164,
+                  191
+                ]
+              ]
+            },
+            {
+              "role": "head",
+              "sourceSHA256": "ac3fd6cf95db8f4ac2a51333c78aafeb8d319ab892f0b778b5f1c6d50a066f74",
+              "spans": [
+                [
+                  164,
+                  191
+                ]
+              ]
+            }
+          ],
+          "projectionSHA256": "6058e763e36e879f603ef12671f676dc21211014c185d75eb6c3ccf1fadc3f63"
+        }
+      },
+      "hot": "BenchmarkEventSnapshotContract|validateEventSnapshots",
+      "leaves": [
+        "nested_types_0",
+        "nested_types_1",
+        "nested_types_16",
+        "nested_types_128"
+      ],
+      "root": "BenchmarkEventSnapshotContract",
+      "shard": "03",
+      "stockOverlay": {},
+      "timed": [
+        "nested_types_0"
+      ]
+    }
+  },
+  "productPathSHA256": "742eb71c22e0bceee62bf644064c599355e8c837ae4abb27fe139c358ab58082"
+}
