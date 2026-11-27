@@ -17,12 +17,13 @@ from zipfile import ZipFile
 
 
 BASE = "5fc47e2a77a5a964e945dc6867ddb7061ce9e9fd"
-PARENT = "4247c57406c05ae0b69c4fa44f96396fb1d0f18d"
+PARENT = "52ac87397267602b56cacd926c3370e9cc73bdbc"
+PREVIOUS = "4247c57406c05ae0b69c4fa44f96396fb1d0f18d"
 BRANCH = "refs/heads/diagnostics/dart-snapshot-5fc"
 BASE_TREE = "41ee4dd6f070fac672dbfb0450ad203fd60ed3fd"
-TREE = "0c01412d6256d8744c0b17cc0d63a686090a6eec"
-DART_TREE = "5339ecc73240411278c7528edcaaed12523649f4"
-PATCH_SHA = "ac4dcd7b90a6b498f9438efcbffde995639eae3b16c61bd8e0be6a9da32fdfbb"
+TREE = "20f0095ccc51ef7313c9fcffdc68ad0c5a00ddd5"
+DART_TREE = "12bf288898511676c20368688d195149d5e60e97"
+PATCH_SHA = "e4e9ab999d8fa9eaf28e8cb5124cc8e8da047a327e886a2b6ff51edb640174a2"
 LOCK_SHA = "0d107eca2444e58cd48cb37abc48bf7115ed04f5101e6ba753ab13dea7e3f8bc"
 PUBSPEC_SHA = "294368c6b2cc61a62c83880cdca56d1137de356ef9a7682a6396d4fcce9dc5f9"
 DART_REVISION = "b530c21f7de367b94fb04787bfed9d8e989d75e8"
@@ -39,7 +40,7 @@ PRODUCT_FILES = {
     "packages/dart/lib/src/builder/snapshot_topology.dart": "30f6b1bcc2a57f73e87b6016be952252e5a0ab5b22881b16b95b718dbcf1b882",
     "packages/dart/lib/src/builder/snapshot_windows.dart": "a76f85b6abdc7215ea14fa32bbd85831213a05ed55fbfa14d48c412f8055b0b7",
     "packages/dart/test/select_fixture.dart": "8928cc9983c72cd48743b42fd61e1154fddc7a9b5c12524177658d0ae8b75a3f",
-    "packages/dart/test/selection_build_test.dart": "1f0b1a742ce1bc50f9878bb0b70b7f4c01382d9b22c61f870da36b861d4ac73c"
+    "packages/dart/test/selection_build_test.dart": "00f866243e81b660c6be7cee98f9d90402ccd2f421b2223294dcd55bc1827f81"
 }
 COMMON = (
     "build close releases an unconsumed prepared output",
@@ -51,21 +52,27 @@ COMMON = (
 SPLIT_DEVICE = "snapshot rejects cross-device shared scratch and retries privately"
 JUNCTION = "snapshot refresh rejects a Windows junction and can retry"
 COMPONENT = "build rejects a regular scratch file and can retry"
+UNRESOLVABLE = "an unresolvable Dart path leaves the prior snapshot unchanged"
+READ_ONLY_CLOSE = "snapshot close retries after a Windows read-only file denies deletion"
 FIXTURE_ENV = "LUXO_TEST_POSIX_SPLIT_DEVICE_PROJECT"
 
 
 def suites(system):
     require(system in ("linux", "windows"), f"unexpected runner platform: {system}")
-    common = ("selection", COMMON, {
+    selection_lines = {
         "selection_build.dart": (27, 166, 182),
         "snapshot_directory.dart": (118, 277 if system == "linux" else 243),
-    })
+    }
     if system == "linux":
-        return (common, ("split-device", (SPLIT_DEVICE,), {"snapshot_directory.dart": (51,)}))
+        return (("selection", COMMON, selection_lines), ("split-device", (SPLIT_DEVICE,), {"snapshot_directory.dart": (51,)}))
+    selection_lines["selection_build.dart"] += (144,)
     return (
-        common,
+        ("selection", COMMON + (UNRESOLVABLE,), selection_lines),
         ("junction", (JUNCTION,), {"snapshot_windows.dart": (114,)}),
-        ("component-open", (COMPONENT,), {"artifact_publish.dart": (594,)}),
+        ("component-open", (COMPONENT, READ_ONLY_CLOSE), {
+            "artifact_publish.dart": (594,),
+            "snapshot_windows.dart": (343,),
+        }),
     )
 
 
@@ -96,7 +103,8 @@ def diagnostic_assets(repo, offline):
         parent = git(repo, "rev-list", "--parents", "-n", "1", "HEAD").decode().split()
         require(os.environ.get("GITHUB_REF") == BRANCH and os.environ.get("GITHUB_EVENT_NAME") == "push"
                 and head == os.environ.get("GITHUB_SHA") and parent == [head, PARENT]
-                and git(repo, "rev-parse", PARENT + "^").decode().strip() == BASE,
+                and git(repo, "rev-parse", PARENT + "^").decode().strip() == PREVIOUS
+                and git(repo, "rev-parse", PREVIOUS + "^").decode().strip() == BASE,
                 "expected one diagnostic append to the pinned qualification")
         paths = git(repo, "diff", "--no-renames", "--name-status", BASE, head, "--").decode().splitlines()
         expected = {f"A\t{WORKFLOW}"} | {f"A\t{FIXTURE}/{name}" for name in ("qualify.py", patch_name, "pubspec.lock")}

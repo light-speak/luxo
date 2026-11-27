@@ -23,13 +23,10 @@ jobs:
           - runner: windows-2025
             dart_abi: windows_x64
             python: python
-          - runner: ubuntu-24.04
-            dart_abi: linux_x64
-            python: python3
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
 
       - uses: dart-lang/setup-dart@v1
