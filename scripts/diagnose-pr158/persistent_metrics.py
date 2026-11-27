@@ -33,7 +33,10 @@ def metrics_from(raw, cpu, goos='linux', goarch='amd64'):
     if len(counters) != 1 or runs != [(BENCHMARK + '-2', str(ITERATIONS))] or raw.splitlines().count('PASS') != 1:
         raise ValueError('wrong counter window or benchmark inventory')
     for key, value in (('cpu', cpu), ('goos', goos), ('goarch', goarch), ('pkg', 'github.com/light-speak/luxo/' + PACKAGE)):
-        if re.findall(rf'^{key}: (.+)$', raw, re.M) != [value]:
+        headers = re.findall(rf'^{key}: (.+)$', raw, re.M)
+        if key == 'cpu':
+            headers = [name.rstrip(' \t') for name in headers]
+        if headers != [value]:
             raise ValueError(f'wrong {key} for the HTTP/2 allocation fixture')
     if re.search(r'(^FAIL|^--- FAIL|^panic:)', raw, re.M):
         raise ValueError('failed HTTP/2 allocation fixture')
@@ -81,13 +84,14 @@ def pair_results(processes):
     return pairs
 
 
-def capture(go, call, json_file, need, output, arms, work, trees, cpu, plan_sha):
+def capture(go, call, json_file, need, output, arms, work, trees, cpu, plan_sha, parser_sha, previous_parser):
     plan_file = INPUT / 'persistent-native-plan.json'
     need(sha256(plan_file.read_bytes()).hexdigest() == plan_sha, 'persistent diagnostic plan changed')
     plan = json.loads(plan_file.read_bytes())
     fixture = (INPUT / 'persistent_fixture_test.go.txt').read_bytes()
-    need(sha256(fixture).hexdigest() == plan['fixtureSHA256'] and sha256(Path(__file__).read_bytes()).hexdigest()
-         == plan['runnerSHA256'], 'persistent request fixture or parser changed')
+    need(sha256(fixture).hexdigest() == plan['fixtureSHA256'] and
+         sha256(previous_parser).hexdigest() == plan['runnerSHA256'] and
+         sha256(Path(__file__).read_bytes()).hexdigest() == parser_sha, 'persistent request fixture or parser changed')
     need(cpu == plan['cpu'] and {role: trees[role] for role in 'BC'} == plan['trees'] and
          plan['processes'] == 120 and plan['iterations'] == ITERATIONS, 'persistent native inputs changed')
     evidence = output / 'h2-persistent'
@@ -95,7 +99,8 @@ def capture(go, call, json_file, need, output, arms, work, trees, cpu, plan_sha)
     built = {role: compile_arm(go, call, need, role, arms[role], work, evidence, fixture, plan['modules'][role])
              for role in 'BC'}
     need(built['B'][1]['h2Files'] == built['C'][1]['h2Files'], 'original H2 files differ between B and C')
-    json_file(evidence / 'binding.json', dict(plan=plan, planSHA256=plan_sha, arms={role: built[role][1] for role in 'BC'}))
+    json_file(evidence / 'binding.json', dict(plan=plan, planSHA256=plan_sha, parserSHA256=parser_sha,
+                                             arms={role: built[role][1] for role in 'BC'}))
     processes = []
     for block, repetition, comparison, slot, role in process_order():
         name = f'{block}-{repetition:02d}-{comparison}-{slot}.txt'

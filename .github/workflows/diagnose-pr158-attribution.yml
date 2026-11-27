@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 7
+          fetch-depth: 8
           persist-credentials: false
 
       - name: Require the original EPYC 7763 runner CPU

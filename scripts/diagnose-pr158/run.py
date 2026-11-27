@@ -20,21 +20,21 @@ INPUT = Path(__file__).resolve().parent
 ROOT = INPUT.parents[1]
 OUT = ROOT / '.tmp/pr158-attribution'
 RUN_CONFIG_SHA = 'bf3be34db7cca43489c678e725e5baa66ca03e323c4a282df9e8650db93cdc81'
-DIAGNOSTIC_PARENT = 'ee59a8b0c89e6adc97f0806b893e4a86e7802168'
+DIAGNOSTIC_PARENT = '94b1c49a7845ad5323b9a7183acd5db60d7739be'
+PREVIOUS_DIAGNOSTIC_PARENT = 'ee59a8b0c89e6adc97f0806b893e4a86e7802168'
 TINY_PARENT = '2c5890285ef03d2fb7e55211550cba4bc06cc0b6'
 PROFILE_PARENT = 'd586d4283c290501fb9f4e911996be13aa6945d7'
 ORIGINAL_WITNESS = '5d63fd896bcc88aa35968e986985bb387e7de661'
 DIAGNOSTIC_REF = 'refs/heads/diagnostics/pr158-attribution'
 PERSISTENT_PLAN_SHA = 'b4507306a64469df4c95f765a7e1dd07d4dc39e552be908d43f921686d27cdb5'
+PERSISTENT_PARSER_SHA = '772c540331cce996ac0d1f82fafa951959cce889ac1866f393a497f8bbb38aff'
 CONFIG = json.loads((INPUT / 'routes.json').read_bytes())
 PATHS = ('.github/workflows/diagnose-pr158-attribution.yml',
          *('scripts/diagnose-pr158/' + name for name in (
              'arm-b.patch.b64', 'go-capture.py', 'h2_metrics.py', 'h2_profile.py', 'persistent-native-plan.json',
              'persistent_fixture_test.go.txt', 'persistent_metrics.py', 'routes.json', 'run.py')))
 FOLLOWUP_PATHS = ('M\t.github/workflows/diagnose-pr158-attribution.yml',
-                  'A\tscripts/diagnose-pr158/persistent-native-plan.json',
-                  'A\tscripts/diagnose-pr158/persistent_fixture_test.go.txt',
-                  'A\tscripts/diagnose-pr158/persistent_metrics.py',
+                  'M\tscripts/diagnose-pr158/persistent_metrics.py',
                   'M\tscripts/diagnose-pr158/run.py')
 PAIRS = ('AA', 'BB', 'CC', 'AB', 'BC', 'AC')
 METRICS = '.unit:(sec/op OR B/op OR allocs/op)'
@@ -107,7 +107,8 @@ def verify_provenance():
     active = git('rev-parse', 'HEAD')
     need(active == os.environ.get('GITHUB_SHA') and git('show', '-s', '--format=%P', active) == DIAGNOSTIC_PARENT,
          'the diagnostic must append one commit to the published witness')
-    need(git('show', '-s', '--format=%P', DIAGNOSTIC_PARENT) == TINY_PARENT and
+    need(git('show', '-s', '--format=%P', DIAGNOSTIC_PARENT) == PREVIOUS_DIAGNOSTIC_PARENT and
+         git('show', '-s', '--format=%P', PREVIOUS_DIAGNOSTIC_PARENT) == TINY_PARENT and
          git('show', '-s', '--format=%P', TINY_PARENT) == PROFILE_PARENT and
          git('show', '-s', '--format=%P', PROFILE_PARENT) == ORIGINAL_WITNESS and
          git('show', '-s', '--format=%P', ORIGINAL_WITNESS) == CONFIG['candidateCommit'],
@@ -290,7 +291,10 @@ def main():
         if persistent:
             arms = materialize(work)
             compare = runpy.run_path(str(INPUT / 'persistent_metrics.py'))['capture']
-            processes = compare(go, call, json_file, need, OUT, arms, work, CONFIG['trees'], cpu, PERSISTENT_PLAN_SHA)
+            previous_parser = call('git', '--no-replace-objects', 'show',
+                                   f'{DIAGNOSTIC_PARENT}:scripts/diagnose-pr158/persistent_metrics.py')
+            processes = compare(go, call, json_file, need, OUT, arms, work, CONFIG['trees'], cpu,
+                                PERSISTENT_PLAN_SHA, PERSISTENT_PARSER_SHA, previous_parser)
             json_file(OUT / 'status.json', {'matched': True, 'route': selected, 'cpu': cpu,
                                           'persistentCounterProcesses': processes, 'timedComparison': False})
             return
