@@ -45,18 +45,21 @@ const (
 		"\n" + benchlayout.APIIdentityConditionProfile + "-overlay-v1 " + apiIdentityConditionFixture + "=" + apiIdentityConditionSHA +
 		"\n" + benchlayout.APIHandlerPanicProfile + "-overlay-v1 " + apiHandlerPanicFixture + "=" + apiHandlerPanicSHA +
 		"\n" + benchlayout.APIWebSocketRegistrationsProfile + "-overlay-v1 " + apiWSRegistrationsFixture + "=" + apiWSRegistrationsSHA +
+		"\n" + benchlayout.APIResponseOriginRunProfile + "-overlay-v1 " + apiResponseOriginBenchmarkFixture + "=" + apiResponseOriginBenchmarkSHA +
+		" " + apiResponseOriginHelperFixture + "=" + apiResponseOriginHelperSHA + ":" + apiResponseOriginProjectionSHA +
 		"\nrpc-owned-request-overlay-v1 " + rpcOwnedRequestFixture +
 		"\nrpc-deadline-classification-overlay-v1 " + rpcDeadlineBenchmarkFixture + "=" + rpcDeadlineBenchmarkSHA +
 		" " + rpcDeadlineContextFixture + "=" + rpcDeadlineContextSHA +
 		"\nrpc-nil-context-guard-overlay-v1 " + rpcNilContextGuardFixture + "=" + rpcNilContextGuardSHA +
 		"\nrpc-prepared-frame-overlay-v1 " + rpcPreparedFrameFilename + "=" + rpcPreparedFrameProjectionSHA + " " + rpcPreparedFrameSourceSHA +
+		"\nrpc-handler-panic-overlay-v1 " + rpcHandlerPanicFixture + "=" + rpcHandlerPanicSHA +
 		"\nqueue-stream-name-overlay-v1 " + queueStreamNameFilename + "=" + queueStreamNameProjectionSHA + " " + queueStreamNameSourceSHA +
 		"\nluvia-auth-middleware-overlay-v1 " + luviaAuthBenchmarkFixture + "=" + luviaAuthBenchmarkSHA +
 		" " + luviaAuthHelperFixture + "=" + luviaAuthHelperSHA +
 		"\napi-binary-param-lookup-overlay-v1 " + apiBinaryParamLookupFixture +
 		"\napi-request-log-overlay-v1 " + apiRequestLogFixture + "=" + apiRequestLogProjectionSHA + " " + apiRequestLogSourceSHA +
 		"\ncodegen-relation-loader-overlay-v1 " + codegenRelationLoaderFilename + "=" + codegenRelationLoaderProjectionSHA + " " + codegenRelationLoaderSourceSHA +
-		"\nsemantic-event-emits-overlay-v1 " + semanticEventEmitsFilename + "=" + semanticEventEmitsProjectionSHA + " " + semanticEventEmitsSourceSHA
+		"\nsemantic-event-emits-overlay-v1 " + semanticEventEmitsFilename + "=" + semanticEventEmitsProjectionSHA + " " + semanticEventEmitsSourceSHA + transportBenchmarkFingerprint
 )
 
 func writeRPCOwnedRequestOverlay(pkg, workspace string) (string, error) {
@@ -159,6 +162,7 @@ func writeProjectedBenchmarkOverlay(pkg, workspace, description string, project 
 		return "", err
 	}
 	replacements := make(map[string]string)
+	retained := make(map[string]bool)
 	for _, entry := range entries {
 		if name := entry.Name(); strings.HasSuffix(name, "_test.go") {
 			path := filepath.Join(pkg, name)
@@ -166,11 +170,15 @@ func writeProjectedBenchmarkOverlay(pkg, workspace, description string, project 
 			if err != nil {
 				return "", fmt.Errorf("%s fixture %s: %w", description, name, err)
 			}
-			replacements[path] = projection
+			retained[name] = projection != ""
+			// The projector returns the source path when it retains the original test file.
+			if projection != path {
+				replacements[path] = projection
+			}
 		}
 	}
 	for _, name := range fixtures {
-		if replacements[filepath.Join(pkg, name)] == "" {
+		if !retained[name] {
 			return "", fmt.Errorf("missing %s fixture %s", description, name)
 		}
 	}
