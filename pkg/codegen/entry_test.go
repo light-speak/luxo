@@ -16,6 +16,18 @@ import (
 	"github.com/light-speak/luxo/pkg/token"
 )
 
+func generateEntryFile(result *semantic.Result, modulePath string, backends EntryBackends) []byte {
+	return emitEntryFile(collectModules(result), modulePath, backends)
+}
+
+func generateModuleEntryFiles(result *semantic.Result, modulePath string, backends EntryBackends) map[string][]byte {
+	return emitModuleEntryFiles(result, collectModules(result), modulePath, backends)
+}
+
+func generateGatewayEntry(result *semantic.Result, modulePath string, backends EntryBackends) []byte {
+	return emitGatewayEntry(result, collectModules(result), modulePath, backends)
+}
+
 func TestCheckedEntriesReturnCanonicalSource(t *testing.T) {
 	result := &semantic.Result{Files: []*ast.File{{Name: "origin/user.luxo", Models: []*ast.ModelDecl{{Name: "User"}}}}}
 	entries, err := GenerateModuleEntryFilesChecked(result, "example.com/app")
@@ -68,7 +80,7 @@ func TestEntryEmissionDefersFormattingToCheckedBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	emitters := map[string]bool{
-		"generateEntryFile": false, "generateSingleModuleEntry": false, "generateGatewayEntry": false,
+		"emitEntryFile": false, "generateSingleModuleEntry": false, "emitGatewayEntry": false,
 	}
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*goast.FuncDecl)
@@ -549,6 +561,43 @@ func TestGenerateEntryFileWithEvents(t *testing.T) {
 	}
 }
 
+func TestGeneratedModuleSelectsManagedJetStreamReadiness(t *testing.T) {
+	result := analyzePermissionFixture(t, "event Changed(value: Int)\napi value(): Int { return 42 }")
+	for _, sample := range []struct {
+		name  string
+		queue string
+	}{
+		{name: "event-only"},
+		{name: "jetstream", queue: "nats"},
+	} {
+		t.Run(sample.name, func(t *testing.T) {
+			entries, err := GenerateModuleEntryFilesChecked(result, "example.com/app", EntryBackends{
+				Events: "nats",
+				Queue:  sample.queue,
+			})
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("expected one entry, got %d: %v", len(entries), err)
+			}
+			for _, source := range entries {
+				code := string(source)
+				if !strings.Contains(code, "gw.AddReadinessCheck(eventBus.CheckReady)") {
+					t.Fatal("event bus lost its readiness check")
+				}
+				const selector = `if queueURL == "nats://nats:4222" && os.Getenv("LUXO_INTERNAL_COMPOSE_JETSTREAM") == "1" {`
+				usesQueue := sample.queue == "nats"
+				for _, part := range []string{
+					selector, "gw.AddReadinessCheck(taskQueue.CheckDirectJetStreamReady)",
+					"gw.AddReadinessCheck(taskQueue.CheckReady)",
+				} {
+					if strings.Contains(code, part) != usesQueue {
+						t.Errorf("generated entry has %q = %v, want %v", part, !usesQueue, usesQueue)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestGenerateEntryFileWithServiceFns(t *testing.T) {
 	result := &semantic.Result{
 		Files: []*ast.File{
@@ -828,6 +877,9 @@ func TestGenerateGatewayEntry(t *testing.T) {
 	if strings.Contains(src, `"errors"`) || strings.Contains(src, `"github.com/light-speak/luxo/pkg/lux/env"`) {
 		t.Error("a gateway without streams must not import dotenv helpers")
 	}
+	if strings.Contains(src, "_ = context.Background") {
+		t.Error("the gateway already uses context in the forwarding helpers")
+	}
 
 	checks := []string{
 		"package main",
@@ -837,6 +889,8 @@ func TestGenerateGatewayEntry(t *testing.T) {
 		`rpcClients, err := rpc.LoadGatewayClients(".env", map[string]string{`,
 		`"user": "user:9000",`,
 		`"post": "post:9000",`,
+		`gw.AddReadinessCheck(rpcClients["user"].CheckReady)`,
+		`gw.AddReadinessCheck(rpcClients["post"].CheckReady)`,
 		"RegisterSchema",
 		"gw.Router.Registry.RegisterSchemaAPIs(gw.Router.Schema)",
 		"proxyHandler",

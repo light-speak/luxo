@@ -21,6 +21,8 @@ type jsClient interface {
 	// Publish publishes a message to a subject.
 	Publish(ctx context.Context, subject string, payload []byte) error
 	Flush(time.Duration) error
+	FlushWithContext(context.Context) error
+	serverJetStreamEnabled() bool
 }
 
 // jsStream abstracts the stream-level operations needed for Subscribe.
@@ -62,6 +64,15 @@ func (r *realJSClient) Publish(ctx context.Context, subject string, payload []by
 
 func (r *realJSClient) Flush(timeout time.Duration) error {
 	return r.js.Conn().FlushTimeout(timeout)
+}
+
+func (r *realJSClient) FlushWithContext(ctx context.Context) error {
+	return r.js.Conn().FlushWithContext(ctx)
+}
+
+func (r *realJSClient) serverJetStreamEnabled() bool {
+	enabled, _ := r.js.Conn().ConnectedServerJetStream()
+	return enabled
 }
 
 // realJSStream wraps jetstream.Stream to satisfy jsStream.
@@ -210,6 +221,32 @@ func (n *NATSQueue) ensureStream(ctx context.Context, queue string) (jsStream, e
 	n.streams[queue] = true
 	n.mu.Unlock()
 	return stream, nil
+}
+
+// CheckReady verifies the broker acknowledges the queue's connection.
+func (n *NATSQueue) CheckReady(ctx context.Context) error {
+	n.mu.Lock()
+	closed := n.closed
+	n.mu.Unlock()
+	if closed {
+		return fmt.Errorf("queue: closed")
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	return n.js.FlushWithContext(ctx)
+}
+
+// CheckDirectJetStreamReady verifies an ordinary connection to a server that
+// advertises JetStream. Use it when the queue connects directly to its managed
+// broker. The flag describes the server, while routed JetStream may be remote.
+func (n *NATSQueue) CheckDirectJetStreamReady(ctx context.Context) error {
+	if err := n.CheckReady(ctx); err != nil {
+		return err
+	}
+	if !n.js.serverJetStreamEnabled() {
+		return fmt.Errorf("queue: direct NATS server does not advertise JetStream")
+	}
+	return nil
 }
 
 // getOrCreateStream ensures the stream exists and returns the stream handle.

@@ -67,6 +67,10 @@ func newMockJSClient() *mockJSClient {
 
 func (m *mockJSClient) Flush(time.Duration) error { return nil }
 
+func (m *mockJSClient) FlushWithContext(ctx context.Context) error { return ctx.Err() }
+
+func (m *mockJSClient) serverJetStreamEnabled() bool { return false }
+
 func (m *mockJSClient) CreateStream(_ context.Context, cfg jetstream.StreamConfig) (jsStream, error) {
 	m.createStreamN.Add(1)
 	if m.createStreamErr != nil {

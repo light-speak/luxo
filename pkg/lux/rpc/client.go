@@ -103,6 +103,12 @@ func NewNamedClientWithOptions(name, addr string, options PoolOptions) (*Client,
 	return &Client{name: name, pool: pool}, nil
 }
 
+// CheckReady verifies a fresh LRPC handshake within the shared connection
+// budget, without invoking a business operation.
+func (c *Client) CheckReady(ctx context.Context) error {
+	return c.pool.checkReady(ctx)
+}
+
 // LoadGatewayClients loads an optional dotenv file and configures one named
 // client and pool per target. Process values override dotenv values. Each
 // default address can be overridden by the uppercase target's _SERVICE_ADDR key.

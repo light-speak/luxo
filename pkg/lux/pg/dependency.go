@@ -23,10 +23,15 @@ type poolStatistics interface {
 	TotalConns() int32
 }
 
+// CheckReady verifies that the database can accept work through the current pool.
+func (db *DB) CheckReady(ctx context.Context) error {
+	return db.pool.Ping(ctx)
+}
+
 // RuntimeDependencies reports a credential-free PostgreSQL pool snapshot.
 func (db *DB) RuntimeDependencies(ctx context.Context) []lux.RuntimeDependencyStats {
 	startedAt := time.Now()
-	err := db.pool.Ping(ctx)
+	err := db.CheckReady(ctx)
 	return []lux.RuntimeDependencyStats{
 		postgresDependencyStats(db.pool.Config(), db.pool.Stat(), time.Since(startedAt), err),
 	}

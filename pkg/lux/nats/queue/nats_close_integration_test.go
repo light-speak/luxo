@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -88,7 +89,7 @@ func TestNATSQueueCloseReportsSharedConnectionLoss(t *testing.T) {
 }
 
 func TestNATSQueueCloseReportsFlushTimeout(t *testing.T) {
-	address, stopped := silentFlushServer(t)
+	address, stopped := queueFlushServer(t, queueFlushServerOptions{})
 	q, err := NewNATSQueue(address, testConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -108,7 +109,47 @@ func TestNATSQueueCloseReportsFlushTimeout(t *testing.T) {
 	}
 }
 
-func silentFlushServer(t *testing.T) (string, <-chan struct{}) {
+func TestNATSQueueDirectJetStreamReadiness(t *testing.T) {
+	for _, jetStream := range []bool{false, true} {
+		t.Run(strconv.FormatBool(jetStream), func(t *testing.T) {
+			address, stopped := queueFlushServer(t, queueFlushServerOptions{jetStream: jetStream, acknowledgeFlush: true})
+			q, err := NewNATSQueue(address, testConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = q.Close() })
+			if err := q.CheckReady(t.Context()); err != nil {
+				t.Fatalf("ordinary readiness must accept either server: %v", err)
+			}
+			if err := q.CheckDirectJetStreamReady(t.Context()); (err == nil) != jetStream {
+				t.Fatalf("direct JetStream ready = %v, want %v: %v", err == nil, jetStream, err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			if err := q.CheckDirectJetStreamReady(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("direct readiness lost cancellation: %v", err)
+			}
+			if err := q.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := q.CheckDirectJetStreamReady(t.Context()); err == nil {
+				t.Fatal("closed queue reported ready")
+			}
+			select {
+			case <-stopped:
+			case <-time.After(time.Second):
+				t.Fatal("owned connection did not close")
+			}
+		})
+	}
+}
+
+type queueFlushServerOptions struct {
+	jetStream        bool
+	acknowledgeFlush bool
+}
+
+func queueFlushServer(t *testing.T, options queueFlushServerOptions) (string, <-chan struct{}) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -124,7 +165,7 @@ func silentFlushServer(t *testing.T) (string, <-chan struct{}) {
 		}
 		defer conn.Close()
 		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-		_, _ = io.WriteString(conn, "INFO {\"server_id\":\"queue-close-audit\",\"version\":\"2.10.0\",\"proto\":1,\"max_payload\":1048576}\r\n")
+		_, _ = fmt.Fprintf(conn, "INFO {\"server_id\":\"queue-audit\",\"version\":\"2.10.0\",\"proto\":1,\"max_payload\":1048576,\"jetstream\":%t}\r\n", options.jetStream)
 		reader := bufio.NewReader(conn)
 		initial := true
 		for {
@@ -132,7 +173,7 @@ func silentFlushServer(t *testing.T) (string, <-chan struct{}) {
 			if err != nil {
 				return
 			}
-			if line == "PING\r\n" && initial {
+			if line == "PING\r\n" && (initial || options.acknowledgeFlush) {
 				_, _ = io.WriteString(conn, "PONG\r\n")
 				initial = false
 			}

@@ -199,6 +199,43 @@ func (p *Pool) wait(ctx context.Context) (net.Conn, error) {
 	}
 }
 
+func (p *Pool) checkReady(ctx context.Context) error {
+	if err := p.readinessContextErr(ctx); err != nil {
+		return err
+	}
+	replace := false
+	if !reserve(&p.open, p.options.MaxOpen) {
+		idle, err, ready := p.tryAcquire(ctx)
+		if !ready {
+			idle, err = p.wait(ctx)
+		}
+		if idle != nil {
+			err = idle.(*poolConn).closeForReplacement()
+			replace = true
+		}
+		if err != nil {
+			return err
+		}
+	}
+	conn, err := p.dialReserved(ctx)
+	if err != nil {
+		return err
+	}
+	if replace {
+		p.Put(conn)
+	} else {
+		conn.Close()
+	}
+	return p.readinessContextErr(ctx)
+}
+
+func (p *Pool) readinessContextErr(ctx context.Context) error {
+	if p.closed.Load() {
+		return errPoolClosed
+	}
+	return ctx.Err()
+}
+
 // The reservation precedes dialing and is held through handshake. Closing the
 // pool cancels in-flight setup without interrupting already borrowed calls.
 func (p *Pool) dialReserved(ctx context.Context) (net.Conn, error) {

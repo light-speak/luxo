@@ -96,7 +96,7 @@ func testCORSMiddleware(t testing.TB, next http.Handler) http.Handler {
 
 func buildTestMux(t testing.TB, gateway *Gateway, version string) (*http.ServeMux, string) {
 	t.Helper()
-	mux, port, err := gateway.buildMux(version)
+	mux, port, err := gateway.buildMux(testReadinessHandler(t, gateway), version)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestInvalidOriginStopsGatewayStartup(t *testing.T) {
 	for _, configured := range []string{"https://app.example/path", "*,bad", "null,", "https://app.example:65536"} {
 		t.Setenv("CORS_ORIGIN", configured)
 		gateway := New()
-		mux, _, err := gateway.buildMux("origin-test")
+		mux, _, err := gateway.buildMux(testReadinessHandler(t, gateway), "origin-test")
 		if err == nil || mux != nil || !strings.Contains(err.Error(), "CORS_ORIGIN") {
 			t.Fatal("invalid configuration produced mux", err)
 		}

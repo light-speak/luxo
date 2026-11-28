@@ -74,6 +74,19 @@ func (s *Server) ListenAndServe(addr string) error {
 	return s.Serve(ln)
 }
 
+// CheckReady reports whether this server owns a listener and accepts requests.
+func (s *Server) CheckReady(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if s.closing || s.listener == nil {
+		return fmt.Errorf("rpc: server is not listening")
+	}
+	return nil
+}
+
 // Serve accepts RPC connections from an already allocated listener.
 // It owns and closes the listener, including when the server is closed or busy.
 // Only one listener may serve at a time. Close makes this server permanently closed.

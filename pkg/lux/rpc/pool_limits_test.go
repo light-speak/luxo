@@ -125,6 +125,54 @@ func TestPoolRejectsCanceledIdleBorrow(t *testing.T) {
 	}
 }
 
+func TestPoolReadinessWaitUsesCallerDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := boundedTestPool(t)
+		conn, err := p.Get()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		if err := p.checkReady(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("readiness wait returned %v", err)
+		}
+		if elapsed := time.Since(start); elapsed != 10*time.Millisecond {
+			t.Fatalf("readiness exceeded caller deadline: %v", elapsed)
+		}
+		if open, waiting := p.open.Load(), p.waiters.Load(); open != 1 || waiting != 0 {
+			t.Fatalf("readiness changed a borrowed slot: open=%d waiting=%d", open, waiting)
+		}
+	})
+}
+
+func TestPoolReplacementRetainsReservationThroughClose(t *testing.T) {
+	p := boundedTestPool(t)
+	conn, err := p.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaced := conn.(*poolConn)
+	if err := replaced.closeForReplacement(); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaced.closeForReplacement(); !errors.Is(err, ErrPoolExhausted) {
+		t.Fatalf("repeated replacement returned %v", err)
+	}
+	if err := replaced.Close(); err != nil || p.open.Load() != 1 {
+		t.Fatalf("closing the retired socket released the replacement's slot: %v", err)
+	}
+	replacement, err := p.acceptDial(t.Context(), &poolLifecycleConn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil || p.open.Load() != 0 {
+		t.Fatalf("replacement leaked the slot: %v", err)
+	}
+}
+
 func TestPoolDialingConsumesCapacityAndCloseCancelsHandshake(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

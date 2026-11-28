@@ -14,7 +14,6 @@ import (
 
 type gatewayHTTPRuntime interface {
 	Shutdown(context.Context) error
-	RegisterOnShutdown(func())
 }
 
 type gatewayHTTPServer struct {

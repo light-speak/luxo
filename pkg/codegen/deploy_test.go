@@ -160,6 +160,33 @@ func TestComposeOptionalNamesWithoutInfrastructure(t *testing.T) {
 	}
 }
 
+func TestComposeJetStreamReadinessWithAliasedGatewayModule(t *testing.T) {
+	modules := []moduleInfo{{name: "gateway"}}
+	backends := composeBackends{selection: EntryBackends{Queue: "nats"}}
+	files := renderDeployFiles(modules, "probe", backends)
+	var compose struct {
+		Services map[string]struct {
+			Environment map[string]string
+			DependsOn   map[string]struct{ Condition string } `yaml:"depends_on"`
+		}
+	}
+	if err := yaml.Unmarshal(files.DockerCompose, &compose); err != nil {
+		t.Fatal(err)
+	}
+	module := compose.Services["module-gateway"]
+	const readiness = "LUXO_INTERNAL_COMPOSE_JETSTREAM"
+	if module.Environment[readiness] != "1" || module.DependsOn["nats"].Condition != "service_healthy" {
+		t.Errorf("module lost JetStream readiness: %+v", module)
+	}
+	gateway := compose.Services["gateway"]
+	if gateway.Environment["GATEWAY_SERVICE_ADDR"] != "${GATEWAY_SERVICE_ADDR:-module-gateway:9000}" {
+		t.Errorf("gateway lost its module RPC address: %+v", gateway.Environment)
+	}
+	if _, exists := gateway.Environment[readiness]; exists {
+		t.Error("gateway should only wait for the dependencies it uses")
+	}
+}
+
 func TestDeploymentAliasesReserveBothDockerStageNames(t *testing.T) {
 	modules := []moduleInfo{
 		{name: "worker"}, {name: "worker-run"}, {name: "module-worker-run"},
@@ -381,6 +408,10 @@ func checkComposeBackends(t *testing.T, manifest []byte, natsConsumers []string,
 	for _, name := range []string{"watch", "order", "read", "gateway"} {
 		service := config.Services[name]
 		checkComposeServiceConnection(t, name, "NATS_URL", "nats://nats:4222", service.Environment, service.DependsOn["nats"].Condition, slices.Contains(natsConsumers, name))
+		flag, hasFlag := service.Environment["LUXO_INTERNAL_COMPOSE_JETSTREAM"]
+		if want := jetstream && name != "gateway"; hasFlag != want || hasFlag && flag != "1" {
+			t.Fatalf("service %s: managed JetStream flag = %q (%v), want present=%v", name, flag, hasFlag, want)
+		}
 		checkComposeServiceConnection(t, name, "REDIS_URL", "redis://redis:6379", service.Environment, service.DependsOn["redis"].Condition, redis && name == "read")
 		if name != "read" && service.Environment["LUXO_CACHE_PROJECT"] != "" {
 			t.Fatalf("service %s got cache settings", name)
