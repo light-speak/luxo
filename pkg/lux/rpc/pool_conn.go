@@ -16,6 +16,7 @@ const (
 	connClosing
 	connClosed
 	connCloseWaiter
+	connStream
 )
 
 // One wrapper per physical connection accounts for every direct Close path,
@@ -82,19 +83,23 @@ func partialResponseError(received int, err error) error {
 }
 
 func (c *poolConn) Close() error {
-	if state := c.state.Or(connClosing); state&connClosing != 0 {
+	state := c.state.Or(connClosing)
+	if state&connClosing != 0 {
 		if state&connClosed == 0 {
 			c.pool.waitForClose(c)
 		}
 		return nil
 	}
-	defer c.finishClose()
+	defer c.finishClose(state)
 	return c.Conn.Close()
 }
 
-func (c *poolConn) finishClose() {
+func (c *poolConn) finishClose(state uint32) {
 	p := c.pool
 	p.open.Add(-1)
+	if state&connStream != 0 {
+		p.streams.Add(-1)
+	}
 	p.signal()
 	if c.state.Or(connClosed)&connCloseWaiter == 0 {
 		return
