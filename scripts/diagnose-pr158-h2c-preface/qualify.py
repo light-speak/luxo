@@ -17,7 +17,7 @@ from tempfile import TemporaryDirectory
 
 HERE = Path(__file__).resolve().parent
 MANIFEST = HERE / 'manifest.json'
-MANIFEST_SHA = 'f07ba2295710c6e3c7f57049ac0ceaebc50fd92f42a6ad4b91378c6b322b1bc3'
+MANIFEST_SHA = '75ff89da6a0d93f0b6880eeeebd7e210714f928f9bc4ba46b593d632e693fdf4'
 REF = 'refs/heads/diagnostics/pr158-h2c-preface'
 
 
