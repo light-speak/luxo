@@ -1,0 +1,55 @@
+name: Diagnose PR 143 Luvia timings on EPYC 7763
+
+on:
+  push:
+    branches: [diagnostics/pr143-luvia-readiness-amd]
+
+permissions:
+  contents: read
+
+jobs:
+  witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5]
+    name: EPYC 7763 witness (${{ matrix.slot }})
+    env:
+      RUNNER_KIND: ${{ runner.environment }}
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Match the processor and bind the diagnostic commit
+        id: route
+        run: bash scripts/diagnose-pr143-luvia-amd/run.sh route
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: de7360c78f1e6f50edfe837b2f2471f9d6ed9410
+          path: .tmp/pr143-amd-base
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        name: Measure stock and aligned binaries with interleaved controls
+        run: bash scripts/diagnose-pr143-luvia-amd/run.sh measure
+
+      - if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr143-luvia-amd-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slot }}
+          path: .tmp/pr143-luvia-amd-evidence
+          if-no-files-found: error
+          retention-days: 14
