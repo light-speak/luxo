@@ -29,11 +29,16 @@ const (
 	semanticEventEmitsFilename         = "analyzer_bench_test.go"
 	semanticEventEmitsSourceSHA        = "ee8320cdca18a8700a37b504b8ee2f3ff05624c8e25a6ef35fe9ea8d4bad2a51"
 	semanticEventEmitsProjectionSHA    = "94ef2558fb21f50051ac83b9fe1ca7baa7ec52456bfb16735879344b71d5d4ca"
+
+	apiJSONListMetadataFilename      = "request_list_bench_test.go"
+	apiJSONListMetadataSourceSHA     = "7de8d4387a94119bc2c6d71287c3e344d2423453a566b750d809fab0afd1a4c5"
+	apiJSONListMetadataProjectionSHA = "a8fd9a37ceaaf2c5d61f3147fd27acc397d412247bc97e7bae3beea3274f3730"
 )
 
 type pairedBenchmarkFixture struct {
 	name, sourceSHA, projectionSHA string
 	imports, functions             []string
+	variables                      []string
 }
 
 var rpcPreparedFrameFixture = pairedBenchmarkFixture{
@@ -60,9 +65,54 @@ var semanticEventEmitsFixture = pairedBenchmarkFixture{
 	functions: []string{benchlayout.SemanticEventEmitsBenchmark},
 }
 
+var apiJSONListMetadataFixture = pairedBenchmarkFixture{
+	name: apiJSONListMetadataFilename, sourceSHA: apiJSONListMetadataSourceSHA, projectionSHA: apiJSONListMetadataProjectionSHA,
+}
+
+func writeAPIJSONListMetadataOverlay(pkg, workspace string) (string, error) {
+	project := func(path, workspace string) (string, error) {
+		return apiJSONListMetadataFixture.writeProjection(path, workspace, projectAPIJSONListMetadata)
+	}
+	return writeProjectedBenchmarkOverlay(pkg, workspace, benchlayout.APIJSONListMetadataProfile, project, apiJSONListMetadataFilename)
+}
+
+func projectAPIJSONListMetadata(_ string, source []byte, _ pairedBenchmarkFixture) ([]byte, error) {
+	// Retain the exact measured imports, declaration bytes, and source positions.
+	projected, line := bytes.Clone(source), 1
+	for i, ch := range projected {
+		if ch == '\n' {
+			line++
+			continue
+		}
+		switch line {
+		case 1, 3, 5, 6, 7, 9, 10, 11, 14:
+		default:
+			if line < 110 {
+				projected[i] = ' '
+			}
+		}
+	}
+	return projected, nil
+}
+
 func pairedBenchmarkOverlay(root, pkg, profile string, fixture pairedBenchmarkFixture) (string, func() error, error) {
+	return pairedBenchmarkGroupOverlay(root, pkg, profile, []pairedBenchmarkFixture{fixture})
+}
+
+func pairedBenchmarkGroupOverlay(root, pkg, profile string, fixtures []pairedBenchmarkFixture) (string, func() error, error) {
+	names := make([]string, len(fixtures))
+	for i, fixture := range fixtures {
+		names[i] = fixture.name
+	}
 	return packageTestOverlay(root, pkg, "bench-"+profile+"-*", func(pkg, workspace string) (string, error) {
-		return writeProjectedBenchmarkOverlay(pkg, workspace, profile, fixture.projectFile, fixture.name)
+		return writeProjectedBenchmarkOverlay(pkg, workspace, profile, func(path, workspace string) (string, error) {
+			for _, fixture := range fixtures {
+				if filepath.Base(path) == fixture.name {
+					return fixture.projectFile(path, workspace)
+				}
+			}
+			return fixtures[0].projectFile(path, workspace)
+		}, names...)
 	})
 }
 
@@ -123,7 +173,8 @@ func keepPairedDeclarations(file *ast.File, fixture pairedBenchmarkFixture, keep
 	for _, declaration := range file.Decls {
 		switch node := declaration.(type) {
 		case *ast.GenDecl:
-			if node.Tok == token.IMPORT && node.Lparen.IsValid() {
+			keepPairedVariable(node, fixture.variables, keep)
+			if node.Tok == token.IMPORT && node.Lparen.IsValid() && len(fixture.imports) != 0 {
 				keep(node.Pos(), node.Lparen+1)
 				keep(node.Rparen, node.End())
 			}
@@ -142,4 +193,19 @@ func keepPairedDeclarations(file *ast.File, fixture pairedBenchmarkFixture, keep
 			keep(item.Pos(), item.End())
 		}
 	}
+}
+
+func keepPairedVariable(node *ast.GenDecl, names []string, keep func(token.Pos, token.Pos)) {
+	if node.Tok != token.VAR || len(node.Specs) != 1 {
+		return
+	}
+	item := node.Specs[0].(*ast.ValueSpec)
+	if len(item.Names) != 1 || len(item.Values) != 0 || !slices.Contains(names, item.Names[0].Name) {
+		return
+	}
+	first := node.Pos()
+	if node.Doc != nil {
+		first = node.Doc.Pos()
+	}
+	keep(first, node.End())
 }

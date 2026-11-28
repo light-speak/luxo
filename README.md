@@ -452,6 +452,10 @@ Studio releases must pin the tested core Go module, CLI, frontend SDKs, and CI c
 
 #### Pre-Beta Internal RPC Upgrade (Under Validation)
 
+A generated gateway shares one LRPC connection pool per target service. The default pool allows 32 connections, with at most 24 used by native streams. New native streams receive `LRPCPoolBusy` (503) immediately when the stream quota or the shared pool is full. Unary RPCs can use any available connection.
+
+Set `LRPC_MAX_OPEN` and `LRPC_UNARY_RESERVE` in the gateway process environment to tune the total limit and unary reservation. When the reserve is omitted or set to zero, the gateway reserves one quarter of the total, rounded up. A reserve equal to the total disables native streams for the pool. Go callers can set `MaxOpen` and `UnaryReserve` in `rpc.PoolOptions`, with `MaxIdle` at most `MaxOpen`.
+
 `fn @service`, generated batch loaders, relation resolvers, and named remote
 loaders register through `Router.HandleInternal`. HTTP and WebSocket only use
 the public route table; RPC exports both public APIs and internal functions at
@@ -639,7 +643,11 @@ Same task in TypeScript? 150+ lines, 4 packages, no compile-time safety.
 
 In PostgreSQL migrations, run each supported statement that requires execution outside a transaction, such as `CREATE INDEX CONCURRENTLY`, in its own numbered SQL file. For example, add the column in `002_add_column.sql` and create its index in `003_create_index.sql`. Write each `UP` or `DOWN` section as either ordinary transactional SQL or one standalone statement. Luxo validates the selected sections before applying or rolling back any migration. Rollback also checks each selected file against its recorded checksum when one exists. `luxo migrate up --dry-run` reads the pending plan without creating the history table or running migration SQL.
 
-Luxo selects `_migrations` in PostgreSQL's `current_schema()` at the start of each operation. Configure the same `search_path` for preview, apply, and rollback. Migration SQL requires `standard_conforming_strings=on`, the PostgreSQL default. Use explicit `E'...'` literals for backslash escapes.
+Luxo binds migration history and recovery state to PostgreSQL's `current_schema()` at the start of each operation. Configure the same `search_path` for preview, apply, rollback, and reconciliation. Migration SQL requires `standard_conforming_strings=on`, the PostgreSQL default. Use explicit `E'...'` literals for backslash escapes.
+
+`luxo migrate reconcile` reads the outstanding attempt ID, migration name, direction, and history state. If history is unconfirmed, inspect the affected PostgreSQL objects. Use `luxo migrate reconcile <attempt-id> --record-executed` after verifying that the statement took effect, or `--retry` after confirming the recorded statement can safely run again. Use `luxo migrate reconcile <attempt-id> --acknowledge` when the history is already committed, including a retained rollback receipt. Each recovery command takes exactly one action.
+
+For `--record-executed` or `--retry`, pause conflicting DDL from clients that do not acquire Luxo's PostgreSQL migration advisory lock. Keep it paused from the start of inspection until the action completes. The same requirement applies to direct calls to `migrate.Runner.Reconcile` with `RecordApplied` or `RetryMigration`.
 
 If a previously applied file has a mixed `DOWN` section, leave its recorded file intact and create new compensating migrations in dependency order. When a concurrent index build fails, PostgreSQL can leave an invalid index. Inspect and resolve that index before retrying. A concurrent `CREATE INDEX IF NOT EXISTS` only counts as successful if the index is valid and belongs to the intended table.
 

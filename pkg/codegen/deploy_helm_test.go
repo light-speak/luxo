@@ -2,6 +2,8 @@ package codegen
 
 import (
 	"bytes"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -372,7 +374,7 @@ func TestHelmModuleDeployment(t *testing.T) {
 		dep := string(helm.Files["templates/module-"+mod+"-deployment.yaml"])
 		checks := []string{
 			"kind: Deployment",
-			"component: " + mod,
+			"component: " + strconv.Quote(mod),
 			"name: http",
 			"name: rpc",
 			"APP_PORT",
@@ -406,7 +408,7 @@ func TestHelmModuleService_Ports(t *testing.T) {
 		"name: rpc",
 		".Values.modules.user.rpcPort",
 		"targetPort: rpc",
-		"component: user",
+		`component: "user"`,
 	}
 	for _, check := range checks {
 		if !strings.Contains(svc, check) {
@@ -496,11 +498,93 @@ func TestHelmHelpersSizeMatchesTemplates(t *testing.T) {
 	for _, modules := range [][]moduleInfo{
 		{{name: "module001"}},
 		{{name: "user"}, {name: "dotless-ı"}, {name: "latin-ɜ"}},
+		{{name: "gateway"}, {name: "module-gateway"}},
 	} {
-		got := len(generateHelpers(modules))
-		if predicted := helmHelpersSize(modules); predicted != got {
+		names := planDeploymentAliases(modules, "", "gateway")
+		got := len(generateHelpers(modules, names))
+		if predicted := helmHelpersSize(modules, names); predicted != got {
 			t.Errorf("helpers size = %d, want %d emitted bytes", predicted, got)
 		}
+	}
+}
+
+func TestHelmGatewayModuleHasDistinctDeploymentIdentity(t *testing.T) {
+	chart, err := GenerateHelmFilesChecked(makeHelmResult("gateway", "postgres", "builder"), "probe", EntryBackends{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := map[string][]string{
+		"templates/gateway-deployment.yaml":        {`name: {{ include "luxo.resourceName" (list . "gateway") }}`, `/gateway:{{ .Values.image.tag }}`},
+		"templates/module-gateway-deployment.yaml": {`name: {{ include "luxo.resourceName" (list . "module-gateway") }}`, "app.kubernetes.io/component: \"module-gateway\"", `/module-gateway:{{ .Values.image.tag }}`, ".Values.modules.gateway.replicas"},
+		"templates/module-gateway-service.yaml":    {`name: {{ include "luxo.resourceName" (list . "module-gateway") }}`, "app.kubernetes.io/component: \"module-gateway\"", ".Values.modules.gateway.rpcPort"},
+		"templates/module-postgres-service.yaml":   {`name: {{ include "luxo.resourceName" (list . "postgres") }}`},
+		"templates/module-builder-service.yaml":    {`name: {{ include "luxo.resourceName" (list . "builder") }}`},
+		"templates/hpa.yaml":                       {`name: {{ include "luxo.resourceName" (list . "module-gateway") }}`, ".Values.modules.gateway.autoscaling.enabled"},
+		"templates/_helpers.tpl":                   {`GATEWAY_SERVICE_ADDR: {{ include "luxo.resourceName" (list . "module-gateway") }}:{{ .Values.modules.gateway.rpcPort }}`},
+		"values.yaml":                              {"modules:\n  gateway:\n"},
+	}
+	for path, expected := range checks {
+		for _, pattern := range expected {
+			if !strings.Contains(string(chart.Files[path]), pattern) {
+				t.Errorf("%s is missing %q", path, pattern)
+			}
+		}
+	}
+	if got := strings.Count(string(chart.Files["templates/hpa.yaml"]), `name: {{ include "luxo.resourceName" (list . "module-gateway") }}`); got != 2 {
+		t.Errorf("module HPA must have a distinct name and target, got %d references", got)
+	}
+}
+
+func TestHelmModuleNamesPreserveExternalReferences(t *testing.T) {
+	chart, err := GenerateHelmFilesChecked(makeHelmResult("order_items", "order__items", "gateway", "user"), "demo", EntryBackends{Queue: "nats"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := map[string][]string{
+		"templates/module-order_items-deployment.yaml": {`name: {{ include "luxo.resourceName" (list . "order-items") }}`, "app.kubernetes.io/component: \"order-items\"\n", "/order_items:{{ .Values.image.tag }}", `- name: "order-items"`, ".Values.modules.order_items.replicas", "- name: NATS_URL"},
+		"templates/module-order_items-service.yaml":    {`name: {{ include "luxo.resourceName" (list . "order-items") }}`, "app.kubernetes.io/component: \"order-items\"\n", ".Values.modules.order_items.rpcPort"},
+		"templates/module-order__items-service.yaml":   {`name: {{ include "luxo.resourceName" (list . "order-items-2") }}`, "app.kubernetes.io/component: \"order-items-2\"\n", ".Values.modules.order__items.rpcPort"},
+		"templates/module-gateway-deployment.yaml":     {`name: {{ include "luxo.resourceName" (list . "module-gateway") }}`, "/module-gateway:{{ .Values.image.tag }}"},
+		"templates/module-user-service.yaml":           {`name: {{ include "luxo.resourceName" (list . "user") }}`},
+		"templates/_helpers.tpl":                       {`ORDER_ITEMS_SERVICE_ADDR: {{ include "luxo.resourceName" (list . "order-items") }}:{{ .Values.modules.order_items.rpcPort }}`, `ORDER__ITEMS_SERVICE_ADDR: {{ include "luxo.resourceName" (list . "order-items-2") }}:{{ .Values.modules.order__items.rpcPort }}`},
+		"templates/hpa.yaml":                           {`name: {{ include "luxo.resourceName" (list . "order-items") }}`, ".Values.modules.order_items.autoscaling.enabled"},
+		"templates/configmap.yaml":                     {`list "gateway" "order-items" "order-items-2" "module-gateway" "user"`, `if hasKey $seen $name`, `fail (printf`},
+		"values.yaml":                                  {"  order_items:\n", "  order__items:\n"},
+	}
+	for path, patterns := range checks {
+		for _, pattern := range patterns {
+			if !bytes.Contains(chart.Files[path], []byte(pattern)) {
+				t.Errorf("%s does not contain %q", path, pattern)
+			}
+		}
+	}
+}
+
+func TestHelmModuleLabelBoundsAndStability(t *testing.T) {
+	long := strings.Repeat("long", 17)
+	modules := []moduleInfo{{name: "order_items"}, {name: "order__items"}, {name: "order-items"},
+		{name: long + "a"}, {name: long + "b"}, {name: "_Gateway"}, {name: "_1"}, {name: "_"},
+		{name: strings.Repeat("x", 63)}}
+	names := planHelmResourceNames(modules, nil)
+	if names.name("order-items") != "order-items" || names.name("order_items") != "order-items-2" ||
+		names.name("order__items") != "order-items-3" || names.name("_Gateway") != "gateway-2" ||
+		names.name("_1") != "1" || names.name("_") != "module" {
+		t.Fatalf("unexpected Helm resource assignments: %v", names)
+	}
+	claimed := map[string]bool{"gateway": true}
+	for _, module := range modules {
+		label := names.name(module.name)
+		if claimed[label] || !isHelmModuleLabel(label) {
+			t.Fatalf("duplicate or invalid resource label %q for %q", label, module.name)
+		}
+		claimed[label] = true
+	}
+	if valid := strings.Repeat("x", 63); names.name(valid) != valid {
+		t.Fatalf("already valid component changed: %q", names.name(valid))
+	}
+	slices.Reverse(modules)
+	if reverse := planHelmResourceNames(modules, nil); !maps.Equal(names, reverse) {
+		t.Fatalf("resource names depend on module traversal: %v != %v", names, reverse)
 	}
 }
 
@@ -698,5 +782,46 @@ func TestHelmFileCount(t *testing.T) {
 	expected := 17
 	if len(helm.Files) != expected {
 		t.Errorf("expected %d files, got %d", expected, len(helm.Files))
+	}
+}
+
+func TestGenerateHPAOutputAllocation(t *testing.T) {
+	for _, count := range []int{0, 1, 16} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			modules := make([]moduleInfo, count)
+			for index := range modules {
+				modules[index].name = "module" + strconv.Itoa(index)
+			}
+			var output []byte
+			allocations := testing.AllocsPerRun(20, func() { output = generateHPA(modules, nil) })
+			if allocations != 1 {
+				t.Fatalf("HPA output needs one owned byte allocation, got %g", allocations)
+			}
+			if len(output) != cap(output) {
+				t.Fatalf("HPA output capacity %d != size %d", cap(output), len(output))
+			}
+		})
+	}
+}
+
+func TestGenerateHPAOutputOwnership(t *testing.T) {
+	for _, name := range []string{"user", "order_items", strings.Repeat("long", 22), "用户"} {
+		modules := []moduleInfo{{name: name}}
+		names := planHelmResourceNames(modules, nil)
+		first, second := generateHPA(modules, names), generateHPA(modules, names)
+		original := bytes.Clone(second)
+		first[0] ^= 1
+		if !bytes.Equal(second, original) {
+			t.Fatal("HPA outputs share mutable storage")
+		}
+		if len(second) != cap(second) {
+			t.Fatalf("normalized HPA output capacity %d != size %d", cap(second), len(second))
+		}
+		if !bytes.Contains(second, []byte(".Values.modules."+name+".autoscaling.enabled")) {
+			t.Fatal("values lookup spelling changed")
+		}
+		if !bytes.Contains(second, []byte(names.name(name))) {
+			t.Fatal("resource name disappeared")
+		}
 	}
 }

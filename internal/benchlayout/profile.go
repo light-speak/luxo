@@ -68,6 +68,15 @@ const (
 	SemanticEventEmitsProfile   = "semantic-event-emits"
 	SemanticEventEmitsBenchmark = "BenchmarkCollectEventEmits"
 
+	CodegenFindReadProfile   = "codegen-find-read"
+	CodegenFindReadBenchmark = "BenchmarkFindRead"
+
+	CodegenNumericRangeProfile   = "codegen-numeric-range"
+	CodegenNumericRangeBenchmark = "BenchmarkNumericRangeValidation"
+
+	SemanticEventSnapshotProfile   = "semantic-event-snapshot"
+	SemanticEventSnapshotBenchmark = "BenchmarkEventSnapshotContract"
+
 	APILocalRouteExportProfile      = "api-local-route-export"
 	APILocalRouteExportBenchmark    = "BenchmarkLocalRouteExport"
 	APICanonicalJSONProfile         = "api-canonical-json"
@@ -91,6 +100,8 @@ const (
 	APIBodyReadBenchmark               = "BenchmarkBodyRead"
 	APIJSONQuoteCandidateProfile       = "api-json-quote-candidate"
 	APIJSONQuoteCandidateBenchmark     = "BenchmarkJSONQuoteCandidate"
+	APIJSONListMetadataProfile         = "api-json-list-metadata"
+	APIJSONListMetadataBenchmark       = "BenchmarkJSONListMetadata"
 
 	LuviaMergeDestinationProfile   = "luvia-merge-destination"
 	LuviaMergeDestinationBenchmark = "BenchmarkMergeDestination"
@@ -164,8 +175,11 @@ func ProfileForBenchmark(pkg, name string) string {
 	case CodegenPackage:
 		return codegenBenchmarkProfile(root)
 	case SemanticPackage:
-		if root == SemanticEventEmitsBenchmark {
+		switch root {
+		case SemanticEventEmitsBenchmark:
 			return SemanticEventEmitsProfile
+		case SemanticEventSnapshotBenchmark:
+			return SemanticEventSnapshotProfile
 		}
 	}
 	return DefaultProfile
@@ -181,6 +195,10 @@ func codegenBenchmarkProfile(root string) string {
 		return CodegenMigrationStateProfile
 	case CodegenRelationLoaderBenchmark:
 		return CodegenRelationLoaderProfile
+	case CodegenFindReadBenchmark:
+		return CodegenFindReadProfile
+	case CodegenNumericRangeBenchmark:
+		return CodegenNumericRangeProfile
 	default:
 		return DefaultProfile
 	}
@@ -200,6 +218,8 @@ func apiBenchmarkProfile(root string) string {
 		return APIBodyReadProfile
 	case APIJSONQuoteCandidateBenchmark:
 		return APIJSONQuoteCandidateProfile
+	case APIJSONListMetadataBenchmark:
+		return APIJSONListMetadataProfile
 	}
 	if root == APIRequestLogBoundaryBenchmark || root == APIRequestLogDeliveredBenchmark {
 		return APIRequestLogProfile
@@ -264,6 +284,7 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{APIResponseOriginRunProfile, "^" + APIResponseOriginRunBenchmark + "$"},
 			{APIBodyReadProfile, "^" + APIBodyReadBenchmark + "$"},
 			{APIJSONQuoteCandidateProfile, "^" + APIJSONQuoteCandidateBenchmark + "$"},
+			{APIJSONListMetadataProfile, "^" + APIJSONListMetadataBenchmark + "$"},
 		}
 	case LuviaPackage:
 		return []IsolationSpec{
@@ -280,9 +301,11 @@ func IsolationProfiles(pkg string) []IsolationSpec {
 			{CodegenReceiverProfile, "^" + CodegenReceiverBenchmark + "$"},
 			{CodegenMigrationStateProfile, "^" + CodegenReceiverBenchmark + "$|^" + CodegenMigrationStateBenchmark + "$"},
 			{CodegenRelationLoaderProfile, "^" + CodegenRelationLoaderBenchmark + "$"},
+			{CodegenFindReadProfile, "^" + CodegenFindReadBenchmark + "$"},
+			{CodegenNumericRangeProfile, "^" + CodegenNumericRangeBenchmark + "$"},
 		}
 	case SemanticPackage:
-		return []IsolationSpec{{SemanticEventEmitsProfile, "^" + SemanticEventEmitsBenchmark + "$"}}
+		return []IsolationSpec{{SemanticEventEmitsProfile, "^" + SemanticEventEmitsBenchmark + "$"}, {SemanticEventSnapshotProfile, "^" + SemanticEventSnapshotBenchmark + "$"}}
 	default:
 		return nil
 	}

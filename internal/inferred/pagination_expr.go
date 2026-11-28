@@ -113,22 +113,6 @@ func (p *paginationAnalysis) opaqueBlock(body *ast.Block) pageValue {
 }
 
 func (p *paginationAnalysis) opaqueAwait(body *ast.Block) pageValue {
-	// A single await result can precede a trailing statement.
-	if body == nil || len(body.Stmts) < 2 {
-		return p.opaqueBlock(body)
-	}
-	result := false
-	for index, stmt := range body.Stmts {
-		if expression, ok := stmt.(*ast.ExprStmt); ok && expression.Expr != nil {
-			if result || index == len(body.Stmts)-1 {
-				return p.opaqueBlock(body)
-			}
-			result = true
-		}
-	}
-	if !result {
-		return p.opaqueBlock(body)
-	}
 	var value pageValue
 	p.visitAwaitResults(body, func(expr ast.Expr) {
 		value = p.awaitResult(p.expression(expr))
@@ -148,7 +132,7 @@ func (p *paginationAnalysis) visitAwaitResults(body *ast.Block, visit func(ast.E
 			if len(p.scopes) == outer {
 				p.scopes = append(p.scopes, nil)
 			}
-			p.statement(stmt, false)
+			p.statement(stmt, p.publicReturn)
 			continue
 		}
 		visit(expression.Expr)
@@ -237,7 +221,12 @@ func (p *paginationAnalysis) queryInputs(expression ast.Expr) {
 
 func (p *paginationAnalysis) mapping(collection ast.Expr, body *ast.Block, name string, expression ast.Expr) pageValue {
 	base := p.expression(collection)
-	p.conditionalBlock(body, map[string]pageValue{name: p.iterationItem(collection)}, true, false)
+	bindings := map[string]pageValue{name: p.iterationItem(collection)}
+	if _, forValue := expression.(*ast.ForStmt); forValue {
+		p.forValueBody(body, bindings)
+	} else {
+		p.conditionalBlock(body, bindings, true, false)
+	}
 	if len(base.queries) == 0 {
 		return pageValue{}
 	}
@@ -246,6 +235,37 @@ func (p *paginationAnalysis) mapping(collection ast.Expr, body *ast.Block, name 
 		p.consume(base, expression)
 	}
 	return base
+}
+
+func (p *paginationAnalysis) forValueBody(body *ast.Block, bindings map[string]pageValue) {
+	if body == nil {
+		return
+	}
+	p.depth++
+	p.scopes = append(p.scopes, bindings)
+	defer func() {
+		p.scopes = p.scopes[:len(p.scopes)-1]
+		p.depth--
+	}()
+	collect := true
+	ast.WalkYields(body, func(*ast.YieldExpr) { collect = false })
+	for index, statement := range body.Stmts {
+		if collect && index == len(body.Stmts)-1 {
+			switch value := statement.(type) {
+			case *ast.ExprStmt:
+				p.expression(value.Expr)
+				return
+			case *ast.ReturnStmt:
+				if value.Value != nil {
+					p.expression(value.Value)
+					return
+				}
+			}
+		}
+		if _, returned := p.statement(statement, p.publicReturn); returned {
+			return
+		}
+	}
 }
 
 func purePageResult(statement ast.Stmt) bool {

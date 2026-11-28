@@ -61,7 +61,7 @@ func (a *loadDemandAnalysis) expressionValue(expr ast.Expr) []loadOrigin {
 	case *ast.AsyncExpr:
 		a.consume(a.conditionalBlock(value.Body, nil, true, false))
 	case *ast.AwaitExpr:
-		return a.conditionalBlock(value.Body, nil, true, false)
+		return a.awaitValue(value)
 	case *ast.YieldExpr:
 		origins := a.expression(value.Value)
 		a.loopYields = append(a.loopYields, origins...)
@@ -70,6 +70,16 @@ func (a *loadDemandAnalysis) expressionValue(expr ast.Expr) []loadOrigin {
 		return a.loopValue(value)
 	}
 	return nil
+}
+
+func (a *loadDemandAnalysis) awaitValue(await *ast.AwaitExpr) []loadOrigin {
+	var inline [1]loadAwaitResult
+	results, returned := a.awaitResults(await.Body, inline[:0], a.valueReturns.public)
+	a.valueReturns.origins = append(a.valueReturns.origins, returned...)
+	if len(results) == 0 {
+		return nil
+	}
+	return results[len(results)-1].origins
 }
 
 func (a *loadDemandAnalysis) binary(value *ast.BinaryExpr) {

@@ -25,6 +25,7 @@ type Pool struct {
 	cancel         context.CancelFunc
 	closingMu      sync.Mutex
 	closingWaiters map[*poolConn]*sync.WaitGroup
+	streams        atomic.Int64
 }
 
 // NewPool creates a connection pool for the given address.

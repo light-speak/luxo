@@ -165,9 +165,17 @@ func (c *compiler) valueCompiler() *compiler {
 }
 
 // Branches share the resolved result ABI, including nullable scalar/object values.
-func (c *compiler) branchValueCompiler(expr ast.Expr) *compiler {
-	sub := c.valueCompiler()
-	sub.pageResult = c.pageBranch(expr)
+func (c *compiler) branchValueCompiler(expr *ast.WhenExpr) *compiler {
+	sub := c.expressionCompiler(expr)
+	sub.statementWhen = nil
+	page := c.pageBranch(expr)
+	if sub.inlineValue != nil {
+		sub.inlineWhen = true
+		sub.inlineValue.when = expr
+		sub.inlineValue.page = page
+		return sub
+	}
+	sub.pageResult = page
 	if expr.IsNullable() {
 		sub.valueResult = &ast.TypeRef{Name: expr.GetTypeTag(), IsList: expr.IsListType(), Nullable: true}
 	} else {
@@ -181,6 +189,9 @@ func (c *compiler) branchValueCompiler(expr ast.Expr) *compiler {
 // no panic/recover, reflection or transport serialization crosses this boundary.
 func (c *compiler) finishValueClosure(sub *compiler, goType, body string) string {
 	c.resultTmp = max(c.resultTmp, sub.resultTmp)
+	if sub.inlineValue != nil {
+		return c.writeInlineValueScope(sub, goType, body)
+	}
 	signature := goType
 	if sub.closureError != "" {
 		signature = "(_value " + goType + ")"
@@ -221,7 +232,7 @@ func (c *compiler) errorCompiler() *compiler {
 func (c *compiler) compileValueBranch(expr ast.Expr) {
 	switch value := expr.(type) {
 	case *ast.LambdaExpr:
-		c.compileBranchStatements(value.Body)
+		c.compileWhenBranchBlock(value.Body)
 		return
 	case *ast.UnaryExpr:
 		if value.Op == "throw" {
@@ -229,11 +240,47 @@ func (c *compiler) compileValueBranch(expr ast.Expr) {
 			return
 		}
 	}
-	if c.whenScope != nil {
+	if scope := c.statementWhen; scope != nil {
+		c.statementWhen = nil
 		c.compileExprStmt(&ast.ExprStmt{Expr: expr})
-	} else {
-		c.compileReturn(&ast.ReturnStmt{Value: expr})
+		c.statementWhen = scope
+		return
 	}
+	if c.inlineWhen {
+		c.writeInlineWhenValue(c.inlineValue, expr)
+		return
+	}
+	c.compileReturn(&ast.ReturnStmt{Value: expr})
+}
+
+func (c *compiler) compileWhenBranchBlock(body *ast.Block) {
+	if scope := c.statementWhen; scope != nil {
+		outer := c.whenScope
+		c.statementWhen, c.whenScope = nil, scope
+		c.compileBranchStatements(body)
+		c.statementWhen, c.whenScope = scope, outer
+		return
+	}
+	if !c.inlineWhen {
+		c.compileBranchStatements(body)
+		return
+	}
+	scope := c.inlineValue
+	outer := c.whenScope
+	c.whenScope = nil
+	scope.branch = true
+	c.compileBranchStatements(body)
+	scope.branch = false
+	c.whenScope = outer
+}
+
+func (c *compiler) compileValueResult(expr ast.Expr, expected *ast.TypeRef, page string, model bool) string {
+	value := c.compileAssignedValue(expr, expected)
+	value = c.pageBranchValue(page, expr, value)
+	if model {
+		value = c.modelReference(expr, value)
+	}
+	return value
 }
 
 func (c *compiler) compileBranchStatements(block *ast.Block) {
@@ -258,7 +305,7 @@ func (c *compiler) compileBranchStatements(block *ast.Block) {
 func (c *compiler) finishWhenClosure(sub *compiler, expr *ast.WhenExpr, fallback bool) string {
 	goType := c.inferWhenReturnType(expr)
 	if fallback {
-		sub.write("return %s", zeroValueForType(goType))
+		sub.writeValueCompletion("", zeroValueForType(goType))
 	}
 	return c.finishValueClosure(sub, goType, sub.b.String())
 }
@@ -471,10 +518,13 @@ func (c *compiler) compileYieldValueBlock(block *ast.Block, result string, expec
 }
 
 func (c *compiler) compileForValue(s *ast.ForStmt, yield bool) string {
-	sub := c.valueCompiler()
+	sub := c.expressionCompiler(s)
 	sub.indent += "\t"
 	sub.inForExpr = yield
 	sub.yieldAddr = yield && c.yieldNeedsAddress(s)
+	if sub.inlineValue != nil {
+		sub.inlineValue.yield = yield
+	}
 	goType := c.goTypeForExpr(s)
 	if goType == "" {
 		if yield {
@@ -488,9 +538,9 @@ func (c *compiler) compileForValue(s *ast.ForStmt, yield bool) string {
 	}
 	sub.withLoopScope(func() { sub.compileForValueLoop(s, yield) })
 	if yield {
-		sub.write("return nil")
+		sub.writeValueCompletion("", "nil")
 	} else {
-		sub.write("return _result")
+		sub.writeValueCompletion("", "_result")
 	}
 	return c.finishValueClosure(sub, goType, sub.b.String())
 }

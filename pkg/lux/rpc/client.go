@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/env"
 	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 )
 
@@ -100,6 +103,25 @@ func NewNamedClientWithOptions(name, addr string, options PoolOptions) (*Client,
 	return &Client{name: name, pool: pool}, nil
 }
 
+// LoadGatewayClients loads an optional dotenv file and configures one named
+// client and pool per target. Process values override dotenv values. Each
+// default address can be overridden by the uppercase target's _SERVICE_ADDR key.
+func LoadGatewayClients(envFile string, defaultAddresses map[string]string) (map[string]*Client, error) {
+	if err := env.Load(envFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("load %s: %w", envFile, err)
+	}
+	options, err := poolOptionsFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("RPC pool configuration: %w", err)
+	}
+	clients := make(map[string]*Client, len(defaultAddresses))
+	for name, fallback := range defaultAddresses {
+		address := env.GetOrDefault(strings.ToUpper(name)+"_SERVICE_ADDR", fallback)
+		clients[name] = &Client{name: name, pool: newPool(address, options)}
+	}
+	return clients, nil
+}
+
 // Call sends a binary-encoded request and returns the response body.
 // apiID: from luxo.lock. params: pre-encoded binary (fieldID+value pairs + 0x00).
 // Returns the response body (without status byte) and any error.
@@ -160,9 +182,11 @@ func (c *Client) SubscribeContext(ctx context.Context, bearerToken string, apiID
 	if size := callFrameSize(bearerToken, apiID, fieldMask, params); size > maxFrameSize || size < 0 {
 		return nil, errRequestFrameTooLarge
 	}
-	payload := prepareCallFrame(requestKindStream, bearerToken, apiID, fieldMask, params)
-	conn, err := c.pool.GetContext(ctx)
+	conn, err := c.pool.getStreamContext(ctx)
 	if err != nil {
+		if err == ErrPoolExhausted {
+			return nil, err
+		}
 		return nil, fmt.Errorf("rpc: dial %s: %w", c.pool.addr, err)
 	}
 	if deadline, ok := ctx.Deadline(); ok {
@@ -171,6 +195,7 @@ func (c *Client) SubscribeContext(ctx context.Context, bearerToken string, apiID
 			return nil, fmt.Errorf("rpc: stream deadline: %w", err)
 		}
 	}
+	payload := prepareCallFrame(requestKindStream, bearerToken, apiID, fieldMask, params)
 	streamCtx, cancel := context.WithCancel(ctx)
 	subscription := &Subscription{
 		messages: make(chan []byte, 64),

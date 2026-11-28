@@ -462,7 +462,11 @@ func TestLuviaAuthPrimaryAndConfirmationStayExclusive(t *testing.T) {
 func exactProfileMeasurements(benchmark string, leaves []string) string {
 	var output strings.Builder
 	for _, leaf := range leaves {
-		output.WriteString(benchmark + "/" + leaf + "-2 1 3 ns/op 0 B/op 0 allocs/op\n")
+		name := benchmark
+		if leaf != "" {
+			name += "/" + leaf
+		}
+		output.WriteString(name + "-2 1 3 ns/op 0 B/op 0 allocs/op\n")
 	}
 	return output.String()
 }
@@ -511,7 +515,11 @@ func TestResolvedFieldsPrimaryAndConfirmationStayExclusive(t *testing.T) {
 func verifyExactProfileRouting(t *testing.T, pkg, control, profile, root, target, targetFilter string) {
 	t.Helper()
 	primary := formatShard(benchShard{Groups: []benchGroup{{Package: pkg, Name: root}, {Package: pkg, Name: control}}})
-	keys := []sampleKey{{pkg, root + "/" + target + "-2"}, {pkg, control + "-2"}}
+	name := root
+	if target != "" {
+		name += "/" + target
+	}
+	keys := []sampleKey{{pkg, name + "-2"}, {pkg, control + "-2"}}
 	confirmation := formatConfirmationBatch(keys)
 	data, err := json.Marshal(expectedSamples{Base: keys, Head: keys})
 	if err != nil {
@@ -520,9 +528,13 @@ func verifyExactProfileRouting(t *testing.T, pkg, control, profile, root, target
 	dir := benchmarkTempDir(t)
 	expected, batch := dir+"/expected.json", dir+"/batch.tsv"
 	writeFixture(t, expected, string(data))
+	confirmationFilter := "^" + root + "$"
+	if targetFilter != "" {
+		confirmationFilter += "/" + targetFilter
+	}
 	for _, tc := range []struct{ phase, batch, selected, sibling string }{
 		{"primary", primary, "^(" + root + ")$", "^(" + control + ")$"},
-		{"confirmation", confirmation, "^" + root + "$/" + targetFilter, "^" + control + "$"},
+		{"confirmation", confirmation, confirmationFilter, "^" + control + "$"},
 	} {
 		t.Run(tc.phase, func(t *testing.T) {
 			if !strings.Contains(tc.batch, pkg+"\t"+profile+"\t"+tc.selected+"\n") ||
@@ -554,7 +566,7 @@ func TestCollectEventEmitsProfileKeepsExactlySixLeaves(t *testing.T) {
 		"BenchmarkCollectEventEmits", []string{"direct_0/recursive=false", "direct_0/recursive=true",
 			"direct_1/recursive=false", "direct_1/recursive=true", "direct_128/recursive=false", "direct_128/recursive=true"},
 		"direct_256/recursive=true")
-	verifyExactProfileRouting(t, "pkg/semantic", "BenchmarkEventSnapshotContract", "semantic-event-emits",
+	verifyExactProfileRouting(t, "pkg/semantic", "BenchmarkReachableEventEmits", "semantic-event-emits",
 		"BenchmarkCollectEventEmits", "direct_128/recursive=true", "^direct_128$/^recursive=true$")
 }
 
@@ -1028,4 +1040,81 @@ func TestTransportRejectionAndReplacementInventoriesAndRouting(t *testing.T) {
 		benchmarkCaseProduct([]string{"1", "8", "128"}, []string{"conditional", "scan"}), "16/scan")
 	verifyExactProfileRouting(t, rpc, "BenchmarkRPC_Ping", rpcProfile, rpcRoot, "full/after", "^full$/^after$")
 	verifyExactProfileRouting(t, h2, "BenchmarkRequestHead", h2Profile, h2Root, "128/conditional", "^128$/^conditional$")
+}
+
+func TestSealedCompilerProfilesKeepAllLeavesAndRouteConfirmation(t *testing.T) {
+	for _, tc := range []struct {
+		pkg, control, profile, root, target, filter string
+		leaves                                      []string
+	}{
+		{"pkg/codegen", "BenchmarkRelationResolverEmission", "codegen-find-read", "BenchmarkFindRead", "", "", []string{""}},
+		{"pkg/codegen", "BenchmarkRelationResolverEmission", "codegen-numeric-range", "BenchmarkNumericRangeValidation", "none", "^none$", []string{"none", "positive", "signed_int", "signed_float"}},
+		{"pkg/semantic", "BenchmarkReachableEventEmits", "semantic-event-snapshot", "BenchmarkEventSnapshotContract", "nested_types_0", "^nested_types_0$", []string{"nested_types_0", "nested_types_1", "nested_types_16", "nested_types_128"}},
+	} {
+		t.Run(tc.profile, func(t *testing.T) {
+			verifyExactProfileInventory(t, tc.pkg, tc.control, tc.profile, tc.root, tc.leaves, "unknown")
+			verifyExactProfileRouting(t, tc.pkg, tc.control, tc.profile, tc.root, tc.target, tc.filter)
+		})
+	}
+}
+
+func TestAPIJSONListMetadataCompleteInventory(t *testing.T) {
+	groups := benchmarkCaseProduct([]string{"filters", "escaped", "sorters"}, []string{"0", "1", "16", "100"})
+	leaves := benchmarkCaseProduct(append(groups, "chinese72KB/1"), []string{"metadata", "request"})
+	verifyExactProfileInventory(t, "pkg/lux/api", "BenchmarkStreamAPIClassification", "api-json-list-metadata",
+		"BenchmarkJSONListMetadata", leaves, "filters/2/metadata")
+}
+
+func TestAPIJSONListMetadataKeepsBroadInventoryAndRoutesExclusively(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	const profile = "api-json-list-metadata"
+	const list = "BenchmarkJSONListMetadata"
+	const stream = "BenchmarkStreamAPIClassification"
+	const ws = "BenchmarkWSJSONSubscriptionMetadata"
+	const measurement = "-2 1 3 ns/op 0 B/op 0 allocs/op\n"
+	broad := list + "/filters/0/metadata" + measurement + stream + measurement + ws + measurement
+	dir := benchmarkTempDir(t)
+	ordinary, isolated := dir+"/ordinary.log", dir+"/isolated.log"
+	writeFixture(t, ordinary, broad+"PASS\n")
+	args := []string{"--verify-profile-inventory", pkg, "api-non-identity", ordinary, isolated}
+	for _, tc := range []struct {
+		missing string
+		valid   bool
+	}{{"", true}, {list + "/filters/0/metadata" + measurement, false}, {stream + measurement, false}, {ws + measurement, false}} {
+		binary := broad
+		if tc.missing != "" {
+			binary = strings.Replace(broad, tc.missing, "", 1)
+		}
+		writeFixture(t, isolated, binary+"PASS\n")
+		if err := run(args, io.Discard); (err == nil) != tc.valid {
+			t.Fatalf("broad binary missing %q valid=%v: %v", tc.missing, tc.valid, err)
+		}
+	}
+	keys := []sampleKey{{pkg, list + "/filters/0/metadata-2"}, {pkg, stream + "-2"}, {pkg, ws + "-2"}}
+	groups := []benchGroup{{Package: pkg, Name: list}, {Package: pkg, Name: stream}, {Package: pkg, Name: ws}}
+	payload, err := json.Marshal(expectedSamples{Base: keys, Head: keys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, batch := dir+"/expected.json", dir+"/batch.tsv"
+	writeFixture(t, expected, string(payload))
+	for _, tc := range []struct{ phase, batch string }{
+		{"primary", formatShard(benchShard{Groups: groups})},
+		{"confirmation", formatConfirmationBatch(keys)},
+	} {
+		t.Run(tc.phase, func(t *testing.T) {
+			if strings.Count(tc.batch, "\t"+profile+"\t") != 1 || strings.Count(tc.batch, "\tapi-non-identity\t") != 1 {
+				t.Fatalf("incorrect route:\n%s", tc.batch)
+			}
+			args := []string{"--verify-profile-batch", tc.phase, expected, batch}
+			writeFixture(t, batch, tc.batch)
+			if err := run(args, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			writeFixture(t, batch, strings.Replace(tc.batch, "\t"+profile+"\t", "\tapi-non-identity\t", 1))
+			if err := run(args, io.Discard); err == nil {
+				t.Fatal("accepted JSONList metadata measurements in the broad profile")
+			}
+		})
+	}
 }

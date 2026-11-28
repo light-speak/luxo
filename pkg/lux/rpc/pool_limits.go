@@ -3,7 +3,10 @@ package rpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -11,7 +14,7 @@ import (
 )
 
 var (
-	// ErrPoolExhausted rejects work beyond the bounded waiting budget.
+	// ErrPoolExhausted rejects work beyond the waiting or streaming budget.
 	ErrPoolExhausted error = luxerrors.New("LRPCPoolBusy", 503, "error.lrpc_pool_busy")
 	// ErrPoolWaitTimeout reports expiration before a connection slot is acquired.
 	ErrPoolWaitTimeout error = luxerrors.New("LRPCPoolWaitTimeout", 503, "error.lrpc_pool_wait_timeout")
@@ -19,32 +22,99 @@ var (
 
 // PoolOptions applies per destination and client, not globally across replicas.
 // MaxOpen includes idle, borrowed, dialing, and handshaking connections.
-// Streams occupy a borrowed connection until termination. Zero MaxWaiters
-// rejects saturation immediately; zero MaxIdle disables idle retention.
+// Streams can use at most MaxOpen minus UnaryReserve connections and never
+// enter the wait queue. Unary calls can use any available connection.
+// Zero UnaryReserve reserves one quarter of MaxOpen, rounded up. A reserve
+// equal to MaxOpen disables streams. Zero MaxWaiters rejects unary saturation
+// immediately; zero MaxIdle disables idle retention.
 type PoolOptions struct {
-	MaxIdle     int
-	MaxOpen     int
-	MaxWaiters  int
-	WaitTimeout time.Duration
-	DialTimeout time.Duration
+	MaxIdle      int
+	MaxOpen      int
+	MaxWaiters   int
+	WaitTimeout  time.Duration
+	DialTimeout  time.Duration
+	UnaryReserve int
 }
 
 func DefaultPoolOptions() PoolOptions {
 	return PoolOptions{MaxIdle: 32, MaxOpen: 32, MaxWaiters: 32, WaitTimeout: 5 * time.Second, DialTimeout: 5 * time.Second}
 }
 
+func poolOptionsFromEnv() (PoolOptions, error) {
+	options := DefaultPoolOptions()
+	var err error
+	if options.MaxOpen, err = readPoolLimit("LRPC_MAX_OPEN", options.MaxOpen); err != nil {
+		return PoolOptions{}, err
+	}
+	if options.UnaryReserve, err = readPoolLimit("LRPC_UNARY_RESERVE", options.UnaryReserve); err != nil {
+		return PoolOptions{}, err
+	}
+	if options.MaxOpen == 0 {
+		return PoolOptions{}, errors.New("lrpc: LRPC_MAX_OPEN must be positive")
+	}
+	if options.UnaryReserve > options.MaxOpen {
+		return PoolOptions{}, errors.New("lrpc: LRPC_UNARY_RESERVE must be at most LRPC_MAX_OPEN")
+	}
+	options.MaxIdle = min(options.MaxIdle, options.MaxOpen)
+	return options, nil
+}
+
+func readPoolLimit(key string, fallback int) (int, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("lrpc: %s must be a non-negative integer", key)
+	}
+	return value, nil
+}
+
 func NewPoolWithOptions(addr string, options PoolOptions) (*Pool, error) {
-	if options.MaxOpen <= 0 || options.MaxIdle < 0 || options.MaxIdle > options.MaxOpen || options.MaxWaiters < 0 || options.WaitTimeout < 0 || (options.MaxWaiters > 0 && options.WaitTimeout == 0) || options.DialTimeout <= 0 {
+	if options.MaxOpen <= 0 || options.MaxIdle < 0 || options.MaxIdle > options.MaxOpen ||
+		options.MaxWaiters < 0 || options.WaitTimeout < 0 || (options.MaxWaiters > 0 && options.WaitTimeout == 0) ||
+		options.DialTimeout <= 0 || options.UnaryReserve < 0 || options.UnaryReserve > options.MaxOpen {
 		return nil, errors.New("lrpc: invalid connection pool limits")
 	}
 	return newPool(addr, options), nil
 }
 
 func newPool(addr string, options PoolOptions) *Pool {
+	if options.UnaryReserve == 0 {
+		options.UnaryReserve = 1 + (options.MaxOpen-1)/4
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Pool{addr: addr,
 		conns: make(chan net.Conn, options.MaxIdle), options: options,
 		wake: make(chan struct{}, 1), lifetime: ctx, cancel: cancel}
+}
+
+// Hold the streaming budget through connection setup and physical close.
+// Stream attempts bypass the ordinary wait queue, including when unary calls
+// currently occupy all physical connections.
+func (p *Pool) getStreamContext(ctx context.Context) (net.Conn, error) {
+	if p.closed.Load() {
+		return nil, errPoolClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !reserve(&p.streams, p.options.MaxOpen-p.options.UnaryReserve) {
+		return nil, ErrPoolExhausted
+	}
+	conn, err, ready := p.tryAcquire(ctx)
+	if !ready {
+		err = ErrPoolExhausted
+	} else if conn == nil && err == nil {
+		conn, err = p.dialReserved(ctx)
+	}
+	if err != nil {
+		p.streams.Add(-1)
+		return nil, err
+	}
+	conn.(*poolConn).state.Or(connStream)
+	return conn, nil
 }
 
 func reserve(counter *atomic.Int64, limit int) bool {
