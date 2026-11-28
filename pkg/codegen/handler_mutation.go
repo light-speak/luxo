@@ -96,7 +96,8 @@ func generateMutationInputApply(b *strings.Builder, input mutationInputField, se
 		if len(modelNames) == 0 {
 			panic(&InternalCompilerError{Detail: "missing save model name"})
 		}
-		fmt.Fprintf(b, "%s_prepared, err := %s(%s)\n%sif err != nil { return err }\n%s%s = _prepared\n", indent, saveBodyName(modelNames[0], field), name, indent, indent, name)
+		fmt.Fprintf(b, "%[1]sif _prepared, err := %[2]s(%[3]s); err != nil {\n%[1]s\treturn err\n%[1]s} else {\n%[1]s\t%[3]s = _prepared\n%[1]s}\n",
+			indent, saveBodyName(modelNames[0], field), name)
 	} else {
 		generateBeforeSave(b, field, name, indent)
 	}
