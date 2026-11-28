@@ -877,6 +877,9 @@ func TestGenerateGatewayEntry(t *testing.T) {
 	if strings.Contains(src, `"errors"`) || strings.Contains(src, `"github.com/light-speak/luxo/pkg/lux/env"`) {
 		t.Error("a gateway without streams must not import dotenv helpers")
 	}
+	if strings.Contains(src, "_ = context.Background") {
+		t.Error("the gateway already uses context in the forwarding helpers")
+	}
 
 	checks := []string{
 		"package main",

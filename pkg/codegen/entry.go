@@ -900,8 +900,6 @@ func emitGatewayEntry(result *semantic.Result, allModules []moduleInfo, modulePa
 	}
 	b.WriteString("\n")
 
-	b.WriteString("\t_ = context.Background\n\n")
-
 	b.WriteString("\tif err := gw.Serve(Version); err != nil {\n")
 	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: %v\\n\", err)\n")
 	b.WriteString("\t\tos.Exit(1)\n")
