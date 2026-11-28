@@ -51,6 +51,7 @@ import (
   "net/http/httptest"
   "sync/atomic"
   "testing"
+  "testing/synctest"
   "time"
 
   "github.com/light-speak/luxo/pkg/lux/api"
@@ -196,15 +197,47 @@ func verifyIdentityPartitions(t *testing.T, endpoint *identityEndpoint, a, b, me
   }
 }
 
-func waitIdentityExpiry(t *testing.T, expiry int64) {
-  t.Helper()
-  timer := time.NewTimer(time.Until(time.Unix(expiry, 0)))
+func waitIdentityExpiry(ctx context.Context, expiry time.Time, now func() time.Time) error {
+  timer := time.NewTimer(expiry.Sub(now()))
   defer timer.Stop()
-  select {
-  case <-timer.C:
-  case <-t.Context().Done(): t.Fatal(t.Context().Err())
+  for {
+    select {
+    case <-timer.C:
+      remaining := expiry.Sub(now())
+      if remaining <= 0 { return nil }
+      timer.Reset(remaining)
+    case <-ctx.Done(): return ctx.Err()
+    }
   }
-  if time.Now().Unix() < expiry { t.Fatal("expiry wait did not reach the signed deadline") }
+}
+
+func TestIdentityExpiryRechecksTheWallClock(t *testing.T) {
+  synctest.Test(t, func(t *testing.T) {
+    start := time.Now()
+    wallStart := time.Unix(1_800_000_000, 0)
+    now := func() time.Time {
+      elapsed := time.Since(start)
+      if elapsed >= time.Second { elapsed -= 300*time.Millisecond }
+      return wallStart.Add(elapsed)
+    }
+    if err := waitIdentityExpiry(t.Context(), wallStart.Add(2*time.Second), now); err != nil {
+      t.Fatal(err)
+    }
+    if elapsed := time.Since(start); elapsed != 2300*time.Millisecond {
+      t.Fatalf("expiry wait returned after %s", elapsed)
+    }
+  })
+}
+
+func TestIdentityExpiryWaitHonorsCancellation(t *testing.T) {
+  synctest.Test(t, func(t *testing.T) {
+    wall := time.Unix(1_800_000_000, 0)
+    ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+    defer cancel()
+    if err := waitIdentityExpiry(ctx, wall.Add(2*time.Second), func() time.Time { return wall }); err != context.DeadlineExceeded {
+      t.Fatalf("expiry wait returned %v", err)
+    }
+  })
 }
 
 func TestVerifiedCacheIdentityLifecycle(t *testing.T) {
@@ -221,7 +254,9 @@ func TestVerifiedCacheIdentityLifecycle(t *testing.T) {
   _, expiry, err := auth.VerifyCachedWithExpiry(cfg,a)
   if err != nil { t.Fatal(err) }
   for _, endpoint := range endpoints { verifyIdentityPartitions(t,endpoint,a,b,member,refresh) }
-  waitIdentityExpiry(t,expiry)
+  expiryCtx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+  defer cancel()
+  if err := waitIdentityExpiry(expiryCtx, time.Unix(expiry, 0), time.Now); err != nil { t.Fatal(err) }
   claims, err := auth.VerifyRefresh(cfg,refresh)
   if err != nil { t.Fatal(err) }
   renewed, err := auth.Sign(cfg,claims.AppendJSON)
