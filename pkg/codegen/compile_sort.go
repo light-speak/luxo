@@ -14,7 +14,7 @@ func (c *compiler) compileSortBy(call *ast.CallExpr) (string, bool) {
 	}
 	prefix := c.collectionPrefix(lambda)
 	items, entries, entry := prefix+"Items", prefix+"Entries", prefix+"Entry"
-	sub := c.valueCompiler()
+	sub := c.expressionCompiler(member.Object)
 	sub.indent += "\t"
 	sub.compileVal(&ast.ValStmt{Name: items, Value: member.Object})
 	goType := c.goTypeForExpr(call)
@@ -40,7 +40,7 @@ func (c *compiler) compileSortBy(call *ast.CallExpr) (string, bool) {
 	sub.write("})")
 	sub.write("%sResult := make(%s, len(%s))", prefix, goType, entries)
 	sub.write("for i := range %s { %sResult[i] = %s[i].value }", entries, prefix, entries)
-	sub.write("return %sResult", prefix)
+	sub.writeValueCompletion("", prefix+"Result")
 	return c.finishValueClosure(sub, goType, sub.b.String()), true
 }
 

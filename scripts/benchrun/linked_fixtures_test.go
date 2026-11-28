@@ -28,7 +28,8 @@ func TestIsolationProfileCommand(t *testing.T) {
 			"api-websocket-registrations\t^BenchmarkWSConnectionRegistrations$\n" +
 			"api-response-origin-run\t^BenchmarkResponseOriginRun$\n" +
 			"api-body-read\t^BenchmarkBodyRead$\n" +
-			"api-json-quote-candidate\t^BenchmarkJSONQuoteCandidate$\n"},
+			"api-json-quote-candidate\t^BenchmarkJSONQuoteCandidate$\n" +
+			"api-json-list-metadata\t^BenchmarkJSONListMetadata$\n"},
 		{"pkg/lux/luvia", "luvia-primary-trace\t^BenchmarkPrimaryKeys$|^BenchmarkTraceEncodingComparison$\n" +
 			"luvia-gateway-identity\t^BenchmarkGatewayIdentity$\n" +
 			"luvia-auth-middleware\t^BenchmarkAuthMiddlewareIsolation$\n" +
@@ -1205,6 +1206,79 @@ func TestPairedVariableProjectionPreservesDeclarationAndSourcePositions(t *testi
 	for _, removed := range []string{"unrelated", "initialized", "left", "a string", "b string"} {
 		if bytes.Contains(projected, []byte(removed)) {
 			t.Fatalf("unselected or initialized declaration survived: %s", removed)
+		}
+	}
+}
+
+func TestAPIJSONListMetadataOverlayMatchesNativeWitness(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	const profile = "api-json-list-metadata"
+	const fixture = "request_list_bench_test.go"
+	const sourceSHA = "7de8d4387a94119bc2c6d71287c3e344d2423453a566b750d809fab0afd1a4c5"
+	const outputSHA = "a8fd9a37ceaaf2c5d61f3147fd27acc397d412247bc97e7bae3beea3274f3730"
+	if !strings.Contains(performanceProfile, "\n"+profile+"-overlay-v1 "+fixture+"="+outputSHA+" "+sourceSHA) {
+		t.Fatal("missing native fixture profile binding")
+	}
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, baseline := range []bool{true, false} {
+		candidate, cleanup, err := compileOverlay(root, pkg, baseline, profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := cleanup(); err != nil {
+				t.Error(err)
+			}
+		})
+		data, err := os.ReadFile(candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var overlay struct{ Replace map[string]string }
+		if err := json.Unmarshal(data, &overlay); err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(root, pkg)
+		key := filepath.Join(dir, fixture)
+		projected, err := os.ReadFile(overlay.Replace[key])
+		if err != nil || fmt.Sprintf("%x", sha256.Sum256(projected)) != outputSHA {
+			t.Fatalf("overlay does not reproduce the native witness: %v", err)
+		}
+		delete(overlay.Replace, key)
+		verifyOnlyListedTestFiles(t, overlay.Replace, dir, fixture)
+		if bytes.Contains(projected, []byte("BenchmarkWSJSONSubscriptionMetadata")) ||
+			bytes.Contains(projected, []byte("BenchmarkStreamAPIClassification")) {
+			t.Fatal("overlay linked a different benchmark root")
+		}
+	}
+}
+
+func TestAPIJSONListMetadataOverlayRejectsMissingAndChangedFixture(t *testing.T) {
+	const pkg = "pkg/lux/api"
+	const fixture = "request_list_bench_test.go"
+	root := newBenchmarkRunTree(t)
+	writeBenchmarkRunFixture(t, root, pkg+"/other_test.go", "package api\n")
+	for _, tc := range []struct {
+		prepare func()
+		want    string
+	}{
+		{func() {}, "missing api-json-list-metadata fixture"},
+		{func() {
+			source, err := os.ReadFile(filepath.Join("../..", pkg, fixture))
+			if err != nil {
+				t.Fatal(err)
+			}
+			altered := bytes.Replace(source, []byte("BenchmarkJSONListMetadata"), []byte("BenchmarkJSONListMetadatX"), 1)
+			writeBenchmarkRunFixture(t, root, pkg+"/"+fixture, string(altered))
+		}, "does not match the verified source"},
+	} {
+		tc.prepare()
+		path, cleanup, err := compileOverlay(root, pkg, false, "api-json-list-metadata")
+		if path != "" || cleanup != nil || err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("expected %q and no partial overlay, got %s: %v", tc.want, path, err)
 		}
 	}
 }

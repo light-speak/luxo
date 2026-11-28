@@ -31,8 +31,11 @@ func (c *compiler) compileDefaultExpr(expr *ast.ElvisExpr) string {
 	if throws {
 		return c.compileThrowDefault(expr, thrown.Value, booleanGuard)
 	}
-	sub := c.valueCompiler()
-	sub.pageResult = c.pageBranch(expr)
+	sub := c.expressionCompiler(expr)
+	page := c.pageBranch(expr)
+	if sub.inlineValue == nil {
+		sub.pageResult = page
+	}
 	sub.indent = c.indent + "\t"
 	left := sub.compileMaterializedValue(expr.Left, result)
 	sub.resultTmp++
@@ -40,17 +43,17 @@ func (c *compiler) compileDefaultExpr(expr *ast.ElvisExpr) string {
 	sub.write("%s := %s", name, left)
 	sub.write("if %s != nil {", name)
 	if !expr.IsNullable() && !expr.Left.IsListType() && c.models[expr.Left.GetTypeTag()] == nil {
-		sub.write("\treturn *%s", name)
+		sub.writeValueCompletion("\t", "*"+name)
 	} else {
 		sub.indent += "\t"
-		value := sub.pageBranchValue(sub.pageResult, expr.Left, name)
-		sub.write("return %s", value)
+		value := sub.pageBranchValue(page, expr.Left, name)
+		sub.writeValueCompletion("", value)
 		sub.indent = c.indent + "\t"
 	}
 	sub.write("}")
 	right := sub.compileMaterializedValue(expr.Right, result)
-	right = sub.pageBranchValue(sub.pageResult, expr.Right, right)
-	sub.write("return %s", right)
+	right = sub.pageBranchValue(page, expr.Right, right)
+	sub.writeValueCompletion("", right)
 	return c.finishValueClosure(sub, compiledFunctionGoType(result, c.models), sub.b.String())
 }
 
@@ -283,14 +286,18 @@ func (c *compiler) compileSafeAccess(member *ast.MemberExpr, call *ast.CallExpr)
 }
 
 func (c *compiler) compileSafeAccessValue(member *ast.MemberExpr, call *ast.CallExpr, unwrap *ast.UnaryExpr) string {
-	sub := c.valueCompiler()
+	var source ast.Expr = member
+	if call != nil {
+		source = call
+	}
+	sub := c.expressionCompiler(source)
 	sub.indent = c.indent + "\t"
 	sub.resultTmp++
 	name := "_safeReceiver" + strconv.Itoa(sub.resultTmp)
 	receiver := &ast.TypeRef{Name: member.Object.GetTypeTag(), IsList: member.Object.IsListType(), Nullable: member.Object.IsNullable()}
 	sub.compileNullableResult(name, member.Object, receiver)
 	if receiver.Nullable {
-		sub.write("if %s == nil { return nil }", name)
+		sub.writeConditionalValue(name+" == nil", "nil")
 	}
 	sub.vars[name] = valType{name: receiver.Name, isList: receiver.IsList, nullable: receiver.Nullable, isModel: c.models[receiver.Name] != nil}
 	access := *member
@@ -319,7 +326,7 @@ func (c *compiler) compileSafeAccessValue(member *ast.MemberExpr, call *ast.Call
 	}
 	result := &ast.TypeRef{Name: expression.GetTypeTag(), IsList: expression.IsListType(), Nullable: true}
 	value := sub.compileAssignedValue(expression, result)
-	sub.write("return %s", value)
+	sub.writeValueCompletion("", value)
 	return c.finishValueClosure(sub, compiledFunctionGoType(result, c.models), sub.b.String())
 }
 

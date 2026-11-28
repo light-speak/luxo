@@ -29,6 +29,10 @@ const (
 	semanticEventEmitsFilename         = "analyzer_bench_test.go"
 	semanticEventEmitsSourceSHA        = "ee8320cdca18a8700a37b504b8ee2f3ff05624c8e25a6ef35fe9ea8d4bad2a51"
 	semanticEventEmitsProjectionSHA    = "94ef2558fb21f50051ac83b9fe1ca7baa7ec52456bfb16735879344b71d5d4ca"
+
+	apiJSONListMetadataFilename      = "request_list_bench_test.go"
+	apiJSONListMetadataSourceSHA     = "7de8d4387a94119bc2c6d71287c3e344d2423453a566b750d809fab0afd1a4c5"
+	apiJSONListMetadataProjectionSHA = "a8fd9a37ceaaf2c5d61f3147fd27acc397d412247bc97e7bae3beea3274f3730"
 )
 
 type pairedBenchmarkFixture struct {
@@ -59,6 +63,36 @@ var semanticEventEmitsFixture = pairedBenchmarkFixture{
 	name: semanticEventEmitsFilename, sourceSHA: semanticEventEmitsSourceSHA, projectionSHA: semanticEventEmitsProjectionSHA,
 	imports:   []string{`"fmt"`, `"testing"`, `"github.com/light-speak/luxo/pkg/ast"`},
 	functions: []string{benchlayout.SemanticEventEmitsBenchmark},
+}
+
+var apiJSONListMetadataFixture = pairedBenchmarkFixture{
+	name: apiJSONListMetadataFilename, sourceSHA: apiJSONListMetadataSourceSHA, projectionSHA: apiJSONListMetadataProjectionSHA,
+}
+
+func writeAPIJSONListMetadataOverlay(pkg, workspace string) (string, error) {
+	project := func(path, workspace string) (string, error) {
+		return apiJSONListMetadataFixture.writeProjection(path, workspace, projectAPIJSONListMetadata)
+	}
+	return writeProjectedBenchmarkOverlay(pkg, workspace, benchlayout.APIJSONListMetadataProfile, project, apiJSONListMetadataFilename)
+}
+
+func projectAPIJSONListMetadata(_ string, source []byte, _ pairedBenchmarkFixture) ([]byte, error) {
+	// Retain the exact measured imports, declaration bytes, and source positions.
+	projected, line := bytes.Clone(source), 1
+	for i, ch := range projected {
+		if ch == '\n' {
+			line++
+			continue
+		}
+		switch line {
+		case 1, 3, 5, 6, 7, 9, 10, 11, 14:
+		default:
+			if line < 110 {
+				projected[i] = ' '
+			}
+		}
+	}
+	return projected, nil
 }
 
 func pairedBenchmarkOverlay(root, pkg, profile string, fixture pairedBenchmarkFixture) (string, func() error, error) {

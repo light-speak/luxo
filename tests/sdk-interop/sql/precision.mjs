@@ -23,6 +23,14 @@ function verifyNullable(row) {
  const expected = nullableCases[Number(row.id % 10n) - 1]
  assert.equal(row.number, expected.number)
  assert.deepEqual(row.items, expected.items)
+ const copied = { ...row }
+ for (const field of ['id', 'number', 'items']) {
+  assert.equal(Object.hasOwn(row, field), true, `selected ${field} lost its own property`)
+  assert.equal(Object.hasOwn(copied, field), true, `spread omitted selected ${field}`)
+ }
+ const applied = { number: 1n, items: [1n], ...row }
+ assert.equal(applied.number, expected.number)
+ assert.deepEqual(applied.items, expected.items)
 }
 async function verifyNullableStorage() {
  for (const [modeIndex, mode] of ['json', 'binary'].entries()) {
