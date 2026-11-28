@@ -11,7 +11,7 @@ import (
 )
 
 // Keep scaffold and build-image requirements in sync with the core module.
-const generatedGoVersion = "1.27.1"
+const generatedGoVersion = "1.27.4"
 const generatedLuxoVersion = "1.0.0-beta.1"
 
 // ScaffoldResult holds scaffold files to be written to disk.

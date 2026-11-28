@@ -64,8 +64,8 @@ func prepareRunEntryProject(t *testing.T, kind string) {
 		source = "package main\nfunc main() { missingRunEntrySymbol() }\n"
 	}
 	for path, data := range map[string]string{
-		"go.mod":                "module example.com/cli-run-probe\n\ngo 1.27.1\n",
-		"go.work":               "go 1.27.1\n\nuse .\n",
+		"go.mod":                "module example.com/cli-run-probe\n\ngo 1.27.4\n",
+		"go.work":               "go 1.27.4\n\nuse .\n",
 		"lucis/app/main.gen.go": source,
 	} {
 		if err := os.WriteFile(path, []byte(data), 0600); err != nil {

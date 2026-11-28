@@ -16,9 +16,9 @@ func TestRevisionWorkspace(t *testing.T) {
 	dir := consumerFixture(t, root, "", "")
 	files := map[string]string{
 		"VERSION":            "1.0.0-beta.1\n",
-		"go.mod":             "module github.com/light-speak/luxo\ngo 1.27.1\n",
+		"go.mod":             "module github.com/light-speak/luxo\ngo 1.27.4\n",
 		"pkg/model/model.go": "package model\nconst Value = 1\n",
-		"pkg/lux/pg/go.mod":  "module github.com/light-speak/luxo/pkg/lux/pg\ngo 1.27.1\nrequire github.com/light-speak/luxo v1.0.0-beta.1\n",
+		"pkg/lux/pg/go.mod":  "module github.com/light-speak/luxo/pkg/lux/pg\ngo 1.27.4\nrequire github.com/light-speak/luxo v1.0.0-beta.1\n",
 		"pkg/lux/pg/pg.go":   "package pg\nimport \"github.com/light-speak/luxo/pkg/model\"\nconst Value = model.Value\n",
 	}
 	for name, content := range files {

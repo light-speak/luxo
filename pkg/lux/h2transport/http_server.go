@@ -1,13 +1,13 @@
 package h2transport
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
 	"io"
 	"net"
 	"net/http"
-	"strings"
 )
 
 // ConfigureHTTPServer installs HTTP/2 dispatch before the HTTP server starts.
@@ -62,8 +62,7 @@ func (s *Server) servePriorKnowledge(w http.ResponseWriter, r *http.Request) {
 	}
 	// net/http consumed only the request-shaped prefix. Replay it, then retain
 	// every buffered byte (including the rest of the preface and initial frames).
-	reader := io.MultiReader(strings.NewReader("PRI * HTTP/2.0\r\n\r\n"), buffered.Reader)
-	_ = s.ServeConn(r.Context(), &prefacedConn{Conn: conn, reader: reader})
+	_ = s.ServeConn(r.Context(), newPrefacedConn(conn, buffered.Reader))
 }
 
 func rejectUnnegotiatedTLS(w http.ResponseWriter) {
@@ -71,9 +70,31 @@ func rejectUnnegotiatedTLS(w http.ResponseWriter) {
 	http.Error(w, "HTTP/2 over TLS requires h2 ALPN negotiation", http.StatusBadRequest)
 }
 
+const consumedPriorKnowledgePrefix = "PRI * HTTP/2.0\r\n\r\n"
+
 type prefacedConn struct {
 	net.Conn
-	reader io.Reader
+	reader *bufio.Reader
+	offset int
 }
 
-func (c *prefacedConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+func newPrefacedConn(conn net.Conn, reader *bufio.Reader) *prefacedConn {
+	return &prefacedConn{Conn: conn, reader: reader}
+}
+
+func (c *prefacedConn) Read(p []byte) (int, error) {
+	if c.offset < len(consumedPriorKnowledgePrefix) {
+		n := copy(p, consumedPriorKnowledgePrefix[c.offset:])
+		c.offset += n
+		return n, nil
+	}
+	if c.reader == nil {
+		return 0, io.EOF
+	}
+	n, err := c.reader.Read(p)
+	// EOF is terminal for this handoff, including when it arrives with bytes.
+	if err == io.EOF {
+		c.reader = nil
+	}
+	return n, err
+}

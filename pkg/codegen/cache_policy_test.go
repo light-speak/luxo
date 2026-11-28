@@ -600,7 +600,7 @@ func writeAdapterFixtureModule(t *testing.T, dir string, adapters ...string) {
 	}
 	module := fmt.Sprintf(`module example.com/luxo-cache-fixture
 
-go 1.27.1
+go 1.27.4
 
 require github.com/light-speak/luxo v1.0.0-beta.1
 replace github.com/light-speak/luxo => %s

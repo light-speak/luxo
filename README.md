@@ -13,7 +13,7 @@
   <a href="https://github.com/light-speak/luxo/actions/workflows/test.yml"><img src="https://github.com/light-speak/luxo/actions/workflows/test.yml/badge.svg" alt="Tests" /></a>
   <a href="https://codecov.io/gh/light-speak/luxo"><img src="https://codecov.io/gh/light-speak/luxo/branch/main/graph/badge.svg" alt="codecov" /></a>
   <a href="https://goreportcard.com/report/github.com/light-speak/luxo"><img src="https://goreportcard.com/badge/github.com/light-speak/luxo?v=2" alt="Go Report Card" /></a>
-  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.27.1+-00ADD8?style=flat&logo=go" alt="Go Version" /></a>
+  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.27.4+-00ADD8?style=flat&logo=go" alt="Go Version" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License" /></a>
 </p>
 
@@ -552,7 +552,7 @@ Valid wire bytes, negative zero and finite subnormals are preserved. Checks appl
 
 The development mainline actively adopts the latest stable toolchains and useful stable language features. It does not maintain old compiler support merely for its own sake. Experimental flags, nightly compilers, and preview APIs are not requirements of released SDKs. Toolchain upgrades do not change wire versions, field IDs, integer precision, or selection semantics.
 
-The current migration targets are Go 1.27.1+, TypeScript 7, Dart 3.13+, and Kotlin 2.4.20; Swift tracks its latest stable compiler line in separately verified SDK changes. Compiler versions and device/runtime deployment targets are separate decisions: a newer Kotlin or Swift compiler does not by itself justify dropping older Android or iOS devices.
+The current migration targets are Go 1.27.4+, TypeScript 7, Dart 3.13+, and Kotlin 2.4.20; Swift tracks its latest stable compiler line in separately verified SDK changes. Compiler versions and device/runtime deployment targets are separate decisions: a newer Kotlin or Swift compiler does not by itself justify dropping older Android or iOS devices.
 
 The exact Node version for JavaScript development and SDK interoperability is defined in [`.node-version`](.node-version), shared by TS and Dart Web CI instead of a floating major. Before installing dependencies, `sh scripts/check-node.sh` verifies the actual runtime; Studio's linked build uses the same core script. Old or preview versions, invalid pins, and failed tool invocations stop validation without downloading or installing tools. TS CI also pins pnpm and reports the actual Node, pnpm and TypeScript compiler versions. Node declarations in all three TS packages are build/test-only, with resolved versions pinned by lockfiles; they do not enter browser runtime code. Client/React retain ES2022 output, and the Vite plugin declares its minimum Node requirement separately. Updating development tools does not certify browser or minimum plugin-runtime compatibility.
 

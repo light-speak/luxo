@@ -578,7 +578,7 @@ func TestInitProjectCreatesBuildableModuleWithoutChangingManifest(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	workspace := "go 1.27.1\n\nuse (\n .\n " + strconv.Quote(core) + "\n " + strconv.Quote(filepath.Join(core, "pkg/lux/pg")) + "\n)\nreplace github.com/light-speak/luxo v1.0.0-beta.1 => " + strconv.Quote(core) + "\nreplace github.com/light-speak/luxo/pkg/lux/pg v1.0.0-beta.1 => " + strconv.Quote(filepath.Join(core, "pkg/lux/pg")) + "\n"
+	workspace := "go 1.27.4\n\nuse (\n .\n " + strconv.Quote(core) + "\n " + strconv.Quote(filepath.Join(core, "pkg/lux/pg")) + "\n)\nreplace github.com/light-speak/luxo v1.0.0-beta.1 => " + strconv.Quote(core) + "\nreplace github.com/light-speak/luxo/pkg/lux/pg v1.0.0-beta.1 => " + strconv.Quote(filepath.Join(core, "pkg/lux/pg")) + "\n"
 	if err := os.WriteFile("go.work", []byte(workspace), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -973,8 +973,8 @@ func configureGeneratedModuleWorkspace(t testing.TB) {
 	}
 	core := filepath.Dir(filepath.Dir(directory))
 	for name, content := range map[string]string{
-		"go.mod":  "module example.com/generated\n\ngo 1.27.1\n",
-		"go.work": "go 1.27.1\n\nuse (\n .\n " + strconv.Quote(core) + "\n " + strconv.Quote(filepath.Join(core, "pkg/lux/pg")) + "\n)\nreplace github.com/light-speak/luxo v1.0.0-beta.1 => " + strconv.Quote(core) + "\n",
+		"go.mod":  "module example.com/generated\n\ngo 1.27.4\n",
+		"go.work": "go 1.27.4\n\nuse (\n .\n " + strconv.Quote(core) + "\n " + strconv.Quote(filepath.Join(core, "pkg/lux/pg")) + "\n)\nreplace github.com/light-speak/luxo v1.0.0-beta.1 => " + strconv.Quote(core) + "\n",
 	} {
 		if err := os.WriteFile(name, []byte(content), 0600); err != nil {
 			t.Fatal(err)

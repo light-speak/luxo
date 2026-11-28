@@ -21,7 +21,7 @@ func TestDeployGeneratesProjectArtifacts(t *testing.T) {
 					name = "luxo"
 				}
 				if target == "compose" {
-					assertDeployArtifactContains(t, "Dockerfile", "FROM golang:1.27.1-alpine", "./lucis/user/", "./lucis/post/", "./lucis/gateway/")
+					assertDeployArtifactContains(t, "Dockerfile", "FROM golang:1.27.4-alpine", "./lucis/user/", "./lucis/post/", "./lucis/gateway/")
 					assertDeployArtifactContains(t, "docker-compose.yml", "container_name: "+name+"-pg", "DATABASE_PREFIX: "+name, "target: user-run", "target: post-run", "target: gateway-run")
 					if !strings.Contains(output, "Deploy files generated") {
 						t.Fatalf("missing compose completion: %s", output)
@@ -119,7 +119,7 @@ func prepareDeployProject(t *testing.T, module string) {
 		}
 	}
 	if module != "" {
-		if err := os.WriteFile("go.mod", []byte("module "+module+"\n\ngo 1.27.1\n"), 0600); err != nil {
+		if err := os.WriteFile("go.mod", []byte("module "+module+"\n\ngo 1.27.4\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
 	}

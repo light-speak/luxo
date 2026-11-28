@@ -31,10 +31,10 @@ func TestCanonicalAndInvalidCommand(t *testing.T) {
 func TestCompileAndRunBothPartsOfSplit(t *testing.T) {
 	root := newBenchmarkRunTree(t)
 	files := map[string]string{
-		"go.mod":                            "module github.com/light-speak/luxo\ngo 1.27.1\n",
-		"go.work":                           "go 1.27.1\nuse (\n.\n./pkg/lux/cache/redis\n)\n",
+		"go.mod":                            "module github.com/light-speak/luxo\ngo 1.27.4\n",
+		"go.work":                           "go 1.27.4\nuse (\n.\n./pkg/lux/cache/redis\n)\n",
 		"pkg/lux/cache/cache_test.go":       "package cache\nimport \"testing\"\nfunc BenchmarkMemory(b *testing.B) { for b.Loop() {} }\n",
-		"pkg/lux/cache/redis/go.mod":        "module github.com/light-speak/luxo/pkg/lux/cache/redis\ngo 1.27.1\n",
+		"pkg/lux/cache/redis/go.mod":        "module github.com/light-speak/luxo/pkg/lux/cache/redis\ngo 1.27.4\n",
 		"pkg/lux/cache/redis/redis_test.go": "package redis\nimport \"testing\"\nfunc BenchmarkRedis(b *testing.B) { for b.Loop() {} }\n",
 	}
 	for name, content := range files {
@@ -119,8 +119,8 @@ func TestPerformanceOverlayBindsOnlyReviewedRPCFile(t *testing.T) {
 func TestCompilePerformanceKeepsBenchmarksAndSeparatesCorrectness(t *testing.T) {
 	root := newBenchmarkRunTree(t)
 	files := map[string]string{
-		"go.mod":                        "module example.com/rpc-fixture\ngo 1.27.1\n",
-		"go.work":                       "go 1.27.1\nuse .\n",
+		"go.mod":                        "module example.com/rpc-fixture\ngo 1.27.4\n",
+		"go.work":                       "go 1.27.4\nuse .\n",
 		rpcBoundaryPath:                 isolatedRPCFixture,
 		"pkg/lux/rpc/benchmark_test.go": "package rpc\nimport \"testing\"\nfunc BenchmarkKept(b *testing.B) { for b.Loop() {} }\n",
 	}

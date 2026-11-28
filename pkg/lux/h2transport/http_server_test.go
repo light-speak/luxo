@@ -1,8 +1,11 @@
 package h2transport
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +16,7 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 func TestHTTPServerRejectsTLSWithoutH2ALPN(t *testing.T) {
@@ -354,5 +358,144 @@ func TestPriorKnowledgeRejectsUnavailableHandoff(t *testing.T) {
 	server.Handler.ServeHTTP(res, req)
 	if res.Code != http.StatusInternalServerError || len(s.connections) != 0 {
 		t.Fatal("failed handoff was accepted", res.Code)
+	}
+}
+
+// Keep the connection wrapper across the call, as ServeConn does.
+var priorKnowledgeConnSink *prefacedConn
+
+func TestPriorKnowledgeHandoffAllocation(t *testing.T) {
+	reader := bufio.NewReader(strings.NewReader(""))
+	t.Cleanup(func() { priorKnowledgeConnSink = nil })
+	if allocs := testing.AllocsPerRun(100, func() {
+		priorKnowledgeConnSink = newPrefacedConn(nil, reader)
+	}); allocs != 1 {
+		t.Fatalf("prior knowledge handoff made %.0f allocations, want 1 connection wrapper", allocs)
+	}
+}
+
+type priorKnowledgeRead struct {
+	data string
+	err  error
+}
+
+type priorKnowledgeTail struct {
+	reads []priorKnowledgeRead
+}
+
+func (r *priorKnowledgeTail) Read(p []byte) (int, error) {
+	if len(r.reads) == 0 {
+		return 0, io.EOF
+	}
+	step := r.reads[0]
+	r.reads = r.reads[1:]
+	return copy(p, step.data), step.err
+}
+
+func TestPrefacedConnPreservesReadResults(t *testing.T) {
+	retry := errors.New("temporary reader error")
+	tail := func() *bufio.Reader {
+		reader := bufio.NewReaderSize(&priorKnowledgeTail{reads: []priorKnowledgeRead{
+			{data: "SM\r\n\r\n"}, {data: "frames", err: retry}, {data: "resumed"},
+			{data: "final", err: io.EOF}, {data: "unreachable after EOF"},
+		}}, 32)
+		if _, err := reader.Peek(1); err != nil {
+			t.Fatal(err)
+		}
+		return reader
+	}
+	want := io.MultiReader(strings.NewReader("PRI * HTTP/2.0\r\n\r\n"), tail())
+	got := newPrefacedConn(nil, tail())
+	sawRetry, sawFinalEOF := false, false
+	for _, size := range []int{0, 1, 3, 14, 0, 8, 32, 32, 32, 0, 32} {
+		left, right := make([]byte, size), make([]byte, size)
+		n, err := want.Read(left)
+		m, actual := got.Read(right)
+		if m != n || actual != err || !bytes.Equal(right[:m], left[:n]) {
+			t.Fatalf("read(%d) = %q, %v; want %q, %v", size, right[:m], actual, left[:n], err)
+		}
+		sawRetry = sawRetry || err == retry && n > 0
+		sawFinalEOF = sawFinalEOF || err == io.EOF && n > 0
+	}
+	if !sawRetry || !sawFinalEOF {
+		t.Fatal("comparison failed to exercise bytes returned with error and EOF")
+	}
+}
+
+type priorKnowledgeHijacker struct {
+	http.ResponseWriter
+	conn     net.Conn
+	buffered *bufio.ReadWriter
+}
+
+func (h priorKnowledgeHijacker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return h.conn, h.buffered, nil
+}
+
+func TestPriorKnowledgeHandoffRetainsBufferedFrames(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() { _ = serverConn.Close(); _ = clientConn.Close() })
+	if err := clientConn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	partial := openingBytes(t)[len(consumedPriorKnowledgePrefix):]
+	initial := append(partial, headerWire(t, requestFields(), true)...)
+	buffered := bufio.NewReader(io.MultiReader(bytes.NewReader(initial), serverConn))
+	if _, err := buffered.Peek(len(initial)); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.ProtoMajor != 2 {
+			t.Errorf("prior knowledge request became %s %s", r.Method, r.Proto)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	config := &http.Server{}
+	if err := server.ConfigureHTTPServer(config); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("PRI", "http://example.test/", nil)
+	request.RequestURI, request.Proto = "*", "HTTP/2.0"
+	hijacker := priorKnowledgeHijacker{httptest.NewRecorder(), serverConn, bufio.NewReadWriter(buffered, bufio.NewWriter(serverConn))}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		config.Handler.ServeHTTP(hijacker, request)
+	}()
+	checkPriorKnowledgeResponse(t, clientConn)
+	_ = clientConn.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("prior knowledge handler did not retire")
+	}
+}
+
+func checkPriorKnowledgeResponse(t *testing.T, conn net.Conn) {
+	t.Helper()
+	peer := http2.NewFramer(conn, conn)
+	peer.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+	for {
+		frame, err := peer.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch received := frame.(type) {
+		case *http2.SettingsFrame:
+			if !received.IsAck() {
+				if err := peer.WriteSettingsAck(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		case *http2.MetaHeadersFrame:
+			if received.StreamID != 1 || !received.StreamEnded() || received.PseudoValue("status") != "204" {
+				t.Fatalf("unexpected prior knowledge response: %v", received)
+			}
+			return
+		}
 	}
 }

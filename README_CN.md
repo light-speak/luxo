@@ -13,7 +13,7 @@
   <a href="https://github.com/light-speak/luxo/actions/workflows/test.yml"><img src="https://github.com/light-speak/luxo/actions/workflows/test.yml/badge.svg" alt="Tests" /></a>
   <a href="https://codecov.io/gh/light-speak/luxo"><img src="https://codecov.io/gh/light-speak/luxo/branch/main/graph/badge.svg" alt="codecov" /></a>
   <a href="https://goreportcard.com/report/github.com/light-speak/luxo"><img src="https://goreportcard.com/badge/github.com/light-speak/luxo?v=2" alt="Go Report Card" /></a>
-  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.27.1+-00ADD8?style=flat&logo=go" alt="Go Version" /></a>
+  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.27.4+-00ADD8?style=flat&logo=go" alt="Go Version" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License" /></a>
 </p>
 
@@ -516,7 +516,7 @@ Native 流 handler 已接收生成的强类型参数快照并返回 `error`，�
 
 开发主线积极采用最新稳定工具链和有实际价值的稳定语言特性，不为兼容旧编译器本身而保留旧实现。正式 SDK 不依赖实验开关、nightly 编译器或预览 API。工具链升级不改变 wire 版本、字段 ID、整数精度和字段选择语义。
 
-当前迁移目标为 Go 1.27.1+、TypeScript 7、Dart 3.13+、Kotlin 2.4.20；Swift 通过独立验收的 SDK 改动跟进最新稳定编译器。编译器版本与设备/运行时最低版本分开决策：升级 Kotlin、Swift 编译器，不等于必须淘汰旧 Android、iOS 设备。
+当前迁移目标为 Go 1.27.4+、TypeScript 7、Dart 3.13+、Kotlin 2.4.20；Swift 通过独立验收的 SDK 改动跟进最新稳定编译器。编译器版本与设备/运行时最低版本分开决策：升级 Kotlin、Swift 编译器，不等于必须淘汰旧 Android、iOS 设备。
 
 JavaScript 开发与 SDK 联测的 Node 精确版本由 [`.node-version`](.node-version) 统一指定；TS 和 Dart Web CI 共用此文件，不使用浮动主版本。安装依赖前通过 `sh scripts/check-node.sh` 核验实际 Node 版本；Studio 的联动构建同样调用核心脚本。旧版本、预览版本、无效版本文件或工具执行失败都阻断，不自动下载或安装。TS CI 的 pnpm 同样固定精确版本，并输出实际 Node、pnpm、TS 编译器版本。三个 TS 包的 Node 类型声明仅用于构建/测试，锁文件固定实际解析版本；不进入浏览器运行代码。client/React 继续输出 ES2022，Vite 插件的最低 Node 要求独立声明，不能把开发工具升级等同于浏览器或插件运行时兼容性验收。
 
