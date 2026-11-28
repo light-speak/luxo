@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -122,6 +125,54 @@ func TestPoolRejectsCanceledIdleBorrow(t *testing.T) {
 	}
 }
 
+func TestPoolReadinessWaitUsesCallerDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := boundedTestPool(t)
+		conn, err := p.Get()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+		defer cancel()
+		start := time.Now()
+		if err := p.checkReady(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("readiness wait returned %v", err)
+		}
+		if elapsed := time.Since(start); elapsed != 10*time.Millisecond {
+			t.Fatalf("readiness exceeded caller deadline: %v", elapsed)
+		}
+		if open, waiting := p.open.Load(), p.waiters.Load(); open != 1 || waiting != 0 {
+			t.Fatalf("readiness changed a borrowed slot: open=%d waiting=%d", open, waiting)
+		}
+	})
+}
+
+func TestPoolReplacementRetainsReservationThroughClose(t *testing.T) {
+	p := boundedTestPool(t)
+	conn, err := p.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replaced := conn.(*poolConn)
+	if err := replaced.closeForReplacement(); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaced.closeForReplacement(); !errors.Is(err, ErrPoolExhausted) {
+		t.Fatalf("repeated replacement returned %v", err)
+	}
+	if err := replaced.Close(); err != nil || p.open.Load() != 1 {
+		t.Fatalf("closing the retired socket released the replacement's slot: %v", err)
+	}
+	replacement, err := p.acceptDial(t.Context(), &poolLifecycleConn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replacement.Close(); err != nil || p.open.Load() != 0 {
+		t.Fatalf("replacement leaked the slot: %v", err)
+	}
+}
+
 func TestPoolDialingConsumesCapacityAndCloseCancelsHandshake(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -190,7 +241,7 @@ func TestPoolConcurrentBorrowLimit(t *testing.T) {
 }
 
 func TestPoolOptionsAndAdoption(t *testing.T) {
-	for _, field := range []string{"open", "idle", "idle-over-open", "waiters", "wait-timeout", "dial-timeout"} {
+	for _, field := range []string{"open", "idle", "idle-over-open", "waiters", "wait-timeout", "dial-timeout", "reserve", "reserve-over-open"} {
 		options := DefaultPoolOptions()
 		switch field {
 		case "open":
@@ -205,6 +256,10 @@ func TestPoolOptionsAndAdoption(t *testing.T) {
 			options.WaitTimeout = 0
 		case "dial-timeout":
 			options.DialTimeout = 0
+		case "reserve":
+			options.UnaryReserve = -1
+		case "reserve-over-open":
+			options.UnaryReserve = options.MaxOpen + 1
 		}
 		if _, err := NewNamedClientWithOptions("test", "unused", options); err == nil {
 			t.Fatalf("accepted %s", field)
@@ -246,10 +301,186 @@ func TestPoolFailedDialReleasesReservation(t *testing.T) {
 	}
 }
 
-func TestPoolStreamOccupiesSlotUntilTermination(t *testing.T) {
+func TestLoadGatewayClientsFromEnv(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.env")
+	for _, tc := range []struct {
+		name, maxOpen, reserve, invalidKey string
+		wantOpen, wantReserve              int
+	}{
+		{name: "default", wantOpen: 32, wantReserve: 8},
+		{name: "smaller", maxOpen: "12", reserve: "4", wantOpen: 12, wantReserve: 4},
+		{name: "larger", maxOpen: "64", reserve: "0", wantOpen: 64, wantReserve: 16},
+		{name: "no-streams", reserve: "32", wantOpen: 32, wantReserve: 32},
+		{name: "bad-open", maxOpen: "slow", invalidKey: "LRPC_MAX_OPEN"},
+		{name: "bad-reserve", reserve: "fast", invalidKey: "LRPC_UNARY_RESERVE"},
+		{name: "zero-open", maxOpen: "0", invalidKey: "LRPC_MAX_OPEN"},
+		{name: "negative-open", maxOpen: "-1", invalidKey: "LRPC_MAX_OPEN"},
+		{name: "negative-reserve", reserve: "-1", invalidKey: "LRPC_UNARY_RESERVE"},
+		{name: "oversized-reserve", maxOpen: "12", reserve: "13", invalidKey: "LRPC_UNARY_RESERVE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LRPC_MAX_OPEN", tc.maxOpen)
+			t.Setenv("LRPC_UNARY_RESERVE", tc.reserve)
+			t.Setenv("EMPTY_SERVICE_ADDR", "")
+			clients, err := LoadGatewayClients(missing, map[string]string{"empty": "fallback:9000", "other": "other:9000"})
+			for _, client := range clients {
+				t.Cleanup(client.Close)
+			}
+			if tc.invalidKey != "" {
+				if clients != nil || err == nil || !strings.Contains(err.Error(), tc.invalidKey) {
+					t.Fatalf("invalid configuration returned %d clients, error %v", len(clients), err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := DefaultPoolOptions()
+			want.MaxOpen, want.UnaryReserve = tc.wantOpen, tc.wantReserve
+			want.MaxIdle = min(want.MaxIdle, want.MaxOpen)
+			if len(clients) != 2 || clients["empty"] == nil || clients["other"] == nil ||
+				clients["empty"].pool.options != want || clients["other"].pool.options != want {
+				t.Fatalf("clients did not use validated pool options: %+v", want)
+			}
+			if clients["empty"].pool.addr != "" {
+				t.Fatal("an explicitly empty service address must keep dotenv lookup semantics")
+			}
+		})
+	}
+}
+
+func TestLoadGatewayClientsKeepTargetPoolsIndependent(t *testing.T) {
+	t.Setenv("LRPC_MAX_OPEN", "2")
+	t.Setenv("LRPC_UNARY_RESERVE", "1")
+	t.Setenv("FIRST_SERVICE_ADDR", "ignored")
+	if err := os.Unsetenv("FIRST_SERVICE_ADDR"); err != nil {
+		t.Fatal(err)
+	}
+	router, _ := newStreamIsolationRouter(t)
+	addr := startTestRPCServer(t, NewServer(router))
+	t.Setenv("SECOND_SERVICE_ADDR", addr)
+	clients, err := LoadGatewayClients(filepath.Join(t.TempDir(), "missing.env"),
+		map[string]string{"first": addr, "second": "unused:9000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second := clients["first"], clients["second"]
+	if first == nil || second == nil {
+		t.Fatal("factory did not construct both clients")
+	}
+	t.Cleanup(first.Close)
+	t.Cleanup(second.Close)
+	if first.name != "first" || second.name != "second" || first.pool == second.pool ||
+		first.pool.addr != addr || second.pool.addr != addr {
+		t.Fatal("named clients did not keep distinct pools or resolve the service address")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	stream := openIsolationStream(t, ctx, first)
+	extra, err := first.SubscribeContext(ctx, "", 1, nil, nil)
+	if extra != nil {
+		extra.Close()
+	}
+	if extra != nil || !errors.Is(err, ErrPoolExhausted) {
+		t.Fatalf("first pool accepted a second stream: %v", err)
+	}
+	requirePooledPing(t, ctx, first)
+	openIsolationStream(t, ctx, second)
+	stream.Close()
+	first.Close()
+	requirePooledPing(t, ctx, second)
+}
+
+func TestLoadGatewayClientsUsesExplicitDotenv(t *testing.T) {
+	t.Setenv("LRPC_MAX_OPEN", "3")
+	t.Setenv("LRPC_UNARY_RESERVE", "1")
+	t.Setenv("DOTENV_SERVICE_ADDR", "restore-after-test")
+	if err := os.Unsetenv("DOTENV_SERVICE_ADDR"); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "cluster.env")
+	content := []byte("LRPC_MAX_OPEN=8\nLRPC_UNARY_RESERVE=4\nDOTENV_SERVICE_ADDR=localhost:9234\n")
+	if err := os.WriteFile(file, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clients, err := LoadGatewayClients(file, map[string]string{"dotenv": "fallback:9000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := clients["dotenv"]
+	if client == nil {
+		t.Fatal("factory did not construct the dotenv client")
+	}
+	t.Cleanup(client.Close)
+	if pool := client.pool; pool.addr != "localhost:9234" ||
+		pool.options.MaxOpen != 3 || pool.options.UnaryReserve != 1 {
+		t.Fatal("startup did not load the explicit dotenv file with process values taking precedence")
+	}
+}
+
+func TestLoadGatewayClientsRejectsMalformedDotenv(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "cluster.env")
+	if err := os.WriteFile(file, []byte("invalid config without an equals sign\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clients, err := LoadGatewayClients(file, map[string]string{"test": "localhost:9234"})
+	if clients != nil || err == nil || !strings.HasPrefix(err.Error(), "load "+file+":") {
+		t.Fatalf("malformed dotenv returned %d clients, error %v", len(clients), err)
+	}
+}
+
+func TestPoolStreamLeavesUnaryReserve(t *testing.T) {
+	router, started := newStreamIsolationRouter(t)
+	client := NewNamedClient("test", startTestRPCServer(t, NewServer(router)))
+	t.Cleanup(client.Close)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	streams := make([]*Subscription, 0, 24)
+	for range cap(streams) {
+		streams = append(streams, openIsolationStream(t, ctx, client))
+		<-started
+	}
+
+	overflow, err := client.SubscribeContext(ctx, "", 1, nil, nil)
+	if overflow != nil {
+		overflow.Close()
+	}
+	if overflow != nil || !errors.Is(err, ErrPoolExhausted) {
+		t.Fatalf("25th stream = %v, %v; want immediate pool busy", overflow != nil, err)
+	}
+	var app *luxerrors.AppError
+	if !errors.As(err, &app) || app.Code != 503 {
+		t.Fatalf("lost overload status: %v", err)
+	}
+
+	requirePooledPing(t, ctx, client)
+	borrowed := make([]net.Conn, 0, 8)
+	for range cap(borrowed) {
+		conn, err := client.pool.GetContext(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { client.pool.Put(conn) })
+		borrowed = append(borrowed, conn)
+	}
+	if client.pool.open.Load() != 32 || client.pool.waiters.Load() != 0 {
+		t.Fatal("streams and unary calls did not share the 32-connection limit")
+	}
+
+	streams[0].Close()
+	for range streams[0].Messages() {
+	}
+	openIsolationStream(t, ctx, client)
+	<-started
+	if client.pool.open.Load() != 32 {
+		t.Fatal("reopening a stream exceeded the shared limit")
+	}
+}
+
+func TestPoolStreamConfiguredUnaryReserve(t *testing.T) {
 	router, _ := newStreamIsolationRouter(t)
 	opts := DefaultPoolOptions()
-	opts.MaxIdle, opts.MaxOpen, opts.MaxWaiters = 1, 1, 0
+	opts.MaxIdle, opts.MaxOpen, opts.UnaryReserve = 3, 3, 2
 	client, err := NewNamedClientWithOptions("test", startTestRPCServer(t, NewServer(router)), opts)
 	if err != nil {
 		t.Fatal(err)
@@ -258,22 +489,127 @@ func TestPoolStreamOccupiesSlotUntilTermination(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	sub := openIsolationStream(t, ctx, client)
-	if _, err := client.CallWithMaskContext(ctx, "", 2, nil, nil); !errors.Is(err, ErrPoolExhausted) {
-		t.Fatalf("stream did not reserve capacity: %v", err)
-	} else {
-		var app *luxerrors.AppError
-		if !errors.As(err, &app) || app.Code != 503 {
-			t.Fatalf("lost overload status: %v", err)
+	for range 2 {
+		if extra, err := client.SubscribeContext(ctx, "", 1, nil, nil); extra != nil || !errors.Is(err, ErrPoolExhausted) {
+			t.Fatalf("stream exceeded the configured budget: %v, %v", extra != nil, err)
 		}
 	}
+	requirePooledPing(t, ctx, client)
 	sub.Close()
-	// The reader may be concurrently closing the same socket. Wait for its
-	// terminal notification before asserting that physical Close has finished.
-	for range sub.Messages() {
-	}
-	if _, err := client.CallWithMaskContext(ctx, "", 2, nil, nil); err != nil {
+	openIsolationStream(t, ctx, client)
+	requirePooledPing(t, ctx, client)
+}
+
+func TestPoolStreamDoesNotWaitAtSharedLimit(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := boundedTestPool(t)
+		unary, err := p.Get()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unary.Close()
+		// A one-connection pool reserves the only slot for unary RPC.
+		start := time.Now()
+		if conn, err := p.getStreamContext(t.Context()); conn != nil || !errors.Is(err, ErrPoolExhausted) {
+			t.Fatalf("single-connection pool admitted a stream: %v, %v", conn, err)
+		}
+		if time.Since(start) != 0 || p.waiters.Load() != 0 {
+			t.Fatal("stream waited for the unary-only slot")
+		}
+
+		opts := DefaultPoolOptions()
+		opts.MaxOpen, opts.MaxIdle = 2, 2
+		p, err = NewPoolWithOptions("unused", opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer p.Close()
+		for range 2 {
+			p.Put(&poolLifecycleConn{})
+			conn, err := p.Get()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+		}
+		start = time.Now()
+		if conn, err := p.getStreamContext(t.Context()); conn != nil || !errors.Is(err, ErrPoolExhausted) {
+			t.Fatalf("stream entered the full pool: %v, %v", conn, err)
+		}
+		if time.Since(start) != 0 || p.waiters.Load() != 0 || p.streams.Load() != 0 {
+			t.Fatal("stream waited or leaked its reservation at the shared limit")
+		}
+	})
+}
+
+func TestPoolStreamDialingConsumesBudget(t *testing.T) {
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer listener.Close()
+	opts := DefaultPoolOptions()
+	opts.MaxOpen, opts.MaxIdle = 2, 2
+	p, err := NewPoolWithOptions(listener.Addr().String(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		conn, err := p.getStreamContext(ctx)
+		if conn != nil {
+			conn.Close()
+		}
+		done <- err
+	}()
+	if err := listener.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	peer, err := listener.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	if conn, err := p.getStreamContext(t.Context()); conn != nil || !errors.Is(err, ErrPoolExhausted) {
+		t.Fatalf("another stream acquired a slot during handshake: %v, %v", conn, err)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) || p.open.Load() != 0 || p.streams.Load() != 0 {
+		t.Fatalf("canceled handshake leaked quota: err=%v, open=%d, streams=%d", err, p.open.Load(), p.streams.Load())
+	}
+}
+
+func TestPoolStreamAcquisitionPreservesErrors(t *testing.T) {
+	t.Run("canceled", func(t *testing.T) {
+		p := NewPool("unused", 1)
+		defer p.Close()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if conn, err := p.getStreamContext(ctx); conn != nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled stream got %v, %v", conn, err)
+		}
+	})
+	t.Run("closed", func(t *testing.T) {
+		p := NewPool("unused", 1)
+		p.Close()
+		if conn, err := p.getStreamContext(t.Context()); conn != nil || !errors.Is(err, errPoolClosed) {
+			t.Fatalf("stream from closed pool got %v, %v", conn, err)
+		}
+	})
+	t.Run("shutdown after admission", func(t *testing.T) {
+		p := NewPool("unused", 1)
+		defer p.Close()
+		ctx := poolClosingContext{Context: t.Context(), pool: p}
+		if conn, err := p.getStreamContext(ctx); conn != nil || !errors.Is(err, errPoolClosed) {
+			t.Fatalf("stream during shutdown got %v, %v", conn, err)
+		}
+		if p.streams.Load() != 0 {
+			t.Fatal("shutdown leaked stream quota")
+		}
+	})
 }
 
 // Closing the pipe can wake the reader before the underlying Close returns.
@@ -297,12 +633,18 @@ func TestPoolStreamTerminalWaitsForSlotRelease(t *testing.T) {
 			armObservation, observationDone := poolCloseWatchdog(t, 100*time.Millisecond)
 			synctest.Test(t, func(t *testing.T) {
 				opts := DefaultPoolOptions()
-				opts.MaxIdle, opts.MaxOpen, opts.MaxWaiters = 1, 1, 0
+				opts.MaxIdle, opts.MaxOpen, opts.MaxWaiters = 2, 2, 0
 				client, err := NewNamedClientWithOptions("test", "unused", opts)
 				if err != nil {
 					t.Fatal(err)
 				}
 				defer client.Close()
+				client.pool.Put(&poolLifecycleConn{})
+				unaryHold, err := client.pool.Get()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer unaryHold.Close()
 				conn, peer := net.Pipe()
 				defer peer.Close()
 				closeStarted, allowClose := make(chan struct{}), make(chan struct{})
@@ -346,6 +688,9 @@ func TestPoolStreamTerminalWaitsForSlotRelease(t *testing.T) {
 				if _, err := client.CallWithMaskContext(t.Context(), "", 2, nil, nil); !errors.Is(err, ErrPoolExhausted) {
 					t.Fatalf("slot released during physical close: %v", err)
 				}
+				if client.pool.streams.Load() != 1 {
+					t.Fatal("stream quota released during physical close")
+				}
 				close(armObservation)
 				assertPoolStreamTerminalPending(t, sub, explicit, observationDone)
 
@@ -362,7 +707,7 @@ func TestPoolStreamTerminalWaitsForSlotRelease(t *testing.T) {
 				if source == "explicit close" {
 					<-explicit
 				}
-				if client.pool.open.Load() != 0 {
+				if client.pool.open.Load() != 1 || client.pool.streams.Load() != 0 {
 					t.Fatal("terminal notification preceded capacity release")
 				}
 

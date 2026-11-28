@@ -16,6 +16,7 @@ const (
 	connClosing
 	connClosed
 	connCloseWaiter
+	connStream
 )
 
 // One wrapper per physical connection accounts for every direct Close path,
@@ -82,23 +83,45 @@ func partialResponseError(received int, err error) error {
 }
 
 func (c *poolConn) Close() error {
-	if state := c.state.Or(connClosing); state&connClosing != 0 {
+	state := c.state.Or(connClosing)
+	if state&connClosing != 0 {
 		if state&connClosed == 0 {
 			c.pool.waitForClose(c)
 		}
 		return nil
 	}
-	defer c.finishClose()
+	defer c.finishClose(state)
 	return c.Conn.Close()
 }
 
-func (c *poolConn) finishClose() {
+// closeForReplacement closes a socket taken from the idle queue and transfers
+// its reservation to the caller. A competing closer still releases the slot.
+func (c *poolConn) closeForReplacement() error {
+	if !c.state.CompareAndSwap(connBorrowed, connClosing) {
+		return ErrPoolExhausted
+	}
+	defer c.markClosed()
+	_ = c.Conn.Close()
+	return nil
+}
+
+func (c *poolConn) finishClose(state uint32) {
 	p := c.pool
 	p.open.Add(-1)
-	p.signal()
-	if c.state.Or(connClosed)&connCloseWaiter == 0 {
-		return
+	if state&connStream != 0 {
+		p.streams.Add(-1)
 	}
+	p.signal()
+	c.markClosed()
+}
+
+func (c *poolConn) markClosed() {
+	if c.state.Or(connClosed)&connCloseWaiter != 0 {
+		c.pool.releaseCloseWaiter(c)
+	}
+}
+
+func (p *Pool) releaseCloseWaiter(c *poolConn) {
 	// A waiter marks the state and registers under this same lock.
 	p.closingMu.Lock()
 	waiter := p.closingWaiters[c]

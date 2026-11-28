@@ -49,14 +49,19 @@ func TestGeneratedStreamBridgeDrainsBeforeTerminalResult(t *testing.T) {
 	var source strings.Builder
 	source.WriteString(`package generated
 import (
+    "bytes"
     "context"
     "fmt"
+    "sync"
     "github.com/light-speak/luxo/pkg/lux/api"
+    "github.com/light-speak/luxo/pkg/lux/codec"
+    "github.com/light-speak/luxo/pkg/lux/schema"
     "github.com/light-speak/luxo/pkg/lux/rpc"
     "github.com/light-speak/luxo/pkg/lux/luvia"
 )
 `)
 	writeGatewayRPCStreamProxy(&source, []moduleInfo{{nativeStreams: []string{"watch"}}})
+	writeGatewayProxy(&source)
 	runGeneratedProtocolPackage(t, source.String(), streamBridgeAssertions)
 }
 
@@ -107,6 +112,7 @@ const streamBridgeAssertions = `package generated
 import (
     "bytes"
     "context"
+    "encoding/json"
     "errors"
     "net"
     "net/http/httptest"
@@ -189,14 +195,204 @@ func TestBridgeRejectsEmptyRPCStreamData(t *testing.T) {
  if count!=1||sub.Err()==nil{t.Fatalf("protocol failure became normal completion: count=%d error=%v",count,sub.Err())}
  if gateway.Streams.SubCount("watch")!=0{t.Fatal("failed forwarded stream retained subscription")}
 }
-func startStreamBackend(t *testing.T,router *api.Router)*rpc.Client{
+
+func TestBridgePoolQuotaAcrossWebSocket(t *testing.T) {
+	for _, sample := range []struct {
+		name   string
+		binary bool
+	}{{"json", false}, {"binary", true}} {
+		t.Run(sample.name, func(t *testing.T) { testBridgePoolQuota(t, sample.binary) })
+	}
+}
+func testBridgePoolQuota(t *testing.T, binary bool) {
+	gateway, deliveries := quotaBridgeRouter(t)
+	server := httptest.NewServer(gateway)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	first := bridgeQuotaExchange(t, ctx, conn, binary, "{\"$id\":1,\"$sub\":\"watch\"}", []byte{api.BinaryFrameSubscribe, 1, 1, 0, 0})
+	bridgeQuotaACK(t, first, binary, 1)
+	firstOutput := bridgeQuotaDelivery(t, ctx, deliveries)
+	rejected := bridgeQuotaExchange(t, ctx, conn, binary, "{\"$id\":2,\"$sub\":\"watch\"}", []byte{api.BinaryFrameSubscribe, 2, 1, 0, 0})
+	bridgeQuotaBusy(t, rejected, binary)
+	ping := bridgeQuotaExchange(t, ctx, conn, binary, "{\"$id\":9,\"$api\":\"ping\"}", []byte{api.BinaryFrameCallRequest, 9, 2, 0, 0})
+	if binary {
+		if !bytes.Equal(ping, []byte{api.BinaryFrameCallSuccess, 9, 14}) {
+			t.Fatalf("reserved unary slot failed: %x", ping)
+		}
+	} else {
+		response := bridgeQuotaJSON(t, ping)
+		bridgeQuotaJSONInt(t, response, "$id", 9)
+		bridgeQuotaJSONInt(t, response, "data", 7)
+	}
+	firstOutput <- []byte{14}
+	bridgeQuotaData(t, bridgeQuotaRead(t, ctx, conn, binary), binary, 1, 7)
+	// The same socket processes unsubscribe synchronously before the next subscribe.
+	bridgeQuotaWrite(t, ctx, conn, binary, "{\"$unsub\":1}", []byte{api.BinaryFrameUnsubscribe, 1})
+	restored := bridgeQuotaExchange(t, ctx, conn, binary, "{\"$id\":3,\"$sub\":\"watch\"}", []byte{api.BinaryFrameSubscribe, 3, 1, 0, 0})
+	bridgeQuotaACK(t, restored, binary, 3)
+	restoredOutput := bridgeQuotaDelivery(t, ctx, deliveries)
+	restoredOutput <- []byte{18}
+	bridgeQuotaData(t, bridgeQuotaRead(t, ctx, conn, binary), binary, 3, 9)
+}
+func quotaBridgeRouter(t *testing.T) (*api.Router, <-chan chan []byte) {
+	t.Helper()
+	backend, gateway := api.NewRouter(), api.NewRouter()
+	for _, router := range []*api.Router{backend, gateway} {
+		for _, definition := range []*schema.API{{ID: 1, Name: "watch", Stream: true, ReturnType: "Int"}, {ID: 2, Name: "ping", ReturnType: "Int"}} {
+			if err := router.Schema.RegisterAPI(definition); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := router.Registry.RegisterSchemaAPIs(router.Schema); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deliveries := make(chan chan []byte, 2)
+	backend.HandleStreamNative("watch", func(ctx context.Context, _ *api.StreamParams, _ any, stream *api.Stream) error {
+		output := make(chan []byte, 1)
+		select {
+		case deliveries <- output:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		for {
+			select {
+			case value := <-output:
+				if err := stream.Send(value); err != nil {
+					return err
+				}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
+	backend.Handle("ping", func(_ context.Context, req *api.Request) error { req.Buf.WriteLuxoInt(7); return nil })
+	options := rpc.DefaultPoolOptions()
+	options.MaxIdle, options.MaxOpen, options.UnaryReserve = 2, 2, 1
+	client := startStreamBackend(t, backend, options)
+	gateway.HandleStreamForwarded("watch", rpcStreamProxy(client, gateway, "watch"))
+	gateway.Handle("ping", proxyHandler(client, gateway.Schema, "ping", map[string]*rpc.Client{"quota": client}))
+	return gateway, deliveries
+}
+func bridgeQuotaDelivery(t *testing.T, ctx context.Context, deliveries <-chan chan []byte) chan []byte {
+	t.Helper()
+	select {
+	case output := <-deliveries:
+		return output
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+		return nil
+	}
+}
+func bridgeQuotaExchange(t *testing.T, ctx context.Context, conn *websocket.Conn, binary bool, text string, wire []byte) []byte {
+	t.Helper()
+	bridgeQuotaWrite(t, ctx, conn, binary, text, wire)
+	return bridgeQuotaRead(t, ctx, conn, binary)
+}
+func bridgeQuotaWrite(t *testing.T, ctx context.Context, conn *websocket.Conn, binary bool, text string, wire []byte) {
+	t.Helper()
+	kind, data := websocket.MessageText, []byte(text)
+	if binary {
+		kind, data = websocket.MessageBinary, wire
+	}
+	if err := conn.Write(ctx, kind, data); err != nil {
+		t.Fatal(err)
+	}
+}
+func bridgeQuotaRead(t *testing.T, ctx context.Context, conn *websocket.Conn, binary bool) []byte {
+	t.Helper()
+	kind, data, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := websocket.MessageText
+	if binary {
+		want = websocket.MessageBinary
+	}
+	if kind != want {
+		t.Fatalf("unexpected WebSocket frame kind %v", kind)
+	}
+	return data
+}
+func bridgeQuotaACK(t *testing.T, data []byte, binary bool, id byte) {
+	t.Helper()
+	if binary {
+		if !bytes.Equal(data, []byte{api.BinaryFrameSubscribeSuccess, id}) {
+			t.Fatalf("subscription ACK: %x", data)
+		}
+		return
+	}
+	response := bridgeQuotaJSON(t, data)
+	bridgeQuotaJSONInt(t, response, "$sub", int(id))
+	var accepted bool
+	if err := json.Unmarshal(response["ok"], &accepted); err != nil || !accepted {
+		t.Fatalf("subscription ACK: %s (%v)", data, err)
+	}
+}
+func bridgeQuotaBusy(t *testing.T, data []byte, binary bool) {
+	t.Helper()
+	if binary {
+		if len(data) < 3 || data[0] != api.BinaryFrameSubscribeError || data[1] != 2 {
+			t.Fatalf("pool overflow acknowledged: %x", data)
+		}
+		failure, err := api.DecodeBinaryError(data[2:], 0)
+		if err != nil || failure.Code != 503 || failure.Name != "LRPCPoolBusy" {
+			t.Fatalf("lost pool rejection: %v %v", failure, err)
+		}
+	} else {
+		response := bridgeQuotaJSON(t, data)
+		bridgeQuotaJSONInt(t, response, "$sub", 2)
+		bridgeQuotaJSONInt(t, response, "code", 503)
+		var name string
+		if err := json.Unmarshal(response["error"], &name); err != nil || name != "LRPCPoolBusy" {
+			t.Fatalf("lost pool rejection: %s (%v)", data, err)
+		}
+	}
+}
+func bridgeQuotaData(t *testing.T, data []byte, binary bool, id byte, value int) {
+	t.Helper()
+	if binary {
+		if !bytes.Equal(data, []byte{api.BinaryFrameStream, id, byte(value * 2)}) {
+			t.Fatalf("active stream lost: %x", data)
+		}
+		return
+	}
+	response := bridgeQuotaJSON(t, data)
+	bridgeQuotaJSONInt(t, response, "$stream", int(id))
+	bridgeQuotaJSONInt(t, response, "data", value)
+}
+func bridgeQuotaJSON(t *testing.T, data []byte) map[string]json.RawMessage {
+	t.Helper()
+	var response map[string]json.RawMessage
+	if err := json.Unmarshal(data, &response); err != nil {
+		t.Fatalf("WebSocket JSON frame: %s (%v)", data, err)
+	}
+	return response
+}
+func bridgeQuotaJSONInt(t *testing.T, response map[string]json.RawMessage, key string, want int) {
+	t.Helper()
+	var value int
+	if err := json.Unmarshal(response[key], &value); err != nil || value != want {
+		t.Fatalf("WebSocket JSON %s: got %s want %d (%v)", key, response[key], want, err)
+	}
+}
+func startStreamBackend(t *testing.T,router *api.Router, selected ...rpc.PoolOptions)*rpc.Client{
     t.Helper()
     listener,err:=net.Listen("tcp","127.0.0.1:0")
     if err!=nil{t.Fatal(err)}
     server:=rpc.NewServer(router)
     done:=make(chan error,1)
     go func(){done<-server.Serve(listener)}()
-    client:=rpc.NewClient(listener.Addr().String())
+    options:=rpc.DefaultPoolOptions()
+    if len(selected)>0{options=selected[0]}
+    client,err:=rpc.NewNamedClientWithOptions("stream-fixture",listener.Addr().String(),options)
+    if err!=nil{server.Close();<-done;t.Fatal(err)}
     t.Cleanup(func(){client.Close();server.Close();if err:=<-done;err!=nil{t.Error(err)}})
     return client
 }

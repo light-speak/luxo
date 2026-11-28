@@ -65,12 +65,12 @@ func (c *compiler) compileJoinToString(call *ast.CallExpr) (string, bool) {
 	}
 	prefix := c.collectionPrefix(&ast.LambdaExpr{Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: call}}}})
 	items, separator, builder, item := prefix+"Items", prefix+"Separator", prefix+"Builder", prefix+"Item"
-	sub := c.valueCompiler()
+	sub := c.expressionCompiler(call)
 	sub.indent += "\t"
 	sub.compileVal(&ast.ValStmt{Name: items, Value: member.Object})
 	sub.compileVal(&ast.ValStmt{Name: separator, Value: call.Args[0].Value})
 	if element.name == "String" {
-		sub.write("return strings.Join(%s, %s)", items, separator)
+		sub.writeValueCompletion("", "strings.Join("+items+", "+separator+")")
 		return c.finishValueClosure(sub, "string", sub.b.String()), true
 	}
 	sub.write("var %s strings.Builder", builder)
@@ -89,7 +89,7 @@ func (c *compiler) compileJoinToString(call *ast.CallExpr) (string, bool) {
 	sub.write("%s.%s(%s)", builder, method, part.value)
 	sub.indent = c.indent + "\t"
 	sub.write("}")
-	sub.write("return %s.String()", builder)
+	sub.writeValueCompletion("", builder+".String()")
 	return c.finishValueClosure(sub, "string", sub.b.String()), true
 }
 
@@ -113,7 +113,7 @@ func (c *compiler) compileCollectionCall(call *ast.CallExpr) (string, bool) {
 	}
 	prefix := c.collectionPrefix(lambda)
 	items, result := prefix+"Items", prefix+"Result"
-	sub := c.valueCompiler()
+	sub := c.expressionCompiler(member.Object)
 	sub.indent += "\t"
 	sub.compileVal(&ast.ValStmt{Name: items, Value: member.Object})
 	goType := c.goTypeForExpr(call)
@@ -142,14 +142,14 @@ func (c *compiler) compileCollectionCall(call *ast.CallExpr) (string, bool) {
 	} else if member.Field == "filter" {
 		sub.write("if %s { %s = append(%s, %s) }", value, result, result, goParameter)
 	} else {
-		sub.write("if %s { return true }", value)
+		sub.writeConditionalValue(value, "true")
 	}
 	sub.indent = c.indent + "\t"
 	sub.write("}")
 	if member.Field == "any" {
-		sub.write("return false")
+		sub.writeValueCompletion("", "false")
 	} else {
-		sub.write("return %s", result)
+		sub.writeValueCompletion("", result)
 	}
 	return c.finishValueClosure(sub, goType, sub.b.String()), true
 }

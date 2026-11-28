@@ -285,6 +285,13 @@ func verifyAPIWholeFixtureLeaves(profile string, isolated inventory) error {
 		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
 			return errors.New("API body read profile requires the ten verified benchmark leaves")
 		}
+	case benchlayout.APIJSONListMetadataProfile:
+		const root = benchlayout.APIJSONListMetadataBenchmark
+		groups := benchmarkCaseProduct([]string{"filters", "escaped", "sorters"}, []string{"0", "1", "16", "100"})
+		leaves := benchmarkCaseProduct(append(groups, "chinese72KB/1"), []string{"metadata", "request"})
+		if !verifiedBenchmarkLeaves(isolated[root], root, leaves...) {
+			return errors.New("API JSONList metadata profile requires the 26 verified benchmark leaves")
+		}
 	case benchlayout.APIJSONQuoteCandidateProfile:
 		const root = benchlayout.APIJSONQuoteCandidateBenchmark
 		leaves := benchmarkCaseProduct([]string{"empty", "ascii16", "ascii1024", "unicode24", "unicode1026", "escapes24", "html"},
@@ -306,7 +313,7 @@ func verifyAPINonIdentityCompanions(ordinary, isolated inventory) error {
 		case benchlayout.APILocalRouteExportProfile, benchlayout.APICanonicalJSONProfile,
 			benchlayout.APIBinaryParamLookupProfile, benchlayout.APIRequestLogProfile,
 			benchlayout.APIHandlerPanicProfile, benchlayout.APIWebSocketRegistrationsProfile, benchlayout.APIResponseOriginRunProfile,
-			benchlayout.APIBodyReadProfile, benchlayout.APIJSONQuoteCandidateProfile:
+			benchlayout.APIBodyReadProfile, benchlayout.APIJSONQuoteCandidateProfile, benchlayout.APIJSONListMetadataProfile:
 			if !maps.Equal(leaves, isolated[root]) {
 				return fmt.Errorf("API non-identity profile must retain the ordinary %s inventory", root)
 			}

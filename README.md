@@ -452,6 +452,10 @@ Studio releases must pin the tested core Go module, CLI, frontend SDKs, and CI c
 
 #### Pre-Beta Internal RPC Upgrade (Under Validation)
 
+A generated gateway shares one LRPC connection pool per target service. The default pool allows 32 connections, with at most 24 used by native streams. New native streams receive `LRPCPoolBusy` (503) immediately when the stream quota or the shared pool is full. Unary RPCs can use any available connection.
+
+Set `LRPC_MAX_OPEN` and `LRPC_UNARY_RESERVE` in the gateway process environment to tune the total limit and unary reservation. When the reserve is omitted or set to zero, the gateway reserves one quarter of the total, rounded up. A reserve equal to the total disables native streams for the pool. Go callers can set `MaxOpen` and `UnaryReserve` in `rpc.PoolOptions`, with `MaxIdle` at most `MaxOpen`.
+
 `fn @service`, generated batch loaders, relation resolvers, and named remote
 loaders register through `Router.HandleInternal`. HTTP and WebSocket only use
 the public route table; RPC exports both public APIs and internal functions at
@@ -686,6 +690,9 @@ Regenerate the Helm chart and service binaries together to use `/health` for
 liveness and `/ready` for readiness. The latter returns HTTP 503 when a required
 PostgreSQL connection, configured NATS broker connection, or LRPC listener is
 unavailable. The cluster gateway checks the LRPC handshake with each module.
+Probes share the target's connection budget and may replace an idle connection
+at the limit. A probe that cannot obtain a slot before its deadline reports
+unready.
 Modules check local dependencies so their readiness cannot depend on each other.
 Response caches still fall back to the origin. Readiness responses contain only
 a status and the service shares a probe result for up to one second.

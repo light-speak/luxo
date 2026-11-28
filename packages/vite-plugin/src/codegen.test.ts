@@ -739,6 +739,51 @@ it.each(['model', 'type'].flatMap(target => [false, true].flatMap(list =>
   expect(Array.from({ length: 66 }, () => nestedModelWire(1, list, true)).map(decode.column)).toHaveLength(66)
 })
 
+it.each(['list', 'page'])('keeps Binary %s projections sparse when merging records', async shape => {
+  await generateTypes({
+    models: { Product: { name: 'Product', fields: [
+      { id: 1, name: 'id', type: 'Int' },
+      { id: 2, name: 'name', type: 'String' },
+      { id: 3, name: 'price', type: 'Float' },
+      { id: 4, name: 'description', type: 'String' },
+      { id: 5, name: 'note', type: 'String', nullable: true },
+      { id: 6, name: 'active', type: 'Boolean' },
+    ] } },
+    apis: {},
+  }, 'projection-merge')
+  const generated = outputs.get('projection-merge/types.ts') ?? ''
+  const js = stripTypeScriptTypes(generated.replace(/^import .*\n/gm, '')).replace(/^export /gm, '')
+  const runtime = await import('@luxojs/client')
+  const load = new Function('runtime', `const { Decoder, ColumnarDecoder, int64FromJSON, stringFromJSON,
+    floatFromJSON, booleanFromJSON } = runtime; ${js}
+    return { json: decodeJSONProduct$list, list: decodeColumnarProduct, page: decodePaginatedProduct }`) as
+    (bindings: typeof runtime) => {
+      json(value: unknown): Record<string, unknown>[]
+      list(bytes: Uint8Array): Record<string, unknown>[]
+      page(bytes: Uint8Array): { items: Record<string, unknown>[] }
+    }
+  const decode = load(runtime)
+  const wire = new Encoder()
+  wire.writeVarint(1)
+  wire.writeVarint(0)
+  wire.writeFieldInt(1, 0n)
+  wire.writeFieldString(2, '')
+  wire.writeVarint(5)
+  wire.writeBool(false)
+  wire.writeFieldBool(6, false)
+  wire.writeEnd()
+  if (shape === 'page') for (const metadata of [1n, 1n, 10n]) wire.writeSvarint(metadata)
+
+  const before = { id: 0n, name: 'old', price: 12.5, description: 'saved', note: 'old', active: true }
+  const [json] = decode.json([{ id: 0, name: '', note: null, active: false }])
+  const [binary] = shape === 'page' ? decode.page(wire.bytes()).items : decode.list(wire.bytes())
+  expect(Object.keys(binary)).toEqual(Object.keys(json))
+  expect(Object.hasOwn(binary, 'price')).toBe(false)
+  expect(Object.hasOwn(binary, 'description')).toBe(false)
+  expect(binary).toStrictEqual({ id: 0n, name: '', note: null, active: false })
+  expect({ ...before, ...binary }).toStrictEqual({ ...before, ...json })
+})
+
 it.each(['json', 'row', 'column', 'page'].flatMap(mode =>
   ['kept', null, undefined].map(value => [mode, value] as const),
 ))('preserves prototype-named fields in %s responses (%s)', async (mode, value) => {
@@ -779,6 +824,10 @@ it.each(['json', 'row', 'column', 'page'].flatMap(mode =>
     expect(Object.hasOwn(actual, name), name).toBe(true)
     expect(actual[name], name).toBe(absent ? undefined : expected[name])
   }
+  const previous = { ['__proto__']: 'previous' }
+  expect(Object.keys(actual)).toContain('constructor')
+  expect(Object.keys(actual).includes('__proto__')).toBe(value !== undefined)
+  expect({ ...previous, ...actual }['__proto__']).toBe(value === undefined ? 'previous' : value)
   if (mode === 'json' || mode === 'row') {
     const empty = mode === 'json' ? decode.json({}) : decode.row(new Decoder(new Uint8Array([0, 0])))
     for (const name of names) expect(empty[name], `unselected ${name}`).toBeUndefined()
@@ -1076,8 +1125,8 @@ describe('generateTypes', () => {
 
     const types = outputs.get('generated/types.ts') ?? ''
     expect(types).toContain('let _points: Uint8Array[] | undefined')
-    expect(types).toContain('points: _points ? decodeColumnarMetricPoint$value(_points[i], depth + 1) : undefined')
-    expect(types).toContain('points: _points ? decodeColumnarMetricPoint$value(_points[i], 1 + 1) : undefined')
+    expect(types).toContain("if (_points !== undefined) obj['points'] = decodeColumnarMetricPoint$value(_points[i], depth + 1)")
+    expect(types).toContain("if (_points !== undefined) obj['points'] = decodeColumnarMetricPoint$value(_points[i], 1 + 1)")
   })
 
   it('decodes UUID columns from their fixed-width binary representation', async () => {
@@ -1236,7 +1285,7 @@ describe('generateTypes', () => {
     expect(types).toContain('metadata: true extends Selection ? Selected<unknown> : unknown')
     expect(types).toContain("Object.prototype.hasOwnProperty.call(data, 'blob')")
     expect(types).not.toContain('new Uint8Array(0)')
-    expect(types).toContain('decodeJSONValue(_metadata![i]!)')
+    expect(types).toContain("if (_metadata !== undefined) obj['metadata'] = decodeJSONValue(_metadata[i])")
     expect(client).toContain('decodeJSONPayload')
   })
 

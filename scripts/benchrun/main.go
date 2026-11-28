@@ -147,6 +147,8 @@ func compileOverlay(root, packagePath string, baseline bool, profile string) (st
 		return packageTestOverlay(root, packagePath, "bench-"+profile+"-*", func(pkg, workspace string) (string, error) {
 			return writeAPIBenchmarkFileOverlay(pkg, workspace, profile)
 		})
+	case benchlayout.APIJSONListMetadataProfile:
+		return packageTestOverlay(root, packagePath, "bench-api-json-list-metadata-*", writeAPIJSONListMetadataOverlay)
 	case benchlayout.APIResponseOriginRunProfile:
 		return packageTestOverlay(root, packagePath, "bench-api-response-origin-run-*", writeAPIResponseOriginOverlay)
 	case benchlayout.LuviaPrimaryTraceProfile:

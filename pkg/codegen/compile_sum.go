@@ -14,7 +14,7 @@ func (c *compiler) compileSumOf(call *ast.CallExpr) (string, bool) {
 	}
 	prefix := c.collectionPrefix(lambda)
 	items, result := prefix+"Items", prefix+"Sum"
-	sub := c.valueCompiler()
+	sub := c.expressionCompiler(member.Object)
 	sub.indent += "\t"
 	sub.compileVal(&ast.ValStmt{Name: items, Value: member.Object})
 	goType := c.goTypeForExpr(lambda)
@@ -35,7 +35,7 @@ func (c *compiler) compileSumOf(call *ast.CallExpr) (string, bool) {
 	sub.writeSumAddition(lambda.GetTypeTag(), result, prefix+"Value")
 	sub.indent = c.indent + "\t"
 	sub.write("}")
-	sub.write("return %s", result)
+	sub.writeValueCompletion("", result)
 	return c.finishValueClosure(sub, goType, sub.b.String()), true
 }
 

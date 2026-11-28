@@ -36,6 +36,17 @@ func TestPaginationDestructuringWithoutAwaitBody(t *testing.T) {
 	}
 }
 
+func TestPaginationTransactionWithoutBodyKeepsOuterScope(t *testing.T) {
+	p := paginationAnalysis{scopes: []map[string]pageValue{{"outer": {builder: "Node"}}}, publicReturn: true}
+	value := p.expression(&ast.TransactionExpr{})
+	if value.owner != nil || len(value.queries) != 0 {
+		t.Fatalf("partial transaction acquired pagination lineage: %+v", value)
+	}
+	if len(p.scopes) != 1 || p.lookup("outer").builder != "Node" || !p.publicReturn {
+		t.Fatalf("partial transaction changed its outer scope: %+v", p.scopes)
+	}
+}
+
 func TestPaginationBuilderMetadataAndMutation(t *testing.T) {
 	// Prepared type metadata must not disguise a database list as a manual list.
 	root := &ast.Ident{Name: "provided", TypeTagged: ast.TypeTagged{TypeTag: "NodeQueryBuilder"}}

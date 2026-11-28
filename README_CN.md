@@ -433,6 +433,10 @@ Studio 发布时必须将核心 Go module、CLI、前端 SDK 和 CI checkout 固
 
 #### Beta 前的内部 RPC 升级（验收中）
 
+生成的网关为每个目标服务共用一个 LRPC 连接池。默认共 32 条连接，原生流最多占 24 条。流配额或连接池已满时，新流立即收到 `LRPCPoolBusy`（503）。普通 RPC 可以使用池内任意可用连接。
+
+在网关进程设置 `LRPC_MAX_OPEN` 和 `LRPC_UNARY_RESERVE` 可调整总连接上限和普通 RPC 预留。预留未设置或为零时，按总数的四分之一向上取整。预留等于总数时，该池关闭原生流。Go 调用方也可设置 `rpc.PoolOptions` 的 `MaxOpen` 和 `UnaryReserve`，并确保 `MaxIdle` 不超过 `MaxOpen`。
+
 `fn @service`、自动批量加载、关系解析与命名跨服务加载通过
 `Router.HandleInternal`注册。HTTP/WebSocket只查询公开路由表，RPC在启动时
 导出公开API和内部函数；Schema携带`internal`元数据，启动时拒绝注册作用域
@@ -649,8 +653,10 @@ PostgreSQL 的独立事务外语句和迁移历史分开提交。失败可能发
 
 请一起重新生成 Helm Chart 和服务二进制。`/health` 检测进程存活，`/ready`
 检测就绪。所需的 PostgreSQL 连接、已配置的 NATS 连接或 LRPC 监听不可用时，
-`/ready` 返回 HTTP 503。集群网关与每个模块做 LRPC 握手，各模块只检查本地依赖，
-避免互相等待。响应缓存仍按原有规则回源。探针只返回状态，服务最多复用一秒的探测结果。
+`/ready` 返回 HTTP 503。集群网关与每个模块做 LRPC 握手，探针与业务请求共用目标服务的连接配额。
+达到上限时，探针可以替换一条空闲连接，在期限内拿不到配额则报告未就绪。
+各模块只检查本地依赖，避免互相等待。响应缓存仍按原有规则回源。
+探针只返回状态，服务最多复用一秒的探测结果。
 
 ## 贡献
 

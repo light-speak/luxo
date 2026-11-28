@@ -103,9 +103,8 @@ func TestLRPCReadinessClosesHandshakeWhenClientCloses(t *testing.T) {
 		t.Fatal(err)
 	}
 	client.Close()
-	reply := protocolPreface()
-	if err := writePreface(peer, &reply); err != nil {
-		t.Fatal(err)
+	if _, err := peer.Read(preface[:]); !errors.Is(err, io.EOF) {
+		t.Fatalf("closing the client did not release the pending readiness socket: %v", err)
 	}
 	select {
 	case err := <-readiness:
@@ -115,8 +114,71 @@ func TestLRPCReadinessClosesHandshakeWhenClientCloses(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatalf("readiness completed after its deadline: %v", ctx.Err())
 	}
-	if _, err := peer.Read(preface[:]); !errors.Is(err, io.EOF) {
-		t.Fatalf("ready handshake connection stayed open: %v", err)
+	if open := client.pool.open.Load(); open != 0 {
+		t.Fatalf("closed readiness left %d reservations", open)
+	}
+}
+
+func TestLRPCReadinessAtConnectionLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		maxOpen int
+		idle    bool
+	}{
+		{"borrowed", 2, false},
+		{"full idle", 2, true},
+		{"idle with headroom", 3, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			counted := &rpcResponseListener{Listener: listener}
+			addr := startTestRPCListener(t, NewServer(api.NewRouter()), counted)
+			options := DefaultPoolOptions()
+			options.MaxOpen, options.MaxIdle, options.MaxWaiters = tc.maxOpen, 2, 0
+			client, err := NewNamedClientWithOptions("ready", addr, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(client.Close)
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			var held [2]net.Conn
+			for i := range held {
+				conn, err := client.pool.GetContext(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				held[i] = conn
+				t.Cleanup(func() { _ = conn.Close() })
+			}
+			if tc.idle {
+				for _, conn := range held {
+					client.pool.Put(conn)
+				}
+			}
+			err = client.CheckReady(ctx)
+			if !tc.idle {
+				if accepted := counted.accepted.Load(); accepted != 2 {
+					t.Fatalf("readiness opened an extra connection: accepted=%d, want 2", accepted)
+				}
+				if !errors.Is(err, ErrPoolExhausted) {
+					t.Fatalf("readiness with both connections borrowed = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if accepted, open, idle := counted.accepted.Load(), client.pool.open.Load(), len(client.pool.conns); accepted != 3 || open != 2 || idle != 2 {
+				t.Fatalf("readiness should make a fresh handshake and preserve idle capacity: accepted=%d open=%d idle=%d", accepted, open, idle)
+			}
+			if closed := held[0].(*poolConn).state.Load()&connClosed != 0; closed != (tc.maxOpen == 2) {
+				t.Fatalf("closed an idle socket = %t at limit %d", closed, tc.maxOpen)
+			}
+		})
 	}
 }
 
