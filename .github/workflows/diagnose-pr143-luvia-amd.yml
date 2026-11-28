@@ -17,16 +17,17 @@ jobs:
         slot: [1, 2, 3, 4, 5]
     name: EPYC 7763 witness (${{ matrix.slot }})
     env:
-      RUNNER_KIND: ${{ runner.environment }}
       GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
 
       - name: Match the processor and bind the diagnostic commit
         id: route
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
         run: bash scripts/diagnose-pr143-luvia-amd/run.sh route
 
       - if: steps.route.outputs.matched == 'true'
@@ -44,6 +45,8 @@ jobs:
 
       - if: steps.route.outputs.matched == 'true'
         name: Measure stock and aligned binaries with interleaved controls
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
         run: bash scripts/diagnose-pr143-luvia-amd/run.sh measure
 
       - if: always()

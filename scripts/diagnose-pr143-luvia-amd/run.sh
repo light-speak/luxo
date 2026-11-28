@@ -5,6 +5,7 @@ root=$(git rev-parse --show-toplevel)
 cd "$root"
 base=de7360c78f1e6f50edfe837b2f2471f9d6ed9410
 head=99a25aab7de63de85b5137820e9e85d557c0e158
+initial_diagnostic=58ca1c2b7342161baa4da68dea7af63d9f17a584
 base_tree=78a0ec2db7e24a2d68a8e53152dbb84228cc4502
 head_tree=7372cc5019201862c8b96c85d45bdbb285824991
 package=pkg/lux/luvia
@@ -16,7 +17,8 @@ bind_checkout() {
   test "$GITHUB_REF" = refs/heads/diagnostics/pr143-luvia-readiness-amd
   test "$RUNNER_KIND" = github-hosted
   test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-  test "$(git show -s --format=%P HEAD)" = "$head"
+  test "$(git show -s --format=%P HEAD)" = "$initial_diagnostic"
+  test "$(git show -s --format=%P "$initial_diagnostic")" = "$head"
   expected=$'A\t.github/workflows/diagnose-pr143-luvia-amd.yml\nA\tscripts/diagnose-pr143-luvia-amd/run.sh'
   test "$(git diff --name-status "$head" HEAD)" = "$expected"
   test "$(git rev-parse "$head^{tree}")" = "$head_tree"
