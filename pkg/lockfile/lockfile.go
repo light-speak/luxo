@@ -23,7 +23,9 @@ type LockFile struct {
 	Events      map[string]*ModelLock `json:"events,omitempty"`
 	APIs        map[string]*APILock   `json:"apis"`
 	ReservedAPI []int                 `json:"reserved_api_ids,omitempty"`
-	nextAPI     int                   // transient: next API ID to assign
+	// A default permits omission independently of whether null is a valid value.
+	DefaultAPIParams map[string][]int `json:"default_api_params,omitempty"`
+	nextAPI          int              // transient: next API ID to assign
 }
 
 // APILock tracks ID and param field IDs for a single API.

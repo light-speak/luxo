@@ -17,7 +17,7 @@ import (
 func readLock(data []byte) (*LockFile, error) {
 	d := jsontext.NewDecoder(bytes.NewBuffer(data), jsontext.AllowDuplicateNames(true))
 	lf := &LockFile{Version: currentVersion}
-	err := readLockMembers(d, lockVersion|lockModels|lockTypes|lockEvents|lockAPIs|lockReservedAPIs, func(member lockMember) (err error) {
+	err := readLockMembers(d, lockVersion|lockModels|lockTypes|lockEvents|lockAPIs|lockReservedAPIs|lockDefaultAPIParams, func(member lockMember) (err error) {
 		switch member {
 		case lockVersion:
 			lf.Version, err = readLockInt(d)
@@ -31,6 +31,12 @@ func readLock(data []byte) (*LockFile, error) {
 			lf.APIs, err = readLockMap(d, readAPILock)
 		case lockReservedAPIs:
 			lf.ReservedAPI, err = readLockInts(d)
+		case lockDefaultAPIParams:
+			lf.DefaultAPIParams, err = readLockMap(d, func(d *jsontext.Decoder) ([]int, error) {
+				ids, readErr := readDefaultIDs(d, MaxParameterID, "API parameter")
+				slices.Sort(ids)
+				return ids, readErr
+			})
 		}
 		return err
 	})
@@ -60,7 +66,7 @@ func readModelLock(d *jsontext.Decoder) (*ModelLock, error) {
 		case lockKind:
 			m.ensureTypeInfo().kind, err = readLockString(d)
 		case lockDefaultFields:
-			m.ensureTypeInfo().defaultIDs, err = readDefaultFieldIDs(d)
+			m.ensureTypeInfo().defaultIDs, err = readDefaultIDs(d, codec.MaxSelectionFieldID, "field")
 			slices.Sort(m.typeInfo.defaultIDs)
 		case lockNextID:
 			m.NextID, err = readLockInt(d)
@@ -116,14 +122,14 @@ func readAPILock(d *jsontext.Decoder) (*APILock, error) {
 	return a, err
 }
 
-func readDefaultFieldIDs(d *jsontext.Decoder) ([]int, error) {
+func readDefaultIDs(d *jsontext.Decoder, limit int, label string) ([]int, error) {
 	if _, err := readLockToken(d, '['); err != nil {
 		return nil, err
 	}
 	ids := []int{}
 	for d.PeekKind() != ']' {
-		if len(ids) >= codec.MaxSelectionFieldID {
-			return nil, fmt.Errorf("too many default field IDs")
+		if len(ids) >= limit {
+			return nil, fmt.Errorf("too many default %s IDs", label)
 		}
 		id, err := readLockInt(d)
 		if err != nil {

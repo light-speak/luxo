@@ -21,6 +21,7 @@ const (
 	lockContract
 	lockKind
 	lockDefaultFields
+	lockDefaultAPIParams
 )
 
 // The token text is compared before advancing the decoder. Only names stored
@@ -61,6 +62,8 @@ func lockMemberFor(name string) lockMember {
 		return lockKind
 	case "default_fields":
 		return lockDefaultFields
+	case "default_api_params":
+		return lockDefaultAPIParams
 	default:
 		return 0
 	}

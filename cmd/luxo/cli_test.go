@@ -1655,6 +1655,46 @@ func TestValidateWireCompatibilityRequiresExplicitOverride(t *testing.T) {
 	}
 }
 
+func TestGenRejectsBreakingAPIParameterOmissionWithoutOverride(t *testing.T) {
+	for _, test := range []struct {
+		name, before, after, path string
+	}{
+		{"non-nullable default removed", `api search(limit: Int = 5): Int { return limit }`, `api search(limit: Int): Int { return limit }`, "api search.limit default"},
+		{"nullable default removed", `api search(limit: Int? = null): Int { return limit ?: 0 }`, `api search(limit: Int?): Int { return limit ?: 0 }`, "api search.limit default"},
+		{"required nullable added", `api search(): Int { return 0 }`, `api search(limit: Int?): Int { return limit ?: 0 }`, "api search.limit"},
+	} {
+		t.Run(test.name, func(t *testing.T) { checkAPIParameterOmissionChange(t, test.before, test.after, test.path) })
+	}
+}
+
+func checkAPIParameterOmissionChange(t *testing.T, previousSource, changedSource, breakingPath string) {
+	t.Helper()
+	writeGlobalGenerationProject(t, map[string]string{"project/main": previousSource})
+	previous := allowBreaking
+	allowBreaking = false
+	t.Cleanup(func() { allowBreaking = previous })
+	if _, err := captureCLIResponse(t, func() error { return runGen(nil, nil) }); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join("origin", "project", "main.luxo"), []byte(changedSource), 0600); err != nil {
+		t.Fatal(err)
+	}
+	before := addProjectSnapshot(t)
+	_, err := captureCLIResponse(t, func() error { return runGen(nil, nil) })
+	if err == nil || !strings.Contains(err.Error(), breakingPath) || !strings.Contains(err.Error(), "--allow-breaking") {
+		t.Fatalf("generator did not report the breaking omission contract: %v", err)
+	}
+	assertAddProjectSnapshot(t, before)
+	allowBreaking = true
+	if _, err := captureCLIResponse(t, func() error { return runGen(nil, nil) }); err != nil {
+		t.Fatalf("explicit breaking change failed: %v", err)
+	}
+	allowBreaking = false
+	if _, err := captureCLIResponse(t, func() error { return runGen(nil, nil) }); err != nil {
+		t.Fatalf("repeating the accepted generation still requires an override: %v", err)
+	}
+}
+
 func TestLockUpdateFailurePreservesPersistedFile(t *testing.T) {
 	enterCacheGenerationScratch(t)
 	lf := lockfile.New()

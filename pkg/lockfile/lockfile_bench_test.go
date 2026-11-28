@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/light-speak/luxo/pkg/ast"
+	"github.com/light-speak/luxo/pkg/token"
 )
 
 // This measures cold-tool parsing, excluding disk I/O and ID validation. The
@@ -109,6 +110,41 @@ func BenchmarkUpdateExistingSnapshot(b *testing.B) {
 				mustUpdate(b, lf, input)
 			}
 		})
+	}
+}
+
+func BenchmarkAPIParameterDefaults(b *testing.B) {
+	for _, size := range []int{1, 128} {
+		for _, mode := range []string{"required", "defaulted", "nullable-defaulted"} {
+			api := &ast.ApiDecl{Name: "search"}
+			for index := range size {
+				param := &ast.ParamDecl{Name: "p" + strconv.Itoa(index), Type: &ast.TypeRef{Name: "Int", Nullable: mode == "nullable-defaulted"}}
+				if mode != "required" {
+					param.Default = &ast.Literal{Kind: token.Int, Value: "5"}
+				}
+				api.Params = append(api.Params, param)
+			}
+			input := []*ast.File{{APIs: []*ast.ApiDecl{api}}}
+			name := strconv.Itoa(size) + "/" + mode
+			b.Run(name+"/update", func(b *testing.B) {
+				lf := New()
+				mustUpdate(b, lf, input)
+				b.ReportAllocs()
+				for b.Loop() {
+					mustUpdate(b, lf, input)
+				}
+			})
+			b.Run(name+"/compatible", func(b *testing.B) {
+				lf := New()
+				mustUpdate(b, lf, input)
+				b.ReportAllocs()
+				for b.Loop() {
+					if changes := lf.BreakingChanges(input); len(changes) != 0 {
+						b.Fatal(changes)
+					}
+				}
+			})
+		}
 	}
 }
 

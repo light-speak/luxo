@@ -2,6 +2,7 @@ package lockfile
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -173,6 +174,7 @@ func (lf *LockFile) compareAPIs(files []*ast.File, contracts map[string]apiContr
 		if !declared || !locked.Contract {
 			continue
 		}
+		defaultIDs := lf.DefaultAPIParams[name]
 		for param, previousType := range locked.ParamTypes {
 			current, exists := contract.params[param]
 			path := "api " + name + "." + param
@@ -183,10 +185,14 @@ func (lf *LockFile) compareAPIs(files []*ast.File, contracts map[string]apiContr
 			currentType := formatTypeRef(current.Type)
 			if previousType != currentType {
 				changes = append(changes, BreakingChange{Path: path, Before: previousType, After: currentType})
+			} else if len(defaultIDs) != 0 && current.Default == nil {
+				if _, defaulted := slices.BinarySearch(defaultIDs, locked.Params[param]); defaulted {
+					changes = append(changes, BreakingChange{Path: path + " default", Before: "optional", After: "required"})
+				}
 			}
 		}
 		for param, current := range contract.params {
-			if _, exists := locked.ParamTypes[param]; exists || current.Type.Nullable || current.Default != nil {
+			if _, exists := locked.ParamTypes[param]; exists || current.Default != nil {
 				continue
 			}
 			changes = append(changes, BreakingChange{Path: "api " + name + "." + param, After: formatTypeRef(current.Type)})
@@ -221,11 +227,32 @@ func (lf *LockFile) updateContractMetadata(files []*ast.File) {
 		}
 		locked.ParamTypes = make(map[string]string, len(contract.params))
 		locked.Contract = true
+		defaultCount := 0
 		for param, declaration := range contract.params {
 			locked.ParamTypes[param] = formatTypeRef(declaration.Type)
+			if declaration.Default != nil {
+				defaultCount++
+			}
+		}
+		if defaultCount != 0 {
+			lf.storeAPIDefaults(name, locked, contract.params, defaultCount)
 		}
 		locked.ReturnType = contract.returnType
 	}
+}
+
+func (lf *LockFile) storeAPIDefaults(name string, locked *APILock, params map[string]*ast.ParamDecl, count int) {
+	defaults := make([]int, 0, count)
+	for name, param := range params {
+		if param.Default != nil {
+			defaults = append(defaults, locked.Params[name])
+		}
+	}
+	slices.Sort(defaults)
+	if lf.DefaultAPIParams == nil {
+		lf.DefaultAPIParams = make(map[string][]int)
+	}
+	lf.DefaultAPIParams[name] = defaults
 }
 
 func updateFieldMetadata(locked map[string]*ModelLock, current map[string]map[string]string) {
