@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/light-speak/luxo/pkg/codegen"
@@ -37,7 +39,11 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	case "compose":
 		return runDeployCompose()
 	case "helm":
-		return runDeployHelm()
+		ctx := context.Background()
+		if cmd != nil && cmd.Context() != nil {
+			ctx = cmd.Context()
+		}
+		return runDeployHelm(ctx)
 	default:
 		return fmt.Errorf("unknown deploy target: %s", target)
 	}
@@ -100,7 +106,7 @@ func runDeployCompose() error {
 	return nil
 }
 
-func runDeployHelm() error {
+func runDeployHelm(ctx context.Context) error {
 	if err := loadGenerationEnvironment(".env"); err != nil {
 		return err
 	}
@@ -141,18 +147,15 @@ func runDeployHelm() error {
 	green := "\033[32m"
 	reset := "\033[0m"
 
-	for path, data := range helm.Files {
-		fullPath := "deploy/helm/" + path
-		// Ensure parent directory exists
-		if dir := fullPath[:strings.LastIndex(fullPath, "/")]; dir != "" {
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return fmt.Errorf("mkdir %s: %w", dir, err)
-			}
-		}
-		if err := os.WriteFile(fullPath, data, 0644); err != nil {
-			return fmt.Errorf("write %s: %w", fullPath, err)
-		}
-		fmt.Printf("  %s+%s %s\n", green, reset, fullPath)
+	paths, retired, err := publishHelmChart(ctx, helm.Files)
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		fmt.Printf("  %s+%s %s/%s\n", green, reset, helmChartDirectory, filepath.ToSlash(path))
+	}
+	for _, path := range retired {
+		fmt.Printf("  - %s/%s\n", helmChartDirectory, filepath.ToSlash(path))
 	}
 
 	fmt.Printf("\n%s✓ Helm chart generated%s\n", green, reset)
