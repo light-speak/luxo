@@ -11,6 +11,8 @@ func FuzzReadLock(f *testing.F) {
 	for _, raw := range []string{completeLockJSON, `{}`, `{"version":1}`, `{"version":1,"version":2}`, `null`, `{"apis":{"a":{"id":1}}}`} {
 		f.Add([]byte(raw))
 	}
+	f.Add([]byte(`{"apis":{"a":{"id":1,"contract":true,"params":{"first":1,"second":2}}},"default_api_params":{"a":[2,1]}}`))
+	f.Add([]byte(`{"default_api_params":{"a":[1],"\u0061":[2]}}`))
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		lf, err := readLock(raw)
 		if err != nil {

@@ -208,6 +208,27 @@ func TestValidateRejectsNullInMemoryCatalogs(t *testing.T) {
 	}
 }
 
+func TestDefaultAPIParametersRequireActiveUniqueIDs(t *testing.T) {
+	const prefix = `{"apis":{"search":{"id":1,"params":{"limit":1,"offset":2},"contract":true}},"default_api_params":`
+	for _, defaults := range []string{`null`, `{"unknown":[1]}`, `{"search":[1,1]}`, `{"search":[3]}`, `{"search":[0]}`, `{"search":null}`, `{"search":[1],"search":[2]}`} {
+		lf, err := readLock([]byte(prefix + defaults + "}"))
+		if err == nil {
+			err = lf.Validate()
+		}
+		if err == nil {
+			t.Errorf("accepted invalid default parameter IDs: %s", defaults)
+		}
+	}
+	lf, err := readLock([]byte(prefix + `{"search":[2,1]}}`))
+	if err != nil || lf.Validate() != nil || lf.DefaultAPIParams["search"][0] != 1 {
+		t.Fatalf("compatible input was not normalized: %#v, %v", lf, err)
+	}
+	lf.DefaultAPIParams["search"] = []int{2, 1}
+	if err := lf.Validate(); err == nil || !strings.Contains(err.Error(), "must be sorted") {
+		t.Fatalf("invalid in-memory order accepted: %v", err)
+	}
+}
+
 func TestModelLockUnmarshalRejectsInvalidInputAtomically(t *testing.T) {
 	var missing *ModelLock
 	if err := missing.UnmarshalJSON([]byte(`{}`)); err == nil || !strings.Contains(err.Error(), "nil declaration") {

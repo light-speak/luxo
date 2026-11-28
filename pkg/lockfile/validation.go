@@ -67,18 +67,45 @@ func (lf *LockFile) validateAPIIDs() error {
 			return fmt.Errorf("luxo.lock API %q must not be null", name)
 		}
 		apis[name] = api.ID
-		if _, err := ValidateAssignments("apis."+name+".params", api.Params, api.Reserved, MaxParameterID); err != nil {
+		if _, err := validateAssignments("apis."+name+".params", api.Params, api.Reserved, MaxParameterID, lf.DefaultAPIParams[name]); err != nil {
 			return err
+		}
+	}
+	for name := range lf.DefaultAPIParams {
+		api := lf.APIs[name]
+		if api == nil || !api.Contract {
+			return fmt.Errorf("luxo.lock API %q has default parameters without a contract", name)
 		}
 	}
 	_, err := ValidateAssignments("apis", apis, lf.ReservedAPI, codec.MaxAPIID)
 	return err
 }
 
+func validateAPIDefaultIDs(scope string, ids []int, assigned map[int]string) error {
+	var previous int
+	for _, id := range ids {
+		if id <= 0 || id == previous {
+			return fmt.Errorf("luxo.lock %s has invalid or duplicate default API parameter ID %d", scope, id)
+		}
+		if id < previous {
+			return fmt.Errorf("luxo.lock %s default parameter IDs must be sorted", scope)
+		}
+		if _, ok := assigned[id]; !ok {
+			return fmt.Errorf("luxo.lock %s default API parameter ID %d is not active", scope, id)
+		}
+		previous = id
+	}
+	return nil
+}
+
 // ValidateAssignments checks one independent identifier space without mutation.
 // It returns the highest occupied ID (zero for an empty space). Generation tools
 // share this check so direct callers cannot bypass lockfile assignment rules.
 func ValidateAssignments(scope string, assigned map[string]int, reserved []int, limit int) (int, error) {
+	return validateAssignments(scope, assigned, reserved, limit, nil)
+}
+
+func validateAssignments(scope string, assigned map[string]int, reserved []int, limit int, defaultIDs []int) (int, error) {
 	seen := make(map[int]string, len(assigned)+len(reserved))
 	maximum := 0
 	for name, id := range assigned {
@@ -89,6 +116,11 @@ func ValidateAssignments(scope string, assigned map[string]int, reserved []int, 
 			return 0, err
 		}
 		maximum = max(maximum, id)
+	}
+	if len(defaultIDs) != 0 {
+		if err := validateAPIDefaultIDs(scope, defaultIDs, seen); err != nil {
+			return 0, err
+		}
 	}
 	for _, id := range reserved {
 		if err := claimID(scope, seen, id, "<reserved>", limit); err != nil {

@@ -338,7 +338,7 @@ func TestBreakingChangesProtectWireContracts(t *testing.T) {
 			Name: "getProfile",
 			Params: []*ast.ParamDecl{
 				{Name: "id", Type: &ast.TypeRef{Name: "Int"}},
-				{Name: "locale", Type: &ast.TypeRef{Name: "String", Nullable: true}},
+				{Name: "locale", Type: &ast.TypeRef{Name: "String", Nullable: true}, Default: &ast.Literal{Kind: token.Null, Value: "null"}},
 			},
 			ReturnType: &ast.TypeRef{Name: "User"},
 		}},
@@ -360,6 +360,47 @@ func TestBreakingChangesProtectWireContracts(t *testing.T) {
 		if !hasBreakingPath(changes, path) {
 			t.Errorf("missing breaking change for %q: %v", path, changes)
 		}
+	}
+}
+
+func TestBreakingChangesDetectRemovedAPIDefaultAfterReload(t *testing.T) {
+	for _, name := range []string{"required", "nullable"} {
+		t.Run(name, func(t *testing.T) {
+			nullable := name == "nullable"
+			input := func(fallback ast.Expr) []*ast.File {
+				return files(nil, []*ast.ApiDecl{{Name: "search", Params: []*ast.ParamDecl{{
+					Name: "limit", Type: &ast.TypeRef{Name: "Int", Nullable: nullable}, Default: fallback,
+				}}}})
+			}
+			lf := New()
+			mustUpdate(t, lf, input(&ast.Literal{Kind: token.Int, Value: "5"}))
+			path := filepath.Join(t.TempDir(), "luxo.lock")
+			if err := lf.Save(path); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changes := loaded.BreakingChanges(input(nil))
+			if !hasBreakingPath(changes, "api search.limit default") {
+				t.Fatalf("unexpected default change: %v", changes)
+			}
+			if changes := loaded.BreakingChanges(input(&ast.Literal{Kind: token.Int, Value: "10"})); len(changes) != 0 {
+				t.Fatalf("changing an existing default should keep the wire contract: %v", changes)
+			}
+		})
+	}
+}
+
+func TestBreakingChangesRejectsAddingRequiredNullableAPIParameter(t *testing.T) {
+	lf := New()
+	mustUpdate(t, lf, files(nil, []*ast.ApiDecl{{Name: "search"}}))
+	added := files(nil, []*ast.ApiDecl{{Name: "search", Params: []*ast.ParamDecl{{
+		Name: "limit", Type: &ast.TypeRef{Name: "Int", Nullable: true},
+	}}}})
+	if changes := lf.BreakingChanges(added); !hasBreakingPath(changes, "api search.limit") {
+		t.Fatalf("nullable parameter without a default was treated as optional: %v", changes)
 	}
 }
 
