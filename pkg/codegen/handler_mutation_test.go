@@ -60,6 +60,34 @@ func TestGeneratedMutationInputOrder(t *testing.T) {
 	runGeneratedProtocolPackage(t, source.String(), mutationInputAssertions+mutationInputBenchmarks)
 }
 
+func TestGeneratedCreateMultipleFallibleSaveFields(t *testing.T) {
+	runGeneratedFixture(t, `
+fn normalizeRequired(value: String): String {
+  if value == "bad" { throw error.NotFound }
+  return value.trim()
+}
+model User @noTime @crud {
+  id: Int @id
+  first: String @beforeSave { normalizeRequired(it) }
+  second: String @beforeSave { normalizeRequired(it) }
+}
+`, `package generated
+import("encoding/json";"errors";"testing";"github.com/light-speak/luxo/pkg/lux/api";luxerrors "github.com/light-speak/luxo/pkg/lux/errors")
+func TestRequiredSaveFailure(t *testing.T) {
+  handler:=handleCreateUser(&App{User:&UserClient{}})
+  for _, values:=range [][2]string{{"bad","second"},{" first ","bad"}} {
+    first,_:=json.Marshal(values[0])
+    second,_:=json.Marshal(values[1])
+    request:=&api.Request{Params:map[string]json.RawMessage{
+      "id":json.RawMessage("1"),"first":first,"second":second,
+    },Buf:&api.ResponseBuf{}}
+    if err:=handler(t.Context(),request);!errors.Is(err,luxerrors.NotFound){t.Fatal(values,err)}
+    if len(request.Buf.B)!=0{t.Fatal("failed save wrote a success response")}
+  }
+}
+`, StableIDs{ModelFields: map[string]map[string]int{"User": {"id": 1, "first": 2, "second": 3}}})
+}
+
 func TestGeneratedLocalCRUDRegistration(t *testing.T) {
 	code := string(generateHandlerFile(result(&ast.File{Models: []*ast.ModelDecl{mutationInputModel()}}), "generated", map[string]bool{"State": true}))
 	for _, name := range []string{"getRecord", "listRecords", "createRecord", "updateRecord", "deleteRecord", "deleteRecords"} {
