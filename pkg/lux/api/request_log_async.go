@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -9,6 +10,8 @@ import (
 
 const requestLogQueueCapacity = 256
 const maxRequestLogBytes = 16 * 1024
+
+var errRequestLogWriterAborted = errors.New("api: request log writer exited without returning")
 
 type asyncRequestLogs struct {
 	mu       sync.Mutex
@@ -44,10 +47,11 @@ func (l *asyncRequestLogs) submit(buf *[]byte) {
 }
 
 func (l *asyncRequestLogs) run() {
-	defer close(l.done)
-	for buf := range l.queue {
-		n, err := l.writer.Write(*buf)
-		if err == nil && n != len(*buf) {
+	var current *[]byte
+	defer l.finishWorker(&current)
+	for current = range l.queue {
+		n, err := l.writer.Write(*current)
+		if err == nil && n != len(*current) {
 			err = io.ErrShortWrite
 		}
 		if err != nil {
@@ -56,17 +60,42 @@ func (l *asyncRequestLogs) run() {
 				l.err = err
 			}
 		}
-		putRequestLogBuffer(buf)
+		putRequestLogBuffer(current)
+		current = nil
 	}
 }
 
-func (l *asyncRequestLogs) close(ctx context.Context) error {
+func (l *asyncRequestLogs) finishWorker(current **[]byte) {
+	defer close(l.done)
+	if *current == nil {
+		return
+	}
+	// A configured Writer can panic or exit without returning. Stop using it
+	// and release every record the worker still owns before reporting failure.
+	_ = recover()
+	l.failures.Add(1)
+	if l.err == nil {
+		l.err = errRequestLogWriterAborted
+	}
+	putRequestLogBuffer(*current)
+	l.stopAdmission()
+	for pending := range l.queue {
+		l.dropped.Add(1)
+		putRequestLogBuffer(pending)
+	}
+}
+
+func (l *asyncRequestLogs) stopAdmission() {
 	l.mu.Lock()
 	if !l.closed {
 		l.closed = true
 		close(l.queue)
 	}
 	l.mu.Unlock()
+}
+
+func (l *asyncRequestLogs) close(ctx context.Context) error {
+	l.stopAdmission()
 	select {
 	case <-l.done:
 		return l.err
@@ -90,7 +119,7 @@ func (rt *Router) CloseRequestLogs(ctx context.Context) error {
 	return rt.asyncLogs.close(ctx)
 }
 
-// RequestLogStats reports queue/size rejection and output failures, not sampling.
+// RequestLogStats reports rejected or abandoned records and output failures, excluding sampling.
 func (rt *Router) RequestLogStats() (dropped, failures uint64) {
 	if rt.asyncLogs == nil {
 		return 0, 0
