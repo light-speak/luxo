@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -443,9 +444,14 @@ func DecodeDebugTrace(data []byte) (DebugTraceSnapshot, error) {
 		return DebugTraceSnapshot{}, fmt.Errorf("invalid debug trace envelope")
 	}
 	version := data[0]
-	dec := codec.NewDecoder(data[1:])
+	if err := validateDebugTraceByteBudget(version, len(data)); err != nil {
+		return DebugTraceSnapshot{}, err
+	}
+	payload := data[1:]
+	dec := codec.NewDecoder(payload)
 	var snapshot DebugTraceSnapshot
-	var spanData [][]byte
+	var spanData []byte
+	var spanCount int
 	for dec.NextField() {
 		switch dec.FieldID() {
 		case 1:
@@ -453,7 +459,7 @@ func DecodeDebugTrace(data []byte) (DebugTraceSnapshot, error) {
 		case 2:
 			snapshot.Duration = time.Duration(dec.ReadInt())
 		case 3:
-			spanData = dec.ReadBytesArray()
+			spanData, spanCount = readDebugSpanList(dec, payload)
 		case 4:
 			snapshot.Truncated = dec.ReadBool()
 		case 5:
@@ -471,19 +477,57 @@ func DecodeDebugTrace(data []byte) (DebugTraceSnapshot, error) {
 	if (snapshot.TraceID == "" && !snapshot.EncodingFailed) || snapshot.Duration < 0 {
 		return DebugTraceSnapshot{}, fmt.Errorf("invalid debug trace metadata")
 	}
-	snapshot.Spans = make([]DebugSpan, len(spanData))
-	for i := range spanData {
-		span, err := decodeDebugSpan(spanData[i])
-		if err != nil {
-			return DebugTraceSnapshot{}, err
-		}
-		snapshot.Spans[i] = span
-		if version == 1 {
-			snapshot.Spans[i].ID = uint32(i + 1)
-			snapshot.Spans[i].FieldPath = snapshot.Spans[i].Field
+	spans, err := decodeDebugSpans(spanData, spanCount, version)
+	if err != nil {
+		return DebugTraceSnapshot{}, err
+	}
+	snapshot.Spans = spans
+	return snapshot, nil
+}
+
+var errDebugTraceByteBudget = errors.New("debug trace exceeds maximum encoded size")
+
+func validateDebugTraceByteBudget(version byte, size int) error {
+	// Only the current encoder imposed a byte ceiling on public trace snapshots.
+	if version == debugTraceVersion && size > MaxDebugResponseTraceBytes {
+		return errDebugTraceByteBudget
+	}
+	return nil
+}
+
+// Validate the outer framing and retain a borrowed window for the final span list.
+// Legacy duplicate fields keep their last-value semantics.
+func readDebugSpanList(dec *codec.Decoder, payload []byte) ([]byte, int) {
+	count := dec.ReadArrayLength()
+	if !dec.CheckElementBytes(count, 1) {
+		return nil, 0
+	}
+	start := dec.Offset()
+	for range count {
+		_ = dec.ReadBytes()
+		if dec.Err() != nil {
+			return nil, 0
 		}
 	}
-	return snapshot, nil
+	return payload[start:dec.Offset()], count
+}
+
+func decodeDebugSpans(data []byte, count int, version byte) ([]DebugSpan, error) {
+	dec := codec.NewDecoder(data)
+	// Public snapshots may exceed the session limit. Grow only for decoded spans.
+	spans := make([]DebugSpan, 0, min(count, maxDebugTraceSpans))
+	for i := range count {
+		span, err := decodeDebugSpan(dec.ReadBytes())
+		if err != nil {
+			return nil, err
+		}
+		if version == 1 {
+			span.ID = uint32(i + 1)
+			span.FieldPath = span.Field
+		}
+		spans = append(spans, span)
+	}
+	return spans, nil
 }
 
 func decodeDebugSpan(data []byte) (DebugSpan, error) {
@@ -590,11 +634,45 @@ func EncodeDebugTraceHeader(snapshot DebugTraceSnapshot) (string, error) {
 
 // DecodeDebugTraceHeader decodes a trace response header.
 func DecodeDebugTraceHeader(value string) (DebugTraceSnapshot, error) {
-	data, err := base64.RawURLEncoding.DecodeString(value)
+	data, err := decodeDebugTraceHeaderBytes(value)
 	if err != nil {
 		return DebugTraceSnapshot{}, fmt.Errorf("decode debug trace header: %w", err)
 	}
 	return DecodeDebugTrace(data)
+}
+
+func decodeDebugTraceHeaderBytes(value string) ([]byte, error) {
+	encoding := base64.RawURLEncoding
+	if len(value) <= encoding.EncodedLen(MaxDebugResponseTraceBytes) {
+		return encoding.DecodeString(value)
+	}
+	reader := base64.NewDecoder(encoding, strings.NewReader(value))
+	var version [1]byte
+	if _, err := io.ReadFull(reader, version[:]); err != nil {
+		if err == io.EOF {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if version[0] < 1 || version[0] > debugTraceVersion {
+		return nil, fmt.Errorf("invalid debug trace envelope")
+	}
+	if version[0] < debugTraceVersion {
+		return encoding.DecodeString(value)
+	}
+	// Read at most one decoded byte beyond the inclusive budget, even when the
+	// header contains CR/LF accepted by the base64 decoder.
+	data := make([]byte, MaxDebugResponseTraceBytes+1)
+	data[0] = version[0]
+	n, err := io.ReadFull(reader, data[1:])
+	switch err {
+	case nil:
+		return nil, errDebugTraceByteBudget
+	case io.EOF, io.ErrUnexpectedEOF:
+		return data[:n+1], nil
+	default:
+		return nil, err
+	}
 }
 
 // EncodeDebugResponseEnvelope carries an unmodified response body and its
