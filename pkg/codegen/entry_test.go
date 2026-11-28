@@ -289,11 +289,7 @@ func TestGeneratedEntriesTreatDotEnvAsOptionalButRejectMalformedFiles(t *testing
 	}
 	for name, source := range sources {
 		t.Run(name, func(t *testing.T) {
-			if !strings.Contains(source, `err != nil && !errors.Is(err, os.ErrNotExist)`) ||
-				!strings.Contains(source, `fatal: load .env: %v`) {
-				t.Fatalf("generated entry must ignore only a missing .env file:\n%s", source)
-			}
-			executeGeneratedDotEnvGuard(t, source)
+			executeGeneratedDotEnvGuard(t, source, name == "gateway")
 		})
 	}
 }
@@ -829,17 +825,18 @@ func TestGenerateGatewayEntry(t *testing.T) {
 		t.Fatal("should generate gateway entry")
 	}
 	src := string(code)
+	if strings.Contains(src, `"errors"`) || strings.Contains(src, `"github.com/light-speak/luxo/pkg/lux/env"`) {
+		t.Error("a gateway without streams must not import dotenv helpers")
+	}
 
 	checks := []string{
 		"package main",
 		"gateway/main.gen.go",
 		`user_luxo "myapp/service/user/luxo"`,
 		`post_luxo "myapp/service/post/luxo"`,
-		"rpc.NewNamedClient",
-		"USER_SERVICE_ADDR",
-		"POST_SERVICE_ADDR",
-		"user:9000",
-		"post:9000",
+		`rpcClients, err := rpc.LoadGatewayClients(".env", map[string]string{`,
+		`"user": "user:9000",`,
+		`"post": "post:9000",`,
 		"RegisterSchema",
 		"gw.Router.Registry.RegisterSchemaAPIs(gw.Router.Schema)",
 		"proxyHandler",
@@ -1342,6 +1339,10 @@ func TestGeneratedEntriesBridgeNativeStreamsThroughRPC(t *testing.T) {
 	gateway := string(generateGatewayEntry(result, "myapp", EntryBackends{Events: "memory", Queue: "memory", Cache: "memory"}))
 	for _, want := range []string{
 		"score_luxo.RegisterStreams(gw.Router, eventBus, nil)",
+		`rpcClients, err := rpc.LoadGatewayClients(".env", map[string]string{`,
+		`"score": "score:9000",`,
+		`fmt.Fprintf(os.Stderr, "fatal: %v\n", err)`,
+		`env.CheckBackend("LUXO_EVENT_BACKEND", "memory")`,
 		`gw.Router.HandleStreamForwarded("watchLiveScore", rpcStreamProxy(rpcClients["score"]`,
 		"client.SubscribeContext(ctx, luvia.BearerToken(ctx)",
 		"req.BinaryParams()",
@@ -1354,6 +1355,11 @@ func TestGeneratedEntriesBridgeNativeStreamsThroughRPC(t *testing.T) {
 	}
 	if strings.Contains(gateway, "case <-subscription.Errors():") {
 		t.Fatal("terminal errors must not skip buffered stream messages")
+	}
+	if strings.Count(gateway, "rpc.LoadGatewayClients(") != 1 ||
+		strings.Contains(gateway, "env.Load(") || strings.Contains(gateway, `"errors"`) ||
+		strings.Contains(gateway, "rpc.NewNamedClient") || strings.Contains(gateway, "_SERVICE_ADDR") {
+		t.Fatal("gateway should initialize and check the client map only once")
 	}
 }
 
@@ -1424,9 +1430,17 @@ func TestGenerateGatewayEntryCompiledAPIDedup(t *testing.T) {
 
 // Execute the exact generated guard: string matching alone cannot prove that
 // wrapped filesystem errors retain the intended optional-file behavior.
-func executeGeneratedDotEnvGuard(t *testing.T, source string) {
+func executeGeneratedDotEnvGuard(t *testing.T, source string, gateway bool) {
 	t.Helper()
-	start := strings.Index(source, "if err := env.Load(")
+	guardStart := `if err := env.Load(".env"); err != nil && !errors.Is(err, os.ErrNotExist)`
+	imports := `import ("errors"; "fmt"; "os"; "github.com/light-speak/luxo/pkg/lux/env")`
+	finish := ""
+	if gateway {
+		guardStart = `rpcClients, err := rpc.LoadGatewayClients(".env",`
+		imports = `import ("fmt"; "os"; "github.com/light-speak/luxo/pkg/lux/rpc")`
+		finish = "\nfor _, client := range rpcClients { client.Close() }\n"
+	}
+	start := strings.Index(source, guardStart)
 	if start < 0 {
 		t.Fatal("missing generated environment guard")
 	}
@@ -1451,9 +1465,7 @@ func executeGeneratedDotEnvGuard(t *testing.T, source string) {
 			t.Error(err)
 		}
 	})
-	program := `package main
-import ("errors"; "fmt"; "os"; "github.com/light-speak/luxo/pkg/lux/env")
-func main() {` + guard + "}\n"
+	program := "package main\n" + imports + "\nfunc main() {\n" + guard + finish + "}\n"
 	path := filepath.Join(dir, "main.go")
 	if err := os.WriteFile(path, []byte(program), 0600); err != nil {
 		t.Fatal(err)
@@ -1496,6 +1508,7 @@ func checkGeneratedDotEnvGuard(t *testing.T, binary, root, mode string) {
 	}
 	command := exec.CommandContext(t.Context(), binary)
 	command.Dir = dir
+	command.Env = append(command.Environ(), "LRPC_MAX_OPEN=32", "LRPC_UNARY_RESERVE=8")
 	output, err := command.CombinedOutput()
 	rejected := mode != "missing" && mode != "valid"
 	if (err != nil) != rejected {

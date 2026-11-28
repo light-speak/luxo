@@ -1072,6 +1072,9 @@ func TestClientDiscardsConnectionOnSetupFailure(t *testing.T) {
 					if sub, err := client.SubscribeContext(ctx, "", 1, nil, nil); err == nil || sub != nil {
 						t.Fatalf("failed stream escaped setup: %v", err)
 					}
+					if client.pool.streams.Load() != 0 {
+						t.Fatal("failed setup retained its stream quota")
+					}
 				} else if body, err := client.exchange(ctx, []byte{0, 0, 0, 0, 1}); err == nil || body != nil {
 					t.Fatalf("failed unary exchange returned data: %v", err)
 				}

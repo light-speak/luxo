@@ -179,6 +179,11 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{APIPackage, "BenchmarkBodyReadReverse/4096/direct-2", APINonIdentityProfile},
 		{APIPackage, "BenchmarkJSONQuoteCandidate/empty/current-2", "api-json-quote-candidate"},
 		{APIPackage, "BenchmarkJSONQuoteInvalidCandidate", APINonIdentityProfile},
+		{APIPackage, "BenchmarkJSONListMetadata/escaped/0/metadata-2", "api-json-list-metadata"},
+		{APIPackage, "BenchmarkJSONListMetadataSibling", APINonIdentityProfile},
+		{APIPackage, "BenchmarkStreamAPIClassification/binary-2", APINonIdentityProfile},
+		{APIPackage, "BenchmarkWSJSONSubscriptionMetadata", APINonIdentityProfile},
+		{RPCPackage, "BenchmarkJSONListMetadata", DefaultProfile},
 		{RPCPackage, "BenchmarkResponseOriginRun", DefaultProfile},
 		{APIPackage, "BenchmarkWSConnectionRegistrationsSibling-2", APINonIdentityProfile},
 		{RPCPackage, "BenchmarkHandlerPanicFormatting", RPCHandlerPanicProfile},
@@ -258,6 +263,7 @@ func TestAPIAndLuviaProfilesPreserveTheirOtherReaders(t *testing.T) {
 		{"api-response-origin-run", "^BenchmarkResponseOriginRun$"},
 		{"api-body-read", "^BenchmarkBodyRead$"},
 		{"api-json-quote-candidate", "^BenchmarkJSONQuoteCandidate$"},
+		{"api-json-list-metadata", "^BenchmarkJSONListMetadata$"},
 	}
 	if !reflect.DeepEqual(apiProfiles, wantAPI) || ValidPerformanceProfile(RPCPackage, APIBinaryParamLookupProfile) ||
 		ValidPerformanceProfile(RPCPackage, APIRequestLogProfile) {

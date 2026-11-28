@@ -3,8 +3,33 @@ package semantic
 import (
 	"slices"
 
+	"github.com/light-speak/luxo/pkg/ast"
 	"github.com/light-speak/luxo/pkg/token"
 )
+
+// Keep the unresolved values with dedicated lowering in compileSealedComparison:
+// a null literal and an await expression whose checked result is null.
+func sealedComparisonLacksValue(left, right ast.Expr, leftType, rightType *ResolvedType) bool {
+	if rightType == nil || rightType.Kind == TypeUnknown {
+		return leftType != nil && leftType.Kind == TypeSealed && !isSealedComparisonNull(right)
+	}
+	return rightType.Kind == TypeSealed && (leftType == nil || leftType.Kind == TypeUnknown) && !isSealedComparisonNull(left)
+}
+
+func isSealedComparisonNull(expression ast.Expr) bool {
+	switch value := expression.(type) {
+	case *ast.Literal:
+		return value.Kind == token.Null
+	case *ast.AwaitExpr:
+		return value.GetTypeTag() == "null"
+	default:
+		return false
+	}
+}
+
+func (a *Analyzer) reportUnresolvedSealedComparison(pos token.Position) {
+	a.addError(pos, "sealed comparison requires a typed value, a null literal, or a null-valued await / 密封比较需要类型明确的值、null 字面量或结果为空的 await")
+}
 
 func (a *Analyzer) checkSealedEquality(owner *ResolvedType, pos token.Position) {
 	if owner.IsList {

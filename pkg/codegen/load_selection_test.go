@@ -154,6 +154,7 @@ func TestLoadProjectionScopesAndExpressions(t *testing.T) {
 		{"when_model", `val p = (Product.load(id) ?: throw error.NotFound) return when { p.flag -> p else -> p }`, "Product", "flag", true},
 		{"loop", `val rows = Product.load(id: id) var name = "" for p in rows { name = p.name } return name`, "String", "name", false},
 		{"loop_value", `val rows = Product.load(id: id) return for p in rows { p.name }`, "[String]", "name", false},
+		{"loop_value_return", `val rows = Product.load(id: id) val names = for p in rows { return p.name } return "done"`, "String", "name", false},
 		{"loop_returned_model", `val rows = Product.load(id: id) return for p in rows { p }`, "[Product]", "", true},
 		{"loop_yielded_model", `val rows = Product.load(id: id) return for p in rows { if p.flag { yield p } }`, "Product?", "flag", true},
 		{"range", `val p = (Product.load(id) ?: throw error.NotFound) var total = 0 for number in p.id..p.price { total += number } return total`, "Int", "id,price", false},
@@ -618,6 +619,18 @@ func TestLoadProjectionDefensivePaths(t *testing.T) {
 	analysis.expression(&ast.TransactionExpr{Body: &ast.Block{Stmts: []ast.Stmt{&ast.ExprStmt{Expr: &ast.Ident{Name: "product"}}}}})
 	analysis.expression(&ast.YieldExpr{Value: &ast.Ident{Name: "product"}})
 	analysis.loop(&ast.ForStmt{VarName: "letter", Collection: &ast.MemberExpr{Object: &ast.Ident{Name: "product"}, Field: "name"}}, false, false)
+	for _, expression := range []ast.Expr{
+		&ast.ForStmt{},
+		&ast.ForStmt{Body: &ast.Block{Stmts: []ast.Stmt{&ast.ReturnStmt{}}}},
+		&ast.AwaitExpr{Body: &ast.Block{}},
+	} {
+		if origins := analysis.expression(expression); len(origins) != 0 {
+			t.Fatalf("partial value expression %T acquired provenance: %v", expression, origins)
+		}
+		if analysis.controlDepth != 0 || len(analysis.scopes) != 1 {
+			t.Fatalf("partial value expression %T leaked its scope", expression)
+		}
+	}
 	if analysis.originModel(loadOrigin{demand: analysis.demands[argument], path: []string{"absent"}}) != nil {
 		t.Fatal("unknown path acquired a model")
 	}

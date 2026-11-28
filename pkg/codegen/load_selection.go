@@ -76,6 +76,11 @@ type loadDemand struct {
 	clientSelection *loadClientSelection
 }
 
+type loadReturnFlow struct {
+	public  bool
+	origins []loadOrigin
+}
+
 type loadDemandAnalysis struct {
 	models            map[string]*ast.ModelDecl
 	resultType        *ast.TypeRef
@@ -88,6 +93,7 @@ type loadDemandAnalysis struct {
 	collectionQueries bool
 	objectStorage     bool
 	controlDepth      int
+	valueReturns      loadReturnFlow
 }
 
 // Selected queries seed lexical origins at select(), including saved builders.
@@ -260,6 +266,8 @@ func (a *loadDemandAnalysis) block(body *ast.Block, bindings map[string][]loadOr
 	if bindings == nil {
 		bindings = make(map[string][]loadOrigin)
 	}
+	parent := a.valueReturns
+	a.valueReturns = loadReturnFlow{public: publicReturn}
 	a.scopes = append(a.scopes, bindings)
 	var result []loadOrigin
 	for index, statement := range body.Stmts {
@@ -273,6 +281,8 @@ func (a *loadDemandAnalysis) block(body *ast.Block, bindings map[string][]loadOr
 		result = append(result, a.statement(statement, publicReturn)...)
 	}
 	a.scopes = a.scopes[:len(a.scopes)-1]
+	result = append(result, a.valueReturns.origins...)
+	a.valueReturns = parent
 	return result
 }
 
@@ -346,28 +356,7 @@ func (a *loadDemandAnalysis) bindAwaitResults(scope map[string][]loadOrigin, dec
 
 	// The tasks read the surrounding scope before any result is bound.
 	var inline [2]loadAwaitResult
-	results := inline[:0]
-	var returned []loadOrigin
-	if await.Body != nil {
-		a.controlDepth++
-		parentDepth := len(a.scopes)
-		for _, statement := range await.Body.Stmts {
-			if value, ok := statement.(*ast.ExprStmt); ok {
-				if value.Expr != nil {
-					results = append(results, loadAwaitResult{value.Expr, a.expression(value.Expr)})
-				}
-				continue
-			}
-			// Only declarations bind names in this scope. A nested block
-			// owns its bindings, and an assignment searches existing scopes.
-			if _, local := statement.(*ast.ValStmt); local && len(a.scopes) == parentDepth {
-				a.scopes = append(a.scopes, make(map[string][]loadOrigin))
-			}
-			returned = append(returned, a.statement(statement, publicReturn)...)
-		}
-		a.scopes = a.scopes[:parentDepth]
-		a.controlDepth--
-	}
+	results, returned := a.awaitResults(await.Body, inline[:0], publicReturn)
 	if len(results) == 1 {
 		result := results[0]
 		a.bindLoadAliases(scope, names, result.origins, result.expression, declaration.Type)
@@ -385,6 +374,32 @@ func (a *loadDemandAnalysis) bindAwaitResults(scope map[string][]loadOrigin, dec
 		scope[name] = bound
 	}
 	return returned
+}
+
+func (a *loadDemandAnalysis) awaitResults(body *ast.Block, results []loadAwaitResult, publicReturn bool) ([]loadAwaitResult, []loadOrigin) {
+	if body == nil {
+		return results, nil
+	}
+	var returned []loadOrigin
+	a.controlDepth++
+	parentDepth := len(a.scopes)
+	for _, statement := range body.Stmts {
+		if value, ok := statement.(*ast.ExprStmt); ok {
+			if value.Expr != nil {
+				results = append(results, loadAwaitResult{value.Expr, a.expression(value.Expr)})
+			}
+			continue
+		}
+		// Only declarations bind names in this scope. A nested block
+		// owns its bindings, and an assignment searches existing scopes.
+		if _, local := statement.(*ast.ValStmt); local && len(a.scopes) == parentDepth {
+			a.scopes = append(a.scopes, make(map[string][]loadOrigin))
+		}
+		returned = append(returned, a.statement(statement, publicReturn)...)
+	}
+	a.scopes = a.scopes[:parentDepth]
+	a.controlDepth--
+	return results, returned
 }
 
 func (a *loadDemandAnalysis) assignment(value *ast.AssignStmt) {
@@ -431,10 +446,40 @@ func (a *loadDemandAnalysis) loopValue(loop *ast.ForStmt) []loadOrigin {
 	previous := a.loopYields
 	a.loopYields = nil
 	// Ordinary nested loops share this target; value loops save their own target.
-	result := a.loop(loop, !containsYield(loop.Body), false)
+	origins := a.expression(loop.Collection)
+	a.presence(origins)
+	result := a.loopValueBody(loop, origins)
 	result = append(result, a.loopYields...)
 	a.loopYields = previous
 	return result
+}
+
+func (a *loadDemandAnalysis) loopValueBody(loop *ast.ForStmt, origins []loadOrigin) []loadOrigin {
+	if loop.Body == nil {
+		return nil
+	}
+	a.controlDepth++
+	a.scopes = append(a.scopes, map[string][]loadOrigin{loop.VarName: origins})
+	defer func() {
+		a.scopes = a.scopes[:len(a.scopes)-1]
+		a.controlDepth--
+	}()
+	collect := !containsYield(loop.Body)
+	for index, statement := range loop.Body.Stmts {
+		if collect && index == len(loop.Body.Stmts)-1 {
+			switch value := statement.(type) {
+			case *ast.ExprStmt:
+				return a.expression(value.Expr)
+			case *ast.ReturnStmt:
+				if value.Value != nil {
+					return a.expression(value.Value)
+				}
+			}
+		}
+		returned := a.statement(statement, a.valueReturns.public)
+		a.valueReturns.origins = append(a.valueReturns.origins, returned...)
+	}
+	return nil
 }
 
 func (a *loadDemandAnalysis) presence(origins []loadOrigin) {

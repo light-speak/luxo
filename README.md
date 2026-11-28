@@ -452,6 +452,10 @@ Studio releases must pin the tested core Go module, CLI, frontend SDKs, and CI c
 
 #### Pre-Beta Internal RPC Upgrade (Under Validation)
 
+A generated gateway shares one LRPC connection pool per target service. The default pool allows 32 connections, with at most 24 used by native streams. New native streams receive `LRPCPoolBusy` (503) immediately when the stream quota or the shared pool is full. Unary RPCs can use any available connection.
+
+Set `LRPC_MAX_OPEN` and `LRPC_UNARY_RESERVE` in the gateway process environment to tune the total limit and unary reservation. When the reserve is omitted or set to zero, the gateway reserves one quarter of the total, rounded up. A reserve equal to the total disables native streams for the pool. Go callers can set `MaxOpen` and `UnaryReserve` in `rpc.PoolOptions`, with `MaxIdle` at most `MaxOpen`.
+
 `fn @service`, generated batch loaders, relation resolvers, and named remote
 loaders register through `Router.HandleInternal`. HTTP and WebSocket only use
 the public route table; RPC exports both public APIs and internal functions at
