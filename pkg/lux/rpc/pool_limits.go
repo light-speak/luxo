@@ -40,8 +40,7 @@ func DefaultPoolOptions() PoolOptions {
 	return PoolOptions{MaxIdle: 32, MaxOpen: 32, MaxWaiters: 32, WaitTimeout: 5 * time.Second, DialTimeout: 5 * time.Second}
 }
 
-// PoolOptionsFromEnv reads the per-target budgets used by a generated gateway.
-func PoolOptionsFromEnv() (PoolOptions, error) {
+func poolOptionsFromEnv() (PoolOptions, error) {
 	options := DefaultPoolOptions()
 	var err error
 	if options.MaxOpen, err = readPoolLimit("LRPC_MAX_OPEN", options.MaxOpen); err != nil {

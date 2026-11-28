@@ -760,7 +760,6 @@ func generateGatewayEntry(result *semantic.Result, modulePath string, backends E
 	b.WriteString("import (\n")
 	b.WriteString("\t\"bytes\"\n")
 	b.WriteString("\t\"context\"\n")
-	b.WriteString("\t\"errors\"\n")
 	b.WriteString("\t\"fmt\"\n")
 	b.WriteString("\t\"os\"\n\n")
 	if len(rateLimits) > 0 {
@@ -776,8 +775,8 @@ func generateGatewayEntry(result *semantic.Result, modulePath string, backends E
 	b.WriteString("\n\t\"sync\"\n\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/api\"\n")
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/codec\"\n")
-	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
 	if anyStreams {
+		b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/env\"\n")
 		writeEventBackendImport(&b, backends.Events)
 	}
 	b.WriteString("\t\"github.com/light-speak/luxo/pkg/lux/luvia\"\n")
@@ -788,28 +787,15 @@ func generateGatewayEntry(result *semantic.Result, modulePath string, backends E
 	b.WriteString("var Version = \"dev\"\n\n")
 
 	b.WriteString("func main() {\n")
-	b.WriteString("\tif err := env.Load(\".env\"); err != nil && !errors.Is(err, os.ErrNotExist) {\n")
-	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: load .env: %v\\n\", err)\n")
-	b.WriteString("\t\tos.Exit(1)\n")
-	b.WriteString("\t}\n\n")
 
-	// RPC clients — default address = moduleName:9000 (Docker/K8s DNS)
-	b.WriteString("\tpoolOptions, err := rpc.PoolOptionsFromEnv()\n")
-	b.WriteString("\tif err != nil {\n")
-	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: RPC pool configuration: %v\\n\", err)\n")
-	b.WriteString("\t\tos.Exit(1)\n")
-	b.WriteString("\t}\n\n")
-	b.WriteString("\trpcClients := map[string]*rpc.Client{}\n")
+	// RPC clients use moduleName:9000 as the default Docker/K8s DNS address.
+	b.WriteString("\trpcClients, err := rpc.LoadGatewayClients(\".env\", map[string]string{\n")
 	for _, m := range allModules {
-		envKey := strings.ToUpper(m.name) + "_SERVICE_ADDR"
-		defaultAddr := m.name + ":9000"
-		fmt.Fprintf(&b, "\trpcClients[%q], err = rpc.NewNamedClientWithOptions(%q, env.GetOrDefault(%q, %q), poolOptions)\n",
-			m.name, m.name, envKey, defaultAddr)
-		b.WriteString("\tif err != nil {\n")
-		fmt.Fprintf(&b, "\t\tfmt.Fprintf(os.Stderr, \"fatal: %s RPC client: %%v\\n\", err)\n", m.name)
-		b.WriteString("\t\tos.Exit(1)\n\t}\n")
+		fmt.Fprintf(&b, "\t\t%q: %q,\n", m.name, m.name+":9000")
 	}
-	b.WriteString("\n")
+	b.WriteString("\t})\n\tif err != nil {\n")
+	b.WriteString("\t\tfmt.Fprintf(os.Stderr, \"fatal: %v\\n\", err)\n")
+	b.WriteString("\t\tos.Exit(1)\n\t}\n\n")
 
 	// Gateway
 	b.WriteString("\tgw := luvia.New()\n\n")

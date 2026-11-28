@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -250,30 +253,34 @@ func TestPoolFailedDialReleasesReservation(t *testing.T) {
 	}
 }
 
-func TestPoolOptionsFromEnv(t *testing.T) {
+func TestLoadGatewayClientsFromEnv(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.env")
 	for _, tc := range []struct {
-		name, maxOpen, reserve string
-		wantOpen, wantReserve  int
-		invalid                bool
+		name, maxOpen, reserve, invalidKey string
+		wantOpen, wantReserve              int
 	}{
-		{name: "default", wantOpen: 32},
+		{name: "default", wantOpen: 32, wantReserve: 8},
 		{name: "smaller", maxOpen: "12", reserve: "4", wantOpen: 12, wantReserve: 4},
-		{name: "larger", maxOpen: "64", reserve: "0", wantOpen: 64},
+		{name: "larger", maxOpen: "64", reserve: "0", wantOpen: 64, wantReserve: 16},
 		{name: "no-streams", reserve: "32", wantOpen: 32, wantReserve: 32},
-		{name: "bad-open", maxOpen: "slow", invalid: true},
-		{name: "bad-reserve", reserve: "fast", invalid: true},
-		{name: "zero-open", maxOpen: "0", invalid: true},
-		{name: "negative-open", maxOpen: "-1", invalid: true},
-		{name: "negative-reserve", reserve: "-1", invalid: true},
-		{name: "oversized-reserve", maxOpen: "12", reserve: "13", invalid: true},
+		{name: "bad-open", maxOpen: "slow", invalidKey: "LRPC_MAX_OPEN"},
+		{name: "bad-reserve", reserve: "fast", invalidKey: "LRPC_UNARY_RESERVE"},
+		{name: "zero-open", maxOpen: "0", invalidKey: "LRPC_MAX_OPEN"},
+		{name: "negative-open", maxOpen: "-1", invalidKey: "LRPC_MAX_OPEN"},
+		{name: "negative-reserve", reserve: "-1", invalidKey: "LRPC_UNARY_RESERVE"},
+		{name: "oversized-reserve", maxOpen: "12", reserve: "13", invalidKey: "LRPC_UNARY_RESERVE"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("LRPC_MAX_OPEN", tc.maxOpen)
 			t.Setenv("LRPC_UNARY_RESERVE", tc.reserve)
-			options, err := PoolOptionsFromEnv()
-			if tc.invalid {
-				if err == nil {
-					t.Fatal("accepted invalid pool configuration")
+			t.Setenv("EMPTY_SERVICE_ADDR", "")
+			clients, err := LoadGatewayClients(missing, map[string]string{"empty": "fallback:9000", "other": "other:9000"})
+			for _, client := range clients {
+				t.Cleanup(client.Close)
+			}
+			if tc.invalidKey != "" {
+				if clients != nil || err == nil || !strings.Contains(err.Error(), tc.invalidKey) {
+					t.Fatalf("invalid configuration returned %d clients, error %v", len(clients), err)
 				}
 				return
 			}
@@ -283,10 +290,94 @@ func TestPoolOptionsFromEnv(t *testing.T) {
 			want := DefaultPoolOptions()
 			want.MaxOpen, want.UnaryReserve = tc.wantOpen, tc.wantReserve
 			want.MaxIdle = min(want.MaxIdle, want.MaxOpen)
-			if options != want {
-				t.Fatalf("options = %+v, want %+v", options, want)
+			if len(clients) != 2 || clients["empty"] == nil || clients["other"] == nil ||
+				clients["empty"].pool.options != want || clients["other"].pool.options != want {
+				t.Fatalf("clients did not use validated pool options: %+v", want)
+			}
+			if clients["empty"].pool.addr != "" {
+				t.Fatal("an explicitly empty service address must keep dotenv lookup semantics")
 			}
 		})
+	}
+}
+
+func TestLoadGatewayClientsKeepTargetPoolsIndependent(t *testing.T) {
+	t.Setenv("LRPC_MAX_OPEN", "2")
+	t.Setenv("LRPC_UNARY_RESERVE", "1")
+	t.Setenv("FIRST_SERVICE_ADDR", "ignored")
+	if err := os.Unsetenv("FIRST_SERVICE_ADDR"); err != nil {
+		t.Fatal(err)
+	}
+	router, _ := newStreamIsolationRouter(t)
+	addr := startTestRPCServer(t, NewServer(router))
+	t.Setenv("SECOND_SERVICE_ADDR", addr)
+	clients, err := LoadGatewayClients(filepath.Join(t.TempDir(), "missing.env"),
+		map[string]string{"first": addr, "second": "unused:9000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second := clients["first"], clients["second"]
+	if first == nil || second == nil {
+		t.Fatal("factory did not construct both clients")
+	}
+	t.Cleanup(first.Close)
+	t.Cleanup(second.Close)
+	if first.name != "first" || second.name != "second" || first.pool == second.pool ||
+		first.pool.addr != addr || second.pool.addr != addr {
+		t.Fatal("named clients did not keep distinct pools or resolve the service address")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	stream := openIsolationStream(t, ctx, first)
+	extra, err := first.SubscribeContext(ctx, "", 1, nil, nil)
+	if extra != nil {
+		extra.Close()
+	}
+	if extra != nil || !errors.Is(err, ErrPoolExhausted) {
+		t.Fatalf("first pool accepted a second stream: %v", err)
+	}
+	requirePooledPing(t, ctx, first)
+	openIsolationStream(t, ctx, second)
+	stream.Close()
+	first.Close()
+	requirePooledPing(t, ctx, second)
+}
+
+func TestLoadGatewayClientsUsesExplicitDotenv(t *testing.T) {
+	t.Setenv("LRPC_MAX_OPEN", "3")
+	t.Setenv("LRPC_UNARY_RESERVE", "1")
+	t.Setenv("DOTENV_SERVICE_ADDR", "restore-after-test")
+	if err := os.Unsetenv("DOTENV_SERVICE_ADDR"); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(t.TempDir(), "cluster.env")
+	content := []byte("LRPC_MAX_OPEN=8\nLRPC_UNARY_RESERVE=4\nDOTENV_SERVICE_ADDR=localhost:9234\n")
+	if err := os.WriteFile(file, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clients, err := LoadGatewayClients(file, map[string]string{"dotenv": "fallback:9000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := clients["dotenv"]
+	if client == nil {
+		t.Fatal("factory did not construct the dotenv client")
+	}
+	t.Cleanup(client.Close)
+	if pool := client.pool; pool.addr != "localhost:9234" ||
+		pool.options.MaxOpen != 3 || pool.options.UnaryReserve != 1 {
+		t.Fatal("startup did not load the explicit dotenv file with process values taking precedence")
+	}
+}
+
+func TestLoadGatewayClientsRejectsMalformedDotenv(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "cluster.env")
+	if err := os.WriteFile(file, []byte("invalid config without an equals sign\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clients, err := LoadGatewayClients(file, map[string]string{"test": "localhost:9234"})
+	if clients != nil || err == nil || !strings.HasPrefix(err.Error(), "load "+file+":") {
+		t.Fatalf("malformed dotenv returned %d clients, error %v", len(clients), err)
 	}
 }
 

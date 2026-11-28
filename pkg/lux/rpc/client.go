@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/light-speak/luxo/pkg/lux/api"
 	"github.com/light-speak/luxo/pkg/lux/codec"
+	"github.com/light-speak/luxo/pkg/lux/env"
 	luxerrors "github.com/light-speak/luxo/pkg/lux/errors"
 )
 
@@ -98,6 +101,25 @@ func NewNamedClientWithOptions(name, addr string, options PoolOptions) (*Client,
 		return nil, err
 	}
 	return &Client{name: name, pool: pool}, nil
+}
+
+// LoadGatewayClients loads an optional dotenv file and configures one named
+// client and pool per target. Process values override dotenv values. Each
+// default address can be overridden by the uppercase target's _SERVICE_ADDR key.
+func LoadGatewayClients(envFile string, defaultAddresses map[string]string) (map[string]*Client, error) {
+	if err := env.Load(envFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("load %s: %w", envFile, err)
+	}
+	options, err := poolOptionsFromEnv()
+	if err != nil {
+		return nil, fmt.Errorf("RPC pool configuration: %w", err)
+	}
+	clients := make(map[string]*Client, len(defaultAddresses))
+	for name, fallback := range defaultAddresses {
+		address := env.GetOrDefault(strings.ToUpper(name)+"_SERVICE_ADDR", fallback)
+		clients[name] = &Client{name: name, pool: newPool(address, options)}
+	}
+	return clients, nil
 }
 
 // Call sends a binary-encoded request and returns the response body.
