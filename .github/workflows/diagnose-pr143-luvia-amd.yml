@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 3
+          fetch-depth: 4
           persist-credentials: false
 
       - name: Match the processor and bind the diagnostic commit
