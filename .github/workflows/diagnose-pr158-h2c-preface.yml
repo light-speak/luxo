@@ -1,0 +1,128 @@
+name: Qualify #158 HTTP/2 cleartext connection lifecycle
+
+on:
+  push:
+    branches: [diagnostics/pr158-h2c-preface]
+
+permissions:
+  contents: read
+
+jobs:
+  witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Route only the original Intel CPU models
+        id: route
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/h2c-result
+          python3 -I -B scripts/diagnose-pr158-h2c-preface/qualify.py probe | tee .tmp/h2c-result/route.json
+          printf 'matched=%s\n' "$(jq -r '.matched' .tmp/h2c-result/route.json)" >> "$GITHUB_OUTPUT"
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+          cache: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: 5491ebcb17c4208303ff6e313b3f1fcbefee30e7
+          fetch-depth: 2
+          path: .tmp/h2c-source
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ee59a8b0c89e6adc97f0806b893e4a86e7802168
+          sparse-checkout: scripts/diagnose-pr158
+          path: .tmp/h2c-sampler
+          persist-credentials: false
+
+      - if: steps.route.outputs.matched == 'true'
+        name: Verify fixed Go and module identities and measure the original leaf
+        env:
+          RUNNER_KIND: ${{ runner.environment }}
+        run: >-
+          python3 -I -B scripts/diagnose-pr158-h2c-preface/qualify.py native
+          --repo .tmp/h2c-source
+          --helper .tmp/h2c-sampler/scripts/diagnose-pr158
+          --out .tmp/h2c-result/samples
+
+      - if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: pr158-h2c-${{ github.run_id }}-${{ github.run_attempt }}-slot-${{ matrix.slot }}
+          path: .tmp/h2c-result
+          if-no-files-found: error
+          retention-days: 14
+
+  qualification:
+    needs: witness
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/diagnose-pr158-h2c-preface
+          persist-credentials: false
+
+      - name: Require qualifying evidence on both original CPU models
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          receipts=$(mktemp -d .tmp/pr158-h2c-receipts.XXXXXXXX)
+          trap 'rm -rf -- "$receipts"' EXIT
+          gh run download "$GITHUB_RUN_ID" --pattern "pr158-h2c-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-slot-*" --dir "$receipts"
+          python3 -I -B - "$receipts" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          manifest = json.loads(Path('scripts/diagnose-pr158-h2c-preface/manifest.json').read_text())
+          root = Path(sys.argv[1]); slots = list(root.glob('*/route.json'))
+          if len(slots) != 6:
+              raise SystemExit('missing slot evidence')
+          accepted, commits = set(), set()
+          for path in slots:
+              route = json.loads(path.read_text())
+              cpu = route['cpu']
+              if route['matched'] != (cpu in manifest['routes']):
+                  raise SystemExit('invalid CPU route evidence')
+              if not route['matched']:
+                  if (path.parent/'samples').exists():
+                      raise SystemExit('samples from a non-matching CPU')
+                  continue
+              source = path.parent/'samples'
+              receipt = json.loads((source/'binding.json').read_text())
+              status = json.loads((source/'status.json').read_text())
+              if receipt['source'] != manifest or receipt['mode'] != 'native' or receipt['cpu'] != cpu:
+                  raise SystemExit('invalid immutable source or host evidence')
+              if status['cpu'] != cpu or status['processes'] != 240 or status['qualified'] is not True:
+                  raise SystemExit('a matching host did not qualify')
+              commits.add(receipt['CCommit'])
+              accepted.add(cpu)
+          if accepted != set(manifest['routes']) or len(commits) != 1:
+              raise SystemExit(f'missing CPU qualification or candidate binding: {accepted}')
+          print('Qualified on', ', '.join(sorted(accepted)))
+          PY

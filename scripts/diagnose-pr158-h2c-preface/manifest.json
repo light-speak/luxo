@@ -1,0 +1,111 @@
+{
+  "A": {
+    "commit": "4f9faaa61b174b9de73f583945e10ed416231d65",
+    "goModBlob": "f21af0f958d0b527e714ddb36b55b6e79baa6910",
+    "goSumBlob": "9bdebe12f9c858c55dbe99e5852953f056cdc161",
+    "tree": "75445ec9234b98a2a68d33a72fe9126bc2a3ee8d",
+    "xNet": "v0.58.0",
+    "xNetGoModSum": "h1:YwCddHnFlT7eLQqVprV19OnhLGtc5xOKgE0RyqgfWAU=",
+    "xNetSum": "h1:ynWG7rqYi4ccpTEuPZ2QGWHktVEM9DMCj9yzDE0Q7To="
+  },
+  "B": {
+    "goModBlob": "21495fc536e24fed0c5694f0cef5c0972cacadeb",
+    "goSumBlob": "273f01e855e0efeba803684087281f6f097176ff",
+    "tree": "e0c60fbb625c6ce5793d10c1226a5581faae15a1",
+    "xNet": "v0.63.0",
+    "xNetGoModSum": "h1:15JLg3IX1bLjHK264EZQEbIpTiR/KVLuo9CTRWd0pig=",
+    "xNetSum": "h1:HCoTmNh9EpD1PpK8gBNFY4gcTY4N+KQEO8ylfIKqFJ0="
+  },
+  "C": {
+    "commit": "5491ebcb17c4208303ff6e313b3f1fcbefee30e7",
+    "firstParent": "e3317c9bd72543297a95e27b04966474a2d479db",
+    "goModBlob": "21495fc536e24fed0c5694f0cef5c0972cacadeb",
+    "goSumBlob": "273f01e855e0efeba803684087281f6f097176ff",
+    "tree": "3cea1dbc715a13954d18ff52382016d2943c6cdd",
+    "xNet": "v0.63.0",
+    "xNetGoModSum": "h1:15JLg3IX1bLjHK264EZQEbIpTiR/KVLuo9CTRWd0pig=",
+    "xNetSum": "h1:HCoTmNh9EpD1PpK8gBNFY4gcTY4N+KQEO8ylfIKqFJ0="
+  },
+  "case": {
+    "name": "BenchmarkPriorKnowledgeConnectionLifecycle-2",
+    "package": "pkg/lux/h2transport",
+    "profile": "default"
+  },
+  "compileProfileSHA256": "f9c4c57d865d0038632086c464bc9e502b709b5229827d83513b4def8a73cccd",
+  "fixtureSHA256": "d2dbd1919f88fd102ba4547eb9f1d46b3b2046f61509b48f376c720dd669c017",
+  "helperCommit": "ee59a8b0c89e6adc97f0806b893e4a86e7802168",
+  "helperFiles": {
+    "go-capture.py": "b93cb28f2b092f63a07543a71cd39d46f3f28044d73f3547aaf16078c2d07db9",
+    "routes.json": "bf3be34db7cca43489c678e725e5baa66ca03e323c4a282df9e8650db93cdc81",
+    "run.py": "ca70b8d62f6e2fa9081d9f6bf059945e1608e17487b051ff1cb4cbc36e1dc809"
+  },
+  "inventory": [
+    "BenchmarkControlHandoff-2",
+    "BenchmarkHTTP1ProtocolDispatch-2",
+    "BenchmarkHTTPProtocolConfiguration-2",
+    "BenchmarkHTTPWorkerDispatch-2",
+    "BenchmarkHeaderSnapshot/0/map-2",
+    "BenchmarkHeaderSnapshot/0/slice-2",
+    "BenchmarkHeaderSnapshot/1/map-2",
+    "BenchmarkHeaderSnapshot/1/slice-2",
+    "BenchmarkHeaderSnapshot/16/map-2",
+    "BenchmarkHeaderSnapshot/16/slice-2",
+    "BenchmarkHeaderSnapshot/4/map-2",
+    "BenchmarkHeaderSnapshot/4/slice-2",
+    "BenchmarkPriorKnowledgeConnectionLifecycle-2",
+    "BenchmarkQueueUnary-2",
+    "BenchmarkReadDeadline/changed-2",
+    "BenchmarkReadDeadline/same-2",
+    "BenchmarkReceiveBurst/1-2",
+    "BenchmarkReceiveBurst/16-2",
+    "BenchmarkReceiveBurst/8-2",
+    "BenchmarkReceiveTerminalBody-2",
+    "BenchmarkReceiveUnary4KiB-2",
+    "BenchmarkReceiveWindowAnnouncement/false-2",
+    "BenchmarkReceiveWindowAnnouncement/true-2",
+    "BenchmarkReceiveWindowConnectionInit/false-2",
+    "BenchmarkReceiveWindowConnectionInit/true-2",
+    "BenchmarkReceiverInit-2",
+    "BenchmarkRequestHead-2",
+    "BenchmarkReserveData-2",
+    "BenchmarkResponseHandoff/4KiB/copy-2",
+    "BenchmarkResponseHandoff/4KiB/transfer-2",
+    "BenchmarkResponseHandoff/64KiB/copy-2",
+    "BenchmarkResponseHandoff/64KiB/transfer-2",
+    "BenchmarkResponseHandoff/small/copy-2",
+    "BenchmarkResponseHandoff/small/transfer-2",
+    "BenchmarkResponseReadyFlush/combined-2",
+    "BenchmarkResponseReadyFlush/separate-2",
+    "BenchmarkTaskDeadlineMinimum/conditional-2",
+    "BenchmarkTaskDeadlineMinimum/scan-2",
+    "BenchmarkTaskDeadlineReplacement/1/conditional-2",
+    "BenchmarkTaskDeadlineReplacement/1/scan-2",
+    "BenchmarkTaskDeadlineReplacement/128/conditional-2",
+    "BenchmarkTaskDeadlineReplacement/128/scan-2",
+    "BenchmarkTaskDeadlineReplacement/8/conditional-2",
+    "BenchmarkTaskDeadlineReplacement/8/scan-2",
+    "BenchmarkValidatedHTTPBridge//-2",
+    "BenchmarkValidatedHTTPBridge///a%20b?q=1-2",
+    "BenchmarkValidatedHTTPBridge//?-2",
+    "BenchmarkWakeControlBatch/1/combined=false-2",
+    "BenchmarkWakeControlBatch/1/combined=true-2",
+    "BenchmarkWakeControlBatch/8/combined=false-2",
+    "BenchmarkWakeControlBatch/8/combined=true-2",
+    "BenchmarkWindowProgressCredit-2"
+  ],
+  "mainOnlyPaths": [
+    "packages/vite-plugin/src/codegen.test.ts",
+    "packages/vite-plugin/src/codegen.ts",
+    "tests/sdk-interop/sql/consumer.mjs",
+    "tests/sdk-interop/sql/precision.mjs"
+  ],
+  "patchPaths": [
+    "pkg/lux/h2transport/http_server.go",
+    "pkg/lux/h2transport/http_server_test.go"
+  ],
+  "previousB": "5422c6f455c20ded7aff4ec663e3be5f820a7040",
+  "routes": [
+    "Intel(R) Xeon(R) 6975P-C",
+    "INTEL(R) XEON(R) PLATINUM 8573C"
+  ]
+}
