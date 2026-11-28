@@ -1,0 +1,245 @@
+{
+  "A": {
+    "commit": "de7360c78f1e6f50edfe837b2f2471f9d6ed9410",
+    "tree": "78a0ec2db7e24a2d68a8e53152dbb84228cc4502"
+  },
+  "H": {
+    "commit": "c4adf3cfdd12b789c5c28a47929dc2a8920a30b6",
+    "parents": [
+      "f72667fbb2f76101e611a45cfc9cbb670548b6db",
+      "de7360c78f1e6f50edfe837b2f2471f9d6ed9410"
+    ],
+    "tree": "4d5ecacdee69a67252db1749ef3c853caf5cd7ad"
+  },
+  "case": {
+    "cache": {
+      "confirmed": [
+        "github.com/light-speak/luxo/pkg/lux/api/CacheExecutionDependencyCollection/models=1-2"
+      ],
+      "hot": "BenchmarkCacheExecutionDependencyCollection|\\(\\*cacheDependencyPlan\\)\\.appendModels",
+      "inventory": "cache",
+      "originalArtifact": 15260360505,
+      "originalDigest": "6a604d4dfc747ac747d172a40b4fb4e7d503f01491cac293fb7507277da3963a",
+      "package": "pkg/lux/api",
+      "profile": "api-non-identity",
+      "required": [
+        "\\.BenchmarkCacheExecutionDependencyCollection\\.func1$",
+        "\\.\\(\\*cacheDependencyPlan\\)\\.appendModels$"
+      ],
+      "selector": "^BenchmarkCacheExecutionDependencyCollection$/^models=1$",
+      "timed": [
+        "BenchmarkCacheExecutionDependencyCollection/models=1-2"
+      ]
+    },
+    "gateway-identity": {
+      "confirmed": [
+        "github.com/light-speak/luxo/pkg/lux/luvia/GatewayIdentity/typed-nil/after-2"
+      ],
+      "hot": "BenchmarkGatewayIdentity|/luvia\\.(New|newGateway|Identity)|context\\.\\(\\*valueCtx\\)\\.Value",
+      "inventory": "gateway-identity",
+      "originalArtifact": 15260316625,
+      "originalDigest": "f6961cc12792acc7efd41b8f61bc68a885935b208aaea63e8d1e421cf299b073",
+      "package": "pkg/lux/luvia",
+      "profile": "luvia-gateway-identity",
+      "required": [
+        "\\.newGateway\\.func1$",
+        "\\.BenchmarkGatewayIdentity$"
+      ],
+      "selector": "^BenchmarkGatewayIdentity$/^typed-nil$/^after$|^BenchmarkGatewayIdentity$/^typed-nil$/^before$",
+      "timed": [
+        "BenchmarkGatewayIdentity/typed-nil/after-2",
+        "BenchmarkGatewayIdentity/typed-nil/before-2"
+      ]
+    },
+    "local-export": {
+      "confirmed": [
+        "github.com/light-speak/luxo/pkg/lux/api/LocalRouteExport/routes=1/previous-2",
+        "github.com/light-speak/luxo/pkg/lux/api/LocalRouteExport/routes=128/previous-2",
+        "github.com/light-speak/luxo/pkg/lux/api/LocalRouteExport/routes=16/previous-2"
+      ],
+      "hot": "BenchmarkLocalRouteExport|\\(\\*Router\\)\\.ExportHandlers",
+      "inventory": "local-export",
+      "originalArtifact": 15260316625,
+      "originalDigest": "f6961cc12792acc7efd41b8f61bc68a885935b208aaea63e8d1e421cf299b073",
+      "package": "pkg/lux/api",
+      "profile": "api-local-route-export",
+      "required": [
+        "\\.BenchmarkLocalRouteExport\\.func[1-9]$"
+      ],
+      "selector": "^BenchmarkLocalRouteExport$/^routes=1$/^previous$|^BenchmarkLocalRouteExport$/^routes=128$/^previous$|^BenchmarkLocalRouteExport$/^routes=16$/^previous$",
+      "timed": [
+        "BenchmarkLocalRouteExport/routes=1/previous-2",
+        "BenchmarkLocalRouteExport/routes=128/previous-2",
+        "BenchmarkLocalRouteExport/routes=16/previous-2"
+      ]
+    },
+    "response-empty": {
+      "confirmed": [
+        "github.com/light-speak/luxo/pkg/lux/api/HandlerResponseBuffer/Empty-2"
+      ],
+      "hot": "BenchmarkHandlerResponseBuffer|/api\\.\\(\\*Router\\)\\.callHandler",
+      "inventory": "response-empty",
+      "originalArtifact": 15259902424,
+      "originalDigest": "66bff72fd4fb9ae846a861ea35d496c49a12fe0b1f076df31b797bda5bf8fc6a",
+      "package": "pkg/lux/api",
+      "profile": "api-handler-panic",
+      "required": [
+        "\\.BenchmarkHandlerResponseBuffer\\.func[1-9]$",
+        "\\.\\(\\*Router\\)\\.callHandler$"
+      ],
+      "selector": "^BenchmarkHandlerResponseBuffer$/^Empty$",
+      "timed": [
+        "BenchmarkHandlerResponseBuffer/Empty-2"
+      ]
+    },
+    "response-stream": {
+      "confirmed": [
+        "github.com/light-speak/luxo/pkg/lux/api/HandlerDetachedResponseBuffer-2",
+        "github.com/light-speak/luxo/pkg/lux/api/StreamSourceReleaseRecovery/64/After-2"
+      ],
+      "hot": "BenchmarkHandlerDetachedResponseBuffer|BenchmarkStreamSourceReleaseRecovery|BenchmarkWSWriteBudgets|/api\\.(\\(\\*Router\\)\\.callHandler|releaseStreamSource)",
+      "inventory": "response-stream",
+      "originalArtifact": 15260057035,
+      "originalDigest": "17edd9446e472376bb72feb109b879e81bb765cfcfee9c3ca6c3ff79a6f40ebc",
+      "package": "pkg/lux/api",
+      "profile": "api-non-identity",
+      "required": [
+        "\\.BenchmarkHandlerDetachedResponseBuffer$",
+        "\\.BenchmarkStreamSourceReleaseRecovery\\.func[1-9]$",
+        "\\.releaseStreamSource$"
+      ],
+      "selector": "^BenchmarkHandlerDetachedResponseBuffer$|^BenchmarkStreamSourceReleaseRecovery$/^64$/^After$|^BenchmarkStreamSourceReleaseRecovery$/^64$/^Before$|^BenchmarkWSWriteBudgets$/^kind=2$/^bytes=1024$/^isolated$",
+      "timed": [
+        "BenchmarkHandlerDetachedResponseBuffer-2",
+        "BenchmarkStreamSourceReleaseRecovery/64/After-2",
+        "BenchmarkStreamSourceReleaseRecovery/64/Before-2",
+        "BenchmarkWSWriteBudgets/kind=2/bytes=1024/isolated-2"
+      ]
+    },
+    "rpc-direct": {
+      "confirmed": [
+        "github.com/light-speak/luxo/pkg/lux/rpc/LRPCDirectRequest/0/plain-after-2",
+        "github.com/light-speak/luxo/pkg/lux/rpc/LRPCDirectRequest/0/traced-after-2"
+      ],
+      "hot": "BenchmarkLRPCDirectRequest|/rpc\\.(prepareCallFrame|prepareTracedCallFrame)",
+      "inventory": "rpc-direct",
+      "originalArtifact": 15260316625,
+      "originalDigest": "f6961cc12792acc7efd41b8f61bc68a885935b208aaea63e8d1e421cf299b073",
+      "package": "pkg/lux/rpc",
+      "profile": "default",
+      "required": [
+        "\\.BenchmarkLRPCDirectRequest\\.func[1-9]$",
+        "\\.prepareCallFrame$",
+        "\\.prepareTracedCallFrame$"
+      ],
+      "selector": "^BenchmarkLRPCDirectRequest$/^0$/^plain-after$|^BenchmarkLRPCDirectRequest$/^0$/^traced-after$",
+      "timed": [
+        "BenchmarkLRPCDirectRequest/0/plain-after-2",
+        "BenchmarkLRPCDirectRequest/0/traced-after-2"
+      ]
+    }
+  },
+  "compileProfileSHA256": "f9c4c57d865d0038632086c464bc9e502b709b5229827d83513b4def8a73cccd",
+  "diffSHA256": "d464f8ad1cac256a6a4052dbb2a9fa3b229ff582172a17532a0e3a1dd6dd8e9f",
+  "inventory": {
+    "cache": [
+      "BenchmarkCacheExecutionDependencyCollection/models=1-2",
+      "BenchmarkCacheExecutionDependencyCollection/models=128-2",
+      "BenchmarkCacheExecutionDependencyCollection/models=16-2"
+    ],
+    "gateway-identity": [
+      "BenchmarkGatewayIdentity/anonymous/after-2",
+      "BenchmarkGatewayIdentity/anonymous/before-2",
+      "BenchmarkGatewayIdentity/authenticated/after-2",
+      "BenchmarkGatewayIdentity/authenticated/before-2",
+      "BenchmarkGatewayIdentity/typed-nil/after-2",
+      "BenchmarkGatewayIdentity/typed-nil/before-2"
+    ],
+    "local-export": [
+      "BenchmarkLocalRouteExport/routes=1/current-2",
+      "BenchmarkLocalRouteExport/routes=1/previous-2",
+      "BenchmarkLocalRouteExport/routes=128/current-2",
+      "BenchmarkLocalRouteExport/routes=128/previous-2",
+      "BenchmarkLocalRouteExport/routes=16/current-2",
+      "BenchmarkLocalRouteExport/routes=16/previous-2",
+      "BenchmarkLocalRouteLookup/routes=1/current-2",
+      "BenchmarkLocalRouteLookup/routes=1/previous-2",
+      "BenchmarkLocalRouteLookup/routes=128/current-2",
+      "BenchmarkLocalRouteLookup/routes=128/previous-2",
+      "BenchmarkLocalRouteLookup/routes=16/current-2",
+      "BenchmarkLocalRouteLookup/routes=16/previous-2"
+    ],
+    "response-empty": [
+      "BenchmarkHandlerDetachedResponseBuffer-2",
+      "BenchmarkHandlerPanicFormatting/BusinessError/After-2",
+      "BenchmarkHandlerPanicFormatting/BusinessError/Before-2",
+      "BenchmarkHandlerPanicFormatting/OpaquePanic/After-2",
+      "BenchmarkHandlerPanicFormatting/OpaquePanic/Before-2",
+      "BenchmarkHandlerPanicFormatting/StringPanic/After-2",
+      "BenchmarkHandlerPanicFormatting/StringPanic/Before-2",
+      "BenchmarkHandlerPanicFormatting/Success/After-2",
+      "BenchmarkHandlerPanicFormatting/Success/Before-2",
+      "BenchmarkHandlerResponseBuffer/BusinessError-2",
+      "BenchmarkHandlerResponseBuffer/Bytes4KiB-2",
+      "BenchmarkHandlerResponseBuffer/Empty-2",
+      "BenchmarkHandlerResponseBuffer/Int-2"
+    ],
+    "response-stream": [
+      "BenchmarkHandlerDetachedResponseBuffer-2",
+      "BenchmarkStreamSourceReleaseRecovery/1/After-2",
+      "BenchmarkStreamSourceReleaseRecovery/1/Before-2",
+      "BenchmarkStreamSourceReleaseRecovery/64/After-2",
+      "BenchmarkStreamSourceReleaseRecovery/64/Before-2",
+      "BenchmarkWSWriteBudgets/kind=1/bytes=1024/isolated-2",
+      "BenchmarkWSWriteBudgets/kind=1/bytes=1024/unbounded-2",
+      "BenchmarkWSWriteBudgets/kind=1/bytes=8/isolated-2",
+      "BenchmarkWSWriteBudgets/kind=1/bytes=8/unbounded-2",
+      "BenchmarkWSWriteBudgets/kind=2/bytes=1024/isolated-2",
+      "BenchmarkWSWriteBudgets/kind=2/bytes=1024/unbounded-2",
+      "BenchmarkWSWriteBudgets/kind=2/bytes=8/isolated-2",
+      "BenchmarkWSWriteBudgets/kind=2/bytes=8/unbounded-2"
+    ],
+    "rpc-direct": [
+      "BenchmarkLRPCDirectRequest/0/plain-after-2",
+      "BenchmarkLRPCDirectRequest/0/plain-before-2",
+      "BenchmarkLRPCDirectRequest/0/traced-after-2",
+      "BenchmarkLRPCDirectRequest/0/traced-before-2",
+      "BenchmarkLRPCDirectRequest/128/plain-after-2",
+      "BenchmarkLRPCDirectRequest/128/plain-before-2",
+      "BenchmarkLRPCDirectRequest/128/traced-after-2",
+      "BenchmarkLRPCDirectRequest/128/traced-before-2",
+      "BenchmarkLRPCDirectRequest/4096/plain-after-2",
+      "BenchmarkLRPCDirectRequest/4096/plain-before-2",
+      "BenchmarkLRPCDirectRequest/4096/traced-after-2",
+      "BenchmarkLRPCDirectRequest/4096/traced-before-2",
+      "BenchmarkLRPCDirectRequest/65536/plain-after-2",
+      "BenchmarkLRPCDirectRequest/65536/plain-before-2",
+      "BenchmarkLRPCDirectRequest/65536/traced-after-2",
+      "BenchmarkLRPCDirectRequest/65536/traced-before-2"
+    ]
+  },
+  "originalAttempt": 1,
+  "originalRun": 46134219831,
+  "routes": {
+    "INTEL(R) XEON(R) PLATINUM 8573C": [
+      "local-export",
+      "gateway-identity",
+      "rpc-direct"
+    ],
+    "Intel(R) Xeon(R) 6975P-C": [
+      "response-empty",
+      "cache",
+      "response-stream"
+    ]
+  },
+  "sourceSHA256": {
+    "pkg/lux/api/cache_dependencies_bench_test.go": "69dd6bf66f6b81ae2320762a6794bc70fb1a007851e6dd4fe0837ab3924fba14",
+    "pkg/lux/api/handler_panic_bench_test.go": "01122e4a09e5c6d6a20018f47566fb801ad4888db504fd9d2c932be56146e302",
+    "pkg/lux/api/local_input_bench_test.go": "f74d52661f6a68721b35e02fe92aceb9ea6ca583fd64a539b5d76539cec1227d",
+    "pkg/lux/api/stream_prepare_bench_test.go": "71d073fb21f01aa5ca1050846b66cab1ea7df608f83f3cda5cbd9f268d47297c",
+    "pkg/lux/api/websocket_write_bench_test.go": "0507874cdbaece00383797313043634ca448479cdb7fccf8e7bab067095806b5",
+    "pkg/lux/luvia/middleware_test.go": "a284f6673c86a90ed916099ac82a6ffb0e9b190161c946989957839252b07034",
+    "pkg/lux/rpc/public_boundary_test.go": "555e0a031f0f1286bca7233b6fd5c28854e5a3de3b29aad6e05e5019bbf4c578",
+    "pkg/lux/rpc/request_encode_bench_test.go": "b71675bbcb7e739a25166de6302879b24031d9275995a6dd8ca7b05dd7318994"
+  }
+}
